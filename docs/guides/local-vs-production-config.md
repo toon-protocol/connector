@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This guide explains how to configure the M2M connector for different deployment environments (development, staging, production) with a focus on blockchain configuration for Base L2 and XRP Ledger integration.
+This guide explains how to configure the M2M connector for different deployment environments (development, staging, production) with a focus on blockchain configuration for Base L2 (EVM).
 
 **Why Environment Separation Matters:**
 
@@ -65,37 +65,30 @@ docker-compose logs connector-a | grep "⚠️"
 ⚠️  This is NOT production configuration
 ⚠️  Base RPC: http://anvil:8545
 ⚠️  Base Chain ID: 84532
-⚠️  XRPL RPC: http://rippled:5005
-⚠️  XRPL Network: standalone
 ```
 
 **Production mode:** No warning logs (validation passes silently).
 
 ## Development Configuration
 
-Development configuration uses **local blockchain nodes** running in Docker containers (Anvil for Base L2, rippled standalone for XRPL). This enables fast iteration without relying on public testnets or consuming mainnet resources.
+Development configuration uses **local blockchain nodes** running in Docker containers (Anvil for Base L2). This enables fast iteration without relying on public testnets or consuming mainnet resources.
 
 ### Default Blockchain Endpoints
 
-| Blockchain | Service | Endpoint              | Network           | Notes     |
-| ---------- | ------- | --------------------- | ----------------- | --------- |
-| Base L2    | Anvil   | `http://anvil:8545`   | Base Sepolia fork | Story 7.1 |
-| XRPL       | rippled | `http://rippled:5005` | Standalone mode   | Story 7.2 |
+| Blockchain | Service | Endpoint            | Network           | Notes     |
+| ---------- | ------- | ------------------- | ----------------- | --------- |
+| Base L2    | Anvil   | `http://anvil:8545` | Base Sepolia fork | Story 7.1 |
 
 ### Environment Variable Reference (Development)
 
-| Variable                | Default               | Description               | Required          |
-| ----------------------- | --------------------- | ------------------------- | ----------------- |
-| `ENVIRONMENT`           | `development`         | Environment selector      | Yes               |
-| `BASE_ENABLED`          | `true`                | Enable Base blockchain    | Yes               |
-| `BASE_RPC_URL`          | `http://anvil:8545`   | Base RPC endpoint         | No (uses default) |
-| `BASE_CHAIN_ID`         | `84532`               | Base Sepolia chain ID     | No (uses default) |
-| `BASE_PRIVATE_KEY`      | (Anvil Account #0)    | Private key for contracts | No (for Epic 8+)  |
-| `BASE_REGISTRY_ADDRESS` | (empty)               | Payment channel registry  | No (for Epic 8)   |
-| `XRPL_ENABLED`          | `true`                | Enable XRPL blockchain    | Yes               |
-| `XRPL_RPC_URL`          | `http://rippled:5005` | XRPL RPC endpoint         | No (uses default) |
-| `XRPL_NETWORK`          | `standalone`          | XRPL network type         | No (uses default) |
-| `XRPL_PRIVATE_KEY`      | (empty)               | Private key for channels  | No (for Epic 9)   |
+| Variable                | Default             | Description               | Required          |
+| ----------------------- | ------------------- | ------------------------- | ----------------- |
+| `ENVIRONMENT`           | `development`       | Environment selector      | Yes               |
+| `BASE_ENABLED`          | `true`              | Enable Base blockchain    | Yes               |
+| `BASE_RPC_URL`          | `http://anvil:8545` | Base RPC endpoint         | No (uses default) |
+| `BASE_CHAIN_ID`         | `84532`             | Base Sepolia chain ID     | No (uses default) |
+| `BASE_PRIVATE_KEY`      | (Anvil Account #0)  | Private key for contracts | No (for Epic 8+)  |
+| `BASE_REGISTRY_ADDRESS` | (empty)             | Payment channel registry  | No (for Epic 8)   |
 
 ### Quick Start: Development Setup
 
@@ -118,9 +111,6 @@ make dev-up
 docker-compose logs anvil | grep "Listening"
 # Expected: Listening on http://0.0.0.0:8545
 
-# Check rippled (XRPL)
-docker-compose logs rippled | grep "standalone"
-# Expected: Running in standalone mode
 ```
 
 **Step 4:** Verify connector blockchain configuration
@@ -134,14 +124,13 @@ docker-compose logs connector-a | grep "⚠️"
 
 ## Production Configuration
 
-Production configuration uses **public mainnet RPC endpoints** for Base L2 and XRPL. Production environment enforces strict validation rules to prevent misconfiguration.
+Production configuration uses **public mainnet RPC endpoints** for Base L2. Production environment enforces strict validation rules to prevent misconfiguration.
 
 ### Default Blockchain Endpoints
 
-| Blockchain | Service        | Endpoint                   | Network      | Notes                      |
-| ---------- | -------------- | -------------------------- | ------------ | -------------------------- |
-| Base L2    | Public RPC     | `https://mainnet.base.org` | Base mainnet | Free, may have rate limits |
-| XRPL       | Public cluster | `https://xrplcluster.com`  | XRPL Mainnet | Free public cluster        |
+| Blockchain | Service    | Endpoint                   | Network      | Notes                      |
+| ---------- | ---------- | -------------------------- | ------------ | -------------------------- |
+| Base L2    | Public RPC | `https://mainnet.base.org` | Base mainnet | Free, may have rate limits |
 
 **Recommended Production RPC Providers:**
 
@@ -159,10 +148,6 @@ Production configuration uses **public mainnet RPC endpoints** for Base L2 and X
 | `BASE_CHAIN_ID`         | `8453`                     | Base mainnet chain ID     | No (default) | **Must be 8453**                   |
 | `BASE_PRIVATE_KEY`      | (empty)                    | Private key for contracts | **Yes**      | **From KMS/HSM only**              |
 | `BASE_REGISTRY_ADDRESS` | (empty)                    | Payment channel registry  | **Yes**      | Deployed contract address          |
-| `XRPL_ENABLED`          | `true`                     | Enable XRPL blockchain    | Yes          |                                    |
-| `XRPL_RPC_URL`          | `https://xrplcluster.com`  | XRPL RPC endpoint         | No (default) | Consider dedicated endpoint        |
-| `XRPL_NETWORK`          | `mainnet`                  | XRPL network type         | No (default) | **Must be 'mainnet'**              |
-| `XRPL_PRIVATE_KEY`      | (empty)                    | Private key for channels  | **Yes**      | **From KMS/HSM only**              |
 
 ### Security Best Practices
 
@@ -240,14 +225,13 @@ BASE_RPC_URL=https://base-mainnet.g.alchemy.com/v2/YOUR_API_KEY
 
 ## Staging Environment
 
-Staging environment uses **public testnets** (Base Sepolia, XRPL Testnet) for final validation before mainnet deployment.
+Staging environment uses **public testnets** (Base Sepolia) for final validation before mainnet deployment.
 
 ### Default Blockchain Endpoints
 
-| Blockchain | Service        | Endpoint                                | Network              |
-| ---------- | -------------- | --------------------------------------- | -------------------- |
-| Base L2    | Public testnet | `https://sepolia.base.org`              | Base Sepolia testnet |
-| XRPL       | Public testnet | `https://s.altnet.rippletest.net:51234` | XRPL Testnet         |
+| Blockchain | Service        | Endpoint                   | Network              |
+| ---------- | -------------- | -------------------------- | -------------------- |
+| Base L2    | Public testnet | `https://sepolia.base.org` | Base Sepolia testnet |
 
 ### Environment Variables (Staging)
 
@@ -262,11 +246,6 @@ BASE_CHAIN_ID=84532  # Base Sepolia
 BASE_PRIVATE_KEY=  # Test private key (NOT production key)
 BASE_REGISTRY_ADDRESS=  # Deployed on Base Sepolia
 
-# XRPL Staging Configuration
-XRPL_ENABLED=true
-XRPL_RPC_URL=https://s.altnet.rippletest.net:51234
-XRPL_NETWORK=testnet
-XRPL_PRIVATE_KEY=  # Test private key (NOT production key)
 ```
 
 ### What to Validate in Staging
@@ -279,13 +258,11 @@ XRPL_PRIVATE_KEY=  # Test private key (NOT production key)
    - Test contract interactions (create channel, settle, close)
 
 2. **Payment channel creation/settlement workflows**
-   - Create XRPL payment channel on testnet
    - Test channel funding, claims, and settlement
    - Verify payment channel state transitions
 
 3. **Integration with real testnet faucets**
    - Use Base Sepolia faucet for ETH
-   - Use XRPL Testnet faucet for XRP
    - Verify transactions with real testnet validators (not local genesis accounts)
 
 4. **RPC endpoint reliability**
@@ -311,7 +288,6 @@ cp .env.production.example .env.production
 # CRITICAL: Use secure keys from KMS/HSM
 BASE_PRIVATE_KEY=  # Generate with: openssl rand -hex 32
 BASE_REGISTRY_ADDRESS=  # Deployed contract address
-XRPL_PRIVATE_KEY=  # XRPL seed format (starts with 's')
 ```
 
 **Step 3:** Set ENVIRONMENT=production
@@ -382,7 +358,7 @@ docker-compose logs connector-a | head -50
 ConfigurationError: Cannot use development private key in production. Use secure key from KMS/HSM.
 ```
 
-**Problem:** `BASE_PRIVATE_KEY` or `XRPL_PRIVATE_KEY` matches known Anvil development key:
+**Problem:** `BASE_PRIVATE_KEY` matches known Anvil development key:
 
 ```
 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
@@ -398,8 +374,6 @@ openssl rand -hex 32
 # Prefix with 0x for Ethereum format
 BASE_PRIVATE_KEY=0xa3c5f9e8d7b6a1...
 ```
-
-**For XRPL:** Use offline XRPL account generation tools or hardware wallet.
 
 #### Pitfall 2: Chain ID Mismatch
 
@@ -435,18 +409,16 @@ BASE_CHAIN_ID=8453
 ConfigurationError: Cannot use localhost RPC in production. Use public mainnet endpoint.
 ```
 
-**Problem:** `ENVIRONMENT=production` but `BASE_RPC_URL` or `XRPL_RPC_URL` contains `localhost` or `127.0.0.1`
+**Problem:** `ENVIRONMENT=production` but `BASE_RPC_URL` contains `localhost` or `127.0.0.1`
 
 **Solution:** Update RPC URLs to public mainnet endpoints
 
 ```bash
 # Incorrect (development config)
 BASE_RPC_URL=http://localhost:8545
-XRPL_RPC_URL=http://127.0.0.1:5005
 
 # Correct (production config)
 BASE_RPC_URL=https://mainnet.base.org
-XRPL_RPC_URL=https://xrplcluster.com
 ```
 
 #### Pitfall 4: Forgetting to Update ENVIRONMENT Variable
@@ -484,7 +456,7 @@ ConfigurationError: Cannot use development private key in production. Use secure
 
 **Symptom:** Connector exits during startup validation
 
-**Problem:** `BASE_PRIVATE_KEY` or `XRPL_PRIVATE_KEY` matches known development key from Anvil Account #0:
+**Problem:** `BASE_PRIVATE_KEY` matches known development key from Anvil Account #0:
 
 ```
 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
@@ -596,11 +568,9 @@ ConfigurationError: Cannot use localhost RPC in production. Use public mainnet e
 ```bash
 # Incorrect (development)
 BASE_RPC_URL=http://localhost:8545
-XRPL_RPC_URL=http://127.0.0.1:5005
 
 # Correct (production)
 BASE_RPC_URL=https://mainnet.base.org
-XRPL_RPC_URL=https://xrplcluster.com
 ```
 
 2. **Restart connector:**
@@ -670,24 +640,19 @@ docker-compose up -d
 
 ### Complete Environment Variable List
 
-| Variable                | Development Default   | Staging Default                         | Production Default         | Description            |
-| ----------------------- | --------------------- | --------------------------------------- | -------------------------- | ---------------------- |
-| `ENVIRONMENT`           | `development`         | `staging`                               | `production`               | Environment selector   |
-| `BASE_ENABLED`          | `true`                | `true`                                  | `true`                     | Enable Base blockchain |
-| `BASE_RPC_URL`          | `http://anvil:8545`   | `https://sepolia.base.org`              | `https://mainnet.base.org` | Base RPC endpoint      |
-| `BASE_CHAIN_ID`         | `84532`               | `84532`                                 | `8453`                     | Base chain ID          |
-| `BASE_PRIVATE_KEY`      | (Anvil #0)            | (test key)                              | (from KMS)                 | Private key            |
-| `BASE_REGISTRY_ADDRESS` | (empty)               | (test deploy)                           | (prod deploy)              | Contract address       |
-| `XRPL_ENABLED`          | `true`                | `true`                                  | `true`                     | Enable XRPL            |
-| `XRPL_RPC_URL`          | `http://rippled:5005` | `https://s.altnet.rippletest.net:51234` | `https://xrplcluster.com`  | XRPL RPC endpoint      |
-| `XRPL_NETWORK`          | `standalone`          | `testnet`                               | `mainnet`                  | XRPL network type      |
-| `XRPL_PRIVATE_KEY`      | (empty)               | (test key)                              | (from KMS)                 | Private key            |
+| Variable                | Development Default | Staging Default            | Production Default         | Description            |
+| ----------------------- | ------------------- | -------------------------- | -------------------------- | ---------------------- |
+| `ENVIRONMENT`           | `development`       | `staging`                  | `production`               | Environment selector   |
+| `BASE_ENABLED`          | `true`              | `true`                     | `true`                     | Enable Base blockchain |
+| `BASE_RPC_URL`          | `http://anvil:8545` | `https://sepolia.base.org` | `https://mainnet.base.org` | Base RPC endpoint      |
+| `BASE_CHAIN_ID`         | `84532`             | `84532`                    | `8453`                     | Base chain ID          |
+| `BASE_PRIVATE_KEY`      | (Anvil #0)          | (test key)                 | (from KMS)                 | Private key            |
+| `BASE_REGISTRY_ADDRESS` | (empty)             | (test deploy)              | (prod deploy)              | Contract address       |
 
 ## Related Documentation
 
-- **[Local Blockchain Development Guide](./local-blockchain-development.md):** Detailed setup instructions for Anvil and rippled local nodes
+- **[Local Blockchain Development Guide](./local-blockchain-development.md):** Detailed setup instructions for Anvil local node
 - **[Story 7.1: Anvil Docker Service](../../docs/stories/7.1.story.md):** Base L2 local development infrastructure
-- **[Story 7.2: rippled Standalone](../../docs/stories/7.2.story.md):** XRPL local development infrastructure
 - **[Story 7.3: Docker Compose Integration](../../docs/stories/7.3.story.md):** Full dev stack orchestration
 
 ## Additional Resources
@@ -695,7 +660,6 @@ docker-compose up -d
 ### External Documentation
 
 - **[Base Network Documentation](https://docs.base.org/):** Official Base L2 documentation
-- **[XRPL Documentation](https://xrpl.org/):** Official XRP Ledger documentation
 - **[Alchemy Quickstart](https://www.alchemy.com/overviews/base-rpc):** Base mainnet RPC provider
 - **[Infura Base Support](https://docs.infura.io/networks/base):** Base mainnet RPC provider
 

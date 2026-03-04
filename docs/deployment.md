@@ -36,12 +36,6 @@ KEY_BACKEND=env
 
 # EVM private key (hex format)
 EVM_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-
-# XRP seed (optional, for XRP settlement)
-XRP_SEED=sEdTM1JVyAnDtG7pKF4AeTJrWLWr9oF
-
-# Aptos private key (optional, for Aptos settlement)
-APTOS_PRIVATE_KEY=0x...
 ```
 
 **Production (KMS required):**
@@ -76,11 +70,9 @@ NETWORK_MODE=testnet
 
 **Network Mode URL Mappings:**
 
-| Chain   | Testnet                                     | Mainnet                                     |
-| ------- | ------------------------------------------- | ------------------------------------------- |
-| Base L2 | `https://sepolia.base.org`                  | `https://mainnet.base.org`                  |
-| XRP     | `wss://s.altnet.rippletest.net:51233`       | `wss://xrplcluster.com`                     |
-| Aptos   | `https://fullnode.testnet.aptoslabs.com/v1` | `https://fullnode.mainnet.aptoslabs.com/v1` |
+| Chain   | Testnet                    | Mainnet                    |
+| ------- | -------------------------- | -------------------------- |
+| Base L2 | `https://sepolia.base.org` | `https://mainnet.base.org` |
 
 **Using the deploy script (recommended):**
 
@@ -120,15 +112,7 @@ npx hardhat run scripts/deploy-token.ts --network base-sepolia
 npx hardhat run scripts/deploy-registry.ts --network base-sepolia
 ```
 
-### 5. Configure Custom Token (Aptos)
-
-```env
-APTOS_MODULE_ADDRESS=0xYourModuleAddress
-APTOS_ADDRESS=0xYourAptosAddress
-APTOS_PRIVATE_KEY=0xYourPrivateKey
-```
-
-### 6. Start Services
+### 5. Start Services
 
 ```bash
 # Single connector
@@ -141,7 +125,7 @@ docker-compose -f docker-compose-5-peer-multihop.yml up -d --build
 docker-compose logs -f
 ```
 
-### 7. Verify Deployment
+### 6. Verify Deployment
 
 ```bash
 # Check health
@@ -174,9 +158,7 @@ kubectl -n tigerbeetle get pods
 
 ```bash
 kubectl -n agent-runtime create secret generic connector-secrets \
-  --from-literal=EVM_PRIVATE_KEY=0xYourPrivateKey \
-  --from-literal=XRP_SEED=sYourXRPSeed \
-  --from-literal=APTOS_PRIVATE_KEY=0xYourAptosKey
+  --from-literal=EVM_PRIVATE_KEY=0xYourPrivateKey
 ```
 
 **Option B: Sealed Secrets (production):**
@@ -210,10 +192,10 @@ spec:
 
 ### 4. Choose Network (Testnet vs Mainnet)
 
-| Overlay      | Network Mode | Networks                                 |
-| ------------ | ------------ | ---------------------------------------- |
-| `staging`    | **Testnet**  | Base Sepolia, XRP Testnet, Aptos Testnet |
-| `production` | **Mainnet**  | Base Mainnet, XRP Mainnet, Aptos Mainnet |
+| Overlay      | Network Mode | Networks     |
+| ------------ | ------------ | ------------ |
+| `staging`    | **Testnet**  | Base Sepolia |
+| `production` | **Mainnet**  | Base Mainnet |
 
 ```bash
 # Testnet
@@ -244,21 +226,19 @@ kubectl -n agent-runtime port-forward svc/connector 5173:5173
 
 ### Core Settings
 
-| Variable                | Description                           | Default     |
-| ----------------------- | ------------------------------------- | ----------- |
-| `NODE_ID`               | Unique connector identifier           | `connector` |
-| `LOG_LEVEL`             | Logging level                         | `info`      |
-| `SETTLEMENT_PREFERENCE` | Settlement chain (evm/xrp/aptos/both) | `evm`       |
-| `NETWORK_MODE`          | Network selection (testnet/mainnet)   | `testnet`   |
+| Variable                | Description                         | Default     |
+| ----------------------- | ----------------------------------- | ----------- |
+| `NODE_ID`               | Unique connector identifier         | `connector` |
+| `LOG_LEVEL`             | Logging level                       | `info`      |
+| `SETTLEMENT_PREFERENCE` | Settlement chain                    | `evm`       |
+| `NETWORK_MODE`          | Network selection (testnet/mainnet) | `testnet`   |
 
 ### Key Management
 
-| Variable            | Description            | Values                                        |
-| ------------------- | ---------------------- | --------------------------------------------- |
-| `KEY_BACKEND`       | Secret storage backend | `env`, `aws-kms`, `gcp-kms`, `azure-keyvault` |
-| `EVM_PRIVATE_KEY`   | EVM signing key        | `0x...`                                       |
-| `XRP_SEED`          | XRP seed               | `s...`                                        |
-| `APTOS_PRIVATE_KEY` | Aptos signing key      | `0x...`                                       |
+| Variable          | Description            | Values                                        |
+| ----------------- | ---------------------- | --------------------------------------------- |
+| `KEY_BACKEND`     | Secret storage backend | `env`, `aws-kms`, `gcp-kms`, `azure-keyvault` |
+| `EVM_PRIVATE_KEY` | EVM signing key        | `0x...`                                       |
 
 ### Settlement
 

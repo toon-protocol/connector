@@ -522,12 +522,11 @@ git push --force
 
 #### Required Ports
 
-| Port  | Protocol | Direction | Purpose        | Restriction              |
-| ----- | -------- | --------- | -------------- | ------------------------ |
-| 4000  | TCP      | Inbound   | BTP WebSocket  | Peer IPs only            |
-| 8080  | TCP      | Inbound   | Health/Metrics | Internal/Monitoring only |
-| 443   | TCP      | Outbound  | Blockchain RPC | Allow                    |
-| 51233 | TCP      | Outbound  | XRP Ledger WSS | Allow                    |
+| Port | Protocol | Direction | Purpose        | Restriction              |
+| ---- | -------- | --------- | -------------- | ------------------------ |
+| 4000 | TCP      | Inbound   | BTP WebSocket  | Peer IPs only            |
+| 8080 | TCP      | Inbound   | Health/Metrics | Internal/Monitoring only |
+| 443  | TCP      | Outbound  | Blockchain RPC | Allow                    |
 
 #### UFW (Ubuntu Firewall)
 
@@ -798,7 +797,6 @@ volumes:
 KEY_BACKEND=aws-kms
 AWS_REGION=us-east-1
 AWS_KMS_EVM_KEY_ID=arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012
-AWS_KMS_XRP_KEY_ID=arn:aws:kms:us-east-1:123456789012:key/87654321-4321-4321-4321-210987654321
 ```
 
 **IAM Policy for Connector:**
@@ -824,7 +822,6 @@ AWS_KMS_XRP_KEY_ID=arn:aws:kms:us-east-1:123456789012:key/87654321-4321-4321-432
 ```bash
 # Enable automatic key rotation (annually)
 aws kms enable-key-rotation --key-id $AWS_KMS_EVM_KEY_ID
-aws kms enable-key-rotation --key-id $AWS_KMS_XRP_KEY_ID
 
 # Verify rotation status
 aws kms get-key-rotation-status --key-id $AWS_KMS_EVM_KEY_ID
@@ -839,7 +836,6 @@ GCP_PROJECT_ID=my-project
 GCP_LOCATION_ID=us-east1
 GCP_KEY_RING_ID=connector-keyring
 GCP_KMS_EVM_KEY_ID=evm-signing-key
-GCP_KMS_XRP_KEY_ID=xrp-signing-key
 ```
 
 **Setup Commands:**
@@ -857,13 +853,6 @@ gcloud kms keys create evm-signing-key \
   --purpose=asymmetric-signing \
   --default-algorithm=ec-sign-secp256k1-sha256
 
-# Create XRP signing key (ed25519)
-gcloud kms keys create xrp-signing-key \
-  --keyring=connector-keyring \
-  --location=us-east1 \
-  --purpose=asymmetric-signing \
-  --default-algorithm=ec-sign-ed25519
-
 # Set up rotation (30 days)
 gcloud kms keys update evm-signing-key \
   --keyring=connector-keyring \
@@ -879,7 +868,6 @@ gcloud kms keys update evm-signing-key \
 KEY_BACKEND=azure-kv
 AZURE_VAULT_URL=https://agent-runtime-vault.vault.azure.net
 AZURE_EVM_KEY_NAME=evm-signing-key
-AZURE_XRP_KEY_NAME=xrp-signing-key
 AZURE_TENANT_ID=00000000-0000-0000-0000-000000000000
 AZURE_CLIENT_ID=00000000-0000-0000-0000-000000000000
 ```
@@ -900,13 +888,6 @@ az keyvault key create \
   --name evm-signing-key \
   --kty EC \
   --curve P-256K
-
-# Create XRP signing key
-az keyvault key create \
-  --vault-name agent-runtime-vault \
-  --name xrp-signing-key \
-  --kty EC \
-  --curve Ed25519
 
 # Set up rotation policy
 az keyvault key rotation-policy update \

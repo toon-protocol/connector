@@ -94,15 +94,13 @@ IMAGE_NAME=your-org/agent-runtime ./scripts/rollback.sh v1.2.0
 
 ### Environment Variables
 
-| Variable                | Required | Description                      |
-| ----------------------- | -------- | -------------------------------- |
-| `NODE_ID`               | Yes      | Unique connector identifier      |
-| `SETTLEMENT_PREFERENCE` | Yes      | `evm`, `xrp`, or `both`          |
-| `KEY_BACKEND`           | Yes      | `aws-kms`, `gcp-kms`, `azure-kv` |
-| `BASE_RPC_URL`          | EVM      | Base L2 RPC endpoint             |
-| `XRPL_WSS_URL`          | XRP      | XRP Ledger WebSocket             |
-| `PROMETHEUS_ENABLED`    | No       | Enable metrics (default: true)   |
-| `OTEL_ENABLED`          | No       | Enable tracing (default: false)  |
+| Variable             | Required | Description                      |
+| -------------------- | -------- | -------------------------------- |
+| `NODE_ID`            | Yes      | Unique connector identifier      |
+| `KEY_BACKEND`        | Yes      | `aws-kms`, `gcp-kms`, `azure-kv` |
+| `BASE_RPC_URL`       | Yes      | Base L2 RPC endpoint             |
+| `PROMETHEUS_ENABLED` | No       | Enable metrics (default: true)   |
+| `OTEL_ENABLED`       | No       | Enable tracing (default: false)  |
 
 ### Health Status Codes
 

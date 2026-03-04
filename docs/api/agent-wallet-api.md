@@ -28,7 +28,7 @@ import { AgentWalletLifecycle } from '@crosstown/connector/wallet/agent-wallet-l
 
 #### `createAgentWallet(agentId: string): Promise<WalletLifecycleRecord>`
 
-Creates a new agent wallet with unique EVM and XRP addresses. Automatically triggers funding process.
+Creates a new agent wallet with a unique EVM address. Automatically triggers funding process.
 
 **Parameters:**
 
@@ -54,7 +54,6 @@ try {
   logger.info('Wallet created', {
     agentId: wallet.agentId,
     evmAddress: wallet.evmAddress,
-    xrpAddress: wallet.xrpAddress,
     status: wallet.status,
   });
 } catch (error) {
@@ -69,7 +68,6 @@ try {
 {
   agentId: 'agent-001',
   evmAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
-  xrpAddress: 'rN7n7otQDd6FczFgLdlqtyMVrXqHr7XEEw',
   derivationIndex: 0,
   createdAt: Date,
   status: 'pending', // Will transition to 'active' after funding
@@ -186,10 +184,9 @@ logger.info('Wallet archived', {
   id: 'archive-001',
   agentId: 'agent-001',
   evmAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
-  xrpAddress: 'rN7n7otQDd6FczFgLdlqtyMVrXqHr7XEEw',
   finalBalances: [
     { chain: 'evm', token: 'ETH', balance: '0' },
-    { chain: 'xrp', token: 'XRP', balance: '10000000' }
+    { chain: 'evm', token: 'USDC', balance: '1000000' }
   ],
   archivedAt: Date,
   reason: 'Inactivity > 90 days'
@@ -220,7 +217,7 @@ Derives a new wallet for an agent using HD derivation.
 
 **Returns:**
 
-- `Promise<AgentWallet>`: Derived wallet with EVM and XRP addresses
+- `Promise<AgentWallet>`: Derived wallet with EVM address
 
 **Throws:**
 
@@ -228,10 +225,9 @@ Derives a new wallet for an agent using HD derivation.
 - `Error('master-seed not found')`: If master seed not initialized
 - `Error('Invalid derivation index')`: If derivation index out of range (0 to 2^31-1)
 
-**Derivation Paths:**
+**Derivation Path:**
 
 - EVM: `m/44'/60'/1'/0/{agentIndex}`
-- XRP: `m/44'/144'/1'/0/{agentIndex}`
 
 **Example:**
 
@@ -243,7 +239,6 @@ const wallet = await derivation.deriveAgentWallet('agent-001');
 logger.info('Wallet derived', {
   agentId: wallet.agentId,
   evmAddress: wallet.evmAddress,
-  xrpAddress: wallet.xrpAddress,
   derivationIndex: wallet.derivationIndex,
 });
 ```
@@ -270,50 +265,37 @@ const wallet = await derivation.getAgentWallet('agent-001');
 if (wallet) {
   logger.info('Wallet exists', {
     evmAddress: wallet.evmAddress,
-    xrpAddress: wallet.xrpAddress,
   });
 }
 ```
 
 ---
 
-#### `getAgentSigner(agentId: string, chain: 'evm' | 'xrp'): Promise<Wallet | XRPLWallet>`
+#### `getAgentSigner(agentId: string): Promise<Wallet>`
 
-Gets a signer instance for transaction signing.
+Gets a signer instance for EVM transaction signing.
 
 **Parameters:**
 
 - `agentId` (string, required): Agent identifier
-- `chain` ('evm' | 'xrp', required): Blockchain chain
 
 **Returns:**
 
-- `Promise<Wallet>`: ethers.js Wallet instance (if chain === 'evm')
-- `Promise<XRPLWallet>`: xrpl.js Wallet instance (if chain === 'xrp')
+- `Promise<Wallet>`: ethers.js Wallet instance
 
 **Throws:**
 
 - `Error('Wallet not found')`: If agent wallet doesn't exist
-- `Error('Invalid chain')`: If chain is not 'evm' or 'xrp'
 
 **Example:**
 
 ```typescript
 // Get EVM signer for transaction signing
-const evmSigner = await derivation.getAgentSigner('agent-001', 'evm');
+const evmSigner = await derivation.getAgentSigner('agent-001');
 const tx = await evmSigner.sendTransaction({
   to: '0x...',
   value: ethers.parseEther('0.1'),
 });
-
-// Get XRP signer
-const xrpSigner = await derivation.getAgentSigner('agent-001', 'xrp');
-const payment = {
-  TransactionType: 'Payment',
-  Account: xrpSigner.address,
-  Destination: 'rN7n7otQDd6FczFgLdlqtyMVrXqHr7XEEw',
-  Amount: '10000000',
-};
 ```
 
 **Security Note:** Signers provide access to private keys. Never expose signers in API responses or logs.
@@ -348,7 +330,6 @@ logger.info('Batch derivation complete', {
   wallets: wallets.map((w) => ({
     agentId: w.agentId,
     evmAddress: w.evmAddress,
-    xrpAddress: w.xrpAddress,
   })),
 });
 ```
@@ -367,26 +348,23 @@ import { AgentBalanceTracker } from '@crosstown/connector/wallet/agent-balance-t
 
 ### Methods
 
-#### `getBalance(agentId: string, chain: 'evm' | 'xrp', token: string): Promise<bigint>`
+#### `getBalance(agentId: string, token: string): Promise<bigint>`
 
-Gets the current balance for a specific chain and token.
+Gets the current balance for a specific token.
 
 **Parameters:**
 
 - `agentId` (string, required): Agent identifier
-- `chain` ('evm' | 'xrp', required): Blockchain chain
 - `token` (string, required): Token identifier
-  - For EVM: `'ETH'` or ERC20 contract address (e.g., `'0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'` for USDC)
-  - For XRP: `'XRP'`
+  - `'ETH'` or ERC20 contract address (e.g., `'0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'` for USDC)
 
 **Returns:**
 
-- `Promise<bigint>`: Balance in smallest unit (wei for ETH, drops for XRP, token decimals)
+- `Promise<bigint>`: Balance in smallest unit (wei for ETH, token decimals for ERC20)
 
 **Throws:**
 
 - `Error('Wallet not found')`: If agent wallet doesn't exist
-- `Error('Invalid chain')`: If chain is not 'evm' or 'xrp'
 - `Error('Unsupported token')`: If token not configured
 
 **Example:**
@@ -395,20 +373,15 @@ Gets the current balance for a specific chain and token.
 const balanceTracker = new AgentBalanceTracker();
 
 // Get ETH balance (18 decimals)
-const ethBalance = await balanceTracker.getBalance('agent-001', 'evm', 'ETH');
+const ethBalance = await balanceTracker.getBalance('agent-001', 'ETH');
 logger.info('ETH balance', { balance: ethBalance.toString() }); // '100000000000000000' = 0.1 ETH
 
 // Get USDC balance (6 decimals)
 const usdcBalance = await balanceTracker.getBalance(
   'agent-001',
-  'evm',
   '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
 );
 logger.info('USDC balance', { balance: usdcBalance.toString() }); // '1000000000' = 1000 USDC
-
-// Get XRP balance (6 decimals)
-const xrpBalance = await balanceTracker.getBalance('agent-001', 'xrp', 'XRP');
-logger.info('XRP balance', { balance: xrpBalance.toString() }); // '15000000' = 15 XRP
 ```
 
 ---
@@ -465,14 +438,6 @@ balances.forEach((balance) => {
     decimals: 6,
     lastUpdated: Date,
   },
-  {
-    agentId: 'agent-001',
-    chain: 'xrp',
-    token: 'XRP',
-    balance: 15000000n,
-    decimals: 6,
-    lastUpdated: Date,
-  },
 ];
 ```
 
@@ -492,18 +457,15 @@ import { AgentChannelManager } from '@crosstown/connector/wallet/agent-channel-m
 
 ### Methods
 
-#### `openChannel(agentId: string, peerId: string, chain: 'evm' | 'xrp', token: string, amount: bigint): Promise<string>`
+#### `openChannel(agentId: string, peerId: string, token: string, amount: bigint): Promise<string>`
 
-Opens a new payment channel with a peer agent.
+Opens a new payment channel with a peer agent on Base L2.
 
 **Parameters:**
 
 - `agentId` (string, required): Your agent identifier
 - `peerId` (string, required): Peer agent identifier
-- `chain` ('evm' | 'xrp', required): Blockchain chain for channel
-- `token` (string, required): Token for channel payments
-  - For EVM: `'ETH'`, `'USDC'`, or ERC20 contract address
-  - For XRP: `'XRP'`
+- `token` (string, required): Token for channel payments (`'ETH'`, `'USDC'`, or ERC20 contract address)
 - `amount` (bigint, required): Channel funding amount (in smallest unit)
 
 **Returns:**
@@ -641,7 +603,6 @@ logger.info('Channel closed', {
 **Settlement Time:**
 
 - EVM: ~15 seconds (Base L2 block time)
-- XRP: ~4 seconds (XRP Ledger block time)
 
 ---
 
@@ -692,19 +653,6 @@ channels.forEach((channel) => {
     initialAmount: 1000000000n, // Started with: 1000 USDC
     paymentsCount: 10,
     status: 'open', // 'open' | 'closing' | 'closed'
-    openedAt: Date,
-    lastPaymentAt: Date,
-  },
-  {
-    id: 'channel-xrp-002',
-    agentId: 'agent-001',
-    peerId: 'peer-agent-003',
-    chain: 'xrp',
-    token: 'XRP',
-    balance: 45000000n, // Remaining: 45 XRP
-    initialAmount: 50000000n,
-    paymentsCount: 5,
-    status: 'open',
     openedAt: Date,
     lastPaymentAt: Date,
   },
@@ -773,7 +721,6 @@ await writeFile('backup-2026-01-21.enc', JSON.stringify(backup));
     {
       agentId: 'agent-001',
       evmAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
-      xrpAddress: 'rN7n7otQDd6FczFgLdlqtyMVrXqHr7XEEw',
       derivationIndex: 0,
       createdAt: Date,
       lastActive: Date,
@@ -855,7 +802,6 @@ Core type definitions for agent wallet APIs.
 interface AgentWallet {
   agentId: string; // Unique agent identifier
   evmAddress: string; // EVM address (0x-prefixed, 42 chars)
-  xrpAddress: string; // XRP address (r-prefixed, 25-35 chars)
   derivationIndex: number; // HD wallet derivation index (0 to 2^31-1)
   createdAt: Date; // Wallet creation timestamp
   status: WalletStatus; // Wallet lifecycle status
@@ -875,7 +821,7 @@ interface WalletLifecycleRecord extends AgentWallet {
 }
 
 interface FundingTransaction {
-  chain: 'evm' | 'xrp';
+  chain: 'evm';
   token: string;
   amount: bigint;
   txHash: string;
@@ -888,10 +834,10 @@ interface FundingTransaction {
 ```typescript
 interface AgentBalance {
   agentId: string;
-  chain: 'evm' | 'xrp';
-  token: string; // 'ETH', ERC20 address, or 'XRP'
+  chain: 'evm';
+  token: string; // 'ETH' or ERC20 address
   balance: bigint; // Balance in smallest unit
-  decimals: number; // Token decimals (18 for ETH, 6 for USDC/XRP)
+  decimals: number; // Token decimals (18 for ETH, 6 for USDC)
   lastUpdated: Date; // Last balance update timestamp
 }
 ```
@@ -903,7 +849,7 @@ interface AgentChannel {
   id: string; // Unique channel identifier
   agentId: string; // Your agent ID
   peerId: string; // Peer agent ID
-  chain: 'evm' | 'xrp'; // Blockchain chain
+  chain: 'evm'; // Blockchain chain (Base L2)
   token: string; // Token for payments
   balance: bigint; // Remaining channel balance
   initialAmount: bigint; // Initial channel funding
@@ -924,7 +870,6 @@ interface WalletArchive {
   id: string; // Archive record ID
   agentId: string;
   evmAddress: string;
-  xrpAddress: string;
   finalBalances: AgentBalance[]; // Balances at archival time
   archivedAt: Date;
   reason: string; // Archival reason (e.g., 'Inactivity')
@@ -946,7 +891,6 @@ interface WalletBackup {
 interface WalletBackupEntry {
   agentId: string;
   evmAddress: string;
-  xrpAddress: string;
   derivationIndex: number;
   createdAt: Date;
   lastActive?: Date;
@@ -973,11 +917,11 @@ Standard error messages and meanings.
 
 ### Balance Tracking Errors
 
-| Error Message            | Meaning                            | Resolution                                        |
-| ------------------------ | ---------------------------------- | ------------------------------------------------- |
-| `Invalid chain`          | Chain parameter not 'evm' or 'xrp' | Use valid chain identifier                        |
-| `Unsupported token`      | Token not configured in system     | Add token configuration or use supported token    |
-| `Balance polling failed` | Unable to query on-chain balance   | Check RPC endpoint configuration and connectivity |
+| Error Message            | Meaning                          | Resolution                                        |
+| ------------------------ | -------------------------------- | ------------------------------------------------- |
+| `Invalid chain`          | Chain parameter not 'evm'        | Use valid chain identifier                        |
+| `Unsupported token`      | Token not configured in system   | Add token configuration or use supported token    |
+| `Balance polling failed` | Unable to query on-chain balance | Check RPC endpoint configuration and connectivity |
 
 ### Channel Management Errors
 
