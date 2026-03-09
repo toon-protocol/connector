@@ -29,7 +29,6 @@ describeIf('GCPKMSBackend', () => {
     locationId: 'us-east1',
     keyRingId: 'test-keyring',
     evmKeyId: 'evm-key',
-    xrpKeyId: 'xrp-key',
   };
 
   beforeEach(() => {
@@ -102,21 +101,6 @@ describeIf('GCPKMSBackend', () => {
 
       const callArgs = mockKMSClient.asymmetricSign.mock.calls[0][0];
       expect(callArgs.name).toContain(config.evmKeyId);
-    });
-
-    it('should detect XRP key type and use correct crypto key version name', async () => {
-      const message = Buffer.from('test-message');
-
-      mockKMSClient.asymmetricSign.mockResolvedValueOnce([
-        {
-          signature: new Uint8Array(Buffer.from('signature')),
-        },
-      ]);
-
-      await backend.sign(message, config.xrpKeyId);
-
-      const callArgs = mockKMSClient.asymmetricSign.mock.calls[0][0];
-      expect(callArgs.name).toContain(config.xrpKeyId);
     });
 
     it('should throw error if GCP KMS returns no signature', async () => {
@@ -230,20 +214,6 @@ TW9ja1B1YmxpY0tleURhdGE=
       );
     });
 
-    it('should rotate XRP key and return crypto key name', async () => {
-      const mockNewVersionName = `projects/${config.projectId}/locations/${config.locationId}/keyRings/${config.keyRingId}/cryptoKeys/${config.xrpKeyId}/cryptoKeyVersions/2`;
-
-      mockKMSClient.createCryptoKeyVersion.mockResolvedValueOnce([
-        {
-          name: mockNewVersionName,
-        },
-      ]);
-
-      const result = await backend.rotateKey(config.xrpKeyId);
-
-      expect(result).toBe(config.xrpKeyId);
-    });
-
     it('should throw error if GCP KMS returns no key version name', async () => {
       mockKMSClient.createCryptoKeyVersion.mockResolvedValueOnce([
         {
@@ -286,22 +256,6 @@ TW9ja1B1YmxpY0tleURhdGE=
 
       const callArgs = mockKMSClient.asymmetricSign.mock.calls[0][0];
       expect(callArgs.name).toContain(evmKeyId);
-    });
-
-    it('should detect XRP key from keyId containing "xrp"', async () => {
-      const xrpKeyId = 'my-xrp-signing-key';
-      const message = Buffer.from('test');
-
-      mockKMSClient.asymmetricSign.mockResolvedValueOnce([
-        {
-          signature: new Uint8Array(Buffer.from('sig')),
-        },
-      ]);
-
-      await backend.sign(message, xrpKeyId);
-
-      const callArgs = mockKMSClient.asymmetricSign.mock.calls[0][0];
-      expect(callArgs.name).toContain(xrpKeyId);
     });
   });
 });

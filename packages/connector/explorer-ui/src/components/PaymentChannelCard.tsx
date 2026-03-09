@@ -68,7 +68,6 @@ export const PaymentChannelCard = React.memo(function PaymentChannelCard({
   onClick,
 }: PaymentChannelCardProps) {
   const statusBadge = getStatusBadge(channel.status);
-  const isXrp = channel.settlementMethod === 'xrp';
   const lastActivityTs = new Date(channel.lastActivityAt).getTime();
 
   return (
@@ -84,9 +83,7 @@ export const PaymentChannelCard = React.memo(function PaymentChannelCard({
               {formatAddress(channel.channelId)}
             </span>
           </CardTitle>
-          <Badge className={`text-xs text-white ${isXrp ? 'bg-orange-500' : 'bg-emerald-500'}`}>
-            {isXrp ? 'XRP' : 'EVM'}
-          </Badge>
+          <Badge className="text-xs text-white bg-emerald-500">EVM</Badge>
         </div>
         <CardDescription className="flex items-center gap-2">
           <Badge className={`text-xs text-white ${statusBadge.className}`}>
@@ -118,22 +115,6 @@ export const PaymentChannelCard = React.memo(function PaymentChannelCard({
             <div className="font-mono text-blue-400">{formatBalance(channel.theirTransferred)}</div>
           </div>
         </div>
-
-        {/* XRP-specific fields */}
-        {isXrp && channel.xrpAmount && (
-          <div className="grid grid-cols-2 gap-2 text-xs">
-            <div>
-              <div className="text-muted-foreground">XRP Amount</div>
-              <div className="font-mono">{formatBalance(channel.xrpAmount)} drops</div>
-            </div>
-            {channel.xrpBalance && (
-              <div>
-                <div className="text-muted-foreground">XRP Claimed</div>
-                <div className="font-mono">{formatBalance(channel.xrpBalance)} drops</div>
-              </div>
-            )}
-          </div>
-        )}
 
         {/* Last Activity */}
         <div className="flex items-center gap-1 text-xs text-muted-foreground">

@@ -426,7 +426,7 @@ export class PrometheusExporter {
   /**
    * Update active channel count
    *
-   * @param method - Settlement method (xrp, evm)
+   * @param method - Settlement method (evm)
    * @param status - Channel status
    * @param count - Number of channels in this state
    */
@@ -477,14 +477,14 @@ export class PrometheusExporter {
    * Record a claim sent event for Prometheus metrics
    *
    * @param options - Claim metrics options
-   * @param options.blockchain - Blockchain type ('xrp', 'evm', 'aptos')
+   * @param options.blockchain - Blockchain type ('evm')
    * @param options.peerId - Peer identifier
    * @param options.success - Whether claim send was successful
    *
    * @example
    * ```typescript
    * exporter.recordClaimSent({
-   *   blockchain: 'xrp',
+   *   blockchain: 'evm',
    *   peerId: 'peer-bob',
    *   success: true
    * });
@@ -511,14 +511,14 @@ export class PrometheusExporter {
    * Record a claim received event for Prometheus metrics
    *
    * @param options - Claim metrics options
-   * @param options.blockchain - Blockchain type ('xrp', 'evm', 'aptos')
+   * @param options.blockchain - Blockchain type ('evm')
    * @param options.peerId - Peer identifier
    * @param options.verified - Whether claim was verified successfully
    *
    * @example
    * ```typescript
    * exporter.recordClaimReceived({
-   *   blockchain: 'xrp',
+   *   blockchain: 'evm',
    *   peerId: 'peer-alice',
    *   verified: true
    * });
@@ -548,7 +548,7 @@ export class PrometheusExporter {
    * Record a claim redeemed event for Prometheus metrics
    *
    * @param options - Claim metrics options
-   * @param options.blockchain - Blockchain type ('xrp', 'evm', 'aptos')
+   * @param options.blockchain - Blockchain type ('evm')
    * @param options.peerId - Peer identifier
    * @param options.success - Whether redemption was successful
    * @param options.latencyMs - Time from claim receipt to redemption in milliseconds (optional)
@@ -556,7 +556,7 @@ export class PrometheusExporter {
    * @example
    * ```typescript
    * exporter.recordClaimRedeemed({
-   *   blockchain: 'xrp',
+   *   blockchain: 'evm',
    *   peerId: 'peer-alice',
    *   success: true,
    *   latencyMs: 15000
@@ -594,14 +594,14 @@ export class PrometheusExporter {
    * Record a claim verification failure for Prometheus metrics
    *
    * @param options - Claim metrics options
-   * @param options.blockchain - Blockchain type ('xrp', 'evm', 'aptos')
+   * @param options.blockchain - Blockchain type ('evm')
    * @param options.peerId - Peer identifier
    * @param options.errorType - Error type ('invalid_signature', 'non_monotonic_nonce', 'unknown')
    *
    * @example
    * ```typescript
    * exporter.recordClaimVerificationFailure({
-   *   blockchain: 'xrp',
+   *   blockchain: 'evm',
    *   peerId: 'peer-alice',
    *   errorType: 'invalid_signature'
    * });

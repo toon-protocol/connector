@@ -173,7 +173,7 @@ export class FraudDetector extends EventEmitter {
   }
 
   /**
-   * Handle channel lifecycle events from XRPChannelLifecycleManager
+   * Handle channel lifecycle events
    */
   private async handleChannelEvent(event: ChannelEvent): Promise<void> {
     await this.analyzeEvent(event);

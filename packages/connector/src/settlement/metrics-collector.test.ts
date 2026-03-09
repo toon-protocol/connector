@@ -87,11 +87,14 @@ describe('MetricsCollector', () => {
     });
 
     it('should track methods independently', () => {
+      // Use type assertion since we're testing with different method identifiers
       collector.recordSuccess('evm');
-      collector.recordFailure('xrp');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (collector as any).recordFailure('other-method');
 
       expect(collector.getSuccessRate('evm')).toBe(1.0);
-      expect(collector.getSuccessRate('xrp')).toBe(0.0);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((collector as any).getSuccessRate('other-method')).toBe(0.0);
     });
   });
 

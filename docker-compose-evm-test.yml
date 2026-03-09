@@ -1,0 +1,68 @@
+# Simplified EVM test infrastructure
+# Replaces: docker-compose-base-test.yml (Base Sepolia fork)
+#
+# Usage:
+#   Start: docker compose -f docker-compose-evm-test.yml up -d
+#   Stop:  docker compose -f docker-compose-evm-test.yml down -v
+#
+# Architecture:
+#   Anvil (chain 31337, :8545) → contracts auto-deployed
+#   Faucet (:3500) → ETH + AGENT token distribution
+#
+# No external RPC dependency. Fully offline.
+
+services:
+  # Anvil - Local EVM Node with preloaded contracts
+  # Contracts are baked into anvil-state.json (no compile/deploy at startup)
+  # Regenerate state: ./scripts/generate-anvil-state.sh
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    entrypoint: ["anvil"]
+    command:
+      - --host=0.0.0.0
+      - --port=8545
+      - --chain-id=31337
+      - --accounts=10
+      - --balance=10000
+      - --load-state=/contracts/anvil-state.json
+    volumes:
+      - ./packages/contracts:/contracts:ro
+    ports:
+      - "8545:8545"
+    networks:
+      - evm-test-network
+    healthcheck:
+      test: ["CMD-SHELL", "cast code 0x5FbDB2315678afecb367f032d93F642f64180aa3 --rpc-url http://localhost:8545 2>/dev/null | grep -q '0x60' || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  faucet:
+    build: ./packages/faucet
+    depends_on:
+      anvil:
+        condition: service_healthy
+    environment:
+      PORT: 3500
+      RPC_URL: http://anvil:8545
+      ETH_PRIVATE_KEY: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+      TOKEN_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+      TOKEN_ADDRESS: "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+      ETH_AMOUNT: 100
+      TOKEN_AMOUNT: 10000
+    ports:
+      - "3500:3500"
+    networks:
+      - evm-test-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3500/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+networks:
+  evm-test-network:
+    driver: bridge
+    name: evm-test-network

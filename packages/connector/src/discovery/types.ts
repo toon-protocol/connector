@@ -49,7 +49,7 @@ export interface PeerInfo {
   /** ILP address prefix (e.g., "g.connector.alice") */
   ilpAddress: string;
 
-  /** Supported features: ['evm-settlement', 'xrp-settlement'] */
+  /** Supported features: ['evm-settlement'] */
   capabilities: string[];
 
   /** Unix timestamp of last heartbeat */

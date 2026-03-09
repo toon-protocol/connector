@@ -16,17 +16,14 @@ describe('loadKeyManagerConfig', () => {
     delete process.env.NODE_ID;
     delete process.env.AWS_REGION;
     delete process.env.AWS_KMS_EVM_KEY_ID;
-    delete process.env.AWS_KMS_XRP_KEY_ID;
     delete process.env.AWS_ACCESS_KEY_ID;
     delete process.env.AWS_SECRET_ACCESS_KEY;
     delete process.env.GCP_PROJECT_ID;
     delete process.env.GCP_LOCATION_ID;
     delete process.env.GCP_KEY_RING_ID;
     delete process.env.GCP_KMS_EVM_KEY_ID;
-    delete process.env.GCP_KMS_XRP_KEY_ID;
     delete process.env.AZURE_VAULT_URL;
     delete process.env.AZURE_EVM_KEY_NAME;
-    delete process.env.AZURE_XRP_KEY_NAME;
     delete process.env.AZURE_TENANT_ID;
     delete process.env.AZURE_CLIENT_ID;
     delete process.env.AZURE_CLIENT_SECRET;
@@ -34,7 +31,6 @@ describe('loadKeyManagerConfig', () => {
     delete process.env.HSM_SLOT_ID;
     delete process.env.HSM_PIN;
     delete process.env.HSM_EVM_KEY_LABEL;
-    delete process.env.HSM_XRP_KEY_LABEL;
   });
 
   afterEach(() => {
@@ -76,7 +72,6 @@ describe('loadKeyManagerConfig', () => {
       process.env.NODE_ID = 'test-node';
       process.env.AWS_REGION = 'us-east-1';
       process.env.AWS_KMS_EVM_KEY_ID = 'arn:aws:kms:us-east-1:123456789012:key/evm-key';
-      process.env.AWS_KMS_XRP_KEY_ID = 'arn:aws:kms:us-east-1:123456789012:key/xrp-key';
 
       const config = loadKeyManagerConfig();
 
@@ -84,14 +79,12 @@ describe('loadKeyManagerConfig', () => {
       expect(config.aws).toBeDefined();
       expect(config.aws?.region).toBe('us-east-1');
       expect(config.aws?.evmKeyId).toBe('arn:aws:kms:us-east-1:123456789012:key/evm-key');
-      expect(config.aws?.xrpKeyId).toBe('arn:aws:kms:us-east-1:123456789012:key/xrp-key');
     });
 
     it('should include AWS credentials if provided', () => {
       process.env.KEY_BACKEND = 'aws-kms';
       process.env.AWS_REGION = 'us-east-1';
       process.env.AWS_KMS_EVM_KEY_ID = 'alias/evm-key';
-      process.env.AWS_KMS_XRP_KEY_ID = 'alias/xrp-key';
       process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
       process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
 
@@ -107,7 +100,6 @@ describe('loadKeyManagerConfig', () => {
     it('should throw error if AWS_REGION missing', () => {
       process.env.KEY_BACKEND = 'aws-kms';
       process.env.AWS_KMS_EVM_KEY_ID = 'key-id';
-      process.env.AWS_KMS_XRP_KEY_ID = 'key-id';
 
       expect(() => loadKeyManagerConfig()).toThrow(ConfigurationError);
       expect(() => loadKeyManagerConfig()).toThrow(/AWS_REGION required/);
@@ -116,19 +108,9 @@ describe('loadKeyManagerConfig', () => {
     it('should throw error if AWS_KMS_EVM_KEY_ID missing', () => {
       process.env.KEY_BACKEND = 'aws-kms';
       process.env.AWS_REGION = 'us-east-1';
-      process.env.AWS_KMS_XRP_KEY_ID = 'key-id';
 
       expect(() => loadKeyManagerConfig()).toThrow(ConfigurationError);
       expect(() => loadKeyManagerConfig()).toThrow(/AWS_KMS_EVM_KEY_ID required/);
-    });
-
-    it('should throw error if AWS_KMS_XRP_KEY_ID missing', () => {
-      process.env.KEY_BACKEND = 'aws-kms';
-      process.env.AWS_REGION = 'us-east-1';
-      process.env.AWS_KMS_EVM_KEY_ID = 'key-id';
-
-      expect(() => loadKeyManagerConfig()).toThrow(ConfigurationError);
-      expect(() => loadKeyManagerConfig()).toThrow(/AWS_KMS_XRP_KEY_ID required/);
     });
   });
 
@@ -139,7 +121,6 @@ describe('loadKeyManagerConfig', () => {
       process.env.GCP_LOCATION_ID = 'us-east1';
       process.env.GCP_KEY_RING_ID = 'my-keyring';
       process.env.GCP_KMS_EVM_KEY_ID = 'evm-key';
-      process.env.GCP_KMS_XRP_KEY_ID = 'xrp-key';
 
       const config = loadKeyManagerConfig();
 
@@ -149,7 +130,6 @@ describe('loadKeyManagerConfig', () => {
       expect(config.gcp?.locationId).toBe('us-east1');
       expect(config.gcp?.keyRingId).toBe('my-keyring');
       expect(config.gcp?.evmKeyId).toBe('evm-key');
-      expect(config.gcp?.xrpKeyId).toBe('xrp-key');
     });
 
     it('should throw error if GCP_PROJECT_ID missing', () => {
@@ -157,7 +137,6 @@ describe('loadKeyManagerConfig', () => {
       process.env.GCP_LOCATION_ID = 'us-east1';
       process.env.GCP_KEY_RING_ID = 'my-keyring';
       process.env.GCP_KMS_EVM_KEY_ID = 'evm-key';
-      process.env.GCP_KMS_XRP_KEY_ID = 'xrp-key';
 
       expect(() => loadKeyManagerConfig()).toThrow(ConfigurationError);
       expect(() => loadKeyManagerConfig()).toThrow(/GCP_PROJECT_ID required/);
@@ -169,7 +148,6 @@ describe('loadKeyManagerConfig', () => {
       process.env.KEY_BACKEND = 'azure-kv';
       process.env.AZURE_VAULT_URL = 'https://myvault.vault.azure.net/';
       process.env.AZURE_EVM_KEY_NAME = 'evm-key';
-      process.env.AZURE_XRP_KEY_NAME = 'xrp-key';
 
       const config = loadKeyManagerConfig();
 
@@ -177,14 +155,12 @@ describe('loadKeyManagerConfig', () => {
       expect(config.azure).toBeDefined();
       expect(config.azure?.vaultUrl).toBe('https://myvault.vault.azure.net/');
       expect(config.azure?.evmKeyName).toBe('evm-key');
-      expect(config.azure?.xrpKeyName).toBe('xrp-key');
     });
 
     it('should include Azure credentials if provided', () => {
       process.env.KEY_BACKEND = 'azure-kv';
       process.env.AZURE_VAULT_URL = 'https://myvault.vault.azure.net/';
       process.env.AZURE_EVM_KEY_NAME = 'evm-key';
-      process.env.AZURE_XRP_KEY_NAME = 'xrp-key';
       process.env.AZURE_TENANT_ID = 'tenant-id';
       process.env.AZURE_CLIENT_ID = 'client-id';
       process.env.AZURE_CLIENT_SECRET = 'client-secret';
@@ -200,7 +176,6 @@ describe('loadKeyManagerConfig', () => {
     it('should throw error if AZURE_VAULT_URL missing', () => {
       process.env.KEY_BACKEND = 'azure-kv';
       process.env.AZURE_EVM_KEY_NAME = 'evm-key';
-      process.env.AZURE_XRP_KEY_NAME = 'xrp-key';
 
       expect(() => loadKeyManagerConfig()).toThrow(ConfigurationError);
       expect(() => loadKeyManagerConfig()).toThrow(/AZURE_VAULT_URL required/);
@@ -214,7 +189,6 @@ describe('loadKeyManagerConfig', () => {
       process.env.HSM_SLOT_ID = '0';
       process.env.HSM_PIN = '1234';
       process.env.HSM_EVM_KEY_LABEL = 'evm-key';
-      process.env.HSM_XRP_KEY_LABEL = 'xrp-key';
 
       const config = loadKeyManagerConfig();
 
@@ -224,7 +198,6 @@ describe('loadKeyManagerConfig', () => {
       expect(config.hsm?.slotId).toBe(0);
       expect(config.hsm?.pin).toBe('1234');
       expect(config.hsm?.evmKeyLabel).toBe('evm-key');
-      expect(config.hsm?.xrpKeyLabel).toBe('xrp-key');
     });
 
     it('should throw error if HSM_SLOT_ID is invalid', () => {
@@ -233,7 +206,6 @@ describe('loadKeyManagerConfig', () => {
       process.env.HSM_SLOT_ID = 'invalid';
       process.env.HSM_PIN = '1234';
       process.env.HSM_EVM_KEY_LABEL = 'evm-key';
-      process.env.HSM_XRP_KEY_LABEL = 'xrp-key';
 
       expect(() => loadKeyManagerConfig()).toThrow(ConfigurationError);
       expect(() => loadKeyManagerConfig()).toThrow(/Invalid HSM_SLOT_ID/);
@@ -245,7 +217,6 @@ describe('loadKeyManagerConfig', () => {
       process.env.HSM_SLOT_ID = '-1';
       process.env.HSM_PIN = '1234';
       process.env.HSM_EVM_KEY_LABEL = 'evm-key';
-      process.env.HSM_XRP_KEY_LABEL = 'xrp-key';
 
       expect(() => loadKeyManagerConfig()).toThrow(ConfigurationError);
       expect(() => loadKeyManagerConfig()).toThrow(/Invalid HSM_SLOT_ID/);
@@ -280,7 +251,6 @@ describe('validateKeyManagerConfig', () => {
       aws: {
         region: 'us-east-1',
         evmKeyId: 'arn:aws:kms:us-east-1:123456789012:key/evm-key',
-        xrpKeyId: 'alias/xrp-key',
       },
     };
 
@@ -294,7 +264,6 @@ describe('validateKeyManagerConfig', () => {
       aws: {
         region: 'us-east-1',
         evmKeyId: 'invalid-key-id',
-        xrpKeyId: 'alias/xrp-key',
       },
     };
 
@@ -309,7 +278,6 @@ describe('validateKeyManagerConfig', () => {
       aws: {
         region: 'us-east-1',
         evmKeyId: 'alias/evm-key',
-        xrpKeyId: 'alias/xrp-key',
       },
     };
 
@@ -323,7 +291,6 @@ describe('validateKeyManagerConfig', () => {
       aws: {
         region: 'us-east-1',
         evmKeyId: '12345678-1234-1234-1234-123456789012',
-        xrpKeyId: '87654321-4321-4321-4321-210987654321',
       },
     };
 
@@ -339,7 +306,6 @@ describe('validateKeyManagerConfig', () => {
         locationId: 'us-east1',
         keyRingId: 'my-keyring',
         evmKeyId: 'evm-key',
-        xrpKeyId: 'xrp-key',
       },
     };
 
@@ -355,7 +321,6 @@ describe('validateKeyManagerConfig', () => {
         locationId: 'us-east1',
         keyRingId: 'my-keyring',
         evmKeyId: '',
-        xrpKeyId: 'xrp-key',
       },
     };
 
@@ -370,7 +335,6 @@ describe('validateKeyManagerConfig', () => {
       azure: {
         vaultUrl: 'https://myvault.vault.azure.net/',
         evmKeyName: 'evm-key',
-        xrpKeyName: 'xrp-key',
       },
     };
 
@@ -384,7 +348,6 @@ describe('validateKeyManagerConfig', () => {
       azure: {
         vaultUrl: 'http://invalid-vault.com',
         evmKeyName: 'evm-key',
-        xrpKeyName: 'xrp-key',
       },
     };
 
@@ -401,7 +364,6 @@ describe('validateKeyManagerConfig', () => {
         slotId: 0,
         pin: '1234',
         evmKeyLabel: 'evm-key',
-        xrpKeyLabel: 'xrp-key',
       },
     };
 
@@ -417,7 +379,6 @@ describe('validateKeyManagerConfig', () => {
         slotId: -1,
         pin: '1234',
         evmKeyLabel: 'evm-key',
-        xrpKeyLabel: 'xrp-key',
       },
     };
 
@@ -434,7 +395,6 @@ describe('validateKeyManagerConfig', () => {
         slotId: 0,
         pin: '',
         evmKeyLabel: 'evm-key',
-        xrpKeyLabel: 'xrp-key',
       },
     };
 

@@ -168,38 +168,6 @@ jobs:
           echo "Coverage report generated. Manual review required for exact percentage."
           echo "All 113 tests pass in normal mode. Coverage target >95% validated in Story 8.5 QA."
 
-  aptos-move-tests:
-    name: Aptos Move Contract Tests
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Aptos CLI
-        run: |
-          curl -fsSL "https://aptos.dev/scripts/install_cli.py" | python3
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Verify Aptos CLI
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          aptos --version
-
-      - name: Run Move Tests
-        working-directory: packages/contracts-aptos
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          # Run only channel tests (m2m_token tests have Aptos framework compatibility issues)
-          aptos move test --dev --filter channel
-
-      - name: Run Move Prover (advisory)
-        working-directory: packages/contracts-aptos
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          aptos move prove --dev || echo "Move Prover requires additional setup (boogie/z3) - advisory only"
-        continue-on-error: true
-
   build:
     name: Build All Packages
     runs-on: ubuntu-latest
@@ -292,7 +260,7 @@ jobs:
 
       # Security hardening: Check for high/critical vulnerabilities (Story 16.2)
       # Currently advisory due to transitive dependency issues requiring major updates
-      # Known issues: express (body-parser), elliptic (xrpl), aws-sdk (fast-xml-parser)
+      # Known issues: express (body-parser), aws-sdk (fast-xml-parser)
       - name: Run npm audit
         run: npm audit --audit-level=high
         continue-on-error: true
@@ -585,7 +553,7 @@ jobs:
   ci-status:
     name: CI Status Summary
     runs-on: ubuntu-latest
-    needs: [lint-and-format, test, build, type-check, contracts-coverage, aptos-move-tests, security, rfc-links, docker-build-push, container-scan, performance-benchmark]
+    needs: [lint-and-format, test, build, type-check, contracts-coverage, security, rfc-links, docker-build-push, container-scan, performance-benchmark]
     if: always()
 
     steps:
@@ -601,7 +569,6 @@ jobs:
           echo "  Build: ${{ needs.build.result }}"
           echo "  Type Check: ${{ needs.type-check.result }}"
           echo "  EVM Contracts: ${{ needs.contracts-coverage.result }}"
-          echo "  Aptos Contracts: ${{ needs.aptos-move-tests.result }}"
           echo "  Security: ${{ needs.security.result }}"
           echo "  RFC Links: ${{ needs.rfc-links.result }}"
           echo "  Docker Build: ${{ needs.docker-build-push.result }}"
@@ -614,8 +581,7 @@ jobs:
           if [[ "${{ needs.lint-and-format.result }}" == "failure" ]] || \
              [[ "${{ needs.test.result }}" == "failure" ]] || \
              [[ "${{ needs.build.result }}" == "failure" ]] || \
-             [[ "${{ needs.type-check.result }}" == "failure" ]] || \
-             [[ "${{ needs.aptos-move-tests.result }}" == "failure" ]]; then
+             [[ "${{ needs.type-check.result }}" == "failure" ]]; then
             echo "❌ CI Pipeline FAILED"
             echo ""
             echo "Please check the failed jobs above for details."

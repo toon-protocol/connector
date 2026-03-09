@@ -46,6 +46,7 @@ export class LocalDeliveryClient {
       handlerUrl: config.handlerUrl ?? '',
       timeout: config.timeout ?? DEFAULT_TIMEOUT,
       authToken: config.authToken ?? '',
+      perHopNotification: config.perHopNotification ?? false,
     };
     this.logger = logger.child({ component: 'LocalDeliveryClient' });
 
@@ -62,6 +63,13 @@ export class LocalDeliveryClient {
   }
 
   /**
+   * Check if per-hop BLS notification is enabled for transit packets.
+   */
+  isPerHopNotificationEnabled(): boolean {
+    return this.config.perHopNotification;
+  }
+
+  /**
    * Forward a packet to the business logic server for local delivery.
    *
    * Sends a simplified PaymentRequest (no ILP internals exposed) and maps
@@ -69,11 +77,13 @@ export class LocalDeliveryClient {
    *
    * @param packet - ILP Prepare packet
    * @param _sourcePeer - Peer that sent this packet (unused, kept for interface compat)
+   * @param options - Optional delivery options
    * @returns ILP Fulfill or Reject packet
    */
   async deliver(
     packet: ILPPreparePacket,
-    _sourcePeer: string
+    _sourcePeer: string,
+    options?: { isTransit?: boolean }
   ): Promise<ILPFulfillPacket | ILPRejectPacket> {
     // Check expiry before making the HTTP call
     if (packet.expiresAt < new Date()) {
@@ -99,6 +109,7 @@ export class LocalDeliveryClient {
       amount: packet.amount.toString(),
       expiresAt: packet.expiresAt.toISOString(),
       data: packet.data.length > 0 ? packet.data.toString('base64') : undefined,
+      isTransit: options?.isTransit,
     };
 
     this.logger.debug(

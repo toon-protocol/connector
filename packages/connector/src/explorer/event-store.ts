@@ -216,25 +216,6 @@ function extractIndexedFields(event: TelemetryEvent): ExtractedFields {
       base.packet_id = event.channelId;
       break;
 
-    case 'XRP_CHANNEL_OPENED':
-      base.peer_id = event.peerId ?? null;
-      base.packet_id = event.channelId;
-      base.amount = event.amount;
-      base.destination = event.destination;
-      break;
-
-    case 'XRP_CHANNEL_CLAIMED':
-      base.peer_id = event.peerId ?? null;
-      base.packet_id = event.channelId;
-      base.amount = event.claimAmount;
-      break;
-
-    case 'XRP_CHANNEL_CLOSED':
-      base.peer_id = event.peerId ?? null;
-      base.packet_id = event.channelId;
-      base.amount = event.finalBalance;
-      break;
-
     case 'AGENT_CHANNEL_OPENED':
       base.peer_id = event.peerId;
       base.packet_id = event.channelId;

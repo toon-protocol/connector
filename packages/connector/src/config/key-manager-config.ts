@@ -26,7 +26,6 @@ export class ConfigurationError extends Error {
  * AWS KMS (when KEY_BACKEND=aws-kms):
  * - AWS_REGION: AWS region (e.g., 'us-east-1')
  * - AWS_KMS_EVM_KEY_ID: ARN or alias for EVM signing key
- * - AWS_KMS_XRP_KEY_ID: ARN or alias for XRP signing key
  * - AWS_ACCESS_KEY_ID: (Optional) AWS access key
  * - AWS_SECRET_ACCESS_KEY: (Optional) AWS secret key
  *
@@ -35,12 +34,10 @@ export class ConfigurationError extends Error {
  * - GCP_LOCATION_ID: KMS location (e.g., 'us-east1')
  * - GCP_KEY_RING_ID: KMS key ring name
  * - GCP_KMS_EVM_KEY_ID: Crypto key name for EVM signing
- * - GCP_KMS_XRP_KEY_ID: Crypto key name for XRP signing
  *
  * Azure Key Vault (when KEY_BACKEND=azure-kv):
  * - AZURE_VAULT_URL: Key Vault URL (e.g., 'https://myvault.vault.azure.net/')
  * - AZURE_EVM_KEY_NAME: Key name for EVM signing
- * - AZURE_XRP_KEY_NAME: Key name for XRP signing
  * - AZURE_TENANT_ID: (Optional) Azure AD tenant ID
  * - AZURE_CLIENT_ID: (Optional) Service principal client ID
  * - AZURE_CLIENT_SECRET: (Optional) Service principal secret
@@ -50,7 +47,6 @@ export class ConfigurationError extends Error {
  * - HSM_SLOT_ID: HSM slot ID (0-based index)
  * - HSM_PIN: HSM PIN (from environment variable, never hardcoded)
  * - HSM_EVM_KEY_LABEL: Key pair label for EVM signing
- * - HSM_XRP_KEY_LABEL: Key pair label for XRP signing
  *
  * @returns KeyManagerConfig loaded from environment variables
  * @throws ConfigurationError if required variables are missing or invalid
@@ -107,7 +103,6 @@ export function loadKeyManagerConfig(): KeyManagerConfig {
 function loadAWSConfig(): AWSConfig {
   const region = process.env.AWS_REGION;
   const evmKeyId = process.env.AWS_KMS_EVM_KEY_ID;
-  const xrpKeyId = process.env.AWS_KMS_XRP_KEY_ID;
 
   if (!region) {
     throw new ConfigurationError('AWS_REGION required for aws-kms backend');
@@ -115,14 +110,10 @@ function loadAWSConfig(): AWSConfig {
   if (!evmKeyId) {
     throw new ConfigurationError('AWS_KMS_EVM_KEY_ID required for aws-kms backend');
   }
-  if (!xrpKeyId) {
-    throw new ConfigurationError('AWS_KMS_XRP_KEY_ID required for aws-kms backend');
-  }
 
   const config: AWSConfig = {
     region,
     evmKeyId,
-    xrpKeyId,
   };
 
   // Optional credentials (uses IAM role if not provided)
@@ -146,7 +137,6 @@ function loadGCPConfig(): GCPConfig {
   const locationId = process.env.GCP_LOCATION_ID;
   const keyRingId = process.env.GCP_KEY_RING_ID;
   const evmKeyId = process.env.GCP_KMS_EVM_KEY_ID;
-  const xrpKeyId = process.env.GCP_KMS_XRP_KEY_ID;
 
   if (!projectId) {
     throw new ConfigurationError('GCP_PROJECT_ID required for gcp-kms backend');
@@ -160,16 +150,12 @@ function loadGCPConfig(): GCPConfig {
   if (!evmKeyId) {
     throw new ConfigurationError('GCP_KMS_EVM_KEY_ID required for gcp-kms backend');
   }
-  if (!xrpKeyId) {
-    throw new ConfigurationError('GCP_KMS_XRP_KEY_ID required for gcp-kms backend');
-  }
 
   return {
     projectId,
     locationId,
     keyRingId,
     evmKeyId,
-    xrpKeyId,
   };
 }
 
@@ -179,7 +165,6 @@ function loadGCPConfig(): GCPConfig {
 function loadAzureConfig(): AzureConfig {
   const vaultUrl = process.env.AZURE_VAULT_URL;
   const evmKeyName = process.env.AZURE_EVM_KEY_NAME;
-  const xrpKeyName = process.env.AZURE_XRP_KEY_NAME;
 
   if (!vaultUrl) {
     throw new ConfigurationError('AZURE_VAULT_URL required for azure-kv backend');
@@ -187,14 +172,10 @@ function loadAzureConfig(): AzureConfig {
   if (!evmKeyName) {
     throw new ConfigurationError('AZURE_EVM_KEY_NAME required for azure-kv backend');
   }
-  if (!xrpKeyName) {
-    throw new ConfigurationError('AZURE_XRP_KEY_NAME required for azure-kv backend');
-  }
 
   const config: AzureConfig = {
     vaultUrl,
     evmKeyName,
-    xrpKeyName,
   };
 
   // Optional credentials (uses DefaultAzureCredential if not provided)
@@ -220,7 +201,6 @@ function loadHSMConfig(): HSMConfig {
   const slotIdStr = process.env.HSM_SLOT_ID;
   const pin = process.env.HSM_PIN;
   const evmKeyLabel = process.env.HSM_EVM_KEY_LABEL;
-  const xrpKeyLabel = process.env.HSM_XRP_KEY_LABEL;
 
   if (!pkcs11LibraryPath) {
     throw new ConfigurationError('HSM_PKCS11_LIBRARY_PATH required for hsm backend');
@@ -233,9 +213,6 @@ function loadHSMConfig(): HSMConfig {
   }
   if (!evmKeyLabel) {
     throw new ConfigurationError('HSM_EVM_KEY_LABEL required for hsm backend');
-  }
-  if (!xrpKeyLabel) {
-    throw new ConfigurationError('HSM_XRP_KEY_LABEL required for hsm backend');
   }
 
   const slotId = parseInt(slotIdStr, 10);
@@ -250,7 +227,6 @@ function loadHSMConfig(): HSMConfig {
     slotId,
     pin,
     evmKeyLabel,
-    xrpKeyLabel,
   };
 }
 
@@ -320,12 +296,6 @@ function validateAWSKeyIds(config: AWSConfig): void {
       `Invalid AWS_KMS_EVM_KEY_ID format: ${config.evmKeyId}. Must be ARN, alias, or key ID.`
     );
   }
-
-  if (!validArnPattern.test(config.xrpKeyId)) {
-    throw new ConfigurationError(
-      `Invalid AWS_KMS_XRP_KEY_ID format: ${config.xrpKeyId}. Must be ARN, alias, or key ID.`
-    );
-  }
 }
 
 /**
@@ -335,10 +305,6 @@ function validateGCPKeyIds(config: GCPConfig): void {
   // GCP key names are alphanumeric + hyphens, underscores
   if (!config.evmKeyId || config.evmKeyId.trim() === '') {
     throw new ConfigurationError('GCP_KMS_EVM_KEY_ID cannot be empty');
-  }
-
-  if (!config.xrpKeyId || config.xrpKeyId.trim() === '') {
-    throw new ConfigurationError('GCP_KMS_XRP_KEY_ID cannot be empty');
   }
 }
 
@@ -356,10 +322,6 @@ function validateAzureKeyIds(config: AzureConfig): void {
   // Key names must not be empty
   if (!config.evmKeyName || config.evmKeyName.trim() === '') {
     throw new ConfigurationError('AZURE_EVM_KEY_NAME cannot be empty');
-  }
-
-  if (!config.xrpKeyName || config.xrpKeyName.trim() === '') {
-    throw new ConfigurationError('AZURE_XRP_KEY_NAME cannot be empty');
   }
 }
 
@@ -385,9 +347,5 @@ function validateHSMConfig(config: HSMConfig): void {
   // Validate key labels are not empty
   if (!config.evmKeyLabel || config.evmKeyLabel.trim() === '') {
     throw new ConfigurationError('HSM_EVM_KEY_LABEL cannot be empty');
-  }
-
-  if (!config.xrpKeyLabel || config.xrpKeyLabel.trim() === '') {
-    throw new ConfigurationError('HSM_XRP_KEY_LABEL cannot be empty');
   }
 }

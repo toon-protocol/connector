@@ -30,6 +30,7 @@ import { AccountLedgerCodes } from '../settlement/types';
 import { EventStore } from '../explorer/event-store';
 import { EventBroadcaster } from '../explorer/event-broadcaster';
 import { LocalDeliveryClient } from './local-delivery-client';
+import type { PerPacketClaimService } from '../settlement/per-packet-claim-service';
 
 /**
  * Packet validation result
@@ -105,6 +106,11 @@ export class PacketHandler {
    * Event broadcaster for real-time WebSocket event streaming (optional)
    */
   private eventBroadcaster: EventBroadcaster | null = null;
+
+  /**
+   * Per-packet claim service for attaching signed claims to outgoing packets (optional)
+   */
+  private perPacketClaimService: PerPacketClaimService | null = null;
 
   /**
    * Account manager for settlement recording (optional)
@@ -244,6 +250,15 @@ export class PacketHandler {
         'Settlement recording enabled via late initialization'
       );
     }
+  }
+
+  /**
+   * Set PerPacketClaimService for attaching signed claims to outgoing packets
+   * @param service - PerPacketClaimService instance
+   */
+  setPerPacketClaimService(service: PerPacketClaimService): void {
+    this.perPacketClaimService = service;
+    this.logger.info('Per-packet claim service enabled');
   }
 
   /**
@@ -694,7 +709,8 @@ export class PacketHandler {
   private async forwardToNextHop(
     packet: ILPPreparePacket,
     nextHop: string,
-    correlationId: string
+    correlationId: string,
+    protocolData?: Array<{ protocolName: string; contentType: number; data: Buffer }>
   ): Promise<ILPFulfillPacket | ILPRejectPacket> {
     this.logger.info(
       {
@@ -717,7 +733,7 @@ export class PacketHandler {
       const hasInbound = this.btpServer?.hasPeer(nextHop) ?? false;
 
       if (hasOutbound) {
-        response = await this.btpClientManager.sendToPeer(nextHop, packet);
+        response = await this.btpClientManager.sendToPeer(nextHop, packet, protocolData);
         this.logger.debug(
           { correlationId, peerId: nextHop },
           'Forwarded via outbound peer connection'
@@ -727,7 +743,7 @@ export class PacketHandler {
           { correlationId, peerId: nextHop },
           'No outbound connection, using incoming peer connection'
         );
-        response = await this.btpServer!.sendPacketToPeer(nextHop, packet);
+        response = await this.btpServer!.sendPacketToPeer(nextHop, packet, protocolData);
         this.logger.debug(
           { correlationId, peerId: nextHop },
           'Forwarded via incoming peer connection'
@@ -1166,8 +1182,111 @@ export class PacketHandler {
       };
     }
 
+    // Fire-and-forget BLS notification for transit packets (per-hop notification)
+    const perHopEnabled = this.localDeliveryClient?.isPerHopNotificationEnabled() ?? false;
+    if (perHopEnabled) {
+      let dispatched = false;
+      if (this.localDeliveryHandler) {
+        // In-process handler path (takes priority over HTTP)
+        dispatched = true;
+        const transitRequest: LocalDeliveryRequest = {
+          destination: packet.destination,
+          amount: packet.amount.toString(),
+          executionCondition: packet.executionCondition.toString('base64'),
+          expiresAt: packet.expiresAt.toISOString(),
+          data: packet.data.toString('base64'),
+          sourcePeer: sourcePeerId,
+          isTransit: true,
+        };
+        this.localDeliveryHandler(transitRequest, sourcePeerId).catch((err: unknown) => {
+          this.logger.debug(
+            {
+              error: err instanceof Error ? err.message : String(err),
+              destination: packet.destination,
+            },
+            'Per-hop notification failed (fire-and-forget, in-process)'
+          );
+        });
+      } else if (this.isLocalDeliveryEnabled() && this.localDeliveryClient) {
+        // HTTP client path
+        dispatched = true;
+        this.localDeliveryClient
+          .deliver(packet, sourcePeerId, { isTransit: true })
+          .catch((err: unknown) => {
+            this.logger.debug(
+              {
+                error: err instanceof Error ? err.message : String(err),
+                destination: packet.destination,
+              },
+              'Per-hop notification failed (fire-and-forget, HTTP)'
+            );
+          });
+      }
+
+      // Emit PER_HOP_NOTIFICATION telemetry only when a notification was actually dispatched
+      if (dispatched) {
+        try {
+          const perHopEvent = {
+            type: 'PER_HOP_NOTIFICATION' as const,
+            nodeId: this.nodeId,
+            destination: packet.destination,
+            amount: packet.amount.toString(),
+            nextHop,
+            sourcePeer: sourcePeerId,
+            correlationId,
+            timestamp: Date.now(),
+          };
+          if (this.telemetryEmitter) {
+            this.telemetryEmitter.emit(perHopEvent);
+          } else if (this.eventStore) {
+            this.eventStore.storeEvent(perHopEvent).catch((err) => {
+              this.logger.warn(
+                { error: err.message, correlationId },
+                'Failed to store PER_HOP_NOTIFICATION event'
+              );
+            });
+            this.eventBroadcaster?.broadcast(perHopEvent);
+          }
+        } catch {
+          // Telemetry emission is non-blocking — swallow errors
+        }
+      }
+    }
+
+    // Generate per-packet claim before forwarding (non-blocking on failure)
+    let claimProtocolData:
+      | Array<{ protocolName: string; contentType: number; data: Buffer }>
+      | undefined;
+    if (this.perPacketClaimService && !isLocalDelivery && forwardingPacket.amount > 0n) {
+      try {
+        const result = await this.perPacketClaimService.generateClaimForPacket(
+          nextHop,
+          'ILP',
+          forwardingPacket.amount
+        );
+        if (result) {
+          claimProtocolData = [result.protocolData];
+        }
+      } catch (error) {
+        // Claim failure MUST NOT block packet forwarding
+        this.logger.warn(
+          {
+            correlationId,
+            peerId: nextHop,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          'Claim generation failed, forwarding without claim'
+        );
+      }
+    }
+
     // Forward to next hop via BTP and return response
-    const response = await this.forwardToNextHop(forwardingPacket, nextHop, correlationId);
+    const response = await this.forwardToNextHop(
+      forwardingPacket,
+      nextHop,
+      correlationId,
+      claimProtocolData
+    );
 
     // Emit PACKET_FORWARDED telemetry after successful forward
     if (this.telemetryEmitter) {

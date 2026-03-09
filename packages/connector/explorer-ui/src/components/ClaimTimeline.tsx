@@ -51,24 +51,11 @@ function getBlockchainExplorerUrl(
   blockchain: ClaimBlockchain,
   txHash: string
 ): { url: string; label: string } {
-  switch (blockchain) {
-    case 'xrp':
-      return {
-        url: `https://xrpscan.com/tx/${txHash}`,
-        label: 'View on XRPScan',
-      };
-    case 'evm':
-      // Base L2 explorer
-      return {
-        url: `https://basescan.org/tx/${txHash}`,
-        label: 'View on BaseScan',
-      };
-    case 'aptos':
-      return {
-        url: `https://explorer.aptoslabs.com/txn/${txHash}`,
-        label: 'View on Aptos Explorer',
-      };
-  }
+  // Base L2 explorer (EVM only)
+  return {
+    url: `https://basescan.org/tx/${txHash}`,
+    label: 'View on BaseScan',
+  };
 }
 
 /**

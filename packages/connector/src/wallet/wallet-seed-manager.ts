@@ -81,7 +81,6 @@ export interface PaperWallet {
  */
 export const DERIVATION_PATHS = {
   EVM: "m/44'/60'/1'/0", // Ethereum/Base L2 (coin type 60)
-  XRP: "m/44'/144'/1'/0", // XRP Ledger (coin type 144)
 } as const;
 
 /**

@@ -311,7 +311,7 @@ describe('BTPClientManager', () => {
       await manager.sendToPeer('peerA', packet);
 
       // Assert
-      expect(mockClientA.sendPacket).toHaveBeenCalledWith(packet);
+      expect(mockClientA.sendPacket).toHaveBeenCalledWith(packet, undefined);
       expect(mockClientB.sendPacket).not.toHaveBeenCalled();
     });
 

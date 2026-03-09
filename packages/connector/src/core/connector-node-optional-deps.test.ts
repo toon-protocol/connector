@@ -41,7 +41,6 @@ jest.mock('../http/admin-api', () => ({
   createAdminRouter: jest.fn(),
 }));
 jest.mock('../explorer');
-jest.mock('../settlement/aptos-channel-sdk');
 jest.mock('../settlement/payment-channel-sdk');
 jest.mock('../settlement/channel-manager');
 jest.mock('../settlement/settlement-executor');

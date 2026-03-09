@@ -1,5 +1,5 @@
 # Docker Compose configuration for development/CI testing
-# Provides Anvil (EVM), rippled (XRP), and TigerBeetle services
+# Provides Anvil (EVM) and TigerBeetle services
 #
 # Usage:
 #   Start: docker compose -f docker-compose-dev.yml up -d
@@ -33,27 +33,6 @@ services:
       timeout: 5s
       retries: 30
       start_period: 5s
-
-  # rippled - XRP Ledger standalone mode
-  # Runs in standalone mode for local testing without network connectivity
-  rippled:
-    image: rippleci/rippled:develop
-    container_name: rippled
-    command: ["-a", "--start", "--conf", "/etc/opt/ripple/rippled.cfg"]
-    volumes:
-      - ./config/rippled-standalone.cfg:/etc/opt/ripple/rippled.cfg:ro
-    ports:
-      - "5005:5005"   # JSON-RPC HTTP
-      - "6006:6006"   # WebSocket
-      - "51235:51235" # Peer protocol
-    networks:
-      - dev-network
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf -X POST http://localhost:5005 -H 'Content-Type: application/json' -d '{\"method\":\"server_info\",\"params\":[]}' || exit 1"]
-      interval: 10s
-      timeout: 10s
-      retries: 30
-      start_period: 30s
 
   # TigerBeetle - High-performance accounting database
   # Used for tracking settlement balances between ILP connector peers

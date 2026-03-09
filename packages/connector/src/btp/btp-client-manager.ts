@@ -152,7 +152,8 @@ export class BTPClientManager {
    */
   async sendToPeer(
     peerId: string,
-    packet: ILPPreparePacket
+    packet: ILPPreparePacket,
+    protocolData?: Array<{ protocolName: string; contentType: number; data: Buffer }>
   ): Promise<ILPFulfillPacket | ILPRejectPacket> {
     this._logger.debug(
       { event: 'btp_client_send_to_peer', peerId, destination: packet.destination },
@@ -193,7 +194,10 @@ export class BTPClientManager {
       });
 
       // Race between sendPacket and timeout
-      const response = await Promise.race([client.sendPacket(packet), timeoutPromise]);
+      const response = await Promise.race([
+        client.sendPacket(packet, protocolData),
+        timeoutPromise,
+      ]);
 
       this._logger.debug(
         { event: 'btp_client_packet_sent', peerId, destination: packet.destination },

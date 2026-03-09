@@ -12,7 +12,6 @@ import {
   SettlementTriggeredEvent,
   AgentChannelOpenedEvent,
   AgentChannelPaymentSentEvent,
-  XRPChannelOpenedEvent,
   PaymentChannelOpenedEvent,
 } from '@crosstown/shared';
 import pino from 'pino';
@@ -98,27 +97,6 @@ function createAgentChannelPaymentSentEvent(
     channelId: '0xabc123',
     amount: '100000000000000000',
     destination: 'g.agent.peer-b',
-    ...overrides,
-  };
-}
-
-/**
- * Helper to create a test XRPChannelOpenedEvent.
- */
-function createXRPChannelOpenedEvent(
-  overrides: Partial<XRPChannelOpenedEvent> = {}
-): XRPChannelOpenedEvent {
-  return {
-    type: 'XRP_CHANNEL_OPENED',
-    timestamp: '2026-01-24T12:00:00.000Z',
-    nodeId: 'connector-a',
-    channelId: 'A1B2C3D4E5F6789',
-    account: 'rN7n7otQDd6FczFgLdlqtyMVrn3HMfXEEW',
-    destination: 'rLHzPsX6oXkzU9rFkRaYT8yBqJcQwPgHWN',
-    amount: '10000000000',
-    settleDelay: 86400,
-    publicKey: 'ED01234567890ABCDEF',
-    peerId: 'peer-bob',
     ...overrides,
   };
 }
@@ -323,14 +301,6 @@ describe('EventStore', () => {
 
       const stored = await eventStore.queryEvents({});
       expect(stored[0]!.direction).toBe('sent');
-    });
-
-    it('should extract destination for XRP_CHANNEL_OPENED', async () => {
-      const event = createXRPChannelOpenedEvent();
-      await eventStore.storeEvent(event);
-
-      const stored = await eventStore.queryEvents({});
-      expect(stored[0]!.destination).toBe('rLHzPsX6oXkzU9rFkRaYT8yBqJcQwPgHWN');
     });
 
     it('should calculate sum of initialDeposits for PAYMENT_CHANNEL_OPENED', async () => {

@@ -39,7 +39,6 @@ describeIf('HSMBackend', () => {
       slotId: 0,
       pin: 'test-pin',
       evmKeyLabel: 'evm-key',
-      xrpKeyLabel: 'xrp-key',
     };
 
     // Create mock PKCS#11 instance
@@ -152,19 +151,6 @@ describeIf('HSMBackend', () => {
       );
     });
 
-    it('should sign XRP message using CKM_EDDSA mechanism', async () => {
-      const message = Buffer.from('xrp-test-message');
-      const signature = await backend.sign(message, config.xrpKeyLabel);
-
-      expect(mockPKCS11Instance.C_SignInit).toHaveBeenCalledWith(
-        1,
-        { mechanism: pkcs11js.CKM_EDDSA },
-        100
-      );
-      expect(mockPKCS11Instance.C_Sign).toHaveBeenCalledWith(1, message, expect.any(Buffer));
-      expect(signature).toEqual(Buffer.from('signature-bytes'));
-    });
-
     it('should detect key type from keyLabel containing "evm"', async () => {
       const message = Buffer.from('test');
       await backend.sign(message, 'my-evm-signing-key');
@@ -172,17 +158,6 @@ describeIf('HSMBackend', () => {
       expect(mockPKCS11Instance.C_SignInit).toHaveBeenCalledWith(
         1,
         { mechanism: pkcs11js.CKM_ECDSA },
-        100
-      );
-    });
-
-    it('should detect key type from keyLabel containing "xrp"', async () => {
-      const message = Buffer.from('test');
-      await backend.sign(message, 'my-xrp-signing-key');
-
-      expect(mockPKCS11Instance.C_SignInit).toHaveBeenCalledWith(
-        1,
-        { mechanism: pkcs11js.CKM_EDDSA },
         100
       );
     });
@@ -294,22 +269,6 @@ describeIf('HSMBackend', () => {
         expect.objectContaining({ oldKeyLabel: config.evmKeyLabel, newKeyLabel }),
         'HSM key rotation completed'
       );
-    });
-
-    it('should generate new ed25519 key pair for XRP keys', async () => {
-      const newKeyLabel = await backend.rotateKey(config.xrpKeyLabel);
-
-      expect(newKeyLabel).toMatch(/xrp-key-rotated-\d+/);
-
-      const generateCall = mockPKCS11Instance.C_GenerateKeyPair.mock.calls[0];
-      expect(generateCall[1]).toEqual({ mechanism: pkcs11js.CKM_EC_EDWARDS_KEY_PAIR_GEN });
-
-      // Verify Ed25519 OID
-      const publicKeyTemplate = generateCall[2];
-      const ecParamsAttr = publicKeyTemplate.find(
-        (attr: any) => attr.type === pkcs11js.CKA_EC_PARAMS
-      );
-      expect(ecParamsAttr.value).toEqual(Buffer.from([0x06, 0x03, 0x2b, 0x65, 0x70]));
     });
 
     it('should mark new private key as non-extractable', async () => {

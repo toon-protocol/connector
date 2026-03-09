@@ -307,19 +307,20 @@ describe('ConnectionPool', () => {
     });
 
     it('should retry reconnection up to maxReconnectAttempts', async () => {
-      // Mark connection as unhealthy
-      const conn = connectionPool.getConnection();
-      conn!.isHealthy = false;
-
       // Clear any previous calls and mock reconnection to always fail
       mockFactory.create.mockClear();
       mockFactory.create.mockRejectedValue(new Error('Reconnect failed'));
 
-      // Trigger health check (which triggers reconnection for unhealthy connections)
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // Mark connection as unhealthy
+      const conn = connectionPool.getConnection();
+      conn!.isHealthy = false;
+
+      // Wait for connection-failed event (emitted after all reconnection attempts exhausted)
+      await new Promise<void>((resolve) => {
+        connectionPool.on('connection-failed', resolve);
+      });
 
       // Should attempt reconnection at least maxReconnectAttempts times (3)
-      // May be more due to health check timing triggering multiple reconnection cycles
       const callCount = mockFactory.create.mock.calls.length;
       expect(callCount).toBeGreaterThanOrEqual(3);
     });
@@ -328,15 +329,17 @@ describe('ConnectionPool', () => {
       const failedListener = jest.fn();
       connectionPool.on('connection-failed', failedListener);
 
+      // Mock reconnection to always fail
+      mockFactory.create.mockRejectedValue(new Error('Reconnect failed'));
+
       // Mark connection as unhealthy
       const conn = connectionPool.getConnection();
       conn!.isHealthy = false;
 
-      // Mock reconnection to always fail
-      mockFactory.create.mockRejectedValue(new Error('Reconnect failed'));
-
-      // Trigger health check
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // Wait for connection-failed event instead of using fixed timeout
+      await new Promise<void>((resolve) => {
+        connectionPool.on('connection-failed', resolve);
+      });
 
       // Failed event should be emitted
       expect(failedListener).toHaveBeenCalled();

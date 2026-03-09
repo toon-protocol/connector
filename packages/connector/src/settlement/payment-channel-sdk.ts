@@ -234,6 +234,17 @@ export class PaymentChannelSDK {
   }
 
   /**
+   * Get the chain ID from the connected provider
+   * Public method for Epic 31 self-describing claims
+   *
+   * @returns EVM chain ID as a number
+   */
+  async getChainId(): Promise<number> {
+    const network = await this.provider.getNetwork();
+    return Number(network.chainId);
+  }
+
+  /**
    * Get the signer's Ethereum address
    *
    * @returns Ethereum address of the signer
@@ -820,6 +831,101 @@ export class PaymentChannelSDK {
     this.channelStateCache.set(channelId, state);
 
     return state;
+  }
+
+  /**
+   * Get channel state directly from a TokenNetwork contract address (no registry lookup)
+   * Used for verifying unknown channels from self-describing claims.
+   * Read-only operation -- no signer needed, only provider.
+   *
+   * @param channelId - Channel identifier (bytes32)
+   * @param tokenNetworkAddress - TokenNetwork contract address
+   * @returns Simplified channel state for verification
+   */
+  async getChannelStateByNetwork(
+    channelId: string,
+    tokenNetworkAddress: string
+  ): Promise<{
+    exists: boolean;
+    state: number;
+    participant1: string;
+    participant2: string;
+    settlementTimeout: number;
+  }> {
+    const { ethers } = await requireOptional<typeof import('ethers')>('ethers', 'EVM settlement');
+
+    const tokenNetwork = new ethers.Contract(tokenNetworkAddress, TOKEN_NETWORK_ABI, this.provider);
+
+    try {
+      const channelData = await tokenNetwork.channels!(channelId);
+      const stateEnum = Number(channelData.state);
+
+      return {
+        exists: stateEnum !== 0,
+        state: stateEnum,
+        participant1: channelData.participant1 as string,
+        participant2: channelData.participant2 as string,
+        settlementTimeout: Number(channelData.settlementTimeout),
+      };
+    } catch (error) {
+      this.logger.error('Failed to query channel state by network', {
+        channelId,
+        tokenNetworkAddress,
+        error,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Verify a balance proof signature using an explicit EIP-712 domain
+   * Used for verifying claims from unknown channels where the TokenNetwork
+   * is not in the registry cache. Read-only -- no signer needed.
+   *
+   * @param balanceProof - Balance proof to verify
+   * @param signature - EIP-712 signature
+   * @param expectedSigner - Expected signer address
+   * @param chainId - EVM chain ID for domain construction
+   * @param tokenNetworkAddress - TokenNetwork contract address for domain construction
+   * @returns True if signature is valid
+   */
+  async verifyBalanceProofWithDomain(
+    balanceProof: BalanceProof,
+    signature: string,
+    expectedSigner: string,
+    chainId: number,
+    tokenNetworkAddress: string
+  ): Promise<boolean> {
+    try {
+      const { ethers } = await requireOptional<typeof import('ethers')>('ethers', 'EVM settlement');
+
+      const domain = getDomainSeparator(chainId, tokenNetworkAddress);
+      const types = getBalanceProofTypes();
+
+      const recoveredSigner = ethers.verifyTypedData(domain, types, balanceProof, signature);
+
+      const isValid = recoveredSigner.toLowerCase() === expectedSigner.toLowerCase();
+
+      if (!isValid) {
+        this.logger.warn('Balance proof verification with explicit domain failed', {
+          channelId: balanceProof.channelId,
+          expectedSigner,
+          recoveredSigner,
+          chainId,
+          tokenNetworkAddress,
+        });
+      }
+
+      return isValid;
+    } catch (error) {
+      this.logger.error('Balance proof verification with explicit domain error', {
+        channelId: balanceProof.channelId,
+        chainId,
+        tokenNetworkAddress,
+        error,
+      });
+      return false;
+    }
   }
 
   /**

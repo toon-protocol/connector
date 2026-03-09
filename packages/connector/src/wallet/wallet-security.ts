@@ -156,7 +156,7 @@ export class WalletSecurityManager {
   /**
    * Get daily spending for agent
    * @param agentId - Agent identifier
-   * @param token - Token symbol (e.g., 'USDC', 'XRP')
+   * @param token - Token symbol (e.g., 'USDC', 'DAI')
    * @returns Total spending in last 24 hours
    * @remarks
    * Queries transaction history from audit log
@@ -191,7 +191,7 @@ export class WalletSecurityManager {
   /**
    * Get monthly spending for agent
    * @param agentId - Agent identifier
-   * @param token - Token symbol (e.g., 'USDC', 'XRP')
+   * @param token - Token symbol (e.g., 'USDC', 'DAI')
    * @returns Total spending in last 30 days
    * @remarks
    * Queries transaction history from audit log
@@ -229,7 +229,7 @@ export class WalletSecurityManager {
    * Validate transaction against spending limits and fraud detection
    * @param agentId - Agent identifier
    * @param amount - Transaction amount
-   * @param token - Token symbol (e.g., 'USDC', 'XRP')
+   * @param token - Token symbol (e.g., 'USDC', 'DAI')
    * @returns True if transaction valid, false if exceeds limits or fraud detected
    * @remarks
    * Checks: transaction size limit, daily limit, monthly limit, fraud detection

@@ -31,19 +31,9 @@ const ERC20_ABI = [
 interface TestnetWallets {
   seed: string;
   funding: {
-    aptos?: {
-      address: string;
-      privateKey: string;
-      publicKey: string;
-    };
     evm: {
       address: string;
       privateKey: string;
-      publicKey: string;
-    };
-    xrp?: {
-      address: string;
-      secret: string;
       publicKey: string;
     };
   };

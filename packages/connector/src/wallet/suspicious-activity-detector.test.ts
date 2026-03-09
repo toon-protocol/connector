@@ -70,8 +70,8 @@ describe('SuspiciousActivityDetector', () => {
         detector.recordTransaction('agent-001', BigInt(1000 + i * 100), 'USDC');
       }
 
-      // Try transaction with new token (XRP)
-      const isUnusual = detector.detectUnusualTransactions('agent-001', BigInt(1000), 'XRP');
+      // Try transaction with new token (DAI)
+      const isUnusual = detector.detectUnusualTransactions('agent-001', BigInt(1000), 'DAI');
       expect(isUnusual).toBe(true); // New token is suspicious
     });
 

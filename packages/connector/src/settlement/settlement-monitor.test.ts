@@ -717,4 +717,168 @@ describe('SettlementMonitor Threshold Detection', () => {
       expect(eventListener).toHaveBeenCalledTimes(1);
     });
   });
+
+  describe('Time-Based Settlement Threshold', () => {
+    it('should trigger settlement when time interval exceeded and balance > 0', async () => {
+      const config: SettlementMonitorConfig = {
+        thresholds: {
+          defaultThreshold: 999999n, // Very high amount threshold (won't trigger)
+          pollingInterval: 30000,
+          timeBasedIntervalMs: 100, // 100ms time interval for testing
+        },
+        peers: ['peer-a'],
+        tokenIds: ['ILP'],
+        nodeId: 'test-node',
+      };
+
+      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+
+      // Return balance below amount threshold but > 0
+      mockAccountManager.getAccountBalance.mockResolvedValue({
+        creditBalance: 500n, // Below 999999n threshold
+        debitBalance: 0n,
+        netBalance: 500n,
+      });
+
+      const eventListener = jest.fn();
+      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
+
+      // First check: time threshold starts at 0, so interval is exceeded
+      await checkBalances(settlementMonitor);
+
+      expect(eventListener).toHaveBeenCalledTimes(1);
+      expect(eventListener).toHaveBeenCalledWith(
+        expect.objectContaining({
+          peerId: 'peer-a',
+          tokenId: 'ILP',
+          currentBalance: 500n,
+        })
+      );
+    });
+
+    it('should NOT trigger time-based settlement when balance is 0', async () => {
+      const config: SettlementMonitorConfig = {
+        thresholds: {
+          defaultThreshold: 999999n,
+          pollingInterval: 30000,
+          timeBasedIntervalMs: 100,
+        },
+        peers: ['peer-a'],
+        tokenIds: ['ILP'],
+        nodeId: 'test-node',
+      };
+
+      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+
+      mockAccountManager.getAccountBalance.mockResolvedValue({
+        creditBalance: 0n,
+        debitBalance: 0n,
+        netBalance: 0n,
+      });
+
+      const eventListener = jest.fn();
+      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
+
+      await checkBalances(settlementMonitor);
+
+      expect(eventListener).not.toHaveBeenCalled();
+    });
+
+    it('should NOT trigger time-based settlement when state is not IDLE', async () => {
+      const config: SettlementMonitorConfig = {
+        thresholds: {
+          defaultThreshold: 999999n,
+          pollingInterval: 30000,
+          timeBasedIntervalMs: 100,
+        },
+        peers: ['peer-a'],
+        tokenIds: ['ILP'],
+        nodeId: 'test-node',
+      };
+
+      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+
+      mockAccountManager.getAccountBalance.mockResolvedValue({
+        creditBalance: 500n,
+        debitBalance: 0n,
+        netBalance: 500n,
+      });
+
+      const eventListener = jest.fn();
+      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
+
+      // First check triggers settlement (time exceeded)
+      await checkBalances(settlementMonitor);
+      expect(eventListener).toHaveBeenCalledTimes(1);
+
+      // Second check: state is SETTLEMENT_PENDING, should NOT trigger again
+      await checkBalances(settlementMonitor);
+      expect(eventListener).toHaveBeenCalledTimes(1);
+    });
+
+    it('should record last settlement time on markSettlementCompleted', async () => {
+      const config: SettlementMonitorConfig = {
+        thresholds: {
+          defaultThreshold: 999999n,
+          pollingInterval: 30000,
+          timeBasedIntervalMs: 60000, // 60s interval
+        },
+        peers: ['peer-a'],
+        tokenIds: ['ILP'],
+        nodeId: 'test-node',
+      };
+
+      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+
+      mockAccountManager.getAccountBalance.mockResolvedValue({
+        creditBalance: 500n,
+        debitBalance: 0n,
+        netBalance: 500n,
+      });
+
+      const eventListener = jest.fn();
+      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
+
+      // First check triggers (time starts at 0)
+      await checkBalances(settlementMonitor);
+      expect(eventListener).toHaveBeenCalledTimes(1);
+
+      // Complete settlement
+      settlementMonitor.markSettlementCompleted('peer-a', 'ILP');
+
+      // Immediately check again — 60s hasn't passed since completion
+      await checkBalances(settlementMonitor);
+      // Should NOT trigger because interval hasn't elapsed since last settlement
+      expect(eventListener).toHaveBeenCalledTimes(1);
+    });
+
+    it('should NOT trigger time-based when timeBasedIntervalMs is not configured', async () => {
+      const config: SettlementMonitorConfig = {
+        thresholds: {
+          defaultThreshold: 999999n,
+          pollingInterval: 30000,
+          // No timeBasedIntervalMs
+        },
+        peers: ['peer-a'],
+        tokenIds: ['ILP'],
+        nodeId: 'test-node',
+      };
+
+      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+
+      mockAccountManager.getAccountBalance.mockResolvedValue({
+        creditBalance: 500n,
+        debitBalance: 0n,
+        netBalance: 500n,
+      });
+
+      const eventListener = jest.fn();
+      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
+
+      await checkBalances(settlementMonitor);
+
+      // Only amount-based triggers; 500 < 999999 so no trigger
+      expect(eventListener).not.toHaveBeenCalled();
+    });
+  });
 });

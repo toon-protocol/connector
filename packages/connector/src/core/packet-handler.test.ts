@@ -974,4 +974,387 @@ describe('PacketHandler', () => {
       expect(decrementLog![0]).toHaveProperty('safetyMargin', 1000);
     });
   });
+
+  describe('handlePreparePacket() - Per-Hop BLS Notification', () => {
+    let routingTable: RoutingTable;
+    let mockLogger: jest.Mocked<Logger>;
+    let btpClientManager: jest.Mocked<BTPClientManager>;
+    let handler: PacketHandler;
+
+    beforeEach(() => {
+      // Set up routing table with a peer route (not local)
+      routingTable = new RoutingTable([{ prefix: 'g.alice', nextHop: 'peer-alice' }]);
+      mockLogger = createMockLogger();
+      btpClientManager = createMockBTPClientManager();
+      handler = new PacketHandler(routingTable, btpClientManager, 'test.connector', mockLogger);
+    });
+
+    it('should fire notification when perHopNotification enabled (HTTP path)', async () => {
+      // Arrange - enable per-hop notification with HTTP client
+      handler.setLocalDelivery({
+        enabled: true,
+        handlerUrl: 'http://localhost:3100',
+        timeout: 5000,
+        perHopNotification: true,
+      });
+
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      const result = await handler.handlePreparePacket(packet, 'source-peer-1');
+      // Wait for fire-and-forget promise to settle
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // Assert - packet should still be forwarded successfully (fire-and-forget doesn't block)
+      expect(result.type).toBe(PacketType.FULFILL);
+      expect(btpClientManager.sendToPeer).toHaveBeenCalledTimes(1);
+      // HTTP notification was attempted (may log debug on failure, but non-blocking)
+    });
+
+    it('should fire notification when perHopNotification enabled (in-process handler path)', async () => {
+      // Arrange - enable per-hop notification with in-process handler
+      handler.setLocalDelivery({
+        enabled: true,
+        handlerUrl: 'http://localhost:3100',
+        timeout: 5000,
+        perHopNotification: true,
+      });
+      const mockHandler = jest.fn().mockResolvedValue({
+        fulfill: { fulfillment: Buffer.alloc(32, 0xcd).toString('base64') },
+      });
+      handler.setLocalDeliveryHandler(mockHandler);
+
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      await handler.handlePreparePacket(packet, 'source-peer-1');
+      // Wait for fire-and-forget promise to settle
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Assert - in-process handler should have been called with isTransit: true
+      expect(mockHandler).toHaveBeenCalledTimes(1);
+      const callArgs = mockHandler.mock.calls[0];
+      const transitRequest = callArgs[0];
+      expect(transitRequest.isTransit).toBe(true);
+      expect(transitRequest.destination).toBe('g.alice.wallet');
+      expect(transitRequest.sourcePeer).toBe('source-peer-1');
+    });
+
+    it('should NOT fire notification when perHopNotification disabled (default)', async () => {
+      // Arrange - local delivery enabled but perHopNotification NOT set (defaults to false)
+      handler.setLocalDelivery({
+        enabled: true,
+        handlerUrl: 'http://localhost:3100',
+        timeout: 5000,
+      });
+      const mockHandler = jest.fn().mockResolvedValue({
+        fulfill: { fulfillment: Buffer.alloc(32, 0xcd).toString('base64') },
+      });
+      handler.setLocalDeliveryHandler(mockHandler);
+
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      await handler.handlePreparePacket(packet, 'source-peer-1');
+      // Wait to ensure no fire-and-forget calls
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Assert - handler should NOT have been called (no notification for transit)
+      expect(mockHandler).not.toHaveBeenCalled();
+      // BTP forward should still have happened
+      expect(btpClientManager.sendToPeer).toHaveBeenCalledTimes(1);
+    });
+
+    it('should still forward packet successfully when notification throws (HTTP path)', async () => {
+      // Arrange - enable per-hop notification (HTTP will fail/throw in test env)
+      handler.setLocalDelivery({
+        enabled: true,
+        handlerUrl: 'http://localhost:3100',
+        timeout: 5000,
+        perHopNotification: true,
+      });
+
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      const result = await handler.handlePreparePacket(packet, 'source-peer-1');
+      // Wait for fire-and-forget promise to settle
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // Assert - packet should still be forwarded and fulfilled despite notification failure
+      // This is the key test: forwarding succeeds even if notification fails
+      expect(result.type).toBe(PacketType.FULFILL);
+      expect(btpClientManager.sendToPeer).toHaveBeenCalledTimes(1);
+    });
+
+    it('should still forward packet successfully when notification throws (in-process handler path)', async () => {
+      // Arrange - enable per-hop notification with handler that rejects
+      handler.setLocalDelivery({
+        enabled: true,
+        handlerUrl: 'http://localhost:3100',
+        timeout: 5000,
+        perHopNotification: true,
+      });
+      const mockHandler = jest.fn().mockRejectedValue(new Error('Handler error'));
+      handler.setLocalDeliveryHandler(mockHandler);
+
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      const result = await handler.handlePreparePacket(packet, 'source-peer-1');
+      // Wait for fire-and-forget promise to settle
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Assert - packet should still be forwarded and fulfilled despite notification rejection
+      expect(result.type).toBe(PacketType.FULFILL);
+      expect(btpClientManager.sendToPeer).toHaveBeenCalledTimes(1);
+      // Debug log should show notification failure
+      const debugCalls = mockLogger.debug.mock.calls;
+      const notificationLog = debugCalls.find((call) =>
+        call[1]?.includes('Per-hop notification failed (fire-and-forget, in-process)')
+      );
+      expect(notificationLog).toBeDefined();
+      expect((notificationLog![0] as { error?: string }).error).toContain('Handler error');
+    });
+
+    it('should set isTransit: true for transit notifications (forwarding path)', async () => {
+      // Arrange - enable per-hop notification with in-process handler
+      handler.setLocalDelivery({
+        enabled: true,
+        handlerUrl: 'http://localhost:3100',
+        timeout: 5000,
+        perHopNotification: true,
+      });
+      const mockHandler = jest.fn().mockResolvedValue({
+        fulfill: { fulfillment: Buffer.alloc(32, 0xcd).toString('base64') },
+      });
+      handler.setLocalDeliveryHandler(mockHandler);
+
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      await handler.handlePreparePacket(packet, 'source-peer-1');
+      // Wait for fire-and-forget promise to settle
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Assert - isTransit should be true for the notification
+      expect(mockHandler).toHaveBeenCalledTimes(1);
+      const transitRequest = mockHandler.mock.calls[0][0];
+      expect(transitRequest.isTransit).toBe(true);
+    });
+
+    it('should NOT set isTransit for final-hop local delivery', async () => {
+      // Arrange - create handler with routing to local delivery
+      const localRoutingTable = new RoutingTable([
+        { prefix: 'g.local', nextHop: 'local' }, // Route to local delivery
+      ]);
+      const localHandler = new PacketHandler(
+        localRoutingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger
+      );
+
+      // Enable local delivery with handler
+      localHandler.setLocalDelivery({
+        enabled: true,
+        handlerUrl: 'http://localhost:3100',
+        timeout: 5000,
+        perHopNotification: true, // Even with per-hop enabled
+      });
+      const mockHandler = jest.fn().mockResolvedValue({
+        fulfill: { fulfillment: Buffer.alloc(32, 0xcd).toString('base64') },
+      });
+      localHandler.setLocalDeliveryHandler(mockHandler);
+
+      // Route to local (final-hop delivery, not forwarding)
+      const packet = createValidPreparePacket({ destination: 'g.local.wallet' });
+
+      // Act
+      await localHandler.handlePreparePacket(packet, 'source-peer-1');
+
+      // Assert - handler called for final-hop delivery, isTransit should NOT be set
+      expect(mockHandler).toHaveBeenCalledTimes(1);
+      const finalHopRequest = mockHandler.mock.calls[0][0];
+      expect(finalHopRequest.isTransit).toBeUndefined();
+    });
+
+    it('should prioritize in-process handler over HTTP client for per-hop notification', async () => {
+      // Arrange - configure both HTTP client and in-process handler
+      handler.setLocalDelivery({
+        enabled: true,
+        handlerUrl: 'http://localhost:3100',
+        timeout: 5000,
+        perHopNotification: true,
+      });
+      const mockHandler = jest.fn().mockResolvedValue({
+        fulfill: { fulfillment: Buffer.alloc(32, 0xcd).toString('base64') },
+      });
+      handler.setLocalDeliveryHandler(mockHandler);
+
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      await handler.handlePreparePacket(packet, 'source-peer-1');
+      // Wait for fire-and-forget promise to settle
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Assert - in-process handler should have been called, not HTTP
+      expect(mockHandler).toHaveBeenCalledTimes(1);
+      // No debug log about HTTP failure (HTTP path not taken)
+      const debugCalls = mockLogger.debug.mock.calls;
+      const httpLog = debugCalls.find((call) => call[1]?.includes('(fire-and-forget, HTTP)'));
+      expect(httpLog).toBeUndefined();
+    });
+
+    it('should emit PER_HOP_NOTIFICATION telemetry via telemetryEmitter when notification dispatched', async () => {
+      // Arrange - create handler with mock telemetryEmitter
+      const mockEmit = jest.fn();
+      const mockTelemetryEmitter = {
+        emit: mockEmit,
+        emitPacketReceived: jest.fn(),
+        emitPacketSent: jest.fn(),
+        emitRouteLookup: jest.fn(),
+      } as unknown as import('../telemetry/telemetry-emitter').TelemetryEmitter;
+
+      const telemetryHandler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger,
+        mockTelemetryEmitter
+      );
+      telemetryHandler.setLocalDelivery({
+        enabled: true,
+        handlerUrl: 'http://localhost:3100',
+        timeout: 5000,
+        perHopNotification: true,
+      });
+      const mockDeliveryHandler = jest.fn().mockResolvedValue({
+        fulfill: { fulfillment: Buffer.alloc(32, 0xcd).toString('base64') },
+      });
+      telemetryHandler.setLocalDeliveryHandler(mockDeliveryHandler);
+
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      await telemetryHandler.handlePreparePacket(packet, 'source-peer-1');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Assert - PER_HOP_NOTIFICATION emitted via telemetryEmitter
+      const perHopCalls = mockEmit.mock.calls.filter(
+        (call: unknown[]) => (call[0] as { type: string }).type === 'PER_HOP_NOTIFICATION'
+      );
+      expect(perHopCalls.length).toBe(1);
+      const emittedEvent = perHopCalls[0][0] as {
+        type: string;
+        nodeId: string;
+        destination: string;
+        amount: string;
+        nextHop: string;
+        sourcePeer: string;
+        correlationId: string;
+        timestamp: number;
+      };
+      expect(emittedEvent.type).toBe('PER_HOP_NOTIFICATION');
+      expect(emittedEvent.nodeId).toBe('test.connector');
+      expect(emittedEvent.destination).toBe('g.alice.wallet');
+      expect(emittedEvent.amount).toBe('1000');
+      expect(emittedEvent.nextHop).toBe('peer-alice');
+      expect(emittedEvent.sourcePeer).toBe('source-peer-1');
+      expect(emittedEvent.correlationId).toMatch(/^pkt_[a-f0-9]{16}$/);
+      expect(emittedEvent.timestamp).toBeGreaterThan(0);
+    });
+
+    it('should NOT emit PER_HOP_NOTIFICATION telemetry when perHopNotification disabled', async () => {
+      // Arrange - create handler with mock telemetryEmitter, perHopNotification disabled
+      const mockEmit = jest.fn();
+      const mockTelemetryEmitter = {
+        emit: mockEmit,
+        emitPacketReceived: jest.fn(),
+        emitPacketSent: jest.fn(),
+        emitRouteLookup: jest.fn(),
+      } as unknown as import('../telemetry/telemetry-emitter').TelemetryEmitter;
+
+      const telemetryHandler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger,
+        mockTelemetryEmitter
+      );
+      telemetryHandler.setLocalDelivery({
+        enabled: true,
+        handlerUrl: 'http://localhost:3100',
+        timeout: 5000,
+        // perHopNotification not set (defaults to false)
+      });
+
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      await telemetryHandler.handlePreparePacket(packet, 'source-peer-1');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Assert - no PER_HOP_NOTIFICATION emitted
+      const perHopCalls = mockEmit.mock.calls.filter(
+        (call: unknown[]) => (call[0] as { type: string }).type === 'PER_HOP_NOTIFICATION'
+      );
+      expect(perHopCalls.length).toBe(0);
+    });
+
+    it('should emit PER_HOP_NOTIFICATION telemetry via eventStore in standalone mode', async () => {
+      // Arrange - create handler without telemetryEmitter but with eventStore
+      const mockStoreEvent = jest.fn().mockResolvedValue(undefined);
+      const mockEventStore = {
+        storeEvent: mockStoreEvent,
+      } as unknown as import('../explorer/event-store').EventStore;
+
+      const mockBroadcast = jest.fn();
+      const mockBroadcaster = {
+        broadcast: mockBroadcast,
+      } as unknown as import('../explorer/event-broadcaster').EventBroadcaster;
+
+      const standaloneHandler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger,
+        null // no telemetryEmitter
+      );
+      standaloneHandler.setEventStore(mockEventStore);
+      standaloneHandler.setEventBroadcaster(mockBroadcaster);
+      standaloneHandler.setLocalDelivery({
+        enabled: true,
+        handlerUrl: 'http://localhost:3100',
+        timeout: 5000,
+        perHopNotification: true,
+      });
+      const mockDeliveryHandler = jest.fn().mockResolvedValue({
+        fulfill: { fulfillment: Buffer.alloc(32, 0xcd).toString('base64') },
+      });
+      standaloneHandler.setLocalDeliveryHandler(mockDeliveryHandler);
+
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      await standaloneHandler.handlePreparePacket(packet, 'source-peer-1');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Assert - PER_HOP_NOTIFICATION stored via eventStore
+      const perHopStoreCalls = mockStoreEvent.mock.calls.filter(
+        (call: unknown[]) => (call[0] as { type: string }).type === 'PER_HOP_NOTIFICATION'
+      );
+      expect(perHopStoreCalls.length).toBe(1);
+      const storedEvent = perHopStoreCalls[0][0] as { type: string; nodeId: string };
+      expect(storedEvent.type).toBe('PER_HOP_NOTIFICATION');
+      expect(storedEvent.nodeId).toBe('test.connector');
+
+      // Also broadcast to WebSocket clients
+      const perHopBroadcastCalls = mockBroadcast.mock.calls.filter(
+        (call: unknown[]) => (call[0] as { type: string }).type === 'PER_HOP_NOTIFICATION'
+      );
+      expect(perHopBroadcastCalls.length).toBe(1);
+    });
+  });
 });

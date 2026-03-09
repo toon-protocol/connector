@@ -241,11 +241,8 @@ export interface PeerAccountBalance {
  *   peerId: 'peer-alice',
  *   address: 'g.alice',
  *   settlementPreference: 'any',
- *   settlementTokens: ['USDC', 'XRP', 'APT'],
+ *   settlementTokens: ['USDC', 'DAI'],
  *   evmAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
- *   xrpAddress: 'rN7n7otQDd6FczFgLdlqtyMVrn3HMfXEEW',
- *   aptosAddress: '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
- *   aptosPubkey: 'abcd1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab'
  * };
  */
 export interface PeerConfig {
@@ -264,21 +261,17 @@ export interface PeerConfig {
   /**
    * Settlement preference for this peer
    * - 'evm': Only settle via EVM payment channels (Epic 8)
-   * - 'xrp': Only settle via XRP payment channels (Epic 9)
-   * - 'aptos': Only settle via Aptos payment channels (Epic 27)
-   * - 'any': Support all methods (auto-select based on token)
+   * - 'any': Support all methods (currently EVM-only)
    *
-   * Note: 'both' is deprecated in favor of 'any' for tri-chain support
+   * Note: 'both' is deprecated in favor of 'any'
    */
-  settlementPreference: 'evm' | 'xrp' | 'aptos' | 'any' | 'both';
+  settlementPreference: 'evm' | 'any' | 'both';
 
   /**
    * Supported settlement tokens
    * Format: Array of token identifiers
    * - ERC20 tokens: Contract address (e.g., '0x...')
-   * - XRP: Literal string 'XRP'
-   * - APT: Literal string 'APT'
-   * Example: ['USDC', 'XRP', 'APT', 'DAI']
+   * Example: ['USDC', 'DAI']
    */
   settlementTokens: string[];
 
@@ -288,27 +281,6 @@ export interface PeerConfig {
    * Format: Ethereum checksummed address (0x prefixed)
    */
   evmAddress?: string;
-
-  /**
-   * Optional: XRP Ledger address for XRP settlement
-   * Required if settlementPreference is 'xrp' or 'any' with XRP token
-   * Format: XRP Ledger r-address
-   */
-  xrpAddress?: string;
-
-  /**
-   * Optional: Aptos address for Aptos settlement
-   * Required if settlementPreference is 'aptos' or 'any' with APT token
-   * Format: 0x-prefixed 64-character hex (Aptos account address)
-   */
-  aptosAddress?: string;
-
-  /**
-   * Optional: Aptos public key for claim verification
-   * Required if settlementPreference is 'aptos' or 'any' with APT token
-   * Format: 64-character hex (ed25519 public key)
-   */
-  aptosPubkey?: string;
 
   /**
    * Optional: ERC20 token contract address for settlement
@@ -363,19 +335,10 @@ export interface PeerConfig {
  */
 export interface AdminSettlementConfig {
   /** Settlement method preference */
-  preference: 'evm' | 'xrp' | 'aptos' | 'any';
+  preference: 'evm' | 'any';
 
   /** 0x-prefixed EVM address (42 chars) */
   evmAddress?: string;
-
-  /** r-prefixed XRP address (25-35 chars) */
-  xrpAddress?: string;
-
-  /** 0x-prefixed Aptos address (66 chars) */
-  aptosAddress?: string;
-
-  /** Hex-encoded Ed25519 public key (64 chars) */
-  aptosPubkey?: string;
 
   /** ERC20 token contract address (0x-prefixed, 42 chars) */
   tokenAddress?: string;
@@ -396,9 +359,6 @@ export interface AdminSettlementConfig {
 /** Regex pattern for valid EVM addresses (0x + 40 hex chars) */
 const EVM_ADDRESS_REGEX = /^0x[0-9a-fA-F]{40}$/;
 
-/** Regex pattern for valid Aptos addresses (0x + 64 hex chars) */
-const APTOS_ADDRESS_REGEX = /^0x[0-9a-fA-F]{64}$/;
-
 /** Regex pattern for non-negative integer strings */
 const NON_NEGATIVE_INTEGER_REGEX = /^\d+$/;
 
@@ -409,24 +369,6 @@ const NON_NEGATIVE_INTEGER_REGEX = /^\d+$/;
  */
 export function isValidEvmAddress(address: string): boolean {
   return EVM_ADDRESS_REGEX.test(address);
-}
-
-/**
- * Validate an XRP address format
- * @param address - Address to validate
- * @returns true if address starts with 'r' and is 25-35 characters
- */
-export function isValidXrpAddress(address: string): boolean {
-  return address.startsWith('r') && address.length >= 25 && address.length <= 35;
-}
-
-/**
- * Validate an Aptos address format
- * @param address - Address to validate
- * @returns true if address matches 0x-prefixed 64-char hex pattern
- */
-export function isValidAptosAddress(address: string): boolean {
-  return APTOS_ADDRESS_REGEX.test(address);
 }
 
 /**
@@ -467,7 +409,6 @@ export interface SettlementRequiredEvent {
 
   /**
    * Token identifier
-   * - XRP: 'XRP'
    * - ERC20: Contract address (0x prefixed)
    */
   tokenId: string;
@@ -476,54 +417,6 @@ export interface SettlementRequiredEvent {
    * Timestamp of event emission
    */
   timestamp: number;
-}
-
-/**
- * XRP Payment Channel Claim
- *
- * Off-chain signed claim authorizing XRP transfer from payment channel.
- * Created by ClaimSigner, sent to peer for on-ledger submission.
- *
- * @interface XRPClaim
- * @example
- * const claim: XRPClaim = {
- *   channelId: 'A'.repeat(64),
- *   amount: '5000000000', // 5000 XRP in drops
- *   signature: 'B'.repeat(128),
- *   publicKey: 'ED' + 'C'.repeat(64)
- * };
- */
-export interface XRPClaim {
-  /**
-   * Channel identifier (transaction hash from PaymentChannelCreate)
-   * Format: 64-character hex string (256-bit hash)
-   * Example: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
-   */
-  channelId: string;
-
-  /**
-   * Cumulative XRP amount to claim from channel (drops)
-   * Format: String for bigint precision (1 XRP = 1,000,000 drops)
-   * Must be greater than all previous claims (monotonically increasing)
-   * Example: '5000000000' = 5000 XRP
-   */
-  amount: string;
-
-  /**
-   * ed25519 signature of claim message
-   * Format: 128-character hex string (64-byte signature)
-   * Signature covers: CLM\0 + channelId + amount (uint64 big-endian)
-   * Generated by ClaimSigner using xrpl.js signPaymentChannelClaim()
-   */
-  signature: string;
-
-  /**
-   * ed25519 public key for signature verification
-   * Format: 66-character hex string (ED prefix + 64 hex characters)
-   * Must match the public key registered in PaymentChannelCreate transaction
-   * Example: 'ED0123456789ABCDEF...'
-   */
-  publicKey: string;
 }
 
 /**
@@ -539,11 +432,8 @@ export interface XRPClaim {
  *       peerId: 'peer-alice',
  *       address: 'g.alice',
  *       settlementPreference: 'any',
- *       settlementTokens: ['USDC', 'XRP', 'APT'],
+ *       settlementTokens: ['USDC', 'DAI'],
  *       evmAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
- *       xrpAddress: 'rN7n7otQDd6FczFgLdlqtyMVrn3HMfXEEW',
- *       aptosAddress: '0x1234...',
- *       aptosPubkey: 'abcd...'
  *     }]
  *   ]),
  *   defaultPreference: 'any',
@@ -562,7 +452,7 @@ export interface UnifiedSettlementExecutorConfig {
    * Default settlement preference (fallback)
    * Used when peer not found in peers map
    */
-  defaultPreference: 'evm' | 'xrp' | 'aptos' | 'any' | 'both';
+  defaultPreference: 'evm' | 'any' | 'both';
 
   /**
    * Enable settlement execution

@@ -9,7 +9,7 @@
  * @packageDocumentation
  */
 
-import { ConnectorConfig } from './types';
+import { ConnectorConfig, EVMChainConfig } from './types';
 import { ConfigurationError } from './config-loader';
 import { createLogger } from '../utils/logger';
 
@@ -82,21 +82,63 @@ export function validateEnvironment(config: ConnectorConfig): void {
 }
 
 /**
+ * Validate an EVM chain configuration for production environment.
+ *
+ * Enforces strict validation rules:
+ * - Chain ID must match expected mainnet chain ID
+ * - RPC URL must not contain localhost or 127.0.0.1
+ * - RPC URL must use HTTPS (not HTTP)
+ * - Private key must not be a known development key
+ *
+ * @param chain - EVM chain configuration
+ * @param chainName - Human-readable chain name for error messages (e.g., 'Base', 'Arbitrum')
+ * @param expectedChainId - Expected mainnet chain ID
+ * @throws ConfigurationError if any production validation rule fails
+ * @private
+ */
+function validateEVMChainProduction(
+  chain: EVMChainConfig,
+  chainName: string,
+  expectedChainId: number
+): void {
+  // Chain ID must match expected mainnet
+  if (chain.chainId !== expectedChainId) {
+    throw new ConfigurationError(
+      `Production must use ${chainName} mainnet (chainId ${expectedChainId}), got chainId ${chain.chainId}`
+    );
+  }
+
+  // RPC URL must not contain localhost
+  if (chain.rpcUrl.includes('localhost') || chain.rpcUrl.includes('127.0.0.1')) {
+    throw new ConfigurationError(
+      `Cannot use localhost RPC for ${chainName} in production. Use public mainnet endpoint.`
+    );
+  }
+
+  // RPC URL must use HTTPS
+  if (!chain.rpcUrl.startsWith('https://') && !chain.rpcUrl.startsWith('wss://')) {
+    throw new ConfigurationError(`Production ${chainName} RPC URL must use HTTPS for security`);
+  }
+
+  // Private key must not be a known development key
+  if (chain.privateKey && KNOWN_DEV_PRIVATE_KEYS.includes(chain.privateKey)) {
+    throw new ConfigurationError(
+      `Cannot use development private key for ${chainName} in production. Use secure key from KMS/HSM.`
+    );
+  }
+}
+
+/**
  * Validate Production Environment Configuration
  *
  * Enforces strict validation rules for production deployments.
  * All validations are HARD ERRORS (throw ConfigurationError).
  *
- * Base blockchain validations:
- * - Chain ID must be Base mainnet (8453)
+ * EVM chain validations (Base, Arbitrum):
+ * - Chain ID must match expected mainnet chain ID
  * - RPC URL must not contain localhost or 127.0.0.1
  * - RPC URL must use HTTPS (not HTTP)
  * - Private key must not be a known development key
- *
- * XRPL blockchain validations:
- * - Network must be 'mainnet'
- * - RPC URL must not contain localhost or 127.0.0.1
- * - RPC URL must use HTTPS (not HTTP)
  *
  * @param config - Connector configuration
  * @throws ConfigurationError if any production validation rule fails
@@ -118,61 +160,12 @@ function validateProductionEnvironment(config: ConnectorConfig): void {
 
   // Validate Base blockchain if enabled
   if (config.blockchain?.base?.enabled) {
-    const base = config.blockchain.base;
-
-    // Chain ID must be Base mainnet (8453)
-    if (base.chainId !== 8453) {
-      throw new ConfigurationError(
-        `Production must use Base mainnet (chainId 8453), got chainId ${base.chainId}`
-      );
-    }
-
-    // RPC URL must not contain localhost
-    if (base.rpcUrl.includes('localhost') || base.rpcUrl.includes('127.0.0.1')) {
-      throw new ConfigurationError(
-        'Cannot use localhost RPC in production. Use public mainnet endpoint.'
-      );
-    }
-
-    // RPC URL must use HTTPS
-    if (!base.rpcUrl.startsWith('https://') && !base.rpcUrl.startsWith('wss://')) {
-      throw new ConfigurationError('Production RPC URL must use HTTPS for security');
-    }
-
-    // Private key must not be a known development key
-    if (base.privateKey && KNOWN_DEV_PRIVATE_KEYS.includes(base.privateKey)) {
-      throw new ConfigurationError(
-        'Cannot use development private key in production. Use secure key from KMS/HSM.'
-      );
-    }
+    validateEVMChainProduction(config.blockchain.base, 'Base', 8453);
   }
 
-  // Validate XRPL blockchain if enabled
-  if (config.blockchain?.xrpl?.enabled) {
-    const xrpl = config.blockchain.xrpl;
-
-    // Network must be mainnet
-    if (xrpl.network !== 'mainnet') {
-      throw new ConfigurationError(
-        `Production must use XRPL mainnet, got network '${xrpl.network}'`
-      );
-    }
-
-    // RPC URL must not contain localhost
-    if (xrpl.rpcUrl.includes('localhost') || xrpl.rpcUrl.includes('127.0.0.1')) {
-      throw new ConfigurationError(
-        'Cannot use localhost rippled in production. Use public mainnet endpoint.'
-      );
-    }
-
-    // RPC URL must use HTTPS (if using HTTP transport, not WebSocket)
-    if (
-      xrpl.rpcUrl.startsWith('http://') ||
-      xrpl.rpcUrl.startsWith('ws://') ||
-      xrpl.rpcUrl.includes('localhost')
-    ) {
-      throw new ConfigurationError('Production XRPL RPC URL must use HTTPS for security');
-    }
+  // Validate Arbitrum blockchain if enabled
+  if (config.blockchain?.arbitrum?.enabled) {
+    validateEVMChainProduction(config.blockchain.arbitrum, 'Arbitrum', 42161);
   }
 }
 
@@ -197,10 +190,70 @@ function logDevelopmentWarnings(config: ConnectorConfig): void {
     logger.warn(`⚠️  Base Chain ID: ${config.blockchain.base.chainId}`);
   }
 
-  // Log XRPL blockchain config if enabled
-  if (config.blockchain?.xrpl?.enabled) {
-    logger.warn(`⚠️  XRPL RPC: ${config.blockchain.xrpl.rpcUrl}`);
-    logger.warn(`⚠️  XRPL Network: ${config.blockchain.xrpl.network}`);
+  // Log Arbitrum blockchain config if enabled
+  if (config.blockchain?.arbitrum?.enabled) {
+    logger.warn(`⚠️  Arbitrum RPC: ${config.blockchain.arbitrum.rpcUrl}`);
+    logger.warn(`⚠️  Arbitrum Chain ID: ${config.blockchain.arbitrum.chainId}`);
+  }
+}
+
+/**
+ * Validate an EVM chain configuration for staging environment.
+ *
+ * Enforces moderate validation rules for public testnet deployments:
+ * - Chain ID must match expected testnet chain ID
+ * - Warns on localhost RPC URLs
+ * - Warns on HTTP for public endpoints
+ * - Rejects known Anvil development keys
+ *
+ * @param chain - EVM chain configuration
+ * @param chainName - Human-readable chain name for log/error messages
+ * @param expectedChainId - Expected testnet chain ID
+ * @throws ConfigurationError if staging validation fails
+ * @private
+ */
+function validateEVMChainStaging(
+  chain: EVMChainConfig,
+  chainName: string,
+  expectedChainId: number
+): void {
+  logger.warn(`⚠️  ${chainName} RPC: ${chain.rpcUrl}`);
+  logger.warn(`⚠️  ${chainName} Chain ID: ${chain.chainId}`);
+
+  // Chain ID must match expected testnet
+  if (chain.chainId !== expectedChainId) {
+    throw new ConfigurationError(
+      `Staging must use ${chainName} testnet (chainId ${expectedChainId}), got chainId ${chain.chainId}. ` +
+        `Use ENVIRONMENT=production for ${chainName} mainnet.`
+    );
+  }
+
+  // RPC URL must not point to localhost (staging uses public testnets)
+  if (chain.rpcUrl.includes('localhost') || chain.rpcUrl.includes('127.0.0.1')) {
+    logger.warn(
+      `⚠️  Staging ${chainName} RPC points to localhost. ` +
+        `Use a public testnet endpoint, or ENVIRONMENT=development for local Anvil.`
+    );
+  }
+
+  // Warn if using HTTP instead of HTTPS for public endpoints
+  if (
+    chain.rpcUrl.startsWith('http://') &&
+    !chain.rpcUrl.includes('localhost') &&
+    !chain.rpcUrl.includes('127.0.0.1') &&
+    !chain.rpcUrl.includes('anvil')
+  ) {
+    logger.warn(
+      `⚠️  Staging ${chainName} RPC uses HTTP - consider HTTPS for public testnet endpoints`
+    );
+  }
+
+  // Reject known development keys in staging
+  if (chain.privateKey && KNOWN_DEV_PRIVATE_KEYS.includes(chain.privateKey)) {
+    throw new ConfigurationError(
+      `Cannot use Anvil development private key for ${chainName} in staging. ` +
+        'Generate a dedicated testnet wallet for staging deployment.'
+    );
   }
 }
 
@@ -208,12 +261,7 @@ function logDevelopmentWarnings(config: ConnectorConfig): void {
  * Log Staging Environment Warnings and Validate Testnet Configuration
  *
  * Emits warning logs to indicate staging/testnet mode.
- * Enforces moderate validation rules for public testnet deployments:
- * - Base chain ID must be testnet (84532 Base Sepolia)
- * - XRPL network must be 'testnet'
- * - RPC URLs should use HTTPS for public endpoints
- * - Rejects known Anvil development keys
- * - Rejects localhost RPC URLs (staging uses public testnets)
+ * Validates all enabled EVM chains for testnet correctness.
  *
  * @param config - Connector configuration
  * @throws ConfigurationError if staging validation fails
@@ -221,71 +269,16 @@ function logDevelopmentWarnings(config: ConnectorConfig): void {
  */
 function logStagingWarnings(config: ConnectorConfig): void {
   logger.warn('⚠️  STAGING MODE - Using public testnets');
-  logger.warn('⚠️  Base Sepolia (84532) + XRPL Testnet');
   logger.warn('⚠️  This is NOT production configuration');
 
   // Validate Base blockchain if enabled
   if (config.blockchain?.base?.enabled) {
-    const base = config.blockchain.base;
-    logger.warn(`⚠️  Base RPC: ${base.rpcUrl}`);
-    logger.warn(`⚠️  Base Chain ID: ${base.chainId}`);
-
-    // Chain ID must be Base Sepolia (84532) for staging
-    if (base.chainId !== 84532) {
-      throw new ConfigurationError(
-        `Staging must use Base Sepolia (chainId 84532), got chainId ${base.chainId}. ` +
-          `Use ENVIRONMENT=production for Base mainnet (8453).`
-      );
-    }
-
-    // RPC URL must not point to localhost (staging uses public testnets)
-    if (base.rpcUrl.includes('localhost') || base.rpcUrl.includes('127.0.0.1')) {
-      logger.warn(
-        '⚠️  Staging Base RPC points to localhost. ' +
-          'Use https://sepolia.base.org for public testnet, or ENVIRONMENT=development for local Anvil.'
-      );
-    }
-
-    // Warn if using HTTP instead of HTTPS for public endpoints
-    if (
-      base.rpcUrl.startsWith('http://') &&
-      !base.rpcUrl.includes('localhost') &&
-      !base.rpcUrl.includes('127.0.0.1') &&
-      !base.rpcUrl.includes('anvil')
-    ) {
-      logger.warn('⚠️  Staging Base RPC uses HTTP - consider HTTPS for public testnet endpoints');
-    }
-
-    // Reject known development keys in staging
-    if (base.privateKey && KNOWN_DEV_PRIVATE_KEYS.includes(base.privateKey)) {
-      throw new ConfigurationError(
-        'Cannot use Anvil development private key in staging. ' +
-          'Generate a dedicated testnet wallet for staging deployment.'
-      );
-    }
+    validateEVMChainStaging(config.blockchain.base, 'Base', 84532);
   }
 
-  // Validate XRPL blockchain if enabled
-  if (config.blockchain?.xrpl?.enabled) {
-    const xrpl = config.blockchain.xrpl;
-    logger.warn(`⚠️  XRPL RPC: ${xrpl.rpcUrl}`);
-    logger.warn(`⚠️  XRPL Network: ${xrpl.network}`);
-
-    // Network must be testnet for staging
-    if (xrpl.network !== 'testnet') {
-      throw new ConfigurationError(
-        `Staging must use XRPL testnet, got network '${xrpl.network}'. ` +
-          `Use ENVIRONMENT=production for mainnet, or ENVIRONMENT=development for standalone.`
-      );
-    }
-
-    // RPC URL must not point to localhost
-    if (xrpl.rpcUrl.includes('localhost') || xrpl.rpcUrl.includes('127.0.0.1')) {
-      logger.warn(
-        '⚠️  Staging XRPL RPC points to localhost. ' +
-          'Use https://s.altnet.rippletest.net:51234 for public testnet.'
-      );
-    }
+  // Validate Arbitrum blockchain if enabled
+  if (config.blockchain?.arbitrum?.enabled) {
+    validateEVMChainStaging(config.blockchain.arbitrum, 'Arbitrum', 421614);
   }
 }
 
@@ -499,16 +492,38 @@ function validateIPAllowlist(config: ConnectorConfig): void {
  * ```
  */
 export async function validateChainId(config: ConnectorConfig): Promise<void> {
-  // Only validate Base chain ID if enabled
-  if (!config.blockchain?.base?.enabled) {
-    return;
+  const validations: Promise<void>[] = [];
+
+  // Validate Base chain ID if enabled
+  if (config.blockchain?.base?.enabled) {
+    validations.push(validateEVMChainId(config.blockchain.base, 'Base', 'BASE_RPC_URL'));
   }
 
-  const base = config.blockchain.base;
+  // Validate Arbitrum chain ID if enabled
+  if (config.blockchain?.arbitrum?.enabled) {
+    validations.push(
+      validateEVMChainId(config.blockchain.arbitrum, 'Arbitrum', 'ARBITRUM_RPC_URL')
+    );
+  }
 
+  await Promise.all(validations);
+}
+
+/**
+ * Validate a single EVM chain's configured chain ID against its RPC endpoint.
+ *
+ * @param chain - EVM chain configuration
+ * @param chainName - Human-readable chain name for log messages
+ * @param envVarHint - Environment variable name to mention in mismatch warnings
+ * @private
+ */
+async function validateEVMChainId(
+  chain: EVMChainConfig,
+  chainName: string,
+  envVarHint: string
+): Promise<void> {
   try {
-    // Query RPC endpoint for actual chain ID
-    const response = await fetch(base.rpcUrl, {
+    const response = await fetch(chain.rpcUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -520,34 +535,33 @@ export async function validateChainId(config: ConnectorConfig): Promise<void> {
     });
 
     if (!response.ok) {
-      logger.warn(`Chain ID validation failed: RPC endpoint returned HTTP ${response.status}`);
+      logger.warn(
+        `${chainName} chain ID validation failed: RPC endpoint returned HTTP ${response.status}`
+      );
       return;
     }
 
     const data = (await response.json()) as { result?: string; error?: { message: string } };
 
     if (data.error) {
-      logger.warn(`Chain ID validation failed: ${data.error.message}`);
+      logger.warn(`${chainName} chain ID validation failed: ${data.error.message}`);
       return;
     }
 
     if (!data.result) {
-      logger.warn('Chain ID validation failed: No result from RPC endpoint');
+      logger.warn(`${chainName} chain ID validation failed: No result from RPC endpoint`);
       return;
     }
 
-    // Parse hex chain ID from RPC response
     const actualChainId = parseInt(data.result, 16);
 
-    // Compare with configured chain ID
-    if (actualChainId !== base.chainId) {
+    if (actualChainId !== chain.chainId) {
       logger.warn(
-        `⚠️  Chain ID mismatch: config expects ${base.chainId}, RPC returned ${actualChainId}`
+        `⚠️  ${chainName} chain ID mismatch: config expects ${chain.chainId}, RPC returned ${actualChainId}`
       );
-      logger.warn('⚠️  Verify BASE_RPC_URL points to correct network');
+      logger.warn(`⚠️  Verify ${envVarHint} points to correct network`);
     }
   } catch (error) {
-    // Don't fail startup on validation error, just log warning
-    logger.warn(`Chain ID validation failed: ${(error as Error).message}`);
+    logger.warn(`${chainName} chain ID validation failed: ${(error as Error).message}`);
   }
 }

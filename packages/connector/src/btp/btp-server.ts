@@ -202,7 +202,8 @@ export class BTPServer {
    */
   async sendPacketToPeer(
     peerId: string,
-    packet: ILPPreparePacket
+    packet: ILPPreparePacket,
+    protocolData?: Array<{ protocolName: string; contentType: number; data: Buffer }>
   ): Promise<ILPFulfillPacket | ILPRejectPacket> {
     this.logger.debug(
       { event: 'btp_server_send_to_peer', peerId, destination: packet.destination },
@@ -235,7 +236,7 @@ export class BTPServer {
       type: BTPMessageType.MESSAGE,
       requestId,
       data: {
-        protocolData: [],
+        protocolData: protocolData ?? [],
         ilpPacket: ilpPacketBuffer,
       },
     };

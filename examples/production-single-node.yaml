@@ -63,13 +63,12 @@ settlement:
   tigerBeetleReplicas:
     - tigerbeetle:3000
 
-# Settlement preference: 'evm' | 'xrp' | 'aptos' | 'both'
+# Settlement preference: 'evm'
 # Override with SETTLEMENT_PREFERENCE environment variable.
-settlementPreference: both
+settlementPreference: evm
 
 # Blockchain RPC endpoints
-# Override with BASE_RPC_URL, BASE_L2_RPC_URL, XRPL_WSS_URL, APTOS_NODE_URL
-# All loaded from environment variables
+# Override with BASE_RPC_URL, BASE_L2_RPC_URL environment variables
 
 # =============================================================================
 # Logging Configuration

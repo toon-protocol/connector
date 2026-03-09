@@ -339,7 +339,10 @@ export class BTPClient extends EventEmitter {
    * @param packet - ILP Prepare packet
    * @returns ILP Fulfill or Reject packet
    */
-  async sendPacket(packet: ILPPreparePacket): Promise<ILPFulfillPacket | ILPRejectPacket> {
+  async sendPacket(
+    packet: ILPPreparePacket,
+    protocolData?: Array<{ protocolName: string; contentType: number; data: Buffer }>
+  ): Promise<ILPFulfillPacket | ILPRejectPacket> {
     if (!this.isConnected) {
       throw new BTPConnectionError('Not connected to peer');
     }
@@ -359,7 +362,7 @@ export class BTPClient extends EventEmitter {
       type: BTPMessageType.MESSAGE,
       requestId,
       data: {
-        protocolData: [],
+        protocolData: protocolData ?? [],
         ilpPacket: serializedPacket,
       } as BTPData,
     };

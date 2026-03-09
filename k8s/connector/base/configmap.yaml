@@ -2,8 +2,8 @@
 # Non-sensitive configuration values
 #
 # This is the base ConfigMap. Use overlays to configure for different environments:
-#   - overlays/staging    -> TESTNET (Base Sepolia, XRP Testnet, Aptos Testnet)
-#   - overlays/production -> MAINNET (Base Mainnet, XRP Mainnet, Aptos Mainnet)
+#   - overlays/staging    -> TESTNET (Base Sepolia)
+#   - overlays/production -> MAINNET (Base Mainnet)
 #
 apiVersion: v1
 kind: ConfigMap
@@ -51,10 +51,6 @@ data:
   # Base L2 (EVM)
   BASE_RPC_URL: "https://mainnet.base.org"
   BASE_L2_RPC_URL: "https://mainnet.base.org"
-  # XRP Ledger
-  XRPL_WSS_URL: "wss://xrplcluster.com"
-  # Aptos
-  APTOS_NODE_URL: "https://fullnode.mainnet.aptoslabs.com/v1"
 
   # Monitoring
   PROMETHEUS_ENABLED: "true"

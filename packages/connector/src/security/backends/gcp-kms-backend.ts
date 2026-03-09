@@ -5,7 +5,7 @@ import { requireOptional } from '../../utils/optional-require';
 
 /**
  * GCPKMSBackend implements KeyManagerBackend using Google Cloud Key Management Service
- * Supports EVM (secp256k1) and XRP (ed25519) key types
+ * Supports EVM (secp256k1) key type
  */
 export class GCPKMSBackend implements KeyManagerBackend {
   private client: KMSClientType | null = null;
@@ -43,17 +43,10 @@ export class GCPKMSBackend implements KeyManagerBackend {
   /**
    * Detects key type based on keyId
    * @param keyId - Key identifier (crypto key name)
-   * @returns Key type ('evm' or 'xrp')
+   * @returns Key type (always 'evm' for EVM-only connector)
    */
-  private _detectKeyType(keyId: string): 'evm' | 'xrp' {
-    const lowerKeyId = keyId.toLowerCase();
-    if (lowerKeyId.includes('evm') || keyId === this.config.evmKeyId) {
-      return 'evm';
-    }
-    if (lowerKeyId.includes('xrp') || keyId === this.config.xrpKeyId) {
-      return 'xrp';
-    }
-    // Default to EVM
+  private _detectKeyType(_keyId: string): 'evm' {
+    // EVM-only connector - always return 'evm'
     return 'evm';
   }
 

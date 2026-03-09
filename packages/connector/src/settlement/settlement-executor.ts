@@ -31,6 +31,7 @@ import { PaymentChannelSDK } from './payment-channel-sdk';
 import { SettlementMonitor } from './settlement-monitor';
 import { EventStore } from '../explorer/event-store';
 import { EventBroadcaster } from '../explorer/event-broadcaster';
+import type { PerPacketClaimService } from './per-packet-claim-service';
 
 /**
  * Configuration interface for SettlementExecutor
@@ -104,6 +105,7 @@ export class SettlementExecutor extends EventEmitter {
   private readonly boundHandleSettlement: (event: SettlementTriggerEvent) => Promise<void>;
   private eventStore: EventStore | null = null;
   private eventBroadcaster: EventBroadcaster | null = null;
+  private perPacketClaimService: PerPacketClaimService | null = null;
 
   /**
    * Constructor
@@ -172,6 +174,15 @@ export class SettlementExecutor extends EventEmitter {
       { hasBroadcaster: broadcaster !== null },
       'EventBroadcaster reference set for settlement event streaming'
     );
+  }
+
+  /**
+   * Set PerPacketClaimService for using latest per-packet claims in on-chain settlement
+   * @param service - PerPacketClaimService instance
+   */
+  setPerPacketClaimService(service: PerPacketClaimService): void {
+    this.perPacketClaimService = service;
+    this.logger.info('PerPacketClaimService set for on-chain settlement');
   }
 
   /**
@@ -505,41 +516,66 @@ export class SettlementExecutor extends EventEmitter {
       await this.depositAdditionalFunds(channelId, tokenAddress, amount);
     }
 
-    // Calculate new balance proof
-    const newNonce = channelState.myNonce + 1;
-    const newTransferred = channelState.myTransferred + amount;
+    // Use latest per-packet claim if available, otherwise generate fresh balance proof
+    let myBalanceProof: BalanceProof;
+    let mySignature: string;
 
-    this.logger.info(
-      {
+    const latestClaim = this.perPacketClaimService?.getLatestClaim(channelId);
+    if (latestClaim) {
+      // Per-packet claims already accumulated the correct cumulative state
+      myBalanceProof = {
         channelId,
-        newNonce,
-        newTransferred: newTransferred.toString(),
-        amount: amount.toString(),
-      },
-      'Signing balance proof for cooperative settlement'
-    );
+        nonce: latestClaim.nonce,
+        transferredAmount: BigInt(latestClaim.transferredAmount),
+        lockedAmount: BigInt(latestClaim.lockedAmount),
+        locksRoot: latestClaim.locksRoot,
+      };
+      mySignature = latestClaim.signature;
 
-    // Sign my balance proof (lockedAmount=0, locksRoot=0x00...00 for simple settlements)
-    const myBalanceProof: BalanceProof = {
-      channelId,
-      nonce: newNonce,
-      transferredAmount: newTransferred,
-      lockedAmount: 0n,
-      locksRoot: '0x' + '0'.repeat(64),
-    };
+      this.logger.info(
+        {
+          channelId,
+          nonce: latestClaim.nonce,
+          transferred: latestClaim.transferredAmount,
+        },
+        'Using latest per-packet claim for on-chain settlement'
+      );
+    } else {
+      // Fallback: calculate new balance proof (legacy path)
+      const newNonce = channelState.myNonce + 1;
+      const newTransferred = channelState.myTransferred + amount;
 
-    const mySignature = await this.retryWithBackoff(
-      async () =>
-        await this.paymentChannelSDK.signBalanceProof(
+      this.logger.info(
+        {
           channelId,
           newNonce,
-          newTransferred,
-          0n,
-          '0x' + '0'.repeat(64)
-        ),
-      'signBalanceProof',
-      this.config.maxRetries
-    );
+          newTransferred: newTransferred.toString(),
+          amount: amount.toString(),
+        },
+        'Signing balance proof for cooperative settlement'
+      );
+
+      myBalanceProof = {
+        channelId,
+        nonce: newNonce,
+        transferredAmount: newTransferred,
+        lockedAmount: 0n,
+        locksRoot: '0x' + '0'.repeat(64),
+      };
+
+      mySignature = await this.retryWithBackoff(
+        async () =>
+          await this.paymentChannelSDK.signBalanceProof(
+            channelId,
+            myBalanceProof.nonce,
+            myBalanceProof.transferredAmount,
+            0n,
+            '0x' + '0'.repeat(64)
+          ),
+        'signBalanceProof',
+        this.config.maxRetries
+      );
+    }
 
     // In a real implementation, we would exchange balance proofs with peer off-chain
     // For this story, we simulate the peer also signing their proof
@@ -588,6 +624,11 @@ export class SettlementExecutor extends EventEmitter {
 
     // Update TigerBeetle after successful settlement
     await this.accountManager.recordSettlement(peerId, tokenId, amount);
+
+    // Reset per-packet claim tracking after successful on-chain settlement
+    if (this.perPacketClaimService) {
+      this.perPacketClaimService.resetChannel(channelId);
+    }
 
     this.logger.info(
       { peerId, tokenId, amount: amount.toString() },

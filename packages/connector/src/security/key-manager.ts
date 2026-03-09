@@ -17,7 +17,6 @@ export interface KeyManagerBackend {
 export interface AWSConfig {
   region: string;
   evmKeyId: string;
-  xrpKeyId: string;
   credentials?: {
     accessKeyId: string;
     secretAccessKey: string;
@@ -32,7 +31,6 @@ export interface GCPConfig {
   locationId: string;
   keyRingId: string;
   evmKeyId: string;
-  xrpKeyId: string;
 }
 
 /**
@@ -41,7 +39,6 @@ export interface GCPConfig {
 export interface AzureConfig {
   vaultUrl: string;
   evmKeyName: string;
-  xrpKeyName: string;
   credentials?: {
     tenantId: string;
     clientId: string;
@@ -57,7 +54,6 @@ export interface HSMConfig {
   slotId: number;
   pin: string;
   evmKeyLabel: string;
-  xrpKeyLabel: string;
 }
 
 /**
@@ -180,7 +176,7 @@ export class KeyManager {
    * Signs a message using the backend-specific signing mechanism
    * @param message - Message to sign
    * @param keyId - Key identifier (backend-specific format)
-   * @returns Signature buffer compatible with EVM (ECDSA) or XRP (ed25519) verification
+   * @returns Signature buffer compatible with EVM (ECDSA) verification
    */
   async sign(message: Buffer, keyId: string): Promise<Buffer> {
     const messageHash = message.toString('hex');
@@ -209,7 +205,7 @@ export class KeyManager {
   /**
    * Retrieves public key for signature verification
    * @param keyId - Key identifier
-   * @returns Public key buffer in format compatible with blockchain (secp256k1 for EVM, ed25519 for XRP)
+   * @returns Public key buffer in format compatible with blockchain (secp256k1 for EVM)
    */
   async getPublicKey(keyId: string): Promise<Buffer> {
     this.logger.debug({ keyId }, 'Retrieving public key');

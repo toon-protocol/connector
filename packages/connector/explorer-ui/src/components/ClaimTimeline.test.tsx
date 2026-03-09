@@ -11,7 +11,7 @@ describe('ClaimTimeline', () => {
     type: 'CLAIM_SENT',
     timestamp: Date.now(),
     success: true,
-    blockchain: 'xrp',
+    blockchain: 'evm',
     amount: '1000000',
     messageId: 'msg_test123',
     peerId: 'peer-alice',
@@ -120,7 +120,7 @@ describe('ClaimTimeline', () => {
           type: 'CLAIM_REDEEMED',
           success: true,
           txHash: 'ABC123DEF456',
-          blockchain: 'xrp',
+          blockchain: 'evm',
         }),
       ];
 
@@ -154,7 +154,7 @@ describe('ClaimTimeline', () => {
           type: 'CLAIM_REDEEMED',
           success: true,
           txHash: '0xdef789',
-          blockchain: 'aptos',
+          blockchain: 'evm',
         }),
       ];
 
@@ -217,7 +217,7 @@ describe('ClaimTimeline', () => {
 
   describe('blockchain badges', () => {
     it('displays XRP blockchain badge', () => {
-      const events = [createClaimEvent({ blockchain: 'xrp' })];
+      const events = [createClaimEvent({ blockchain: 'evm' })];
 
       render(<ClaimTimeline messageId="msg_123" events={events} />);
 
@@ -233,7 +233,7 @@ describe('ClaimTimeline', () => {
     });
 
     it('displays Aptos blockchain badge', () => {
-      const events = [createClaimEvent({ blockchain: 'aptos' })];
+      const events = [createClaimEvent({ blockchain: 'evm' })];
 
       render(<ClaimTimeline messageId="msg_123" events={events} />);
 
@@ -245,7 +245,7 @@ describe('ClaimTimeline', () => {
     it('displays claim amount for XRP', () => {
       const events = [
         createClaimEvent({
-          blockchain: 'xrp',
+          blockchain: 'evm',
           amount: '1000000', // 1 XRP in drops
         }),
       ];

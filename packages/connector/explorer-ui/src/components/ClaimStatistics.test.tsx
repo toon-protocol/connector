@@ -8,7 +8,7 @@ import { ClaimStatistics, ClaimStats } from './ClaimStatistics';
 
 describe('ClaimStatistics', () => {
   const createStats = (overrides: Partial<ClaimStats> = {}): ClaimStats => ({
-    blockchain: 'xrp',
+    blockchain: 'evm',
     sentCount: 100,
     receivedCount: 95,
     redeemedCount: 90,
@@ -62,7 +62,7 @@ describe('ClaimStatistics', () => {
     it('renders XRP statistics card', () => {
       const stats = [
         createStats({
-          blockchain: 'xrp',
+          blockchain: 'evm',
           sentCount: 150,
           receivedCount: 145,
           redeemedCount: 140,
@@ -100,7 +100,7 @@ describe('ClaimStatistics', () => {
     it('renders Aptos statistics card', () => {
       const stats = [
         createStats({
-          blockchain: 'aptos',
+          blockchain: 'evm',
           sentCount: 80,
           receivedCount: 79,
           redeemedCount: 78,
@@ -118,9 +118,9 @@ describe('ClaimStatistics', () => {
 
     it('renders all three blockchain cards together', () => {
       const stats = [
-        createStats({ blockchain: 'xrp' }),
         createStats({ blockchain: 'evm' }),
-        createStats({ blockchain: 'aptos' }),
+        createStats({ blockchain: 'evm' }),
+        createStats({ blockchain: 'evm' }),
       ];
 
       render(<ClaimStatistics stats={stats} timeRange="24h" />);
@@ -251,9 +251,9 @@ describe('ClaimStatistics', () => {
   describe('responsive grid layout', () => {
     it('renders cards in grid layout', () => {
       const stats = [
-        createStats({ blockchain: 'xrp' }),
         createStats({ blockchain: 'evm' }),
-        createStats({ blockchain: 'aptos' }),
+        createStats({ blockchain: 'evm' }),
+        createStats({ blockchain: 'evm' }),
       ];
 
       const { container } = render(<ClaimStatistics stats={stats} timeRange="24h" />);

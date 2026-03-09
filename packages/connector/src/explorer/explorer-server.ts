@@ -30,7 +30,6 @@ export interface PeerInfo {
   peerId: string;
   ilpAddress: string;
   evmAddress?: string;
-  xrpAddress?: string;
   btpUrl?: string;
   connected: boolean;
   petname?: string;

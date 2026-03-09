@@ -1,0 +1,65 @@
+schema: 1
+story: "30.7"
+story_title: "Embedded-Mode EVM Integration Test with Anvil"
+gate: PASS
+status_reason: "All 10 acceptance criteria met. 9/9 tests pass in live EVM environment (6.2s). Five bugs fixed during review: healthCheckPort conflicts, sdkB cache warmup, faucet Dockerfile, faucet nonce race condition, Jest open handles."
+reviewer: "Quinn (Test Architect)"
+updated: "2026-03-02T18:00:00Z"
+
+waiver: { active: false }
+
+top_issues: []
+
+risk_summary:
+  totals: { critical: 0, high: 0, medium: 0, low: 3 }
+  recommendations:
+    must_fix: []
+    monitor:
+      - "Empty authToken in registerPeer calls — cosmetic, does not affect test correctness"
+      - "PER_HOP_NOTIFICATION telemetry assertion is indirect (verifies handler received notification, not telemetry event emission)"
+      - "getBalance helper duplicated between beforeAll and on-chain verification test"
+
+quality_score: 95
+expires: "2026-03-16T18:00:00Z"
+
+evidence:
+  tests_reviewed: 9
+  tests_passing: 9
+  risks_identified: 0
+  bugs_fixed_during_review: 5
+  execution_time_seconds: 6.2
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    ac_gaps: []
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "Test-only change using standard Anvil deterministic accounts. No real secrets exposed. Environment gating prevents accidental execution against live networks."
+  performance:
+    status: PASS
+    notes: "9 tests complete in 6.2s (well under 60s limit). waitFor() with exponential backoff for all async operations. Random port allocation prevents collisions."
+  reliability:
+    status: PASS
+    notes: "Proper afterAll cleanup for all 3 connectors and SDK listeners. Error-swallowing try/catch in teardown. waitFor() polling replaces brittle fixed sleeps. Faucet nonce race condition fixed with NonceManager."
+  maintainability:
+    status: PASS
+    notes: "Well-structured describe blocks, AAA pattern, JSDoc on helpers, follows established embedded-mode test conventions."
+
+history:
+  - at: "2026-03-02T12:00:00Z"
+    gate: PASS
+    note: "Initial static review — all ACs verified, APIs confirmed"
+  - at: "2026-03-02T18:00:00Z"
+    gate: PASS
+    note: "Live test execution — 5 bugs fixed (healthCheckPort, sdkB cache, faucet Docker, faucet nonce, Jest handles). 9/9 passing."
+
+recommendations:
+  immediate: []
+  future:
+    - action: "Use non-empty authToken values in registerPeer() to match established convention"
+      refs: ["test/integration/embedded-evm-settlement.test.ts:296", "test/integration/embedded-evm-settlement.test.ts:303"]
+    - action: "Extract getBalance helper to module scope to reduce duplication"
+      refs: ["test/integration/embedded-evm-settlement.test.ts:174", "test/integration/embedded-evm-settlement.test.ts:594"]
+    - action: "Add telemetry event spy for direct PER_HOP_NOTIFICATION assertion"
+      refs: ["test/integration/embedded-evm-settlement.test.ts:553"]

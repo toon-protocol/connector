@@ -246,7 +246,7 @@ export interface ErrorResponse {
  * **MOCK Settlement Explanation:**
  * - Settlement transfer recorded to TigerBeetle (balance reduced to zero)
  * - NO real blockchain transaction sent
- * - Epic 7 will replace this with real EVM/XRP Ledger settlement
+ * - Epic 7 will replace this with real EVM settlement
  * - Same API endpoint, different implementation
  *
  * @param config - Settlement API configuration

@@ -1,6 +1,6 @@
 # Connector
 
-[![Version](https://img.shields.io/badge/version-1.19.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.20.0-blue.svg)](CHANGELOG.md)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.3.3-blue.svg)](https://www.typescriptlang.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -60,8 +60,6 @@ Connectors handle three critical tasks:
 │  ┌──────────────────────────────────────────┐   │
 │  │  Settlement (optional)                    │   │
 │  │  • Base L2 (EVM)                          │   │
-│  │  • XRP Ledger                             │   │
-│  │  • Aptos                                  │   │
 │  └──────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────┘
                        │
@@ -151,7 +149,7 @@ ILP uses a **two-phase commit** protocol with cryptographic escrow:
 
 ## Quick Start
 
-### As a Library (Embedded Mode)
+### Embedded Mode (In-Process)
 
 **Use when:** Building an AI agent or application that needs to send/receive payments
 
@@ -196,7 +194,7 @@ await node.sendPacket({
 await node.stop();
 ```
 
-### As a Standalone Process
+### Standalone Mode (Separate Process)
 
 **Use when:** Running a connector as infrastructure for external applications
 
@@ -308,8 +306,6 @@ npx connector setup
 # Key environment variables:
 EVM_PRIVATE_KEY=0x...
 EVM_RPC_URL=https://base-sepolia.g.alchemy.com/v2/...
-XRP_SECRET=s...
-XRP_RPC_URL=wss://s.altnet.rippletest.net:51233
 ```
 
 See [`examples/`](examples/) for full configuration examples (linear topology, mesh, hub-spoke).
@@ -332,13 +328,11 @@ On-chain (slow, costs gas):
 
 ### Supported Chains
 
-| Chain          | Why Use It                                             | Settlement Type        |
-| -------------- | ------------------------------------------------------ | ---------------------- |
-| **Base L2**    | Ethereum ecosystem, ERC-20 tokens, DeFi composability  | Payment channels (EVM) |
-| **XRP Ledger** | Native payment channels, 3-5 second finality, low fees | PayChan                |
-| **Aptos**      | Move language, 160k+ TPS, sub-second finality          | Payment channels       |
+| Chain       | Why Use It                                            | Settlement Type        |
+| ----------- | ----------------------------------------------------- | ---------------------- |
+| **Base L2** | Ethereum ecosystem, ERC-20 tokens, DeFi composability | Payment channels (EVM) |
 
-Settlement is **optional**. You can run a connector without on-chain settlement for testing or private networks. All chain SDKs are bundled and loaded lazily, so there's nothing extra to install.
+Settlement is **optional**. You can run a connector without on-chain settlement for testing or private networks. The EVM settlement SDK is bundled and loaded lazily, so there's nothing extra to install.
 
 ### Payment Channels: How They Work
 
@@ -364,7 +358,7 @@ A payment channel is a smart contract that holds funds in escrow. Both parties c
 
 The connector supports two deployment modes via the `deploymentMode` configuration:
 
-### `library` Mode (Default)
+### `embedded` Mode (Default)
 
 **When to use:**
 
@@ -379,7 +373,7 @@ The connector supports two deployment modes via the `deploymentMode` configurati
 - No HTTP overhead
 - Fastest performance
 
-**Example:** [Crosstown relay](https://github.com/ALLiDoizCode/crosstown) uses `library` mode to integrate ILP payments directly into the Nostr relay.
+**Example:** [Crosstown relay](https://github.com/ALLiDoizCode/crosstown) uses `embedded` mode to integrate ILP payments directly into the Nostr relay.
 
 ### `standalone` Mode
 
@@ -401,13 +395,12 @@ The connector supports two deployment modes via the `deploymentMode` configurati
 
 This repo is a monorepo with multiple packages:
 
-| Package                                                  | Description                                           |
-| -------------------------------------------------------- | ----------------------------------------------------- |
-| [`@crosstown/connector`](packages/connector)             | Connector node — routing, accounting, settlement, CLI |
-| [`@crosstown/shared`](packages/shared)                   | Shared types and OER codec utilities                  |
-| [`@crosstown/contracts`](packages/contracts)             | EVM payment channel smart contracts                   |
-| [`@crosstown/contracts-aptos`](packages/contracts-aptos) | Aptos payment channel smart contracts (Move)          |
-| [`@crosstown/dashboard`](packages/dashboard)             | Real-time network visualization UI                    |
+| Package                                      | Description                                            |
+| -------------------------------------------- | ------------------------------------------------------ |
+| [`@crosstown/connector`](packages/connector) | Connector node — routing, accounting, settlement, CLI  |
+| [`@crosstown/shared`](packages/shared)       | Shared types and OER codec utilities                   |
+| [`@crosstown/contracts`](packages/contracts) | EVM payment channel smart contracts (Foundry/Solidity) |
+| [`@m2m-connector/faucet`](packages/faucet)   | Token faucet for local EVM testing                     |
 
 ## Explorer UI
 
@@ -416,7 +409,7 @@ The connector includes a built-in real-time dashboard for observability:
 ```yaml
 explorer:
   enabled: true
-  port: 3001
+  port: 3001 # or set EXPLORER_PORT env var
 ```
 
 Open `http://localhost:3001` to:
@@ -430,38 +423,19 @@ Perfect for development and debugging. Disable in production.
 
 ## Example: Crosstown Integration
 
-[Crosstown](https://github.com/ALLiDoizCode/crosstown) is a Nostr relay that uses connector as its payment layer. Here's how it works:
+[Crosstown](https://github.com/ALLiDoizCode/crosstown) is a Nostr relay that uses connector as its payment layer. Crosstown is a separate project — see its repository for full integration details.
 
-**Crosstown's architecture:**
+**How it works conceptually:**
 
-```typescript
-import { createCrosstownNode } from '@crosstown/core';
-import { ConnectorNode } from '@crosstown/connector';
+1. Crosstown creates a `ConnectorNode` (payment infrastructure)
+2. The relay wraps the connector with Nostr-specific logic (event storage, subscriptions, TOON encoding)
+3. Events flow as ILP packets with payment attached — free to read, pay to write
 
-// 1. Create connector (payment infrastructure)
-const connector = new ConnectorNode('config.yaml', logger);
-
-// 2. Create Crosstown node (application logic)
-const node = createCrosstownNode({
-  connector, // Use connector for payments
-  secretKey, // Nostr keypair
-  ilpInfo, // ILP address, BTP endpoint
-  relayUrl, // Nostr relay for discovery
-  basePricePerByte: 10n, // Pricing for writes
-});
-
-// 3. Start both (connector + relay)
-await node.start();
-
-// 4. Events flow as ILP packets with payment attached
-// Free to read, pay to write
-```
-
-**Key insight:** Crosstown doesn't implement payment routing—it delegates to connector. Crosstown focuses on Nostr relay logic (event storage, subscriptions, TOON encoding). Connector handles routing, accounting, and settlement.
+**Key insight:** Crosstown doesn't implement payment routing — it delegates to connector. Connector handles routing, accounting, and settlement so applications can focus on business logic.
 
 ## Architecture: Two Modes
 
-### Embedded (Library) Mode
+### Embedded Mode
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -481,18 +455,18 @@ await node.start();
 │  └──────────┬───────────────────────────┘   │
 └─────────────┼───────────────────────────────┘
               │
-      ┌───────┴────────┬─────────┐
-      │ Base L2        │ XRP     │ Aptos
-      └────────────────┴─────────┘
+      ┌───────▼────────┐
+      │ Base L2 (EVM)  │
+      └────────────────┘
 ```
 
-### Standalone (Process) Mode
+### Standalone Mode
 
 ```
 ┌──────────────┐   /handle-packet   ┌──────────────┐
-│  Your BLS    │◄──────────────────│  @agent-     │
-│              │                    │  society/    │
-│  Outbound:   │  /admin/ilp/send  │  connector   │
+│  Your BLS    │◄──────────────────│  @crosstown/ │
+│              │                    │  connector   │
+│  Outbound:   │  /admin/ilp/send  │              │
 │  POST ───────│──────────────────►│              │
 └──────────────┘                    └──────┬───────┘
                                            │
@@ -503,203 +477,89 @@ await node.start();
 
 ## Docker Deployment
 
-The fastest way to experiment with connectors is using Docker. We provide two deployment options:
+The fastest way to experiment with connectors is using Docker. Several compose files are provided at the project root:
 
-### Option 1: Simple (In-Memory Ledger)
+| Compose File                            | Purpose                                  |
+| --------------------------------------- | ---------------------------------------- |
+| `docker-compose.yml`                    | Base multi-node network with TigerBeetle |
+| `docker-compose-dev.yml`                | Development setup                        |
+| `docker-compose-production.yml`         | Production deployment                    |
+| `docker-compose-e2e-no-tigerbeetle.yml` | E2E tests with in-memory ledger          |
+| `docker-compose-evm-test.yml`           | EVM settlement testing                   |
+| `docker-compose-base-e2e-test.yml`      | Base L2 E2E testing                      |
 
-**Use when:** Learning, testing, or development without settlement
-
-**What you get:**
-
-- 3-node linear network (A → B → C)
-- In-memory ledger (balances stored in RAM)
-- Explorer UI for each node
-- No blockchain settlement
-
-**Start the network:**
+### Quick Start: Development Network
 
 ```bash
 # 1. Build the connector image
 docker build -t connector .
 
-# 2. Start a 3-node linear network
-docker-compose -f docker/docker-compose.linear.yml up -d
+# 2. Start the development network
+docker-compose -f docker-compose-dev.yml up -d
 
 # 3. Check status
-docker-compose -f docker/docker-compose.linear.yml ps
+docker-compose -f docker-compose-dev.yml ps
 
 # 4. View logs
-docker-compose -f docker/docker-compose.linear.yml logs -f connector-a
+docker-compose -f docker-compose-dev.yml logs -f
 ```
 
-**Access the Explorer UI:**
-
-- Connector A: http://localhost:3010
-- Connector B: http://localhost:3011
-- Connector C: http://localhost:3012
-
-**Send a test packet:**
+### Production Deployment
 
 ```bash
-# Install the send-packet tool
-npm install
+# 1. Copy .env.example and configure
+cp .env.example .env
+# Edit .env with your settings (RPC URLs, private keys, etc.)
 
-# Send from connector-a to connector-c (routes through B)
-npm run send-packet -- \
-  --destination g.connector-c.alice \
-  --amount 1000 \
-  --data "Hello through the network!" \
-  --url http://localhost:9080
+# 2. Start production network
+docker-compose -f docker-compose-production.yml up -d
+
+# 3. Check health
+docker-compose -f docker-compose-production.yml ps
 ```
 
-**Stop the network:**
+### TigerBeetle (High-Performance Ledger)
+
+The base `docker-compose.yml` includes [TigerBeetle](https://tigerbeetle.com) for production-grade double-entry accounting:
 
 ```bash
-docker-compose -f docker/docker-compose.linear.yml down
-```
-
-### Option 2: TigerBeetle (High-Performance Ledger)
-
-**Use when:** Production-like testing, high-throughput scenarios, settlement simulation
-
-**What you get:**
-
-- 3-node linear network (A → B → C)
-- [TigerBeetle](https://tigerbeetle.com) distributed ledger (ACID-compliant accounting)
-- Persistent balance storage (survives restarts)
-- Production-grade double-entry bookkeeping
-
-**Start the network:**
-
-```bash
-# 1. Build the connector image (if not done already)
-docker build -t connector .
-
-# 2. Start network with TigerBeetle
+# Start network with TigerBeetle
 docker-compose up -d
 
-# 3. Check status (including TigerBeetle)
+# Check status (including TigerBeetle)
 docker-compose ps
 
-# 4. View TigerBeetle logs
+# View TigerBeetle logs
 docker-compose logs -f tigerbeetle
-```
-
-**Access the Explorer UI:**
-
-- Connector A: http://localhost:9080/explorer (via health check port)
-- Connector B: http://localhost:9081/explorer
-- Connector C: http://localhost:9082/explorer
-
-**TigerBeetle Dashboard:**
-
-TigerBeetle doesn't have a web UI, but you can query balances via the connector's admin API:
-
-```bash
-# Query account balance
-curl http://localhost:9080/admin/accounts/connector-b
-```
-
-**Stop the network:**
-
-```bash
-# Stop containers
-docker-compose down
-
-# Stop and remove data (WARNING: deletes all balances)
-docker-compose down -v
-```
-
-### Other Network Topologies
-
-We provide several pre-configured topologies:
-
-**Mesh Network (4 nodes, fully connected):**
-
-```bash
-docker-compose -f docker/docker-compose.mesh.yml up -d
-```
-
-**Hub-and-Spoke (1 hub + 3 spokes):**
-
-```bash
-docker-compose -f docker/docker-compose.hub-spoke.yml up -d
-```
-
-**Custom Topology:**
-
-Copy and modify the template:
-
-```bash
-cp docker/docker-compose.custom-template.yml docker/docker-compose.custom.yml
-# Edit docker-compose.custom.yml to define your topology
-docker-compose -f docker/docker-compose.custom.yml up -d
 ```
 
 ### Docker Environment Variables
 
-Configure connectors using environment variables in docker-compose files:
+Configure connectors using environment variables (see `.env.example` for full list):
 
-| Variable            | Purpose                              | Example                          |
-| ------------------- | ------------------------------------ | -------------------------------- |
-| `CONFIG_FILE`       | Path to YAML config inside container | `/app/config.yaml`               |
-| `NODE_ID`           | Connector identifier                 | `connector-a`                    |
-| `LOG_LEVEL`         | Logging verbosity                    | `info`, `debug`, `warn`, `error` |
-| `BTP_SERVER_PORT`   | WebSocket server port                | `3000`                           |
-| `HEALTH_CHECK_PORT` | HTTP health endpoint port            | `8080`                           |
-| `EXPLORER_ENABLED`  | Enable Explorer UI                   | `true`, `false`                  |
-| `EXPLORER_PORT`     | Explorer UI port                     | `3010`                           |
-| `EVM_PRIVATE_KEY`   | Ethereum wallet private key          | `0x...`                          |
-| `EVM_RPC_URL`       | Ethereum RPC endpoint                | `https://...`                    |
-| `XRP_SECRET`        | XRP wallet secret                    | `s...`                           |
-| `APTOS_PRIVATE_KEY` | Aptos wallet private key             | `0x...`                          |
+| Variable             | Purpose                       | Default |
+| -------------------- | ----------------------------- | ------- |
+| `NODE_ID`            | Connector identifier          | —       |
+| `BTP_PORT`           | BTP WebSocket server port     | `4000`  |
+| `HEALTH_CHECK_PORT`  | HTTP health endpoint port     | `8080`  |
+| `EXPLORER_PORT`      | Explorer UI port              | `5173`  |
+| `LOG_LEVEL`          | Logging verbosity             | `info`  |
+| `NETWORK_MODE`       | Auto-configure chain settings | —       |
+| `EVM_PRIVATE_KEY`    | Ethereum wallet private key   | —       |
+| `BASE_L2_RPC_URL`    | Base L2 RPC endpoint          | —       |
+| `SETTLEMENT_ENABLED` | Enable on-chain settlement    | `true`  |
 
-**Example with settlement:**
-
-```yaml
-services:
-  connector-a:
-    image: connector
-    environment:
-      CONFIG_FILE: /app/config.yaml
-      NODE_ID: connector-a
-      EVM_PRIVATE_KEY: ${EVM_PRIVATE_KEY}
-      EVM_RPC_URL: ${EVM_RPC_URL}
-    env_file:
-      - .env # Load sensitive values from .env file
-```
-
-### Troubleshooting Docker Deployments
-
-**Containers won't start:**
+### Troubleshooting
 
 ```bash
 # Check container logs
 docker-compose logs connector-a
 
-# Check health status
-docker inspect connector-a | grep -A 10 Health
-```
-
-**TigerBeetle connection errors:**
-
-```bash
-# Verify TigerBeetle is running
-docker-compose ps tigerbeetle
-
-# Test TigerBeetle connectivity
-docker-compose exec connector-a sh -c '(echo > /dev/tcp/tigerbeetle/3000) && echo "Connected" || echo "Failed"'
-```
-
-**Reset everything:**
-
-```bash
-# Stop containers and remove volumes (WARNING: deletes all data)
+# Stop and remove data (WARNING: deletes all balances)
 docker-compose down -v
 
 # Rebuild from scratch
 docker build --no-cache -t connector .
-docker-compose up -d
 ```
 
 ## Development
@@ -726,16 +586,16 @@ npm run dev
 - **Docker** >= 20.10.0 (for container deployments)
 - **Docker Compose** >= 2.0.0
 
-**macOS note:** For local development with TigerBeetle outside Docker, run `npm run tigerbeetle:install` first. See [macOS Setup](docs/development/README.md).
+**macOS note:** For local development with TigerBeetle outside Docker, run `npm run tigerbeetle:install` first.
 
 ## Documentation
 
-| Guide                                                            | Description                          |
-| ---------------------------------------------------------------- | ------------------------------------ |
-| [Building Agents](docs/building-agents.md)                       | Write your business logic and deploy |
-| [Operators Guide](docs/operators/README.md)                      | Production deployment and operations |
-| [API Reference](docs/operators/api-reference.md)                 | Full HTTP API documentation          |
-| [Performance Tuning](docs/operators/performance-tuning-guide.md) | Optimize for high throughput         |
+| Guide                                             | Description                          |
+| ------------------------------------------------- | ------------------------------------ |
+| [Configuration Examples](examples/README.md)      | YAML config schema and example files |
+| [Connector Package](packages/connector/README.md) | Implementation reference and API     |
+| [Changelog](CHANGELOG.md)                         | Version history and release notes    |
+| [Contributing](CONTRIBUTING.md)                   | Contribution guidelines              |
 
 ## Contributing
 

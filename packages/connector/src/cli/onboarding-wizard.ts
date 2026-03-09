@@ -22,9 +22,6 @@ import {
 // Ethereum address: 0x-prefixed, 40 hex characters (case-insensitive)
 const ETH_ADDRESS_REGEX = /^0x[a-fA-F0-9]{40}$/;
 
-// XRP address: r-prefixed, 25-35 base58 characters (no 0, O, I, l)
-const XRP_ADDRESS_REGEX = /^r[1-9A-HJ-NP-Za-km-z]{24,34}$/;
-
 /**
  * Validate Ethereum address format
  * @param address - The address to validate
@@ -32,15 +29,6 @@ const XRP_ADDRESS_REGEX = /^r[1-9A-HJ-NP-Za-km-z]{24,34}$/;
  */
 export function validateEthereumAddress(address: string): boolean {
   return ETH_ADDRESS_REGEX.test(address);
-}
-
-/**
- * Validate XRP address format
- * @param address - The address to validate
- * @returns true if valid, false otherwise
- */
-export function validateXRPAddress(address: string): boolean {
-  return XRP_ADDRESS_REGEX.test(address);
 }
 
 /**
@@ -88,57 +76,29 @@ export async function runOnboardingWizard(): Promise<OnboardingConfig> {
       type: 'list',
       name: 'settlementPreference',
       message: 'Select your settlement preference:',
-      choices: [
-        { name: 'Both EVM and XRP (recommended)', value: 'both' },
-        { name: 'EVM only (Base L2)', value: 'evm' },
-        { name: 'XRP only (XRP Ledger)', value: 'xrp' },
-      ],
-      default: 'both',
+      choices: [{ name: 'EVM only (Base L2)', value: 'evm' }],
+      default: 'evm',
     },
   ]);
 
-  // Step 2: Blockchain addresses (conditional based on settlement preference)
-  const addressAnswers: Partial<WizardAnswers> = {};
-
-  if (basicAnswers.settlementPreference === 'evm' || basicAnswers.settlementPreference === 'both') {
-    const evmAnswer = await inquirer.prompt<{ evmAddress: string }>([
-      {
-        type: 'input',
-        name: 'evmAddress',
-        message: 'Enter your Ethereum address (0x...):',
-        validate: (input: string) => {
-          if (!input || input.trim().length === 0) {
-            return 'Ethereum address is required for EVM settlement';
-          }
-          if (!validateEthereumAddress(input)) {
-            return 'Invalid Ethereum address format. Must be 0x followed by 40 hex characters.';
-          }
-          return true;
-        },
+  // Step 2: Blockchain addresses
+  const evmAnswer = await inquirer.prompt<{ evmAddress: string }>([
+    {
+      type: 'input',
+      name: 'evmAddress',
+      message: 'Enter your Ethereum address (0x...):',
+      validate: (input: string) => {
+        if (!input || input.trim().length === 0) {
+          return 'Ethereum address is required for EVM settlement';
+        }
+        if (!validateEthereumAddress(input)) {
+          return 'Invalid Ethereum address format. Must be 0x followed by 40 hex characters.';
+        }
+        return true;
       },
-    ]);
-    addressAnswers.evmAddress = evmAnswer.evmAddress;
-  }
-
-  if (basicAnswers.settlementPreference === 'xrp' || basicAnswers.settlementPreference === 'both') {
-    const xrpAnswer = await inquirer.prompt<{ xrpAddress: string }>([
-      {
-        type: 'input',
-        name: 'xrpAddress',
-        message: 'Enter your XRP address (r...):',
-        validate: (input: string) => {
-          if (!input || input.trim().length === 0) {
-            return 'XRP address is required for XRP settlement';
-          }
-          if (!validateXRPAddress(input)) {
-            return 'Invalid XRP address format. Must be r followed by 24-34 base58 characters.';
-          }
-          return true;
-        },
-      },
-    ]);
-    addressAnswers.xrpAddress = xrpAnswer.xrpAddress;
-  }
+    },
+  ]);
+  const addressAnswers = { evmAddress: evmAnswer.evmAddress };
 
   // Step 3: Key management configuration
   const keyAnswers = await inquirer.prompt<Pick<WizardAnswers, 'keyBackend'>>([
@@ -209,7 +169,6 @@ export async function runOnboardingWizard(): Promise<OnboardingConfig> {
     nodeId: basicAnswers.nodeId,
     settlementPreference: basicAnswers.settlementPreference as SettlementPreference,
     evmAddress: addressAnswers.evmAddress,
-    xrpAddress: addressAnswers.xrpAddress,
     keyBackend: keyAnswers.keyBackend as KeyBackend,
     enableMonitoring: advancedAnswers.enableMonitoring,
     btpPort: advancedAnswers.btpPort,
@@ -240,17 +199,8 @@ export function generateEnvFile(config: OnboardingConfig): string {
 
   // Blockchain configuration
   lines.push('# Blockchain Configuration');
-
-  if (config.settlementPreference === 'evm' || config.settlementPreference === 'both') {
-    lines.push('BASE_RPC_URL=https://mainnet.base.org');
-    lines.push(`EVM_ADDRESS=${config.evmAddress || ''}`);
-  }
-
-  if (config.settlementPreference === 'xrp' || config.settlementPreference === 'both') {
-    lines.push('XRPL_WSS_URL=wss://xrplcluster.com');
-    lines.push(`XRP_ADDRESS=${config.xrpAddress || ''}`);
-  }
-
+  lines.push('BASE_RPC_URL=https://mainnet.base.org');
+  lines.push(`EVM_ADDRESS=${config.evmAddress || ''}`);
   lines.push('');
 
   // Key management
@@ -259,23 +209,19 @@ export function generateEnvFile(config: OnboardingConfig): string {
 
   if (config.keyBackend === 'env') {
     lines.push('# WARNING: env backend is for development only!');
-    lines.push('# Uncomment and set your private keys:');
+    lines.push('# Uncomment and set your private key:');
     lines.push('# EVM_PRIVATE_KEY=0x...');
-    lines.push('# XRP_SEED=s...');
   } else if (config.keyBackend === 'aws-kms') {
     lines.push('AWS_REGION=us-east-1');
     lines.push('# AWS_KMS_EVM_KEY_ID=arn:aws:kms:...');
-    lines.push('# AWS_KMS_XRP_KEY_ID=arn:aws:kms:...');
   } else if (config.keyBackend === 'gcp-kms') {
     lines.push('# GCP_PROJECT_ID=my-project');
     lines.push('GCP_LOCATION_ID=us-east1');
     lines.push('GCP_KEY_RING_ID=connector-keyring');
     lines.push('# GCP_KMS_EVM_KEY_ID=evm-signing-key');
-    lines.push('# GCP_KMS_XRP_KEY_ID=xrp-signing-key');
   } else if (config.keyBackend === 'azure-kv') {
     lines.push('# AZURE_VAULT_URL=https://my-vault.vault.azure.net');
     lines.push('AZURE_EVM_KEY_NAME=evm-signing-key');
-    lines.push('AZURE_XRP_KEY_NAME=xrp-signing-key');
   }
 
   lines.push('');

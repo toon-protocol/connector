@@ -39,8 +39,8 @@ jobs:
 
       - name: Start docker-compose-dev infrastructure
         run: |
-          echo "Starting Anvil (Base L2), rippled (XRP Ledger), and TigerBeetle..."
-          docker compose -f docker-compose-dev.yml up -d anvil rippled tigerbeetle
+          echo "Starting Anvil (Base L2) and TigerBeetle..."
+          docker compose -f docker-compose-dev.yml up -d anvil tigerbeetle
 
           echo "Waiting for services to start..."
           sleep 10
@@ -61,19 +61,6 @@ jobs:
             sleep 1
           done
 
-          # Wait for rippled to be responsive (may take longer in CI)
-          echo "Waiting for rippled to be responsive..."
-          for i in {1..60}; do
-            if curl -sf -X POST http://localhost:5005 \
-              -H "Content-Type: application/json" \
-              -d '{"method":"server_info","params":[]}' > /dev/null 2>&1; then
-              echo "rippled is responsive!"
-              break
-            fi
-            echo "Waiting for rippled... (attempt $i/60)"
-            sleep 2
-          done
-
           # TigerBeetle doesn't have an HTTP endpoint, so just give it time to start
           echo "Giving TigerBeetle time to initialize..."
           sleep 5
@@ -89,13 +76,6 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
             || (echo "Anvil not accessible" && exit 1)
-
-      - name: Verify rippled is accessible
-        run: |
-          curl -X POST http://localhost:5005 \
-            -H "Content-Type: application/json" \
-            -d '{"method":"server_info","params":[]}' \
-            || (echo "rippled not accessible" && exit 1)
 
       - name: Run integration tests
         run: INTEGRATION_TESTS=true npm test

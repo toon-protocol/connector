@@ -3,7 +3,7 @@ import { KeyManagerBackend, HSMConfig } from '../key-manager';
 
 /**
  * HSMBackend implements KeyManagerBackend using Hardware Security Module via PKCS#11
- * Supports EVM (secp256k1) and XRP (ed25519) key types
+ * Supports EVM (secp256k1) key type
  * Note: Requires pkcs11js library and PKCS#11 library (e.g., SoftHSM)
  */
 export class HSMBackend implements KeyManagerBackend {
@@ -11,11 +11,9 @@ export class HSMBackend implements KeyManagerBackend {
   private pkcs11: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private session: any;
-  private config: HSMConfig;
   private logger: Logger;
 
   constructor(config: HSMConfig, logger: Logger) {
-    this.config = config;
     this.logger = logger.child({ component: 'HSMBackend' });
 
     try {
@@ -83,17 +81,10 @@ export class HSMBackend implements KeyManagerBackend {
   /**
    * Detects key type based on keyLabel
    * @param keyLabel - Key label in HSM
-   * @returns Key type ('evm' or 'xrp')
+   * @returns Key type (always 'evm' for EVM-only connector)
    */
-  private _detectKeyType(keyLabel: string): 'evm' | 'xrp' {
-    const lowerKeyLabel = keyLabel.toLowerCase();
-    if (lowerKeyLabel.includes('evm') || keyLabel === this.config.evmKeyLabel) {
-      return 'evm';
-    }
-    if (lowerKeyLabel.includes('xrp') || keyLabel === this.config.xrpKeyLabel) {
-      return 'xrp';
-    }
-    // Default to EVM
+  private _detectKeyType(_keyLabel: string): 'evm' {
+    // EVM-only connector - always return 'evm'
     return 'evm';
   }
 
@@ -151,19 +142,15 @@ export class HSMBackend implements KeyManagerBackend {
 
   /**
    * Gets PKCS#11 mechanism for signing based on key type
-   * @param keyType - Key type ('evm' or 'xrp')
+   * @param _keyType - Key type ('evm')
    * @returns PKCS#11 mechanism
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private _getSignMechanism(keyType: 'evm' | 'xrp'): any {
+  private _getSignMechanism(_keyType: 'evm'): any {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const pkcs11js = require('pkcs11js');
 
-    if (keyType === 'evm') {
-      return { mechanism: pkcs11js.CKM_ECDSA }; // ECDSA for secp256k1
-    } else {
-      return { mechanism: pkcs11js.CKM_EDDSA }; // EdDSA for ed25519
-    }
+    return { mechanism: pkcs11js.CKM_ECDSA }; // ECDSA for secp256k1
   }
 
   /**

@@ -2,8 +2,6 @@
 #
 # This overlay configures the connector for TESTNET deployment with:
 #   - Base Sepolia (testnet)
-#   - XRP Testnet
-#   - Aptos Testnet
 #   - Debug logging enabled
 #
 # Usage:
@@ -33,8 +31,6 @@ patches:
         # Testnet RPC URLs
         BASE_L2_RPC_URL: "https://sepolia.base.org"
         BASE_RPC_URL: "https://sepolia.base.org"
-        XRPL_WSS_URL: "wss://s.altnet.rippletest.net:51233"
-        APTOS_NODE_URL: "https://fullnode.testnet.aptoslabs.com/v1"
         # Staging settings
         ENVIRONMENT: "staging"
         LOG_LEVEL: "debug"

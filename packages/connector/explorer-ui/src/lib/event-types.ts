@@ -31,10 +31,6 @@ export type TelemetryEventType =
   | 'PAYMENT_CHANNEL_OPENED'
   | 'PAYMENT_CHANNEL_BALANCE_UPDATE'
   | 'PAYMENT_CHANNEL_SETTLED'
-  // XRP payment channel events
-  | 'XRP_CHANNEL_OPENED'
-  | 'XRP_CHANNEL_CLAIMED'
-  | 'XRP_CHANNEL_CLOSED'
   // Agent channel events
   | 'AGENT_CHANNEL_OPENED'
   | 'AGENT_CHANNEL_PAYMENT_SENT'
@@ -207,10 +203,6 @@ export const EVENT_TYPE_COLORS: Record<string, string> = {
   PAYMENT_CHANNEL_OPENED: 'bg-emerald-500',
   PAYMENT_CHANNEL_BALANCE_UPDATE: 'bg-teal-500',
   PAYMENT_CHANNEL_SETTLED: 'bg-green-600',
-  // XRP channels - orange
-  XRP_CHANNEL_OPENED: 'bg-orange-500',
-  XRP_CHANNEL_CLAIMED: 'bg-orange-400',
-  XRP_CHANNEL_CLOSED: 'bg-orange-600',
   // Agent channels - violet
   AGENT_CHANNEL_OPENED: 'bg-violet-500',
   AGENT_CHANNEL_PAYMENT_SENT: 'bg-violet-400',
@@ -273,7 +265,7 @@ export interface AccountState {
   settlementState: SettlementState;
   balanceHistory: BalanceHistoryEntry[];
   hasActiveChannel?: boolean;
-  channelType?: 'evm' | 'xrp' | 'aptos';
+  channelType?: 'evm';
   lastUpdated: number;
 }
 
@@ -299,13 +291,7 @@ export interface ChannelState {
   settledAt?: string;
   lastActivityAt: string;
   // Chain-specific fields
-  settlementMethod?: 'evm' | 'xrp' | 'aptos';
-  xrpAccount?: string;
-  xrpDestination?: string;
-  xrpAmount?: string;
-  xrpBalance?: string;
-  xrpSettleDelay?: number;
-  xrpPublicKey?: string;
+  settlementMethod?: 'evm';
 }
 
 /**
@@ -319,9 +305,6 @@ export const SETTLEMENT_EVENT_TYPES = [
   'PAYMENT_CHANNEL_OPENED',
   'PAYMENT_CHANNEL_BALANCE_UPDATE',
   'PAYMENT_CHANNEL_SETTLED',
-  'XRP_CHANNEL_OPENED',
-  'XRP_CHANNEL_CLAIMED',
-  'XRP_CHANNEL_CLOSED',
   'AGENT_CHANNEL_OPENED',
   'AGENT_CHANNEL_BALANCE_UPDATE',
   'AGENT_CHANNEL_CLOSED',
@@ -353,42 +336,14 @@ export interface WalletEvmChannel {
 }
 
 /**
- * XRP payment channel from /api/balances
- */
-export interface WalletXrpChannel {
-  channelId: string;
-  destination: string;
-  amount: string;
-  balance: string;
-  status: string;
-}
-
-/**
- * Aptos payment channel from /api/balances
- */
-export interface WalletAptosChannel {
-  channelId: string;
-  peerAddress: string;
-  deposit: string;
-  transferredAmount: string;
-  status: string;
-}
-
-/**
  * Response from GET /api/balances
  */
 export interface WalletBalances {
   agentId: string;
   evmAddress: string;
-  xrpAddress: string | null;
-  aptosAddress: string | null;
   ethBalance: string | null;
   agentTokenBalance: string | null;
-  xrpBalance: string | null;
-  aptBalance: string | null;
   evmChannels: WalletEvmChannel[];
-  xrpChannels: WalletXrpChannel[];
-  aptosChannels: WalletAptosChannel[];
 }
 
 // ============================================================================
@@ -398,7 +353,7 @@ export interface WalletBalances {
 /**
  * Blockchain type for claim events
  */
-export type ClaimBlockchain = 'xrp' | 'evm' | 'aptos';
+export type ClaimBlockchain = 'evm';
 
 /**
  * Extract blockchain type from claim event
@@ -406,7 +361,7 @@ export type ClaimBlockchain = 'xrp' | 'evm' | 'aptos';
 export function getClaimBlockchain(event: TelemetryEvent): ClaimBlockchain | null {
   if (typeof event.blockchain === 'string') {
     const blockchain = event.blockchain.toLowerCase();
-    if (blockchain === 'xrp' || blockchain === 'evm' || blockchain === 'aptos') {
+    if (blockchain === 'evm') {
       return blockchain as ClaimBlockchain;
     }
   }
@@ -450,38 +405,19 @@ export function getClaimChannelId(event: TelemetryEvent): string | null {
 
 /**
  * Format claim amount based on blockchain
- * - XRP: drops
  * - EVM: wei
- * - Aptos: octas
  */
-export function formatClaimAmount(amount: string, blockchain: ClaimBlockchain): string {
+export function formatClaimAmount(amount: string): string {
   const value = BigInt(amount);
-
-  switch (blockchain) {
-    case 'xrp':
-      // Convert drops to XRP (1 XRP = 1,000,000 drops)
-      return `${(Number(value) / 1_000_000).toFixed(6)} XRP`;
-    case 'evm':
-      // Convert wei to ETH (1 ETH = 10^18 wei)
-      return `${(Number(value) / 1e18).toFixed(6)} ETH`;
-    case 'aptos':
-      // Convert octas to APT (1 APT = 10^8 octas)
-      return `${(Number(value) / 1e8).toFixed(6)} APT`;
-  }
+  // Convert wei to ETH (1 ETH = 10^18 wei)
+  return `${(Number(value) / 1e18).toFixed(6)} ETH`;
 }
 
 /**
  * Get blockchain badge color
  */
-export function getBlockchainBadgeColor(blockchain: ClaimBlockchain): string {
-  switch (blockchain) {
-    case 'xrp':
-      return 'bg-orange-100 text-orange-800 border-orange-300';
-    case 'evm':
-      return 'bg-blue-100 text-blue-800 border-blue-300';
-    case 'aptos':
-      return 'bg-green-100 text-green-800 border-green-300';
-  }
+export function getBlockchainBadgeColor(): string {
+  return 'bg-blue-100 text-blue-800 border-blue-300';
 }
 
 // ============================================================================

@@ -7,27 +7,18 @@ module.exports = {
   testMatch: ['**/*.test.ts'],
   // Ignore cloud KMS backend tests - they require optional provider-specific packages
   // Ignore integration tests with missing type dependencies (future features)
-  // Ignore performance tests (run via jest.performance.config.js)
   // Ignore acceptance tests (run separately)
-  // Ignore slow integration tests (wallet-derivation, xrp-channel-*)
   testPathIgnorePatterns: [
     '/node_modules/',
     'aws-kms-backend\.test\.ts$',
     'azure-kv-backend\.test\.ts$',
     'gcp-kms-backend\.test\.ts$',
     'wallet-disaster-recovery\.test\.ts$',
-    'connector-aptos-settlement\.test\.ts$',
-    'production-acceptance\.test\.ts$',
     'agent-wallet-integration\.doc\.test\.ts$',
-    'tri-chain-settlement\.test\.ts$',
-    'aptos-local-testnet\.test\.ts$',
     'tigerbeetle-5peer-deployment\.test\.ts$',
-    'test/performance/', // Performance benchmarks (run via test:performance)
     'test/acceptance/', // Acceptance tests (run separately)
     'test/unit/performance/', // Unit performance tests (timing-sensitive)
-    'wallet-derivation\.test\.ts$', // 587s runtime, resource intensive
-    'xrp-channel-manager\.test\.ts$', // Requires rippled, unstable in CI
-    'xrp-channel-lifecycle\.test\.ts$', // Requires rippled, unstable in CI
+    'evm-payment-channel\.test\.ts$', // Requires live Anvil + Docker infrastructure
   ],
   testTimeout: 30000, // 30 second default timeout for integration tests
   collectCoverageFrom: [
@@ -37,14 +28,14 @@ module.exports = {
     '!src/**/__mocks__/**',
     '!src/index.ts', // Exclude index.ts (re-exports only)
   ],
-  // Coverage thresholds temporarily lowered due to skipped flaky/Docker tests
-  // TODO: Re-enable strict thresholds after test stabilization
+  // Coverage thresholds increased after test suite cleanup (Story 30.6)
+  // Fake tests and Docker orchestration tests removed, legitimate tests remain
   coverageThreshold: {
     global: {
-      branches: 45, // Lowered from 68% due to skipped tests
-      functions: 70, // Lowered from 100% due to skipped tests
-      lines: 65, // Lowered from 100% due to skipped tests
-      statements: 65, // Lowered from 100% due to skipped tests
+      branches: 60, // Increased from 45% after cleanup
+      functions: 75, // Increased from 70% after cleanup
+      lines: 70, // Increased from 65% after cleanup
+      statements: 70, // Increased from 65% after cleanup
     },
   },
   moduleFileExtensions: ['ts', 'js', 'json'],

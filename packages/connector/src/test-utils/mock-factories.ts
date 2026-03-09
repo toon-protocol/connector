@@ -17,7 +17,6 @@
  */
 
 import { ethers } from 'ethers';
-import { Client as XRPLClient } from 'xrpl';
 import type { Logger } from 'pino';
 
 // Agent wallet imports removed - Epic 16 infrastructure deferred
@@ -36,9 +35,6 @@ import type { FraudDetector, FraudCheckResult } from '../wallet/wallet-security'
 
 /** Valid EVM address for testing (40 hex chars after 0x) */
 export const TEST_EVM_ADDRESS = '0x742d35Cc6634C0532925a3b844Bc454321f0bEb0';
-
-/** Valid XRP address for testing (base58, no 0/I/O/l) */
-export const TEST_XRP_ADDRESS = 'rN7n7otQDd6FczFgLdqtyMVrXqHr7XEEwAB';
 
 /** Default test agent ID */
 export const TEST_AGENT_ID = 'test-agent-001';
@@ -63,7 +59,6 @@ export const TEST_PASSWORD = 'TestP@ssw0rd12345678';
 export interface MockWalletDerivationOptions {
   agentId?: string;
   evmAddress?: string;
-  xrpAddress?: string;
   derivationIndex?: number;
 }
 
@@ -77,14 +72,12 @@ export function createMockWalletDerivation(
   const {
     agentId = TEST_AGENT_ID,
     evmAddress = TEST_EVM_ADDRESS,
-    xrpAddress = TEST_XRP_ADDRESS,
     derivationIndex = 0,
   } = options;
 
   const defaultWallet: AgentWallet = {
     agentId,
     evmAddress,
-    xrpAddress,
     derivationIndex,
     createdAt: Date.now(),
   };
@@ -250,10 +243,10 @@ export function createMockTreasuryWallet(
   overrides?: Partial<jest.Mocked<TreasuryWallet>>
 ): jest.Mocked<TreasuryWallet> {
   return {
-    fundAgentEVM: jest.fn().mockResolvedValue({ txHash: '0x' + '1'.repeat(64) }),
-    fundAgentXRP: jest.fn().mockResolvedValue({ txHash: 'ABC123' }),
-    getEVMBalance: jest.fn().mockResolvedValue(BigInt('10000000000000000000')),
-    getXRPBalance: jest.fn().mockResolvedValue(BigInt('10000000000')),
+    sendETH: jest.fn().mockResolvedValue({ hash: '0x' + '1'.repeat(64), to: TEST_EVM_ADDRESS }),
+    sendERC20: jest.fn().mockResolvedValue({ hash: '0x' + '1'.repeat(64), to: TEST_EVM_ADDRESS }),
+    getBalance: jest.fn().mockResolvedValue(BigInt('10000000000000000000')),
+    evmAddress: TEST_EVM_ADDRESS,
     ...overrides,
   } as unknown as jest.Mocked<TreasuryWallet>;
 }
@@ -338,34 +331,6 @@ export function createMockEvmProvider(
   } as unknown as jest.Mocked<ethers.Provider>;
 }
 
-export interface MockXrplClientOptions {
-  balance?: string;
-  isConnected?: boolean;
-}
-
-/**
- * Create a mock XRPL Client with commonly used methods
- */
-export function createMockXrplClient(
-  options: MockXrplClientOptions = {},
-  overrides?: Partial<jest.Mocked<XRPLClient>>
-): jest.Mocked<XRPLClient> {
-  const { balance = '1000000000', isConnected = true } = options;
-
-  return {
-    isConnected: jest.fn().mockReturnValue(isConnected),
-    getXrpBalance: jest.fn().mockResolvedValue(balance),
-    request: jest.fn().mockResolvedValue({
-      result: {
-        account_data: { Balance: balance },
-      },
-    }),
-    connect: jest.fn().mockResolvedValue(undefined),
-    disconnect: jest.fn().mockResolvedValue(undefined),
-    ...overrides,
-  } as unknown as jest.Mocked<XRPLClient>;
-}
-
 // ============================================================================
 // Logger Mocks
 // ============================================================================
@@ -409,7 +374,6 @@ export function createWalletMocks(options?: {
   lifecycle?: MockWalletLifecycleOptions;
   fraudDetector?: MockFraudDetectorOptions;
   evmProvider?: MockEvmProviderOptions;
-  xrplClient?: MockXrplClientOptions;
 }): {
   walletDerivation: jest.Mocked<AgentWalletDerivation>;
   balanceTracker: jest.Mocked<AgentBalanceTracker>;
@@ -419,7 +383,6 @@ export function createWalletMocks(options?: {
   telemetryEmitter: jest.Mocked<TelemetryEmitter>;
   fraudDetector: jest.Mocked<FraudDetector>;
   evmProvider: jest.Mocked<ethers.Provider>;
-  xrplClient: jest.Mocked<XRPLClient>;
   logger: jest.Mocked<Logger>;
 } {
   return {
@@ -431,7 +394,6 @@ export function createWalletMocks(options?: {
     telemetryEmitter: createMockTelemetryEmitter(),
     fraudDetector: createMockFraudDetector(options?.fraudDetector),
     evmProvider: createMockEvmProvider(options?.evmProvider),
-    xrplClient: createMockXrplClient(options?.xrplClient),
     logger: createMockLogger(),
   };
 }

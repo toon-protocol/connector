@@ -5,7 +5,7 @@ import { requireOptional } from '../../utils/optional-require';
 
 /**
  * AzureKeyVaultBackend implements KeyManagerBackend using Azure Key Vault
- * Supports EVM (secp256k1) and XRP (ed25519) key types
+ * Supports EVM (secp256k1) key type
  */
 export class AzureKeyVaultBackend implements KeyManagerBackend {
   private keyClient: KeyClientType | null = null;
@@ -18,7 +18,7 @@ export class AzureKeyVaultBackend implements KeyManagerBackend {
     this.logger = logger.child({ component: 'AzureKeyVaultBackend' });
 
     this.logger.info(
-      { vaultUrl: config.vaultUrl, evmKeyName: config.evmKeyName, xrpKeyName: config.xrpKeyName },
+      { vaultUrl: config.vaultUrl, evmKeyName: config.evmKeyName },
       'AzureKeyVaultBackend initialized'
     );
   }
@@ -69,31 +69,20 @@ export class AzureKeyVaultBackend implements KeyManagerBackend {
   /**
    * Detects key type based on keyName
    * @param keyName - Key name in Azure Key Vault
-   * @returns Key type ('evm' or 'xrp')
+   * @returns Key type (always 'evm' for EVM-only connector)
    */
-  private _detectKeyType(keyName: string): 'evm' | 'xrp' {
-    const lowerKeyName = keyName.toLowerCase();
-    if (lowerKeyName.includes('evm') || keyName === this.config.evmKeyName) {
-      return 'evm';
-    }
-    if (lowerKeyName.includes('xrp') || keyName === this.config.xrpKeyName) {
-      return 'xrp';
-    }
-    // Default to EVM
+  private _detectKeyType(_keyName: string): 'evm' {
+    // EVM-only connector - always return 'evm'
     return 'evm';
   }
 
   /**
    * Gets the appropriate signing algorithm for Azure Key Vault
-   * @param keyType - Key type ('evm' or 'xrp')
+   * @param _keyType - Key type ('evm')
    * @returns Azure signing algorithm
    */
-  private _getSignAlgorithm(keyType: 'evm' | 'xrp'): string {
-    if (keyType === 'evm') {
-      return 'ES256K'; // secp256k1 with SHA-256
-    } else {
-      return 'EdDSA'; // ed25519
-    }
+  private _getSignAlgorithm(_keyType: 'evm'): string {
+    return 'ES256K'; // secp256k1 with SHA-256
   }
 
   /**

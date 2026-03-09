@@ -1,0 +1,44 @@
+schema: 1
+story: '30.3'
+story_title: 'Telemetry and Integration Test'
+gate: PASS
+status_reason: 'All acceptance criteria met. PerHopNotificationEvent telemetry type added, dual-path emission (telemetryEmitter + eventStore) implemented, 3-connector integration test validates full pipeline, all tests pass.'
+reviewer: 'Quinn (Test Architect)'
+updated: '2026-03-02T20:00:00Z'
+
+waiver: { active: false }
+
+top_issues: []
+
+quality_score: 100
+
+expires: '2026-03-16T20:00:00Z'
+
+evidence:
+  tests_reviewed: 14
+  risks_identified: 0
+  trace:
+    ac_covered: [1, 2, 3]
+    ac_gaps: []
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: 'Fire-and-forget pattern with .catch() error swallowing ensures no impact on packet forwarding. Telemetry emission wrapped in try-catch. No new external endpoints or auth surfaces.'
+  performance:
+    status: PASS
+    notes: 'Fire-and-forget adds negligible latency (<1ms). Integration test latency measurement confirms <500ms per packet (BTP roundtrip dominated). dispatched flag avoids unnecessary event construction.'
+  reliability:
+    status: PASS
+    notes: 'Non-blocking telemetry emission — errors are caught and logged at debug level. Packet forwarding succeeds even when notification or telemetry fails. Both connected and standalone emission paths tested.'
+  maintainability:
+    status: PASS
+    notes: 'Follows existing telemetry event patterns exactly. JSDoc documentation on all new interfaces. Clean dispatched flag pattern. Dual-path emission mirrors PACKET_FORWARDED pattern.'
+
+recommendations:
+  immediate: []
+  future:
+    - action: 'Add ClaimRedeemedEvent to shared index.ts exports (pre-existing gap, not from this story)'
+      refs: ['packages/shared/src/index.ts']
+    - action: 'Manual Explorer UI verification of PER_HOP_NOTIFICATION events when Explorer is available'
+      refs: ['packages/connector/explorer-ui/src/components/EventTable.tsx']

@@ -59,12 +59,6 @@ export enum TelemetryEventType {
   PAYMENT_CHANNEL_BALANCE_UPDATE = 'PAYMENT_CHANNEL_BALANCE_UPDATE',
   /** Payment channel settled event - emitted when channel settlement completes on-chain (Story 8.10) */
   PAYMENT_CHANNEL_SETTLED = 'PAYMENT_CHANNEL_SETTLED',
-  /** XRP payment channel opened event - emitted when XRP channel created on-ledger (Story 9.7) */
-  XRP_CHANNEL_OPENED = 'XRP_CHANNEL_OPENED',
-  /** XRP payment channel claimed event - emitted when XRP claim submitted to ledger (Story 9.7) */
-  XRP_CHANNEL_CLAIMED = 'XRP_CHANNEL_CLAIMED',
-  /** XRP payment channel closed event - emitted when XRP channel closure initiated (Story 9.7) */
-  XRP_CHANNEL_CLOSED = 'XRP_CHANNEL_CLOSED',
   /** Agent payment channel opened event - emitted when agent opens payment channel (Story 11.6) */
   AGENT_CHANNEL_OPENED = 'AGENT_CHANNEL_OPENED',
   /** Agent payment channel payment sent event - emitted when agent sends payment through channel (Story 11.6) */
@@ -85,6 +79,8 @@ export enum TelemetryEventType {
   CLAIM_RECEIVED = 'CLAIM_RECEIVED',
   /** Claim redeemed event - emitted when claim redeemed on-chain (Story 17.5) */
   CLAIM_REDEEMED = 'CLAIM_REDEEMED',
+  /** Per-hop notification event - emitted when fire-and-forget BLS notification dispatched (Story 30.3) */
+  PER_HOP_NOTIFICATION = 'PER_HOP_NOTIFICATION',
 }
 
 /**
@@ -144,7 +140,7 @@ export interface AccountBalanceEvent {
   nodeId: string;
   /** Peer account ID (connector peered with) */
   peerId: string;
-  /** Token ID (e.g., 'ILP', 'ETH', 'XRP') */
+  /** Token ID (e.g., 'ILP', 'ETH') */
   tokenId: string;
   /** Debit balance (amount we owe peer), bigint as string */
   debitBalance: string;
@@ -450,9 +446,9 @@ export interface AgentBalanceChangedEvent {
   type: 'AGENT_BALANCE_CHANGED';
   /** Agent identifier */
   agentId: string;
-  /** Blockchain ('evm' or 'xrp') */
+  /** Blockchain ('evm') */
   chain: string;
-  /** Token identifier ('ETH', ERC20 address, or 'XRP') */
+  /** Token identifier ('ETH' or ERC20 address) */
   token: string;
   /** Previous balance, bigint as string */
   oldBalance: string;
@@ -467,12 +463,12 @@ export interface AgentBalanceChangedEvent {
 /**
  * Funding Transaction Interface
  *
- * Represents a single funding transaction (ETH, ERC20, or XRP).
+ * Represents a single funding transaction (ETH or ERC20).
  * Used by AgentWalletFundedEvent (Story 11.4).
  */
 export interface FundingTransaction {
-  /** Blockchain ('evm' or 'xrp') */
-  chain: 'evm' | 'xrp' | 'aptos';
+  /** Blockchain ('evm') */
+  chain: 'evm';
   /** Token identifier ('ETH', ERC20 address, or 'XRP') */
   token: string;
   /** Recipient address */
@@ -489,7 +485,7 @@ export interface FundingTransaction {
  * Agent Wallet Funded Telemetry Event
  *
  * Emitted when AgentWalletFunder (Story 11.4) successfully funds a new agent wallet.
- * Indicates agent received initial ETH, ERC20 tokens, and XRP funding.
+ * Indicates agent received initial ETH and ERC20 token funding.
  *
  * **BigInt Serialization:** All amount fields in transactions are strings (bigint serialized for JSON).
  *
@@ -519,8 +515,6 @@ export interface AgentWalletFundedEvent {
   agentId: string;
   /** Agent EVM address */
   evmAddress: string;
-  /** Agent XRP address */
-  xrpAddress: string;
   /** List of funding transactions */
   transactions: FundingTransaction[];
   /** Event timestamp (ISO 8601 format) */
@@ -578,7 +572,7 @@ export interface FundingTransactionConfirmedEvent {
   agentId: string;
   /** Transaction hash */
   txHash: string;
-  /** Blockchain ('evm' or 'xrp') */
+  /** Blockchain ('evm') */
   chain: string;
   /** Transaction status */
   status: 'confirmed';
@@ -610,7 +604,7 @@ export interface FundingTransactionFailedEvent {
   agentId: string;
   /** Transaction hash */
   txHash: string;
-  /** Blockchain ('evm' or 'xrp') */
+  /** Blockchain ('evm') */
   chain: string;
   /** Error message */
   error: string;
@@ -921,10 +915,10 @@ export interface AgentChannelOpenedEvent {
   nodeId: string;
   /** Agent identifier */
   agentId: string;
-  /** Channel ID (EVM: bytes32, XRP: channel_id, Aptos: channelOwner) */
+  /** Channel ID (EVM: bytes32) */
   channelId: string;
-  /** Blockchain network ('evm', 'xrp', or 'aptos') */
-  chain: 'evm' | 'xrp' | 'aptos';
+  /** Blockchain network ('evm') */
+  chain: 'evm';
   /** Peer agent identifier */
   peerId: string;
   /** Initial deposit amount, bigint as string */
@@ -1038,8 +1032,8 @@ export interface AgentChannelPaymentSentEvent {
   errorCode?: string;
   /** Error message if packet was rejected */
   errorMessage?: string;
-  /** Channel type (evm, xrp, or aptos) */
-  channelType?: 'evm' | 'xrp' | 'aptos' | 'none';
+  /** Channel type (evm) */
+  channelType?: 'evm' | 'none';
   /** Channel balance after this payment, bigint as string */
   channelBalance?: string;
   /** Channel total deposit, bigint as string */
@@ -1087,8 +1081,8 @@ export interface AgentChannelBalanceUpdateEvent {
   agentId: string;
   /** Channel ID */
   channelId: string;
-  /** Channel type: 'evm', 'xrp', or 'aptos' */
-  channelType: 'evm' | 'xrp' | 'aptos';
+  /** Channel type: 'evm' */
+  channelType: 'evm';
   /** Peer identifier */
   peerId: string;
   /** Previous balance before this update, bigint as string */
@@ -1136,8 +1130,8 @@ export interface AgentChannelClosedEvent {
   agentId: string;
   /** Channel ID */
   channelId: string;
-  /** Blockchain network ('evm' or 'xrp') */
-  chain: 'evm' | 'xrp' | 'aptos';
+  /** Blockchain network ('evm') */
+  chain: 'evm';
 }
 
 /**
@@ -1175,9 +1169,9 @@ export interface WalletBalanceMismatchEvent {
   nodeId: string;
   /** Agent identifier */
   agentId: string;
-  /** Blockchain network ('evm' or 'xrp') */
-  chain: 'evm' | 'xrp' | 'aptos';
-  /** Token identifier (e.g., 'ETH', 'XRP', '0xUSDC...') */
+  /** Blockchain network ('evm') */
+  chain: 'evm';
+  /** Token identifier (e.g., 'ETH', '0xUSDC...') */
   token: string;
   /** Expected balance from backup snapshot, bigint as string */
   expectedBalance: string;
@@ -1287,9 +1281,9 @@ export interface ClaimSettlementInitiatedEvent {
   type: 'CLAIM_SETTLEMENT_INITIATED';
   /** Connector node ID initiating settlement */
   nodeId: string;
-  /** Blockchain network ('evm', 'xrp', or 'aptos') */
-  chain: 'evm' | 'xrp' | 'aptos';
-  /** Channel ID (EVM: bytes32, XRP: 64-char hex, Aptos: channelOwner address) */
+  /** Blockchain network ('evm') */
+  chain: 'evm';
+  /** Channel ID (EVM: bytes32) */
   channelId: string;
   /** Settlement amount, bigint as string */
   amount: string;
@@ -1328,8 +1322,8 @@ export interface ClaimSettlementSuccessEvent {
   type: 'CLAIM_SETTLEMENT_SUCCESS';
   /** Connector node ID completing settlement */
   nodeId: string;
-  /** Blockchain network ('evm', 'xrp', or 'aptos') */
-  chain: 'evm' | 'xrp' | 'aptos';
+  /** Blockchain network ('evm') */
+  chain: 'evm';
   /** Channel ID */
   channelId: string;
   /** On-chain transaction hash */
@@ -1371,8 +1365,8 @@ export interface ClaimSettlementFailedEvent {
   type: 'CLAIM_SETTLEMENT_FAILED';
   /** Connector node ID failing settlement */
   nodeId: string;
-  /** Blockchain network ('evm', 'xrp', or 'aptos') */
-  chain: 'evm' | 'xrp' | 'aptos';
+  /** Blockchain network ('evm') */
+  chain: 'evm';
   /** Channel ID */
   channelId: string;
   /** Error message describing failure */
@@ -1416,7 +1410,7 @@ export interface ClaimSentEvent {
   nodeId: string;
   /** Peer identifier receiving claim */
   peerId: string;
-  /** Blockchain type: 'xrp', 'evm', 'aptos' */
+  /** Blockchain type: 'evm' */
   blockchain: string;
   /** Unique message ID for idempotency */
   messageId: string;
@@ -1462,11 +1456,11 @@ export interface ClaimReceivedEvent {
   nodeId: string;
   /** Peer identifier sending claim */
   peerId: string;
-  /** Blockchain type: 'xrp', 'evm', 'aptos' */
+  /** Blockchain type: 'evm' */
   blockchain: string;
   /** Unique message ID for idempotency */
   messageId: string;
-  /** Channel ID (XRP: 64-char hex, EVM: bytes32, Aptos: channelOwner) */
+  /** Channel ID (EVM: bytes32) */
   channelId: string;
   /** Claim amount, bigint as string */
   amount: string;
@@ -1518,11 +1512,11 @@ export interface ClaimRedeemedEvent {
   nodeId: string;
   /** Peer identifier who sent the claim */
   peerId: string;
-  /** Blockchain type: 'xrp', 'evm', 'aptos' */
-  blockchain: 'xrp' | 'evm' | 'aptos';
+  /** Blockchain type: 'evm' */
+  blockchain: 'evm';
   /** Unique message ID from CLAIM_RECEIVED (for correlation) */
   messageId: string;
-  /** Channel ID (XRP: 64-char hex, EVM: bytes32, Aptos: channelOwner) */
+  /** Channel ID (EVM: bytes32) */
   channelId: string;
   /** Claim amount redeemed, bigint as string */
   amount: string;
@@ -1541,6 +1535,36 @@ export interface ClaimRedeemedEvent {
   error?: string;
   /** Event timestamp (ISO 8601 format) */
   timestamp: string;
+}
+
+/**
+ * Per-Hop Notification Telemetry Event
+ *
+ * Emitted when PacketHandler dispatches a fire-and-forget BLS notification
+ * at an intermediate hop. Indicates that the per-hop notification pipeline
+ * is active and a transit notification was sent to the local BLS.
+ *
+ * **Dashboard Usage:**
+ * - Explorer UI displays per-hop notification events in telemetry tab
+ * - Network visualization shows notification activity at each hop
+ */
+export interface PerHopNotificationEvent {
+  /** Event type discriminator */
+  type: 'PER_HOP_NOTIFICATION';
+  /** Connector node ID emitting event */
+  nodeId: string;
+  /** ILP destination address */
+  destination: string;
+  /** Packet amount, bigint as string */
+  amount: string;
+  /** Next hop peer identifier (the peer the packet is being forwarded to) */
+  nextHop: string;
+  /** Source peer identifier (the peer the packet was received from) */
+  sourcePeer: string;
+  /** Correlation ID for packet tracking */
+  correlationId: string;
+  /** Event timestamp (Unix milliseconds) */
+  timestamp: number;
 }
 
 /**
@@ -1636,4 +1660,5 @@ export type TelemetryEvent =
   | ClaimSettlementFailedEvent
   | ClaimSentEvent
   | ClaimReceivedEvent
-  | ClaimRedeemedEvent;
+  | ClaimRedeemedEvent
+  | PerHopNotificationEvent;

@@ -16,13 +16,14 @@ import { promisify } from 'util';
 
 const execAsync = promisify(exec);
 
-// Integration test timeout - 2 minutes for TigerBeetle operations
-jest.setTimeout(120000);
+// Integration test timeout - 1 minute for TigerBeetle operations
+jest.setTimeout(60000);
 
 // Skip tests unless E2E_TESTS is enabled (requires TigerBeetle container)
 const e2eEnabled = process.env.E2E_TESTS === 'true';
 const describeIfE2E = e2eEnabled ? describe : describe.skip;
 
+/* eslint-disable no-console */
 describeIfE2E('TigerBeetleClient Integration Tests', () => {
   let client: TigerBeetleClient;
   let logger: pino.Logger;
@@ -224,6 +225,7 @@ describeIfE2E('TigerBeetleClient Integration Tests', () => {
     const restrictedTransferId = timestamp * 1000n + 14n;
 
     // Import AccountFlags
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { AccountFlags } = require('tigerbeetle-node');
 
     // Create account with credit limit enforcement

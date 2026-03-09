@@ -1,12 +1,17 @@
 /**
  * Claim Sender - Send payment channel claims to peers via BTP
  *
+ * @deprecated This module is superseded by PerPacketClaimService (Epic 31).
+ * Claims are now generated per-packet and attached to BTP protocolData during
+ * packet forwarding, rather than sent as separate BTP messages triggered by
+ * settlement thresholds. This file is retained for reference only.
+ *
  * This module implements the claim transport layer for Epic 17 (BTP Off-Chain Claim Exchange).
  * It sends signed payment channel claims over BTP WebSocket connections to enable off-chain
  * settlement without on-chain transactions for every payment.
  *
  * Key Features:
- * - Sends blockchain-specific claims (XRP, EVM, Aptos) via BTP protocolData
+ * - Sends EVM claims via BTP protocolData
  * - Retry logic with exponential backoff (3 attempts: 1s, 2s, 4s delays)
  * - Claim persistence in SQLite for dispute resolution
  * - Telemetry emission for observability
@@ -26,9 +31,7 @@ import { BTPClient } from '../btp/btp-client';
 import {
   BTP_CLAIM_PROTOCOL,
   BTPClaimMessage,
-  XRPClaimMessage,
   EVMClaimMessage,
-  AptosClaimMessage,
   BlockchainType,
 } from '../btp/btp-claim-types';
 import { TelemetryEmitter } from '../telemetry/telemetry-emitter';
@@ -55,7 +58,7 @@ export interface ClaimSendResult {
  *
  * The caller (UnifiedSettlementExecutor) is responsible for:
  * 1. Obtaining BTPClient from BTPConnectionManager.getClientForPeer(peerId)
- * 2. Passing BTPClient to sendXRPClaim() / sendEVMClaim() / sendAptosClaim()
+ * 2. Passing BTPClient to sendEVMClaim()
  *
  * This separation ensures ClaimSender remains focused on transport, while
  * connection management stays with BTPConnectionManager.
@@ -69,58 +72,6 @@ export class ClaimSender {
   ) {}
 
   /**
-   * Send an XRP payment channel claim to a peer
-   *
-   * @param peerId - Peer identifier
-   * @param btpClient - BTPClient instance for this peer connection
-   * @param channelId - 64-character hex XRP channel ID
-   * @param amount - XRP drops as string
-   * @param signature - 128-character hex signature
-   * @param publicKey - 66-character hex public key (ED prefix)
-   * @returns Promise resolving to ClaimSendResult
-   *
-   * @example
-   * ```typescript
-   * const result = await claimSender.sendXRPClaim(
-   *   'peer-alice',
-   *   btpClient,
-   *   'a1b2c3d4...',
-   *   '1000000',
-   *   'abcd1234...',
-   *   'ED01234...'
-   * );
-   * if (result.success) {
-   *   logger.info({ messageId: result.messageId }, 'XRP claim sent');
-   * }
-   * ```
-   */
-  async sendXRPClaim(
-    peerId: string,
-    btpClient: BTPClient,
-    channelId: string,
-    amount: string,
-    signature: string,
-    publicKey: string
-  ): Promise<ClaimSendResult> {
-    const messageId = this._generateMessageId('xrp', channelId, undefined);
-    const timestamp = new Date().toISOString();
-
-    const claimMessage: XRPClaimMessage = {
-      version: '1.0',
-      blockchain: 'xrp',
-      messageId,
-      timestamp,
-      senderId: this.nodeId ?? 'unknown',
-      channelId,
-      amount,
-      signature,
-      publicKey,
-    };
-
-    return this.sendClaim(peerId, btpClient, claimMessage);
-  }
-
-  /**
    * Send an EVM payment channel claim to a peer
    *
    * @param peerId - Peer identifier
@@ -132,6 +83,9 @@ export class ClaimSender {
    * @param locksRoot - Merkle root of locks
    * @param signature - EIP-712 signature
    * @param signerAddress - Ethereum address
+   * @param chainId - (Optional) EVM chain ID for self-describing claims (Epic 31)
+   * @param tokenNetworkAddress - (Optional) TokenNetwork contract address for self-describing claims (Epic 31)
+   * @param tokenAddress - (Optional) ERC20 token contract address for self-describing claims (Epic 31)
    * @returns Promise resolving to ClaimSendResult
    *
    * @example
@@ -145,7 +99,10 @@ export class ClaimSender {
    *   '0',
    *   '0x0000...',
    *   '0x1234...',
-   *   '0x5678...'
+   *   '0x5678...',
+   *   8453, // chainId (optional)
+   *   '0x1234...', // tokenNetworkAddress (optional)
+   *   '0xabcd...' // tokenAddress (optional)
    * );
    * ```
    */
@@ -158,7 +115,10 @@ export class ClaimSender {
     lockedAmount: string,
     locksRoot: string,
     signature: string,
-    signerAddress: string
+    signerAddress: string,
+    chainId?: number,
+    tokenNetworkAddress?: string,
+    tokenAddress?: string
   ): Promise<ClaimSendResult> {
     const messageId = this._generateMessageId('evm', channelId, nonce);
     const timestamp = new Date().toISOString();
@@ -176,59 +136,9 @@ export class ClaimSender {
       locksRoot,
       signature,
       signerAddress,
-    };
-
-    return this.sendClaim(peerId, btpClient, claimMessage);
-  }
-
-  /**
-   * Send an Aptos payment channel claim to a peer
-   *
-   * @param peerId - Peer identifier
-   * @param btpClient - BTPClient instance for this peer connection
-   * @param channelOwner - Aptos account address
-   * @param amount - Octas as string
-   * @param nonce - Balance proof nonce
-   * @param signature - ed25519 signature
-   * @param publicKey - ed25519 public key
-   * @returns Promise resolving to ClaimSendResult
-   *
-   * @example
-   * ```typescript
-   * const result = await claimSender.sendAptosClaim(
-   *   'peer-charlie',
-   *   btpClient,
-   *   '0x123...',
-   *   '10000000',
-   *   5,
-   *   'abc123...',
-   *   'def456...'
-   * );
-   * ```
-   */
-  async sendAptosClaim(
-    peerId: string,
-    btpClient: BTPClient,
-    channelOwner: string,
-    amount: string,
-    nonce: number,
-    signature: string,
-    publicKey: string
-  ): Promise<ClaimSendResult> {
-    const messageId = this._generateMessageId('aptos', channelOwner, nonce);
-    const timestamp = new Date().toISOString();
-
-    const claimMessage: AptosClaimMessage = {
-      version: '1.0',
-      blockchain: 'aptos',
-      messageId,
-      timestamp,
-      senderId: this.nodeId ?? 'unknown',
-      channelOwner,
-      amount,
-      nonce,
-      signature,
-      publicKey,
+      ...(chainId !== undefined && { chainId }),
+      ...(tokenNetworkAddress !== undefined && { tokenNetworkAddress }),
+      ...(tokenAddress !== undefined && { tokenAddress }),
     };
 
     return this.sendClaim(peerId, btpClient, claimMessage);
@@ -300,23 +210,17 @@ export class ClaimSender {
    *
    * Format: `<blockchain>-<channelId-prefix>-<nonce>-<timestamp>`
    *
-   * @param blockchain - Blockchain type ('xrp', 'evm', 'aptos')
+   * @param blockchain - Blockchain type ('evm')
    * @param channelId - Channel identifier (first 8 chars used as prefix)
-   * @param nonce - Optional nonce (undefined for XRP, number for EVM/Aptos)
+   * @param nonce - Nonce number
    * @returns Unique message ID string
    *
    * @example
-   * // XRP: xrp-a1b2c3d4-n/a-1706889600000
    * // EVM: evm-0xabcdef-42-1706889600000
-   * // Aptos: aptos-0x123456-5-1706889600000
    */
-  private _generateMessageId(
-    blockchain: BlockchainType,
-    channelId: string,
-    nonce: number | undefined
-  ): string {
+  private _generateMessageId(blockchain: BlockchainType, channelId: string, nonce: number): string {
     const prefix = channelId.substring(0, 8);
-    const nonceStr = nonce !== undefined ? nonce.toString() : 'n/a';
+    const nonceStr = nonce.toString();
     const timestamp = Date.now();
     return `${blockchain}-${prefix}-${nonceStr}-${timestamp}`;
   }
@@ -328,12 +232,8 @@ export class ClaimSender {
    * @returns Amount as string
    */
   private _getClaimAmount(claim: BTPClaimMessage): string {
-    if (claim.blockchain === 'xrp' || claim.blockchain === 'aptos') {
-      return claim.amount;
-    } else {
-      // EVM uses transferredAmount
-      return claim.transferredAmount;
-    }
+    // EVM uses transferredAmount
+    return claim.transferredAmount;
   }
 
   /**
@@ -395,7 +295,7 @@ export class ClaimSender {
    * Stores claim in `sent_claims` table with:
    * - message_id (PRIMARY KEY)
    * - peer_id
-   * - blockchain ('xrp', 'evm', 'aptos')
+   * - blockchain ('evm')
    * - claim_data (JSON-encoded claim)
    * - sent_at (Unix timestamp ms)
    *

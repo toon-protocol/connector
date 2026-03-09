@@ -49,9 +49,6 @@ import { HealthStatus, HealthStatusProvider } from '../http/types';
 import { TelemetryEmitter } from '../telemetry/telemetry-emitter';
 import { PeerStatus } from '../telemetry/types';
 import { EventStore, ExplorerServer } from '../explorer';
-import { validateAptosEnvironment } from '../config/aptos-env-validator';
-import type { IAptosChannelSDK } from '../settlement/aptos-channel-sdk';
-import { createAptosChannelSDKFromEnv } from '../settlement/aptos-channel-sdk';
 import { PaymentChannelSDK } from '../settlement/payment-channel-sdk';
 import { ChannelManager } from '../settlement/channel-manager';
 import { SettlementExecutor } from '../settlement/settlement-executor';
@@ -61,6 +58,11 @@ import { KeyManager } from '../security/key-manager';
 import { requireOptional } from '../utils/optional-require';
 import { TigerBeetleClient } from '../settlement/tigerbeetle-client';
 import { InMemoryLedgerClient } from '../settlement/in-memory-ledger-client';
+import { PerPacketClaimService } from '../settlement/per-packet-claim-service';
+import {
+  SENT_CLAIMS_TABLE_SCHEMA,
+  SENT_CLAIMS_INDEXES,
+} from '../settlement/claim-sender-db-schema';
 import { promises as dns } from 'dns';
 // Import package.json for version information
 import packageJson from '../../package.json';
@@ -82,8 +84,8 @@ export class ConnectorNode implements HealthStatusProvider {
   private readonly _telemetryEmitter: TelemetryEmitter | null;
   private _eventStore: EventStore | null = null;
   private _explorerServer: ExplorerServer | null = null;
-  private _aptosChannelSDK: IAptosChannelSDK | null = null;
   private _paymentChannelSDK: PaymentChannelSDK | null = null;
+  private _chainSDKs: Map<number, PaymentChannelSDK> = new Map();
   private _channelManager: ChannelManager | null = null;
   private _accountManager: AccountManager | null = null;
   private _settlementMonitor: SettlementMonitor | null = null;
@@ -197,6 +199,9 @@ export class ConnectorNode implements HealthStatusProvider {
           resolvedConfig.localDelivery?.timeout ||
           parseInt(process.env.LOCAL_DELIVERY_TIMEOUT || '30000', 10),
         authToken: resolvedConfig.localDelivery?.authToken || process.env.LOCAL_DELIVERY_AUTH_TOKEN,
+        perHopNotification:
+          resolvedConfig.localDelivery?.perHopNotification ??
+          process.env.LOCAL_DELIVERY_PER_HOP_NOTIFICATION === 'true',
       };
       this._packetHandler.setLocalDelivery(localDeliveryConfig);
     }
@@ -437,31 +442,6 @@ export class ConnectorNode implements HealthStatusProvider {
     );
 
     try {
-      // Initialize Aptos Channel SDK if enabled
-      const aptosValidation = validateAptosEnvironment(this._logger);
-      if (aptosValidation.enabled && aptosValidation.valid) {
-        try {
-          this._aptosChannelSDK = await createAptosChannelSDKFromEnv(this._logger);
-          this._aptosChannelSDK.startAutoRefresh();
-          this._logger.info(
-            { event: 'aptos_sdk_initialized' },
-            'AptosChannelSDK initialized with auto-refresh'
-          );
-        } catch (error) {
-          // Log error but continue without Aptos (graceful degradation)
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          this._logger.error(
-            { event: 'aptos_sdk_init_failed', error: errorMessage },
-            'Failed to initialize AptosChannelSDK (connector continues without Aptos)'
-          );
-        }
-      } else if (aptosValidation.enabled && !aptosValidation.valid) {
-        this._logger.warn(
-          { event: 'aptos_disabled_missing_env', missing: aptosValidation.missing },
-          'Aptos settlement disabled due to missing environment variables'
-        );
-      }
-
       // Initialize Base L2 Payment Channel infrastructure if enabled
       // Config-first pattern: settlementInfra config takes precedence, env var fallback
       const settlementEnabled =
@@ -496,7 +476,7 @@ export class ConnectorNode implements HealthStatusProvider {
           // Use 'evm' as key ID (EnvironmentVariableBackend detects type from keyId)
           const evmKeyId = 'evm';
 
-          // Initialize PaymentChannelSDK
+          // Initialize PaymentChannelSDK (primary chain)
           const { ethers } = await requireOptional<typeof import('ethers')>(
             'ethers',
             'EVM settlement'
@@ -509,6 +489,66 @@ export class ConnectorNode implements HealthStatusProvider {
             registryAddress,
             this._logger
           );
+
+          // Store primary SDK in chain map
+          const primaryChainId =
+            this._config.blockchain?.base?.chainId ?? this._config.blockchain?.arbitrum?.chainId;
+          if (primaryChainId) {
+            this._chainSDKs.set(primaryChainId, this._paymentChannelSDK);
+          }
+
+          // Initialize additional chain SDKs for multi-chain settlement
+          const enabledChains: Array<{
+            name: string;
+            config: import('../config/types').EVMChainConfig;
+          }> = [];
+          if (this._config.blockchain?.base?.enabled && this._config.blockchain.base) {
+            enabledChains.push({ name: 'Base', config: this._config.blockchain.base });
+          }
+          if (this._config.blockchain?.arbitrum?.enabled && this._config.blockchain.arbitrum) {
+            enabledChains.push({ name: 'Arbitrum', config: this._config.blockchain.arbitrum });
+          }
+
+          for (const chain of enabledChains) {
+            // Skip if already stored (primary chain)
+            if (this._chainSDKs.has(chain.config.chainId)) {
+              continue;
+            }
+
+            // Build per-chain config with settlementInfra fallbacks
+            const chainRpcUrl = chain.config.rpcUrl;
+            const chainRegistryAddress = chain.config.registryAddress ?? registryAddress;
+            const chainPrivateKey = chain.config.privateKey ?? treasuryPrivateKey;
+
+            // Create per-chain KeyManager if different private key
+            const chainKeyManager =
+              chainPrivateKey !== treasuryPrivateKey
+                ? new KeyManager(
+                    { backend: 'env', nodeId: this._config.nodeId, evmPrivateKey: chainPrivateKey },
+                    this._logger
+                  )
+                : keyManager;
+
+            const chainProvider = new ethers.JsonRpcProvider(chainRpcUrl);
+            const chainSDK = new PaymentChannelSDK(
+              chainProvider,
+              chainKeyManager,
+              evmKeyId,
+              chainRegistryAddress,
+              this._logger
+            );
+            this._chainSDKs.set(chain.config.chainId, chainSDK);
+
+            this._logger.info(
+              {
+                event: 'chain_sdk_initialized',
+                chain: chain.name,
+                chainId: chain.config.chainId,
+                rpcUrl: chainRpcUrl,
+              },
+              `PaymentChannelSDK initialized for ${chain.name} (chainId: ${chain.config.chainId})`
+            );
+          }
 
           // Build peer ID to EVM address mapping from config (with env var fallback)
           const peerIdToAddressMap = new Map<string, string>();
@@ -772,6 +812,45 @@ export class ConnectorNode implements HealthStatusProvider {
             },
             'Payment channel infrastructure initialized'
           );
+
+          // Wire PerPacketClaimService for attaching claims to outgoing packets
+          if (this._channelManager && this._paymentChannelSDK) {
+            try {
+              const BetterSqlite3Module = await requireOptional<{
+                default: new (path: string) => import('better-sqlite3').Database;
+              }>('better-sqlite3', 'per-packet claims persistence');
+              const BetterSqlite3 = BetterSqlite3Module.default;
+
+              const claimDbPath = `./data/claims-${this._config.nodeId}.db`;
+              const claimDb = new BetterSqlite3(claimDbPath);
+              claimDb.exec(SENT_CLAIMS_TABLE_SCHEMA);
+              for (const indexSql of SENT_CLAIMS_INDEXES) {
+                claimDb.exec(indexSql);
+              }
+
+              const perPacketClaimService = new PerPacketClaimService(
+                this._paymentChannelSDK,
+                this._channelManager,
+                claimDb,
+                this._logger,
+                this._config.nodeId,
+                this._telemetryEmitter || undefined
+              );
+              this._packetHandler.setPerPacketClaimService(perPacketClaimService);
+              this._settlementExecutor?.setPerPacketClaimService(perPacketClaimService);
+
+              this._logger.info(
+                { event: 'per_packet_claims_enabled' },
+                'Per-packet claim service wired to PacketHandler and SettlementExecutor'
+              );
+            } catch (error) {
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              this._logger.warn(
+                { event: 'per_packet_claims_init_failed', error: errorMessage },
+                'Failed to initialize per-packet claim service (continuing without claims)'
+              );
+            }
+          }
 
           // Wire AccountManager into PacketHandler for settlement recording
           if (accountManager) {
@@ -1183,13 +1262,6 @@ export class ConnectorNode implements HealthStatusProvider {
         this._settlementMonitor = null;
       }
 
-      // Stop Aptos SDK auto-refresh if running
-      if (this._aptosChannelSDK) {
-        this._aptosChannelSDK.stopAutoRefresh();
-        this._logger.info({ event: 'aptos_sdk_stopped' }, 'AptosChannelSDK auto-refresh stopped');
-        this._aptosChannelSDK = null;
-      }
-
       // Stop channel manager if running
       if (this._channelManager) {
         this._channelManager.stop();
@@ -1197,9 +1269,19 @@ export class ConnectorNode implements HealthStatusProvider {
         this._channelManager = null;
       }
 
-      // Clean up payment channel SDK
+      // Clean up all chain SDKs
+      for (const [chainId, sdk] of this._chainSDKs.entries()) {
+        sdk.removeAllListeners();
+        this._logger.debug(
+          { event: 'chain_sdk_stopped', chainId },
+          `Chain SDK stopped (chainId: ${chainId})`
+        );
+      }
+      this._chainSDKs.clear();
+
+      // Clean up primary payment channel SDK reference
       if (this._paymentChannelSDK) {
-        this._paymentChannelSDK.removeAllListeners();
+        // Already cleaned up via _chainSDKs iteration above, just null the reference
         this._logger.info({ event: 'payment_channel_sdk_stopped' }, 'Payment channel SDK stopped');
         this._paymentChannelSDK = null;
       }
@@ -1321,6 +1403,58 @@ export class ConnectorNode implements HealthStatusProvider {
    * Called internally when connection state changes
    * @private
    */
+
+  /**
+   * Get routing table instance (for admin API access)
+   * @returns RoutingTable instance
+   */
+  get routingTable(): RoutingTable {
+    return this._routingTable;
+  }
+
+  /**
+   * Get BTP client manager instance (for admin API access)
+   * @returns BTPClientManager instance
+   */
+  get btpClientManager(): BTPClientManager {
+    return this._btpClientManager;
+  }
+
+  /**
+   * Get payment channel SDK instance (for admin API access)
+   * @returns PaymentChannelSDK instance or null if not initialized
+   */
+  get paymentChannelSDK(): PaymentChannelSDK | null {
+    return this._paymentChannelSDK;
+  }
+
+  /**
+   * Get channel manager instance (for admin API access)
+   * @returns ChannelManager instance or null if not initialized
+   */
+  get channelManager(): ChannelManager | null {
+    return this._channelManager;
+  }
+
+  /**
+   * Get account manager instance (for admin API access)
+   * @returns AccountManager instance or null if not initialized
+   */
+  get accountManager(): AccountManager | null {
+    return this._accountManager;
+  }
+
+  /**
+   * Get PaymentChannelSDK for a specific chain ID.
+   * Used for multi-chain settlement when peers settle on different chains.
+   *
+   * @param chainId - EVM chain ID (e.g., 8453 for Base, 42161 for Arbitrum)
+   * @returns PaymentChannelSDK for the chain, or null if not initialized
+   */
+  getPaymentChannelSDKForChain(chainId: number): PaymentChannelSDK | null {
+    return this._chainSDKs.get(chainId) ?? null;
+  }
+
   /**
    * Creates an AccountManager backed by InMemoryLedgerClient when TigerBeetle is unavailable.
    * Provides working balance tracking with snapshot persistence.
@@ -1606,8 +1740,6 @@ export class ConnectorNode implements HealthStatusProvider {
       peerInfo.settlement = {
         preference: peerConfig.settlementPreference,
         evmAddress: peerConfig.evmAddress,
-        xrpAddress: peerConfig.xrpAddress,
-        aptosAddress: peerConfig.aptosAddress,
         tokenAddress: peerConfig.tokenAddress,
         chainId: peerConfig.chainId,
       };
@@ -1695,8 +1827,6 @@ export class ConnectorNode implements HealthStatusProvider {
         peerInfo.settlement = {
           preference: peerConfig.settlementPreference,
           evmAddress: peerConfig.evmAddress,
-          xrpAddress: peerConfig.xrpAddress,
-          aptosAddress: peerConfig.aptosAddress,
           tokenAddress: peerConfig.tokenAddress,
           chainId: peerConfig.chainId,
         };
@@ -1937,8 +2067,6 @@ export class ConnectorNode implements HealthStatusProvider {
       settlementTokens.push(s.tokenAddress);
     } else {
       if (s.evmAddress) settlementTokens.push('EVM');
-      if (s.xrpAddress) settlementTokens.push('XRP');
-      if (s.aptosAddress) settlementTokens.push('APT');
     }
 
     const newConfig: SettlementPeerConfig = {
@@ -1947,9 +2075,6 @@ export class ConnectorNode implements HealthStatusProvider {
       settlementPreference: s.preference,
       settlementTokens,
       evmAddress: s.evmAddress,
-      xrpAddress: s.xrpAddress,
-      aptosAddress: s.aptosAddress,
-      aptosPubkey: s.aptosPubkey,
       tokenAddress: s.tokenAddress,
       tokenNetworkAddress: s.tokenNetworkAddress,
       chainId: s.chainId,
@@ -1989,13 +2114,5 @@ export class ConnectorNode implements HealthStatusProvider {
    */
   getRoutingTable(): RoutingTableEntry[] {
     return this._routingTable.getAllRoutes();
-  }
-
-  /**
-   * Get Aptos Channel SDK instance
-   * @returns IAptosChannelSDK if initialized, null otherwise
-   */
-  getAptosChannelSDK(): IAptosChannelSDK | null {
-    return this._aptosChannelSDK;
   }
 }

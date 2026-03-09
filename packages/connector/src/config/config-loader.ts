@@ -16,7 +16,6 @@ import {
   RouteConfig,
   BlockchainConfig,
   BaseBlockchainConfig,
-  XRPLBlockchainConfig,
   Environment,
   ExplorerConfig,
   SettlementConfig,
@@ -140,7 +139,7 @@ export class ConfigLoader {
    *
    * **Environment field handling:** The `environment`, `blockchain`, and
    * `explorer` fields are always derived from process environment variables
-   * (`ENVIRONMENT`, `BASE_ENABLED`/`XRPL_ENABLED`, `EXPLORER_*`), regardless
+   * (`ENVIRONMENT`, `BASE_ENABLED`, `EXPLORER_*`), regardless
    * of whether the input object includes them. Any values provided for these
    * fields in the input are silently overridden.
    *
@@ -182,8 +181,10 @@ export class ConfigLoader {
     const btpServerPort = rawConfig.btpServerPort as number;
     const healthCheckPort = (rawConfig.healthCheckPort as number | undefined) ?? 8080;
 
-    // Load explorer configuration from environment variables
-    const explorer = this.loadExplorerConfig(btpServerPort, healthCheckPort);
+    // Load explorer configuration (prefer input config, fall back to environment variables)
+    const explorer =
+      (rawConfig.explorer as ExplorerConfig | undefined) ??
+      this.loadExplorerConfig(btpServerPort, healthCheckPort);
 
     // Apply default values for optional fields and pass through all optional config
     const connectorConfig: ConnectorConfig = {
@@ -241,20 +242,19 @@ export class ConfigLoader {
   /**
    * Load Blockchain Configuration from Environment Variables
    *
-   * Loads Base L2 and XRPL configuration from environment variables with
-   * environment-specific defaults. Only loads configuration for blockchains
-   * that are explicitly enabled via environment variables.
+   * Loads Base L2 configuration from environment variables with
+   * environment-specific defaults. Only loads configuration if Base
+   * is explicitly enabled via environment variable.
    *
    * @param environment - Deployment environment (development/staging/production)
-   * @returns BlockchainConfig with Base and/or XRPL configuration (or undefined if no blockchain enabled)
+   * @returns BlockchainConfig with Base configuration (or undefined if Base not enabled)
    * @private
    */
   private static loadBlockchainConfig(environment: Environment): BlockchainConfig | undefined {
     const baseEnabled = process.env.BASE_ENABLED === 'true';
-    const xrplEnabled = process.env.XRPL_ENABLED === 'true';
 
-    // If neither blockchain is enabled, return undefined
-    if (!baseEnabled && !xrplEnabled) {
+    // If Base is not enabled, return undefined
+    if (!baseEnabled) {
       return undefined;
     }
 
@@ -263,11 +263,6 @@ export class ConfigLoader {
     // Load Base L2 configuration if enabled
     if (baseEnabled) {
       blockchain.base = this.loadBaseBlockchainConfig(environment);
-    }
-
-    // Load XRPL configuration if enabled
-    if (xrplEnabled) {
-      blockchain.xrpl = this.loadXRPLBlockchainConfig(environment);
     }
 
     return blockchain;
@@ -321,66 +316,6 @@ export class ConfigLoader {
         : envDefaults.chainId,
       privateKey: process.env.BASE_PRIVATE_KEY,
       registryAddress: process.env.BASE_REGISTRY_ADDRESS,
-    };
-  }
-
-  /**
-   * Load XRPL Blockchain Configuration
-   *
-   * Loads XRPL configuration from environment variables with environment-specific defaults.
-   *
-   * Environment variables:
-   * - XRPL_ENABLED (required): 'true' to enable XRPL blockchain
-   * - XRPL_RPC_URL (optional): RPC endpoint URL (defaults by environment)
-   * - XRPL_NETWORK (optional): Network type (standalone/testnet/mainnet, defaults by environment)
-   * - XRPL_PRIVATE_KEY (optional): Private key for payment channels
-   *
-   * Environment-specific defaults:
-   * - development: rpcUrl=http://rippled:5005, network=standalone
-   * - staging: rpcUrl=https://s.altnet.rippletest.net:51234, network=testnet
-   * - production: rpcUrl=https://xrplcluster.com, network=mainnet
-   *
-   * @param environment - Deployment environment
-   * @returns XRPLBlockchainConfig with environment-specific defaults applied
-   * @throws ConfigurationError if XRPL_NETWORK value is invalid
-   * @private
-   */
-  private static loadXRPLBlockchainConfig(environment: Environment): XRPLBlockchainConfig {
-    // Environment-specific defaults
-    const defaults = {
-      development: {
-        rpcUrl: 'http://rippled:5005',
-        network: 'standalone' as const,
-      },
-      staging: {
-        rpcUrl: 'https://s.altnet.rippletest.net:51234',
-        network: 'testnet' as const,
-      },
-      production: {
-        rpcUrl: 'https://xrplcluster.com',
-        network: 'mainnet' as const,
-      },
-    };
-
-    const envDefaults = defaults[environment];
-
-    // Validate XRPL_NETWORK if provided
-    let network = envDefaults.network;
-    if (process.env.XRPL_NETWORK) {
-      const validNetworks = ['standalone', 'testnet', 'mainnet'];
-      if (!validNetworks.includes(process.env.XRPL_NETWORK)) {
-        throw new ConfigurationError(
-          `Invalid XRPL_NETWORK: must be one of ${validNetworks.join(', ')}, got ${process.env.XRPL_NETWORK}`
-        );
-      }
-      network = process.env.XRPL_NETWORK as 'standalone' | 'testnet' | 'mainnet';
-    }
-
-    return {
-      enabled: true,
-      rpcUrl: process.env.XRPL_RPC_URL || envDefaults.rpcUrl,
-      network,
-      privateKey: process.env.XRPL_PRIVATE_KEY,
     };
   }
 
@@ -553,7 +488,7 @@ export class ConfigLoader {
         );
       }
 
-      if (!peer.authToken) {
+      if (peer.authToken == null) {
         throw new ConfigurationError(`Peer ${peer.id} missing required field: authToken`);
       }
       if (typeof peer.authToken !== 'string') {

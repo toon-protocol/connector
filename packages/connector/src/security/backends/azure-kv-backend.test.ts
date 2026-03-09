@@ -32,7 +32,6 @@ describeIf('AzureKeyVaultBackend', () => {
   const config: AzureConfig = {
     vaultUrl: 'https://test-vault.vault.azure.net/',
     evmKeyName: 'evm-key',
-    xrpKeyName: 'xrp-key',
     credentials: {
       tenantId: 'test-tenant-id',
       clientId: 'test-client-id',
@@ -88,27 +87,6 @@ describeIf('AzureKeyVaultBackend', () => {
       expect(result).toEqual(mockSignature);
     });
 
-    it('should sign message using Azure Key Vault with EdDSA algorithm for XRP keys', async () => {
-      const message = Buffer.from('test-message');
-      const mockSignature = Buffer.from('mock-signature');
-      const digest = crypto.createHash('sha256').update(message).digest();
-
-      mockKeyClient.getKey.mockResolvedValueOnce({
-        id: 'https://test-vault.vault.azure.net/keys/xrp-key/version',
-        name: config.xrpKeyName,
-      });
-
-      mockCryptoClient.sign.mockResolvedValueOnce({
-        result: mockSignature,
-      });
-
-      const result = await backend.sign(message, config.xrpKeyName);
-
-      expect(mockKeyClient.getKey).toHaveBeenCalledWith(config.xrpKeyName);
-      expect(mockCryptoClient.sign).toHaveBeenCalledWith('EdDSA', digest);
-      expect(result).toEqual(mockSignature);
-    });
-
     it('should create SHA256 digest of message before signing', async () => {
       const message = Buffer.from('test-message');
       const expectedDigest = crypto.createHash('sha256').update(message).digest();
@@ -143,24 +121,6 @@ describeIf('AzureKeyVaultBackend', () => {
       await backend.sign(message, evmKeyName);
 
       expect(mockCryptoClient.sign).toHaveBeenCalledWith('ES256K', expect.any(Buffer));
-    });
-
-    it('should detect XRP key type from keyName containing "xrp"', async () => {
-      const xrpKeyName = 'my-xrp-signing-key';
-      const message = Buffer.from('test');
-
-      mockKeyClient.getKey.mockResolvedValueOnce({
-        id: 'https://test-vault.vault.azure.net/keys/my-xrp-signing-key/version',
-        name: xrpKeyName,
-      });
-
-      mockCryptoClient.sign.mockResolvedValueOnce({
-        result: Buffer.from('sig'),
-      });
-
-      await backend.sign(message, xrpKeyName);
-
-      expect(mockCryptoClient.sign).toHaveBeenCalledWith('EdDSA', expect.any(Buffer));
     });
 
     it('should throw error if Azure Key Vault returns no key ID', async () => {
@@ -301,29 +261,6 @@ describeIf('AzureKeyVaultBackend', () => {
           purpose: 'ILP-Connector-Settlement',
           keyType: 'EVM',
           rotatedFrom: config.evmKeyName,
-        },
-      });
-      expect(result).toBe(expectedNewKeyName);
-    });
-
-    it('should rotate XRP key using createKey with Ed25519 curve', async () => {
-      const currentTime = Date.now();
-      jest.spyOn(Date, 'now').mockReturnValue(currentTime);
-
-      const expectedNewKeyName = `${config.xrpKeyName}-rotated-${currentTime}`;
-
-      mockKeyClient.createKey.mockResolvedValueOnce({
-        name: expectedNewKeyName,
-      });
-
-      const result = await backend.rotateKey(config.xrpKeyName);
-
-      expect(mockKeyClient.createKey).toHaveBeenCalledWith(expectedNewKeyName, 'Ed25519', {
-        keyOps: ['sign', 'verify'],
-        tags: {
-          purpose: 'ILP-Connector-Settlement',
-          keyType: 'XRP',
-          rotatedFrom: config.xrpKeyName,
         },
       });
       expect(result).toBe(expectedNewKeyName);

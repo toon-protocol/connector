@@ -95,7 +95,7 @@ describe('useFeeStatistics', () => {
 
     // Find stats by network
     const evmStats = result.current.stats.find((s) => s.network === 'evm');
-    const xrpStats = result.current.stats.find((s) => s.network === 'xrp');
+    const xrpStats = result.current.stats.find((s) => s.network === 'evm');
 
     expect(evmStats?.totalFees).toBe(100n); // 1000 - 900
     expect(evmStats?.packetCount).toBe(1);

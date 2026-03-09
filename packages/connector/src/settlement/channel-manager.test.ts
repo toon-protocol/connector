@@ -174,6 +174,71 @@ describe('ChannelManager', () => {
     });
   });
 
+  describe('registerExternalChannel', () => {
+    const externalChannelParams = {
+      channelId: '0xExternalChannel123',
+      peerId: 'peer-external',
+      tokenAddress: '0xTokenAddress',
+      tokenNetworkAddress: '0xTokenNetworkAddress',
+      chainId: 31337,
+      status: 'open' as const,
+    };
+
+    it('should register external channel in both channelMetadata and peerChannelIndex', () => {
+      const metadata = channelManager.registerExternalChannel(externalChannelParams);
+
+      expect(metadata.channelId).toBe(externalChannelParams.channelId);
+      expect(metadata.peerId).toBe(externalChannelParams.peerId);
+      expect(metadata.tokenAddress).toBe(externalChannelParams.tokenAddress);
+      expect(metadata.chain).toBe('evm:31337');
+      expect(metadata.status).toBe('open');
+      expect(metadata.tokenId).toBe('TEST_TOKEN'); // reverse-lookup matched
+
+      // Verify accessible via getChannelById
+      const byId = channelManager.getChannelById(externalChannelParams.channelId);
+      expect(byId).toBe(metadata);
+
+      // Verify accessible via getChannelForPeer
+      const byPeer = channelManager.getChannelForPeer('peer-external', 'TEST_TOKEN');
+      expect(byPeer).toBe(metadata);
+    });
+
+    it('should be idempotent -- duplicate registration returns existing', () => {
+      const first = channelManager.registerExternalChannel(externalChannelParams);
+      const second = channelManager.registerExternalChannel(externalChannelParams);
+
+      expect(second).toBe(first);
+      expect(channelManager.getAllChannels()).toHaveLength(1);
+    });
+
+    it('should handle token address reverse-lookup fallback', () => {
+      const unknownTokenParams = {
+        ...externalChannelParams,
+        tokenAddress: '0xUnknownToken',
+      };
+
+      const metadata = channelManager.registerExternalChannel(unknownTokenParams);
+
+      // Falls back to raw token address as tokenId
+      expect(metadata.tokenId).toBe('0xUnknownToken');
+    });
+
+    it('should emit EXTERNAL_CHANNEL_REGISTERED telemetry', () => {
+      channelManager.registerExternalChannel(externalChannelParams);
+
+      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'EXTERNAL_CHANNEL_REGISTERED',
+          channelId: externalChannelParams.channelId,
+          peerId: externalChannelParams.peerId,
+          chainId: externalChannelParams.chainId,
+          tokenNetworkAddress: externalChannelParams.tokenNetworkAddress,
+          tokenAddress: externalChannelParams.tokenAddress,
+        })
+      );
+    });
+  });
+
   describe('markChannelActivity', () => {
     it('should update lastActivityAt timestamp', async () => {
       const mockChannelId = '0xChannelId123';

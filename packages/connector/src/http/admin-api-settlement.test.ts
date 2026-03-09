@@ -13,8 +13,6 @@ import { createAdminRouter, AdminAPIConfig } from './admin-api';
 import {
   PeerConfig as SettlementPeerConfig,
   isValidEvmAddress,
-  isValidXrpAddress,
-  isValidAptosAddress,
   isValidNonNegativeIntegerString,
 } from '../settlement/types';
 import type { Logger } from 'pino';
@@ -107,46 +105,6 @@ describe('Admin API Settlement Extension', () => {
       });
     });
 
-    describe('isValidXrpAddress', () => {
-      it('should accept valid XRP address', () => {
-        expect(isValidXrpAddress('rN7n7otQDd6FczFgLdlqtyMVrn3HMfXEEW')).toBe(true);
-      });
-
-      it('should reject address without r prefix', () => {
-        expect(isValidXrpAddress('N7n7otQDd6FczFgLdlqtyMVrn3HMfXEEW')).toBe(false);
-      });
-
-      it('should reject address too short', () => {
-        expect(isValidXrpAddress('r1234')).toBe(false);
-      });
-
-      it('should reject address too long', () => {
-        expect(isValidXrpAddress('r' + 'a'.repeat(35))).toBe(false);
-      });
-
-      it('should accept address at min length (25)', () => {
-        expect(isValidXrpAddress('r' + 'a'.repeat(24))).toBe(true);
-      });
-
-      it('should accept address at max length (35)', () => {
-        expect(isValidXrpAddress('r' + 'a'.repeat(34))).toBe(true);
-      });
-    });
-
-    describe('isValidAptosAddress', () => {
-      it('should accept valid Aptos address', () => {
-        expect(isValidAptosAddress('0x' + '1'.repeat(64))).toBe(true);
-      });
-
-      it('should reject address without 0x prefix', () => {
-        expect(isValidAptosAddress('1'.repeat(64))).toBe(false);
-      });
-
-      it('should reject address with wrong length', () => {
-        expect(isValidAptosAddress('0x' + '1'.repeat(40))).toBe(false);
-      });
-    });
-
     describe('isValidNonNegativeIntegerString', () => {
       it('should accept "0"', () => {
         expect(isValidNonNegativeIntegerString('0')).toBe(true);
@@ -191,54 +149,6 @@ describe('Admin API Settlement Extension', () => {
       expect(settlementPeers.get('peer-a')?.settlementPreference).toBe('evm');
     });
 
-    it('should create peer with valid XRP settlement config', async () => {
-      const res = await request(app)
-        .post('/admin/peers')
-        .send({
-          ...validBaseRequest,
-          settlement: {
-            preference: 'xrp',
-            xrpAddress: 'rN7n7otQDd6FczFgLdlqtyMVrn3HMfXEEW',
-          },
-        });
-
-      expect(res.status).toBe(201);
-      expect(settlementPeers.has('peer-a')).toBe(true);
-      expect(settlementPeers.get('peer-a')?.settlementPreference).toBe('xrp');
-    });
-
-    it('should create peer with valid Aptos settlement config', async () => {
-      const res = await request(app)
-        .post('/admin/peers')
-        .send({
-          ...validBaseRequest,
-          settlement: {
-            preference: 'aptos',
-            aptosAddress: '0x' + '1'.repeat(64),
-            aptosPubkey: 'a'.repeat(64),
-          },
-        });
-
-      expect(res.status).toBe(201);
-      expect(settlementPeers.has('peer-a')).toBe(true);
-      expect(settlementPeers.get('peer-a')?.settlementPreference).toBe('aptos');
-    });
-
-    it('should create peer with preference "any" and EVM address', async () => {
-      const res = await request(app)
-        .post('/admin/peers')
-        .send({
-          ...validBaseRequest,
-          settlement: {
-            preference: 'any',
-            evmAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28',
-          },
-        });
-
-      expect(res.status).toBe(201);
-      expect(settlementPeers.has('peer-a')).toBe(true);
-    });
-
     it('should reject invalid preference value', async () => {
       const res = await request(app)
         .post('/admin/peers')
@@ -265,50 +175,6 @@ describe('Admin API Settlement Extension', () => {
 
       expect(res.status).toBe(400);
       expect(res.body.message).toContain('settlement.evmAddress required when preference is evm');
-    });
-
-    it('should reject XRP preference without xrpAddress', async () => {
-      const res = await request(app)
-        .post('/admin/peers')
-        .send({
-          ...validBaseRequest,
-          settlement: {
-            preference: 'xrp',
-          },
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.message).toContain('settlement.xrpAddress required when preference is xrp');
-    });
-
-    it('should reject Aptos preference without aptosAddress', async () => {
-      const res = await request(app)
-        .post('/admin/peers')
-        .send({
-          ...validBaseRequest,
-          settlement: {
-            preference: 'aptos',
-          },
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.message).toContain(
-        'settlement.aptosAddress required when preference is aptos'
-      );
-    });
-
-    it('should reject "any" preference with no addresses at all', async () => {
-      const res = await request(app)
-        .post('/admin/peers')
-        .send({
-          ...validBaseRequest,
-          settlement: {
-            preference: 'any',
-          },
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.message).toContain('at least one address required');
     });
 
     it('should reject invalid EVM address format (no 0x prefix)', async () => {
@@ -339,36 +205,6 @@ describe('Admin API Settlement Extension', () => {
 
       expect(res.status).toBe(400);
       expect(res.body.message).toContain('settlement.evmAddress must be a valid');
-    });
-
-    it('should reject invalid XRP address format (no r prefix)', async () => {
-      const res = await request(app)
-        .post('/admin/peers')
-        .send({
-          ...validBaseRequest,
-          settlement: {
-            preference: 'xrp',
-            xrpAddress: 'N7n7otQDd6FczFgLdlqtyMVrn3HMfXEEW',
-          },
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.message).toContain('settlement.xrpAddress must start with r');
-    });
-
-    it('should reject invalid Aptos address format', async () => {
-      const res = await request(app)
-        .post('/admin/peers')
-        .send({
-          ...validBaseRequest,
-          settlement: {
-            preference: 'aptos',
-            aptosAddress: '0x1234',
-          },
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.message).toContain('settlement.aptosAddress must be a valid');
     });
 
     it('should reject negative chainId', async () => {
@@ -547,19 +383,18 @@ describe('Admin API Settlement Extension', () => {
       ]);
     });
 
-    it('should set settlementTokens from addresses when no tokenAddress', async () => {
+    it('should set settlementTokens to EVM when no tokenAddress', async () => {
       await request(app)
         .post('/admin/peers')
         .send({
           ...validBaseRequest,
           settlement: {
-            preference: 'any',
+            preference: 'evm',
             evmAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28',
-            xrpAddress: 'rN7n7otQDd6FczFgLdlqtyMVrn3HMfXEEW',
           },
         });
 
-      expect(settlementPeers.get('peer-a')?.settlementTokens).toEqual(['EVM', 'XRP']);
+      expect(settlementPeers.get('peer-a')?.settlementTokens).toEqual(['EVM']);
     });
   });
 

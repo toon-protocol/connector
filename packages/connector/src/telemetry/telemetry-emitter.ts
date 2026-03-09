@@ -8,14 +8,7 @@
  */
 
 import WebSocket from 'ws';
-import {
-  ILPPreparePacket,
-  RoutingTableEntry,
-  TelemetryEvent,
-  XRPChannelOpenedEvent,
-  XRPChannelClaimedEvent,
-  XRPChannelClosedEvent,
-} from '@crosstown/shared';
+import { ILPPreparePacket, RoutingTableEntry, TelemetryEvent } from '@crosstown/shared';
 import { Logger } from '../utils/logger';
 import {
   TelemetryMessage,
@@ -26,7 +19,6 @@ import {
   LogTelemetryData,
   PeerStatus,
 } from './types';
-import type { XRPChannelState } from '../settlement/xrp-channel-manager';
 import {
   TelemetryBuffer,
   TelemetryBufferConfig,
@@ -527,135 +519,6 @@ export class TelemetryEmitter {
       );
       // Do NOT throw - this is non-blocking
     }
-  }
-
-  /**
-   * Emit XRP channel opened event (Story 9.7)
-   * @param channelState - XRP channel state from XRPChannelSDK
-   * @param peerId - Optional peer identifier
-   * @remarks
-   * Non-blocking: Errors are logged but never thrown.
-   * Called from XRPChannelSDK.openChannel() after successful channel creation.
-   *
-   * @example
-   * ```typescript
-   * telemetryEmitter.emitXRPChannelOpened({
-   *   channelId: 'A1B2C3D4...',
-   *   account: 'rN7n7otQDd6FczFgLdlqtyMVrn3HMfXEEW',
-   *   destination: 'rLHzPsX6oXkzU9rFkRaYT8yBqJcQwPgHWN',
-   *   amount: '10000000000',
-   *   balance: '0',
-   *   settleDelay: 86400,
-   *   publicKey: 'ED01234567...',
-   *   status: 'open'
-   * }, 'peer-bob');
-   * ```
-   */
-  emitXRPChannelOpened(channelState: XRPChannelState, peerId?: string): void {
-    const event: XRPChannelOpenedEvent = {
-      type: 'XRP_CHANNEL_OPENED',
-      timestamp: new Date().toISOString(),
-      nodeId: this._nodeId,
-      channelId: channelState.channelId,
-      account: channelState.account,
-      destination: channelState.destination,
-      amount: channelState.amount,
-      settleDelay: channelState.settleDelay,
-      publicKey: channelState.publicKey,
-      peerId,
-    };
-
-    this.emit(event);
-    this._logger.debug(
-      { channelId: channelState.channelId, peerId },
-      'XRP_CHANNEL_OPENED telemetry emitted'
-    );
-  }
-
-  /**
-   * Emit XRP channel claimed event (Story 9.7)
-   * @param channelId - XRP payment channel identifier (64-char hex)
-   * @param claimAmount - Cumulative XRP claimed (drops as string)
-   * @param remainingBalance - XRP remaining after claim (drops as string)
-   * @param peerId - Optional peer identifier
-   * @remarks
-   * Non-blocking: Errors are logged but never thrown.
-   * Called from XRPChannelSDK.submitClaim() after successful claim submission.
-   *
-   * @example
-   * ```typescript
-   * telemetryEmitter.emitXRPChannelClaimed(
-   *   'A1B2C3D4...',
-   *   '5000000000',
-   *   '5000000000',
-   *   'peer-bob'
-   * );
-   * ```
-   */
-  emitXRPChannelClaimed(
-    channelId: string,
-    claimAmount: string,
-    remainingBalance: string,
-    peerId?: string
-  ): void {
-    const event: XRPChannelClaimedEvent = {
-      type: 'XRP_CHANNEL_CLAIMED',
-      timestamp: new Date().toISOString(),
-      nodeId: this._nodeId,
-      channelId,
-      claimAmount,
-      remainingBalance,
-      peerId,
-    };
-
-    this.emit(event);
-    this._logger.debug(
-      { channelId, claimAmount, remainingBalance, peerId },
-      'XRP_CHANNEL_CLAIMED telemetry emitted'
-    );
-  }
-
-  /**
-   * Emit XRP channel closed event (Story 9.7)
-   * @param channelId - XRP payment channel identifier (64-char hex)
-   * @param finalBalance - Final XRP distributed when closed (drops as string)
-   * @param closeType - Channel closure method (cooperative, expiration, unilateral)
-   * @param peerId - Optional peer identifier
-   * @remarks
-   * Non-blocking: Errors are logged but never thrown.
-   * Called from XRPChannelSDK.closeChannel() after channel closure initiated.
-   *
-   * @example
-   * ```typescript
-   * telemetryEmitter.emitXRPChannelClosed(
-   *   'A1B2C3D4...',
-   *   '5000000000',
-   *   'cooperative',
-   *   'peer-bob'
-   * );
-   * ```
-   */
-  emitXRPChannelClosed(
-    channelId: string,
-    finalBalance: string,
-    closeType: 'cooperative' | 'expiration' | 'unilateral',
-    peerId?: string
-  ): void {
-    const event: XRPChannelClosedEvent = {
-      type: 'XRP_CHANNEL_CLOSED',
-      timestamp: new Date().toISOString(),
-      nodeId: this._nodeId,
-      channelId,
-      finalBalance,
-      closeType,
-      peerId,
-    };
-
-    this.emit(event);
-    this._logger.debug(
-      { channelId, finalBalance, closeType, peerId },
-      'XRP_CHANNEL_CLOSED telemetry emitted'
-    );
   }
 
   /**

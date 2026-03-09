@@ -11,7 +11,6 @@ CREATE TABLE IF NOT EXISTS agent_wallets (
   agent_id TEXT PRIMARY KEY,           -- Unique agent identifier
   derivation_index INTEGER UNIQUE NOT NULL,  -- BIP-44 index (prevents collisions)
   evm_address TEXT NOT NULL,           -- Ethereum/Base L2 address
-  xrp_address TEXT NOT NULL,           -- XRP Ledger address
   created_at INTEGER NOT NULL,         -- Unix timestamp
   metadata TEXT                        -- JSON-serialized optional metadata
 );
@@ -20,7 +19,6 @@ CREATE TABLE IF NOT EXISTS agent_wallets (
 export const AGENT_WALLETS_INDEXES = [
   'CREATE INDEX IF NOT EXISTS idx_derivation_index ON agent_wallets(derivation_index);',
   'CREATE INDEX IF NOT EXISTS idx_evm_address ON agent_wallets(evm_address);',
-  'CREATE INDEX IF NOT EXISTS idx_xrp_address ON agent_wallets(xrp_address);',
 ];
 
 /**
@@ -34,7 +32,7 @@ export const AGENT_BALANCES_TABLE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS agent_balances (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   agent_id TEXT NOT NULL,              -- References agent_wallets.agent_id
-  chain TEXT NOT NULL,                 -- 'evm' or 'xrp'
+  chain TEXT NOT NULL,                 -- 'evm'
   token TEXT NOT NULL,                 -- Token identifier
   balance TEXT NOT NULL,               -- Balance as string (bigint serialized)
   timestamp INTEGER NOT NULL           -- Unix timestamp
@@ -99,15 +97,15 @@ export const WALLET_ARCHIVES_INDEXES = [
  * Story 11.6: Payment Channel Integration for Agent Wallets
  *
  * This schema stores payment channel metadata for AI agents.
- * Tracks channels across both EVM (Base L2) and XRP Ledger.
+ * Tracks channels across EVM (Base L2).
  */
 export const AGENT_CHANNELS_TABLE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS agent_channels (
   agent_id TEXT NOT NULL,              -- Agent identifier
-  channel_id TEXT PRIMARY KEY,         -- On-chain channel ID (EVM: bytes32, XRP: channel_id)
-  chain TEXT NOT NULL,                 -- 'evm' or 'xrp'
+  channel_id TEXT PRIMARY KEY,         -- On-chain channel ID (EVM: bytes32)
+  chain TEXT NOT NULL,                 -- 'evm'
   peer_id TEXT NOT NULL,               -- Peer agent identifier
-  token TEXT NOT NULL,                 -- Token symbol (EVM: USDC/DAI, XRP: XRP)
+  token TEXT NOT NULL,                 -- Token symbol (EVM: USDC/DAI)
   opened_at INTEGER NOT NULL,          -- Unix timestamp (channel opened)
   last_activity_at INTEGER,            -- Unix timestamp (last payment)
   closed_at INTEGER                    -- Unix timestamp (channel closed, NULL if active)

@@ -7,7 +7,7 @@
 /**
  * Settlement preference options for the connector
  */
-export type SettlementPreference = 'evm' | 'xrp' | 'both';
+export type SettlementPreference = 'evm';
 
 /**
  * Key management backend options
@@ -26,14 +26,11 @@ export interface OnboardingConfig {
   /** Unique identifier for this connector node */
   nodeId: string;
 
-  /** Settlement preference: EVM only, XRP only, or both */
+  /** Settlement preference: EVM only */
   settlementPreference: SettlementPreference;
 
-  /** Ethereum address for EVM settlement (required if settlement includes 'evm') */
+  /** Ethereum address for EVM settlement */
   evmAddress?: string;
-
-  /** XRP address for XRP settlement (required if settlement includes 'xrp') */
-  xrpAddress?: string;
 
   /** Key management backend selection */
   keyBackend: KeyBackend;
@@ -58,7 +55,6 @@ export interface WizardAnswers {
   nodeId: string;
   settlementPreference: SettlementPreference;
   evmAddress?: string;
-  xrpAddress?: string;
   keyBackend: KeyBackend;
   enableMonitoring: boolean;
   btpPort: number;

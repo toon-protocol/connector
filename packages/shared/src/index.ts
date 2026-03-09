@@ -67,14 +67,12 @@ export {
   FundingTransactionConfirmedEvent,
   FundingTransactionFailedEvent,
   AgentWalletStateChangedEvent,
-  XRPChannelOpenedEvent,
-  XRPChannelClaimedEvent,
-  XRPChannelClosedEvent,
   AgentChannelOpenedEvent,
   AgentChannelPaymentSentEvent,
   AgentChannelClosedEvent,
   ClaimSentEvent,
   ClaimReceivedEvent,
+  PerHopNotificationEvent,
   TelemetryEvent,
 } from './types/telemetry';
 
@@ -84,13 +82,6 @@ export {
   PaymentChannelBalanceUpdateEvent,
   PaymentChannelSettledEvent,
   DashboardChannelState,
-  // Aptos Settlement Telemetry (Story 27.5)
-  AptosChannelOpenedEvent,
-  AptosClaimSignedEvent,
-  AptosClaimSubmittedEvent,
-  AptosSettlementCompletedEvent,
-  AptosSettlementFailedEvent,
-  AptosSettlementTelemetryEvent,
 } from './types/payment-channel-telemetry';
 
 // Payment Channel Types (Epic 8 Story 8.7)

@@ -25,8 +25,6 @@ export interface TokenConfig {
  */
 export const DEFAULT_TOKEN_CONFIGS: Record<string, TokenConfig> = {
   evm: { symbol: 'ETH', decimals: 18 },
-  xrp: { symbol: 'XRP', decimals: 6 },
-  aptos: { symbol: 'APT', decimals: 8 },
   // Default for ILP/unknown - assumes M2M token with 18 decimals
   unknown: { symbol: 'M2M', decimals: 18 },
   // Common tokens
@@ -38,8 +36,8 @@ export const DEFAULT_TOKEN_CONFIGS: Record<string, TokenConfig> = {
  * Fee statistics for a single network
  */
 export interface NetworkFeeStats {
-  /** Network type: 'evm', 'xrp', 'aptos', or 'unknown' */
-  network: 'evm' | 'xrp' | 'aptos' | 'unknown';
+  /** Network type: 'evm' or 'unknown' */
+  network: 'evm' | 'unknown';
   /** Total fees collected (smallest unit) */
   totalFees: bigint;
   /** Total fees as formatted string with token symbol */
@@ -85,20 +83,13 @@ interface PacketData {
 /**
  * Determine primary network for a peer based on their configured addresses
  */
-function getPeerNetwork(peer: PeerInfo | undefined): 'evm' | 'xrp' | 'aptos' | 'unknown' {
+function getPeerNetwork(peer: PeerInfo | undefined): 'evm' | 'unknown' {
   if (!peer) return 'unknown';
 
-  // Check which addresses are configured
+  // Check if EVM address is configured
   const hasEvm = Boolean(peer.evmAddress);
-  const hasXrp = Boolean(peer.xrpAddress);
 
-  // For now, prioritize based on address presence
-  // Future: Use actual settlementPreference from peer config
-  if (hasEvm && !hasXrp) return 'evm';
-  if (hasXrp && !hasEvm) return 'xrp';
-  if (hasEvm && hasXrp) return 'evm'; // Default to EVM if both
-
-  return 'unknown';
+  return hasEvm ? 'evm' : 'unknown';
 }
 
 /**
@@ -130,14 +121,7 @@ function formatAmount(amount: bigint, tokenConfig: TokenConfig): string {
     }
 
     // For very small amounts, show in smallest unit
-    const smallestUnit =
-      tokenConfig.decimals === 18
-        ? 'wei'
-        : tokenConfig.decimals === 6
-          ? 'drops'
-          : tokenConfig.decimals === 8
-            ? 'octas'
-            : 'units';
+    const smallestUnit = tokenConfig.decimals === 18 ? 'wei' : 'units';
     return `${amount.toString()} ${smallestUnit}`;
   } catch {
     return `${amount.toString()} ${tokenConfig.symbol}`;
@@ -258,15 +242,10 @@ export function useFeeStatistics(
 
     // Calculate fees by matching received and forwarded packets
     // Fee = received amount - forwarded amount
-    const feesByNetwork = new Map<
-      'evm' | 'xrp' | 'aptos' | 'unknown',
-      { totalFees: bigint; packetCount: number }
-    >();
+    const feesByNetwork = new Map<'evm' | 'unknown', { totalFees: bigint; packetCount: number }>();
 
     // Initialize all networks
     feesByNetwork.set('evm', { totalFees: 0n, packetCount: 0 });
-    feesByNetwork.set('xrp', { totalFees: 0n, packetCount: 0 });
-    feesByNetwork.set('aptos', { totalFees: 0n, packetCount: 0 });
     feesByNetwork.set('unknown', { totalFees: 0n, packetCount: 0 });
 
     // Match packets and calculate fees

@@ -26,6 +26,9 @@ describe('InMemoryLedgerClient Integration', () => {
     // Save original environment
     originalEnv = { ...process.env };
 
+    // Disable explorer to avoid port conflicts in concurrent test runs
+    process.env.EXPLORER_ENABLED = 'false';
+
     // Create temp snapshot path
     testSnapshotPath = path.join(os.tmpdir(), `ledger-test-${Date.now()}.json`);
   });
@@ -69,6 +72,8 @@ describe('InMemoryLedgerClient Integration', () => {
       const config: ConnectorConfig = {
         nodeId: 'test-node-1',
         btpServerPort: 7780,
+        healthCheckPort: 17780,
+        explorer: { enabled: false },
         environment: 'development',
         routes: [],
         peers: [],
@@ -115,6 +120,8 @@ describe('InMemoryLedgerClient Integration', () => {
       const config: ConnectorConfig = {
         nodeId: 'test-node-2',
         btpServerPort: 7781,
+        healthCheckPort: 17781,
+        explorer: { enabled: false },
         environment: 'development',
         routes: [],
         peers: [],
@@ -155,6 +162,8 @@ describe('InMemoryLedgerClient Integration', () => {
       const config: ConnectorConfig = {
         nodeId: 'test-node-3',
         btpServerPort: 7782,
+        healthCheckPort: 17782,
+        explorer: { enabled: false },
         environment: 'development',
         routes: [],
         peers: [],
@@ -216,6 +225,8 @@ describe('InMemoryLedgerClient Integration', () => {
       const config: ConnectorConfig = {
         nodeId: 'test-node-4',
         btpServerPort: 7783,
+        healthCheckPort: 17783,
+        explorer: { enabled: false },
         environment: 'development',
         routes: [],
         peers: [],
@@ -254,6 +265,8 @@ describe('InMemoryLedgerClient Integration', () => {
       const config: ConnectorConfig = {
         nodeId: 'test-node-5',
         btpServerPort: 7784,
+        healthCheckPort: 17784,
+        explorer: { enabled: false },
         environment: 'development',
         routes: [],
         peers: [],

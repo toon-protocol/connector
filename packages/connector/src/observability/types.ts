@@ -70,7 +70,7 @@ export type PacketStatus = 'success' | 'error' | 'timeout' | 'rejected';
 /**
  * Settlement method for metrics labeling
  */
-export type SettlementMethod = 'xrp' | 'evm' | 'tigerbeetle';
+export type SettlementMethod = 'evm' | 'tigerbeetle';
 
 /**
  * Settlement operation status
@@ -188,7 +188,7 @@ export interface ErrorMetricsOptions {
 /**
  * Blockchain type for claim metrics
  */
-export type ClaimBlockchain = 'xrp' | 'evm' | 'aptos';
+export type ClaimBlockchain = 'evm';
 
 /**
  * Metrics recording options for claim operations

@@ -21,7 +21,6 @@ import { AdminApiConfig } from '../config/types';
 import { PeerConfig as SettlementPeerConfig } from '../settlement/types';
 import type { ChannelManager } from '../settlement/channel-manager';
 import type { PaymentChannelSDK } from '../settlement/payment-channel-sdk';
-import type { XRPChannelLifecycleManager } from '../settlement/xrp-channel-lifecycle';
 import type { AccountManager } from '../settlement/account-manager';
 import type { SettlementMonitor } from '../settlement/settlement-monitor';
 import type { ClaimReceiver } from '../settlement/claim-receiver';
@@ -64,7 +63,6 @@ export class AdminServer {
     settlementPeers?: Map<string, SettlementPeerConfig>;
     channelManager?: ChannelManager;
     paymentChannelSDK?: PaymentChannelSDK;
-    xrpChannelLifecycleManager?: XRPChannelLifecycleManager;
     accountManager?: AccountManager;
     settlementMonitor?: SettlementMonitor;
     claimReceiver?: ClaimReceiver;
@@ -91,7 +89,6 @@ export class AdminServer {
     settlementPeers?: Map<string, SettlementPeerConfig>;
     channelManager?: ChannelManager;
     paymentChannelSDK?: PaymentChannelSDK;
-    xrpChannelLifecycleManager?: XRPChannelLifecycleManager;
     accountManager?: AccountManager;
     settlementMonitor?: SettlementMonitor;
     claimReceiver?: ClaimReceiver;
@@ -121,7 +118,6 @@ export class AdminServer {
       settlementPeers,
       channelManager,
       paymentChannelSDK,
-      xrpChannelLifecycleManager,
       accountManager,
       settlementMonitor,
       claimReceiver,
@@ -143,7 +139,6 @@ export class AdminServer {
       settlementPeers,
       channelManager,
       paymentChannelSDK,
-      xrpChannelLifecycleManager,
       accountManager,
       settlementMonitor,
       claimReceiver,

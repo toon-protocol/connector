@@ -53,32 +53,6 @@ function AgentIcon({ className }: { className?: string }) {
   );
 }
 
-function XrpIcon({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 256 256" className={className} fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path
-        d="M59.5 26h30.3l38 39.3L166 26h30.5L145 80.5l-17 17.5-17-17.5L59.5 26Z"
-        fill="#F97316"
-      />
-      <path
-        d="M196.5 230h-30.3l-38-39.3L90 230H59.5L111 175.5l17-17.5 17 17.5L196.5 230Z"
-        fill="#F97316"
-      />
-    </svg>
-  );
-}
-
-function AptosIcon({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 100 100" className={className} fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path
-        d="M71.4 36.5h-9.8c-.8 0-1.6.4-2.1 1l-4.5 5.5c-.7.9-2.1.9-2.8 0l-4.5-5.5c-.5-.6-1.3-1-2.1-1h-17c-.9 0-1.4 1-.8 1.7l7.8 9.5c.5.6.5 1.5 0 2.1l-7.8 9.5c-.6.7-.1 1.7.8 1.7h17c.8 0 1.6-.4 2.1-1l4.5-5.5c.7-.9 2.1-.9 2.8 0l4.5 5.5c.5.6 1.3 1 2.1 1h9.8c.9 0 1.4-1 .8-1.7l-12.3-15c-.5-.6-.5-1.5 0-2.1l12.3-15c.6-.7.1-1.7-.8-1.7z"
-        fill="#10B981"
-      />
-    </svg>
-  );
-}
-
 /** Truncate an address to first 6 + last 4 characters */
 function truncateAddress(addr: string): string {
   if (addr.length <= 12) return addr;
@@ -168,30 +142,12 @@ export const WalletOverview = React.memo(function WalletOverview({
               explorerUrl={getExplorerUrl(data.evmAddress, 'address') ?? undefined}
             />
           </span>
-          {data.xrpAddress && (
-            <span>
-              XRP:{' '}
-              <CopyableAddress
-                address={data.xrpAddress}
-                explorerUrl={getExplorerUrl(data.xrpAddress, 'address') ?? undefined}
-              />
-            </span>
-          )}
-          {data.aptosAddress && (
-            <span>
-              Aptos:{' '}
-              <CopyableAddress
-                address={data.aptosAddress}
-                explorerUrl={getExplorerUrl(data.aptosAddress, 'address') ?? undefined}
-              />
-            </span>
-          )}
         </div>
       </CardHeader>
 
       <CardContent className="space-y-4">
         {/* Balance cards */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {/* ETH Balance */}
           <div className="rounded-lg border p-3">
             <div className="flex items-center gap-1.5 text-xs font-medium text-blue-500 mb-1">
@@ -216,32 +172,6 @@ export const WalletOverview = React.memo(function WalletOverview({
                 ? Number(data.agentTokenBalance).toLocaleString(undefined, {
                     maximumFractionDigits: 2,
                   })
-                : '—'}
-            </div>
-          </div>
-
-          {/* XRP Balance */}
-          <div className="rounded-lg border p-3">
-            <div className="flex items-center gap-1.5 text-xs font-medium text-orange-500 mb-1">
-              <XrpIcon className="h-3.5 w-3.5" />
-              XRP
-            </div>
-            <div className="text-lg font-bold font-mono">
-              {data.xrpBalance != null
-                ? Number(data.xrpBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })
-                : '—'}
-            </div>
-          </div>
-
-          {/* APT Balance */}
-          <div className="rounded-lg border p-3">
-            <div className="flex items-center gap-1.5 text-xs font-medium text-emerald-500 mb-1">
-              <AptosIcon className="h-3.5 w-3.5" />
-              APT
-            </div>
-            <div className="text-lg font-bold font-mono">
-              {data.aptBalance != null
-                ? Number(data.aptBalance).toLocaleString(undefined, { maximumFractionDigits: 4 })
                 : '—'}
             </div>
           </div>
@@ -296,114 +226,12 @@ export const WalletOverview = React.memo(function WalletOverview({
           </div>
         )}
 
-        {/* XRP Channels */}
-        {data.xrpChannels.length > 0 && (
-          <div>
-            <h4 className="text-xs font-medium text-muted-foreground mb-2">
-              XRP Channels ({data.xrpChannels.length})
-            </h4>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-[20%]">Channel</TableHead>
-                  <TableHead className="w-[20%]">Dest</TableHead>
-                  <TableHead className="w-[25%] text-right">Amount</TableHead>
-                  <TableHead className="w-[25%] text-right">Balance</TableHead>
-                  <TableHead className="w-[10%] text-right">Status</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.xrpChannels.map((ch) => (
-                  <TableRow key={ch.channelId}>
-                    <TableCell>
-                      <CopyableAddress
-                        address={ch.channelId}
-                        explorerUrl={
-                          data.xrpAddress
-                            ? (getExplorerUrl(data.xrpAddress, 'address') ?? undefined)
-                            : undefined
-                        }
-                      />
-                    </TableCell>
-                    <TableCell>
-                      <CopyableAddress
-                        address={ch.destination}
-                        explorerUrl={getExplorerUrl(ch.destination, 'address') ?? undefined}
-                      />
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs">
-                      {Number(ch.amount).toLocaleString(undefined, { maximumFractionDigits: 2 })}
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs">
-                      {Number(ch.balance).toLocaleString(undefined, { maximumFractionDigits: 2 })}
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <ChannelStatusBadge status={ch.status} />
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-        )}
-
-        {/* Aptos Channels */}
-        {data.aptosChannels && data.aptosChannels.length > 0 && (
-          <div>
-            <h4 className="text-xs font-medium text-muted-foreground mb-2">
-              Aptos Channels ({data.aptosChannels.length})
-            </h4>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-[20%]">Channel</TableHead>
-                  <TableHead className="w-[20%]">Peer</TableHead>
-                  <TableHead className="w-[25%] text-right">Deposit</TableHead>
-                  <TableHead className="w-[25%] text-right">Transferred</TableHead>
-                  <TableHead className="w-[10%] text-right">Status</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.aptosChannels.map((ch) => (
-                  <TableRow key={ch.channelId}>
-                    <TableCell>
-                      <CopyableAddress
-                        address={ch.channelId}
-                        explorerUrl={getExplorerUrl(ch.channelId, 'address') ?? undefined}
-                      />
-                    </TableCell>
-                    <TableCell>
-                      <CopyableAddress
-                        address={ch.peerAddress}
-                        explorerUrl={getExplorerUrl(ch.peerAddress, 'address') ?? undefined}
-                      />
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs">
-                      {Number(ch.deposit).toLocaleString(undefined, { maximumFractionDigits: 4 })}
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs">
-                      {Number(ch.transferredAmount).toLocaleString(undefined, {
-                        maximumFractionDigits: 4,
-                      })}
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <ChannelStatusBadge status={ch.status} />
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-        )}
-
         {/* No channels message */}
-        {data.evmChannels.length === 0 &&
-          data.xrpChannels.length === 0 &&
-          (!data.aptosChannels || data.aptosChannels.length === 0) && (
-            <p className="text-xs text-muted-foreground text-center py-2">
-              No payment channels open yet.
-            </p>
-          )}
+        {data.evmChannels.length === 0 && (
+          <p className="text-xs text-muted-foreground text-center py-2">
+            No payment channels open yet.
+          </p>
+        )}
       </CardContent>
     </Card>
   );

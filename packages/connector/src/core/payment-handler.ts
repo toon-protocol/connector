@@ -34,6 +34,13 @@ export interface PaymentRequest {
   expiresAt: string;
   /** Base64-encoded application data (optional) */
   data?: string;
+  /**
+   * Whether this is a transit notification at an intermediate hop.
+   * When true, the BLS response is ignored (fire-and-forget notification).
+   * When false or omitted, this is a final-hop delivery where the BLS
+   * response determines accept/reject.
+   */
+  isTransit?: boolean;
 }
 
 /**
@@ -189,6 +196,7 @@ export function createPaymentHandlerAdapter(
       amount: packet.amount,
       expiresAt: packet.expiresAt,
       data: packet.data || undefined,
+      isTransit: packet.isTransit,
     };
 
     // 3. Call user handler

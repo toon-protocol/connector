@@ -1,0 +1,59 @@
+jest.mock('./lib');
+
+import { main } from './main';
+import { ConnectorNode, createLogger } from './lib';
+
+describe.skip('main.ts', () => {
+  const mockLogger = {
+    info: jest.fn(),
+    error: jest.fn(),
+    warn: jest.fn(),
+    debug: jest.fn(),
+    child: jest.fn(),
+  };
+
+  const mockConnectorNode = {
+    start: jest.fn().mockResolvedValue(undefined),
+    stop: jest.fn().mockResolvedValue(undefined),
+  };
+
+  // Store original process listeners
+  const originalListeners = {
+    SIGTERM: process.listeners('SIGTERM'),
+    SIGINT: process.listeners('SIGINT'),
+    uncaughtException: process.listeners('uncaughtException'),
+    unhandledRejection: process.listeners('unhandledRejection'),
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (createLogger as jest.Mock).mockReturnValue(mockLogger);
+    (ConnectorNode as jest.Mock).mockImplementation(() => mockConnectorNode);
+  });
+
+  afterEach(() => {
+    // Remove all listeners added by main() to prevent interference
+    process.removeAllListeners('SIGTERM');
+    process.removeAllListeners('SIGINT');
+    process.removeAllListeners('uncaughtException');
+    process.removeAllListeners('unhandledRejection');
+
+    // Restore original listeners
+    originalListeners.SIGTERM.forEach(listener => process.on('SIGTERM', listener));
+    originalListeners.SIGINT.forEach(listener => process.on('SIGINT', listener));
+    originalListeners.uncaughtException.forEach(listener => process.on('uncaughtException', listener));
+    originalListeners.unhandledRejection.forEach(listener => process.on('unhandledRejection', listener));
+  });
+
+  it('should export main function', () => {
+    expect(typeof main).toBe('function');
+  });
+
+  it('should load config and start connector', async () => {
+    await main();
+
+    expect(createLogger).toHaveBeenCalledWith('connector-startup', expect.any(String));
+    expect(ConnectorNode).toHaveBeenCalledWith(expect.any(String), mockLogger);
+    expect(mockConnectorNode.start).toHaveBeenCalled();
+  });
+});

@@ -24,7 +24,6 @@ describeIf('AWSKMSBackend', () => {
   const config: AWSConfig = {
     region: 'us-east-1',
     evmKeyId: 'arn:aws:kms:us-east-1:123456789012:key/evm-key-id',
-    xrpKeyId: 'arn:aws:kms:us-east-1:123456789012:key/xrp-key-id',
     credentials: {
       accessKeyId: 'test-access-key',
       secretAccessKey: 'test-secret-key',
@@ -67,24 +66,6 @@ describeIf('AWSKMSBackend', () => {
       });
     });
 
-    it('should sign message using AWS KMS SignCommand with ED25519_SHA_512 for XRP keys', async () => {
-      const message = Buffer.from('test-message');
-      const mockSignature = Buffer.from('mock-signature');
-
-      mockKMSClient.send.mockResolvedValueOnce({
-        Signature: mockSignature,
-      });
-
-      const result = await backend.sign(message, config.xrpKeyId);
-
-      expect(mockKMSClient.send).toHaveBeenCalled();
-      expect(result).toEqual(mockSignature);
-
-      // Verify ED25519_SHA_512 algorithm was used (for RAW message signing)
-      const call = mockKMSClient.send.mock.calls[0][0];
-      expect(call.input.SigningAlgorithm).toBe('ED25519_SHA_512');
-    });
-
     it('should detect EVM key type from keyId containing "evm"', async () => {
       const message = Buffer.from('test-message');
       const mockSignature = Buffer.from('mock-signature');
@@ -98,21 +79,6 @@ describeIf('AWSKMSBackend', () => {
 
       const call = mockKMSClient.send.mock.calls[0][0];
       expect(call.input.SigningAlgorithm).toBe('ECDSA_SHA_256');
-    });
-
-    it('should detect XRP key type from keyId containing "xrp"', async () => {
-      const message = Buffer.from('test-message');
-      const mockSignature = Buffer.from('mock-signature');
-      const xrpKeyId = 'arn:aws:kms:us-east-1:123456789012:key/my-xrp-signing-key';
-
-      mockKMSClient.send.mockResolvedValueOnce({
-        Signature: mockSignature,
-      });
-
-      await backend.sign(message, xrpKeyId);
-
-      const call = mockKMSClient.send.mock.calls[0][0];
-      expect(call.input.SigningAlgorithm).toBe('ED25519_SHA_512');
     });
 
     it('should throw error if AWS KMS returns no signature', async () => {
@@ -200,29 +166,6 @@ describeIf('AWSKMSBackend', () => {
         KeySpec: 'ECC_SECG_P256K1',
       });
       expect(call.input.Description).toContain('EVM');
-    });
-
-    it('should rotate XRP key using CreateKeyCommand with ECC_NIST_EDWARDS25519 KeySpec', async () => {
-      const newKeyArn = 'arn:aws:kms:us-east-1:123456789012:key/new-xrp-key-id';
-
-      mockKMSClient.send.mockResolvedValueOnce({
-        KeyMetadata: {
-          Arn: newKeyArn,
-        },
-      });
-
-      const result = await backend.rotateKey(config.xrpKeyId);
-
-      expect(mockKMSClient.send).toHaveBeenCalled();
-      expect(result).toBe(newKeyArn);
-
-      // Verify ECC_NIST_EDWARDS25519 KeySpec (ed25519 for XRP)
-      const call = mockKMSClient.send.mock.calls[0][0];
-      expect(call.input).toMatchObject({
-        KeyUsage: 'SIGN_VERIFY',
-        KeySpec: 'ECC_NIST_EDWARDS25519',
-      });
-      expect(call.input.Description).toContain('XRP');
     });
 
     it('should include rotation tags in CreateKeyCommand', async () => {

@@ -10,7 +10,7 @@
  * Table: sent_claims
  *
  * Stores all claims sent to peers via BTP for dispute resolution.
- * Claims include XRP, EVM, and Aptos blockchain-specific signatures.
+ * Claims include EVM blockchain-specific signatures.
  *
  * Key Design Decisions:
  * - message_id as PRIMARY KEY ensures idempotency (no duplicate sends)
@@ -21,7 +21,7 @@ export const SENT_CLAIMS_TABLE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS sent_claims (
   message_id TEXT PRIMARY KEY,     -- Unique message ID (blockchain-channelId-nonce-timestamp)
   peer_id TEXT NOT NULL,           -- Peer identifier (who received the claim)
-  blockchain TEXT NOT NULL,        -- Blockchain type: 'xrp', 'evm', 'aptos'
+  blockchain TEXT NOT NULL,        -- Blockchain type: 'evm'
   claim_data TEXT NOT NULL,        -- JSON-encoded BTPClaimMessage
   sent_at INTEGER NOT NULL,        -- Unix timestamp ms (when claim was sent)
   ack_received_at INTEGER          -- Unix timestamp ms (when ack received, NULL until Story 17.3)

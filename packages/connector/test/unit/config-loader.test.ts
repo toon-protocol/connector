@@ -514,4 +514,350 @@ describe('ConfigLoader', () => {
       );
     });
   });
+
+  describe('Multi-Chain Blockchain Configuration', () => {
+    const savedEnv: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      // Save and clear relevant env vars
+      const envVars = [
+        'BASE_ENABLED',
+        'BASE_RPC_URL',
+        'BASE_CHAIN_ID',
+        'BASE_PRIVATE_KEY',
+        'BASE_REGISTRY_ADDRESS',
+        'BASE_TOKEN_ADDRESS',
+        'ARBITRUM_ENABLED',
+        'ARBITRUM_RPC_URL',
+        'ARBITRUM_CHAIN_ID',
+        'ARBITRUM_PRIVATE_KEY',
+        'ARBITRUM_REGISTRY_ADDRESS',
+        'ARBITRUM_TOKEN_ADDRESS',
+        'ENVIRONMENT',
+      ];
+      for (const key of envVars) {
+        savedEnv[key] = process.env[key];
+        delete process.env[key];
+      }
+    });
+
+    afterEach(() => {
+      // Restore env vars
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    });
+
+    it('should return undefined blockchain when neither Base nor Arbitrum is enabled', () => {
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      const config = ConfigLoader.validateConfig(raw);
+      expect(config.blockchain).toBeUndefined();
+    });
+
+    it('should load Base-only config when only BASE_ENABLED=true', () => {
+      process.env.BASE_ENABLED = 'true';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      const config = ConfigLoader.validateConfig(raw);
+      expect(config.blockchain).toBeDefined();
+      expect(config.blockchain!.base).toBeDefined();
+      expect(config.blockchain!.base!.enabled).toBe(true);
+      expect(config.blockchain!.base!.rpcUrl).toBe('http://anvil:8545');
+      expect(config.blockchain!.base!.chainId).toBe(84532);
+      expect(config.blockchain!.arbitrum).toBeUndefined();
+    });
+
+    it('should load Arbitrum-only config when only ARBITRUM_ENABLED=true', () => {
+      process.env.ARBITRUM_ENABLED = 'true';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      const config = ConfigLoader.validateConfig(raw);
+      expect(config.blockchain).toBeDefined();
+      expect(config.blockchain!.base).toBeUndefined();
+      expect(config.blockchain!.arbitrum).toBeDefined();
+      expect(config.blockchain!.arbitrum!.enabled).toBe(true);
+      expect(config.blockchain!.arbitrum!.rpcUrl).toBe('http://anvil-arbitrum:8546');
+      expect(config.blockchain!.arbitrum!.chainId).toBe(421614);
+    });
+
+    it('should load both Base and Arbitrum when both enabled', () => {
+      process.env.BASE_ENABLED = 'true';
+      process.env.ARBITRUM_ENABLED = 'true';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      const config = ConfigLoader.validateConfig(raw);
+      expect(config.blockchain).toBeDefined();
+      expect(config.blockchain!.base).toBeDefined();
+      expect(config.blockchain!.base!.enabled).toBe(true);
+      expect(config.blockchain!.arbitrum).toBeDefined();
+      expect(config.blockchain!.arbitrum!.enabled).toBe(true);
+    });
+
+    it('should use staging defaults for Arbitrum when ENVIRONMENT=staging', () => {
+      process.env.ENVIRONMENT = 'staging';
+      process.env.ARBITRUM_ENABLED = 'true';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      const config = ConfigLoader.validateConfig(raw);
+      expect(config.blockchain!.arbitrum!.rpcUrl).toBe('https://sepolia-rollup.arbitrum.io/rpc');
+      expect(config.blockchain!.arbitrum!.chainId).toBe(421614);
+    });
+
+    it('should use production defaults for Arbitrum when ENVIRONMENT=production', () => {
+      process.env.ENVIRONMENT = 'production';
+      process.env.ARBITRUM_ENABLED = 'true';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      const config = ConfigLoader.validateConfig(raw);
+      expect(config.blockchain!.arbitrum!.rpcUrl).toBe('https://arb1.arbitrum.io/rpc');
+      expect(config.blockchain!.arbitrum!.chainId).toBe(42161);
+    });
+
+    it('should apply ARBITRUM_RPC_URL override', () => {
+      process.env.ARBITRUM_ENABLED = 'true';
+      process.env.ARBITRUM_RPC_URL = 'https://custom-arb-rpc.example.com';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      const config = ConfigLoader.validateConfig(raw);
+      expect(config.blockchain!.arbitrum!.rpcUrl).toBe('https://custom-arb-rpc.example.com');
+    });
+
+    it('should apply ARBITRUM_CHAIN_ID override', () => {
+      process.env.ARBITRUM_ENABLED = 'true';
+      process.env.ARBITRUM_CHAIN_ID = '99999';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      const config = ConfigLoader.validateConfig(raw);
+      expect(config.blockchain!.arbitrum!.chainId).toBe(99999);
+    });
+
+    it('should load ARBITRUM_PRIVATE_KEY and ARBITRUM_REGISTRY_ADDRESS', () => {
+      process.env.ARBITRUM_ENABLED = 'true';
+      process.env.ARBITRUM_PRIVATE_KEY = '0xdeadbeef';
+      process.env.ARBITRUM_REGISTRY_ADDRESS = '0x1234567890123456789012345678901234567890';
+      process.env.ARBITRUM_TOKEN_ADDRESS = '0xabcdef1234567890abcdef1234567890abcdef12';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      const config = ConfigLoader.validateConfig(raw);
+      expect(config.blockchain!.arbitrum!.privateKey).toBe('0xdeadbeef');
+      expect(config.blockchain!.arbitrum!.registryAddress).toBe(
+        '0x1234567890123456789012345678901234567890'
+      );
+      expect(config.blockchain!.arbitrum!.tokenAddress).toBe(
+        '0xabcdef1234567890abcdef1234567890abcdef12'
+      );
+    });
+
+    it('should load BASE_TOKEN_ADDRESS into base config', () => {
+      process.env.BASE_ENABLED = 'true';
+      process.env.BASE_TOKEN_ADDRESS = '0xtoken1234';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      const config = ConfigLoader.validateConfig(raw);
+      expect(config.blockchain!.base!.tokenAddress).toBe('0xtoken1234');
+    });
+  });
+
+  describe('Arbitrum Environment Validation', () => {
+    const savedEnv: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      const envVars = [
+        'BASE_ENABLED',
+        'ARBITRUM_ENABLED',
+        'ENVIRONMENT',
+        'ARBITRUM_RPC_URL',
+        'ARBITRUM_CHAIN_ID',
+        'ARBITRUM_PRIVATE_KEY',
+      ];
+      for (const key of envVars) {
+        savedEnv[key] = process.env[key];
+        delete process.env[key];
+      }
+    });
+
+    afterEach(() => {
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    });
+
+    it('should reject Arbitrum with wrong chain ID in production', () => {
+      process.env.ENVIRONMENT = 'production';
+      process.env.ARBITRUM_ENABLED = 'true';
+      process.env.ARBITRUM_RPC_URL = 'https://arb1.arbitrum.io/rpc';
+      process.env.ARBITRUM_CHAIN_ID = '421614'; // testnet chain ID
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      expect(() => ConfigLoader.validateConfig(raw)).toThrow(
+        /Production must use Arbitrum mainnet \(chainId 42161\)/
+      );
+    });
+
+    it('should reject Arbitrum localhost RPC in production', () => {
+      process.env.ENVIRONMENT = 'production';
+      process.env.ARBITRUM_ENABLED = 'true';
+      process.env.ARBITRUM_RPC_URL = 'http://localhost:8546';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      expect(() => ConfigLoader.validateConfig(raw)).toThrow(
+        /Cannot use localhost RPC for Arbitrum in production/
+      );
+    });
+
+    it('should reject Arbitrum HTTP RPC in production', () => {
+      process.env.ENVIRONMENT = 'production';
+      process.env.ARBITRUM_ENABLED = 'true';
+      process.env.ARBITRUM_RPC_URL = 'http://arb1.arbitrum.io/rpc';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      expect(() => ConfigLoader.validateConfig(raw)).toThrow(
+        /Production Arbitrum RPC URL must use HTTPS/
+      );
+    });
+
+    it('should reject known dev key for Arbitrum in production', () => {
+      process.env.ENVIRONMENT = 'production';
+      process.env.ARBITRUM_ENABLED = 'true';
+      process.env.ARBITRUM_RPC_URL = 'https://arb1.arbitrum.io/rpc';
+      process.env.ARBITRUM_PRIVATE_KEY =
+        '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      expect(() => ConfigLoader.validateConfig(raw)).toThrow(
+        /Cannot use development private key for Arbitrum in production/
+      );
+    });
+
+    it('should reject Arbitrum with wrong chain ID in staging', () => {
+      process.env.ENVIRONMENT = 'staging';
+      process.env.ARBITRUM_ENABLED = 'true';
+      process.env.ARBITRUM_CHAIN_ID = '42161'; // mainnet chain ID
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      expect(() => ConfigLoader.validateConfig(raw)).toThrow(
+        /Staging must use Arbitrum testnet \(chainId 421614\)/
+      );
+    });
+
+    it('should reject known dev key for Arbitrum in staging', () => {
+      process.env.ENVIRONMENT = 'staging';
+      process.env.ARBITRUM_ENABLED = 'true';
+      process.env.ARBITRUM_PRIVATE_KEY =
+        '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      expect(() => ConfigLoader.validateConfig(raw)).toThrow(
+        /Cannot use Anvil development private key for Arbitrum in staging/
+      );
+    });
+
+    it('should allow valid Arbitrum production config', () => {
+      process.env.ENVIRONMENT = 'production';
+      process.env.ARBITRUM_ENABLED = 'true';
+      process.env.ARBITRUM_RPC_URL = 'https://arb1.arbitrum.io/rpc';
+      process.env.ARBITRUM_PRIVATE_KEY =
+        '0x1111111111111111111111111111111111111111111111111111111111111111';
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      const config = ConfigLoader.validateConfig(raw);
+      expect(config.blockchain!.arbitrum!.enabled).toBe(true);
+      expect(config.blockchain!.arbitrum!.chainId).toBe(42161);
+    });
+
+    it('should allow both Base and Arbitrum in production', () => {
+      process.env.ENVIRONMENT = 'production';
+      process.env.BASE_ENABLED = 'true';
+      process.env.ARBITRUM_ENABLED = 'true';
+      // Both need valid production configs
+      const raw = {
+        nodeId: 'test',
+        btpServerPort: 3000,
+        peers: [],
+        routes: [],
+      };
+      const config = ConfigLoader.validateConfig(raw);
+      expect(config.blockchain!.base!.enabled).toBe(true);
+      expect(config.blockchain!.base!.chainId).toBe(8453);
+      expect(config.blockchain!.arbitrum!.enabled).toBe(true);
+      expect(config.blockchain!.arbitrum!.chainId).toBe(42161);
+    });
+  });
 });

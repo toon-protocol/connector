@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # Complete production deployment including:
-# - ILP Connector with tri-chain settlement support (EVM, XRP, Aptos)
+# - ILP Connector with EVM settlement support
 # - TigerBeetle high-performance accounting database
 # - Prometheus metrics collection
 # - Grafana dashboards and visualization
@@ -11,8 +11,6 @@
 #
 # Supported Settlement Chains:
 #   - Base L2 (EVM): Payment channels via smart contracts
-#   - XRP Ledger: Native payment channels
-#   - Aptos: Move-based payment channels
 #
 # Prerequisites:
 #   1. Build connector image: docker build -t agent-runtime/connector:latest .
@@ -21,7 +19,7 @@
 #        ghcr.io/tigerbeetle/tigerbeetle:0.16.68 \
 #        format --cluster=0 --replica=0 --replica-count=1 /data/0_0.tigerbeetle
 #   3. Create .env from template: cp .env.example .env
-#   4. Configure .env with your settings (including Aptos credentials)
+#   4. Configure .env with your EVM settings
 #
 # Usage:
 #   Start all services:  docker-compose -f docker-compose-production.yml up -d
@@ -117,8 +115,6 @@ services:
       # Blockchain RPC URLs
       BASE_RPC_URL: ${BASE_RPC_URL:-https://mainnet.base.org}
       BASE_L2_RPC_URL: ${BASE_L2_RPC_URL:-https://mainnet.base.org}
-      XRPL_WSS_URL: ${XRPL_WSS_URL:-wss://xrplcluster.com}
-      APTOS_NODE_URL: ${APTOS_NODE_URL:-https://fullnode.mainnet.aptoslabs.com/v1}
 
       # M2M Token & Payment Channel Configuration
       M2M_TOKEN_ADDRESS: ${M2M_TOKEN_ADDRESS:-}
@@ -126,35 +122,25 @@ services:
 
       # Wallet Addresses (for settlement)
       EVM_ADDRESS: ${EVM_ADDRESS:-}
-      XRP_ADDRESS: ${XRP_ADDRESS:-}
-      APTOS_ADDRESS: ${APTOS_ADDRESS:-}
 
       # Key Management
       KEY_BACKEND: ${KEY_BACKEND:-env}
       EVM_PRIVATE_KEY: ${EVM_PRIVATE_KEY:-}
       TREASURY_EVM_PRIVATE_KEY: ${TREASURY_EVM_PRIVATE_KEY:-}
-      XRP_SEED: ${XRP_SEED:-}
-      APTOS_PRIVATE_KEY: ${APTOS_PRIVATE_KEY:-}
 
       # AWS KMS (if KEY_BACKEND=aws-kms)
       AWS_REGION: ${AWS_REGION:-}
       AWS_KMS_EVM_KEY_ID: ${AWS_KMS_EVM_KEY_ID:-}
-      AWS_KMS_XRP_KEY_ID: ${AWS_KMS_XRP_KEY_ID:-}
-      AWS_KMS_APTOS_KEY_ID: ${AWS_KMS_APTOS_KEY_ID:-}
 
       # GCP KMS (if KEY_BACKEND=gcp-kms)
       GCP_PROJECT_ID: ${GCP_PROJECT_ID:-}
       GCP_LOCATION_ID: ${GCP_LOCATION_ID:-}
       GCP_KEY_RING_ID: ${GCP_KEY_RING_ID:-}
       GCP_KMS_EVM_KEY_ID: ${GCP_KMS_EVM_KEY_ID:-}
-      GCP_KMS_XRP_KEY_ID: ${GCP_KMS_XRP_KEY_ID:-}
-      GCP_KMS_APTOS_KEY_ID: ${GCP_KMS_APTOS_KEY_ID:-}
 
       # Azure Key Vault (if KEY_BACKEND=azure-kv)
       AZURE_VAULT_URL: ${AZURE_VAULT_URL:-}
       AZURE_EVM_KEY_NAME: ${AZURE_EVM_KEY_NAME:-}
-      AZURE_XRP_KEY_NAME: ${AZURE_XRP_KEY_NAME:-}
-      AZURE_APTOS_KEY_NAME: ${AZURE_APTOS_KEY_NAME:-}
 
       # TigerBeetle Connection
       TIGERBEETLE_CLUSTER_ID: "0"

@@ -158,7 +158,6 @@ describe('PeersView', () => {
           {
             peerId: 'alice',
             ilpAddress: 'g.agent.alice',
-            xrpAddress: 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh',
             connected: true,
           },
         ],
@@ -462,7 +461,6 @@ describe('PeersView', () => {
             {
               peerId: 'alice',
               ilpAddress: 'g.agent.alice',
-              xrpAddress: 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh',
               connected: true,
             },
           ],

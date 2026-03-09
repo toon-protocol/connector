@@ -36,15 +36,12 @@ import {
   AdminSettlementConfig,
   PeerConfig as SettlementPeerConfig,
   isValidEvmAddress,
-  isValidXrpAddress,
-  isValidAptosAddress,
   isValidNonNegativeIntegerString,
   normalizeChannelStatus,
 } from '../settlement/types';
 import type { AdminChannelStatus } from '../settlement/types';
 import type { ChannelManager } from '../settlement/channel-manager';
 import type { PaymentChannelSDK } from '../settlement/payment-channel-sdk';
-import type { XRPChannelLifecycleManager } from '../settlement/xrp-channel-lifecycle';
 import type { AccountManager } from '../settlement/account-manager';
 import type { SettlementMonitor } from '../settlement/settlement-monitor';
 import type { ClaimReceiver } from '../settlement/claim-receiver';
@@ -89,9 +86,6 @@ export interface AdminAPIConfig {
 
   /** Optional PaymentChannelSDK for on-chain EVM channel state queries */
   paymentChannelSDK?: PaymentChannelSDK;
-
-  /** Optional XRPChannelLifecycleManager for XRP payment channel operations */
-  xrpChannelLifecycleManager?: XRPChannelLifecycleManager;
 
   /** Optional AccountManager for peer balance queries (TigerBeetle) */
   accountManager?: AccountManager;
@@ -324,7 +318,6 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
     settlementPeers,
     channelManager,
     paymentChannelSDK,
-    xrpChannelLifecycleManager,
     accountManager,
     settlementMonitor,
     claimReceiver,
@@ -438,9 +431,6 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
             peerResponse.settlement = {
               preference: peerConfig.settlementPreference,
               evmAddress: peerConfig.evmAddress,
-              xrpAddress: peerConfig.xrpAddress,
-              aptosAddress: peerConfig.aptosAddress,
-              aptosPubkey: peerConfig.aptosPubkey,
               tokenAddress: peerConfig.tokenAddress,
               tokenNetworkAddress: peerConfig.tokenNetworkAddress,
               chainId: peerConfig.chainId,
@@ -584,8 +574,6 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
           settlementTokens.push(s.tokenAddress);
         } else {
           if (s.evmAddress) settlementTokens.push('EVM');
-          if (s.xrpAddress) settlementTokens.push('XRP');
-          if (s.aptosAddress) settlementTokens.push('APT');
         }
 
         const newConfig: SettlementPeerConfig = {
@@ -594,9 +582,6 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
           settlementPreference: s.preference,
           settlementTokens,
           evmAddress: s.evmAddress,
-          xrpAddress: s.xrpAddress,
-          aptosAddress: s.aptosAddress,
-          aptosPubkey: s.aptosPubkey,
           tokenAddress: s.tokenAddress,
           tokenNetworkAddress: s.tokenNetworkAddress,
           chainId: s.chainId,
@@ -809,8 +794,6 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
           settlementTokens.push(s.tokenAddress);
         } else {
           if (s.evmAddress) settlementTokens.push('EVM');
-          if (s.xrpAddress) settlementTokens.push('XRP');
-          if (s.aptosAddress) settlementTokens.push('APT');
         }
 
         const newConfig: SettlementPeerConfig = {
@@ -819,9 +802,6 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
           settlementPreference: s.preference,
           settlementTokens,
           evmAddress: s.evmAddress,
-          xrpAddress: s.xrpAddress,
-          aptosAddress: s.aptosAddress,
-          aptosPubkey: s.aptosPubkey,
           tokenAddress: s.tokenAddress,
           tokenNetworkAddress: s.tokenNetworkAddress,
           chainId: s.chainId,
@@ -1099,77 +1079,6 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
           status: normalizeChannelStatus(metadata.status, log),
           deposit: body.initialDeposit,
         } satisfies OpenChannelResponse);
-      } else if (chainPrefix === 'xrp') {
-        if (!xrpChannelLifecycleManager) {
-          res.status(503).json({
-            error: 'Service Unavailable',
-            message: 'XRP settlement infrastructure not enabled',
-          });
-          return;
-        }
-
-        // Resolve XRP destination: explicit request field, then settlementPeers fallback
-        const peerConfig = settlementPeers?.get(body.peerId);
-        const peerXrpAddress = body.peerAddress || peerConfig?.xrpAddress;
-        if (!peerXrpAddress) {
-          res.status(400).json({
-            error: 'Bad request',
-            message: 'Peer XRP address must be provided in request or peer registration',
-          });
-          return;
-        }
-
-        // Validate XRP address format if provided in request
-        if (
-          body.peerAddress &&
-          (!/^r/.test(body.peerAddress) ||
-            body.peerAddress.length < 25 ||
-            body.peerAddress.length > 35)
-        ) {
-          res.status(400).json({
-            error: 'Bad request',
-            message: 'Invalid XRP address format: must start with r and be 25-35 characters',
-          });
-          return;
-        }
-
-        const channelId = await xrpChannelLifecycleManager.getOrCreateChannel(
-          body.peerId,
-          peerXrpAddress
-        );
-
-        log.info(
-          { peerId: body.peerId, chain: body.chain, channelId },
-          'XRP channel opened via Admin API'
-        );
-
-        const metadata = channelManager.getChannelById(channelId);
-        if (!metadata) {
-          res.status(500).json({
-            error: 'Internal error',
-            message: 'XRP channel created but metadata unavailable',
-          });
-          return;
-        }
-
-        res.status(201).json({
-          channelId,
-          chain: body.chain,
-          status: normalizeChannelStatus(metadata.status, log),
-          deposit: body.initialDeposit,
-        } satisfies OpenChannelResponse);
-      } else if (chainPrefix === 'aptos') {
-        // Aptos channel open — placeholder
-        const peerConfig = settlementPeers?.get(body.peerId);
-        if (!peerConfig?.aptosAddress) {
-          res.status(400).json({
-            error: 'Bad request',
-            message: 'Peer has no Aptos address configured',
-          });
-          return;
-        }
-
-        returnNotImplemented(res, 'aptos', 'Channel open');
       } else {
         res.status(400).json({
           error: 'Bad request',
@@ -1389,31 +1298,6 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
           newDeposit: state.myDeposit.toString(),
           status: normalizeChannelStatus(metadata.status, log),
         } satisfies DepositResponse);
-      } else if (chainPrefix === 'xrp') {
-        if (!xrpChannelLifecycleManager) {
-          res.status(503).json({
-            error: 'Service Unavailable',
-            message: 'XRP settlement infrastructure not enabled',
-          });
-          return;
-        }
-
-        await xrpChannelLifecycleManager.fundChannel(metadata.peerId, amount);
-
-        metadata.lastActivityAt = new Date();
-
-        log.info(
-          { channelId: reqChannelId, chain: chainPrefix, amount },
-          'Deposit completed via Admin API'
-        );
-
-        res.json({
-          channelId: reqChannelId,
-          newDeposit: amount,
-          status: normalizeChannelStatus(metadata.status, log),
-        } satisfies DepositResponse);
-      } else if (chainPrefix === 'aptos') {
-        returnNotImplemented(res, 'aptos', 'Channel deposit');
       } else {
         res.status(400).json({
           error: 'Bad request',
@@ -1565,31 +1449,6 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
           channelId: reqChannelId,
           status: 'closing',
         } satisfies CloseChannelResponse);
-      } else if (chainPrefix === 'xrp') {
-        if (!xrpChannelLifecycleManager) {
-          res.status(503).json({
-            error: 'Service Unavailable',
-            message: 'XRP settlement infrastructure not enabled',
-          });
-          return;
-        }
-
-        await xrpChannelLifecycleManager.closeChannel(metadata.peerId, 'manual');
-
-        metadata.status = 'closing';
-        metadata.lastActivityAt = new Date();
-
-        log.info(
-          { channelId: reqChannelId, chain: chainPrefix, cooperative },
-          'Channel close initiated via Admin API'
-        );
-
-        res.json({
-          channelId: reqChannelId,
-          status: 'closing',
-        } satisfies CloseChannelResponse);
-      } else if (chainPrefix === 'aptos') {
-        returnNotImplemented(res, 'aptos', 'Channel close');
       } else {
         res.status(400).json({
           error: 'Bad request',
@@ -1759,7 +1618,7 @@ export interface AdminServerConfig {
 // --- Payment Channel Admin API Types ---
 
 /** Chain format: {blockchain}:{network}:{chainId} */
-export const CHAIN_FORMAT_REGEX = /^(evm|xrp|aptos):[a-zA-Z0-9]+:\d+$/;
+export const CHAIN_FORMAT_REGEX = /^evm:[a-zA-Z0-9]+:\d+$/;
 
 /** POST /admin/channels request body */
 export interface OpenChannelRequest {
@@ -1817,8 +1676,6 @@ export interface DepositResponse {
   channelId: string;
   /**
    * For EVM channels: total cumulative deposit from getChannelState().myDeposit (includes all prior deposits).
-   * For XRP channels: the incremental deposited amount only (XRP fundChannel() returns void — cumulative total unavailable).
-   * Callers should be aware of this semantic difference when interpreting values across chain types.
    */
   newDeposit: string;
   status: AdminChannelStatus;
@@ -1864,47 +1721,25 @@ export function validateDepositRequest(body: Record<string, unknown>): {
 }
 
 /**
- * Return a 501 Not Implemented response for unsupported chain operations
- */
-function returnNotImplemented(res: Response, chain: string, operation: string): void {
-  res.status(501).json({
-    error: 'Not Implemented',
-    message: `${operation} not yet implemented for ${chain}`,
-  });
-}
-
-/**
  * Validate settlement configuration fields.
  * @returns Error message string if invalid, or null if valid
  */
 export function validateSettlementConfig(s: AdminSettlementConfig): string | null {
-  const VALID_PREFERENCES = ['evm', 'xrp', 'aptos', 'any'];
+  const VALID_PREFERENCES = ['evm', 'any'];
 
   if (!s.preference || !VALID_PREFERENCES.includes(s.preference)) {
-    return 'settlement.preference must be one of: evm, xrp, aptos, any';
+    return 'settlement.preference must be one of: evm, any';
   }
 
   if (s.preference === 'evm' && !s.evmAddress) {
     return 'settlement.evmAddress required when preference is evm';
   }
-  if (s.preference === 'xrp' && !s.xrpAddress) {
-    return 'settlement.xrpAddress required when preference is xrp';
-  }
-  if (s.preference === 'aptos' && !s.aptosAddress) {
-    return 'settlement.aptosAddress required when preference is aptos';
-  }
-  if (s.preference === 'any' && !s.evmAddress && !s.xrpAddress && !s.aptosAddress) {
-    return 'settlement: at least one address required when preference is any';
+  if (s.preference === 'any' && !s.evmAddress) {
+    return 'settlement: evmAddress required when preference is any';
   }
 
   if (s.evmAddress && !isValidEvmAddress(s.evmAddress)) {
     return 'settlement.evmAddress must be a valid 0x-prefixed address (42 chars)';
-  }
-  if (s.xrpAddress && !isValidXrpAddress(s.xrpAddress)) {
-    return 'settlement.xrpAddress must start with r and be 25-35 characters';
-  }
-  if (s.aptosAddress && !isValidAptosAddress(s.aptosAddress)) {
-    return 'settlement.aptosAddress must be a valid 0x-prefixed address (66 chars)';
   }
   if (s.tokenAddress && !isValidEvmAddress(s.tokenAddress)) {
     return 'settlement.tokenAddress must be a valid 0x-prefixed address (42 chars)';

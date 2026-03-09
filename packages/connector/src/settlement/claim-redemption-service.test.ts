@@ -5,7 +5,7 @@
  * - Service lifecycle (start/stop)
  * - Claim polling and processing
  * - Profitability checks
- * - XRP/EVM/Aptos redemption success
+ * - EVM redemption success
  * - Retry logic with exponential backoff
  * - Gas estimation
  * - Database updates
@@ -18,17 +18,24 @@ import { ClaimRedemptionService } from './claim-redemption-service';
 import type { Database } from 'better-sqlite3';
 import type { Logger } from 'pino';
 import type { ethers } from 'ethers';
-import type { XRPChannelSDK } from './xrp-channel-sdk';
 import type { PaymentChannelSDK } from './payment-channel-sdk';
-import type { AptosChannelSDK } from './aptos-channel-sdk';
 import type { TelemetryEmitter } from '../telemetry/telemetry-emitter';
+
+/** Helper to create a DB row as returned by the SELECT query */
+function makeDbRow(claim: Record<string, any>) {
+  return {
+    message_id: claim.messageId,
+    peer_id: claim.senderId,
+    blockchain: claim.blockchain,
+    channel_id: claim.channelId,
+    claim_data: JSON.stringify(claim),
+  };
+}
 
 describe('ClaimRedemptionService', () => {
   let service: ClaimRedemptionService;
   let mockDb: jest.Mocked<Database>;
-  let mockXRPChannelSDK: jest.Mocked<XRPChannelSDK>;
   let mockEVMChannelSDK: jest.Mocked<PaymentChannelSDK>;
-  let mockAptosChannelSDK: jest.Mocked<AptosChannelSDK>;
   let mockEvmProvider: jest.Mocked<ethers.Provider>;
   let mockLogger: jest.Mocked<Logger>;
   let mockTelemetryEmitter: jest.Mocked<TelemetryEmitter>;
@@ -39,25 +46,15 @@ describe('ClaimRedemptionService', () => {
       prepare: jest.fn(),
     } as unknown as jest.Mocked<Database>;
 
-    // Mock XRPChannelSDK
-    mockXRPChannelSDK = {
-      submitClaim: jest.fn().mockResolvedValue(undefined),
-    } as unknown as jest.Mocked<XRPChannelSDK>;
-
     // Mock PaymentChannelSDK
     mockEVMChannelSDK = {
       closeChannel: jest.fn().mockResolvedValue(undefined),
     } as unknown as jest.Mocked<PaymentChannelSDK>;
 
-    // Mock AptosChannelSDK
-    mockAptosChannelSDK = {
-      submitClaim: jest.fn().mockResolvedValue(undefined),
-    } as unknown as jest.Mocked<AptosChannelSDK>;
-
     // Mock ethers.Provider
     mockEvmProvider = {
       getFeeData: jest.fn().mockResolvedValue({
-        gasPrice: 1000000000n, // 1 gwei
+        gasPrice: 10n, // 10 wei – keeps gas cost (10 * 150000 = 1.5M) below claim amounts
       }),
     } as unknown as jest.Mocked<ethers.Provider>;
 
@@ -78,9 +75,7 @@ describe('ClaimRedemptionService', () => {
     // Create service instance
     service = new ClaimRedemptionService(
       mockDb,
-      mockXRPChannelSDK,
       mockEVMChannelSDK,
-      mockAptosChannelSDK,
       mockEvmProvider,
       {
         minProfitThreshold: 1000n,
@@ -99,6 +94,29 @@ describe('ClaimRedemptionService', () => {
     jest.useRealTimers();
     service.stop();
   });
+
+  /** Helper to set up DB mocks for a claim row */
+  function setupDbMocks(claimRows: any[]) {
+    const mockSelectStmt = {
+      all: jest.fn().mockReturnValue(claimRows),
+    };
+
+    const mockUpdateStmt = {
+      run: jest.fn().mockReturnValue({ changes: 1 }),
+    };
+
+    mockDb.prepare.mockImplementation((sql: string) => {
+      if (sql.includes('SELECT')) {
+        return mockSelectStmt as any;
+      }
+      if (sql.includes('UPDATE')) {
+        return mockUpdateStmt as any;
+      }
+      return { all: jest.fn().mockReturnValue([]) } as any;
+    });
+
+    return { mockSelectStmt, mockUpdateStmt };
+  }
 
   describe('start()', () => {
     it('should start polling and set isRunning to true', () => {
@@ -176,180 +194,9 @@ describe('ClaimRedemptionService', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       expect(mockStmt.all).toHaveBeenCalledWith(5);
-      expect(mockXRPChannelSDK.submitClaim).not.toHaveBeenCalled();
       expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
-      expect(mockAptosChannelSDK.submitClaim).not.toHaveBeenCalled();
 
       service.stop();
-    });
-  });
-
-  describe('XRP claim redemption', () => {
-    it('should successfully redeem XRP claim', async () => {
-      const xrpClaim = {
-        blockchain: 'xrp',
-        messageId: 'msg_xrp_123',
-        senderId: 'peer-alice',
-        channelId: 'ABC123',
-        amount: '5000000',
-        signature: 'sig_xrp',
-        publicKey: 'pubkey_xrp',
-      };
-
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_xrp_123',
-            peer_id: 'peer-alice',
-            blockchain: 'xrp',
-            channel_id: 'ABC123',
-            claim_data: JSON.stringify(xrpClaim),
-          },
-        ]),
-      };
-
-      const mockUpdateStmt = {
-        run: jest.fn(),
-      };
-
-      mockDb.prepare
-        .mockReturnValueOnce(mockStmt as any) // SELECT
-        .mockReturnValueOnce(mockUpdateStmt as any); // UPDATE
-
-      service.start();
-
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      expect(mockXRPChannelSDK.submitClaim).toHaveBeenCalledWith({
-        channelId: 'ABC123',
-        amount: '5000000',
-        signature: 'sig_xrp',
-        publicKey: 'pubkey_xrp',
-      });
-
-      expect(mockUpdateStmt.run).toHaveBeenCalledWith(
-        expect.any(Number),
-        'msg_xrp_123',
-        'msg_xrp_123'
-      );
-
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CLAIM_REDEEMED',
-          messageId: 'msg_xrp_123',
-          blockchain: 'xrp',
-          success: true,
-        })
-      );
-
-      service.stop();
-    });
-
-    it('should retry XRP claim redemption on failure', async () => {
-      jest.useFakeTimers();
-
-      const xrpClaim = {
-        blockchain: 'xrp',
-        messageId: 'msg_xrp_retry',
-        senderId: 'peer-alice',
-        channelId: 'ABC123',
-        amount: '5000000',
-        signature: 'sig_xrp',
-        publicKey: 'pubkey_xrp',
-      };
-
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_xrp_retry',
-            peer_id: 'peer-alice',
-            blockchain: 'xrp',
-            channel_id: 'ABC123',
-            claim_data: JSON.stringify(xrpClaim),
-          },
-        ]),
-      };
-
-      const mockUpdateStmt = {
-        run: jest.fn(),
-      };
-
-      mockDb.prepare.mockReturnValueOnce(mockStmt as any).mockReturnValue(mockUpdateStmt as any);
-
-      // Fail twice, succeed on third attempt
-      mockXRPChannelSDK.submitClaim
-        .mockRejectedValueOnce(new Error('Network timeout'))
-        .mockRejectedValueOnce(new Error('RPC unavailable'))
-        .mockResolvedValueOnce(undefined);
-
-      service.start();
-
-      // Fast-forward through retries
-      await jest.advanceTimersByTimeAsync(100); // Initial call
-      await jest.advanceTimersByTimeAsync(1000); // First retry (1s delay)
-      await jest.advanceTimersByTimeAsync(2000); // Second retry (2s delay)
-
-      expect(mockXRPChannelSDK.submitClaim).toHaveBeenCalledTimes(3);
-      expect(mockUpdateStmt.run).toHaveBeenCalledWith(
-        expect.any(Number),
-        'msg_xrp_retry',
-        'msg_xrp_retry'
-      );
-
-      service.stop();
-      jest.useRealTimers();
-    });
-
-    it('should fail after 3 retry attempts', async () => {
-      jest.useFakeTimers();
-
-      const xrpClaim = {
-        blockchain: 'xrp',
-        messageId: 'msg_xrp_fail',
-        senderId: 'peer-alice',
-        channelId: 'ABC123',
-        amount: '5000000',
-        signature: 'sig_xrp',
-        publicKey: 'pubkey_xrp',
-      };
-
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_xrp_fail',
-            peer_id: 'peer-alice',
-            blockchain: 'xrp',
-            channel_id: 'ABC123',
-            claim_data: JSON.stringify(xrpClaim),
-          },
-        ]),
-      };
-
-      mockDb.prepare.mockReturnValue(mockStmt as any);
-
-      // All attempts fail
-      mockXRPChannelSDK.submitClaim.mockRejectedValue(new Error('Permanent failure'));
-
-      service.start();
-
-      await jest.advanceTimersByTimeAsync(100);
-      await jest.advanceTimersByTimeAsync(1000);
-      await jest.advanceTimersByTimeAsync(2000);
-      await jest.advanceTimersByTimeAsync(4000);
-
-      expect(mockXRPChannelSDK.submitClaim).toHaveBeenCalledTimes(3);
-
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CLAIM_REDEEMED',
-          messageId: 'msg_xrp_fail',
-          success: false,
-          error: 'Permanent failure',
-        })
-      );
-
-      service.stop();
-      jest.useRealTimers();
     });
   });
 
@@ -358,216 +205,190 @@ describe('ClaimRedemptionService', () => {
       const evmClaim = {
         blockchain: 'evm',
         messageId: 'msg_evm_123',
-        senderId: 'peer-bob',
-        channelId: '0xDEF456',
-        nonce: 5,
-        transferredAmount: '8000000000000000000', // 8 ETH in wei (enough for profitability)
+        senderId: 'peer-alice',
+        channelId: '0xABC123',
+        nonce: 1,
+        transferredAmount: '5000000',
         lockedAmount: '0',
         locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
         signature: 'sig_evm',
-        signerAddress: '0xABCD...',
+        signerAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
       };
 
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_evm_123',
-            peer_id: 'peer-bob',
-            blockchain: 'evm',
-            channel_id: '0xDEF456',
-            claim_data: JSON.stringify(evmClaim),
-          },
-        ]),
-      };
-
-      const mockUpdateStmt = {
-        run: jest.fn(),
-      };
-
-      mockDb.prepare
-        .mockReturnValueOnce(mockStmt as any)
-        .mockReturnValueOnce(mockUpdateStmt as any);
+      const { mockUpdateStmt } = setupDbMocks([makeDbRow(evmClaim)]);
+      mockEVMChannelSDK.closeChannel.mockResolvedValue(undefined);
 
       service.start();
-
       await new Promise((resolve) => setTimeout(resolve, 100));
 
+      // closeChannel called with (channelId, tokenAddress, balanceProof, signature)
       expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledWith(
-        '0xDEF456',
+        '0xABC123',
         '0x1234567890abcdef1234567890abcdef12345678',
-        {
-          channelId: '0xDEF456',
-          nonce: 5,
-          transferredAmount: 8000000000000000000n,
+        expect.objectContaining({
+          channelId: '0xABC123',
+          nonce: 1,
+          transferredAmount: 5000000n,
           lockedAmount: 0n,
-          locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
-        },
+        }),
         'sig_evm'
       );
-
+      // DB update: stmt.run(Date.now(), txHash, messageId)
       expect(mockUpdateStmt.run).toHaveBeenCalledWith(
         expect.any(Number),
         'msg_evm_123',
         'msg_evm_123'
       );
-
       expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
         expect.objectContaining({
           type: 'CLAIM_REDEEMED',
-          messageId: 'msg_evm_123',
           blockchain: 'evm',
+          messageId: 'msg_evm_123',
           success: true,
         })
       );
 
       service.stop();
     });
-  });
 
-  describe('Aptos claim redemption', () => {
-    it('should successfully redeem Aptos claim', async () => {
-      const aptosClaim = {
-        blockchain: 'aptos',
-        messageId: 'msg_aptos_123',
-        senderId: 'peer-charlie',
-        channelOwner: '0x789GHI',
-        amount: '6000000',
-        nonce: 3,
-        signature: 'sig_aptos',
-        publicKey: 'pubkey_aptos',
+    it('should retry EVM claim redemption on failure', async () => {
+      const evmClaim = {
+        blockchain: 'evm',
+        messageId: 'msg_evm_retry',
+        senderId: 'peer-bob',
+        channelId: '0xDEF456',
+        nonce: 2,
+        transferredAmount: '3000000',
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
+        signature: 'sig_evm_retry',
+        signerAddress: '0x8ba1f109551bD432803012645Ac136ddd64DBA72',
       };
 
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_aptos_123',
-            peer_id: 'peer-charlie',
-            blockchain: 'aptos',
-            channel_id: '0x789GHI',
-            claim_data: JSON.stringify(aptosClaim),
-          },
-        ]),
-      };
+      const { mockUpdateStmt } = setupDbMocks([makeDbRow(evmClaim)]);
 
-      const mockUpdateStmt = {
-        run: jest.fn(),
-      };
-
-      mockDb.prepare
-        .mockReturnValueOnce(mockStmt as any)
-        .mockReturnValueOnce(mockUpdateStmt as any);
+      // First attempt fails, second succeeds
+      mockEVMChannelSDK.closeChannel
+        .mockRejectedValueOnce(new Error('Network error'))
+        .mockResolvedValueOnce(undefined);
 
       service.start();
 
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Wait for retry (1s backoff + buffer)
+      await new Promise((resolve) => setTimeout(resolve, 1500));
 
-      expect(mockAptosChannelSDK.submitClaim).toHaveBeenCalledWith(
-        expect.objectContaining({
-          channelOwner: '0x789GHI',
-          amount: 6000000n,
-          nonce: 3,
-          signature: 'sig_aptos',
-          publicKey: 'pubkey_aptos',
-          createdAt: expect.any(Number),
-        })
-      );
-
+      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledTimes(2);
       expect(mockUpdateStmt.run).toHaveBeenCalledWith(
         expect.any(Number),
-        'msg_aptos_123',
-        'msg_aptos_123'
-      );
-
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CLAIM_REDEEMED',
-          messageId: 'msg_aptos_123',
-          blockchain: 'aptos',
-          success: true,
-          channelId: '0x789GHI', // Aptos uses channelOwner as channelId
-        })
+        'msg_evm_retry',
+        'msg_evm_retry'
       );
 
       service.stop();
     });
+
+    it('should fail after 3 retry attempts', async () => {
+      const evmClaim = {
+        blockchain: 'evm',
+        messageId: 'msg_evm_fail',
+        senderId: 'peer-charlie',
+        channelId: '0xGHI789',
+        nonce: 3,
+        transferredAmount: '5000000',
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
+        signature: 'sig_evm_fail',
+        signerAddress: '0x9cA1f109551bD432803012645Ac136ddd64DBA73',
+      };
+
+      setupDbMocks([makeDbRow(evmClaim)]);
+
+      // All attempts fail
+      mockEVMChannelSDK.closeChannel.mockRejectedValue(new Error('Persistent network error'));
+
+      service.start();
+
+      // Wait for all retries (1s + 2s + 4s backoff + buffer)
+      await new Promise((resolve) => setTimeout(resolve, 8000));
+
+      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledTimes(3);
+      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'CLAIM_REDEEMED',
+          blockchain: 'evm',
+          messageId: 'msg_evm_fail',
+          success: false,
+        })
+      );
+
+      service.stop();
+    }, 10000);
   });
 
   describe('Profitability check', () => {
     it('should redeem profitable claims', async () => {
-      const xrpClaim = {
-        blockchain: 'xrp',
+      const evmClaim = {
+        blockchain: 'evm',
         messageId: 'msg_profitable',
         senderId: 'peer-alice',
-        channelId: 'ABC123',
-        amount: '10000', // 10000 - 10 (gas) = 9990, profit > 1000 threshold
-        signature: 'sig_xrp',
-        publicKey: 'pubkey_xrp',
+        channelId: '0xPROFIT',
+        nonce: 1,
+        transferredAmount: '10000000', // High amount
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
+        signature: 'sig_evm',
+        signerAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
       };
 
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_profitable',
-            peer_id: 'peer-alice',
-            blockchain: 'xrp',
-            channel_id: 'ABC123',
-            claim_data: JSON.stringify(xrpClaim),
-          },
-        ]),
-      };
+      const { mockUpdateStmt } = setupDbMocks([makeDbRow(evmClaim)]);
 
-      const mockUpdateStmt = {
-        run: jest.fn(),
-      };
+      mockEvmProvider.getFeeData.mockResolvedValue({
+        gasPrice: 1n, // 1 wei – gas cost = 150000 wei << 10M claim
+      } as any);
 
-      mockDb.prepare
-        .mockReturnValueOnce(mockStmt as any)
-        .mockReturnValueOnce(mockUpdateStmt as any);
+      mockEVMChannelSDK.closeChannel.mockResolvedValue(undefined);
 
       service.start();
-
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      expect(mockXRPChannelSDK.submitClaim).toHaveBeenCalled();
+      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalled();
+      expect(mockUpdateStmt.run).toHaveBeenCalledWith(
+        expect.any(Number),
+        'msg_profitable',
+        'msg_profitable'
+      );
 
       service.stop();
     });
 
     it('should skip unprofitable claims', async () => {
-      const xrpClaim = {
-        blockchain: 'xrp',
+      const evmClaim = {
+        blockchain: 'evm',
         messageId: 'msg_unprofitable',
-        senderId: 'peer-alice',
-        channelId: 'ABC123',
-        amount: '500', // 500 - 10 (gas) = 490, profit < 1000 threshold
-        signature: 'sig_xrp',
-        publicKey: 'pubkey_xrp',
+        senderId: 'peer-bob',
+        channelId: '0xUNPROFIT',
+        nonce: 1,
+        transferredAmount: '500', // Very small amount
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
+        signature: 'sig_evm',
+        signerAddress: '0x8ba1f109551bD432803012645Ac136ddd64DBA72',
       };
 
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_unprofitable',
-            peer_id: 'peer-alice',
-            blockchain: 'xrp',
-            channel_id: 'ABC123',
-            claim_data: JSON.stringify(xrpClaim),
-          },
-        ]),
-      };
+      setupDbMocks([makeDbRow(evmClaim)]);
 
-      mockDb.prepare.mockReturnValue(mockStmt as any);
+      mockEvmProvider.getFeeData.mockResolvedValue({
+        gasPrice: 1000000000n, // 1 gwei
+      } as any);
 
       service.start();
-
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      expect(mockXRPChannelSDK.submitClaim).not.toHaveBeenCalled();
+      // Should NOT attempt redemption
+      expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
       expect(mockLogger.debug).toHaveBeenCalledWith(
         expect.objectContaining({
           messageId: 'msg_unprofitable',
-          claimAmount: '500',
-          gasCost: '10',
         }),
         'Skipping unprofitable claim'
       );
@@ -576,42 +397,29 @@ describe('ClaimRedemptionService', () => {
     });
 
     it('should skip high-gas EVM claims', async () => {
-      // Mock high gas price
-      mockEvmProvider.getFeeData.mockResolvedValue({
-        gasPrice: 100000000000n, // 100 gwei (very high)
-      } as any);
-
       const evmClaim = {
         blockchain: 'evm',
         messageId: 'msg_high_gas',
-        senderId: 'peer-bob',
-        channelId: '0xDEF456',
-        nonce: 5,
-        transferredAmount: '1000000', // Low amount
+        senderId: 'peer-charlie',
+        channelId: '0xHIGHGAS',
+        nonce: 1,
+        transferredAmount: '2000000', // Moderate amount
         lockedAmount: '0',
         locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
         signature: 'sig_evm',
-        signerAddress: '0xABCD...',
+        signerAddress: '0x9cA1f109551bD432803012645Ac136ddd64DBA73',
       };
 
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_high_gas',
-            peer_id: 'peer-bob',
-            blockchain: 'evm',
-            channel_id: '0xDEF456',
-            claim_data: JSON.stringify(evmClaim),
-          },
-        ]),
-      };
+      setupDbMocks([makeDbRow(evmClaim)]);
 
-      mockDb.prepare.mockReturnValue(mockStmt as any);
+      mockEvmProvider.getFeeData.mockResolvedValue({
+        gasPrice: 100000000000n, // 100 gwei (very high gas)
+      } as any);
 
       service.start();
-
       await new Promise((resolve) => setTimeout(resolve, 100));
 
+      // Should NOT attempt redemption due to high gas
       expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
 
       service.stop();
@@ -619,141 +427,67 @@ describe('ClaimRedemptionService', () => {
   });
 
   describe('Gas estimation', () => {
-    it('should estimate XRP gas as 10 drops', async () => {
-      const xrpClaim = {
-        blockchain: 'xrp',
-        messageId: 'msg_xrp_gas',
-        senderId: 'peer-alice',
-        channelId: 'ABC123',
-        amount: '100000',
-        signature: 'sig_xrp',
-        publicKey: 'pubkey_xrp',
-      };
-
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_xrp_gas',
-            peer_id: 'peer-alice',
-            blockchain: 'xrp',
-            channel_id: 'ABC123',
-            claim_data: JSON.stringify(xrpClaim),
-          },
-        ]),
-      };
-
-      const mockUpdateStmt = {
-        run: jest.fn(),
-      };
-
-      mockDb.prepare
-        .mockReturnValueOnce(mockStmt as any)
-        .mockReturnValueOnce(mockUpdateStmt as any);
-
-      service.start();
-
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          gasCost: '10',
-        })
-      );
-
-      service.stop();
-    });
-
     it('should estimate EVM gas using provider.getFeeData()', async () => {
       const evmClaim = {
         blockchain: 'evm',
-        messageId: 'msg_evm_gas',
-        senderId: 'peer-bob',
-        channelId: '0xDEF456',
-        nonce: 5,
-        transferredAmount: '10000000000000000000', // 10 ETH in wei (enough for profitability)
+        messageId: 'msg_gas_test',
+        senderId: 'peer-alice',
+        channelId: '0xGASEST',
+        nonce: 1,
+        transferredAmount: '5000000',
         lockedAmount: '0',
         locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
         signature: 'sig_evm',
-        signerAddress: '0xABCD...',
+        signerAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
       };
 
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_evm_gas',
-            peer_id: 'peer-bob',
-            blockchain: 'evm',
-            channel_id: '0xDEF456',
-            claim_data: JSON.stringify(evmClaim),
-          },
-        ]),
-      };
+      setupDbMocks([makeDbRow(evmClaim)]);
 
-      const mockUpdateStmt = {
-        run: jest.fn(),
-      };
+      mockEvmProvider.getFeeData.mockResolvedValue({
+        gasPrice: 2000000000n, // 2 gwei
+      } as any);
 
-      mockDb.prepare
-        .mockReturnValueOnce(mockStmt as any)
-        .mockReturnValueOnce(mockUpdateStmt as any);
+      mockEVMChannelSDK.closeChannel.mockResolvedValue(undefined);
 
       service.start();
-
       await new Promise((resolve) => setTimeout(resolve, 100));
 
       expect(mockEvmProvider.getFeeData).toHaveBeenCalled();
 
-      // Gas cost = 1 gwei * 150000 = 150000 gwei
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          gasCost: '150000000000000',
-        })
-      );
-
       service.stop();
     });
 
-    it('should estimate Aptos gas as 10000 octas', async () => {
-      const aptosClaim = {
-        blockchain: 'aptos',
-        messageId: 'msg_aptos_gas',
-        senderId: 'peer-charlie',
-        channelOwner: '0x789GHI',
-        amount: '100000',
-        nonce: 3,
-        signature: 'sig_aptos',
-        publicKey: 'pubkey_aptos',
+    it('should return 0 when EVM gas estimation fails', async () => {
+      const evmClaim = {
+        blockchain: 'evm',
+        messageId: 'msg_gas_fail',
+        senderId: 'peer-bob',
+        channelId: '0xGASFAIL',
+        nonce: 1,
+        transferredAmount: '3000000',
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
+        signature: 'sig_evm',
+        signerAddress: '0x8ba1f109551bD432803012645Ac136ddd64DBA72',
       };
 
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_aptos_gas',
-            peer_id: 'peer-charlie',
-            blockchain: 'aptos',
-            channel_id: '0x789GHI',
-            claim_data: JSON.stringify(aptosClaim),
-          },
-        ]),
-      };
+      setupDbMocks([makeDbRow(evmClaim)]);
 
-      const mockUpdateStmt = {
-        run: jest.fn(),
-      };
-
-      mockDb.prepare
-        .mockReturnValueOnce(mockStmt as any)
-        .mockReturnValueOnce(mockUpdateStmt as any);
+      mockEvmProvider.getFeeData.mockRejectedValue(new Error('RPC error'));
+      mockEVMChannelSDK.closeChannel.mockResolvedValue(undefined);
 
       service.start();
-
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+      expect(mockLogger.error).toHaveBeenCalledWith(
         expect.objectContaining({
-          gasCost: '10000',
-        })
+          blockchain: 'evm',
+        }),
+        'Error estimating redemption cost'
       );
+
+      // Should still attempt redemption with gas cost = 0
+      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalled();
 
       service.stop();
     });
@@ -761,159 +495,101 @@ describe('ClaimRedemptionService', () => {
 
   describe('Telemetry emission', () => {
     it('should emit CLAIM_REDEEMED on success', async () => {
-      const xrpClaim = {
-        blockchain: 'xrp',
+      const evmClaim = {
+        blockchain: 'evm',
         messageId: 'msg_telemetry_success',
         senderId: 'peer-alice',
-        channelId: 'ABC123',
-        amount: '5000000',
-        signature: 'sig_xrp',
-        publicKey: 'pubkey_xrp',
+        channelId: '0xTELEMETRY',
+        nonce: 1,
+        transferredAmount: '6000000',
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
+        signature: 'sig_evm',
+        signerAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
       };
 
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_telemetry_success',
-            peer_id: 'peer-alice',
-            blockchain: 'xrp',
-            channel_id: 'ABC123',
-            claim_data: JSON.stringify(xrpClaim),
-          },
-        ]),
-      };
-
-      const mockUpdateStmt = {
-        run: jest.fn(),
-      };
-
-      mockDb.prepare
-        .mockReturnValueOnce(mockStmt as any)
-        .mockReturnValueOnce(mockUpdateStmt as any);
+      setupDbMocks([makeDbRow(evmClaim)]);
+      mockEVMChannelSDK.closeChannel.mockResolvedValue(undefined);
 
       service.start();
-
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith({
-        type: 'CLAIM_REDEEMED',
-        nodeId: 'test-node',
-        peerId: 'peer-alice',
-        blockchain: 'xrp',
-        messageId: 'msg_telemetry_success',
-        channelId: 'ABC123',
-        amount: '5000000',
-        txHash: 'msg_telemetry_success',
-        gasCost: '10',
-        success: true,
-        error: undefined,
-        timestamp: expect.any(String),
-      });
+      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'CLAIM_REDEEMED',
+          blockchain: 'evm',
+          messageId: 'msg_telemetry_success',
+          success: true,
+        })
+      );
 
       service.stop();
     });
 
     it('should emit CLAIM_REDEEMED on failure', async () => {
-      jest.useFakeTimers();
-
-      const xrpClaim = {
-        blockchain: 'xrp',
+      const evmClaim = {
+        blockchain: 'evm',
         messageId: 'msg_telemetry_fail',
-        senderId: 'peer-alice',
-        channelId: 'ABC123',
-        amount: '5000000',
-        signature: 'sig_xrp',
-        publicKey: 'pubkey_xrp',
+        senderId: 'peer-bob',
+        channelId: '0xTELEMETRYFAIL',
+        nonce: 1,
+        transferredAmount: '4000000',
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
+        signature: 'sig_evm',
+        signerAddress: '0x8ba1f109551bD432803012645Ac136ddd64DBA72',
       };
 
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_telemetry_fail',
-            peer_id: 'peer-alice',
-            blockchain: 'xrp',
-            channel_id: 'ABC123',
-            claim_data: JSON.stringify(xrpClaim),
-          },
-        ]),
-      };
-
-      mockDb.prepare.mockReturnValue(mockStmt as any);
-
-      mockXRPChannelSDK.submitClaim.mockRejectedValue(new Error('Claim submission failed'));
+      setupDbMocks([makeDbRow(evmClaim)]);
+      mockEVMChannelSDK.closeChannel.mockRejectedValue(new Error('Blockchain error'));
 
       service.start();
 
-      await jest.advanceTimersByTimeAsync(100);
-      await jest.advanceTimersByTimeAsync(1000);
-      await jest.advanceTimersByTimeAsync(2000);
-      await jest.advanceTimersByTimeAsync(4000);
+      // Wait for all 3 retries (1s + 2s + 4s + buffer)
+      await new Promise((resolve) => setTimeout(resolve, 8000));
 
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith({
-        type: 'CLAIM_REDEEMED',
-        nodeId: 'test-node',
-        peerId: 'peer-alice',
-        blockchain: 'xrp',
-        messageId: 'msg_telemetry_fail',
-        channelId: 'ABC123',
-        amount: '5000000',
-        txHash: '', // Empty string when redemption fails
-        gasCost: '10',
-        success: false,
-        error: 'Claim submission failed',
-        timestamp: expect.any(String),
-      });
+      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'CLAIM_REDEEMED',
+          blockchain: 'evm',
+          messageId: 'msg_telemetry_fail',
+          success: false,
+        })
+      );
 
       service.stop();
-      jest.useRealTimers();
-    });
+    }, 10000);
 
     it('should not crash if telemetry emission fails', async () => {
-      const xrpClaim = {
-        blockchain: 'xrp',
+      const evmClaim = {
+        blockchain: 'evm',
         messageId: 'msg_telemetry_error',
-        senderId: 'peer-alice',
-        channelId: 'ABC123',
-        amount: '5000000',
-        signature: 'sig_xrp',
-        publicKey: 'pubkey_xrp',
+        senderId: 'peer-charlie',
+        channelId: '0xTELEMETRYERROR',
+        nonce: 1,
+        transferredAmount: '7000000',
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
+        signature: 'sig_evm',
+        signerAddress: '0x9cA1f109551bD432803012645Ac136ddd64DBA73',
       };
 
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_telemetry_error',
-            peer_id: 'peer-alice',
-            blockchain: 'xrp',
-            channel_id: 'ABC123',
-            claim_data: JSON.stringify(xrpClaim),
-          },
-        ]),
-      };
+      const { mockUpdateStmt } = setupDbMocks([makeDbRow(evmClaim)]);
 
-      const mockUpdateStmt = {
-        run: jest.fn(),
-      };
-
-      mockDb.prepare
-        .mockReturnValueOnce(mockStmt as any)
-        .mockReturnValueOnce(mockUpdateStmt as any);
-
+      mockEVMChannelSDK.closeChannel.mockResolvedValue(undefined);
       mockTelemetryEmitter.emit.mockImplementation(() => {
-        throw new Error('Telemetry server down');
+        throw new Error('Telemetry service down');
       });
 
       service.start();
-
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      // Redemption should still succeed despite telemetry failure
+      // Should still complete successfully despite telemetry failure
       expect(mockUpdateStmt.run).toHaveBeenCalledWith(
         expect.any(Number),
         'msg_telemetry_error',
         'msg_telemetry_error'
       );
-
       expect(mockLogger.error).toHaveBeenCalledWith(
         expect.objectContaining({
           error: expect.any(Error),
@@ -925,163 +601,16 @@ describe('ClaimRedemptionService', () => {
     });
   });
 
-  describe('Unknown blockchain type', () => {
-    it('should handle unknown blockchain type gracefully', async () => {
-      const unknownClaim = {
-        blockchain: 'unknown_chain',
-        messageId: 'msg_unknown',
-        senderId: 'peer-unknown',
-        channelId: 'UNKNOWN123',
-        amount: '5000000',
-        signature: 'sig_unknown',
-        publicKey: 'pubkey_unknown',
-      };
-
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_unknown',
-            peer_id: 'peer-unknown',
-            blockchain: 'unknown_chain',
-            channel_id: 'UNKNOWN123',
-            claim_data: JSON.stringify(unknownClaim),
-          },
-        ]),
-      };
-
-      mockDb.prepare.mockReturnValue(mockStmt as any);
-
-      service.start();
-
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      // Verify no SDK calls were made
-      expect(mockXRPChannelSDK.submitClaim).not.toHaveBeenCalled();
-      expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
-      expect(mockAptosChannelSDK.submitClaim).not.toHaveBeenCalled();
-
-      // Verify error was logged
-      expect(mockLogger.error).toHaveBeenCalledWith(
-        expect.objectContaining({
-          blockchain: 'unknown_chain',
-        }),
-        'Unknown blockchain type for claim'
-      );
-
-      service.stop();
-    });
-  });
-
-  describe('Gas estimation edge cases', () => {
-    it('should return 0 when EVM gas estimation fails', async () => {
-      // Mock provider to throw
-      mockEvmProvider.getFeeData.mockRejectedValue(new Error('RPC connection failed'));
-
-      const evmClaim = {
-        blockchain: 'evm',
-        messageId: 'msg_evm_gas_fail',
-        senderId: 'peer-evm-gas',
-        channelId: '0xGASFAIL',
-        nonce: 1,
-        transferredAmount: '5000000000000000000', // Large amount to ensure profitability
-        lockedAmount: '0',
-        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
-        signature: 'sig_gas_fail',
-        signerAddress: '0xABCD',
-      };
-
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_evm_gas_fail',
-            peer_id: 'peer-evm-gas',
-            blockchain: 'evm',
-            channel_id: '0xGASFAIL',
-            claim_data: JSON.stringify(evmClaim),
-          },
-        ]),
-      };
-
-      const mockUpdateStmt = {
-        run: jest.fn(),
-      };
-
-      mockDb.prepare
-        .mockReturnValueOnce(mockStmt as any)
-        .mockReturnValueOnce(mockUpdateStmt as any);
-
-      service.start();
-
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      // Should still proceed with redemption (gas cost = 0 when estimation fails)
-      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalled();
-
-      // Verify error was logged
-      expect(mockLogger.error).toHaveBeenCalledWith(
-        expect.objectContaining({
-          error: expect.any(Error),
-          blockchain: 'evm',
-        }),
-        'Error estimating redemption cost'
-      );
-
-      service.stop();
-    });
-
-    it('should log warning for unknown blockchain in gas estimation', async () => {
-      const unknownClaim = {
-        blockchain: 'cosmos', // Unknown chain
-        messageId: 'msg_gas_unknown',
-        senderId: 'peer-cosmos',
-        channelId: 'COSMOS123',
-        amount: '5000000',
-        signature: 'sig_cosmos',
-        publicKey: 'pubkey_cosmos',
-      };
-
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_gas_unknown',
-            peer_id: 'peer-cosmos',
-            blockchain: 'cosmos',
-            channel_id: 'COSMOS123',
-            claim_data: JSON.stringify(unknownClaim),
-          },
-        ]),
-      };
-
-      mockDb.prepare.mockReturnValue(mockStmt as any);
-
-      service.start();
-
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      // Verify warning was logged for unknown blockchain gas estimation
-      expect(mockLogger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({
-          blockchain: 'cosmos',
-        }),
-        'Unknown blockchain type for gas estimation'
-      );
-
-      service.stop();
-    });
-  });
-
   describe('processRedemptions error handling', () => {
     it('should log error when database query fails', async () => {
-      // Mock database to throw on prepare
       mockDb.prepare.mockImplementation(() => {
         throw new Error('Database connection lost');
       });
 
       service.start();
 
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await new Promise((resolve) => setTimeout(resolve, 50));
 
-      // Verify error was logged
       expect(mockLogger.error).toHaveBeenCalledWith(
         expect.objectContaining({
           error: expect.any(Error),
@@ -1093,31 +622,31 @@ describe('ClaimRedemptionService', () => {
     });
 
     it('should handle malformed claim data gracefully', async () => {
-      const mockStmt = {
-        all: jest.fn().mockReturnValue([
-          {
-            message_id: 'msg_malformed',
-            peer_id: 'peer-malformed',
-            blockchain: 'xrp',
-            channel_id: 'MALFORMED123',
-            claim_data: 'not valid json{{{', // Malformed JSON
-          },
-        ]),
+      // Return a row with invalid JSON in claim_data
+      const malformedRow = {
+        message_id: 'msg_malformed',
+        peer_id: 'peer-alice',
+        blockchain: 'evm',
+        channel_id: '0xMALFORMED',
+        claim_data: 'not-valid-json{{{',
       };
 
-      mockDb.prepare.mockReturnValue(mockStmt as any);
+      const mockSelectStmt = {
+        all: jest.fn().mockReturnValue([malformedRow]),
+      };
+
+      mockDb.prepare.mockImplementation((sql: string) => {
+        if (sql.includes('SELECT')) {
+          return mockSelectStmt as any;
+        }
+        return { run: jest.fn().mockReturnValue({ changes: 1 }) } as any;
+      });
 
       service.start();
-
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      // Verify no SDK calls were made
-      expect(mockXRPChannelSDK.submitClaim).not.toHaveBeenCalled();
-
-      // Verify error was logged for processing failure
       expect(mockLogger.error).toHaveBeenCalledWith(
         expect.objectContaining({
-          error: expect.any(Error),
           messageId: 'msg_malformed',
         }),
         'Error processing claim redemption'

@@ -29,7 +29,6 @@ export {
 export {
   // Test data constants
   TEST_EVM_ADDRESS,
-  TEST_XRP_ADDRESS,
   TEST_AGENT_ID,
   TEST_PASSWORD,
   // Individual mock factories
@@ -42,7 +41,6 @@ export {
   createMockTelemetryEmitter,
   createMockFraudDetector,
   createMockEvmProvider,
-  createMockXrplClient,
   createMockLogger,
   // Composite helper
   // REMOVED: Epic 16 (AI Agent Infrastructure) was deferred
@@ -54,5 +52,4 @@ export {
   // type MockWalletLifecycleOptions,
   type MockFraudDetectorOptions,
   type MockEvmProviderOptions,
-  type MockXrplClientOptions,
 } from './mock-factories';

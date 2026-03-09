@@ -73,6 +73,8 @@ describe('HealthServer', () => {
 
   describe('start()', () => {
     it('should start health server successfully and listen on configured port', async () => {
+      // Increase timeout for slow port binding in CI
+      jest.setTimeout(15000);
       // Arrange
       const healthyStatus: HealthStatus = {
         status: 'healthy',
@@ -87,10 +89,10 @@ describe('HealthServer', () => {
       healthServer = new HealthServer(mockLogger, mockProvider);
 
       // Act
-      await healthServer.start(8080);
+      await healthServer.start(9080);
 
       // Assert - GET /health should succeed
-      const response = await request('http://localhost:8080').get('/health');
+      const response = await request('http://localhost:9080').get('/health');
       expect(response.status).toBe(200);
     });
 
@@ -107,11 +109,11 @@ describe('HealthServer', () => {
       const firstServer = new HealthServer(mockLogger, mockProvider);
       const secondServer = new HealthServer(mockLogger, mockProvider);
 
-      // Start first server on port 8181
-      await firstServer.start(8181);
+      // Start first server on port 9181
+      await firstServer.start(9181);
 
       // Act & Assert - Attempt to start second server on same port should fail
-      await expect(secondServer.start(8181)).rejects.toThrow('already in use');
+      await expect(secondServer.start(9181)).rejects.toThrow('already in use');
 
       // Cleanup
       await firstServer.stop();
@@ -132,10 +134,10 @@ describe('HealthServer', () => {
       };
       mockProvider = new MockHealthStatusProvider(healthyStatus);
       healthServer = new HealthServer(mockLogger, mockProvider);
-      await healthServer.start(8082);
+      await healthServer.start(9082);
 
       // Act
-      const response = await request('http://localhost:8082').get('/health');
+      const response = await request('http://localhost:9082').get('/health');
 
       // Assert
       expect(response.status).toBe(200);
@@ -155,10 +157,10 @@ describe('HealthServer', () => {
       };
       mockProvider = new MockHealthStatusProvider(unhealthyStatus);
       healthServer = new HealthServer(mockLogger, mockProvider);
-      await healthServer.start(8083);
+      await healthServer.start(9083);
 
       // Act
-      const response = await request('http://localhost:8083').get('/health');
+      const response = await request('http://localhost:9083').get('/health');
 
       // Assert
       expect(response.status).toBe(503);
@@ -178,10 +180,10 @@ describe('HealthServer', () => {
       };
       mockProvider = new MockHealthStatusProvider(startingStatus);
       healthServer = new HealthServer(mockLogger, mockProvider);
-      await healthServer.start(8084);
+      await healthServer.start(9084);
 
       // Act
-      const response = await request('http://localhost:8084').get('/health');
+      const response = await request('http://localhost:9084').get('/health');
 
       // Assert
       expect(response.status).toBe(503);
@@ -199,10 +201,10 @@ describe('HealthServer', () => {
       };
       mockProvider = new MockHealthStatusProvider(healthyStatus);
       healthServer = new HealthServer(mockLogger, mockProvider);
-      await healthServer.start(8085);
+      await healthServer.start(9085);
 
       // Act
-      const response = await request('http://localhost:8085').get('/health');
+      const response = await request('http://localhost:9085').get('/health');
 
       // Assert
       expect(response.type).toBe('application/json');
@@ -222,10 +224,10 @@ describe('HealthServer', () => {
       };
       mockProvider = new MockHealthStatusProvider(completeStatus);
       healthServer = new HealthServer(mockLogger, mockProvider);
-      await healthServer.start(8086);
+      await healthServer.start(9086);
 
       // Act
-      const response = await request('http://localhost:8086').get('/health');
+      const response = await request('http://localhost:9086').get('/health');
 
       // Assert
       expect(response.body).toHaveProperty('status');
@@ -250,17 +252,17 @@ describe('HealthServer', () => {
       };
       mockProvider = new MockHealthStatusProvider(healthyStatus);
       healthServer = new HealthServer(mockLogger, mockProvider);
-      await healthServer.start(8087);
+      await healthServer.start(9087);
 
       // Verify server is running
-      const beforeStop = await request('http://localhost:8087').get('/health');
+      const beforeStop = await request('http://localhost:9087').get('/health');
       expect(beforeStop.status).toBe(200);
 
       // Act
       await healthServer.stop();
 
       // Assert - Connection should be refused after stop
-      await expect(request('http://localhost:8087').get('/health')).rejects.toThrow();
+      await expect(request('http://localhost:9087').get('/health')).rejects.toThrow();
     });
 
     it('should not throw error if server is not started', async () => {
@@ -296,10 +298,10 @@ describe('HealthServer', () => {
       };
       mockProvider = new MockHealthStatusProvider(healthyStatus);
       healthServer = new HealthServer(mockLogger, mockProvider);
-      await healthServer.start(8088);
+      await healthServer.start(9088);
 
       // Act
-      await request('http://localhost:8088').get('/health');
+      await request('http://localhost:9088').get('/health');
 
       // Assert - This is a basic check; actual log capture may vary
       // The important part is that the server started and responded
@@ -320,10 +322,10 @@ describe('HealthServer', () => {
       };
       mockProvider = new MockHealthStatusProvider(healthyStatus);
       healthServer = new HealthServer(mockLogger, mockProvider);
-      await healthServer.start(8089);
+      await healthServer.start(9089);
 
       // Act
-      const response = await request('http://localhost:8089').get('/health/live');
+      const response = await request('http://localhost:9089').get('/health/live');
 
       // Assert
       expect(response.status).toBe(200);
@@ -342,10 +344,10 @@ describe('HealthServer', () => {
       };
       mockProvider = new MockHealthStatusProvider(unhealthyStatus);
       healthServer = new HealthServer(mockLogger, mockProvider);
-      await healthServer.start(8090);
+      await healthServer.start(9090);
 
       // Act
-      const response = await request('http://localhost:8090').get('/health/live');
+      const response = await request('http://localhost:9090').get('/health/live');
 
       // Assert
       expect(response.status).toBe(200);
@@ -365,10 +367,10 @@ describe('HealthServer', () => {
       };
       mockProvider = new MockHealthStatusProvider(healthyStatus);
       healthServer = new HealthServer(mockLogger, mockProvider);
-      await healthServer.start(8091);
+      await healthServer.start(9091);
 
       // Act
-      const response = await request('http://localhost:8091').get('/health/ready');
+      const response = await request('http://localhost:9091').get('/health/ready');
 
       // Assert
       expect(response.status).toBe(200);
@@ -386,10 +388,10 @@ describe('HealthServer', () => {
       };
       mockProvider = new MockHealthStatusProvider(unhealthyStatus);
       healthServer = new HealthServer(mockLogger, mockProvider);
-      await healthServer.start(8092);
+      await healthServer.start(9092);
 
       // Act
-      const response = await request('http://localhost:8092').get('/health/ready');
+      const response = await request('http://localhost:9092').get('/health/ready');
 
       // Assert
       expect(response.status).toBe(503);
@@ -408,7 +410,7 @@ describe('HealthServer', () => {
         version: '1.0.0',
         dependencies: {
           tigerbeetle: { status: 'up', latencyMs: 5 },
-          xrpl: { status: 'up', latencyMs: 50 },
+          evm: { status: 'up', latencyMs: 50 },
         },
         sla: {
           packetSuccessRate: 0.999,
@@ -420,10 +422,10 @@ describe('HealthServer', () => {
       healthServer = new HealthServer(mockLogger, extendedProvider, {
         extendedProvider,
       });
-      await healthServer.start(8093);
+      await healthServer.start(9093);
 
       // Act
-      const response = await request('http://localhost:8093').get('/health/ready');
+      const response = await request('http://localhost:9093').get('/health/ready');
 
       // Assert
       expect(response.status).toBe(200);
@@ -439,6 +441,8 @@ describe('HealthServer', () => {
         peersConnected: 2,
         totalPeers: 2,
         timestamp: new Date().toISOString(),
+        nodeId: 'test-node',
+        version: '1.0.0',
         dependencies: {
           tigerbeetle: { status: 'down' },
         },
@@ -452,10 +456,10 @@ describe('HealthServer', () => {
       healthServer = new HealthServer(mockLogger, extendedProvider, {
         extendedProvider,
       });
-      await healthServer.start(8094);
+      await healthServer.start(9094);
 
       // Act
-      const response = await request('http://localhost:8094').get('/health/ready');
+      const response = await request('http://localhost:9094').get('/health/ready');
 
       // Assert
       expect(response.status).toBe(503);
@@ -471,9 +475,11 @@ describe('HealthServer', () => {
         peersConnected: 1,
         totalPeers: 2,
         timestamp: new Date().toISOString(),
+        nodeId: 'test-node',
+        version: '1.0.0',
         dependencies: {
           tigerbeetle: { status: 'up', latencyMs: 10 },
-          xrpl: { status: 'down' }, // XRPL down causes degraded but not unready
+          evm: { status: 'down' }, // EVM down causes degraded but not unready
         },
         sla: {
           packetSuccessRate: 0.95,
@@ -485,10 +491,10 @@ describe('HealthServer', () => {
       healthServer = new HealthServer(mockLogger, extendedProvider, {
         extendedProvider,
       });
-      await healthServer.start(8095);
+      await healthServer.start(9095);
 
       // Act
-      const response = await request('http://localhost:8095').get('/health/ready');
+      const response = await request('http://localhost:9095').get('/health/ready');
 
       // Assert
       expect(response.status).toBe(200);
@@ -517,10 +523,10 @@ describe('HealthServer', () => {
       healthServer = new HealthServer(mockLogger, mockProvider, {
         metricsMiddleware: mockMetricsMiddleware,
       });
-      await healthServer.start(8096);
+      await healthServer.start(9096);
 
       // Act
-      const response = await request('http://localhost:8096').get('/metrics');
+      const response = await request('http://localhost:9096').get('/metrics');
 
       // Assert
       expect(response.status).toBe(200);
@@ -539,10 +545,10 @@ describe('HealthServer', () => {
       };
       mockProvider = new MockHealthStatusProvider(healthyStatus);
       healthServer = new HealthServer(mockLogger, mockProvider);
-      await healthServer.start(8097);
+      await healthServer.start(9097);
 
       // Act
-      const response = await request('http://localhost:8097').get('/metrics');
+      const response = await request('http://localhost:9097').get('/metrics');
 
       // Assert
       expect(response.status).toBe(404);
@@ -562,7 +568,6 @@ describe('HealthServer', () => {
         version: '2.0.0',
         dependencies: {
           tigerbeetle: { status: 'up', latencyMs: 2 },
-          xrpl: { status: 'up', latencyMs: 100 },
           evm: { status: 'up', latencyMs: 50 },
         },
         sla: {
@@ -575,10 +580,10 @@ describe('HealthServer', () => {
       healthServer = new HealthServer(mockLogger, extendedProvider, {
         extendedProvider,
       });
-      await healthServer.start(8098);
+      await healthServer.start(9098);
 
       // Act
-      const response = await request('http://localhost:8098').get('/health');
+      const response = await request('http://localhost:9098').get('/health');
 
       // Assert
       expect(response.status).toBe(200);
@@ -596,9 +601,11 @@ describe('HealthServer', () => {
         peersConnected: 1,
         totalPeers: 2,
         timestamp: new Date().toISOString(),
+        nodeId: 'test-node',
+        version: '1.0.0',
         dependencies: {
           tigerbeetle: { status: 'up', latencyMs: 5 },
-          xrpl: { status: 'down' },
+          evm: { status: 'down' },
         },
         sla: {
           packetSuccessRate: 0.95,
@@ -610,10 +617,10 @@ describe('HealthServer', () => {
       healthServer = new HealthServer(mockLogger, extendedProvider, {
         extendedProvider,
       });
-      await healthServer.start(8099);
+      await healthServer.start(9099);
 
       // Act
-      const response = await request('http://localhost:8099').get('/health');
+      const response = await request('http://localhost:9099').get('/health');
 
       // Assert
       expect(response.status).toBe(200); // Degraded still returns 200

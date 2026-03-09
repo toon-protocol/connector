@@ -9,7 +9,7 @@ import { requireOptional } from '../../utils/optional-require';
 
 /**
  * AWSKMSBackend implements KeyManagerBackend using AWS Key Management Service
- * Supports EVM (secp256k1) and XRP (ed25519) key types
+ * Supports EVM (secp256k1) key type
  */
 export class AWSKMSBackend implements KeyManagerBackend {
   private client: KMSClientType | null = null;
@@ -22,7 +22,7 @@ export class AWSKMSBackend implements KeyManagerBackend {
     this.logger = logger.child({ component: 'AWSKMSBackend' });
 
     this.logger.info(
-      { region: config.region, evmKeyId: config.evmKeyId, xrpKeyId: config.xrpKeyId },
+      { region: config.region, evmKeyId: config.evmKeyId },
       'AWSKMSBackend initialized'
     );
   }
@@ -60,47 +60,29 @@ export class AWSKMSBackend implements KeyManagerBackend {
   /**
    * Detects key type based on keyId
    * @param keyId - Key identifier (ARN or alias)
-   * @returns Key type ('evm' or 'xrp')
+   * @returns Key type (always 'evm' for EVM-only connector)
    */
-  private _detectKeyType(keyId: string): 'evm' | 'xrp' {
-    const lowerKeyId = keyId.toLowerCase();
-    if (lowerKeyId.includes('evm') || keyId === this.config.evmKeyId) {
-      return 'evm';
-    }
-    if (lowerKeyId.includes('xrp') || keyId === this.config.xrpKeyId) {
-      return 'xrp';
-    }
-    // Default to EVM
+  private _detectKeyType(_keyId: string): 'evm' {
+    // EVM-only connector - always return 'evm'
     return 'evm';
   }
 
   /**
-   * Gets the appropriate signing algorithm based on key type
-   * @param keyType - Key type ('evm' or 'xrp')
-   * @returns AWS KMS signing algorithm
+   * Gets the signing algorithm for EVM keys
+   * @returns AWS KMS signing algorithm (ECDSA_SHA_256 for secp256k1)
    */
-  private async _getSigningAlgorithm(keyType: 'evm' | 'xrp'): Promise<SigningAlgorithmSpecType> {
+  private async _getSigningAlgorithm(): Promise<SigningAlgorithmSpecType> {
     const sdk = await this._getSdk();
-    if (keyType === 'evm') {
-      return sdk.SigningAlgorithmSpec.ECDSA_SHA_256;
-    } else {
-      // XRP uses ed25519 - ED25519_SHA_512 for RAW message signing
-      return sdk.SigningAlgorithmSpec.ED25519_SHA_512;
-    }
+    return sdk.SigningAlgorithmSpec.ECDSA_SHA_256;
   }
 
   /**
-   * Gets the appropriate key spec for key creation
-   * @param keyType - Key type ('evm' | 'xrp')
-   * @returns AWS KMS key spec
+   * Gets the key spec for EVM key creation
+   * @returns AWS KMS key spec (secp256k1)
    */
-  private async _getKeySpec(keyType: 'evm' | 'xrp'): Promise<KeySpecType> {
+  private async _getKeySpec(): Promise<KeySpecType> {
     const sdk = await this._getSdk();
-    if (keyType === 'evm') {
-      return sdk.KeySpec.ECC_SECG_P256K1; // secp256k1 for EVM
-    } else {
-      return sdk.KeySpec.ECC_NIST_EDWARDS25519; // ed25519 for XRP
-    }
+    return sdk.KeySpec.ECC_SECG_P256K1; // secp256k1 for EVM
   }
 
   /**
@@ -111,7 +93,7 @@ export class AWSKMSBackend implements KeyManagerBackend {
    */
   async sign(message: Buffer, keyId: string): Promise<Buffer> {
     const keyType = this._detectKeyType(keyId);
-    const signingAlgorithm = await this._getSigningAlgorithm(keyType);
+    const signingAlgorithm = await this._getSigningAlgorithm();
     const sdk = await this._getSdk();
     const client = await this._getClient();
 
@@ -182,7 +164,7 @@ export class AWSKMSBackend implements KeyManagerBackend {
    */
   async rotateKey(keyId: string): Promise<string> {
     const keyType = this._detectKeyType(keyId);
-    const keySpec = await this._getKeySpec(keyType);
+    const keySpec = await this._getKeySpec();
     const sdk = await this._getSdk();
     const client = await this._getClient();
 

@@ -59,7 +59,7 @@ routes:
     priority: 0
 
 # Settlement Configuration (Payment Channels)
-# Peer3 uses both XRP (for Peer2) and Aptos (for Peer4)
+# Peer3 uses EVM settlement
 settlement:
   connectorFeePercentage: 0.1
   enableSettlement: true
@@ -71,5 +71,5 @@ settlement:
   tigerBeetleReplicas:
     - tigerbeetle-5peer:3000
 
-# Settlement preference: 'both' to support XRP and Aptos
-settlementPreference: both
+# Settlement preference: 'evm'
+settlementPreference: evm

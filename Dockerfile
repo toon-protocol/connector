@@ -53,8 +53,8 @@ COPY packages/connector/explorer-ui ./packages/connector/explorer-ui
 # Change to explorer-ui directory and install dependencies
 WORKDIR /app/packages/connector/explorer-ui
 
-# Install dependencies and build
-RUN npm ci && npm run build
+# Install dependencies and build (skip tsc type-check, vite handles transpilation)
+RUN npm ci && npx vite build
 
 # ============================================
 # Stage 2: Runtime

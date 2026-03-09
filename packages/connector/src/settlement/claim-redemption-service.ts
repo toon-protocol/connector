@@ -2,15 +2,13 @@
  * Claim Redemption Service
  *
  * Automatically polls for verified unredeemed payment channel claims from the received_claims
- * database table and submits them to the appropriate blockchain for on-chain redemption.
+ * database table and submits them to the blockchain for on-chain redemption.
  *
  * This service implements the final step in the BTP Claim Exchange Protocol (Epic 17):
  * - Polls SQLite database every 60 seconds (configurable) for verified claims
- * - Estimates redemption costs (gas fees) for each blockchain type
+ * - Estimates redemption costs (gas fees)
  * - Only redeems claims where profit exceeds a configurable threshold
- * - Submits XRP claims via XRPChannelSDK.submitClaim()
  * - Submits EVM balance proofs via PaymentChannelSDK.closeChannel()
- * - Submits Aptos claims via AptosChannelSDK.submitClaim()
  * - Updates database with redemption timestamp and transaction identifier
  * - Emits CLAIM_REDEEMED telemetry events
  * - Implements exponential backoff retry (3 attempts: 1s, 2s, 4s delays)
@@ -25,9 +23,7 @@
  * ```typescript
  * const service = new ClaimRedemptionService(
  *   db,
- *   xrpChannelSDK,
  *   evmChannelSDK,
- *   aptosChannelSDK,
  *   evmProvider,
  *   {
  *     minProfitThreshold: 1000n,
@@ -51,19 +47,9 @@
 import type { Database } from 'better-sqlite3';
 import type { Logger } from 'pino';
 import type { ethers } from 'ethers';
-import type { XRPChannelSDK } from './xrp-channel-sdk';
 import type { PaymentChannelSDK } from './payment-channel-sdk';
-import type { AptosChannelSDK } from './aptos-channel-sdk';
 import type { TelemetryEmitter } from '../telemetry/telemetry-emitter';
-import type {
-  BTPClaimMessage,
-  XRPClaimMessage,
-  EVMClaimMessage,
-  AptosClaimMessage,
-  BlockchainType,
-} from '../btp/btp-claim-types';
-import type { XRPClaim } from './types';
-import type { AptosClaim } from './aptos-claim-signer';
+import type { BTPClaimMessage, EVMClaimMessage, BlockchainType } from '../btp/btp-claim-types';
 import type { BalanceProof } from '@crosstown/shared';
 
 /**
@@ -71,13 +57,10 @@ import type { BalanceProof } from '@crosstown/shared';
  */
 export interface RedemptionConfig {
   /**
-   * Minimum profit threshold in native token units (wei, drops, octas).
+   * Minimum profit threshold in wei.
    * Claims are only redeemed if (claimAmount - gasCost) >= minProfitThreshold.
    *
-   * Recommended values:
-   * - XRP: 1000 drops (0.001 XRP)
-   * - EVM: 1000 wei (adjust based on token decimals)
-   * - Aptos: 1000 octas (0.00001 APT)
+   * Recommended value: 1000 wei (adjust based on token decimals)
    */
   minProfitThreshold: bigint;
 
@@ -152,9 +135,7 @@ export class ClaimRedemptionService {
 
   constructor(
     private readonly db: Database,
-    private readonly xrpChannelSDK: XRPChannelSDK,
     private readonly evmChannelSDK: PaymentChannelSDK,
-    private readonly aptosChannelSDK: AptosChannelSDK,
     private readonly evmProvider: ethers.Provider,
     private readonly config: RedemptionConfig,
     private readonly logger: Logger,
@@ -303,105 +284,28 @@ export class ClaimRedemptionService {
   }
 
   /**
-   * Estimate redemption cost for a claim (gas fees)
+   * Estimate redemption cost for EVM claim (gas fees)
    *
-   * @param blockchain - Blockchain type
-   * @returns Estimated cost in native token units (wei, drops, octas)
+   * @param blockchain - Blockchain type (must be 'evm')
+   * @returns Estimated cost in wei
    */
   private async estimateRedemptionCost(blockchain: BlockchainType): Promise<bigint> {
     try {
-      switch (blockchain) {
-        case 'xrp':
-          // XRP transaction fee is fixed at 10 drops (0.00001 XRP)
-          return 10n;
-
-        case 'evm': {
-          // Use ethers.js provider for gas estimation
-          const feeData = await this.evmProvider.getFeeData();
-          const gasPrice = feeData.gasPrice ?? 0n;
-          const gasLimit = 150000n; // Fixed estimate for closeChannel (~100k-150k gas)
-          return gasPrice * gasLimit;
-        }
-
-        case 'aptos':
-          // Aptos gas fees are very low (estimate ~0.0001 APT = 10,000 octas)
-          return 10000n;
-
-        default:
-          this.logger.warn({ blockchain }, 'Unknown blockchain type for gas estimation');
-          return 0n;
+      if (blockchain !== 'evm') {
+        this.logger.warn({ blockchain }, 'Non-EVM blockchain type for gas estimation');
+        return 0n;
       }
+
+      // Use ethers.js provider for gas estimation
+      const feeData = await this.evmProvider.getFeeData();
+      const gasPrice = feeData.gasPrice ?? 0n;
+      const gasLimit = 150000n; // Fixed estimate for closeChannel (~100k-150k gas)
+      return gasPrice * gasLimit;
     } catch (error) {
       this.logger.error({ error, blockchain }, 'Error estimating redemption cost');
       // Return 0 (pessimistic - assume free if estimation fails)
       return 0n;
     }
-  }
-
-  /**
-   * Redeem XRP claim on-chain
-   *
-   * @param claim - XRP claim message
-   * @returns Redemption result
-   */
-  private async redeemXRPClaim(claim: XRPClaimMessage): Promise<ClaimRedemptionResult> {
-    const childLogger = this.logger.child({ messageId: claim.messageId, blockchain: 'xrp' });
-
-    childLogger.info(
-      {
-        channelId: claim.channelId,
-        amount: claim.amount,
-      },
-      'Redeeming XRP claim on-chain'
-    );
-
-    // Build XRPClaim object
-    const xrpClaim: XRPClaim = {
-      channelId: claim.channelId,
-      amount: claim.amount,
-      signature: claim.signature,
-      publicKey: claim.publicKey,
-    };
-
-    // Retry logic (3 attempts, exponential backoff 1s, 2s, 4s)
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        // submitClaim returns void - use messageId as txHash for tracking
-        await this.xrpChannelSDK.submitClaim(xrpClaim);
-
-        // Update database with messageId as redemption identifier
-        this._updateRedemptionStatus(claim.messageId, claim.messageId);
-
-        childLogger.info('XRP claim redeemed successfully');
-
-        return {
-          success: true,
-          messageId: claim.messageId,
-          txHash: claim.messageId,
-        };
-      } catch (error) {
-        if (attempt === 3) {
-          childLogger.error({ error }, 'XRP claim redemption failed after 3 attempts');
-          return {
-            success: false,
-            messageId: claim.messageId,
-            error: error instanceof Error ? error.message : String(error),
-          };
-        }
-
-        // Wait before retry (1s, 2s, 4s)
-        const delayMs = Math.pow(2, attempt - 1) * 1000;
-        childLogger.warn({ attempt, delayMs, error }, 'XRP claim redemption failed, retrying');
-        await this._delay(delayMs);
-      }
-    }
-
-    // Should never reach here due to return in loop, but TypeScript requires it
-    return {
-      success: false,
-      messageId: claim.messageId,
-      error: 'Unknown error',
-    };
   }
 
   /**
@@ -481,132 +385,44 @@ export class ClaimRedemptionService {
   }
 
   /**
-   * Redeem Aptos claim on-chain
-   *
-   * @param claim - Aptos claim message
-   * @returns Redemption result
-   */
-  private async redeemAptosClaim(claim: AptosClaimMessage): Promise<ClaimRedemptionResult> {
-    const childLogger = this.logger.child({ messageId: claim.messageId, blockchain: 'aptos' });
-
-    childLogger.info(
-      {
-        channelOwner: claim.channelOwner,
-        amount: claim.amount,
-        nonce: claim.nonce,
-      },
-      'Redeeming Aptos claim on-chain'
-    );
-
-    // Build AptosClaim object
-    const aptosClaim: AptosClaim = {
-      channelOwner: claim.channelOwner,
-      amount: BigInt(claim.amount),
-      nonce: claim.nonce,
-      signature: claim.signature,
-      publicKey: claim.publicKey,
-      createdAt: Date.now(),
-    };
-
-    // Retry logic (3 attempts, exponential backoff 1s, 2s, 4s)
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        // submitClaim returns void - use messageId as txHash for tracking
-        await this.aptosChannelSDK.submitClaim(aptosClaim);
-
-        // Update database with messageId as redemption identifier
-        this._updateRedemptionStatus(claim.messageId, claim.messageId);
-
-        childLogger.info('Aptos claim redeemed successfully');
-
-        return {
-          success: true,
-          messageId: claim.messageId,
-          txHash: claim.messageId,
-        };
-      } catch (error) {
-        if (attempt === 3) {
-          childLogger.error({ error }, 'Aptos claim redemption failed after 3 attempts');
-          return {
-            success: false,
-            messageId: claim.messageId,
-            error: error instanceof Error ? error.message : String(error),
-          };
-        }
-
-        // Wait before retry (1s, 2s, 4s)
-        const delayMs = Math.pow(2, attempt - 1) * 1000;
-        childLogger.warn({ attempt, delayMs, error }, 'Aptos claim redemption failed, retrying');
-        await this._delay(delayMs);
-      }
-    }
-
-    // Should never reach here due to return in loop, but TypeScript requires it
-    return {
-      success: false,
-      messageId: claim.messageId,
-      error: 'Unknown error',
-    };
-  }
-
-  /**
-   * Main redemption router - dispatches to blockchain-specific redemption method
+   * Main redemption method - redeems EVM claims
    *
    * @param claim - Claim message to redeem
    * @returns Redemption result
    */
   private async _redeemClaim(claim: BTPClaimMessage): Promise<ClaimRedemptionResult> {
-    switch (claim.blockchain) {
-      case 'xrp':
-        return await this.redeemXRPClaim(claim as XRPClaimMessage);
-
-      case 'evm':
-        return await this.redeemEVMClaim(claim as EVMClaimMessage);
-
-      case 'aptos':
-        return await this.redeemAptosClaim(claim as AptosClaimMessage);
-
-      default: {
-        // Type assertion needed for default case
-        const unknownClaim = claim as BTPClaimMessage & { blockchain: string };
-        this.logger.error(
-          { blockchain: unknownClaim.blockchain },
-          'Unknown blockchain type for claim'
-        );
-        return {
-          success: false,
-          messageId: unknownClaim.messageId,
-          error: `Unknown blockchain type: ${unknownClaim.blockchain}`,
-        };
-      }
+    if (claim.blockchain !== 'evm') {
+      this.logger.error(
+        { blockchain: claim.blockchain },
+        'Unsupported blockchain type for claim. Only EVM is supported.'
+      );
+      return {
+        success: false,
+        messageId: claim.messageId,
+        error: `Unsupported blockchain type: ${claim.blockchain}. Only EVM is supported.`,
+      };
     }
+
+    return await this.redeemEVMClaim(claim as EVMClaimMessage);
   }
 
   /**
-   * Get claim amount from claim message
+   * Get claim amount from EVM claim message
    *
    * @param claim - Claim message
    * @returns Claim amount as bigint
    */
   private _getClaimAmount(claim: BTPClaimMessage): bigint {
-    if (claim.blockchain === 'evm') {
-      return BigInt((claim as EVMClaimMessage).transferredAmount);
-    }
-    // XRP and Aptos both use 'amount' field
-    return BigInt(claim.amount);
+    return BigInt((claim as EVMClaimMessage).transferredAmount);
   }
 
   /**
-   * Get channel ID from claim message
+   * Get channel ID from EVM claim message
    *
    * @param claim - Claim message
-   * @returns Channel ID or channel owner
+   * @returns Channel ID
    */
   private _getChannelId(claim: BTPClaimMessage): string {
-    if (claim.blockchain === 'aptos') {
-      return (claim as AptosClaimMessage).channelOwner;
-    }
-    // XRP and EVM both use 'channelId' field
     return claim.channelId;
   }
 
@@ -647,7 +463,7 @@ export class ClaimRedemptionService {
         type: 'CLAIM_REDEEMED',
         nodeId: this.nodeId ?? 'unknown',
         peerId: claim.senderId,
-        blockchain: claim.blockchain as 'xrp' | 'evm' | 'aptos',
+        blockchain: claim.blockchain as 'evm',
         messageId: claim.messageId,
         channelId: this._getChannelId(claim),
         amount: this._getClaimAmount(claim).toString(),

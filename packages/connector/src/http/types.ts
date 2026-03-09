@@ -128,11 +128,10 @@ export interface HealthStatusExtended extends Omit<HealthStatus, 'status'> {
 
   /**
    * Dependency health status
-   * Includes TigerBeetle, XRPL, and EVM health checks
+   * Includes TigerBeetle and EVM health checks
    */
   dependencies: {
     tigerbeetle: DependencyHealthStatus;
-    xrpl?: DependencyHealthStatus;
     evm?: DependencyHealthStatus;
   };
 

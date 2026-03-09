@@ -118,6 +118,7 @@ export class SettlementMonitor extends EventEmitter {
   private readonly _accountManager: AccountManager;
   private readonly _logger: Logger;
   private readonly _settlementStates: Map<string, SettlementState>;
+  private readonly _lastSettlementTime: Map<string, number>;
   private _pollingIntervalId: NodeJS.Timeout | null;
   private _isRunning: boolean;
 
@@ -135,6 +136,7 @@ export class SettlementMonitor extends EventEmitter {
     this._accountManager = accountManager;
     this._logger = logger.child({ component: 'settlement-monitor' });
     this._settlementStates = new Map();
+    this._lastSettlementTime = new Map();
     this._pollingIntervalId = null;
     this._isRunning = false;
 
@@ -324,11 +326,52 @@ export class SettlementMonitor extends EventEmitter {
             // Balance below threshold
             // If state is SETTLEMENT_PENDING, reset to IDLE
             // (balance reduced naturally before settlement started)
-            if (currentState === SettlementState.SETTLEMENT_PENDING) {
+            // When time-based triggers are active, only auto-reset when balance
+            // reaches zero, otherwise the time-based trigger would re-fire immediately
+            const hasTimeBasedTrigger =
+              !!this._config.thresholds?.timeBasedIntervalMs && balance.creditBalance > 0n;
+            if (currentState === SettlementState.SETTLEMENT_PENDING && !hasTimeBasedTrigger) {
               this._settlementStates.set(stateKey, SettlementState.IDLE);
               this._logger.info(
                 { peerId, tokenId },
                 'Balance returned below threshold, resetting to IDLE'
+              );
+            }
+          }
+
+          // Time-based settlement trigger (independent of amount threshold)
+          // Re-read state in case amount-based check already triggered
+          const timeInterval = this._config.thresholds?.timeBasedIntervalMs;
+          const stateAfterAmountCheck =
+            this._settlementStates.get(stateKey) ?? SettlementState.IDLE;
+          if (
+            timeInterval &&
+            stateAfterAmountCheck === SettlementState.IDLE &&
+            balance.creditBalance > 0n
+          ) {
+            const lastTime = this._lastSettlementTime.get(stateKey) ?? 0;
+            if (Date.now() - lastTime >= timeInterval) {
+              const event: SettlementTriggerEvent = {
+                peerId,
+                tokenId,
+                currentBalance: balance.creditBalance,
+                threshold: threshold ?? 0n,
+                exceedsBy: balance.creditBalance,
+                timestamp: new Date(),
+              };
+
+              this.emit('SETTLEMENT_REQUIRED', event);
+              this._emitTelemetry(event);
+              this._settlementStates.set(stateKey, SettlementState.SETTLEMENT_PENDING);
+
+              this._logger.info(
+                {
+                  peerId,
+                  tokenId,
+                  balance: balance.creditBalance.toString(),
+                  intervalMs: timeInterval,
+                },
+                'Time-based settlement triggered'
               );
             }
           }
@@ -431,6 +474,7 @@ export class SettlementMonitor extends EventEmitter {
   markSettlementCompleted(peerId: string, tokenId: string): void {
     const stateKey = `${peerId}:${tokenId}`;
     this._settlementStates.set(stateKey, SettlementState.IDLE);
+    this._lastSettlementTime.set(stateKey, Date.now());
 
     this._logger.info({ peerId, tokenId }, 'Settlement completed, state reset to IDLE');
   }

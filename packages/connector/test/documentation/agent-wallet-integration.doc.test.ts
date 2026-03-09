@@ -29,7 +29,7 @@ import {
 */
 
 import { pino } from 'pino';
-import { TEST_EVM_ADDRESS, TEST_XRP_ADDRESS } from '../../src/test-utils';
+import { TEST_EVM_ADDRESS } from '../../src/test-utils';
 
 const logger = pino({ level: 'silent' }); // Suppress logs in tests
 
@@ -76,6 +76,35 @@ afterEach(() => {
   lifecycleInstances.length = 0;
 });
 */
+
+// Stubs for commented-out infrastructure — these tests are all describe.skip
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const createTrackedLifecycle = (): any => ({
+  createAgentWallet: async (id: string) => ({
+    agentId: id,
+    state: 'active',
+    createdAt: new Date(),
+    totalTransactions: 0,
+    totalVolume: 0n,
+  }),
+  getLifecycleRecord: async (id: string) => ({ agentId: id, state: 'active' }),
+});
+
+const mockBalanceTracker = {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  getBalance: async (_agentId: string, _chain?: string, _token?: string): Promise<bigint> => 0n,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  getAllBalances: async (_agentId?: string) =>
+    [] as Array<{
+      agentId: string;
+      chain: string;
+      token: string;
+      balance: bigint;
+      lastUpdated: Date;
+    }>,
+};
+
+const TEST_XRP_ADDRESS = 'rN7n7otQDd6FczFgLdlqtyMVrXqHr7XEEw';
 
 describe.skip('Documentation Examples - Integration Guide', () => {
   describe('Quick Start Examples', () => {

@@ -1,9 +1,8 @@
 /**
  * Settlement Coordinator
  *
- * Intelligent multi-chain settlement router with fallback and circuit breaker patterns.
- * Evaluates settlement options (EVM, XRP) based on cost, success rate, and latency.
- * Implements automatic fallback when primary method fails.
+ * Intelligent EVM settlement router with circuit breaker pattern.
+ * Evaluates EVM settlement based on cost, success rate, and latency.
  * Uses circuit breaker to disable failing settlement methods.
  *
  * @module settlement/settlement-coordinator
@@ -11,7 +10,6 @@
 
 import type { Logger } from 'pino';
 import type { PaymentChannelSDK } from './payment-channel-sdk';
-import type { XRPChannelSDK } from './xrp-channel-sdk';
 import type { MetricsCollector } from './metrics-collector';
 import type { PeerConfig } from './types';
 
@@ -19,7 +17,7 @@ import type { PeerConfig } from './types';
  * Settlement option evaluation result
  */
 export interface SettlementOption {
-  method: 'evm' | 'xrp';
+  method: 'evm';
   chain?: string; // 'base-l2' | 'ethereum' | 'polygon'
   estimatedCost: bigint; // Gas cost in native token
   estimatedLatency: number; // Seconds
@@ -34,7 +32,7 @@ export interface SettlementRoutingDecision {
   peerId: string;
   tokenId: string;
   amount: bigint;
-  selectedMethod: 'evm' | 'xrp';
+  selectedMethod: 'evm';
   selectedChain?: string;
   estimatedCost: bigint;
   estimatedLatency: number;
@@ -62,7 +60,6 @@ export class SettlementCoordinator {
 
   constructor(
     private readonly evmSDK: PaymentChannelSDK,
-    private readonly xrpSDK: XRPChannelSDK,
     private readonly metricsCollector: MetricsCollector,
     private readonly config: SettlementCoordinatorConfig,
     private readonly logger: Logger
@@ -77,7 +74,7 @@ export class SettlementCoordinator {
    * based on cost, success rate, and latency.
    *
    * @param peerId - Peer identifier
-   * @param tokenId - Token identifier ('XRP' or ERC20 address)
+   * @param tokenId - Token identifier (ERC20 address)
    * @param amount - Amount to settle
    * @returns Optimal settlement option
    * @throws Error if no settlement methods available
@@ -196,7 +193,7 @@ export class SettlementCoordinator {
   /**
    * Evaluate all settlement options
    *
-   * Checks EVM and XRP options based on peer configuration and token type.
+   * Checks EVM options based on peer configuration and token type.
    *
    * @param peerId - Peer identifier
    * @param tokenId - Token identifier
@@ -213,14 +210,11 @@ export class SettlementCoordinator {
     // Get peer configuration
     const peerConfig = await this.getPeerConfig(peerId);
 
-    const isXRPToken = tokenId === 'XRP';
     const canUseEVM =
       peerConfig.settlementPreference === 'evm' || peerConfig.settlementPreference === 'both';
-    const canUseXRP =
-      peerConfig.settlementPreference === 'xrp' || peerConfig.settlementPreference === 'both';
 
     // Evaluate EVM option
-    if (canUseEVM && !isXRPToken && peerConfig.evmAddress) {
+    if (canUseEVM && peerConfig.evmAddress) {
       try {
         const evmCost = await this.estimateEVMCost(tokenId, amount);
         const evmSuccessRate = this.metricsCollector.getSuccessRate('evm');
@@ -245,21 +239,6 @@ export class SettlementCoordinator {
           available: false,
         });
       }
-    }
-
-    // Evaluate XRP option
-    if (canUseXRP && isXRPToken && peerConfig.xrpAddress) {
-      const xrpCost = await this.estimateXRPCost();
-      const xrpSuccessRate = this.metricsCollector.getSuccessRate('xrp');
-      const circuitBreakerOpen = this.circuitBreakerOpen('xrp');
-
-      options.push({
-        method: 'xrp',
-        estimatedCost: xrpCost,
-        estimatedLatency: 4, // seconds
-        successRate: xrpSuccessRate,
-        available: !circuitBreakerOpen,
-      });
     }
 
     return options;
@@ -317,17 +296,6 @@ export class SettlementCoordinator {
     // Estimate gas units for channel claim
     const gasUnits = 50000n;
     return gasPrice * gasUnits;
-  }
-
-  /**
-   * Estimate XRP settlement cost
-   *
-   * Returns fixed XRP transaction fee.
-   *
-   * @returns Estimated cost in drops (12 drops = 0.000012 XRP)
-   */
-  private async estimateXRPCost(): Promise<bigint> {
-    return 12n; // Fixed XRP transaction fee
   }
 
   /**
@@ -391,21 +359,6 @@ export class SettlementCoordinator {
       // Execute EVM settlement (opens new channel with deposit)
       const settlementTimeout = 86400; // 24 hours
       await this.evmSDK.openChannel(peerConfig.evmAddress, tokenId, settlementTimeout, amount);
-    } else if (option.method === 'xrp') {
-      if (!peerConfig.xrpAddress) {
-        throw new Error(`Peer ${peerId} missing xrpAddress for XRP settlement`);
-      }
-      // Execute XRP settlement (opens channel and submits claim)
-      const settleDelay = 86400; // 24 hours
-      const channelId = await this.xrpSDK.openChannel(
-        peerConfig.xrpAddress,
-        amount.toString(),
-        settleDelay,
-        peerId
-      );
-      // Submit claim for the full amount
-      const claim = await this.xrpSDK.signClaim(channelId, amount.toString());
-      await this.xrpSDK.submitClaim(claim);
     }
   }
 

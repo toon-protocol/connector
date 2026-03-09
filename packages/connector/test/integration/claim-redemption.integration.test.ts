@@ -26,9 +26,7 @@ import pino from 'pino';
 describe('ClaimRedemptionService Integration Tests', () => {
   let db: Database.Database;
   let claimRedemptionService: ClaimRedemptionService;
-  let mockXRPChannelSDK: any;
   let mockEVMChannelSDK: any;
-  let mockAptosChannelSDK: any;
   let mockEvmProvider: any;
   let mockTelemetryEmitter: any;
   let logger: pino.Logger;
@@ -57,17 +55,8 @@ describe('ClaimRedemptionService Integration Tests', () => {
       );
     `);
 
-    // Create mock SDKs
-    mockXRPChannelSDK = {
-      submitClaim: jest.fn().mockResolvedValue(undefined),
-    };
-
     mockEVMChannelSDK = {
       closeChannel: jest.fn().mockResolvedValue(undefined),
-    };
-
-    mockAptosChannelSDK = {
-      submitClaim: jest.fn().mockResolvedValue(undefined),
     };
 
     mockEvmProvider = {
@@ -80,12 +69,10 @@ describe('ClaimRedemptionService Integration Tests', () => {
       emit: jest.fn(),
     };
 
-    // Create claim redemption service with mocked dependencies
+    // Create claim redemption service with mocked dependencies (EVM-only)
     claimRedemptionService = new ClaimRedemptionService(
       db,
-      mockXRPChannelSDK,
       mockEVMChannelSDK,
-      mockAptosChannelSDK,
       mockEvmProvider,
       {
         minProfitThreshold: 1000n,
@@ -183,81 +170,20 @@ describe('ClaimRedemptionService Integration Tests', () => {
     });
   });
 
-  describe('XRP Claim Redemption', () => {
-    it('should redeem verified XRP claim', async () => {
-      // Insert verified XRP claim
-      const xrpClaim = {
-        blockchain: 'xrp',
-        messageId: 'msg-xrp-001',
-        senderId: 'peer-xrp-1',
-        channelId: 'ABC123DEF456',
-        amount: '100000', // 100,000 drops (0.1 XRP)
-        signature: 'xrp-signature-123',
-        publicKey: 'xrp-pubkey-123',
-      };
-
-      db.prepare(
-        `
-        INSERT INTO received_claims (
-          message_id, peer_id, blockchain, channel_id, claim_data, verified, received_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `
-      ).run(
-        xrpClaim.messageId,
-        xrpClaim.senderId,
-        xrpClaim.blockchain,
-        xrpClaim.channelId,
-        JSON.stringify(xrpClaim),
-        1,
-        Date.now()
-      );
-
-      // Start service
-      claimRedemptionService.start();
-
-      // Wait for polling cycle to process
-      await new Promise((resolve) => setTimeout(resolve, 200));
-
-      // Stop service
-      claimRedemptionService.stop();
-
-      // Verify XRP SDK was called with correct claim
-      expect(mockXRPChannelSDK.submitClaim).toHaveBeenCalledWith({
-        channelId: 'ABC123DEF456',
-        amount: '100000',
-        signature: 'xrp-signature-123',
-        publicKey: 'xrp-pubkey-123',
-      });
-
-      // Verify database was updated
-      const row = db
-        .prepare('SELECT * FROM received_claims WHERE message_id = ?')
-        .get(xrpClaim.messageId) as any;
-
-      expect(row.redeemed_at).toBeTruthy();
-      expect(row.redemption_tx_hash).toBe(xrpClaim.messageId);
-
-      // Verify telemetry was emitted
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CLAIM_REDEEMED',
-          blockchain: 'xrp',
-          messageId: xrpClaim.messageId,
-          success: true,
-        })
-      );
-    });
-
-    it('should not redeem unverified XRP claims', async () => {
-      // Insert unverified XRP claim
+  describe('EVM Claim Redemption (Verified/Unverified)', () => {
+    it('should not redeem unverified EVM claims', async () => {
+      // Insert unverified EVM claim
       const unverifiedClaim = {
-        blockchain: 'xrp',
-        messageId: 'msg-xrp-unverified',
-        senderId: 'peer-xrp-bad',
-        channelId: 'BADCHANNEL',
-        amount: '50000',
+        blockchain: 'evm',
+        messageId: 'msg-evm-unverified',
+        senderId: 'peer-evm-bad',
+        channelId: '0xBADCHANNEL',
+        nonce: 1,
+        transferredAmount: '50000',
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
         signature: 'invalid-sig',
-        publicKey: 'invalid-key',
+        signerAddress: '0x1234',
       };
 
       db.prepare(
@@ -286,7 +212,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       claimRedemptionService.stop();
 
       // Verify SDK was NOT called
-      expect(mockXRPChannelSDK.submitClaim).not.toHaveBeenCalled();
+      expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
 
       // Verify claim still unredeemed
       const row = db
@@ -372,89 +298,20 @@ describe('ClaimRedemptionService Integration Tests', () => {
     });
   });
 
-  describe('Aptos Claim Redemption', () => {
-    it('should redeem verified Aptos claim', async () => {
-      // Insert verified Aptos claim
-      const aptosClaim = {
-        blockchain: 'aptos',
-        messageId: 'msg-aptos-001',
-        senderId: 'peer-aptos-1',
-        channelOwner: '0x789GHI012JKL',
-        amount: '2000000', // 2 APT in octas
-        nonce: 3,
-        signature: 'aptos-sig-123',
-        publicKey: 'aptos-pubkey-123',
-      };
-
-      db.prepare(
-        `
-        INSERT INTO received_claims (
-          message_id, peer_id, blockchain, channel_id, claim_data, verified, received_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `
-      ).run(
-        aptosClaim.messageId,
-        aptosClaim.senderId,
-        aptosClaim.blockchain,
-        aptosClaim.channelOwner, // Aptos uses channelOwner as channel_id
-        JSON.stringify(aptosClaim),
-        1,
-        Date.now()
-      );
-
-      // Start service
-      claimRedemptionService.start();
-
-      // Wait for polling cycle
-      await new Promise((resolve) => setTimeout(resolve, 200));
-
-      // Stop service
-      claimRedemptionService.stop();
-
-      // Verify Aptos SDK was called with correct claim
-      expect(mockAptosChannelSDK.submitClaim).toHaveBeenCalledWith(
-        expect.objectContaining({
-          channelOwner: aptosClaim.channelOwner,
-          amount: 2000000n,
-          nonce: 3,
-          signature: aptosClaim.signature,
-          publicKey: aptosClaim.publicKey,
-          createdAt: expect.any(Number),
-        })
-      );
-
-      // Verify database was updated
-      const row = db
-        .prepare('SELECT * FROM received_claims WHERE message_id = ?')
-        .get(aptosClaim.messageId) as any;
-
-      expect(row.redeemed_at).toBeTruthy();
-      expect(row.redemption_tx_hash).toBe(aptosClaim.messageId);
-
-      // Verify telemetry was emitted
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CLAIM_REDEEMED',
-          blockchain: 'aptos',
-          messageId: aptosClaim.messageId,
-          channelId: aptosClaim.channelOwner, // Aptos uses channelOwner
-          success: true,
-        })
-      );
-    });
-  });
-
   describe('Profitability Filter', () => {
-    it('should skip unprofitable claims', async () => {
-      // Insert low-value XRP claim (500 drops - 10 gas = 490, below 1000 threshold)
+    it('should skip unprofitable EVM claims', async () => {
+      // Insert low-value EVM claim (below profit threshold after gas)
       const unprofitableClaim = {
-        blockchain: 'xrp',
+        blockchain: 'evm',
         messageId: 'msg-unprofitable',
-        senderId: 'peer-xrp-cheap',
-        channelId: 'CHEAPCHANNEL',
-        amount: '500', // 500 drops, below profit threshold
+        senderId: 'peer-evm-cheap',
+        channelId: '0xCHEAPCHANNEL',
+        nonce: 1,
+        transferredAmount: '500', // Very small amount, below profit threshold
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
         signature: 'cheap-sig',
-        publicKey: 'cheap-key',
+        signerAddress: '0x1234',
       };
 
       db.prepare(
@@ -483,7 +340,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       claimRedemptionService.stop();
 
       // Verify SDK was NOT called (unprofitable)
-      expect(mockXRPChannelSDK.submitClaim).not.toHaveBeenCalled();
+      expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
 
       // Verify claim still unredeemed
       const row = db
@@ -493,16 +350,19 @@ describe('ClaimRedemptionService Integration Tests', () => {
       expect(row.redeemed_at).toBeNull();
     });
 
-    it('should redeem profitable claims', async () => {
-      // Insert high-value XRP claim (10000 drops - 10 gas = 9990, above 1000 threshold)
+    it('should redeem profitable EVM claims', async () => {
+      // Insert high-value EVM claim (above profit threshold after gas)
       const profitableClaim = {
-        blockchain: 'xrp',
+        blockchain: 'evm',
         messageId: 'msg-profitable',
-        senderId: 'peer-xrp-rich',
-        channelId: 'RICHCHANNEL',
-        amount: '10000', // 10000 drops, above profit threshold
+        senderId: 'peer-evm-rich',
+        channelId: '0xRICHCHANNEL',
+        nonce: 1,
+        transferredAmount: '10000000000000000000', // 10 tokens, above profit threshold
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
         signature: 'rich-sig',
-        publicKey: 'rich-key',
+        signerAddress: '0x1234',
       };
 
       db.prepare(
@@ -531,7 +391,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       claimRedemptionService.stop();
 
       // Verify SDK was called (profitable)
-      expect(mockXRPChannelSDK.submitClaim).toHaveBeenCalled();
+      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalled();
 
       // Verify claim was redeemed
       const row = db
@@ -543,38 +403,43 @@ describe('ClaimRedemptionService Integration Tests', () => {
   });
 
   describe('Multiple Claims Processing', () => {
-    it('should process multiple claims from different blockchains in parallel', async () => {
+    it('should process multiple EVM claims in parallel', async () => {
       const claims = [
         {
-          blockchain: 'xrp',
-          messageId: 'msg-multi-xrp',
-          senderId: 'peer-xrp',
-          channelId: 'XRPCHANNEL',
-          amount: '50000',
-          signature: 'xrp-sig',
-          publicKey: 'xrp-key',
-        },
-        {
           blockchain: 'evm',
-          messageId: 'msg-multi-evm',
-          senderId: 'peer-evm',
-          channelId: '0xEVMCHANNEL',
+          messageId: 'msg-multi-evm-1',
+          senderId: 'peer-evm-1',
+          channelId: '0xEVMCHANNEL1',
           nonce: 1,
           transferredAmount: '5000000000000000000',
           lockedAmount: '0',
           locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
-          signature: 'evm-sig',
+          signature: 'evm-sig-1',
           signerAddress: '0xABC',
         },
         {
-          blockchain: 'aptos',
-          messageId: 'msg-multi-aptos',
-          senderId: 'peer-aptos',
-          channelOwner: '0xAPTOSOWNER',
-          amount: '3000000',
+          blockchain: 'evm',
+          messageId: 'msg-multi-evm-2',
+          senderId: 'peer-evm-2',
+          channelId: '0xEVMCHANNEL2',
           nonce: 2,
-          signature: 'aptos-sig',
-          publicKey: 'aptos-key',
+          transferredAmount: '3000000000000000000',
+          lockedAmount: '0',
+          locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
+          signature: 'evm-sig-2',
+          signerAddress: '0xDEF',
+        },
+        {
+          blockchain: 'evm',
+          messageId: 'msg-multi-evm-3',
+          senderId: 'peer-evm-3',
+          channelId: '0xEVMCHANNEL3',
+          nonce: 3,
+          transferredAmount: '7000000000000000000',
+          lockedAmount: '0',
+          locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
+          signature: 'evm-sig-3',
+          signerAddress: '0xGHI',
         },
       ];
 
@@ -590,7 +455,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
           claim.messageId,
           claim.senderId,
           claim.blockchain,
-          claim.blockchain === 'aptos' ? (claim as any).channelOwner : (claim as any).channelId,
+          claim.channelId,
           JSON.stringify(claim),
           1,
           Date.now()
@@ -606,10 +471,8 @@ describe('ClaimRedemptionService Integration Tests', () => {
       // Stop service
       claimRedemptionService.stop();
 
-      // Verify all SDKs were called
-      expect(mockXRPChannelSDK.submitClaim).toHaveBeenCalled();
-      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalled();
-      expect(mockAptosChannelSDK.submitClaim).toHaveBeenCalled();
+      // Verify EVM SDK was called for all claims
+      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledTimes(3);
 
       // Verify all claims were redeemed
       const redeemedCount = db
@@ -626,9 +489,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       // Create a new service with slower polling to avoid multiple cycles
       const slowService = new ClaimRedemptionService(
         db,
-        mockXRPChannelSDK,
         mockEVMChannelSDK,
-        mockAptosChannelSDK,
         mockEvmProvider,
         {
           minProfitThreshold: 1000n,
@@ -641,7 +502,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
         'test-node'
       );
 
-      // Insert 10 claims
+      // Insert 10 EVM claims
       const insertStmt = db.prepare(`
         INSERT INTO received_claims (
           message_id, peer_id, blockchain, channel_id, claim_data, verified, received_at
@@ -650,13 +511,16 @@ describe('ClaimRedemptionService Integration Tests', () => {
 
       for (let i = 0; i < 10; i++) {
         const claim = {
-          blockchain: 'xrp',
+          blockchain: 'evm',
           messageId: `msg-bulk-${i}`,
           senderId: 'peer-bulk',
-          channelId: `BULKCHANNEL${i}`,
-          amount: '100000',
+          channelId: `0xBULKCHANNEL${i}`,
+          nonce: i + 1,
+          transferredAmount: '10000000000000000000',
+          lockedAmount: '0',
+          locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
           signature: `sig-${i}`,
-          publicKey: `key-${i}`,
+          signerAddress: '0xBULK',
         };
 
         insertStmt.run(
@@ -689,13 +553,11 @@ describe('ClaimRedemptionService Integration Tests', () => {
   });
 
   describe('Retry Logic', () => {
-    it('should retry failed redemptions with exponential backoff', async () => {
+    it('should retry failed EVM redemptions with exponential backoff', async () => {
       // Create a fresh service with long polling interval
       const retryService = new ClaimRedemptionService(
         db,
-        mockXRPChannelSDK,
         mockEVMChannelSDK,
-        mockAptosChannelSDK,
         mockEvmProvider,
         {
           minProfitThreshold: 1000n,
@@ -710,7 +572,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
 
       // Mock SDK to fail twice then succeed
       let attemptCount = 0;
-      mockXRPChannelSDK.submitClaim.mockImplementation(async () => {
+      mockEVMChannelSDK.closeChannel.mockImplementation(async () => {
         attemptCount++;
         if (attemptCount <= 2) {
           throw new Error(`Network failure attempt ${attemptCount}`);
@@ -718,15 +580,18 @@ describe('ClaimRedemptionService Integration Tests', () => {
         // Success on 3rd attempt
       });
 
-      // Insert claim
+      // Insert EVM claim
       const claim = {
-        blockchain: 'xrp',
+        blockchain: 'evm',
         messageId: 'msg-retry-success',
         senderId: 'peer-retry',
-        channelId: 'RETRYCHANNEL',
-        amount: '100000',
+        channelId: '0xRETRYCHANNEL',
+        nonce: 1,
+        transferredAmount: '10000000000000000000',
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
         signature: 'retry-sig',
-        publicKey: 'retry-key',
+        signerAddress: '0x1234',
       };
 
       db.prepare(
@@ -755,7 +620,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       retryService.stop();
 
       // Verify 3 attempts were made
-      expect(mockXRPChannelSDK.submitClaim).toHaveBeenCalledTimes(3);
+      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledTimes(3);
 
       // Verify claim was eventually redeemed
       const row = db
@@ -769,9 +634,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       // Create a fresh service with long polling interval
       const failService = new ClaimRedemptionService(
         db,
-        mockXRPChannelSDK,
         mockEVMChannelSDK,
-        mockAptosChannelSDK,
         mockEvmProvider,
         {
           minProfitThreshold: 1000n,
@@ -785,17 +648,20 @@ describe('ClaimRedemptionService Integration Tests', () => {
       );
 
       // Mock SDK to always fail
-      mockXRPChannelSDK.submitClaim.mockRejectedValue(new Error('Permanent failure'));
+      mockEVMChannelSDK.closeChannel.mockRejectedValue(new Error('Permanent failure'));
 
-      // Insert claim
+      // Insert EVM claim
       const claim = {
-        blockchain: 'xrp',
+        blockchain: 'evm',
         messageId: 'msg-retry-fail',
         senderId: 'peer-fail',
-        channelId: 'FAILCHANNEL',
-        amount: '100000',
+        channelId: '0xFAILCHANNEL',
+        nonce: 1,
+        transferredAmount: '10000000000000000000',
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
         signature: 'fail-sig',
-        publicKey: 'fail-key',
+        signerAddress: '0x1234',
       };
 
       db.prepare(
@@ -824,7 +690,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       failService.stop();
 
       // Verify exactly 3 attempts were made
-      expect(mockXRPChannelSDK.submitClaim).toHaveBeenCalledTimes(3);
+      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledTimes(3);
 
       // Verify claim was NOT redeemed
       const row = db
@@ -842,7 +708,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
           error: 'Permanent failure',
         })
       );
-    });
+    }, 15000); // Retries take 1s + 2s + 4s + buffer
   });
 
   describe('Service Lifecycle', () => {
@@ -869,9 +735,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       // Create fresh service for this test
       const skipService = new ClaimRedemptionService(
         db,
-        mockXRPChannelSDK,
         mockEVMChannelSDK,
-        mockAptosChannelSDK,
         mockEvmProvider,
         {
           minProfitThreshold: 1000n,
@@ -884,15 +748,18 @@ describe('ClaimRedemptionService Integration Tests', () => {
         'test-node'
       );
 
-      // Insert already redeemed claim
+      // Insert already redeemed EVM claim
       const redeemedClaim = {
-        blockchain: 'xrp',
+        blockchain: 'evm',
         messageId: 'msg-already-redeemed',
         senderId: 'peer-redeemed',
-        channelId: 'REDEEMEDCHANNEL',
-        amount: '100000',
+        channelId: '0xREDEEMEDCHANNEL',
+        nonce: 1,
+        transferredAmount: '10000000000000000000',
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
         signature: 'redeemed-sig',
-        publicKey: 'redeemed-key',
+        signerAddress: '0x1234',
       };
 
       db.prepare(
@@ -923,7 +790,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       skipService.stop();
 
       // Verify SDK was NOT called (already redeemed)
-      expect(mockXRPChannelSDK.submitClaim).not.toHaveBeenCalled();
+      expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
     });
   });
 
@@ -932,9 +799,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       // Create fresh service for this test
       const gasService = new ClaimRedemptionService(
         db,
-        mockXRPChannelSDK,
         mockEVMChannelSDK,
-        mockAptosChannelSDK,
         mockEvmProvider,
         {
           minProfitThreshold: 1000n,
@@ -1001,9 +866,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       // Create fresh service for this test
       const telemetryService = new ClaimRedemptionService(
         db,
-        mockXRPChannelSDK,
         mockEVMChannelSDK,
-        mockAptosChannelSDK,
         mockEvmProvider,
         {
           minProfitThreshold: 1000n,
@@ -1017,13 +880,16 @@ describe('ClaimRedemptionService Integration Tests', () => {
       );
 
       const claim = {
-        blockchain: 'xrp',
+        blockchain: 'evm',
         messageId: 'msg-telemetry',
         senderId: 'peer-telemetry',
-        channelId: 'TELEMETRYCHANNEL',
-        amount: '100000',
+        channelId: '0xTELEMETRYCHANNEL',
+        nonce: 1,
+        transferredAmount: '10000000000000000000',
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
         signature: 'telemetry-sig',
-        publicKey: 'telemetry-key',
+        signerAddress: '0x1234',
       };
 
       db.prepare(
@@ -1052,29 +918,25 @@ describe('ClaimRedemptionService Integration Tests', () => {
       telemetryService.stop();
 
       // Verify telemetry event structure
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith({
-        type: 'CLAIM_REDEEMED',
-        nodeId: 'test-node',
-        peerId: claim.senderId,
-        blockchain: 'xrp',
-        messageId: claim.messageId,
-        channelId: claim.channelId,
-        amount: claim.amount,
-        txHash: claim.messageId,
-        gasCost: '10', // XRP fixed gas
-        success: true,
-        error: undefined,
-        timestamp: expect.any(String),
-      });
+      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'CLAIM_REDEEMED',
+          nodeId: 'test-node',
+          peerId: claim.senderId,
+          blockchain: 'evm',
+          messageId: claim.messageId,
+          channelId: claim.channelId,
+          success: true,
+          timestamp: expect.any(String),
+        })
+      );
     });
 
     it('should continue even if telemetry emission fails', async () => {
       // Create fresh service for this test
       const telemetryFailService = new ClaimRedemptionService(
         db,
-        mockXRPChannelSDK,
         mockEVMChannelSDK,
-        mockAptosChannelSDK,
         mockEvmProvider,
         {
           minProfitThreshold: 1000n,
@@ -1093,13 +955,16 @@ describe('ClaimRedemptionService Integration Tests', () => {
       });
 
       const claim = {
-        blockchain: 'xrp',
+        blockchain: 'evm',
         messageId: 'msg-telemetry-fail',
         senderId: 'peer-telemetry-fail',
-        channelId: 'TELEMETRYFAILCHANNEL',
-        amount: '100000',
+        channelId: '0xTELEMETRYFAILCHANNEL',
+        nonce: 1,
+        transferredAmount: '10000000000000000000',
+        lockedAmount: '0',
+        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
         signature: 'tel-fail-sig',
-        publicKey: 'tel-fail-key',
+        signerAddress: '0x1234',
       };
 
       db.prepare(

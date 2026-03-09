@@ -1,7 +1,7 @@
 {
   "name": "@crosstown/connector",
-  "version": "1.2.1",
-  "description": "Connector with BTP support and tri-chain settlement",
+  "version": "1.6.1",
+  "description": "Connector with BTP support and EVM settlement",
   "main": "dist/lib.js",
   "types": "dist/lib.d.ts",
   "exports": {
@@ -67,15 +67,11 @@
     "test:performance": "jest --config jest.performance.config.js",
     "test:integration": "jest --testPathPattern=test/integration",
     "test:tigerbeetle": "jest --testPathPattern='tigerbeetle|account-manager|packet-forwarding-with-accounting'",
-    "test:xrp": "jest --testPathPattern='xrp-|xrpl-|rippled-'",
-    "test:aptos": "jest --testPathPattern='aptos-|connector-aptos-'",
-    "test:settlement": "jest --testPathPattern='settlement-|claim-|multi-chain-|tri-chain-'",
+    "test:settlement": "jest --testPathPattern='settlement-|claim-'",
     "test:explorer": "jest --testPathPattern='explorer-'",
     "test:btp": "jest --testPathPattern='btp-'",
-    "test:docker": "jest --testPathPattern='docker-|deployment|mesh-topology|full-stack'",
-    "test:base-channel": "jest --testPathPattern='base-payment-channel.test'",
-    "test:base-bls": "jest --testPathPattern='base-payment-channel-bls'",
-    "test:base-e2e": "jest --testPathPattern='base-payment-channel-e2e'",
+    "test:evm": "jest --testPathPattern='evm-payment-channel|embedded-evm-settlement'",
+    "test:embedded": "jest --testPathPattern='test/integration' --testPathIgnorePatterns='docker-|deployment|mesh-topology|full-stack'",
     "test:crosstown-e2e": "jest --testPathPattern='crosstown-comprehensive-e2e'",
     "lint": "eslint src --ext .ts",
     "dev": "tsc --watch",
@@ -85,7 +81,6 @@
   },
   "dependencies": {
     "@crosstown/shared": "^1.0.0",
-    "@aptos-labs/ts-sdk": "^1.39.0",
     "better-sqlite3": "^11.8.1",
     "cors": "^2.8.6",
     "ethers": "^6.16.0",
@@ -95,7 +90,6 @@
     "pino": "^8.21.0",
     "tslib": "^2.8.1",
     "ws": "^8.16.0",
-    "xrpl": "^2.14.3",
     "zod": "^3.25.76"
   },
   "peerDependencies": {

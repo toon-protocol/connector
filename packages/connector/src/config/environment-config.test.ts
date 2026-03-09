@@ -64,9 +64,6 @@ routes: []
       process.env.BASE_ENABLED = 'true';
       process.env.BASE_RPC_URL = 'http://anvil:8545';
       process.env.BASE_CHAIN_ID = '84532';
-      process.env.XRPL_ENABLED = 'true';
-      process.env.XRPL_RPC_URL = 'http://rippled:5005';
-      process.env.XRPL_NETWORK = 'standalone';
 
       const config = ConfigLoader.loadConfig(testConfigPath);
 
@@ -77,18 +74,12 @@ routes: []
       expect(config.blockchain?.base?.enabled).toBe(true);
       expect(config.blockchain?.base?.rpcUrl).toBe('http://anvil:8545');
       expect(config.blockchain?.base?.chainId).toBe(84532);
-
-      // Verify XRPL blockchain config
-      expect(config.blockchain?.xrpl?.enabled).toBe(true);
-      expect(config.blockchain?.xrpl?.rpcUrl).toBe('http://rippled:5005');
-      expect(config.blockchain?.xrpl?.network).toBe('standalone');
     });
 
     test('should apply development defaults when ENVIRONMENT=development', () => {
       // Set development environment with minimal variables
       process.env.ENVIRONMENT = 'development';
       process.env.BASE_ENABLED = 'true';
-      process.env.XRPL_ENABLED = 'true';
       // Do NOT set RPC URLs or chain IDs - should use defaults
 
       const config = ConfigLoader.loadConfig(testConfigPath);
@@ -96,10 +87,6 @@ routes: []
       // Verify Base defaults
       expect(config.blockchain?.base?.rpcUrl).toBe('http://anvil:8545');
       expect(config.blockchain?.base?.chainId).toBe(84532);
-
-      // Verify XRPL defaults
-      expect(config.blockchain?.xrpl?.rpcUrl).toBe('http://rippled:5005');
-      expect(config.blockchain?.xrpl?.network).toBe('standalone');
     });
   });
 
@@ -112,9 +99,6 @@ routes: []
       process.env.BASE_CHAIN_ID = '8453';
       process.env.BASE_PRIVATE_KEY =
         '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
-      process.env.XRPL_ENABLED = 'true';
-      process.env.XRPL_RPC_URL = 'https://xrplcluster.com';
-      process.env.XRPL_NETWORK = 'mainnet';
 
       const config = ConfigLoader.loadConfig(testConfigPath);
 
@@ -125,11 +109,6 @@ routes: []
       expect(config.blockchain?.base?.enabled).toBe(true);
       expect(config.blockchain?.base?.rpcUrl).toBe('https://mainnet.base.org');
       expect(config.blockchain?.base?.chainId).toBe(8453);
-
-      // Verify XRPL blockchain config
-      expect(config.blockchain?.xrpl?.enabled).toBe(true);
-      expect(config.blockchain?.xrpl?.rpcUrl).toBe('https://xrplcluster.com');
-      expect(config.blockchain?.xrpl?.network).toBe('mainnet');
     });
 
     test('should apply production defaults when ENVIRONMENT=production', () => {
@@ -138,7 +117,6 @@ routes: []
       process.env.BASE_ENABLED = 'true';
       process.env.BASE_PRIVATE_KEY =
         '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
-      process.env.XRPL_ENABLED = 'true';
       // Do NOT set RPC URLs or chain IDs - should use defaults
 
       const config = ConfigLoader.loadConfig(testConfigPath);
@@ -146,10 +124,6 @@ routes: []
       // Verify Base defaults
       expect(config.blockchain?.base?.rpcUrl).toBe('https://mainnet.base.org');
       expect(config.blockchain?.base?.chainId).toBe(8453);
-
-      // Verify XRPL defaults
-      expect(config.blockchain?.xrpl?.rpcUrl).toBe('https://xrplcluster.com');
-      expect(config.blockchain?.xrpl?.network).toBe('mainnet');
     });
   });
 
@@ -166,7 +140,7 @@ routes: []
       // Expect ConfigLoader to throw error
       expect(() => {
         ConfigLoader.loadConfig(testConfigPath);
-      }).toThrow('Cannot use development private key in production');
+      }).toThrow('Cannot use development private key for Base in production');
     });
 
     test('should reject localhost RPC URL in production environment', () => {
@@ -179,7 +153,7 @@ routes: []
       // Expect ConfigLoader to throw error
       expect(() => {
         ConfigLoader.loadConfig(testConfigPath);
-      }).toThrow('Cannot use localhost RPC in production');
+      }).toThrow('Cannot use localhost RPC for Base in production');
     });
 
     test('should reject non-mainnet chain ID in production environment', () => {
@@ -205,7 +179,7 @@ routes: []
       // Expect ConfigLoader to throw error
       expect(() => {
         ConfigLoader.loadConfig(testConfigPath);
-      }).toThrow('Cannot use localhost RPC in production');
+      }).toThrow('Cannot use localhost RPC for Base in production');
     });
 
     test('should reject HTTP RPC URL in production environment', () => {
@@ -218,33 +192,7 @@ routes: []
       // Expect ConfigLoader to throw error
       expect(() => {
         ConfigLoader.loadConfig(testConfigPath);
-      }).toThrow('Production RPC URL must use HTTPS for security');
-    });
-
-    test('should reject non-mainnet XRPL network in production', () => {
-      // Set production environment with XRPL testnet
-      process.env.ENVIRONMENT = 'production';
-      process.env.XRPL_ENABLED = 'true';
-      process.env.XRPL_RPC_URL = 'https://s.altnet.rippletest.net:51234';
-      process.env.XRPL_NETWORK = 'testnet';
-
-      // Expect ConfigLoader to throw error
-      expect(() => {
-        ConfigLoader.loadConfig(testConfigPath);
-      }).toThrow("Production must use XRPL mainnet, got network 'testnet'");
-    });
-
-    test('should reject localhost XRPL RPC in production', () => {
-      // Set production environment with localhost rippled
-      process.env.ENVIRONMENT = 'production';
-      process.env.XRPL_ENABLED = 'true';
-      process.env.XRPL_RPC_URL = 'http://localhost:5005';
-      process.env.XRPL_NETWORK = 'mainnet';
-
-      // Expect ConfigLoader to throw error
-      expect(() => {
-        ConfigLoader.loadConfig(testConfigPath);
-      }).toThrow('Cannot use localhost rippled in production');
+      }).toThrow('Production Base RPC URL must use HTTPS for security');
     });
   });
 
@@ -260,9 +208,8 @@ routes: []
     });
 
     test('should return undefined blockchain config when no blockchain enabled', () => {
-      // Do NOT set BASE_ENABLED or XRPL_ENABLED
+      // Do NOT set BASE_ENABLED
       delete process.env.BASE_ENABLED;
-      delete process.env.XRPL_ENABLED;
 
       const config = ConfigLoader.loadConfig(testConfigPath);
 
@@ -276,7 +223,6 @@ routes: []
       // Set staging environment
       process.env.ENVIRONMENT = 'staging';
       process.env.BASE_ENABLED = 'true';
-      process.env.XRPL_ENABLED = 'true';
       // Do NOT set RPC URLs - should use staging defaults
 
       const config = ConfigLoader.loadConfig(testConfigPath);
@@ -287,42 +233,33 @@ routes: []
       // Verify Base staging defaults
       expect(config.blockchain?.base?.rpcUrl).toBe('https://sepolia.base.org');
       expect(config.blockchain?.base?.chainId).toBe(84532);
-
-      // Verify XRPL staging defaults
-      expect(config.blockchain?.xrpl?.rpcUrl).toBe('https://s.altnet.rippletest.net:51234');
-      expect(config.blockchain?.xrpl?.network).toBe('testnet');
     });
   });
 
   describe('Private Key Handling', () => {
-    test('should load optional private keys when provided', () => {
+    test('should load optional private key when provided', () => {
       process.env.ENVIRONMENT = 'development';
       process.env.BASE_ENABLED = 'true';
       process.env.BASE_PRIVATE_KEY =
         '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
-      process.env.XRPL_ENABLED = 'true';
-      process.env.XRPL_PRIVATE_KEY = 'snoPBrXtMeMyMHUVTgbuqAfg1SUTb';
 
       const config = ConfigLoader.loadConfig(testConfigPath);
 
-      // Verify private keys loaded
+      // Verify private key loaded
       expect(config.blockchain?.base?.privateKey).toBe(
         '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
       );
-      expect(config.blockchain?.xrpl?.privateKey).toBe('snoPBrXtMeMyMHUVTgbuqAfg1SUTb');
     });
 
-    test('should allow undefined private keys (optional)', () => {
+    test('should allow undefined private key (optional)', () => {
       process.env.ENVIRONMENT = 'development';
       process.env.BASE_ENABLED = 'true';
-      process.env.XRPL_ENABLED = 'true';
-      // Do NOT set private keys
+      // Do NOT set private key
 
       const config = ConfigLoader.loadConfig(testConfigPath);
 
-      // Verify private keys are undefined
+      // Verify private key is undefined
       expect(config.blockchain?.base?.privateKey).toBeUndefined();
-      expect(config.blockchain?.xrpl?.privateKey).toBeUndefined();
     });
   });
 
@@ -360,17 +297,6 @@ routes: []
       expect(() => {
         ConfigLoader.loadConfig(testConfigPath);
       }).toThrow('Invalid ENVIRONMENT');
-    });
-
-    test('should reject invalid XRPL_NETWORK value', () => {
-      process.env.ENVIRONMENT = 'development';
-      process.env.XRPL_ENABLED = 'true';
-      process.env.XRPL_NETWORK = 'invalid-network';
-
-      // Expect ConfigLoader to throw error
-      expect(() => {
-        ConfigLoader.loadConfig(testConfigPath);
-      }).toThrow('Invalid XRPL_NETWORK');
     });
   });
 });

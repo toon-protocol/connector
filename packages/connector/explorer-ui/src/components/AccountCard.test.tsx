@@ -222,7 +222,7 @@ describe('AccountCard', () => {
         <AccountCard
           {...createDefaultProps({
             hasActiveChannel: true,
-            channelType: 'xrp',
+            channelType: 'evm',
           })}
         />
       );

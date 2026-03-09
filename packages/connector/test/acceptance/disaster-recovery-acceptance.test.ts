@@ -30,7 +30,6 @@ const TEST_DATA_DIR = path.join(process.cwd(), 'test-data', 'disaster-recovery')
 interface AccountState {
   agentId: string;
   evmBalance: bigint;
-  xrpBalance: bigint;
   pendingSettlements: number;
   lastUpdated: Date;
 }
@@ -39,7 +38,7 @@ interface SettlementState {
   id: string;
   agentId: string;
   amount: bigint;
-  chain: 'evm' | 'xrp';
+  chain: 'evm';
   status: 'pending' | 'completed' | 'failed';
   createdAt: Date;
 }
@@ -81,7 +80,6 @@ class PersistentStorage {
       CREATE TABLE IF NOT EXISTS accounts (
         agent_id TEXT PRIMARY KEY,
         evm_balance INTEGER DEFAULT 0,
-        xrp_balance INTEGER DEFAULT 0,
         pending_settlements INTEGER DEFAULT 0,
         last_updated TEXT DEFAULT CURRENT_TIMESTAMP
       );
@@ -104,12 +102,12 @@ class PersistentStorage {
     `);
   }
 
-  createAccount(agentId: string, evmBalance: bigint, xrpBalance: bigint): void {
+  createAccount(agentId: string, evmBalance: bigint): void {
     const stmt = this.db.prepare(`
-      INSERT OR REPLACE INTO accounts (agent_id, evm_balance, xrp_balance, last_updated)
-      VALUES (?, ?, ?, datetime('now'))
+      INSERT OR REPLACE INTO accounts (agent_id, evm_balance, last_updated)
+      VALUES (?, ?, datetime('now'))
     `);
-    stmt.run(agentId, Number(evmBalance), Number(xrpBalance));
+    stmt.run(agentId, Number(evmBalance));
   }
 
   getAccount(agentId: string): AccountState | null {
@@ -121,7 +119,6 @@ class PersistentStorage {
     return {
       agentId: row.agent_id as string,
       evmBalance: BigInt(row.evm_balance as number),
-      xrpBalance: BigInt(row.xrp_balance as number),
       pendingSettlements: row.pending_settlements as number,
       lastUpdated: new Date(row.last_updated as string),
     };
@@ -134,7 +131,6 @@ class PersistentStorage {
     return rows.map((row) => ({
       agentId: row.agent_id as string,
       evmBalance: BigInt(row.evm_balance as number),
-      xrpBalance: BigInt(row.xrp_balance as number),
       pendingSettlements: row.pending_settlements as number,
       lastUpdated: new Date(row.last_updated as string),
     }));
@@ -164,7 +160,7 @@ class PersistentStorage {
       id: row.id as string,
       agentId: row.agent_id as string,
       amount: BigInt(row.amount as number),
-      chain: row.chain as 'evm' | 'xrp',
+      chain: row.chain as 'evm',
       status: row.status as 'pending' | 'completed' | 'failed',
       createdAt: new Date(row.created_at as string),
     };
@@ -178,7 +174,7 @@ class PersistentStorage {
       id: row.id as string,
       agentId: row.agent_id as string,
       amount: BigInt(row.amount as number),
-      chain: row.chain as 'evm' | 'xrp',
+      chain: row.chain as 'evm',
       status: row.status as 'pending' | 'completed' | 'failed',
       createdAt: new Date(row.created_at as string),
     }));
@@ -481,8 +477,8 @@ describe('Disaster Recovery Acceptance Tests', () => {
   describe('Database Backup and Restore', () => {
     it('should create database backup with all data', () => {
       // Create test data
-      storage.createAccount('agent-1', BigInt(1000), BigInt(500));
-      storage.createAccount('agent-2', BigInt(2000), BigInt(1000));
+      storage.createAccount('agent-1', BigInt(1000));
+      storage.createAccount('agent-2', BigInt(2000));
       storage.createSettlement({
         id: 'settlement-1',
         agentId: 'agent-1',
@@ -513,7 +509,7 @@ describe('Disaster Recovery Acceptance Tests', () => {
 
     it('should restore database from backup', () => {
       // Create initial data
-      storage.createAccount('agent-1', BigInt(1000), BigInt(500));
+      storage.createAccount('agent-1', BigInt(1000));
       storage.createSettlement({
         id: 'settlement-1',
         agentId: 'agent-1',
@@ -552,12 +548,12 @@ describe('Disaster Recovery Acceptance Tests', () => {
     it('should preserve data integrity across backup/restore cycle', () => {
       // Create complex state
       for (let i = 0; i < 10; i++) {
-        storage.createAccount(`agent-${i}`, BigInt(i * 1000), BigInt(i * 500));
+        storage.createAccount(`agent-${i}`, BigInt(i * 1000));
         storage.createSettlement({
           id: `settlement-${i}`,
           agentId: `agent-${i}`,
           amount: BigInt(i * 100),
-          chain: i % 2 === 0 ? 'evm' : 'xrp',
+          chain: 'evm',
           status: 'pending',
         });
       }
@@ -654,7 +650,7 @@ describe('Disaster Recovery Acceptance Tests', () => {
   describe('State Reconstruction', () => {
     it('should create verifiable snapshots', () => {
       // Create state
-      storage.createAccount('agent-1', BigInt(1000), BigInt(500));
+      storage.createAccount('agent-1', BigInt(1000));
       storage.createSettlement({
         id: 'settlement-1',
         agentId: 'agent-1',
@@ -675,7 +671,7 @@ describe('Disaster Recovery Acceptance Tests', () => {
 
     it('should detect data corruption', () => {
       // Create state
-      storage.createAccount('agent-1', BigInt(1000), BigInt(500));
+      storage.createAccount('agent-1', BigInt(1000));
 
       // Create snapshot
       const snapshot = storage.createSnapshot();
@@ -692,7 +688,7 @@ describe('Disaster Recovery Acceptance Tests', () => {
 
     it('should reconstruct state from snapshots', () => {
       // Create initial state
-      storage.createAccount('agent-1', BigInt(1000), BigInt(500));
+      storage.createAccount('agent-1', BigInt(1000));
       storage.createAccount('agent-2', BigInt(2000), BigInt(1000));
 
       const snapshot = storage.createSnapshot();
@@ -700,7 +696,7 @@ describe('Disaster Recovery Acceptance Tests', () => {
       // Verify reconstruction
       expect(snapshot.accounts.length).toBe(2);
       expect(snapshot.accounts.find((a) => a.agentId === 'agent-1')?.evmBalance).toBe(BigInt(1000));
-      expect(snapshot.accounts.find((a) => a.agentId === 'agent-2')?.xrpBalance).toBe(BigInt(1000));
+      expect(snapshot.accounts.find((a) => a.agentId === 'agent-2')?.evmBalance).toBe(BigInt(2000));
     });
   });
 
@@ -772,7 +768,7 @@ describe('Disaster Recovery Acceptance Tests', () => {
     it('should complete full disaster recovery cycle', async () => {
       // Step 1: Create production-like state
       for (let i = 0; i < 5; i++) {
-        storage.createAccount(`agent-${i}`, BigInt(i * 1000), BigInt(i * 500));
+        storage.createAccount(`agent-${i}`, BigInt(i * 1000));
         keyManager.storeKey(`wallet-key-${i}`, crypto.randomBytes(32));
       }
 
@@ -781,7 +777,7 @@ describe('Disaster Recovery Acceptance Tests', () => {
           id: `settlement-${i}`,
           agentId: `agent-${i % 5}`,
           amount: BigInt(i * 100),
-          chain: i % 2 === 0 ? 'evm' : 'xrp',
+          chain: 'evm',
           status: 'pending',
         });
       }
@@ -833,7 +829,7 @@ describe('Disaster Recovery Acceptance Tests', () => {
       // Setup services
       healthManager.registerService('database');
       healthManager.registerService('settlement-evm');
-      healthManager.registerService('settlement-xrp');
+      healthManager.registerService('telemetry');
       healthManager.registerService('key-manager');
 
       // Simulate partial failure

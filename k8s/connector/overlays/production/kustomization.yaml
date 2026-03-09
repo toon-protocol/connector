@@ -2,8 +2,6 @@
 #
 # This overlay configures the connector for MAINNET deployment with:
 #   - Base Mainnet (chainId 8453)
-#   - XRP Mainnet
-#   - Aptos Mainnet
 #   - HA configuration (2 replicas)
 #   - Production resource limits
 #
@@ -56,8 +54,6 @@ patches:
         # Mainnet RPC URLs
         BASE_L2_RPC_URL: "https://mainnet.base.org"
         BASE_RPC_URL: "https://mainnet.base.org"
-        XRPL_WSS_URL: "wss://xrplcluster.com"
-        APTOS_NODE_URL: "https://fullnode.mainnet.aptoslabs.com/v1"
         # Production settings
         ENVIRONMENT: "production"
         LOG_LEVEL: "info"

@@ -182,18 +182,18 @@ describe('PrometheusExporter', () => {
 
     it('should record successful settlement', async () => {
       const options: SettlementMetricsOptions = {
-        method: 'xrp',
+        method: 'evm',
         status: 'success',
         latencyMs: 3000,
         amount: BigInt(1000000),
-        tokenId: 'XRP',
+        tokenId: 'AGENT',
       };
 
       exporter.recordSettlement(options);
 
       const metrics = await exporter.getMetrics();
       expect(metrics).toContain('settlements_executed_total');
-      expect(metrics).toContain('method="xrp"');
+      expect(metrics).toContain('method="evm"');
       expect(metrics).toContain('status="success"');
     });
 
@@ -211,22 +211,22 @@ describe('PrometheusExporter', () => {
 
     it('should record settlement amount', async () => {
       exporter.recordSettlement({
-        method: 'xrp',
+        method: 'evm',
         status: 'success',
         latencyMs: 2000,
         amount: BigInt(5000000),
-        tokenId: 'XRP',
+        tokenId: 'AGENT',
       });
 
       const metrics = await exporter.getMetrics();
       expect(metrics).toContain('settlement_amount_total');
-      expect(metrics).toContain('token="XRP"');
+      expect(metrics).toContain('token="AGENT"');
     });
 
     it('should track SLA metrics for settlements', () => {
-      exporter.recordSettlement({ method: 'xrp', status: 'success', latencyMs: 1000 });
-      exporter.recordSettlement({ method: 'xrp', status: 'success', latencyMs: 2000 });
-      exporter.recordSettlement({ method: 'xrp', status: 'failure', latencyMs: 3000 });
+      exporter.recordSettlement({ method: 'evm', status: 'success', latencyMs: 1000 });
+      exporter.recordSettlement({ method: 'evm', status: 'success', latencyMs: 2000 });
+      exporter.recordSettlement({ method: 'evm', status: 'failure', latencyMs: 3000 });
 
       const slaMetrics = exporter.getSLAMetrics();
 
@@ -269,17 +269,17 @@ describe('PrometheusExporter', () => {
     });
 
     it('should update active channels count', async () => {
-      exporter.updateActiveChannels('xrp', 'open', 5);
+      exporter.updateActiveChannels('evm', 'open', 5);
 
       const metrics = await exporter.getMetrics();
       expect(metrics).toContain('payment_channels_active');
-      expect(metrics).toContain('method="xrp"');
+      expect(metrics).toContain('method="evm"');
       expect(metrics).toContain('status="open"');
     });
 
     it('should record channel funded event', async () => {
       const options: ChannelMetricsOptions = {
-        method: 'xrp',
+        method: 'evm',
         event: 'funded',
       };
 
@@ -305,7 +305,7 @@ describe('PrometheusExporter', () => {
 
     it('should record channel dispute event', async () => {
       const options: ChannelMetricsOptions = {
-        method: 'xrp',
+        method: 'evm',
         event: 'disputed',
       };
 
@@ -446,7 +446,7 @@ describe('PrometheusExporter', () => {
     it('should reset all metrics', async () => {
       // Record some metrics
       exporter.recordPacket({ type: 'prepare', status: 'success', latencyMs: 5 });
-      exporter.recordSettlement({ method: 'xrp', status: 'success', latencyMs: 1000 });
+      exporter.recordSettlement({ method: 'evm', status: 'success', latencyMs: 1000 });
 
       // Reset
       exporter.reset();
@@ -475,9 +475,9 @@ describe('PrometheusExporter', () => {
     });
 
     describe('recordClaimSent', () => {
-      it('should record claim sent for XRP blockchain', async () => {
+      it('should record claim sent for EVM blockchain', async () => {
         const options: ClaimMetricsOptions = {
-          blockchain: 'xrp',
+          blockchain: 'evm',
           peerId: 'peer-bob',
           success: true,
         };
@@ -487,11 +487,11 @@ describe('PrometheusExporter', () => {
         const metrics = await exporter.getMetrics();
         expect(metrics).toContain('claims_sent_total');
         expect(metrics).toContain('peer_id="peer-bob"');
-        expect(metrics).toContain('blockchain="xrp"');
+        expect(metrics).toContain('blockchain="evm"');
         expect(metrics).toContain('success="true"');
       });
 
-      it('should record claim sent for EVM blockchain', async () => {
+      it('should record claim sent for another EVM peer', async () => {
         const options: ClaimMetricsOptions = {
           blockchain: 'evm',
           peerId: 'peer-alice',
@@ -504,22 +504,9 @@ describe('PrometheusExporter', () => {
         expect(metrics).toContain('blockchain="evm"');
       });
 
-      it('should record claim sent for Aptos blockchain', async () => {
-        const options: ClaimMetricsOptions = {
-          blockchain: 'aptos',
-          peerId: 'peer-charlie',
-          success: true,
-        };
-
-        exporter.recordClaimSent(options);
-
-        const metrics = await exporter.getMetrics();
-        expect(metrics).toContain('blockchain="aptos"');
-      });
-
       it('should record failed claim send', async () => {
         const options: ClaimMetricsOptions = {
-          blockchain: 'xrp',
+          blockchain: 'evm',
           peerId: 'peer-bob',
           success: false,
         };
@@ -532,14 +519,14 @@ describe('PrometheusExporter', () => {
 
       it('should warn if success field is missing', () => {
         const options: ClaimMetricsOptions = {
-          blockchain: 'xrp',
+          blockchain: 'evm',
           peerId: 'peer-bob',
         };
 
         exporter.recordClaimSent(options);
 
         expect(mockLogger.warn).toHaveBeenCalledWith(
-          { blockchain: 'xrp', peerId: 'peer-bob' },
+          { blockchain: 'evm', peerId: 'peer-bob' },
           'recordClaimSent called without success field'
         );
       });
@@ -548,7 +535,7 @@ describe('PrometheusExporter', () => {
     describe('recordClaimReceived', () => {
       it('should record verified claim received', async () => {
         const options: ClaimMetricsOptions = {
-          blockchain: 'xrp',
+          blockchain: 'evm',
           peerId: 'peer-alice',
           verified: true,
         };
@@ -558,7 +545,7 @@ describe('PrometheusExporter', () => {
         const metrics = await exporter.getMetrics();
         expect(metrics).toContain('claims_received_total');
         expect(metrics).toContain('peer_id="peer-alice"');
-        expect(metrics).toContain('blockchain="xrp"');
+        expect(metrics).toContain('blockchain="evm"');
         expect(metrics).toContain('verified="true"');
       });
 
@@ -577,14 +564,14 @@ describe('PrometheusExporter', () => {
 
       it('should warn if verified field is missing', () => {
         const options: ClaimMetricsOptions = {
-          blockchain: 'xrp',
+          blockchain: 'evm',
           peerId: 'peer-alice',
         };
 
         exporter.recordClaimReceived(options);
 
         expect(mockLogger.warn).toHaveBeenCalledWith(
-          { blockchain: 'xrp', peerId: 'peer-alice' },
+          { blockchain: 'evm', peerId: 'peer-alice' },
           'recordClaimReceived called without verified field'
         );
       });
@@ -593,7 +580,7 @@ describe('PrometheusExporter', () => {
     describe('recordClaimRedeemed', () => {
       it('should record successful claim redemption with latency', async () => {
         const options: ClaimMetricsOptions = {
-          blockchain: 'xrp',
+          blockchain: 'evm',
           peerId: 'peer-alice',
           success: true,
           latencyMs: 5000,
@@ -603,7 +590,7 @@ describe('PrometheusExporter', () => {
 
         const metrics = await exporter.getMetrics();
         expect(metrics).toContain('claims_redeemed_total');
-        expect(metrics).toContain('blockchain="xrp"');
+        expect(metrics).toContain('blockchain="evm"');
         expect(metrics).toContain('success="true"');
         expect(metrics).toContain('claim_redemption_latency_seconds');
       });
@@ -625,7 +612,7 @@ describe('PrometheusExporter', () => {
         const beforeRecord = Date.now() / 1000;
 
         const options: ClaimMetricsOptions = {
-          blockchain: 'xrp',
+          blockchain: 'evm',
           peerId: 'peer-alice',
           success: true,
         };
@@ -637,7 +624,7 @@ describe('PrometheusExporter', () => {
 
         // The timestamp should be recent
         const match = metrics.match(
-          /claim_last_redemption_timestamp_seconds\{blockchain="xrp"\}\s+(\d+\.?\d*)/
+          /claim_last_redemption_timestamp_seconds\{blockchain="evm"\}\s+(\d+\.?\d*)/
         );
         expect(match).toBeDefined();
         expect(match).not.toBeNull();
@@ -655,14 +642,17 @@ describe('PrometheusExporter', () => {
         exporter.recordClaimRedeemed(options);
 
         const metrics = await exporter.getMetrics();
-        // Timestamp should not be set for failed redemptions
-        const match = metrics.match(/claim_last_redemption_timestamp_seconds\{blockchain="evm"\}/);
+        // Timestamp should not be set for failed redemptions (different peer)
+        const match = metrics.match(
+          /claim_last_redemption_timestamp_seconds\{blockchain="evm"\}\s+(\d+)/
+        );
+        // With only failed redemptions, timestamp gauge should not be set
         expect(match).toBeNull();
       });
 
-      it('should record redemption for all blockchain types', async () => {
+      it('should record redemption for multiple EVM peers', async () => {
         exporter.recordClaimRedeemed({
-          blockchain: 'xrp',
+          blockchain: 'evm',
           peerId: 'peer-1',
           success: true,
         });
@@ -674,27 +664,26 @@ describe('PrometheusExporter', () => {
         });
 
         exporter.recordClaimRedeemed({
-          blockchain: 'aptos',
+          blockchain: 'evm',
           peerId: 'peer-3',
           success: true,
         });
 
         const metrics = await exporter.getMetrics();
-        expect(metrics).toContain('blockchain="xrp"');
         expect(metrics).toContain('blockchain="evm"');
-        expect(metrics).toContain('blockchain="aptos"');
+        expect(metrics).toContain('claims_redeemed_total');
       });
 
       it('should warn if success field is missing', () => {
         const options: ClaimMetricsOptions = {
-          blockchain: 'xrp',
+          blockchain: 'evm',
           peerId: 'peer-alice',
         };
 
         exporter.recordClaimRedeemed(options);
 
         expect(mockLogger.warn).toHaveBeenCalledWith(
-          { blockchain: 'xrp' },
+          { blockchain: 'evm' },
           'recordClaimRedeemed called without success field'
         );
       });
@@ -703,7 +692,7 @@ describe('PrometheusExporter', () => {
     describe('recordClaimVerificationFailure', () => {
       it('should record invalid signature verification failure', async () => {
         const options: ClaimMetricsOptions = {
-          blockchain: 'xrp',
+          blockchain: 'evm',
           peerId: 'peer-bob',
           errorType: 'invalid_signature',
         };
@@ -713,7 +702,7 @@ describe('PrometheusExporter', () => {
         const metrics = await exporter.getMetrics();
         expect(metrics).toContain('claim_verification_failures_total');
         expect(metrics).toContain('peer_id="peer-bob"');
-        expect(metrics).toContain('blockchain="xrp"');
+        expect(metrics).toContain('blockchain="evm"');
         expect(metrics).toContain('error_type="invalid_signature"');
       });
 
@@ -732,7 +721,7 @@ describe('PrometheusExporter', () => {
 
       it('should record unknown verification failure', async () => {
         const options: ClaimMetricsOptions = {
-          blockchain: 'aptos',
+          blockchain: 'evm',
           peerId: 'peer-charlie',
           errorType: 'unknown',
         };
@@ -745,14 +734,14 @@ describe('PrometheusExporter', () => {
 
       it('should warn if errorType is missing', () => {
         const options: ClaimMetricsOptions = {
-          blockchain: 'xrp',
+          blockchain: 'evm',
           peerId: 'peer-bob',
         };
 
         exporter.recordClaimVerificationFailure(options);
 
         expect(mockLogger.warn).toHaveBeenCalledWith(
-          { blockchain: 'xrp', peerId: 'peer-bob' },
+          { blockchain: 'evm', peerId: 'peer-bob' },
           'recordClaimVerificationFailure called without errorType'
         );
       });

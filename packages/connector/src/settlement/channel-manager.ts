@@ -166,6 +166,88 @@ export class ChannelManager extends EventEmitter {
   }
 
   /**
+   * Register a channel discovered from an incoming self-describing claim.
+   * Populates both channelMetadata and peerChannelIndex without opening on-chain.
+   * Idempotent: if channelId already exists, returns existing metadata.
+   */
+  registerExternalChannel(params: {
+    channelId: string;
+    peerId: string;
+    tokenAddress: string;
+    tokenNetworkAddress: string;
+    chainId: number;
+    status: AdminChannelStatus;
+  }): ChannelMetadata {
+    // Idempotent: return existing if already registered
+    const existing = this.channelMetadata.get(params.channelId);
+    if (existing) {
+      this.logger.debug(
+        { channelId: params.channelId },
+        'External channel already registered, returning existing'
+      );
+      return existing;
+    }
+
+    // Resolve tokenId by reverse-lookup from tokenAddressMap
+    let tokenId: string = params.tokenAddress;
+    for (const [id, address] of this.config.tokenAddressMap.entries()) {
+      if (address.toLowerCase() === params.tokenAddress.toLowerCase()) {
+        tokenId = id;
+        break;
+      }
+    }
+
+    const metadata: ChannelMetadata = {
+      channelId: params.channelId,
+      peerId: params.peerId,
+      tokenId,
+      tokenAddress: params.tokenAddress,
+      chain: `evm:${params.chainId}`,
+      createdAt: new Date(),
+      lastActivityAt: new Date(),
+      status: 'open',
+    };
+
+    this.channelMetadata.set(params.channelId, metadata);
+
+    if (!this.peerChannelIndex.has(params.peerId)) {
+      this.peerChannelIndex.set(params.peerId, new Map<string, string>());
+    }
+    this.peerChannelIndex.get(params.peerId)!.set(tokenId, params.channelId);
+
+    this.logger.info(
+      {
+        channelId: params.channelId,
+        peerId: params.peerId,
+        chainId: params.chainId,
+        tokenNetworkAddress: params.tokenNetworkAddress,
+      },
+      'External channel registered'
+    );
+
+    // Emit telemetry for externally-discovered channel
+    try {
+      if (this.telemetryEmitter) {
+        this.telemetryEmitter.emit({
+          type: 'EXTERNAL_CHANNEL_REGISTERED',
+          nodeId: this.config.nodeId,
+          channelId: params.channelId,
+          peerId: params.peerId,
+          chainId: params.chainId,
+          tokenNetworkAddress: params.tokenNetworkAddress,
+          tokenAddress: params.tokenAddress,
+          timestamp: new Date().toISOString(),
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any);
+      }
+    } catch (error) {
+      this.logger.error({ error }, 'Failed to emit EXTERNAL_CHANNEL_REGISTERED telemetry');
+    }
+
+    return metadata;
+  }
+
+  /**
    * Get all channels
    */
   getAllChannels(): ChannelMetadata[] {

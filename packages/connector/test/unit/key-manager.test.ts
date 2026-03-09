@@ -86,7 +86,6 @@ describe('KeyManager', () => {
           aws: {
             region: 'us-east-1',
             evmKeyId: 'arn:aws:kms:us-east-1:123456789012:key/evm-key',
-            xrpKeyId: 'arn:aws:kms:us-east-1:123456789012:key/xrp-key',
           },
         };
 
@@ -110,7 +109,6 @@ describe('KeyManager', () => {
             locationId: 'us-east1',
             keyRingId: 'my-keyring',
             evmKeyId: 'evm-key',
-            xrpKeyId: 'xrp-key',
           },
         };
 
@@ -132,7 +130,6 @@ describe('KeyManager', () => {
           azure: {
             vaultUrl: 'https://myvault.vault.azure.net/',
             evmKeyName: 'evm-key',
-            xrpKeyName: 'xrp-key',
           },
         };
 
@@ -156,7 +153,6 @@ describe('KeyManager', () => {
             slotId: 0,
             pin: '1234',
             evmKeyLabel: 'evm-key',
-            xrpKeyLabel: 'xrp-key',
           },
         };
 

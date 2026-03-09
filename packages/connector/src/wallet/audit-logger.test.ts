@@ -44,7 +44,6 @@ describe('AuditLogger', () => {
     it('should log wallet operation to database', async () => {
       await auditLogger.auditLog('wallet_created', 'agent-001', {
         evmAddress: '0x1234567890123456789012345678901234567890',
-        xrpAddress: 'rN7n7otQDd6FczFgLdlqtyMVrn3z1v735',
       });
 
       const logs = await auditLogger.getAuditLog('agent-001');

@@ -242,14 +242,6 @@ const PeerCard = React.memo(function PeerCard({ peer, id }: { peer: PeerInfo; id
         </div>
       )}
 
-      {/* XRP Address - Blockchain Explorer Link */}
-      {peer.xrpAddress && (
-        <div className="space-y-0.5">
-          <div className="text-xs text-muted-foreground">XRP Address</div>
-          <BlockchainAddressLink address={peer.xrpAddress} type="xrp" />
-        </div>
-      )}
-
       {/* BTP URL */}
       {peer.btpUrl && (
         <div className="space-y-0.5">

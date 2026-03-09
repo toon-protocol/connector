@@ -256,9 +256,9 @@ export interface ConnectorConfig {
    * Defaults to 'development' if not specified
    *
    * Environment types:
-   * - development: Local Anvil and rippled standalone
-   * - staging: Public testnets (Base Sepolia, XRPL Testnet)
-   * - production: Public mainnets (Base mainnet, XRPL Mainnet)
+   * - development: Local Anvil for Base L2
+   * - staging: Public testnet (Base Sepolia)
+   * - production: Public mainnet (Base mainnet)
    */
   environment: Environment;
 
@@ -305,12 +305,11 @@ export interface ConnectorConfig {
   deploymentMode?: DeploymentMode;
 
   /**
-   * Optional blockchain configuration for Base L2 and XRP Ledger integration
+   * Optional blockchain configuration for Base L2 integration
    * When provided, enables blockchain-specific features (payment channels, smart contracts)
    * Defaults to blockchain integration disabled if not specified
    *
    * Epic 8 (EVM Payment Channels) uses config.blockchain.base
-   * Epic 9 (XRP Payment Channels) uses config.blockchain.xrpl
    */
   blockchain?: BlockchainConfig;
 
@@ -403,6 +402,8 @@ export interface ConnectorConfig {
    * - LOCAL_DELIVERY_ENABLED: Enable/disable local delivery (default: false)
    * - LOCAL_DELIVERY_URL: URL to agent runtime (e.g., "http://connector:3100")
    * - LOCAL_DELIVERY_TIMEOUT: Request timeout in ms (default: 30000)
+   * - LOCAL_DELIVERY_AUTH_TOKEN: Bearer token for BLS authentication (no default)
+   * - LOCAL_DELIVERY_PER_HOP_NOTIFICATION: Enable per-hop BLS notification (default: false)
    */
   localDelivery?: LocalDeliveryConfig;
 }
@@ -751,9 +752,9 @@ export interface SettlementInfraConfig {
  * Used to apply environment-specific configuration defaults and validations.
  *
  * Environment types:
- * - development: Local development with Anvil and rippled standalone
- * - staging: Public testnets (Base Sepolia, XRPL Testnet)
- * - production: Public mainnets (Base mainnet, XRPL Mainnet)
+ * - development: Local development with Anvil for Base L2
+ * - staging: Public testnet (Base Sepolia)
+ * - production: Public mainnet (Base mainnet)
  */
 export type Environment = 'development' | 'staging' | 'production';
 
@@ -977,6 +978,17 @@ export interface SettlementThresholdConfig {
   perTokenThresholds?: Map<string, Map<string, bigint>>;
 
   /**
+   * Time-based settlement interval in milliseconds (optional)
+   * When set, triggers on-chain settlement periodically regardless of amount,
+   * as long as there is a positive credit balance.
+   * Works alongside amount-based thresholds — whichever triggers first wins.
+   * undefined = time-based settlement disabled (amount-only)
+   *
+   * Example: 600000 (10 minutes) — settle on-chain at least every 10 minutes
+   */
+  timeBasedIntervalMs?: number;
+
+  /**
    * Balance polling interval in milliseconds
    * Controls how frequently settlement monitor checks account balances
    * Default: 30000 (30 seconds)
@@ -1131,11 +1143,9 @@ export interface SettlementTriggerEvent {
 /**
  * Blockchain Configuration Interface
  *
- * Top-level blockchain configuration containing optional Base L2 and XRPL configurations.
- * Both are optional to support connectors that only integrate with one blockchain.
+ * Top-level blockchain configuration containing optional Base L2 configuration.
  *
  * @property base - Optional Base L2 / EVM configuration
- * @property xrpl - Optional XRP Ledger configuration
  *
  * @example
  * ```typescript
@@ -1146,11 +1156,6 @@ export interface SettlementTriggerEvent {
  *     chainId: 84532,
  *     privateKey: '0xac0974...',
  *     registryAddress: '0x1234...'
- *   },
- *   xrpl: {
- *     enabled: true,
- *     rpcUrl: 'http://rippled:5005',
- *     network: 'standalone'
  *   }
  * };
  * ```
@@ -1162,13 +1167,6 @@ export interface BlockchainConfig {
    * Enabled when connector needs to interact with Base L2
    */
   base?: BaseBlockchainConfig;
-
-  /**
-   * Optional XRP Ledger blockchain configuration
-   * Used for Epic 9 XRP payment channels
-   * Enabled when connector needs to interact with XRPL
-   */
-  xrpl?: XRPLBlockchainConfig;
 }
 
 /**
@@ -1257,80 +1255,6 @@ export interface BaseBlockchainConfig {
 }
 
 /**
- * XRP Ledger Blockchain Configuration
- *
- * Configuration for XRP Ledger (XRPL) integration.
- * Supports local rippled standalone, XRPL Testnet, and XRPL Mainnet.
- *
- * @property enabled - Whether XRPL integration is enabled
- * @property rpcUrl - XRPL RPC endpoint URL (local rippled or public mainnet/testnet)
- * @property network - XRPL network type ('standalone' | 'testnet' | 'mainnet')
- * @property privateKey - Optional private key for payment channel operations (dev only)
- *
- * @example
- * ```typescript
- * // Development configuration
- * const xrplDev: XRPLBlockchainConfig = {
- *   enabled: true,
- *   rpcUrl: 'http://rippled:5005',
- *   network: 'standalone',
- *   privateKey: 'snoPBrXtMeMyMHUVTgbuqAfg1SUTb'
- * };
- *
- * // Production configuration
- * const xrplProd: XRPLBlockchainConfig = {
- *   enabled: true,
- *   rpcUrl: 'https://xrplcluster.com',
- *   network: 'mainnet',
- *   privateKey: process.env.XRPL_PRIVATE_KEY  // From secure KMS
- * };
- * ```
- */
-export interface XRPLBlockchainConfig {
-  /**
-   * Feature flag to enable/disable XRPL integration
-   * When false, connector will not interact with XRP Ledger
-   * Default: false (backward compatible with pre-Epic 9 connectors)
-   */
-  enabled: boolean;
-
-  /**
-   * RPC endpoint URL for XRP Ledger
-   *
-   * Environment-specific defaults:
-   * - Development: http://rippled:5005 (local rippled standalone)
-   * - Staging: https://s.altnet.rippletest.net:51234 (XRPL Testnet)
-   * - Production: https://xrplcluster.com (XRPL Mainnet)
-   *
-   * WebSocket URLs (ws:// or wss://) also supported
-   */
-  rpcUrl: string;
-
-  /**
-   * XRPL network type
-   *
-   * Network types:
-   * - standalone: Local rippled in standalone mode (no consensus)
-   * - testnet: XRPL Testnet for public testing
-   * - mainnet: XRPL Mainnet for production
-   *
-   * Validated to match ENVIRONMENT (production requires mainnet)
-   */
-  network: 'standalone' | 'testnet' | 'mainnet';
-
-  /**
-   * Optional private key for payment channel operations
-   *
-   * Development: Can generate from rippled standalone
-   * Production: MUST use secure key from KMS/HSM
-   *
-   * Format: XRPL seed format (starts with 's')
-   * Example: snoPBrXtMeMyMHUVTgbuqAfg1SUTb
-   */
-  privateKey?: string;
-}
-
-/**
  * Security Configuration Interface
  *
  * Configuration for security features including key management with HSM/KMS support.
@@ -1357,8 +1281,7 @@ export interface XRPLBlockchainConfig {
  *     nodeId: 'connector-1',
  *     aws: {
  *       region: 'us-east-1',
- *       evmKeyId: 'arn:aws:kms:us-east-1:123456789012:key/evm-key-id',
- *       xrpKeyId: 'arn:aws:kms:us-east-1:123456789012:key/xrp-key-id'
+ *       evmKeyId: 'arn:aws:kms:us-east-1:123456789012:key/evm-key-id'
  *     }
  *   }
  * };
@@ -1410,10 +1333,6 @@ export interface SecurityConfig {
  *     evm: {
  *       poolSize: 10,
  *       rpcUrls: ['https://mainnet.base.org', 'https://base.llamarpc.com']
- *     },
- *     xrp: {
- *       poolSize: 5,
- *       wssUrls: ['wss://xrplcluster.com', 'wss://s1.ripple.com']
  *     }
  *   }
  * };
@@ -1460,10 +1379,9 @@ export interface PerformanceConfig {
 
   /**
    * Connection pool configurations for external services
-   * Pools connections to blockchain RPC endpoints and WebSocket servers
+   * Pools connections to blockchain RPC endpoints
    *
    * @property evm - EVM RPC connection pool configuration
-   * @property xrp - XRP WebSocket connection pool configuration
    */
   connectionPools?: {
     /**
@@ -1474,16 +1392,6 @@ export interface PerformanceConfig {
     evm?: {
       poolSize?: number;
       rpcUrls?: string[];
-    };
-
-    /**
-     * XRP WebSocket connection pool (for XRPL integration)
-     * @property poolSize - Number of WebSocket connections (default: 5)
-     * @property wssUrls - List of WebSocket endpoint URLs
-     */
-    xrp?: {
-      poolSize?: number;
-      wssUrls?: string[];
     };
   };
 }
@@ -1723,6 +1631,16 @@ export interface LocalDeliveryConfig {
    * Environment variable: LOCAL_DELIVERY_AUTH_TOKEN (no default)
    */
   authToken?: string;
+
+  /**
+   * Enable per-hop BLS notification for transit packets
+   * When enabled, intermediate connectors fire a non-blocking POST to the BLS
+   * for packets transiting through, in addition to forwarding via BTP.
+   * The BLS notification is fire-and-forget — failures do not affect forwarding.
+   * Environment variable: LOCAL_DELIVERY_PER_HOP_NOTIFICATION (default: 'false')
+   * Default: false
+   */
+  perHopNotification?: boolean;
 }
 
 /**
@@ -1778,6 +1696,8 @@ export interface LocalDeliveryRequest {
   data: string;
   /** Peer that sent this packet */
   sourcePeer: string;
+  /** Whether this is a transit notification (fire-and-forget) at an intermediate hop */
+  isTransit?: boolean;
 }
 
 /**

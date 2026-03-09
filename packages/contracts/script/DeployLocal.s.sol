@@ -25,16 +25,16 @@ contract DeployLocalScript is Script {
 
         vm.startBroadcast(deployerPrivateKey);
 
-        // Deploy MockERC20 token (AGENT token)
-        MockERC20 agentToken = new MockERC20("Agent Token", "AGENT", 18);
-        console.log("AgentToken deployed to:", address(agentToken));
+        // Deploy MockERC20 token (USDC token - 18 decimals for local testing)
+        MockERC20 usdcToken = new MockERC20("USD Coin", "USDC", 18);
+        console.log("USDC Token deployed to:", address(usdcToken));
 
         // Deploy TokenNetworkRegistry
         TokenNetworkRegistry registry = new TokenNetworkRegistry();
         console.log("TokenNetworkRegistry deployed to:", address(registry));
 
-        // Create TokenNetwork for AGENT token through the registry
-        address tokenNetworkAddress = registry.createTokenNetwork(address(agentToken));
+        // Create TokenNetwork for USDC token through the registry
+        address tokenNetworkAddress = registry.createTokenNetwork(address(usdcToken));
         console.log("TokenNetwork created at:", tokenNetworkAddress);
 
         // Transfer tokens to test peer wallets
@@ -46,8 +46,8 @@ contract DeployLocalScript is Script {
         uint256 tokensPerPeer = 10000 * 10**18; // 10k tokens each
 
         for (uint i = 0; i < peerAddresses.length; i++) {
-            agentToken.transfer(peerAddresses[i], tokensPerPeer);
-            console.log("Transferred 10k AGENT to:", peerAddresses[i]);
+            usdcToken.transfer(peerAddresses[i], tokensPerPeer);
+            console.log("Transferred 10k USDC to:", peerAddresses[i]);
         }
 
         vm.stopBroadcast();
@@ -55,7 +55,7 @@ contract DeployLocalScript is Script {
         // Output addresses in format easy to parse
         console.log("");
         console.log("=== DEPLOYMENT COMPLETE ===");
-        console.log("AGENT_TOKEN_ADDRESS=%s", address(agentToken));
+        console.log("USDC_TOKEN_ADDRESS=%s", address(usdcToken));
         console.log("TOKEN_NETWORK_REGISTRY_ADDRESS=%s", address(registry));
         console.log("TOKEN_NETWORK_ADDRESS=%s", tokenNetworkAddress);
     }

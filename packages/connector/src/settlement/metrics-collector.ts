@@ -12,7 +12,7 @@ export interface MetricsConfig {
 }
 
 export interface SettlementAttempt {
-  method: 'evm' | 'xrp';
+  method: 'evm';
   success: boolean;
   timestamp: number;
 }
@@ -48,14 +48,14 @@ export class MetricsCollector {
   /**
    * Record successful settlement
    */
-  recordSuccess(method: 'evm' | 'xrp'): void {
+  recordSuccess(method: 'evm'): void {
     this.recordAttempt(method, true);
   }
 
   /**
    * Record failed settlement
    */
-  recordFailure(method: 'evm' | 'xrp'): void {
+  recordFailure(method: 'evm'): void {
     this.recordAttempt(method, false);
   }
 
@@ -117,7 +117,7 @@ export class MetricsCollector {
   /**
    * Record a settlement attempt
    */
-  private recordAttempt(method: 'evm' | 'xrp', success: boolean): void {
+  private recordAttempt(method: 'evm', success: boolean): void {
     const attempt: SettlementAttempt = {
       method,
       success,

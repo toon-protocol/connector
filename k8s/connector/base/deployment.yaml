@@ -76,18 +76,6 @@ spec:
                 secretKeyRef:
                   name: connector-secrets
                   key: EVM_PRIVATE_KEY
-            - name: XRP_SEED
-              valueFrom:
-                secretKeyRef:
-                  name: connector-secrets
-                  key: XRP_SEED
-                  optional: true
-            - name: APTOS_PRIVATE_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: connector-secrets
-                  key: APTOS_PRIVATE_KEY
-                  optional: true
             - name: M2M_TOKEN_ADDRESS
               valueFrom:
                 secretKeyRef:

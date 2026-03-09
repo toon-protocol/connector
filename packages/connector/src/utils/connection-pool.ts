@@ -280,8 +280,11 @@ export class ConnectionPool<T> extends EventEmitter {
         attempts++;
 
         if (attempts < this.config.maxReconnectAttempts) {
-          // Wait before next attempt
-          await new Promise((resolve) => setTimeout(resolve, this.config.reconnectDelayMs));
+          // Wait before next attempt (unref to avoid keeping process alive)
+          await new Promise((resolve) => {
+            const timer = setTimeout(resolve, this.config.reconnectDelayMs);
+            if (typeof timer.unref === 'function') timer.unref();
+          });
         }
       }
     }

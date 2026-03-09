@@ -9,7 +9,6 @@
 
 import {
   validateEthereumAddress,
-  validateXRPAddress,
   generateEnvFile,
   writeEnvFile,
 } from '../../../src/cli/onboarding-wizard';
@@ -70,63 +69,6 @@ describe('OnboardingWizard', () => {
     });
   });
 
-  describe('validateXRPAddress', () => {
-    it('should accept valid r-prefixed address (25 chars)', () => {
-      // 25 total chars = 'r' + 24 chars (minimum for XRP addresses)
-      const validAddress = 'rN7n3473SaZBCG4dFL83w7a1X';
-      expect(validateXRPAddress(validAddress)).toBe(true);
-    });
-
-    it('should accept valid r-prefixed address (35 chars)', () => {
-      const validAddress = 'rN7n3473SaZBCG4dFL83w7a1RutvXc2pMj';
-      expect(validateXRPAddress(validAddress)).toBe(true);
-    });
-
-    it('should accept valid XRP address with mixed case', () => {
-      const validAddress = 'rDsbeomae4FXwgQTJp9Rs64Qg9vDiTCdBv';
-      expect(validateXRPAddress(validAddress)).toBe(true);
-    });
-
-    it('should reject address without r prefix', () => {
-      const invalidAddress = 'N7n3473SaZBCG4dFL83w7a1RutvXc2pMj';
-      expect(validateXRPAddress(invalidAddress)).toBe(false);
-    });
-
-    it('should reject address with invalid character 0', () => {
-      const invalidAddress = 'rN7n3473SaZBCG4dFL83w7a10utvXc2pMj';
-      expect(validateXRPAddress(invalidAddress)).toBe(false);
-    });
-
-    it('should reject address with invalid character O', () => {
-      const invalidAddress = 'rN7n3473SaZBCG4dFL83w7a1OutvXc2pMj';
-      expect(validateXRPAddress(invalidAddress)).toBe(false);
-    });
-
-    it('should reject address with invalid character I', () => {
-      const invalidAddress = 'rN7n3473SaZBCG4dFL83w7a1IutvXc2pMj';
-      expect(validateXRPAddress(invalidAddress)).toBe(false);
-    });
-
-    it('should reject address with invalid character l', () => {
-      const invalidAddress = 'rN7n3473SaZBCG4dFL83w7a1lutvXc2pMj';
-      expect(validateXRPAddress(invalidAddress)).toBe(false);
-    });
-
-    it('should reject address that is too short (< 25 chars)', () => {
-      const invalidAddress = 'rN7n3473SaZBCG4dFL83w7';
-      expect(validateXRPAddress(invalidAddress)).toBe(false);
-    });
-
-    it('should reject address that is too long (> 35 chars)', () => {
-      const invalidAddress = 'rN7n3473SaZBCG4dFL83w7a1RutvXc2pMjABC';
-      expect(validateXRPAddress(invalidAddress)).toBe(false);
-    });
-
-    it('should reject empty string', () => {
-      expect(validateXRPAddress('')).toBe(false);
-    });
-  });
-
   describe('generateEnvFile', () => {
     it('should include all required variables for EVM-only config', () => {
       const config: OnboardingConfig = {
@@ -151,61 +93,6 @@ describe('OnboardingWizard', () => {
       expect(envContent).toContain('HEALTH_CHECK_PORT=8080');
       expect(envContent).toContain('LOG_LEVEL=info');
       expect(envContent).toContain('PROMETHEUS_ENABLED=true');
-      // Should NOT include XRP settings
-      expect(envContent).not.toContain('XRP_ADDRESS=');
-      expect(envContent).not.toContain('XRPL_WSS_URL=');
-    });
-
-    it('should include all required variables for XRP-only config', () => {
-      const config: OnboardingConfig = {
-        nodeId: 'xrp-node',
-        settlementPreference: 'xrp',
-        xrpAddress: 'rDsbeomae4FXwgQTJp9Rs64Qg9vDiTCdBv',
-        keyBackend: 'env',
-        enableMonitoring: false,
-        btpPort: 3000,
-        healthCheckPort: 8081,
-        logLevel: 'debug',
-      };
-
-      const envContent = generateEnvFile(config);
-
-      expect(envContent).toContain('NODE_ID=xrp-node');
-      expect(envContent).toContain('SETTLEMENT_PREFERENCE=xrp');
-      expect(envContent).toContain('XRP_ADDRESS=rDsbeomae4FXwgQTJp9Rs64Qg9vDiTCdBv');
-      expect(envContent).toContain('XRPL_WSS_URL=wss://xrplcluster.com');
-      expect(envContent).toContain('BTP_PORT=3000');
-      expect(envContent).toContain('HEALTH_CHECK_PORT=8081');
-      expect(envContent).toContain('LOG_LEVEL=debug');
-      expect(envContent).toContain('PROMETHEUS_ENABLED=false');
-      // Should NOT include EVM settings
-      expect(envContent).not.toContain('EVM_ADDRESS=');
-      expect(envContent).not.toContain('BASE_RPC_URL=');
-    });
-
-    it('should include all required variables for dual settlement', () => {
-      const config: OnboardingConfig = {
-        nodeId: 'dual-node',
-        settlementPreference: 'both',
-        evmAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f12AB3',
-        xrpAddress: 'rDsbeomae4FXwgQTJp9Rs64Qg9vDiTCdBv',
-        keyBackend: 'aws-kms',
-        enableMonitoring: true,
-        btpPort: 4000,
-        healthCheckPort: 8080,
-        logLevel: 'info',
-      };
-
-      const envContent = generateEnvFile(config);
-
-      expect(envContent).toContain('NODE_ID=dual-node');
-      expect(envContent).toContain('SETTLEMENT_PREFERENCE=both');
-      expect(envContent).toContain('EVM_ADDRESS=0x742d35Cc6634C0532925a3b844Bc9e7595f12AB3');
-      expect(envContent).toContain('XRP_ADDRESS=rDsbeomae4FXwgQTJp9Rs64Qg9vDiTCdBv');
-      expect(envContent).toContain('BASE_RPC_URL=https://mainnet.base.org');
-      expect(envContent).toContain('XRPL_WSS_URL=wss://xrplcluster.com');
-      expect(envContent).toContain('KEY_BACKEND=aws-kms');
-      expect(envContent).toContain('AWS_REGION=us-east-1');
     });
 
     it('should include GCP KMS config when gcp-kms backend selected', () => {
@@ -230,8 +117,8 @@ describe('OnboardingWizard', () => {
     it('should include Azure Key Vault config when azure-kv backend selected', () => {
       const config: OnboardingConfig = {
         nodeId: 'azure-node',
-        settlementPreference: 'xrp',
-        xrpAddress: 'rDsbeomae4FXwgQTJp9Rs64Qg9vDiTCdBv',
+        settlementPreference: 'evm',
+        evmAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f12AB3',
         keyBackend: 'azure-kv',
         enableMonitoring: false,
         btpPort: 4000,
@@ -243,7 +130,6 @@ describe('OnboardingWizard', () => {
 
       expect(envContent).toContain('KEY_BACKEND=azure-kv');
       expect(envContent).toContain('AZURE_EVM_KEY_NAME=evm-signing-key');
-      expect(envContent).toContain('AZURE_XRP_KEY_NAME=xrp-signing-key');
     });
 
     it('should include TigerBeetle default configuration', () => {
