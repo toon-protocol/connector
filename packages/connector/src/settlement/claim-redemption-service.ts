@@ -8,7 +8,7 @@
  * - Polls SQLite database every 60 seconds (configurable) for verified claims
  * - Estimates redemption costs (gas fees)
  * - Only redeems claims where profit exceeds a configurable threshold
- * - Submits EVM balance proofs via PaymentChannelSDK.closeChannel()
+ * - Submits EVM balance proofs via PaymentChannelSDK.claimFromChannel()
  * - Updates database with redemption timestamp and transaction identifier
  * - Emits CLAIM_REDEEMED telemetry events
  * - Implements exponential backoff retry (3 attempts: 1s, 2s, 4s delays)
@@ -341,8 +341,8 @@ export class ClaimRedemptionService {
     // Retry logic (3 attempts, exponential backoff 1s, 2s, 4s)
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        // closeChannel returns void - use messageId as txHash for tracking
-        await this.evmChannelSDK.closeChannel(
+        // claimFromChannel: submit counterparty's signed proof to collect owed tokens
+        await this.evmChannelSDK.claimFromChannel(
           claim.channelId,
           tokenAddress,
           balanceProof,

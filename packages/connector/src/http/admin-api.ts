@@ -101,6 +101,9 @@ export interface AdminAPIConfig {
 
   /** Optional callback for checking if the connector is ready to send packets */
   isReady?: IsReadyFn;
+
+  /** Default settlement token ID resolved from on-chain ERC-20 symbol (e.g. 'M2M') */
+  defaultSettlementTokenId?: string;
 }
 
 /**
@@ -323,6 +326,7 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
     claimReceiver,
     packetSender,
     isReady,
+    defaultSettlementTokenId,
   } = config;
   const log = logger.child({ component: 'AdminAPI' });
 
@@ -1341,8 +1345,6 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
         return;
       }
 
-      const body = req.body as CloseChannelRequest;
-      const cooperative = body.cooperative !== false;
       const chainPrefix = metadata.chain.split(':')[0];
 
       if (chainPrefix === 'evm') {
@@ -1354,95 +1356,15 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
           return;
         }
 
-        if (cooperative) {
-          try {
-            const state = await paymentChannelSDK.getChannelState(
-              reqChannelId,
-              metadata.tokenAddress
-            );
-
-            const myBalanceProof = {
-              channelId: reqChannelId,
-              nonce: state.myNonce + 1,
-              transferredAmount: state.myTransferred,
-              lockedAmount: 0n,
-              locksRoot: '0x' + '0'.repeat(64),
-            };
-
-            const theirBalanceProof = {
-              channelId: reqChannelId,
-              nonce: state.theirNonce,
-              transferredAmount: state.theirTransferred,
-              lockedAmount: 0n,
-              locksRoot: '0x' + '0'.repeat(64),
-            };
-
-            const mySignature = '0x' + '0'.repeat(130);
-            const theirSignature = '0x' + '0'.repeat(130);
-
-            await paymentChannelSDK.cooperativeSettle(
-              reqChannelId,
-              metadata.tokenAddress,
-              myBalanceProof,
-              mySignature,
-              theirBalanceProof,
-              theirSignature
-            );
-
-            metadata.status = 'closed';
-            metadata.lastActivityAt = new Date();
-
-            log.info(
-              { channelId: reqChannelId, chain: chainPrefix, cooperative: true },
-              'Channel close initiated via Admin API'
-            );
-
-            res.json({
-              channelId: reqChannelId,
-              status: 'settled',
-            } satisfies CloseChannelResponse);
-            return;
-          } catch (coopError) {
-            log.warn(
-              { channelId: reqChannelId, err: coopError },
-              'Cooperative close failed, falling back to unilateral close'
-            );
-            // Fall through to unilateral close
-          }
-        }
-
-        // Unilateral close (fallback or cooperative: false)
-        const state = await paymentChannelSDK.getChannelState(reqChannelId, metadata.tokenAddress);
-
-        const signature = await paymentChannelSDK.signBalanceProof(
-          reqChannelId,
-          state.myNonce + 1,
-          state.myTransferred,
-          0n,
-          '0x' + '0'.repeat(64)
-        );
-
-        const balanceProof = {
-          channelId: reqChannelId,
-          nonce: state.myNonce + 1,
-          transferredAmount: state.myTransferred,
-          lockedAmount: 0n,
-          locksRoot: '0x' + '0'.repeat(64),
-        };
-
-        await paymentChannelSDK.closeChannel(
-          reqChannelId,
-          metadata.tokenAddress,
-          balanceProof,
-          signature
-        );
+        // Close channel — starts grace period for receiver to submit claims
+        await paymentChannelSDK.closeChannel(reqChannelId, metadata.tokenAddress);
 
         metadata.status = 'closing';
         metadata.lastActivityAt = new Date();
 
         log.info(
-          { channelId: reqChannelId, chain: chainPrefix, cooperative: false },
-          'Channel close initiated via Admin API'
+          { channelId: reqChannelId, chain: chainPrefix },
+          'Channel close initiated via Admin API (grace period started)'
         );
 
         res.json({
@@ -1478,7 +1400,7 @@ export async function createAdminRouter(config: AdminAPIConfig): Promise<Router>
       }
 
       const peerId = req.params.peerId as string;
-      const tokenId = (req.query.tokenId as string) || 'ILP';
+      const tokenId = (req.query.tokenId as string) || (defaultSettlementTokenId ?? 'M2M');
 
       const balance = await accountManager.getAccountBalance(peerId, tokenId);
 

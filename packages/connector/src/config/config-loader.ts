@@ -15,7 +15,7 @@ import {
   PeerConfig,
   RouteConfig,
   BlockchainConfig,
-  BaseBlockchainConfig,
+  EVMChainConfig,
   Environment,
   ExplorerConfig,
   SettlementConfig,
@@ -242,19 +242,19 @@ export class ConfigLoader {
   /**
    * Load Blockchain Configuration from Environment Variables
    *
-   * Loads Base L2 configuration from environment variables with
-   * environment-specific defaults. Only loads configuration if Base
-   * is explicitly enabled via environment variable.
+   * Loads EVM chain configurations (Base, Arbitrum) from environment variables
+   * with environment-specific defaults. Returns undefined if no chains are enabled.
    *
    * @param environment - Deployment environment (development/staging/production)
-   * @returns BlockchainConfig with Base configuration (or undefined if Base not enabled)
+   * @returns BlockchainConfig with enabled chain configurations (or undefined if none enabled)
    * @private
    */
   private static loadBlockchainConfig(environment: Environment): BlockchainConfig | undefined {
     const baseEnabled = process.env.BASE_ENABLED === 'true';
+    const arbitrumEnabled = process.env.ARBITRUM_ENABLED === 'true';
 
-    // If Base is not enabled, return undefined
-    if (!baseEnabled) {
+    // If no chains are enabled, return undefined
+    if (!baseEnabled && !arbitrumEnabled) {
       return undefined;
     }
 
@@ -263,6 +263,11 @@ export class ConfigLoader {
     // Load Base L2 configuration if enabled
     if (baseEnabled) {
       blockchain.base = this.loadBaseBlockchainConfig(environment);
+    }
+
+    // Load Arbitrum configuration if enabled
+    if (arbitrumEnabled) {
+      blockchain.arbitrum = this.loadArbitrumBlockchainConfig(environment);
     }
 
     return blockchain;
@@ -279,6 +284,7 @@ export class ConfigLoader {
    * - BASE_CHAIN_ID (optional): Expected chain ID (defaults by environment)
    * - BASE_PRIVATE_KEY (optional): Private key for contract interactions
    * - BASE_REGISTRY_ADDRESS (optional): Payment channel registry contract address
+   * - BASE_TOKEN_ADDRESS (optional): ERC-20 token contract address for Base
    *
    * Environment-specific defaults:
    * - development: rpcUrl=http://anvil:8545, chainId=84532
@@ -286,10 +292,10 @@ export class ConfigLoader {
    * - production: rpcUrl=https://mainnet.base.org, chainId=8453
    *
    * @param environment - Deployment environment
-   * @returns BaseBlockchainConfig with environment-specific defaults applied
+   * @returns EVMChainConfig with environment-specific defaults applied
    * @private
    */
-  private static loadBaseBlockchainConfig(environment: Environment): BaseBlockchainConfig {
+  private static loadBaseBlockchainConfig(environment: Environment): EVMChainConfig {
     // Environment-specific defaults
     const defaults = {
       development: {
@@ -316,6 +322,60 @@ export class ConfigLoader {
         : envDefaults.chainId,
       privateKey: process.env.BASE_PRIVATE_KEY,
       registryAddress: process.env.BASE_REGISTRY_ADDRESS,
+      tokenAddress: process.env.BASE_TOKEN_ADDRESS,
+    };
+  }
+
+  /**
+   * Load Arbitrum Blockchain Configuration
+   *
+   * Loads Arbitrum configuration from environment variables with environment-specific defaults.
+   *
+   * Environment variables:
+   * - ARBITRUM_ENABLED (required): 'true' to enable Arbitrum blockchain
+   * - ARBITRUM_RPC_URL (optional): RPC endpoint URL (defaults by environment)
+   * - ARBITRUM_CHAIN_ID (optional): Expected chain ID (defaults by environment)
+   * - ARBITRUM_PRIVATE_KEY (optional): Private key for contract interactions
+   * - ARBITRUM_REGISTRY_ADDRESS (optional): Payment channel registry contract address
+   * - ARBITRUM_TOKEN_ADDRESS (optional): ERC-20 token contract address for Arbitrum
+   *
+   * Environment-specific defaults:
+   * - development: rpcUrl=http://anvil-arbitrum:8546, chainId=421614
+   * - staging: rpcUrl=https://sepolia-rollup.arbitrum.io/rpc, chainId=421614
+   * - production: rpcUrl=https://arb1.arbitrum.io/rpc, chainId=42161
+   *
+   * @param environment - Deployment environment
+   * @returns EVMChainConfig with environment-specific defaults applied
+   * @private
+   */
+  private static loadArbitrumBlockchainConfig(environment: Environment): EVMChainConfig {
+    // Environment-specific defaults
+    const defaults = {
+      development: {
+        rpcUrl: 'http://anvil-arbitrum:8546',
+        chainId: 421614, // Arbitrum Sepolia (forked by Anvil)
+      },
+      staging: {
+        rpcUrl: 'https://sepolia-rollup.arbitrum.io/rpc',
+        chainId: 421614, // Arbitrum Sepolia testnet
+      },
+      production: {
+        rpcUrl: 'https://arb1.arbitrum.io/rpc',
+        chainId: 42161, // Arbitrum One mainnet
+      },
+    };
+
+    const envDefaults = defaults[environment];
+
+    return {
+      enabled: true,
+      rpcUrl: process.env.ARBITRUM_RPC_URL || envDefaults.rpcUrl,
+      chainId: process.env.ARBITRUM_CHAIN_ID
+        ? parseInt(process.env.ARBITRUM_CHAIN_ID, 10)
+        : envDefaults.chainId,
+      privateKey: process.env.ARBITRUM_PRIVATE_KEY,
+      registryAddress: process.env.ARBITRUM_REGISTRY_ADDRESS,
+      tokenAddress: process.env.ARBITRUM_TOKEN_ADDRESS,
     };
   }
 

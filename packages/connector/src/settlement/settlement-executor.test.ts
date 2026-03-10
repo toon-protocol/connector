@@ -44,7 +44,7 @@ describe('SettlementExecutor', () => {
 
   // Test data
   const testPeerId = 'connector-a';
-  const testTokenId = 'ILP';
+  const testTokenId = 'M2M';
   const testTokenAddress = '0x1234567890123456789012345678901234567890';
   const testPeerAddress = '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd';
   const testChannelId = '0xaaaa111122223333444455556666777788889999aaaabbbbccccddddeeeeffff';
@@ -97,7 +97,7 @@ describe('SettlementExecutor', () => {
       .mockResolvedValue({ channelId: testChannelId, txHash: '0xMockTxHash' });
     mockPaymentChannelSDK.deposit = jest.fn().mockResolvedValue(undefined);
     mockPaymentChannelSDK.signBalanceProof = jest.fn().mockResolvedValue('0xsignature');
-    mockPaymentChannelSDK.cooperativeSettle = jest.fn().mockResolvedValue(undefined);
+    mockPaymentChannelSDK.claimFromChannel = jest.fn().mockResolvedValue(undefined);
     mockSettlementMonitor.markSettlementInProgress = jest.fn();
     mockSettlementMonitor.markSettlementCompleted = jest.fn();
     mockSettlementMonitor.getSettlementState = jest.fn().mockReturnValue(SettlementState.IDLE);
@@ -246,7 +246,7 @@ describe('SettlementExecutor', () => {
   });
 
   describe('Settlement via Existing Channel', () => {
-    it('should sign balance proof and cooperative settle when channel exists', async () => {
+    it('should use claimFromChannel when channel exists (channel stays open)', async () => {
       // Mock: Existing channel found
       mockPaymentChannelSDK.getMyChannels.mockResolvedValue([testChannelId]);
 
@@ -271,31 +271,14 @@ describe('SettlementExecutor', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
       await settlementPromise;
 
-      // Verify: signBalanceProof called with incremented nonce
-      expect(mockPaymentChannelSDK.signBalanceProof).toHaveBeenCalledWith(
-        testChannelId,
-        2, // myNonce + 1
-        testCurrentBalance, // myTransferred + amount
-        0n,
-        '0x' + '0'.repeat(64)
-      );
-
-      // Verify: cooperativeSettle called
-      expect(mockPaymentChannelSDK.cooperativeSettle).toHaveBeenCalledWith(
+      // Verify: claimFromChannel called
+      expect(mockPaymentChannelSDK.claimFromChannel).toHaveBeenCalledWith(
         testChannelId,
         testTokenAddress,
         expect.objectContaining({
           channelId: testChannelId,
-          nonce: 2,
-          transferredAmount: testCurrentBalance,
-          lockedAmount: 0n,
-          locksRoot: '0x' + '0'.repeat(64),
         }),
-        '0xsignature',
-        expect.objectContaining({
-          channelId: testChannelId,
-        }),
-        '0xsignature'
+        expect.any(String)
       );
 
       // Verify: markSettlementCompleted called
@@ -306,81 +289,37 @@ describe('SettlementExecutor', () => {
     });
   });
 
-  describe('Channel Deposit Management', () => {
-    it('should add deposit when channel deposit is low', async () => {
-      // Mock: Existing channel with low deposit
+  describe('Per-Packet Claim Integration', () => {
+    it('should use latest per-packet claim for claimFromChannel when available', async () => {
+      // Mock: Existing channel found
       mockPaymentChannelSDK.getMyChannels.mockResolvedValue([testChannelId]);
 
-      // Mock state sequence (4 calls total):
-      // 1. findChannelForPeer check
-      // 2. settleViaExistingChannel initial check
-      // 3. depositAdditionalFunds internal check
-      // 4. settleViaExistingChannel refresh after deposit
-      mockPaymentChannelSDK.getChannelState
-        .mockResolvedValueOnce({
+      // Create executor with per-packet claim service
+      const mockPerPacketClaimService = {
+        getLatestClaim: jest.fn().mockReturnValue({
           channelId: testChannelId,
-          participants: [
-            testPeerAddress.toLowerCase(),
-            '0x9876543210987654321098765432109876543210',
-          ],
-          myDeposit: 100n, // Low deposit (findChannelForPeer)
-          theirDeposit: 10000n,
-          myNonce: 1,
-          theirNonce: 1,
-          myTransferred: 0n,
-          theirTransferred: 0n,
-          status: 'opened' as const,
-          settlementTimeout: 86400,
-          openedAt: Math.floor(Date.now() / 1000),
-        } as ChannelState)
-        .mockResolvedValueOnce({
-          channelId: testChannelId,
-          participants: [
-            testPeerAddress.toLowerCase(),
-            '0x9876543210987654321098765432109876543210',
-          ],
-          myDeposit: 100n, // Low deposit (settleViaExistingChannel check)
-          theirDeposit: 10000n,
-          myNonce: 1,
-          theirNonce: 1,
-          myTransferred: 0n,
-          theirTransferred: 0n,
-          status: 'opened' as const,
-          settlementTimeout: 86400,
-          openedAt: Math.floor(Date.now() / 1000),
-        } as ChannelState)
-        .mockResolvedValueOnce({
-          channelId: testChannelId,
-          participants: [
-            testPeerAddress.toLowerCase(),
-            '0x9876543210987654321098765432109876543210',
-          ],
-          myDeposit: 100n, // Low deposit (depositAdditionalFunds check)
-          theirDeposit: 10000n,
-          myNonce: 1,
-          theirNonce: 1,
-          myTransferred: 0n,
-          theirTransferred: 0n,
-          status: 'opened' as const,
-          settlementTimeout: 86400,
-          openedAt: Math.floor(Date.now() / 1000),
-        } as ChannelState)
-        .mockResolvedValueOnce({
-          channelId: testChannelId,
-          participants: [
-            testPeerAddress.toLowerCase(),
-            '0x9876543210987654321098765432109876543210',
-          ],
-          myDeposit: 12000n, // High deposit after adding funds (refresh)
-          theirDeposit: 10000n,
-          myNonce: 1,
-          theirNonce: 1,
-          myTransferred: 0n,
-          theirTransferred: 0n,
-          status: 'opened' as const,
-          settlementTimeout: 86400,
-          openedAt: Math.floor(Date.now() / 1000),
-        } as ChannelState);
+          nonce: 5,
+          transferredAmount: '5000',
+          lockedAmount: '0',
+          locksRoot: '0x' + '0'.repeat(64),
+          signature: '0xperpacketsignature',
+        }),
+        resetChannel: jest.fn(),
+        start: jest.fn(),
+        stop: jest.fn(),
+      };
+
+      // Create executor and set perPacketClaimService
+      const executorWithClaims = new SettlementExecutor(
+        config,
+        mockAccountManager,
+        mockPaymentChannelSDK,
+        mockSettlementMonitor,
+        logger,
+        mockTelemetryEmitter
+      );
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      executorWithClaims.setPerPacketClaimService(mockPerPacketClaimService as any);
 
       // Create settlement event
       const event: SettlementTriggerEvent = {
@@ -393,21 +332,36 @@ describe('SettlementExecutor', () => {
       };
 
       // Start executor
-      executor.start();
+      executorWithClaims.start();
 
       // Simulate settlement event
       const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
       const settlementPromise = handler(event);
 
-      // Wait for async processing (deposit operation takes longer)
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Wait for async processing
+      await new Promise((resolve) => setTimeout(resolve, 50));
       await settlementPromise;
 
-      // Verify: deposit called with additional funds
-      expect(mockPaymentChannelSDK.deposit).toHaveBeenCalled();
+      // Verify: claimFromChannel used per-packet claim data
+      expect(mockPaymentChannelSDK.claimFromChannel).toHaveBeenCalledWith(
+        testChannelId,
+        testTokenAddress,
+        expect.objectContaining({
+          channelId: testChannelId,
+          nonce: 5,
+          transferredAmount: 5000n,
+        }),
+        '0xperpacketsignature'
+      );
 
-      // Verify: signBalanceProof called after deposit
-      expect(mockPaymentChannelSDK.signBalanceProof).toHaveBeenCalled();
+      // Verify: signBalanceProof NOT called (used existing claim)
+      expect(mockPaymentChannelSDK.signBalanceProof).not.toHaveBeenCalled();
+
+      // Verify: per-packet claim tracking reset after successful claim
+      expect(mockPerPacketClaimService.resetChannel).toHaveBeenCalledWith(testChannelId);
+
+      // Cleanup
+      executorWithClaims.stop();
     });
   });
 

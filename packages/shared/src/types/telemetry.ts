@@ -122,7 +122,7 @@ export enum SettlementState {
  *   type: 'ACCOUNT_BALANCE',
  *   nodeId: 'connector-a',
  *   peerId: 'peer-b',
- *   tokenId: 'ILP',
+ *   tokenId: 'M2M',
  *   debitBalance: '0',
  *   creditBalance: '1000',
  *   netBalance: '-1000',
@@ -140,7 +140,7 @@ export interface AccountBalanceEvent {
   nodeId: string;
   /** Peer account ID (connector peered with) */
   peerId: string;
-  /** Token ID (e.g., 'ILP', 'ETH') */
+  /** Token ID (e.g., 'M2M', 'ETH') */
   tokenId: string;
   /** Debit balance (amount we owe peer), bigint as string */
   debitBalance: string;
@@ -180,7 +180,7 @@ export interface AccountBalanceEvent {
  *   type: 'SETTLEMENT_TRIGGERED',
  *   nodeId: 'connector-a',
  *   peerId: 'peer-b',
- *   tokenId: 'ILP',
+ *   tokenId: 'M2M',
  *   currentBalance: '5500',
  *   threshold: '5000',
  *   exceedsBy: '500',
@@ -235,7 +235,7 @@ export interface SettlementTriggeredEvent {
  *   type: 'SETTLEMENT_COMPLETED',
  *   nodeId: 'connector-a',
  *   peerId: 'peer-b',
- *   tokenId: 'ILP',
+ *   tokenId: 'M2M',
  *   previousBalance: '5500',
  *   newBalance: '0',
  *   settledAmount: '5500',
@@ -249,7 +249,7 @@ export interface SettlementTriggeredEvent {
  *   type: 'SETTLEMENT_COMPLETED',
  *   nodeId: 'connector-a',
  *   peerId: 'peer-b',
- *   tokenId: 'ILP',
+ *   tokenId: 'M2M',
  *   previousBalance: '5500',
  *   newBalance: '5500',
  *   settledAmount: '0',

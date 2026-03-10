@@ -43,7 +43,7 @@ import type { PerPacketClaimService } from './per-packet-claim-service';
  * @property minDepositThreshold - Add funds when deposit < threshold × multiplier × minDepositThreshold (default: 0.5)
  * @property maxRetries - Maximum retry attempts for transient failures (default: 3)
  * @property retryDelayMs - Initial retry delay in milliseconds (default: 5000ms)
- * @property tokenAddressMap - Maps tokenId (e.g., "ILP", "USDC") to ERC20 contract address
+ * @property tokenAddressMap - Maps tokenId (e.g., "M2M", "USDC") to ERC20 contract address
  * @property peerIdToAddressMap - Maps peerId (e.g., "connector-b") to Ethereum address
  * @property registryAddress - TokenNetworkRegistry contract address
  * @property rpcUrl - Base L2 RPC URL (e.g., http://localhost:8545)
@@ -479,8 +479,9 @@ export class SettlementExecutor extends EventEmitter {
   /**
    * Settle via existing payment channel
    *
-   * Signs balance proof and executes cooperative settlement.
-   * Checks if channel deposit is sufficient, adds funds if needed.
+   * Claims transferred funds from the channel using the sender's latest
+   * per-packet signed balance proof. The channel remains open after claiming —
+   * the sender can continue sending packets and funding the channel.
    *
    * @param channelId - Payment channel ID
    * @param tokenAddress - ERC20 token address
@@ -496,41 +497,21 @@ export class SettlementExecutor extends EventEmitter {
     tokenId: string,
     amount: bigint
   ): Promise<void> {
-    // Query channel state
-    const channelState = await this.paymentChannelSDK.getChannelState(channelId, tokenAddress);
-
-    // Check if deposit needs to be increased
-    // Calculate: amount * initialDepositMultiplier * minDepositThreshold
-    const minDepositFloat =
-      Number(amount) * this.config.initialDepositMultiplier * this.config.minDepositThreshold;
-    const minDeposit = BigInt(Math.floor(minDepositFloat));
-    if (channelState.myDeposit < minDeposit) {
-      await this.depositAdditionalFunds(channelId, tokenAddress, amount);
-      // Refresh channel state after deposit
-      const updatedState = await this.paymentChannelSDK.getChannelState(channelId, tokenAddress);
-      channelState.myDeposit = updatedState.myDeposit;
-    }
-
-    // Check if deposit is sufficient for settlement
-    if (channelState.myDeposit < amount) {
-      await this.depositAdditionalFunds(channelId, tokenAddress, amount);
-    }
-
     // Use latest per-packet claim if available, otherwise generate fresh balance proof
-    let myBalanceProof: BalanceProof;
-    let mySignature: string;
+    let claimBalanceProof: BalanceProof;
+    let claimSignature: string;
 
     const latestClaim = this.perPacketClaimService?.getLatestClaim(channelId);
     if (latestClaim) {
       // Per-packet claims already accumulated the correct cumulative state
-      myBalanceProof = {
+      claimBalanceProof = {
         channelId,
         nonce: latestClaim.nonce,
         transferredAmount: BigInt(latestClaim.transferredAmount),
         lockedAmount: BigInt(latestClaim.lockedAmount),
         locksRoot: latestClaim.locksRoot,
       };
-      mySignature = latestClaim.signature;
+      claimSignature = latestClaim.signature;
 
       this.logger.info(
         {
@@ -538,12 +519,13 @@ export class SettlementExecutor extends EventEmitter {
           nonce: latestClaim.nonce,
           transferred: latestClaim.transferredAmount,
         },
-        'Using latest per-packet claim for on-chain settlement'
+        'Using latest per-packet claim for on-chain settlement (claimFromChannel)'
       );
     } else {
-      // Fallback: calculate new balance proof (legacy path)
-      const newNonce = channelState.myNonce + 1;
-      const newTransferred = channelState.myTransferred + amount;
+      // Fallback: calculate new balance proof
+      const channelState = await this.paymentChannelSDK.getChannelState(channelId, tokenAddress);
+      const newNonce = channelState.theirNonce + 1;
+      const newTransferred = channelState.theirTransferred + amount;
 
       this.logger.info(
         {
@@ -552,10 +534,10 @@ export class SettlementExecutor extends EventEmitter {
           newTransferred: newTransferred.toString(),
           amount: amount.toString(),
         },
-        'Signing balance proof for cooperative settlement'
+        'Generating balance proof for claimFromChannel (no per-packet claims available)'
       );
 
-      myBalanceProof = {
+      claimBalanceProof = {
         channelId,
         nonce: newNonce,
         transferredAmount: newTransferred,
@@ -563,12 +545,14 @@ export class SettlementExecutor extends EventEmitter {
         locksRoot: '0x' + '0'.repeat(64),
       };
 
-      mySignature = await this.retryWithBackoff(
+      // Note: In production, we should have the counterparty's signature.
+      // This fallback path signs with our own key (only works in test scenarios).
+      claimSignature = await this.retryWithBackoff(
         async () =>
           await this.paymentChannelSDK.signBalanceProof(
             channelId,
-            myBalanceProof.nonce,
-            myBalanceProof.transferredAmount,
+            claimBalanceProof.nonce,
+            claimBalanceProof.transferredAmount,
             0n,
             '0x' + '0'.repeat(64)
           ),
@@ -577,112 +561,48 @@ export class SettlementExecutor extends EventEmitter {
       );
     }
 
-    // In a real implementation, we would exchange balance proofs with peer off-chain
-    // For this story, we simulate the peer also signing their proof
-    // Their state remains unchanged (no transfers from them)
-    const theirBalanceProof: BalanceProof = {
-      channelId,
-      nonce: channelState.theirNonce,
-      transferredAmount: channelState.theirTransferred,
-      lockedAmount: 0n,
-      locksRoot: '0x' + '0'.repeat(64),
-    };
-
-    // Simulate peer signature (in production, peer would sign their proof)
-    const theirSignature = mySignature; // Placeholder
-
     this.logger.info(
       {
         channelId,
-        myNonce: myBalanceProof.nonce,
-        myTransferred: myBalanceProof.transferredAmount.toString(),
-        theirNonce: theirBalanceProof.nonce,
-        theirTransferred: theirBalanceProof.transferredAmount.toString(),
+        nonce: claimBalanceProof.nonce,
+        transferredAmount: claimBalanceProof.transferredAmount.toString(),
       },
-      'Executing cooperative settlement'
+      'Claiming from channel (channel stays open)'
     );
 
-    // Execute cooperative settlement
+    // Claim from channel — transfers delta tokens to us, channel stays open
     await this.retryWithBackoff(
       async () =>
-        await this.paymentChannelSDK.cooperativeSettle(
+        await this.paymentChannelSDK.claimFromChannel(
           channelId,
           tokenAddress,
-          myBalanceProof,
-          mySignature,
-          theirBalanceProof,
-          theirSignature
+          claimBalanceProof,
+          claimSignature
         ),
-      'cooperativeSettle',
+      'claimFromChannel',
       this.config.maxRetries
     );
 
     this.logger.info(
       { channelId, amount: amount.toString() },
-      'Settlement completed via existing channel'
+      'Claim from channel completed — channel remains open'
     );
 
-    // Update TigerBeetle after successful settlement
+    // Update TigerBeetle after successful on-chain claim
     await this.accountManager.recordSettlement(peerId, tokenId, amount);
 
-    // Reset per-packet claim tracking after successful on-chain settlement
+    // Reset per-packet claim tracking after successful claim
     if (this.perPacketClaimService) {
       this.perPacketClaimService.resetChannel(channelId);
     }
 
     this.logger.info(
       { peerId, tokenId, amount: amount.toString() },
-      'TigerBeetle balance updated after settlement'
+      'Accounting balance updated after claim'
     );
 
     // Emit CHANNEL_ACTIVITY event for ChannelManager
     this.emit('CHANNEL_ACTIVITY', { channelId });
-  }
-
-  /**
-   * Add additional funds to channel
-   *
-   * Deposits additional funds when channel deposit falls below minimum threshold.
-   * Target deposit = currentBalance × initialDepositMultiplier
-   *
-   * @param channelId - Payment channel ID
-   * @param tokenAddress - ERC20 token address
-   * @param requiredAmount - Amount required for settlement
-   * @private
-   */
-  private async depositAdditionalFunds(
-    channelId: string,
-    tokenAddress: string,
-    requiredAmount: bigint
-  ): Promise<void> {
-    const channelState = await this.paymentChannelSDK.getChannelState(channelId, tokenAddress);
-    const targetDeposit = requiredAmount * BigInt(this.config.initialDepositMultiplier);
-    const additionalDeposit = targetDeposit - channelState.myDeposit;
-
-    if (additionalDeposit <= 0n) {
-      return; // No additional deposit needed
-    }
-
-    this.logger.info(
-      {
-        channelId,
-        currentDeposit: channelState.myDeposit.toString(),
-        targetDeposit: targetDeposit.toString(),
-        additionalDeposit: additionalDeposit.toString(),
-      },
-      'Adding funds to channel'
-    );
-
-    await this.retryWithBackoff(
-      async () => await this.paymentChannelSDK.deposit(channelId, tokenAddress, additionalDeposit),
-      'deposit',
-      this.config.maxRetries
-    );
-
-    this.logger.info(
-      { channelId, additionalDeposit: additionalDeposit.toString() },
-      'Added funds to channel'
-    );
   }
 
   /**

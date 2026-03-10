@@ -39,7 +39,7 @@ import type { TelemetryEmitter } from '../telemetry/telemetry-emitter';
  *
  * @property thresholds - Settlement threshold configuration
  * @property peers - List of peer IDs to monitor
- * @property tokenIds - List of token IDs to monitor (default: ['ILP'] for MVP)
+ * @property tokenIds - List of token IDs to monitor (default: ['M2M'] for MVP)
  * @property telemetryEmitter - Optional telemetry emitter for dashboard visualization
  * @property nodeId - Connector node ID for telemetry event identification
  */
@@ -60,8 +60,8 @@ export interface SettlementMonitorConfig {
 
   /**
    * List of token IDs to monitor
-   * Default: ['ILP'] for MVP (single currency)
-   * Future: ['ILP', 'USDC', 'BTC', 'ETH'] for multi-token support
+   * Default: ['M2M'] for MVP (single currency, resolved from on-chain symbol)
+   * Future: ['M2M', 'USDC', 'BTC', 'ETH'] for multi-token support
    */
   tokenIds: string[];
 

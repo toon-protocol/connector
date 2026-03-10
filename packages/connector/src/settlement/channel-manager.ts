@@ -33,7 +33,7 @@ export interface ChannelManagerConfig {
 export interface ChannelMetadata {
   channelId: string; // bytes32 channel identifier
   peerId: string; // Peer connector ID (e.g., "connector-b")
-  tokenId: string; // Token identifier (e.g., "ILP", "USDC")
+  tokenId: string; // Token identifier (e.g., "M2M", "USDC")
   tokenAddress: string; // ERC20 token contract address
   chain: string; // Chain identifier (e.g., "evm:base:8453")
   createdAt: Date; // When channel was opened
@@ -414,7 +414,7 @@ export class ChannelManager extends EventEmitter {
   }
 
   /**
-   * Close idle channel (cooperative or unilateral)
+   * Close idle channel — starts grace period for receiver to submit claims
    * @private
    */
   private async closeIdleChannel(channelId: string): Promise<void> {
@@ -428,112 +428,28 @@ export class ChannelManager extends EventEmitter {
     metadata.status = 'closing';
 
     try {
-      // Get channel state
-      const channelState = await this.paymentChannelSDK.getChannelState(
-        channelId,
-        metadata.tokenAddress
-      );
-
-      // Create balance proofs for cooperative settlement
-      const myBalanceProof = {
-        channelId,
-        nonce: channelState.myNonce + 1,
-        transferredAmount: channelState.myTransferred,
-        lockedAmount: 0n,
-        locksRoot: '0x' + '0'.repeat(64),
-      };
-
-      const theirBalanceProof = {
-        channelId,
-        nonce: channelState.theirNonce,
-        transferredAmount: channelState.theirTransferred,
-        lockedAmount: 0n,
-        locksRoot: '0x' + '0'.repeat(64),
-      };
-
-      // NOTE: Signatures require off-chain exchange protocol
-      // MVP: Use placeholder signatures like Story 8.8
-      const mySignature = '0x' + '0'.repeat(130);
-      const theirSignature = '0x' + '0'.repeat(130);
-
-      // Attempt cooperative settle
-      await this.paymentChannelSDK.cooperativeSettle(
-        channelId,
-        metadata.tokenAddress,
-        myBalanceProof,
-        mySignature,
-        theirBalanceProof,
-        theirSignature
-      );
-
-      // Success - mark as closed
-      metadata.status = 'closed';
+      // Close channel — starts grace period for claims
+      await this.paymentChannelSDK.closeChannel(channelId, metadata.tokenAddress);
 
       this.emitChannelTelemetry('CHANNEL_CLOSED', channelId, {
         peerId: metadata.peerId,
         tokenId: metadata.tokenId,
-        closureType: 'cooperative',
       });
 
-      this.logger.info({ channelId, peerId: metadata.peerId }, 'Channel closed cooperatively');
-    } catch (error) {
-      // Cooperative close failed - fall back to unilateral close
-      this.logger.warn({ channelId, error }, 'Cooperative close failed, using unilateral close');
-
-      await this.handleUnilateralClose(channelId, metadata);
-    }
-  }
-
-  /**
-   * Handle unilateral channel close
-   * @private
-   */
-  private async handleUnilateralClose(channelId: string, metadata: ChannelMetadata): Promise<void> {
-    try {
-      // Get channel state
-      const channelState = await this.paymentChannelSDK.getChannelState(
-        channelId,
-        metadata.tokenAddress
-      );
-
-      // Sign balance proof
-      const signature = await this.paymentChannelSDK.signBalanceProof(
-        channelId,
-        channelState.myNonce + 1,
-        channelState.myTransferred,
-        0n,
-        '0x' + '0'.repeat(64)
-      );
-
-      // Create balance proof
-      const balanceProof = {
-        channelId,
-        nonce: channelState.myNonce + 1,
-        transferredAmount: channelState.myTransferred,
-        lockedAmount: 0n,
-        locksRoot: '0x' + '0'.repeat(64),
-      };
-
-      // Close channel unilaterally
-      await this.paymentChannelSDK.closeChannel(
-        channelId,
-        metadata.tokenAddress,
-        balanceProof,
-        signature
-      );
-
-      // Update status
-      metadata.status = 'closing';
-
-      // Schedule settle after challenge period
+      // Schedule settle after grace period
       this.scheduleChallengeSettle(channelId, this.config.defaultSettlementTimeout);
 
       this.logger.info(
-        { channelId, settlementTimeout: this.config.defaultSettlementTimeout },
-        'Unilateral close initiated, will settle after challenge period'
+        {
+          channelId,
+          peerId: metadata.peerId,
+          settlementTimeout: this.config.defaultSettlementTimeout,
+        },
+        'Channel close initiated, grace period started'
       );
     } catch (error) {
-      this.logger.error({ channelId, error }, 'Failed to close channel unilaterally');
+      this.logger.error({ channelId, error }, 'Failed to close channel');
+      metadata.status = 'open';
       throw error;
     }
   }

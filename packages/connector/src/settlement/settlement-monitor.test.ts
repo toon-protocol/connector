@@ -88,7 +88,7 @@ describe('SettlementMonitor Threshold Detection', () => {
           pollingInterval: 30000,
         },
         peers: ['peer-a', 'peer-b'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -111,14 +111,14 @@ describe('SettlementMonitor Threshold Detection', () => {
           defaultThreshold: 1000n,
         },
         peers: ['peer-a', 'peer-b'],
-        tokenIds: ['ILP', 'USDC'],
+        tokenIds: ['M2M', 'USDC'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
 
-      expect(settlementMonitor.getSettlementState('peer-a', 'ILP')).toBe(SettlementState.IDLE);
+      expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(SettlementState.IDLE);
       expect(settlementMonitor.getSettlementState('peer-a', 'USDC')).toBe(SettlementState.IDLE);
-      expect(settlementMonitor.getSettlementState('peer-b', 'ILP')).toBe(SettlementState.IDLE);
+      expect(settlementMonitor.getSettlementState('peer-b', 'M2M')).toBe(SettlementState.IDLE);
       expect(settlementMonitor.getSettlementState('peer-b', 'USDC')).toBe(SettlementState.IDLE);
     });
   });
@@ -131,7 +131,7 @@ describe('SettlementMonitor Threshold Detection', () => {
           pollingInterval: 100,
         },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -156,7 +156,7 @@ describe('SettlementMonitor Threshold Detection', () => {
 
       expect(event).toEqual({
         peerId: 'peer-a',
-        tokenId: 'ILP',
+        tokenId: 'M2M',
         currentBalance: 1500n,
         threshold: 1000n,
         exceedsBy: 500n,
@@ -166,7 +166,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({
           peerId: 'peer-a',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           balance: '1500',
           threshold: '1000',
           exceedsBy: '500',
@@ -181,7 +181,7 @@ describe('SettlementMonitor Threshold Detection', () => {
           defaultThreshold: 1000n,
         },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -200,7 +200,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       await checkBalances(settlementMonitor);
 
       expect(eventListener).not.toHaveBeenCalled();
-      expect(settlementMonitor.getSettlementState('peer-a', 'ILP')).toBe(SettlementState.IDLE);
+      expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(SettlementState.IDLE);
     });
 
     it('should NOT emit event when balance equals threshold exactly', async () => {
@@ -209,7 +209,7 @@ describe('SettlementMonitor Threshold Detection', () => {
           defaultThreshold: 1000n,
         },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -234,7 +234,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: undefined, // No thresholds configured
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -264,7 +264,7 @@ describe('SettlementMonitor Threshold Detection', () => {
           defaultThreshold: 1000n,
         },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -282,7 +282,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       // First check - should trigger
       await checkBalances(settlementMonitor);
       expect(eventListener).toHaveBeenCalledTimes(1);
-      expect(settlementMonitor.getSettlementState('peer-a', 'ILP')).toBe(
+      expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(
         SettlementState.SETTLEMENT_PENDING
       );
 
@@ -297,7 +297,7 @@ describe('SettlementMonitor Threshold Detection', () => {
           defaultThreshold: 1000n,
         },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -310,7 +310,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       });
 
       await checkBalances(settlementMonitor);
-      expect(settlementMonitor.getSettlementState('peer-a', 'ILP')).toBe(
+      expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(
         SettlementState.SETTLEMENT_PENDING
       );
 
@@ -322,10 +322,10 @@ describe('SettlementMonitor Threshold Detection', () => {
       });
 
       await checkBalances(settlementMonitor);
-      expect(settlementMonitor.getSettlementState('peer-a', 'ILP')).toBe(SettlementState.IDLE);
+      expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(SettlementState.IDLE);
 
       expect(mockLogger.info).toHaveBeenCalledWith(
-        { peerId: 'peer-a', tokenId: 'ILP' },
+        { peerId: 'peer-a', tokenId: 'M2M' },
         'Balance returned below threshold, resetting to IDLE'
       );
     });
@@ -339,7 +339,7 @@ describe('SettlementMonitor Threshold Detection', () => {
           perPeerThresholds: new Map([['peer-a', 2000n]]),
         },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -402,12 +402,12 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
 
-      expect(settlementMonitor.getSettlementState('peer-a', 'ILP')).toBe(SettlementState.IDLE);
+      expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(SettlementState.IDLE);
 
       mockAccountManager.getAccountBalance.mockResolvedValue({
         creditBalance: 1500n,
@@ -417,7 +417,7 @@ describe('SettlementMonitor Threshold Detection', () => {
 
       await checkBalances(settlementMonitor);
 
-      expect(settlementMonitor.getSettlementState('peer-a', 'ILP')).toBe(
+      expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(
         SettlementState.SETTLEMENT_PENDING
       );
     });
@@ -426,19 +426,19 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
 
-      settlementMonitor.markSettlementInProgress('peer-a', 'ILP');
+      settlementMonitor.markSettlementInProgress('peer-a', 'M2M');
 
-      expect(settlementMonitor.getSettlementState('peer-a', 'ILP')).toBe(
+      expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(
         SettlementState.SETTLEMENT_IN_PROGRESS
       );
 
       expect(mockLogger.info).toHaveBeenCalledWith(
-        { peerId: 'peer-a', tokenId: 'ILP' },
+        { peerId: 'peer-a', tokenId: 'M2M' },
         'Settlement marked in progress'
       );
     });
@@ -447,24 +447,24 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
 
       // Manually set to IN_PROGRESS
-      settlementMonitor.markSettlementInProgress('peer-a', 'ILP');
-      expect(settlementMonitor.getSettlementState('peer-a', 'ILP')).toBe(
+      settlementMonitor.markSettlementInProgress('peer-a', 'M2M');
+      expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(
         SettlementState.SETTLEMENT_IN_PROGRESS
       );
 
       // Mark completed
-      settlementMonitor.markSettlementCompleted('peer-a', 'ILP');
+      settlementMonitor.markSettlementCompleted('peer-a', 'M2M');
 
-      expect(settlementMonitor.getSettlementState('peer-a', 'ILP')).toBe(SettlementState.IDLE);
+      expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(SettlementState.IDLE);
 
       expect(mockLogger.info).toHaveBeenCalledWith(
-        { peerId: 'peer-a', tokenId: 'ILP' },
+        { peerId: 'peer-a', tokenId: 'M2M' },
         'Settlement completed, state reset to IDLE'
       );
     });
@@ -473,7 +473,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a', 'peer-b'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -481,12 +481,12 @@ describe('SettlementMonitor Threshold Detection', () => {
       const states = settlementMonitor.getAllSettlementStates();
 
       expect(states.size).toBe(2);
-      expect(states.get('peer-a:ILP')).toBe(SettlementState.IDLE);
-      expect(states.get('peer-b:ILP')).toBe(SettlementState.IDLE);
+      expect(states.get('peer-a:M2M')).toBe(SettlementState.IDLE);
+      expect(states.get('peer-b:M2M')).toBe(SettlementState.IDLE);
 
       // Verify it's a copy (mutations don't affect internal state)
-      states.set('peer-a:ILP', SettlementState.SETTLEMENT_PENDING);
-      expect(settlementMonitor.getSettlementState('peer-a', 'ILP')).toBe(SettlementState.IDLE);
+      states.set('peer-a:M2M', SettlementState.SETTLEMENT_PENDING);
+      expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(SettlementState.IDLE);
     });
   });
 
@@ -495,7 +495,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -524,7 +524,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -556,7 +556,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
         telemetryEmitter: mockTelemetryEmitter,
         nodeId: 'test-node',
       };
@@ -575,7 +575,7 @@ describe('SettlementMonitor Threshold Detection', () => {
         type: 'SETTLEMENT_TRIGGERED',
         nodeId: 'test-node',
         peerId: 'peer-a',
-        tokenId: 'ILP',
+        tokenId: 'M2M',
         currentBalance: '1200',
         threshold: '1000',
         exceedsBy: '200',
@@ -584,7 +584,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       });
 
       expect(mockLogger.debug).toHaveBeenCalledWith(
-        { peerId: 'peer-a', tokenId: 'ILP' },
+        { peerId: 'peer-a', tokenId: 'M2M' },
         'Settlement trigger telemetry sent to dashboard'
       );
     });
@@ -593,7 +593,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
         // No telemetryEmitter
       };
 
@@ -619,7 +619,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
         telemetryEmitter: mockTelemetryEmitter,
       };
 
@@ -640,7 +640,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       expect(eventListener).toHaveBeenCalledTimes(1);
 
       expect(mockLogger.error).toHaveBeenCalledWith(
-        { error: 'Telemetry server unreachable', peerId: 'peer-a', tokenId: 'ILP' },
+        { error: 'Telemetry server unreachable', peerId: 'peer-a', tokenId: 'M2M' },
         'Failed to emit settlement telemetry'
       );
     });
@@ -651,7 +651,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n, pollingInterval: 100 },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -677,7 +677,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -697,7 +697,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n, pollingInterval: 100000 }, // Very long interval
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
       };
 
       settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
@@ -727,7 +727,7 @@ describe('SettlementMonitor Threshold Detection', () => {
           timeBasedIntervalMs: 100, // 100ms time interval for testing
         },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
         nodeId: 'test-node',
       };
 
@@ -750,7 +750,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       expect(eventListener).toHaveBeenCalledWith(
         expect.objectContaining({
           peerId: 'peer-a',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           currentBalance: 500n,
         })
       );
@@ -764,7 +764,7 @@ describe('SettlementMonitor Threshold Detection', () => {
           timeBasedIntervalMs: 100,
         },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
         nodeId: 'test-node',
       };
 
@@ -792,7 +792,7 @@ describe('SettlementMonitor Threshold Detection', () => {
           timeBasedIntervalMs: 100,
         },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
         nodeId: 'test-node',
       };
 
@@ -824,7 +824,7 @@ describe('SettlementMonitor Threshold Detection', () => {
           timeBasedIntervalMs: 60000, // 60s interval
         },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
         nodeId: 'test-node',
       };
 
@@ -844,7 +844,7 @@ describe('SettlementMonitor Threshold Detection', () => {
       expect(eventListener).toHaveBeenCalledTimes(1);
 
       // Complete settlement
-      settlementMonitor.markSettlementCompleted('peer-a', 'ILP');
+      settlementMonitor.markSettlementCompleted('peer-a', 'M2M');
 
       // Immediately check again — 60s hasn't passed since completion
       await checkBalances(settlementMonitor);
@@ -860,7 +860,7 @@ describe('SettlementMonitor Threshold Detection', () => {
           // No timeBasedIntervalMs
         },
         peers: ['peer-a'],
-        tokenIds: ['ILP'],
+        tokenIds: ['M2M'],
         nodeId: 'test-node',
       };
 

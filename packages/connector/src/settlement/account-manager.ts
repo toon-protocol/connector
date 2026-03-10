@@ -571,7 +571,7 @@ export class AccountManager {
    *
    * @param fromPeerId - Peer who sent us the packet
    * @param toPeerId - Peer we're forwarding to
-   * @param tokenId - Token identifier (e.g., 'ILP')
+   * @param tokenId - Token identifier (e.g., 'M2M')
    * @param incomingAmount - Original packet amount
    * @param outgoingAmount - Forwarded amount (after fee deduction)
    * @param transferId1 - Transfer ID for incoming transfer
@@ -582,7 +582,7 @@ export class AccountManager {
    *
    * @example
    * await accountManager.recordPacketTransfers(
-   *   'peer-a', 'peer-b', 'ILP',
+   *   'peer-a', 'peer-b', 'M2M',
    *   1000n, 999n,
    *   transferId1, transferId2,
    *   1, 1
@@ -703,7 +703,7 @@ export class AccountManager {
    * @returns null if transfer allowed, CreditLimitViolation if limit exceeded
    *
    * @example
-   * const violation = await accountManager.checkCreditLimit('peer-a', 'ILP', 1000n);
+   * const violation = await accountManager.checkCreditLimit('peer-a', 'M2M', 1000n);
    * if (violation) {
    *   // Reject packet with T04_INSUFFICIENT_LIQUIDITY
    *   logger.warn({ violation }, 'Credit limit exceeded');
@@ -804,7 +804,7 @@ export class AccountManager {
    * @returns true if limit would be exceeded, false otherwise
    *
    * @example
-   * if (await accountManager.wouldExceedCreditLimit('peer-a', 'ILP', 1000n)) {
+   * if (await accountManager.wouldExceedCreditLimit('peer-a', 'M2M', 1000n)) {
    *   // Reject packet
    * }
    */
@@ -898,11 +898,11 @@ export class AccountManager {
    *
    * @example
    * // Record settlement for peer-a (settle entire balance)
-   * const balance = await accountManager.getAccountBalance('peer-a', 'ILP');
-   * await accountManager.recordSettlement('peer-a', 'ILP', balance.creditBalance);
+   * const balance = await accountManager.getAccountBalance('peer-a', 'M2M');
+   * await accountManager.recordSettlement('peer-a', 'M2M', balance.creditBalance);
    *
    * // Verify balance reduced to zero
-   * const newBalance = await accountManager.getAccountBalance('peer-a', 'ILP');
+   * const newBalance = await accountManager.getAccountBalance('peer-a', 'M2M');
    * console.log(newBalance.creditBalance); // 0n
    */
   async recordSettlement(peerId: string, tokenId: string, amount: bigint): Promise<void> {

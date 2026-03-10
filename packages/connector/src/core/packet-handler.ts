@@ -113,6 +113,11 @@ export class PacketHandler {
   private perPacketClaimService: PerPacketClaimService | null = null;
 
   /**
+   * Default token ID for settlement recording (resolved from on-chain ERC-20 symbol)
+   */
+  private defaultTokenId: string = 'M2M';
+
+  /**
    * Account manager for settlement recording (optional)
    * @remarks
    * When provided, enables settlement recording for packet forwarding.
@@ -236,9 +241,16 @@ export class PacketHandler {
    * Called after TigerBeetle initialization completes. Allows PacketHandler
    * to be created in constructor while settlement is initialized asynchronously.
    */
-  setSettlement(accountManager: AccountManager, settlementConfig: SettlementConfig): void {
+  setSettlement(
+    accountManager: AccountManager,
+    settlementConfig: SettlementConfig,
+    defaultTokenId?: string
+  ): void {
     this.accountManager = accountManager;
     this.settlementConfig = settlementConfig;
+    if (defaultTokenId) {
+      this.defaultTokenId = defaultTokenId;
+    }
 
     if (this.isSettlementEnabled()) {
       this.logger.info(
@@ -463,7 +475,7 @@ export class PacketHandler {
       await this.accountManager!.recordPacketTransfers(
         fromPeerId,
         toPeerId,
-        'ILP', // tokenId (default for MVP, future: multi-token support)
+        this.defaultTokenId,
         packet.amount, // incoming amount
         forwardedAmount, // outgoing amount (after fee)
         incomingTransferId,
@@ -1091,7 +1103,7 @@ export class PacketHandler {
       // CREDIT LIMIT CHECK (Story 6.5) - Check if incoming transfer would exceed credit limit
       // Check BEFORE settlement recording (fail-safe design)
       const fromPeerId = 'unknown'; // TODO: Pass actual incoming peer ID in future enhancement
-      const tokenId = 'ILP'; // Default token for MVP (multi-token in Epic 7)
+      const tokenId = this.defaultTokenId;
 
       const creditLimitViolation = await this.accountManager!.checkCreditLimit(
         fromPeerId,
@@ -1261,7 +1273,7 @@ export class PacketHandler {
       try {
         const result = await this.perPacketClaimService.generateClaimForPacket(
           nextHop,
-          'ILP',
+          this.defaultTokenId,
           forwardingPacket.amount
         );
         if (result) {

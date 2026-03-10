@@ -376,28 +376,33 @@ describeIfDockerCompose('EVM Payment Channel - SDK Level', () => {
       );
     });
 
-    it('should cooperatively settle a channel', async () => {
-      console.log('\n📖 Test: Cooperative settlement...');
+    it('should close channel, claim, and settle', async () => {
+      console.log('\n📖 Test: Close → Claim → Settle flow...');
 
-      // Create final balance proofs for both participants
-      // Only account0 has deposited (100 tokens), so only account0 can transfer
-      // account1 has no deposit, so its transferredAmount must be 0
+      // Step 1: Close the channel (starts grace period)
+      await sdk0.closeChannel(channelId, TOKEN_ADDRESS);
+
+      // Verify channel is closed
+      let state = await sdk0.getChannelState(channelId, TOKEN_ADDRESS);
+      expect(state.status).toBe('closed');
+      console.log('  Channel closed, grace period started');
+
+      // Step 2: Account 1 claims transferred funds using account 0's balance proof
+      // Account 0 transferred 30 tokens to account 1
       const nonce = 5;
-      const account0TransferredAmount = ethers.parseEther('30'); // Account 0 sent 30 tokens
-      const account1TransferredAmount = 0n; // Account 1 has no deposit, cannot transfer
+      const transferredAmount = ethers.parseEther('30');
 
-      // Account 0 balance proof
-      const proof0: BalanceProof = {
+      const balanceProof: BalanceProof = {
         channelId,
         nonce,
-        transferredAmount: account0TransferredAmount,
+        transferredAmount,
         lockedAmount: 0n,
         locksRoot: ethers.ZeroHash,
       };
-      const sig0 = await sdk0.signBalanceProof(
+      const signature = await sdk0.signBalanceProof(
         channelId,
         nonce,
-        account0TransferredAmount,
+        transferredAmount,
         0n,
         ethers.ZeroHash
       );
@@ -405,30 +410,21 @@ describeIfDockerCompose('EVM Payment Channel - SDK Level', () => {
       // Ensure sdk1 has the token network cached
       await sdk1.getChannelState(channelId, TOKEN_ADDRESS);
 
-      // Account 1 balance proof
-      const proof1: BalanceProof = {
-        channelId,
-        nonce,
-        transferredAmount: account1TransferredAmount,
-        lockedAmount: 0n,
-        locksRoot: ethers.ZeroHash,
-      };
-      const sig1 = await sdk1.signBalanceProof(
-        channelId,
-        nonce,
-        account1TransferredAmount,
-        0n,
-        ethers.ZeroHash
-      );
+      await sdk1.claimFromChannel(channelId, TOKEN_ADDRESS, balanceProof, signature);
+      console.log('  Claim submitted by account 1');
 
-      // Cooperatively settle
-      await sdk0.cooperativeSettle(channelId, TOKEN_ADDRESS, proof0, sig0, proof1, sig1);
+      // Step 3: Fast-forward past settlement timeout and settle
+      const localProvider = new ethers.JsonRpcProvider(ANVIL_RPC_URL);
+      await localProvider.send('evm_increaseTime', [3601]);
+      await localProvider.send('evm_mine', []);
+
+      await sdk0.settleChannel(channelId, TOKEN_ADDRESS);
 
       // Verify channel is settled
-      const state = await sdk0.getChannelState(channelId, TOKEN_ADDRESS);
+      state = await sdk0.getChannelState(channelId, TOKEN_ADDRESS);
       expect(state.status).toBe('settled');
 
-      console.log(`✅ Channel cooperatively settled`);
+      console.log('✅ Channel closed, claimed, and settled');
     });
   });
 
@@ -443,14 +439,10 @@ describeIfDockerCompose('EVM Payment Channel - SDK Level', () => {
     let disputeSigner: ethers.Wallet;
     let tokenNetworkContract: ethers.Contract;
 
-    // Account 2 SDK for signing balance proofs as non-closing participant
-    let keyManager2: KeyManager;
-    let sdk2: PaymentChannelSDK;
-
     const TOKEN_NETWORK_ABI_SUBSET = [
       'function openChannel(address participant2, uint256 settlementTimeout) external returns (bytes32)',
       'function setTotalDeposit(bytes32 channelId, address participant, uint256 totalDeposit) external',
-      'function closeChannel(bytes32 channelId, tuple(bytes32 channelId, uint256 nonce, uint256 transferredAmount, uint256 lockedAmount, bytes32 locksRoot) balanceProof, bytes signature) external',
+      'function closeChannel(bytes32 channelId) external',
       'function settleChannel(bytes32 channelId) external',
       'function channels(bytes32) external view returns (uint256 settlementTimeout, uint8 state, uint256 closedAt, uint256 openedAt, address participant1, address participant2)',
       'event ChannelOpened(bytes32 indexed channelId, address indexed participant1, address indexed participant2, uint256 settlementTimeout)',
@@ -480,19 +472,6 @@ describeIfDockerCompose('EVM Payment Channel - SDK Level', () => {
         disputeSigner
       );
 
-      // Create SDK for account 2 (needed for signing balance proofs)
-      keyManager2 = new KeyManager(
-        { backend: 'env', nodeId: 'account-2', evmPrivateKey: ACCOUNT_2_PRIVATE_KEY },
-        logger
-      );
-      sdk2 = new PaymentChannelSDK(
-        disputeProvider,
-        keyManager2,
-        'evm-key',
-        REGISTRY_ADDRESS,
-        logger
-      );
-
       // Open channel directly via contract (avoids SDK nonce management)
       const openTx = await tokenNetworkContract.openChannel!(ACCOUNT_2_ADDRESS, settlementTimeout);
       const receipt = await openTx.wait();
@@ -501,6 +480,7 @@ describeIfDockerCompose('EVM Payment Channel - SDK Level', () => {
       // In ethers v6, receipt.logs may contain EventLog objects with pre-parsed args
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const channelOpenedLog = receipt.logs.find(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (log: any) => log.fragment?.name === 'ChannelOpened' || log.eventName === 'ChannelOpened'
       );
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -528,36 +508,11 @@ describeIfDockerCompose('EVM Payment Channel - SDK Level', () => {
       console.log(`✅ Dispute test channel opened and funded: ${disputeChannelId}`);
     });
 
-    it('should close channel with balance proof', async () => {
+    it('should close channel', async () => {
       console.log('\n📖 Test: Closing channel...');
 
-      // The balance proof is signed by the non-closing participant (account 2).
-      // transferredAmount = 0 because account 2 has no deposit to transfer.
-      const nonce = 1;
-      const transferredAmount = 0n;
-
-      const balanceProof: BalanceProof = {
-        channelId: disputeChannelId,
-        nonce,
-        transferredAmount,
-        lockedAmount: 0n,
-        locksRoot: ethers.ZeroHash,
-      };
-
-      // Populate sdk2's tokenNetworkCache so signBalanceProof can find the channel
-      await sdk2.getChannelState(disputeChannelId, TOKEN_ADDRESS);
-
-      // Account 2 (non-closing participant) signs the balance proof
-      const signature = await sdk2.signBalanceProof(
-        disputeChannelId,
-        nonce,
-        transferredAmount,
-        0n,
-        ethers.ZeroHash
-      );
-
-      // Account 0 (closer) calls closeChannel with account 2's signature
-      await tokenNetworkContract.closeChannel!(disputeChannelId, balanceProof, signature);
+      // Account 0 (depositor) calls closeChannel — starts grace period
+      await tokenNetworkContract.closeChannel!(disputeChannelId);
 
       // Verify channel is closed on-chain
       const channelData = await tokenNetworkContract.channels!(disputeChannelId);
@@ -1235,23 +1190,19 @@ describeIfDockerE2E('EVM Payment Channel - E2E with Docker Compose', () => {
       console.log(`✅ Channel opened with initial deposit: ${channelIdB}`);
     });
 
-    it('should cooperatively close a channel via Admin API', async () => {
-      console.log('\n📖 Test: Cooperatively closing channel...');
+    it('should close a channel via Admin API', async () => {
+      console.log('\n📖 Test: Closing channel...');
 
-      const request: CloseChannelRequest = {
-        cooperative: true,
-      };
+      const request: CloseChannelRequest = {};
 
       const response = await closeChannel(CONNECTOR_A_ADMIN_URL, channelIdA, request);
 
       expect(response.channelId).toBe(channelIdA);
       expect(['closing', 'closed', 'settled']).toContain(response.status);
-      expect(response.txHash).toBeDefined();
 
       console.log(`✅ Channel close initiated`);
       console.log(`   Channel ID: ${response.channelId}`);
       console.log(`   Status: ${response.status}`);
-      console.log(`   Tx Hash: ${response.txHash}`);
     });
 
     it('should verify channel status after close', async () => {

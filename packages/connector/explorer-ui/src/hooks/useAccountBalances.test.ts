@@ -102,7 +102,7 @@ describe('useAccountBalances', () => {
           type: 'ACCOUNT_BALANCE',
           nodeId: 'connector-a',
           peerId: 'peer-b',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           debitBalance: '0',
           creditBalance: '1000',
           netBalance: '-1000',
@@ -178,7 +178,7 @@ describe('useAccountBalances', () => {
           type: 'ACCOUNT_BALANCE',
           nodeId: 'connector-a',
           peerId: 'peer-b',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           debitBalance: '0',
           creditBalance: '1000',
           netBalance: '-1000',
@@ -212,7 +212,7 @@ describe('useAccountBalances', () => {
           type: 'ACCOUNT_BALANCE',
           nodeId: 'connector-a',
           peerId: 'peer-b',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           debitBalance: '0',
           creditBalance: '5000',
           netBalance: '-5000',
@@ -272,7 +272,7 @@ describe('useAccountBalances', () => {
           type: 'ACCOUNT_BALANCE',
           nodeId: 'connector-a',
           peerId: 'peer-b',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           debitBalance: '0',
           creditBalance: '1000',
           netBalance: '-1000',
@@ -285,7 +285,7 @@ describe('useAccountBalances', () => {
 
       expect(result.current.totalAccounts).toBe(1);
       expect(result.current.accounts[0].peerId).toBe('peer-b');
-      expect(result.current.accounts[0].tokenId).toBe('ILP');
+      expect(result.current.accounts[0].tokenId).toBe('M2M');
       expect(result.current.accounts[0].creditBalance).toBe(1000n);
     });
 
@@ -329,7 +329,7 @@ describe('useAccountBalances', () => {
         MockWebSocket.instances[0].simulateMessage({
           type: 'ACCOUNT_BALANCE',
           peerId: 'peer-a',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           debitBalance: '0',
           creditBalance: '1000',
           netBalance: '-1000',
@@ -339,7 +339,7 @@ describe('useAccountBalances', () => {
         MockWebSocket.instances[0].simulateMessage({
           type: 'ACCOUNT_BALANCE',
           peerId: 'peer-b',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           debitBalance: '0',
           creditBalance: '2000',
           netBalance: '-2000',
@@ -375,7 +375,7 @@ describe('useAccountBalances', () => {
         MockWebSocket.instances[0].simulateMessage({
           type: 'ACCOUNT_BALANCE',
           peerId: 'peer-b',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           debitBalance: '0',
           creditBalance: '1000',
           netBalance: '-1000',
@@ -390,7 +390,7 @@ describe('useAccountBalances', () => {
         MockWebSocket.instances[0].simulateMessage({
           type: 'ACCOUNT_BALANCE',
           peerId: 'peer-b',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           debitBalance: '0',
           creditBalance: '2000',
           netBalance: '-2000',
@@ -421,7 +421,7 @@ describe('useAccountBalances', () => {
         MockWebSocket.instances[0].simulateMessage({
           type: 'ACCOUNT_BALANCE',
           peerId: 'peer-low',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           debitBalance: '0',
           creditBalance: '0',
           netBalance: '-1000',
@@ -431,7 +431,7 @@ describe('useAccountBalances', () => {
         MockWebSocket.instances[0].simulateMessage({
           type: 'ACCOUNT_BALANCE',
           peerId: 'peer-high',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           debitBalance: '0',
           creditBalance: '0',
           netBalance: '5000',
@@ -465,7 +465,7 @@ describe('useAccountBalances', () => {
         MockWebSocket.instances[0].simulateMessage({
           type: 'ACCOUNT_BALANCE',
           peerId: 'peer-near',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           debitBalance: '0',
           creditBalance: '8000',
           netBalance: '-8000',
@@ -497,7 +497,7 @@ describe('useAccountBalances', () => {
         MockWebSocket.instances[0].simulateMessage({
           type: 'ACCOUNT_BALANCE',
           peerId: 'peer-b',
-          tokenId: 'ILP',
+          tokenId: 'M2M',
           debitBalance: '0',
           creditBalance: '1000',
           netBalance: '-1000',

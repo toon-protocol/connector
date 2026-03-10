@@ -86,7 +86,7 @@ export class PerPacketClaimService {
    * packets still flow without claims).
    *
    * @param toPeerId - Destination peer ID
-   * @param tokenId - Token identifier (e.g., 'ILP')
+   * @param tokenId - Token identifier (e.g., 'M2M')
    * @param amount - Packet amount to add to cumulative total
    * @returns PerPacketClaimResult with protocolData and claim, or null
    */

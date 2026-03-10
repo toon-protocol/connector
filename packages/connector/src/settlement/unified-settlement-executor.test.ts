@@ -42,7 +42,6 @@ describe('UnifiedSettlementExecutor', () => {
         .mockResolvedValue('0x1234567890123456789012345678901234567890'), // Epic 31
       getChannelState: jest.fn(),
       closeChannel: jest.fn(),
-      cooperativeSettle: jest.fn(),
       deposit: jest.fn(),
       getMyChannels: jest.fn(),
       settleChannel: jest.fn(),

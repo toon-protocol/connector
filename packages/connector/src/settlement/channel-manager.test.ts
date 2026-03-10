@@ -19,7 +19,6 @@ describe('ChannelManager', () => {
     mockPaymentChannelSDK = {
       openChannel: jest.fn(),
       getChannelState: jest.fn(),
-      cooperativeSettle: jest.fn(),
       closeChannel: jest.fn(),
       signBalanceProof: jest.fn(),
       settleChannel: jest.fn(),
@@ -317,83 +316,14 @@ describe('ChannelManager', () => {
     });
   });
 
-  describe('cooperative close', () => {
-    it('should close idle channel cooperatively', async () => {
+  describe('close idle channel', () => {
+    it('should close idle channel and set status to closing', async () => {
       const mockChannelId = '0xChannelId123';
       mockPaymentChannelSDK.openChannel.mockResolvedValue({
         channelId: mockChannelId,
         txHash: '0xMockTxHash',
       });
 
-      const mockChannelState: ChannelState = {
-        channelId: mockChannelId,
-        participants: ['0xMyAddress', '0xPeerAddress'] as [string, string],
-        myDeposit: BigInt(1000),
-        theirDeposit: BigInt(1000),
-        myNonce: 1,
-        theirNonce: 1,
-        myTransferred: BigInt(100),
-        theirTransferred: BigInt(50),
-        status: 'opened',
-        settlementTimeout: 86400,
-        openedAt: Math.floor(Date.now() / 1000),
-      };
-
-      mockPaymentChannelSDK.getChannelState.mockResolvedValue(mockChannelState);
-      mockPaymentChannelSDK.cooperativeSettle.mockResolvedValue();
-
-      await channelManager.ensureChannelExists('peer-a', 'TEST_TOKEN');
-
-      const metadata = channelManager.getChannelById(mockChannelId);
-      if (!metadata) throw new Error('Metadata not found');
-
-      // Set as idle
-      metadata.lastActivityAt = new Date(Date.now() - 25 * 60 * 60 * 1000);
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await (channelManager as any).closeIdleChannel(mockChannelId);
-
-      // Wait for async operations
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      expect(mockPaymentChannelSDK.cooperativeSettle).toHaveBeenCalled();
-      expect(metadata.status).toBe('closed');
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CHANNEL_CLOSED',
-          channelId: mockChannelId,
-        })
-      );
-    });
-  });
-
-  describe('unilateral close', () => {
-    it('should close channel unilaterally when cooperative fails', async () => {
-      const mockChannelId = '0xChannelId123';
-      mockPaymentChannelSDK.openChannel.mockResolvedValue({
-        channelId: mockChannelId,
-        txHash: '0xMockTxHash',
-      });
-
-      const mockChannelState: ChannelState = {
-        channelId: mockChannelId,
-        participants: ['0xMyAddress', '0xPeerAddress'] as [string, string],
-        myDeposit: BigInt(1000),
-        theirDeposit: BigInt(1000),
-        myNonce: 1,
-        theirNonce: 1,
-        myTransferred: BigInt(100),
-        theirTransferred: BigInt(50),
-        status: 'opened',
-        settlementTimeout: 86400,
-        openedAt: Math.floor(Date.now() / 1000),
-      };
-
-      mockPaymentChannelSDK.getChannelState.mockResolvedValue(mockChannelState);
-      mockPaymentChannelSDK.cooperativeSettle.mockRejectedValue(
-        new Error('Cooperative settle timeout')
-      );
-      mockPaymentChannelSDK.signBalanceProof.mockResolvedValue('0xSignature');
       mockPaymentChannelSDK.closeChannel.mockResolvedValue();
 
       await channelManager.ensureChannelExists('peer-a', 'TEST_TOKEN');
@@ -410,8 +340,42 @@ describe('ChannelManager', () => {
       // Wait for async operations
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      expect(mockPaymentChannelSDK.closeChannel).toHaveBeenCalled();
+      expect(mockPaymentChannelSDK.closeChannel).toHaveBeenCalledWith(
+        mockChannelId,
+        '0xTokenAddress'
+      );
       expect(metadata.status).toBe('closing');
+      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'CHANNEL_CLOSED',
+          channelId: mockChannelId,
+        })
+      );
+    });
+
+    it('should revert status to open if closeChannel fails', async () => {
+      const mockChannelId = '0xChannelId123';
+      mockPaymentChannelSDK.openChannel.mockResolvedValue({
+        channelId: mockChannelId,
+        txHash: '0xMockTxHash',
+      });
+
+      mockPaymentChannelSDK.closeChannel.mockRejectedValue(new Error('Close channel failed'));
+
+      await channelManager.ensureChannelExists('peer-a', 'TEST_TOKEN');
+
+      const metadata = channelManager.getChannelById(mockChannelId);
+      if (!metadata) throw new Error('Metadata not found');
+
+      // Set as idle
+      metadata.lastActivityAt = new Date(Date.now() - 25 * 60 * 60 * 1000);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await expect((channelManager as any).closeIdleChannel(mockChannelId)).rejects.toThrow(
+        'Close channel failed'
+      );
+
+      expect(metadata.status).toBe('open');
     });
   });
 

@@ -99,7 +99,7 @@ describe('Settlement API', () => {
       expect(response.body.error).toContain('Invalid tokenId');
     });
 
-    test('should default tokenId to "ILP" if not provided', async () => {
+    test('should default tokenId to "M2M" if not provided', async () => {
       // Mock successful settlement
       mockAccountManager.getAccountBalance.mockResolvedValueOnce({
         debitBalance: 0n,
@@ -118,8 +118,8 @@ describe('Settlement API', () => {
         .send({ peerId: 'peer-a' })
         .expect(200);
 
-      expect(response.body.tokenId).toBe('ILP');
-      expect(mockAccountManager.recordSettlement).toHaveBeenCalledWith('peer-a', 'ILP', 1000n);
+      expect(response.body.tokenId).toBe('M2M');
+      expect(mockAccountManager.recordSettlement).toHaveBeenCalledWith('peer-a', 'M2M', 1000n);
     });
 
     test('should return 200 with valid response on success', async () => {
@@ -139,13 +139,13 @@ describe('Settlement API', () => {
 
       const response = await request(app)
         .post('/settlement/execute')
-        .send({ peerId: 'peer-a', tokenId: 'ILP' })
+        .send({ peerId: 'peer-a', tokenId: 'M2M' })
         .expect(200);
 
       expect(response.body).toMatchObject({
         success: true,
         peerId: 'peer-a',
-        tokenId: 'ILP',
+        tokenId: 'M2M',
         previousBalance: '1000',
         newBalance: '0',
         settledAmount: '1000',
@@ -161,7 +161,7 @@ describe('Settlement API', () => {
 
       const response = await request(app)
         .post('/settlement/execute')
-        .send({ peerId: 'peer-a', tokenId: 'ILP' })
+        .send({ peerId: 'peer-a', tokenId: 'M2M' })
         .expect(500);
 
       expect(response.body.error).toContain('TigerBeetle connection error');
@@ -189,19 +189,19 @@ describe('Settlement API', () => {
 
       const response = await request(app)
         .get('/settlement/status/peer-a')
-        .query({ tokenId: 'ILP' })
+        .query({ tokenId: 'M2M' })
         .expect(200);
 
       expect(response.body).toMatchObject({
         peerId: 'peer-a',
-        tokenId: 'ILP',
+        tokenId: 'M2M',
         currentBalance: '500',
         settlementState: 'IDLE',
       });
       expect(response.body.timestamp).toBeDefined();
     });
 
-    test('should default tokenId to "ILP" if not in query', async () => {
+    test('should default tokenId to "M2M" if not in query', async () => {
       mockAccountManager.getAccountBalance.mockResolvedValueOnce({
         debitBalance: 0n,
         creditBalance: 200n,
@@ -211,8 +211,8 @@ describe('Settlement API', () => {
 
       await request(app).get('/settlement/status/peer-a').expect(200);
 
-      expect(mockAccountManager.getAccountBalance).toHaveBeenCalledWith('peer-a', 'ILP');
-      expect(mockSettlementMonitor.getSettlementState).toHaveBeenCalledWith('peer-a', 'ILP');
+      expect(mockAccountManager.getAccountBalance).toHaveBeenCalledWith('peer-a', 'M2M');
+      expect(mockSettlementMonitor.getSettlementState).toHaveBeenCalledWith('peer-a', 'M2M');
     });
 
     test('should return 400 if peerId is empty', async () => {
@@ -412,10 +412,10 @@ describe('Settlement API', () => {
 
       const response = await request(app)
         .post('/settlement/execute')
-        .send({ peerId: 'peer-a', tokenId: 'ILP' })
+        .send({ peerId: 'peer-a', tokenId: 'M2M' })
         .expect(200);
 
-      expect(mockAccountManager.recordSettlement).toHaveBeenCalledWith('peer-a', 'ILP', 1200n);
+      expect(mockAccountManager.recordSettlement).toHaveBeenCalledWith('peer-a', 'M2M', 1200n);
       expect(response.body.previousBalance).toBe('1200');
       expect(response.body.newBalance).toBe('0');
       expect(response.body.settledAmount).toBe('1200');
@@ -436,12 +436,12 @@ describe('Settlement API', () => {
 
       await request(app)
         .post('/settlement/execute')
-        .send({ peerId: 'peer-a', tokenId: 'ILP' })
+        .send({ peerId: 'peer-a', tokenId: 'M2M' })
         .expect(200);
 
       // Verify state transitions
-      expect(mockSettlementMonitor.markSettlementInProgress).toHaveBeenCalledWith('peer-a', 'ILP');
-      expect(mockSettlementMonitor.markSettlementCompleted).toHaveBeenCalledWith('peer-a', 'ILP');
+      expect(mockSettlementMonitor.markSettlementInProgress).toHaveBeenCalledWith('peer-a', 'M2M');
+      expect(mockSettlementMonitor.markSettlementCompleted).toHaveBeenCalledWith('peer-a', 'M2M');
     });
 
     test('should handle settlement errors gracefully', async () => {
@@ -456,7 +456,7 @@ describe('Settlement API', () => {
 
       const response = await request(app)
         .post('/settlement/execute')
-        .send({ peerId: 'peer-a', tokenId: 'ILP' })
+        .send({ peerId: 'peer-a', tokenId: 'M2M' })
         .expect(500);
 
       expect(response.body.error).toContain('TigerBeetle transfer failed');
@@ -482,7 +482,7 @@ describe('Settlement API', () => {
 
       const response = await request(app)
         .post('/settlement/execute')
-        .send({ peerId: 'peer-a', tokenId: 'ILP' })
+        .send({ peerId: 'peer-a', tokenId: 'M2M' })
         .expect(500);
 
       expect(response.body.error).toContain('balance not reduced to zero');

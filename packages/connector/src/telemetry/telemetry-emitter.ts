@@ -419,7 +419,7 @@ export class TelemetryEmitter {
    *   type: 'ACCOUNT_BALANCE',
    *   nodeId: 'connector-a',
    *   peerId: 'peer-b',
-   *   tokenId: 'ILP',
+   *   tokenId: 'M2M',
    *   debitBalance: '0',
    *   creditBalance: '1000',
    *   netBalance: '-1000',

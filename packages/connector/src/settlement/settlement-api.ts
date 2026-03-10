@@ -85,6 +85,12 @@ export interface SettlementAPIConfig {
    * Required for telemetry event nodeId field (Story 6.8)
    */
   nodeId?: string;
+
+  /**
+   * Default token ID for settlement operations.
+   * Resolved from the on-chain ERC-20 symbol at startup (e.g. 'M2M', 'USDC').
+   */
+  defaultTokenId?: string;
 }
 
 /**
@@ -93,7 +99,7 @@ export interface SettlementAPIConfig {
  * Request format for POST /settlement/execute endpoint.
  *
  * @property peerId - Peer ID to settle with (required)
- * @property tokenId - Token type to settle (optional, defaults to 'ILP')
+ * @property tokenId - Token type to settle (optional, defaults to resolved on-chain symbol)
  */
 export interface ExecuteSettlementRequest {
   /**
@@ -105,8 +111,8 @@ export interface ExecuteSettlementRequest {
 
   /**
    * Token ID to settle
-   * Defaults to 'ILP' if not provided
-   * Example: 'ILP', 'USDC', 'BTC'
+   * Defaults to the resolved on-chain token symbol if not provided
+   * Example: 'M2M', 'USDC', 'BTC'
    */
   tokenId?: string;
 }
@@ -565,7 +571,7 @@ export async function createSettlementRouter(config: SettlementAPIConfig): Promi
    * ```json
    * {
    *   "peerId": "connector-a",
-   *   "tokenId": "ILP"  // Optional, defaults to "ILP"
+   *   "tokenId": "M2M"  // Optional, defaults to resolved on-chain symbol
    * }
    * ```
    *
@@ -574,7 +580,7 @@ export async function createSettlementRouter(config: SettlementAPIConfig): Promi
    * {
    *   "success": true,
    *   "peerId": "connector-a",
-   *   "tokenId": "ILP",
+   *   "tokenId": "M2M",
    *   "previousBalance": "1000",
    *   "newBalance": "0",
    *   "settledAmount": "1000",
@@ -590,7 +596,8 @@ export async function createSettlementRouter(config: SettlementAPIConfig): Promi
    */
   router.post('/settlement/execute', async (req: Request, res: Response): Promise<void> => {
     try {
-      const { peerId, tokenId = 'ILP' } = req.body as ExecuteSettlementRequest;
+      const { peerId, tokenId = config.defaultTokenId ?? 'M2M' } =
+        req.body as ExecuteSettlementRequest;
 
       // Validate peerId
       if (!peerId || typeof peerId !== 'string') {
@@ -634,13 +641,13 @@ export async function createSettlementRouter(config: SettlementAPIConfig): Promi
    * Query current settlement status for a peer.
    *
    * **Query Parameters:**
-   * - tokenId: Token ID to query (optional, defaults to "ILP")
+   * - tokenId: Token ID to query (optional, defaults to resolved on-chain symbol)
    *
    * **Success Response (200 OK):**
    * ```json
    * {
    *   "peerId": "connector-a",
-   *   "tokenId": "ILP",
+   *   "tokenId": "M2M",
    *   "currentBalance": "500",
    *   "settlementState": "IDLE",
    *   "timestamp": "2026-01-03T12:00:00.000Z"
@@ -655,7 +662,7 @@ export async function createSettlementRouter(config: SettlementAPIConfig): Promi
   router.get('/settlement/status/:peerId', async (req: Request, res: Response): Promise<void> => {
     try {
       const { peerId } = req.params;
-      const tokenId = (req.query.tokenId as string) ?? 'ILP';
+      const tokenId = (req.query.tokenId as string) ?? config.defaultTokenId ?? 'M2M';
 
       // Validate peerId
       if (!peerId) {

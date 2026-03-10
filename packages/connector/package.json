@@ -1,6 +1,6 @@
 {
   "name": "@crosstown/connector",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "Connector with BTP support and EVM settlement",
   "main": "dist/lib.js",
   "types": "dist/lib.d.ts",

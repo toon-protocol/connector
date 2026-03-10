@@ -256,9 +256,9 @@ export interface ConnectorConfig {
    * Defaults to 'development' if not specified
    *
    * Environment types:
-   * - development: Local Anvil for Base L2
-   * - staging: Public testnet (Base Sepolia)
-   * - production: Public mainnet (Base mainnet)
+   * - development: Local Anvil for Base L2 and Arbitrum
+   * - staging: Public testnets (Base Sepolia, Arbitrum Sepolia)
+   * - production: Public mainnets (Base mainnet, Arbitrum One)
    */
   environment: Environment;
 
@@ -511,7 +511,7 @@ export interface CreditLimitConfig {
  * ```typescript
  * const violation: CreditLimitViolation = {
  *   peerId: 'connector-a',
- *   tokenId: 'ILP',
+ *   tokenId: 'M2M',
  *   currentBalance: 4500n,
  *   requestedAmount: 600n,
  *   creditLimit: 5000n,
@@ -528,7 +528,7 @@ export interface CreditLimitViolation {
 
   /**
    * Token type being transferred
-   * Examples: 'ILP' (default), 'USDC', 'BTC', 'ETH'
+   * Examples: 'M2M' (default), 'USDC', 'BTC', 'ETH'
    * Used for token-specific limit lookup
    */
   tokenId: string;
@@ -1079,7 +1079,7 @@ export enum SettlementState {
  * ```typescript
  * const event: SettlementTriggerEvent = {
  *   peerId: 'connector-a',
- *   tokenId: 'ILP',
+ *   tokenId: 'M2M',
  *   currentBalance: 1200n,
  *   threshold: 1000n,
  *   exceedsBy: 200n,
@@ -1102,7 +1102,7 @@ export interface SettlementTriggerEvent {
 
   /**
    * Token type being settled
-   * Examples: 'ILP' (default), 'USDC', 'BTC', 'ETH'
+   * Examples: 'M2M' (default), 'USDC', 'BTC', 'ETH'
    * Used for token-specific threshold lookup and settlement execution
    */
   tokenId: string;
@@ -1143,9 +1143,11 @@ export interface SettlementTriggerEvent {
 /**
  * Blockchain Configuration Interface
  *
- * Top-level blockchain configuration containing optional Base L2 configuration.
+ * Top-level blockchain configuration containing optional EVM chain configurations.
+ * Supports multiple EVM-compatible chains (Base, Arbitrum) for multi-chain settlement.
  *
  * @property base - Optional Base L2 / EVM configuration
+ * @property arbitrum - Optional Arbitrum L2 / EVM configuration
  *
  * @example
  * ```typescript
@@ -1156,6 +1158,13 @@ export interface SettlementTriggerEvent {
  *     chainId: 84532,
  *     privateKey: '0xac0974...',
  *     registryAddress: '0x1234...'
+ *   },
+ *   arbitrum: {
+ *     enabled: true,
+ *     rpcUrl: 'https://sepolia-rollup.arbitrum.io/rpc',
+ *     chainId: 421614,
+ *     privateKey: '0xac0974...',
+ *     registryAddress: '0x5678...'
  *   }
  * };
  * ```
@@ -1166,56 +1175,67 @@ export interface BlockchainConfig {
    * Used for Epic 8 payment channel smart contracts
    * Enabled when connector needs to interact with Base L2
    */
-  base?: BaseBlockchainConfig;
+  base?: EVMChainConfig;
+
+  /**
+   * Optional Arbitrum L2 / EVM blockchain configuration
+   * Uses same contract ABIs as Base (EVM-compatible)
+   * Enabled when connector needs to settle on Arbitrum
+   */
+  arbitrum?: EVMChainConfig;
 }
 
 /**
- * Base L2 Blockchain Configuration
+ * EVM Chain Configuration
  *
- * Configuration for Base L2 (OP Stack) blockchain integration.
- * Supports both local Anvil development and public Base mainnet/testnet.
+ * Generic configuration for any EVM-compatible L2 blockchain integration.
+ * Used for Base, Arbitrum, and other EVM chains sharing the same contract ABIs.
  *
- * @property enabled - Whether Base blockchain integration is enabled
+ * @property enabled - Whether this chain's integration is enabled
  * @property rpcUrl - RPC endpoint URL (local Anvil or public mainnet/testnet)
- * @property chainId - Expected chain ID (84532 = Base Sepolia, 8453 = Base mainnet)
+ * @property chainId - Expected chain ID for validation
  * @property privateKey - Optional private key for contract interactions (dev only)
  * @property registryAddress - Optional payment channel registry contract address
+ * @property tokenAddress - Optional ERC-20 token contract address for this chain
  *
  * @example
  * ```typescript
- * // Development configuration
- * const baseDev: BaseBlockchainConfig = {
+ * // Base development configuration
+ * const baseDev: EVMChainConfig = {
  *   enabled: true,
  *   rpcUrl: 'http://anvil:8545',
  *   chainId: 84532,
  *   privateKey: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
  * };
  *
- * // Production configuration
- * const baseProd: BaseBlockchainConfig = {
+ * // Arbitrum production configuration
+ * const arbProd: EVMChainConfig = {
  *   enabled: true,
- *   rpcUrl: 'https://mainnet.base.org',
- *   chainId: 8453,
- *   privateKey: process.env.BASE_PRIVATE_KEY,  // From secure KMS
+ *   rpcUrl: 'https://arb1.arbitrum.io/rpc',
+ *   chainId: 42161,
+ *   privateKey: process.env.ARBITRUM_PRIVATE_KEY,
  *   registryAddress: '0x1234567890123456789012345678901234567890'
  * };
  * ```
  */
-export interface BaseBlockchainConfig {
+export interface EVMChainConfig {
   /**
-   * Feature flag to enable/disable Base blockchain integration
-   * When false, connector will not interact with Base L2
-   * Default: false (backward compatible with pre-Epic 8 connectors)
+   * Feature flag to enable/disable this chain's integration
+   * When false, connector will not interact with this chain
+   * Default: false (backward compatible)
    */
   enabled: boolean;
 
   /**
-   * RPC endpoint URL for Base L2 blockchain
+   * RPC endpoint URL for the EVM blockchain
    *
-   * Environment-specific defaults:
-   * - Development: http://anvil:8545 (local Anvil fork)
-   * - Staging: https://sepolia.base.org (Base Sepolia testnet)
-   * - Production: https://mainnet.base.org (Base mainnet)
+   * Environment-specific defaults vary by chain:
+   * - Base Development: http://anvil:8545 (local Anvil fork)
+   * - Base Staging: https://sepolia.base.org (Base Sepolia testnet)
+   * - Base Production: https://mainnet.base.org (Base mainnet)
+   * - Arbitrum Development: http://anvil-arbitrum:8546
+   * - Arbitrum Staging: https://sepolia-rollup.arbitrum.io/rpc
+   * - Arbitrum Production: https://arb1.arbitrum.io/rpc
    *
    * Custom endpoints (Alchemy, Infura) recommended for production reliability
    */
@@ -1227,6 +1247,8 @@ export interface BaseBlockchainConfig {
    * Standard chain IDs:
    * - 84532: Base Sepolia testnet
    * - 8453: Base mainnet
+   * - 421614: Arbitrum Sepolia testnet
+   * - 42161: Arbitrum One mainnet
    *
    * Validated at runtime against RPC endpoint's actual chain ID
    */
@@ -1246,13 +1268,27 @@ export interface BaseBlockchainConfig {
   /**
    * Optional payment channel registry contract address
    *
-   * Epic 8 will deploy PaymentChannelRegistry contract
    * Address varies by network (local Anvil vs testnet vs mainnet)
    *
    * Example: 0x1234567890123456789012345678901234567890
    */
   registryAddress?: string;
+
+  /**
+   * Optional ERC-20 token contract address for this chain
+   *
+   * Allows per-chain token address configuration when the same
+   * token is deployed at different addresses on different chains.
+   *
+   * Falls back to global M2M_TOKEN_ADDRESS if not specified.
+   */
+  tokenAddress?: string;
 }
+
+/**
+ * @deprecated Use EVMChainConfig instead. This alias is kept for backward compatibility.
+ */
+export type BaseBlockchainConfig = EVMChainConfig;
 
 /**
  * Security Configuration Interface

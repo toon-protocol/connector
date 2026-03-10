@@ -96,6 +96,15 @@ export class ConnectorNode implements HealthStatusProvider {
   private _healthStatus: 'healthy' | 'unhealthy' | 'starting' = 'starting';
   private readonly _startTime: Date = new Date();
   private _btpServerStarted: boolean = false;
+  private _defaultSettlementTokenId: string = 'M2M';
+
+  /**
+   * The canonical token symbol resolved from the on-chain ERC-20 contract at startup.
+   * Falls back to 'M2M' if the RPC call fails or settlement is disabled.
+   */
+  get defaultSettlementTokenId(): string {
+    return this._defaultSettlementTokenId;
+  }
 
   /**
    * Create ConnectorNode instance
@@ -490,6 +499,36 @@ export class ConnectorNode implements HealthStatusProvider {
             this._logger
           );
 
+          // Resolve on-chain token symbol for canonical tokenId
+          try {
+            const resolvedSymbol = await this._paymentChannelSDK.getTokenSymbol(m2mTokenAddress);
+            if (resolvedSymbol) {
+              this._defaultSettlementTokenId = resolvedSymbol;
+              this._logger.info(
+                {
+                  event: 'token_symbol_resolved',
+                  symbol: resolvedSymbol,
+                  tokenAddress: m2mTokenAddress,
+                },
+                `Resolved on-chain token symbol: ${resolvedSymbol}`
+              );
+            } else {
+              this._logger.warn(
+                { event: 'token_symbol_empty', tokenAddress: m2mTokenAddress },
+                'ERC-20 symbol() returned empty string, falling back to M2M'
+              );
+            }
+          } catch (symbolError) {
+            this._logger.warn(
+              {
+                event: 'token_symbol_resolution_failed',
+                tokenAddress: m2mTokenAddress,
+                error: symbolError instanceof Error ? symbolError.message : String(symbolError),
+              },
+              'Failed to resolve on-chain token symbol, falling back to M2M'
+            );
+          }
+
           // Store primary SDK in chain map
           const primaryChainId =
             this._config.blockchain?.base?.chainId ?? this._config.blockchain?.arbitrum?.chainId;
@@ -576,10 +615,9 @@ export class ConnectorNode implements HealthStatusProvider {
             }
           }
 
-          // Build token address map (M2M token for test deployment)
+          // Build token address map using the resolved on-chain symbol
           const tokenAddressMap = new Map<string, string>();
-          tokenAddressMap.set('M2M', m2mTokenAddress);
-          tokenAddressMap.set('ILP', m2mTokenAddress); // ILP token maps to M2M for settlement
+          tokenAddressMap.set(this._defaultSettlementTokenId, m2mTokenAddress);
           tokenAddressMap.set(m2mTokenAddress, m2mTokenAddress); // Also map address to itself for direct lookups
 
           // Initialize ChannelManager with TigerBeetle accounting if configured
@@ -723,7 +761,7 @@ export class ConnectorNode implements HealthStatusProvider {
                 pollingInterval: settlementPollingInterval,
               },
               peers: peerIds,
-              tokenIds: ['ILP'], // MVP: single token ID
+              tokenIds: [this._defaultSettlementTokenId],
               telemetryEmitter: this._telemetryEmitter || undefined,
               nodeId: this._config.nodeId,
             },
@@ -863,7 +901,11 @@ export class ConnectorNode implements HealthStatusProvider {
                 : [], // Placeholder for in-memory ledger
             };
 
-            this._packetHandler.setSettlement(accountManager, settlementConfig);
+            this._packetHandler.setSettlement(
+              accountManager,
+              settlementConfig,
+              this._defaultSettlementTokenId
+            );
           }
         } catch (error) {
           // Log error but continue without payment channels (graceful degradation)
@@ -924,6 +966,7 @@ export class ConnectorNode implements HealthStatusProvider {
           paymentChannelSDK: this._paymentChannelSDK ?? undefined,
           accountManager: this._accountManager ?? undefined,
           settlementMonitor: this._settlementMonitor ?? undefined,
+          defaultSettlementTokenId: this._defaultSettlementTokenId,
           packetSender: (params) => this.sendPacket(params),
           isReady: () => this._btpServerStarted,
         });
@@ -1841,11 +1884,14 @@ export class ConnectorNode implements HealthStatusProvider {
    * Equivalent to GET /admin/balances/:peerId — same response shape.
    *
    * @param peerId - Peer identifier
-   * @param tokenId - Token identifier (default: 'ILP')
+   * @param tokenId - Token identifier (defaults to the resolved on-chain symbol, e.g. 'M2M')
    * @returns PeerAccountBalance with debit/credit/net balances
    * @throws Error if account management is not enabled
    */
-  async getBalance(peerId: string, tokenId: string = 'ILP'): Promise<PeerAccountBalance> {
+  async getBalance(
+    peerId: string,
+    tokenId: string = this._defaultSettlementTokenId
+  ): Promise<PeerAccountBalance> {
     if (!this._accountManager) {
       throw new Error('Account management not enabled');
     }

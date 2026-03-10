@@ -46,7 +46,7 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         debitAccountId: 123n,
         creditAccountId: 456n,
         peerId: 'peer-test',
-        tokenId: 'ILP',
+        tokenId: 'M2M',
       }),
       createPeerAccounts: jest.fn(),
       getAccountBalance: jest.fn(),
@@ -253,7 +253,7 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
       expect(mockAccountManager.recordPacketTransfers).toHaveBeenCalledWith(
         'peer-sender', // fromPeerId
         'peer-b', // toPeerId
-        'ILP', // tokenId
+        'M2M', // tokenId
         100000n, // incoming amount
         99900n, // outgoing amount (100000 - 100 fee)
         expect.any(BigInt), // incomingTransferId

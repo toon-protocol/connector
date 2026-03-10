@@ -134,7 +134,7 @@ describe('InMemoryLedgerClient Integration', () => {
       // Create an account so the ledger is marked dirty and persists on close
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const accountManager = (connector as any)._accountManager as AccountManager;
-      await accountManager.createPeerAccounts('env-test-peer', 'ILP');
+      await accountManager.createPeerAccounts('env-test-peer', 'M2M');
 
       await connector.stop();
 
@@ -178,7 +178,7 @@ describe('InMemoryLedgerClient Integration', () => {
       expect(accountManager1).not.toBeNull();
 
       // Create test accounts
-      await accountManager1.createPeerAccounts('peer-a', 'ILP');
+      await accountManager1.createPeerAccounts('peer-a', 'M2M');
 
       // Stop connector (triggers snapshot persist)
       await connector1.stop();
@@ -196,7 +196,7 @@ describe('InMemoryLedgerClient Integration', () => {
         expect(accountManager2).not.toBeNull();
 
         // Assert: Balance was restored from snapshot
-        const balance = await accountManager2.getAccountBalance('peer-a', 'ILP');
+        const balance = await accountManager2.getAccountBalance('peer-a', 'M2M');
         expect(balance).toBeDefined();
         // Balance should be zero (we only created accounts, no transfers)
         expect(balance.debitBalance).toBe(0n);

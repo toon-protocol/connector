@@ -56,7 +56,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
     `);
 
     mockEVMChannelSDK = {
-      closeChannel: jest.fn().mockResolvedValue(undefined),
+      claimFromChannel: jest.fn().mockResolvedValue(undefined),
     };
 
     mockEvmProvider = {
@@ -212,7 +212,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       claimRedemptionService.stop();
 
       // Verify SDK was NOT called
-      expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
+      expect(mockEVMChannelSDK.claimFromChannel).not.toHaveBeenCalled();
 
       // Verify claim still unredeemed
       const row = db
@@ -265,7 +265,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       claimRedemptionService.stop();
 
       // Verify EVM SDK was called with correct parameters
-      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledWith(
+      expect(mockEVMChannelSDK.claimFromChannel).toHaveBeenCalledWith(
         evmClaim.channelId,
         '0x1234567890abcdef1234567890abcdef12345678', // Token address from config
         {
@@ -340,7 +340,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       claimRedemptionService.stop();
 
       // Verify SDK was NOT called (unprofitable)
-      expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
+      expect(mockEVMChannelSDK.claimFromChannel).not.toHaveBeenCalled();
 
       // Verify claim still unredeemed
       const row = db
@@ -391,7 +391,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       claimRedemptionService.stop();
 
       // Verify SDK was called (profitable)
-      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalled();
+      expect(mockEVMChannelSDK.claimFromChannel).toHaveBeenCalled();
 
       // Verify claim was redeemed
       const row = db
@@ -472,7 +472,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       claimRedemptionService.stop();
 
       // Verify EVM SDK was called for all claims
-      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledTimes(3);
+      expect(mockEVMChannelSDK.claimFromChannel).toHaveBeenCalledTimes(3);
 
       // Verify all claims were redeemed
       const redeemedCount = db
@@ -572,7 +572,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
 
       // Mock SDK to fail twice then succeed
       let attemptCount = 0;
-      mockEVMChannelSDK.closeChannel.mockImplementation(async () => {
+      mockEVMChannelSDK.claimFromChannel.mockImplementation(async () => {
         attemptCount++;
         if (attemptCount <= 2) {
           throw new Error(`Network failure attempt ${attemptCount}`);
@@ -620,7 +620,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       retryService.stop();
 
       // Verify 3 attempts were made
-      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledTimes(3);
+      expect(mockEVMChannelSDK.claimFromChannel).toHaveBeenCalledTimes(3);
 
       // Verify claim was eventually redeemed
       const row = db
@@ -648,7 +648,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       );
 
       // Mock SDK to always fail
-      mockEVMChannelSDK.closeChannel.mockRejectedValue(new Error('Permanent failure'));
+      mockEVMChannelSDK.claimFromChannel.mockRejectedValue(new Error('Permanent failure'));
 
       // Insert EVM claim
       const claim = {
@@ -690,7 +690,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       failService.stop();
 
       // Verify exactly 3 attempts were made
-      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledTimes(3);
+      expect(mockEVMChannelSDK.claimFromChannel).toHaveBeenCalledTimes(3);
 
       // Verify claim was NOT redeemed
       const row = db
@@ -790,7 +790,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       skipService.stop();
 
       // Verify SDK was NOT called (already redeemed)
-      expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
+      expect(mockEVMChannelSDK.claimFromChannel).not.toHaveBeenCalled();
     });
   });
 
@@ -857,7 +857,7 @@ describe('ClaimRedemptionService Integration Tests', () => {
       gasService.stop();
 
       // Verify EVM SDK was NOT called (unprofitable with high gas)
-      expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
+      expect(mockEVMChannelSDK.claimFromChannel).not.toHaveBeenCalled();
     });
   });
 

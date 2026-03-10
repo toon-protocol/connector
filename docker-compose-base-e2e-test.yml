@@ -82,6 +82,8 @@ services:
     volumes:
       - tigerbeetle-e2e-data:/data
       - ./scripts/init-tigerbeetle.sh:/init-tigerbeetle.sh:ro
+    ports:
+      - "3000:3000"
     networks:
       - base-e2e-network
     entrypoint: ["/init-tigerbeetle.sh"]

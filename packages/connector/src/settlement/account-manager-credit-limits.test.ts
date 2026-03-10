@@ -56,7 +56,7 @@ describe('AccountManager Credit Limit Enforcement', () => {
       );
 
       // Act: Check credit limit with large amount
-      const violation = await accountManager.checkCreditLimit('peer-a', 'ILP', 1000000n);
+      const violation = await accountManager.checkCreditLimit('peer-a', 'M2M', 1000000n);
 
       // Assert: No violation (unlimited)
       expect(violation).toBeNull();
@@ -84,7 +84,7 @@ describe('AccountManager Credit Limit Enforcement', () => {
       );
 
       // Act: Check credit limit
-      const violation = await accountManager.checkCreditLimit('peer-a', 'ILP', 300n);
+      const violation = await accountManager.checkCreditLimit('peer-a', 'M2M', 300n);
 
       // Assert: No violation (800n < 1000n)
       expect(violation).toBeNull();
@@ -112,7 +112,7 @@ describe('AccountManager Credit Limit Enforcement', () => {
       );
 
       // Act: Check credit limit
-      const violation = await accountManager.checkCreditLimit('peer-a', 'ILP', 300n);
+      const violation = await accountManager.checkCreditLimit('peer-a', 'M2M', 300n);
 
       // Assert: No violation (1000n = 1000n, allowed)
       expect(violation).toBeNull();
@@ -145,12 +145,12 @@ describe('AccountManager Credit Limit Enforcement', () => {
       });
 
       // Act: Check credit limit
-      const violation = await accountManager.checkCreditLimit('peer-a', 'ILP', 300n);
+      const violation = await accountManager.checkCreditLimit('peer-a', 'M2M', 300n);
 
       // Assert: Violation returned
       expect(violation).not.toBeNull();
       expect(violation!.peerId).toBe('peer-a');
-      expect(violation!.tokenId).toBe('ILP');
+      expect(violation!.tokenId).toBe('M2M');
       expect(violation!.currentBalance).toBe(800n);
       expect(violation!.requestedAmount).toBe(300n);
       expect(violation!.creditLimit).toBe(1000n);
@@ -180,7 +180,7 @@ describe('AccountManager Credit Limit Enforcement', () => {
       );
 
       // Act: Check credit limit with amount that would exceed default but not per-peer limit
-      const violation = await accountManager.checkCreditLimit('peer-a', 'ILP', 1500n);
+      const violation = await accountManager.checkCreditLimit('peer-a', 'M2M', 1500n);
 
       // Assert: No violation (uses 2000n limit, not 1000n default)
       expect(violation).toBeNull();
@@ -207,7 +207,7 @@ describe('AccountManager Credit Limit Enforcement', () => {
       );
 
       // Act: Check credit limit for peer-b (no override) with amount exceeding default
-      const violation = await accountManager.checkCreditLimit('peer-b', 'ILP', 1500n);
+      const violation = await accountManager.checkCreditLimit('peer-b', 'M2M', 1500n);
 
       // Assert: Violation (uses 1000n default limit)
       expect(violation).not.toBeNull();
@@ -266,8 +266,8 @@ describe('AccountManager Credit Limit Enforcement', () => {
         ])
       );
 
-      // Act: Check credit limit for 'ILP' token (no token-specific override)
-      const violation = await accountManager.checkCreditLimit('peer-a', 'ILP', 800n);
+      // Act: Check credit limit for 'M2M' token (no token-specific override)
+      const violation = await accountManager.checkCreditLimit('peer-a', 'M2M', 800n);
 
       // Assert: No violation (uses 1000n per-peer limit)
       expect(violation).toBeNull();
@@ -296,7 +296,7 @@ describe('AccountManager Credit Limit Enforcement', () => {
       );
 
       // Act: Check credit limit with amount exceeding ceiling
-      const violation = await accountManager.checkCreditLimit('peer-a', 'ILP', 6000n);
+      const violation = await accountManager.checkCreditLimit('peer-a', 'M2M', 6000n);
 
       // Assert: Violation (effective limit = 5000n due to ceiling)
       expect(violation).not.toBeNull();
@@ -325,7 +325,7 @@ describe('AccountManager Credit Limit Enforcement', () => {
       );
 
       // Act: Check credit limit with amount exceeding configured limit
-      const violation = await accountManager.checkCreditLimit('peer-a', 'ILP', 3000n);
+      const violation = await accountManager.checkCreditLimit('peer-a', 'M2M', 3000n);
 
       // Assert: Violation (effective limit = 2000n, ceiling doesn't reduce)
       expect(violation).not.toBeNull();
@@ -358,7 +358,7 @@ describe('AccountManager Credit Limit Enforcement', () => {
       );
 
       // Act: Check credit limit for new peer
-      const violation = await accountManager.checkCreditLimit('new-peer', 'ILP', 100n);
+      const violation = await accountManager.checkCreditLimit('new-peer', 'M2M', 100n);
 
       // Assert: createAccountsBatch called, then balance queried
       expect(mockLedgerClient.createAccountsBatch).toHaveBeenCalled();
@@ -392,7 +392,7 @@ describe('AccountManager Credit Limit Enforcement', () => {
       });
 
       // Act: Check credit limit
-      await accountManager.checkCreditLimit('peer-a', 'ILP', 200n);
+      await accountManager.checkCreditLimit('peer-a', 'M2M', 200n);
 
       // Assert: logger.warn called with violation details
       expect(logSpy).toHaveBeenCalled();
@@ -423,7 +423,7 @@ describe('AccountManager Credit Limit Enforcement', () => {
       });
 
       // Act: Check if limit would be exceeded
-      const wouldExceed = await accountManager.wouldExceedCreditLimit('peer-a', 'ILP', 200n);
+      const wouldExceed = await accountManager.wouldExceedCreditLimit('peer-a', 'M2M', 200n);
 
       // Assert: Returns true
       expect(wouldExceed).toBe(true);
@@ -449,7 +449,7 @@ describe('AccountManager Credit Limit Enforcement', () => {
       );
 
       // Act: Check if limit would be exceeded
-      const wouldExceed = await accountManager.wouldExceedCreditLimit('peer-a', 'ILP', 300n);
+      const wouldExceed = await accountManager.wouldExceedCreditLimit('peer-a', 'M2M', 300n);
 
       // Assert: Returns false
       expect(wouldExceed).toBe(false);

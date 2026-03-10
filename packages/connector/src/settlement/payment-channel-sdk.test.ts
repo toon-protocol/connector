@@ -106,9 +106,6 @@ describe('PaymentChannelSDK', () => {
       closeChannel: jest.fn().mockResolvedValue({
         wait: jest.fn().mockResolvedValue({ hash: '0xtxhash' }),
       }),
-      cooperativeSettle: jest.fn().mockResolvedValue({
-        wait: jest.fn().mockResolvedValue({ hash: '0xtxhash' }),
-      }),
       settleChannel: jest.fn().mockResolvedValue({
         wait: jest.fn().mockResolvedValue({ hash: '0xtxhash' }),
       }),
@@ -122,8 +119,6 @@ describe('PaymentChannelSDK', () => {
       }),
       participants: jest.fn().mockResolvedValue({
         deposit: 1000000n,
-        withdrawnAmount: 0n,
-        isCloser: false,
         nonce: 0n,
         transferredAmount: 0n,
       }),
@@ -265,8 +260,6 @@ describe('PaymentChannelSDK', () => {
       // Mock getChannelState to return existing state
       mockTokenNetworkContract.participants?.mockResolvedValueOnce({
         deposit: 0n,
-        withdrawnAmount: 0n,
-        isCloser: false,
         nonce: 0n,
         transferredAmount: 0n,
       });
@@ -419,25 +412,18 @@ describe('PaymentChannelSDK', () => {
       await sdk.openChannel(mockPeerAddress, mockTokenAddress, 3600, 0n);
     });
 
-    it('should close channel with balance proof', async () => {
-      const balanceProof: BalanceProof = {
-        channelId: mockChannelId,
-        nonce: 1,
-        transferredAmount: 100000n,
-        lockedAmount: 0n,
-        locksRoot: ethers.ZeroHash,
-      };
-      const signature = '0xabcd1234';
+    it('should close channel', async () => {
+      await sdk.closeChannel(mockChannelId, mockTokenAddress);
 
-      await sdk.closeChannel(mockChannelId, mockTokenAddress, balanceProof, signature);
-
-      expect(mockTokenNetworkContract.closeChannel).toHaveBeenCalledWith(
-        mockChannelId,
-        balanceProof,
-        signature
+      expect(mockTokenNetworkContract.closeChannel).toHaveBeenCalledWith(mockChannelId);
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        'Closing channel (starting grace period)',
+        expect.any(Object)
       );
-      expect(mockLogger.info).toHaveBeenCalledWith('Closing channel', expect.any(Object));
-      expect(mockLogger.info).toHaveBeenCalledWith('Channel closed', expect.any(Object));
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        'Channel closed, grace period started',
+        expect.any(Object)
+      );
     });
 
     it('should throw error if channel is not opened', async () => {
@@ -460,61 +446,8 @@ describe('PaymentChannelSDK', () => {
         participant2: mockPeerAddress,
       });
 
-      const balanceProof: BalanceProof = {
-        channelId: mockChannelId,
-        nonce: 1,
-        transferredAmount: 100000n,
-        lockedAmount: 0n,
-        locksRoot: ethers.ZeroHash,
-      };
-
-      await expect(
-        freshSDK.closeChannel(mockChannelId, mockTokenAddress, balanceProof, '0xsig')
-      ).rejects.toThrow('Cannot close channel in status: closed');
-    });
-  });
-
-  describe('cooperativeSettle', () => {
-    beforeEach(async () => {
-      // Open channel first
-      await sdk.openChannel(mockPeerAddress, mockTokenAddress, 3600, 0n);
-    });
-
-    it('should cooperatively settle channel', async () => {
-      const myProof: BalanceProof = {
-        channelId: mockChannelId,
-        nonce: 5,
-        transferredAmount: 100000n,
-        lockedAmount: 0n,
-        locksRoot: ethers.ZeroHash,
-      };
-      const theirProof: BalanceProof = {
-        channelId: mockChannelId,
-        nonce: 5,
-        transferredAmount: 50000n,
-        lockedAmount: 0n,
-        locksRoot: ethers.ZeroHash,
-      };
-
-      await sdk.cooperativeSettle(
-        mockChannelId,
-        mockTokenAddress,
-        myProof,
-        '0xmysig',
-        theirProof,
-        '0xtheirsig'
-      );
-
-      expect(mockTokenNetworkContract.cooperativeSettle).toHaveBeenCalledWith(
-        mockChannelId,
-        myProof,
-        '0xmysig',
-        theirProof,
-        '0xtheirsig'
-      );
-      expect(mockLogger.info).toHaveBeenCalledWith(
-        'Cooperatively settling channel',
-        expect.any(Object)
+      await expect(freshSDK.closeChannel(mockChannelId, mockTokenAddress)).rejects.toThrow(
+        'Cannot close channel in status: closed'
       );
     });
   });

@@ -1359,13 +1359,13 @@ describe('ConnectorNode', () => {
       };
 
       // Act
-      const result = await connectorNode.getBalance('peerA', 'ILP');
+      const result = await connectorNode.getBalance('peerA', 'M2M');
 
       // Assert
       expect(result.peerId).toBe('peerA');
       expect(result.balances).toHaveLength(1);
       expect(result.balances[0]).toEqual({
-        tokenId: 'ILP',
+        tokenId: 'M2M',
         debitBalance: '100',
         creditBalance: '200',
         netBalance: '-100',

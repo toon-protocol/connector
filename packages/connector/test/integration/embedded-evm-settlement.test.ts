@@ -471,14 +471,20 @@ describeIfEVM('Embedded EVM Settlement Integration', () => {
       );
     });
 
-    it('should close channel and verify on-chain settlement', async () => {
-      // Arrange — create final balance proofs for cooperative settlement
-      const nonce = 5;
-      const aTransferred = ethers.parseEther('30'); // A sent 30 tokens to B
-      const bTransferred = ethers.parseEther('0'); // B sent 0 tokens to A
+    it('should close channel, claim, and verify on-chain settlement', async () => {
+      // Step 1: Close the channel (starts grace period)
+      await sdkA.closeChannel(channelId, TOKEN_ADDRESS);
 
-      // Balance proofs
-      const proofA: BalanceProof = {
+      let state = await sdkA.getChannelState(channelId, TOKEN_ADDRESS);
+      expect(state.status).toBe('closed');
+      console.log('  Channel closed, grace period started');
+
+      // Step 2: B claims transferred funds using A's signed balance proof
+      // A transferred 30 tokens to B
+      const nonce = 5;
+      const aTransferred = ethers.parseEther('30');
+
+      const balanceProof: BalanceProof = {
         channelId,
         nonce,
         transferredAmount: aTransferred,
@@ -487,23 +493,23 @@ describeIfEVM('Embedded EVM Settlement Integration', () => {
       };
       const sigA = await sdkA.signBalanceProof(channelId, nonce, aTransferred, 0n, ethers.ZeroHash);
 
-      const proofB: BalanceProof = {
-        channelId,
-        nonce,
-        transferredAmount: bTransferred,
-        lockedAmount: 0n,
-        locksRoot: ethers.ZeroHash,
-      };
-      const sigB = await sdkB.signBalanceProof(channelId, nonce, bTransferred, 0n, ethers.ZeroHash);
+      // Ensure sdkB has the token network cached
+      await sdkB.getChannelState(channelId, TOKEN_ADDRESS);
 
-      // Act — cooperatively settle channel
-      await sdkA.cooperativeSettle(channelId, TOKEN_ADDRESS, proofA, sigA, proofB, sigB);
+      await sdkB.claimFromChannel(channelId, TOKEN_ADDRESS, balanceProof, sigA);
+      console.log('  Claim submitted by connector B');
+
+      // Step 3: Fast-forward past settlement timeout and settle
+      await provider.send('evm_increaseTime', [3601]);
+      await provider.send('evm_mine', []);
+
+      await sdkA.settleChannel(channelId, TOKEN_ADDRESS);
 
       // Assert — channel is settled on-chain
-      const state = await sdkA.getChannelState(channelId, TOKEN_ADDRESS);
+      state = await sdkA.getChannelState(channelId, TOKEN_ADDRESS);
       expect(state.status).toBe('settled');
 
-      console.log('  Channel cooperatively settled');
+      console.log('  Channel closed, claimed, and settled');
     });
   });
 

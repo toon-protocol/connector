@@ -111,7 +111,6 @@ describe('Admin API Channel Endpoints (Story 21.1)', () => {
       getMyChannels: jest.fn(),
       signBalanceProof: jest.fn().mockResolvedValue('0x' + 'ab'.repeat(65)),
       closeChannel: jest.fn().mockResolvedValue(undefined),
-      cooperativeSettle: jest.fn().mockResolvedValue(undefined),
       settleChannel: jest.fn(),
       deposit: jest.fn().mockResolvedValue(undefined),
       removeAllListeners: jest.fn(),
@@ -804,7 +803,6 @@ describe('Admin API Channel Lifecycle Endpoints (Story 21.2)', () => {
       getMyChannels: jest.fn(),
       signBalanceProof: jest.fn().mockResolvedValue('0x' + 'ab'.repeat(65)),
       closeChannel: jest.fn().mockResolvedValue(undefined),
-      cooperativeSettle: jest.fn().mockResolvedValue(undefined),
       settleChannel: jest.fn(),
       deposit: jest.fn().mockResolvedValue(undefined),
       removeAllListeners: jest.fn(),
@@ -1037,92 +1035,32 @@ describe('Admin API Channel Lifecycle Endpoints (Story 21.2)', () => {
 
   // --- POST /admin/channels/:channelId/close ---
 
-  describe('POST /admin/channels/:channelId/close — Close Mode Selection (AC: 6, 7, 8, 9)', () => {
-    it('should attempt cooperative close by default (no body)', async () => {
+  describe('POST /admin/channels/:channelId/close — Close Channel (AC: 6, 7, 8, 9)', () => {
+    it('should close channel and return closing status', async () => {
       mockChannelManager.getChannelById.mockReturnValue({ ...activeEvmChannel });
 
       const res = await request(app).post('/admin/channels/0xevm123/close').send({});
 
       expect(res.status).toBe(200);
-      expect(mockPaymentChannelSDK.cooperativeSettle).toHaveBeenCalled();
-      expect(res.body.status).toBe('settled');
-    });
-
-    it('should attempt cooperative close when cooperative: true', async () => {
-      mockChannelManager.getChannelById.mockReturnValue({ ...activeEvmChannel });
-
-      const res = await request(app)
-        .post('/admin/channels/0xevm123/close')
-        .send({ cooperative: true });
-
-      expect(res.status).toBe(200);
-      expect(mockPaymentChannelSDK.cooperativeSettle).toHaveBeenCalled();
-      expect(res.body.status).toBe('settled');
-    });
-
-    it('should skip cooperative and use unilateral when cooperative: false', async () => {
-      mockChannelManager.getChannelById.mockReturnValue({ ...activeEvmChannel });
-
-      const res = await request(app)
-        .post('/admin/channels/0xevm123/close')
-        .send({ cooperative: false });
-
-      expect(res.status).toBe(200);
-      expect(mockPaymentChannelSDK.cooperativeSettle).not.toHaveBeenCalled();
-      expect(mockPaymentChannelSDK.signBalanceProof).toHaveBeenCalled();
-      expect(mockPaymentChannelSDK.closeChannel).toHaveBeenCalled();
-      expect(res.body.status).toBe('closing');
-    });
-
-    it('should return status "settled" on cooperative close success', async () => {
-      mockChannelManager.getChannelById.mockReturnValue({ ...activeEvmChannel });
-
-      const res = await request(app).post('/admin/channels/0xevm123/close').send({});
-
-      expect(res.status).toBe(200);
-      expect(res.body.channelId).toBe('0xevm123');
-      expect(res.body.status).toBe('settled');
-    });
-
-    it('should fall back to unilateral close when cooperative fails', async () => {
-      mockChannelManager.getChannelById.mockReturnValue({ ...activeEvmChannel });
-      mockPaymentChannelSDK.cooperativeSettle.mockRejectedValue(new Error('Invalid signatures'));
-
-      const res = await request(app)
-        .post('/admin/channels/0xevm123/close')
-        .send({ cooperative: true });
-
-      expect(res.status).toBe(200);
-      expect(mockPaymentChannelSDK.cooperativeSettle).toHaveBeenCalled();
-      expect(mockPaymentChannelSDK.signBalanceProof).toHaveBeenCalled();
-      expect(mockPaymentChannelSDK.closeChannel).toHaveBeenCalled();
-      expect(res.body.status).toBe('closing');
-    });
-
-    it('should call signBalanceProof then closeChannel for unilateral close', async () => {
-      mockChannelManager.getChannelById.mockReturnValue({ ...activeEvmChannel });
-
-      const res = await request(app)
-        .post('/admin/channels/0xevm123/close')
-        .send({ cooperative: false });
-
-      expect(res.status).toBe(200);
-      expect(mockPaymentChannelSDK.signBalanceProof).toHaveBeenCalledWith(
-        '0xevm123',
-        defaultChannelState.myNonce + 1,
-        defaultChannelState.myTransferred,
-        0n,
-        '0x' + '0'.repeat(64)
-      );
       expect(mockPaymentChannelSDK.closeChannel).toHaveBeenCalledWith(
         '0xevm123',
-        '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
-        expect.objectContaining({
-          channelId: '0xevm123',
-          nonce: defaultChannelState.myNonce + 1,
-        }),
-        '0x' + 'ab'.repeat(65)
+        '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
       );
+      expect(res.body.status).toBe('closing');
+    });
+
+    it('should call closeChannel with channelId and tokenAddress only', async () => {
+      mockChannelManager.getChannelById.mockReturnValue({ ...activeEvmChannel });
+
+      const res = await request(app).post('/admin/channels/0xevm123/close').send({});
+
+      expect(res.status).toBe(200);
+      expect(mockPaymentChannelSDK.closeChannel).toHaveBeenCalledWith(
+        '0xevm123',
+        '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
+      );
+      expect(res.body.channelId).toBe('0xevm123');
+      expect(res.body.status).toBe('closing');
     });
 
     it('should return 404 for unknown channelId', async () => {
@@ -1200,7 +1138,6 @@ describe('Admin API Channel Lifecycle Endpoints (Story 21.2)', () => {
 
     it('should return 500 with sanitized message on close error', async () => {
       mockChannelManager.getChannelById.mockReturnValue({ ...activeEvmChannel });
-      mockPaymentChannelSDK.cooperativeSettle.mockRejectedValue(new Error('Coop fail'));
       mockPaymentChannelSDK.closeChannel.mockRejectedValue(new Error('RPC error: gas too low'));
 
       const res = await request(app).post('/admin/channels/0xevm123/close').send({});
@@ -1388,7 +1325,7 @@ describe('Admin API Balance and Settlement State Endpoints (Story 21.3)', () => 
       expect(res.status).toBe(200);
       expect(res.body.peerId).toBe('peer-b');
       expect(res.body.balances).toHaveLength(1);
-      expect(res.body.balances[0].tokenId).toBe('ILP');
+      expect(res.body.balances[0].tokenId).toBe('M2M');
       expect(res.body.balances[0].debitBalance).toBe('5000');
       expect(res.body.balances[0].creditBalance).toBe('3000');
       expect(res.body.balances[0].netBalance).toBe('-2000');
@@ -1402,10 +1339,10 @@ describe('Admin API Balance and Settlement State Endpoints (Story 21.3)', () => 
       expect(mockAccountManager.getAccountBalance).toHaveBeenCalledWith('peer-b', 'USDC');
     });
 
-    it('should default tokenId to ILP when not provided', async () => {
+    it('should default tokenId to M2M when not provided', async () => {
       await request(app).get('/admin/balances/peer-b');
 
-      expect(mockAccountManager.getAccountBalance).toHaveBeenCalledWith('peer-b', 'ILP');
+      expect(mockAccountManager.getAccountBalance).toHaveBeenCalledWith('peer-b', 'M2M');
     });
 
     it('should return 200 with zero balances for unknown peer (TigerBeetle semantics)', async () => {
@@ -1509,18 +1446,18 @@ describe('Admin API Balance and Settlement State Endpoints (Story 21.3)', () => 
   describe('GET /admin/settlement/states (AC: 5, 6)', () => {
     it('should return 200 with state array', async () => {
       const statesMap = new Map<string, SettlementState>();
-      statesMap.set('peer-b:ILP', SettlementState.IDLE);
-      statesMap.set('peer-c:ILP', SettlementState.SETTLEMENT_PENDING);
+      statesMap.set('peer-b:M2M', SettlementState.IDLE);
+      statesMap.set('peer-c:M2M', SettlementState.SETTLEMENT_PENDING);
       mockSettlementMonitor.getAllSettlementStates.mockReturnValue(statesMap);
 
       const res = await request(app).get('/admin/settlement/states');
 
       expect(res.status).toBe(200);
       expect(res.body).toHaveLength(2);
-      expect(res.body[0]).toEqual({ peerId: 'peer-b', tokenId: 'ILP', state: 'IDLE' });
+      expect(res.body[0]).toEqual({ peerId: 'peer-b', tokenId: 'M2M', state: 'IDLE' });
       expect(res.body[1]).toEqual({
         peerId: 'peer-c',
-        tokenId: 'ILP',
+        tokenId: 'M2M',
         state: 'SETTLEMENT_PENDING',
       });
     });
@@ -1536,9 +1473,9 @@ describe('Admin API Balance and Settlement State Endpoints (Story 21.3)', () => 
 
     it('should correctly map all settlement state values', async () => {
       const statesMap = new Map<string, SettlementState>();
-      statesMap.set('peer-a:ILP', SettlementState.IDLE);
-      statesMap.set('peer-b:ILP', SettlementState.SETTLEMENT_PENDING);
-      statesMap.set('peer-c:ILP', SettlementState.SETTLEMENT_IN_PROGRESS);
+      statesMap.set('peer-a:M2M', SettlementState.IDLE);
+      statesMap.set('peer-b:M2M', SettlementState.SETTLEMENT_PENDING);
+      statesMap.set('peer-c:M2M', SettlementState.SETTLEMENT_IN_PROGRESS);
       mockSettlementMonitor.getAllSettlementStates.mockReturnValue(statesMap);
 
       const res = await request(app).get('/admin/settlement/states');
@@ -1552,14 +1489,14 @@ describe('Admin API Balance and Settlement State Endpoints (Story 21.3)', () => 
 
     it('should correctly parse state key to peerId and tokenId', async () => {
       const statesMap = new Map<string, SettlementState>();
-      statesMap.set('peer-b:ILP', SettlementState.IDLE);
+      statesMap.set('peer-b:M2M', SettlementState.IDLE);
       mockSettlementMonitor.getAllSettlementStates.mockReturnValue(statesMap);
 
       const res = await request(app).get('/admin/settlement/states');
 
       expect(res.status).toBe(200);
       expect(res.body[0].peerId).toBe('peer-b');
-      expect(res.body[0].tokenId).toBe('ILP');
+      expect(res.body[0].tokenId).toBe('M2M');
     });
 
     it('should return 503 when settlementMonitor is unavailable', async () => {
@@ -1862,7 +1799,6 @@ describe('Admin API Channel Opening Integration Fixes (Story 21.4)', () => {
       getMyChannels: jest.fn(),
       signBalanceProof: jest.fn().mockResolvedValue('0x' + 'ab'.repeat(65)),
       closeChannel: jest.fn().mockResolvedValue(undefined),
-      cooperativeSettle: jest.fn().mockResolvedValue(undefined),
       settleChannel: jest.fn(),
       deposit: jest.fn().mockResolvedValue(undefined),
       removeAllListeners: jest.fn(),
@@ -2116,7 +2052,6 @@ describe('Admin API Channel Status Normalization (Story 21.5)', () => {
       getMyChannels: jest.fn(),
       signBalanceProof: jest.fn().mockResolvedValue('0x' + 'ab'.repeat(65)),
       closeChannel: jest.fn().mockResolvedValue(undefined),
-      cooperativeSettle: jest.fn().mockResolvedValue(undefined),
       settleChannel: jest.fn(),
       deposit: jest.fn().mockResolvedValue(undefined),
       removeAllListeners: jest.fn(),
