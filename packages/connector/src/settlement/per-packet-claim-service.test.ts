@@ -11,7 +11,6 @@ import type { PaymentChannelSDK } from './payment-channel-sdk';
 import type { ChannelManager } from './channel-manager';
 import type { Database } from 'better-sqlite3';
 import type { Logger } from 'pino';
-import type { TelemetryEmitter } from '../telemetry/telemetry-emitter';
 
 // Mock logger
 const createMockLogger = (): Logger =>
@@ -86,7 +85,7 @@ describe('PerPacketClaimService', () => {
   beforeEach(() => {
     mockSDK = createMockSDK();
     mockChannelManager = createMockChannelManager({
-      [`${TEST_PEER_ID}:ILP`]: {
+      [`${TEST_PEER_ID}:M2M`]: {
         channelId: TEST_CHANNEL_ID,
         tokenAddress: TEST_TOKEN_ADDRESS,
       },
@@ -105,7 +104,7 @@ describe('PerPacketClaimService', () => {
 
   describe('generateClaimForPacket', () => {
     it('should generate a valid claim for a packet', async () => {
-      const result = await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 1000n);
+      const result = await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 1000n);
 
       expect(result).not.toBeNull();
       expect(result!.protocolData.protocolName).toBe(BTP_CLAIM_PROTOCOL.NAME);
@@ -125,9 +124,9 @@ describe('PerPacketClaimService', () => {
     });
 
     it('should increment nonce for sequential packets', async () => {
-      const result1 = await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 100n);
-      const result2 = await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 200n);
-      const result3 = await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 300n);
+      const result1 = await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 100n);
+      const result2 = await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 200n);
+      const result3 = await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 300n);
 
       expect(result1!.claimMessage.nonce).toBe(1);
       expect(result2!.claimMessage.nonce).toBe(2);
@@ -135,9 +134,9 @@ describe('PerPacketClaimService', () => {
     });
 
     it('should accumulate cumulative transferred amounts', async () => {
-      const result1 = await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 100n);
-      const result2 = await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 200n);
-      const result3 = await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 300n);
+      const result1 = await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 100n);
+      const result2 = await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 200n);
+      const result3 = await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 300n);
 
       expect(result1!.claimMessage.transferredAmount).toBe('100');
       expect(result2!.claimMessage.transferredAmount).toBe('300'); // 100 + 200
@@ -145,20 +144,20 @@ describe('PerPacketClaimService', () => {
     });
 
     it('should return null when no channel exists for peer', async () => {
-      const result = await service.generateClaimForPacket('unknown-peer', 'ILP', 1000n);
+      const result = await service.generateClaimForPacket('unknown-peer', 'M2M', 1000n);
       expect(result).toBeNull();
     });
 
     it('should cache channel context after first lookup', async () => {
-      await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 100n);
-      await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 200n);
+      await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 100n);
+      await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 200n);
 
       // ChannelManager should only be called once due to caching
       expect(mockChannelManager.getChannelForPeer).toHaveBeenCalledTimes(1);
     });
 
     it('should call signBalanceProof with correct parameters', async () => {
-      await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 500n);
+      await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 500n);
 
       expect(mockSDK.signBalanceProof).toHaveBeenCalledWith(
         TEST_CHANNEL_ID,
@@ -170,14 +169,14 @@ describe('PerPacketClaimService', () => {
     });
 
     it('should persist claim to database', async () => {
-      await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 1000n);
+      await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 1000n);
 
       // The DB prepare should have been called for INSERT
       expect(mockDb.prepare).toHaveBeenCalled();
     });
 
     it('should serialize claim as JSON in protocolData', async () => {
-      const result = await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 1000n);
+      const result = await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 1000n);
 
       const parsed = JSON.parse(result!.protocolData.data.toString('utf8'));
       expect(parsed.channelId).toBe(TEST_CHANNEL_ID);
@@ -192,8 +191,8 @@ describe('PerPacketClaimService', () => {
     });
 
     it('should return latest claim after generation', async () => {
-      await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 100n);
-      await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 200n);
+      await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 100n);
+      await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 200n);
 
       const latest = service.getLatestClaim(TEST_CHANNEL_ID);
       expect(latest).not.toBeNull();
@@ -204,7 +203,7 @@ describe('PerPacketClaimService', () => {
 
   describe('resetChannel', () => {
     it('should clear all tracking state for a channel', async () => {
-      await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 1000n);
+      await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 1000n);
       expect(service.getLatestClaim(TEST_CHANNEL_ID)).not.toBeNull();
 
       service.resetChannel(TEST_CHANNEL_ID);
@@ -213,13 +212,13 @@ describe('PerPacketClaimService', () => {
     });
 
     it('should restart nonce and cumulative after reset', async () => {
-      await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 100n);
-      await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 200n);
+      await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 100n);
+      await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 200n);
 
       service.resetChannel(TEST_CHANNEL_ID);
 
       // Need to clear cache so context is re-fetched
-      const result = await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 50n);
+      const result = await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 50n);
       expect(result!.claimMessage.nonce).toBe(1);
       expect(result!.claimMessage.transferredAmount).toBe('50');
     });
@@ -276,7 +275,7 @@ describe('PerPacketClaimService', () => {
         TEST_NODE_ID
       );
 
-      const result = await recoveredService.generateClaimForPacket(TEST_PEER_ID, 'ILP', 500n);
+      const result = await recoveredService.generateClaimForPacket(TEST_PEER_ID, 'M2M', 500n);
       expect(result!.claimMessage.nonce).toBe(11); // continues from 10
       expect(result!.claimMessage.transferredAmount).toBe('10500'); // 10000 + 500
     });
@@ -326,45 +325,19 @@ describe('PerPacketClaimService', () => {
       mockSDK.getChainId.mockRejectedValueOnce(new Error('RPC failure'));
 
       // Channel exists but context building fails
-      const result = await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 1000n);
+      const result = await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 1000n);
       expect(result).toBeNull();
     });
 
     it('should propagate signBalanceProof errors', async () => {
       // First, build context successfully
-      await service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 100n);
+      await service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 100n);
 
       // Then fail on sign
       mockSDK.signBalanceProof.mockRejectedValueOnce(new Error('Signing failed'));
 
-      await expect(service.generateClaimForPacket(TEST_PEER_ID, 'ILP', 200n)).rejects.toThrow(
+      await expect(service.generateClaimForPacket(TEST_PEER_ID, 'M2M', 200n)).rejects.toThrow(
         'Signing failed'
-      );
-    });
-  });
-
-  describe('telemetry', () => {
-    it('should emit telemetry when emitter is provided', async () => {
-      const mockTelemetry = { emit: jest.fn() };
-
-      const serviceWithTelemetry = new PerPacketClaimService(
-        mockSDK as unknown as PaymentChannelSDK,
-        mockChannelManager as unknown as ChannelManager,
-        mockDb as unknown as Database,
-        mockLogger,
-        TEST_NODE_ID,
-        mockTelemetry as unknown as TelemetryEmitter
-      );
-
-      await serviceWithTelemetry.generateClaimForPacket(TEST_PEER_ID, 'ILP', 1000n);
-
-      expect(mockTelemetry.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CLAIM_SENT',
-          nodeId: TEST_NODE_ID,
-          peerId: TEST_PEER_ID,
-          success: true,
-        })
       );
     });
   });

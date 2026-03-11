@@ -1,44 +1,6 @@
 import pino from 'pino';
 import { KeyManager, KeyManagerConfig, KeyManagerBackend } from '../../src/security/key-manager';
 
-// Check if cloud SDKs and HSM libraries are available
-let awsSdkAvailable = false;
-let gcpSdkAvailable = false;
-let azureSdkAvailable = false;
-let hsmAvailable = false;
-
-try {
-  require('@aws-sdk/client-kms');
-  awsSdkAvailable = true;
-} catch {
-  // AWS SDK not installed
-}
-
-try {
-  require('@google-cloud/kms');
-  gcpSdkAvailable = true;
-} catch {
-  // GCP SDK not installed
-}
-
-try {
-  require('@azure/keyvault-keys');
-  require('@azure/identity');
-  azureSdkAvailable = true;
-} catch {
-  // Azure SDK not installed
-}
-
-try {
-  require('pkcs11js');
-  hsmAvailable = true;
-} catch {
-  // pkcs11js not installed
-}
-
-// Helper to conditionally run tests
-const describeIf = (condition: boolean): jest.Describe => (condition ? describe : describe.skip);
-
 describe('KeyManager', () => {
   let mockLogger: pino.Logger;
   let mockBackend: jest.Mocked<KeyManagerBackend>;
@@ -78,89 +40,15 @@ describe('KeyManager', () => {
       expect(mockLogger.info).toHaveBeenCalledWith({ backend: 'env' }, 'KeyManager initialized');
     });
 
-    describeIf(awsSdkAvailable)('AWS KMS backend (requires @aws-sdk/client-kms)', () => {
-      it('should select AWSKMSBackend when backend="aws-kms"', () => {
-        const config: KeyManagerConfig = {
-          backend: 'aws-kms',
+    it('should throw error for unsupported backend types', () => {
+      for (const backend of ['aws-kms', 'gcp-kms', 'azure-kv', 'hsm']) {
+        const config = {
+          backend,
           nodeId: 'test-node',
-          aws: {
-            region: 'us-east-1',
-            evmKeyId: 'arn:aws:kms:us-east-1:123456789012:key/evm-key',
-          },
-        };
+        } as unknown as KeyManagerConfig;
 
-        const keyManager = new KeyManager(config, mockLogger);
-
-        expect(keyManager).toBeDefined();
-        expect(mockLogger.info).toHaveBeenCalledWith(
-          { backend: 'aws-kms' },
-          'KeyManager initialized'
-        );
-      });
-    });
-
-    describeIf(gcpSdkAvailable)('GCP KMS backend (requires @google-cloud/kms)', () => {
-      it('should select GCPKMSBackend when backend="gcp-kms"', () => {
-        const config: KeyManagerConfig = {
-          backend: 'gcp-kms',
-          nodeId: 'test-node',
-          gcp: {
-            projectId: 'my-project',
-            locationId: 'us-east1',
-            keyRingId: 'my-keyring',
-            evmKeyId: 'evm-key',
-          },
-        };
-
-        const keyManager = new KeyManager(config, mockLogger);
-
-        expect(keyManager).toBeDefined();
-        expect(mockLogger.info).toHaveBeenCalledWith(
-          { backend: 'gcp-kms' },
-          'KeyManager initialized'
-        );
-      });
-    });
-
-    describeIf(azureSdkAvailable)('Azure Key Vault backend (requires @azure/keyvault-keys)', () => {
-      it('should select AzureKeyVaultBackend when backend="azure-kv"', () => {
-        const config: KeyManagerConfig = {
-          backend: 'azure-kv',
-          nodeId: 'test-node',
-          azure: {
-            vaultUrl: 'https://myvault.vault.azure.net/',
-            evmKeyName: 'evm-key',
-          },
-        };
-
-        const keyManager = new KeyManager(config, mockLogger);
-
-        expect(keyManager).toBeDefined();
-        expect(mockLogger.info).toHaveBeenCalledWith(
-          { backend: 'azure-kv' },
-          'KeyManager initialized'
-        );
-      });
-    });
-
-    describeIf(hsmAvailable)('HSM backend (requires pkcs11js)', () => {
-      it('should select HSMBackend when backend="hsm"', () => {
-        const config: KeyManagerConfig = {
-          backend: 'hsm',
-          nodeId: 'test-node',
-          hsm: {
-            pkcs11LibraryPath: '/usr/lib/softhsm/libsofthsm2.so',
-            slotId: 0,
-            pin: '1234',
-            evmKeyLabel: 'evm-key',
-          },
-        };
-
-        const keyManager = new KeyManager(config, mockLogger);
-
-        expect(keyManager).toBeDefined();
-        expect(mockLogger.info).toHaveBeenCalledWith({ backend: 'hsm' }, 'KeyManager initialized');
-      });
+        expect(() => new KeyManager(config, mockLogger)).toThrow('is not supported');
+      }
     });
 
     it('should throw error for unknown backend type', () => {
@@ -361,52 +249,15 @@ describe('KeyManager', () => {
   });
 
   describe('backend configuration validation', () => {
-    it('should throw error if AWS config missing for aws-kms backend', () => {
-      const config: KeyManagerConfig = {
-        backend: 'aws-kms',
-        nodeId: 'test-node',
-        // Missing aws config
-      };
+    it('should reject unsupported cloud/HSM backends', () => {
+      for (const backend of ['aws-kms', 'gcp-kms', 'azure-kv', 'hsm'] as const) {
+        const config = {
+          backend,
+          nodeId: 'test-node',
+        } as unknown as KeyManagerConfig;
 
-      expect(() => new KeyManager(config, mockLogger)).toThrow(
-        'AWS configuration required for aws-kms backend'
-      );
-    });
-
-    it('should throw error if GCP config missing for gcp-kms backend', () => {
-      const config: KeyManagerConfig = {
-        backend: 'gcp-kms',
-        nodeId: 'test-node',
-        // Missing gcp config
-      };
-
-      expect(() => new KeyManager(config, mockLogger)).toThrow(
-        'GCP configuration required for gcp-kms backend'
-      );
-    });
-
-    it('should throw error if Azure config missing for azure-kv backend', () => {
-      const config: KeyManagerConfig = {
-        backend: 'azure-kv',
-        nodeId: 'test-node',
-        // Missing azure config
-      };
-
-      expect(() => new KeyManager(config, mockLogger)).toThrow(
-        'Azure configuration required for azure-kv backend'
-      );
-    });
-
-    it('should throw error if HSM config missing for hsm backend', () => {
-      const config: KeyManagerConfig = {
-        backend: 'hsm',
-        nodeId: 'test-node',
-        // Missing hsm config
-      };
-
-      expect(() => new KeyManager(config, mockLogger)).toThrow(
-        'HSM configuration required for hsm backend'
-      );
+        expect(() => new KeyManager(config, mockLogger)).toThrow('is not supported');
+      }
     });
   });
 });

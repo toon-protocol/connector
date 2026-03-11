@@ -1,9 +1,0 @@
-# Production TigerBeetle deployment
-# Deploy with: kubectl apply -k k8s/tigerbeetle/
-#
-# For single-node testing, use: kubectl apply -k k8s/tigerbeetle/overlays/test/
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-
-resources:
-  - base

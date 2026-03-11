@@ -40,7 +40,6 @@ jest.mock('../http/admin-api', () => ({
   validateSettlementConfig: jest.fn().mockReturnValue(null),
   createAdminRouter: jest.fn(),
 }));
-jest.mock('../explorer');
 jest.mock('../settlement/payment-channel-sdk');
 jest.mock('../settlement/channel-manager');
 jest.mock('../settlement/settlement-executor');
@@ -92,7 +91,6 @@ describe('ConnectorNode — minimal dependency startup', () => {
     delete process.env.TIGERBEETLE_CLUSTER_ID;
     delete process.env.TIGERBEETLE_REPLICAS;
     delete process.env.ADMIN_API_ENABLED;
-    delete process.env.DASHBOARD_TELEMETRY_URL;
 
     mockLogger = createMockLogger();
 
@@ -115,8 +113,6 @@ describe('ConnectorNode — minimal dependency startup', () => {
       setLocalDelivery: jest.fn(),
       setLocalDeliveryHandler: jest.fn(),
       handlePreparePacket: jest.fn(),
-      setEventStore: jest.fn(),
-      setEventBroadcaster: jest.fn(),
     } as unknown as jest.Mocked<PacketHandler>;
 
     mockHealthServer = {
@@ -159,7 +155,6 @@ describe('ConnectorNode — minimal dependency startup', () => {
     delete process.env.TIGERBEETLE_CLUSTER_ID;
     delete process.env.TIGERBEETLE_REPLICAS;
     delete process.env.ADMIN_API_ENABLED;
-    delete process.env.DASHBOARD_TELEMETRY_URL;
   });
 
   describe('settlement error messages', () => {

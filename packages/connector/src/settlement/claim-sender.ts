@@ -14,7 +14,6 @@
  * - Sends EVM claims via BTP protocolData
  * - Retry logic with exponential backoff (3 attempts: 1s, 2s, 4s delays)
  * - Claim persistence in SQLite for dispute resolution
- * - Telemetry emission for observability
  * - Idempotent message IDs for duplicate detection
  *
  * References:
@@ -34,8 +33,6 @@ import {
   EVMClaimMessage,
   BlockchainType,
 } from '../btp/btp-claim-types';
-import { TelemetryEmitter } from '../telemetry/telemetry-emitter';
-
 /**
  * Result of a claim send operation
  */
@@ -54,7 +51,7 @@ export interface ClaimSendResult {
  * ClaimSender handles sending payment channel claims to peers via BTP.
  *
  * It integrates with BTPClient for WebSocket transmission, implements retry logic,
- * persists claims for dispute resolution, and emits telemetry events.
+ * persists claims for dispute resolution.
  *
  * The caller (UnifiedSettlementExecutor) is responsible for:
  * 1. Obtaining BTPClient from BTPConnectionManager.getClientForPeer(peerId)
@@ -67,7 +64,6 @@ export class ClaimSender {
   constructor(
     private readonly db: Database,
     private readonly logger: Logger,
-    private readonly telemetryEmitter?: TelemetryEmitter,
     private readonly nodeId?: string
   ) {}
 
@@ -147,7 +143,7 @@ export class ClaimSender {
   /**
    * Core claim sending logic (private method)
    *
-   * Handles serialization, retry logic, persistence, and telemetry for all claim types.
+   * Handles serialization, retry logic, and persistence for all claim types.
    *
    * @param peerId - Peer identifier
    * @param btpClient - BTPClient instance
@@ -178,9 +174,6 @@ export class ClaimSender {
       // Persist claim to database
       this._persistSentClaim(peerId, claimMessage.messageId, claimMessage);
 
-      // Emit success telemetry
-      this._emitClaimSentTelemetry(peerId, claimMessage, true);
-
       childLogger.info('Claim sent successfully');
 
       return {
@@ -190,9 +183,6 @@ export class ClaimSender {
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-
-      // Emit failure telemetry
-      this._emitClaimSentTelemetry(peerId, claimMessage, false, errorMessage);
 
       childLogger.error({ error: errorMessage }, 'Failed to send claim');
 
@@ -223,17 +213,6 @@ export class ClaimSender {
     const nonceStr = nonce.toString();
     const timestamp = Date.now();
     return `${blockchain}-${prefix}-${nonceStr}-${timestamp}`;
-  }
-
-  /**
-   * Extract claim amount for telemetry
-   *
-   * @param claim - BTP claim message
-   * @returns Amount as string
-   */
-  private _getClaimAmount(claim: BTPClaimMessage): string {
-    // EVM uses transferredAmount
-    return claim.transferredAmount;
   }
 
   /**
@@ -324,47 +303,6 @@ export class ClaimSender {
         // Log other database errors but don't block send
         this.logger.error({ error, messageId, peerId }, 'Failed to persist claim to database');
       }
-    }
-  }
-
-  /**
-   * Emit telemetry event for claim send attempt
-   *
-   * Wraps emit() in try-catch to prevent telemetry failures from blocking claim sends.
-   *
-   * @param peerId - Peer identifier
-   * @param claim - Claim message
-   * @param success - Whether send was successful
-   * @param error - Optional error message
-   */
-  private _emitClaimSentTelemetry(
-    peerId: string,
-    claim: BTPClaimMessage,
-    success: boolean,
-    error?: string
-  ): void {
-    if (!this.telemetryEmitter) {
-      return;
-    }
-
-    try {
-      this.telemetryEmitter.emit({
-        type: 'CLAIM_SENT',
-        nodeId: this.nodeId ?? 'unknown',
-        peerId,
-        blockchain: claim.blockchain,
-        messageId: claim.messageId,
-        amount: this._getClaimAmount(claim),
-        success,
-        error,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (emitError) {
-      // Non-blocking: log telemetry emission errors
-      this.logger.error(
-        { error: emitError, messageId: claim.messageId },
-        'Failed to emit claim telemetry'
-      );
     }
   }
 }

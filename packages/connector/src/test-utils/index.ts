@@ -38,7 +38,6 @@ export {
   // createMockWalletLifecycle,
   // createMockWalletFunder,
   createMockTreasuryWallet,
-  createMockTelemetryEmitter,
   createMockFraudDetector,
   createMockEvmProvider,
   createMockLogger,

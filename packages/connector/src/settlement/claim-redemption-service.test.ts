@@ -9,7 +9,6 @@
  * - Retry logic with exponential backoff
  * - Gas estimation
  * - Database updates
- * - Telemetry emission
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -19,7 +18,6 @@ import type { Database } from 'better-sqlite3';
 import type { Logger } from 'pino';
 import type { ethers } from 'ethers';
 import type { PaymentChannelSDK } from './payment-channel-sdk';
-import type { TelemetryEmitter } from '../telemetry/telemetry-emitter';
 
 /** Helper to create a DB row as returned by the SELECT query */
 function makeDbRow(claim: Record<string, any>) {
@@ -38,7 +36,6 @@ describe('ClaimRedemptionService', () => {
   let mockEVMChannelSDK: jest.Mocked<PaymentChannelSDK>;
   let mockEvmProvider: jest.Mocked<ethers.Provider>;
   let mockLogger: jest.Mocked<Logger>;
-  let mockTelemetryEmitter: jest.Mocked<TelemetryEmitter>;
 
   beforeEach(() => {
     // Mock Database
@@ -48,7 +45,7 @@ describe('ClaimRedemptionService', () => {
 
     // Mock PaymentChannelSDK
     mockEVMChannelSDK = {
-      closeChannel: jest.fn().mockResolvedValue(undefined),
+      claimFromChannel: jest.fn().mockResolvedValue(undefined),
     } as unknown as jest.Mocked<PaymentChannelSDK>;
 
     // Mock ethers.Provider
@@ -67,11 +64,6 @@ describe('ClaimRedemptionService', () => {
       child: jest.fn().mockReturnThis(),
     } as unknown as jest.Mocked<Logger>;
 
-    // Mock TelemetryEmitter
-    mockTelemetryEmitter = {
-      emit: jest.fn(),
-    } as unknown as jest.Mocked<TelemetryEmitter>;
-
     // Create service instance
     service = new ClaimRedemptionService(
       mockDb,
@@ -83,9 +75,7 @@ describe('ClaimRedemptionService', () => {
         maxConcurrentRedemptions: 5,
         evmTokenAddress: '0x1234567890abcdef1234567890abcdef12345678',
       },
-      mockLogger,
-      mockTelemetryEmitter,
-      'test-node'
+      mockLogger
     );
   });
 
@@ -194,7 +184,7 @@ describe('ClaimRedemptionService', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       expect(mockStmt.all).toHaveBeenCalledWith(5);
-      expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
+      expect(mockEVMChannelSDK.claimFromChannel).not.toHaveBeenCalled();
 
       service.stop();
     });
@@ -216,13 +206,13 @@ describe('ClaimRedemptionService', () => {
       };
 
       const { mockUpdateStmt } = setupDbMocks([makeDbRow(evmClaim)]);
-      mockEVMChannelSDK.closeChannel.mockResolvedValue(undefined);
+      mockEVMChannelSDK.claimFromChannel.mockResolvedValue(undefined);
 
       service.start();
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      // closeChannel called with (channelId, tokenAddress, balanceProof, signature)
-      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledWith(
+      // claimFromChannel called with (channelId, tokenAddress, balanceProof, signature)
+      expect(mockEVMChannelSDK.claimFromChannel).toHaveBeenCalledWith(
         '0xABC123',
         '0x1234567890abcdef1234567890abcdef12345678',
         expect.objectContaining({
@@ -238,14 +228,6 @@ describe('ClaimRedemptionService', () => {
         expect.any(Number),
         'msg_evm_123',
         'msg_evm_123'
-      );
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CLAIM_REDEEMED',
-          blockchain: 'evm',
-          messageId: 'msg_evm_123',
-          success: true,
-        })
       );
 
       service.stop();
@@ -268,7 +250,7 @@ describe('ClaimRedemptionService', () => {
       const { mockUpdateStmt } = setupDbMocks([makeDbRow(evmClaim)]);
 
       // First attempt fails, second succeeds
-      mockEVMChannelSDK.closeChannel
+      mockEVMChannelSDK.claimFromChannel
         .mockRejectedValueOnce(new Error('Network error'))
         .mockResolvedValueOnce(undefined);
 
@@ -277,7 +259,7 @@ describe('ClaimRedemptionService', () => {
       // Wait for retry (1s backoff + buffer)
       await new Promise((resolve) => setTimeout(resolve, 1500));
 
-      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledTimes(2);
+      expect(mockEVMChannelSDK.claimFromChannel).toHaveBeenCalledTimes(2);
       expect(mockUpdateStmt.run).toHaveBeenCalledWith(
         expect.any(Number),
         'msg_evm_retry',
@@ -304,22 +286,14 @@ describe('ClaimRedemptionService', () => {
       setupDbMocks([makeDbRow(evmClaim)]);
 
       // All attempts fail
-      mockEVMChannelSDK.closeChannel.mockRejectedValue(new Error('Persistent network error'));
+      mockEVMChannelSDK.claimFromChannel.mockRejectedValue(new Error('Persistent network error'));
 
       service.start();
 
       // Wait for all retries (1s + 2s + 4s backoff + buffer)
       await new Promise((resolve) => setTimeout(resolve, 8000));
 
-      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalledTimes(3);
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CLAIM_REDEEMED',
-          blockchain: 'evm',
-          messageId: 'msg_evm_fail',
-          success: false,
-        })
-      );
+      expect(mockEVMChannelSDK.claimFromChannel).toHaveBeenCalledTimes(3);
 
       service.stop();
     }, 10000);
@@ -346,12 +320,12 @@ describe('ClaimRedemptionService', () => {
         gasPrice: 1n, // 1 wei – gas cost = 150000 wei << 10M claim
       } as any);
 
-      mockEVMChannelSDK.closeChannel.mockResolvedValue(undefined);
+      mockEVMChannelSDK.claimFromChannel.mockResolvedValue(undefined);
 
       service.start();
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalled();
+      expect(mockEVMChannelSDK.claimFromChannel).toHaveBeenCalled();
       expect(mockUpdateStmt.run).toHaveBeenCalledWith(
         expect.any(Number),
         'msg_profitable',
@@ -385,7 +359,7 @@ describe('ClaimRedemptionService', () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
 
       // Should NOT attempt redemption
-      expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
+      expect(mockEVMChannelSDK.claimFromChannel).not.toHaveBeenCalled();
       expect(mockLogger.debug).toHaveBeenCalledWith(
         expect.objectContaining({
           messageId: 'msg_unprofitable',
@@ -420,7 +394,7 @@ describe('ClaimRedemptionService', () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
 
       // Should NOT attempt redemption due to high gas
-      expect(mockEVMChannelSDK.closeChannel).not.toHaveBeenCalled();
+      expect(mockEVMChannelSDK.claimFromChannel).not.toHaveBeenCalled();
 
       service.stop();
     });
@@ -447,7 +421,7 @@ describe('ClaimRedemptionService', () => {
         gasPrice: 2000000000n, // 2 gwei
       } as any);
 
-      mockEVMChannelSDK.closeChannel.mockResolvedValue(undefined);
+      mockEVMChannelSDK.claimFromChannel.mockResolvedValue(undefined);
 
       service.start();
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -474,7 +448,7 @@ describe('ClaimRedemptionService', () => {
       setupDbMocks([makeDbRow(evmClaim)]);
 
       mockEvmProvider.getFeeData.mockRejectedValue(new Error('RPC error'));
-      mockEVMChannelSDK.closeChannel.mockResolvedValue(undefined);
+      mockEVMChannelSDK.claimFromChannel.mockResolvedValue(undefined);
 
       service.start();
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -487,115 +461,7 @@ describe('ClaimRedemptionService', () => {
       );
 
       // Should still attempt redemption with gas cost = 0
-      expect(mockEVMChannelSDK.closeChannel).toHaveBeenCalled();
-
-      service.stop();
-    });
-  });
-
-  describe('Telemetry emission', () => {
-    it('should emit CLAIM_REDEEMED on success', async () => {
-      const evmClaim = {
-        blockchain: 'evm',
-        messageId: 'msg_telemetry_success',
-        senderId: 'peer-alice',
-        channelId: '0xTELEMETRY',
-        nonce: 1,
-        transferredAmount: '6000000',
-        lockedAmount: '0',
-        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
-        signature: 'sig_evm',
-        signerAddress: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
-      };
-
-      setupDbMocks([makeDbRow(evmClaim)]);
-      mockEVMChannelSDK.closeChannel.mockResolvedValue(undefined);
-
-      service.start();
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CLAIM_REDEEMED',
-          blockchain: 'evm',
-          messageId: 'msg_telemetry_success',
-          success: true,
-        })
-      );
-
-      service.stop();
-    });
-
-    it('should emit CLAIM_REDEEMED on failure', async () => {
-      const evmClaim = {
-        blockchain: 'evm',
-        messageId: 'msg_telemetry_fail',
-        senderId: 'peer-bob',
-        channelId: '0xTELEMETRYFAIL',
-        nonce: 1,
-        transferredAmount: '4000000',
-        lockedAmount: '0',
-        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
-        signature: 'sig_evm',
-        signerAddress: '0x8ba1f109551bD432803012645Ac136ddd64DBA72',
-      };
-
-      setupDbMocks([makeDbRow(evmClaim)]);
-      mockEVMChannelSDK.closeChannel.mockRejectedValue(new Error('Blockchain error'));
-
-      service.start();
-
-      // Wait for all 3 retries (1s + 2s + 4s + buffer)
-      await new Promise((resolve) => setTimeout(resolve, 8000));
-
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CLAIM_REDEEMED',
-          blockchain: 'evm',
-          messageId: 'msg_telemetry_fail',
-          success: false,
-        })
-      );
-
-      service.stop();
-    }, 10000);
-
-    it('should not crash if telemetry emission fails', async () => {
-      const evmClaim = {
-        blockchain: 'evm',
-        messageId: 'msg_telemetry_error',
-        senderId: 'peer-charlie',
-        channelId: '0xTELEMETRYERROR',
-        nonce: 1,
-        transferredAmount: '7000000',
-        lockedAmount: '0',
-        locksRoot: '0x0000000000000000000000000000000000000000000000000000000000000000',
-        signature: 'sig_evm',
-        signerAddress: '0x9cA1f109551bD432803012645Ac136ddd64DBA73',
-      };
-
-      const { mockUpdateStmt } = setupDbMocks([makeDbRow(evmClaim)]);
-
-      mockEVMChannelSDK.closeChannel.mockResolvedValue(undefined);
-      mockTelemetryEmitter.emit.mockImplementation(() => {
-        throw new Error('Telemetry service down');
-      });
-
-      service.start();
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      // Should still complete successfully despite telemetry failure
-      expect(mockUpdateStmt.run).toHaveBeenCalledWith(
-        expect.any(Number),
-        'msg_telemetry_error',
-        'msg_telemetry_error'
-      );
-      expect(mockLogger.error).toHaveBeenCalledWith(
-        expect.objectContaining({
-          error: expect.any(Error),
-        }),
-        'Error emitting CLAIM_REDEEMED telemetry'
-      );
+      expect(mockEVMChannelSDK.claimFromChannel).toHaveBeenCalled();
 
       service.stop();
     });

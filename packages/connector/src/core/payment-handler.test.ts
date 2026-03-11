@@ -12,6 +12,7 @@ import {
   PaymentRequest,
   REJECT_CODE_MAP,
   computeFulfillmentFromData,
+  validateFulfillment,
   generatePaymentId,
   mapRejectCode,
   validateResponseData,
@@ -58,6 +59,39 @@ describe('computeFulfillmentFromData', () => {
     const expected = crypto.createHash('sha256').update(data).digest();
     expect(result).toEqual(expected);
     expect(result.length).toBe(32);
+  });
+});
+
+describe('validateFulfillment', () => {
+  it('should return true when SHA256(fulfillment) equals condition', () => {
+    const data = Buffer.from('test-payload');
+    const fulfillment = crypto.createHash('sha256').update(data).digest();
+    const condition = crypto.createHash('sha256').update(fulfillment).digest();
+
+    expect(validateFulfillment(fulfillment, condition)).toBe(true);
+  });
+
+  it('should return false when fulfillment does not match condition', () => {
+    const fulfillment = Buffer.alloc(32, 0xaa);
+    const wrongCondition = Buffer.alloc(32, 0xbb);
+
+    expect(validateFulfillment(fulfillment, wrongCondition)).toBe(false);
+  });
+
+  it('should work with computeFulfillmentFromData output', () => {
+    const data = Buffer.from('some-packet-data');
+    const fulfillment = computeFulfillmentFromData(data);
+    const condition = crypto.createHash('sha256').update(fulfillment).digest();
+
+    expect(validateFulfillment(fulfillment, condition)).toBe(true);
+  });
+
+  it('should return false when fulfillment is all zeros', () => {
+    const fulfillment = Buffer.alloc(32, 0);
+    const condition = Buffer.alloc(32, 0);
+
+    // SHA256(zeros) != zeros
+    expect(validateFulfillment(fulfillment, condition)).toBe(false);
   });
 });
 

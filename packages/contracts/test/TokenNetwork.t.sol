@@ -132,7 +132,7 @@ contract TokenNetworkTest is Test {
         tokenNetwork.setTotalDeposit(channelId, alice, depositAmount);
 
         // Assert participant deposit updated
-        (uint256 deposit,,,,) = tokenNetwork.participants(channelId, alice);
+        (uint256 deposit,,) = tokenNetwork.participants(channelId, alice);
         assertEq(deposit, depositAmount, "Alice deposit should be 1000 tokens");
 
         // Assert TokenNetwork contract balance increased
@@ -179,7 +179,7 @@ contract TokenNetworkTest is Test {
         uint256 balanceAfter = token.balanceOf(address(tokenNetwork));
 
         // Assert participant deposit updated to 2000
-        (uint256 deposit,,,,) = tokenNetwork.participants(channelId, alice);
+        (uint256 deposit,,) = tokenNetwork.participants(channelId, alice);
         assertEq(deposit, 2000 * 10 ** 18, "Alice deposit should be 2000 tokens");
 
         // Assert only 1000 additional tokens transferred
@@ -299,8 +299,8 @@ contract TokenNetworkTest is Test {
         vm.stopPrank();
 
         // Assert both deposits recorded
-        (uint256 aliceDeposit,,,,) = tokenNetwork.participants(channelId, alice);
-        (uint256 bobDeposit,,,,) = tokenNetwork.participants(channelId, bob);
+        (uint256 aliceDeposit,,) = tokenNetwork.participants(channelId, alice);
+        (uint256 bobDeposit,,) = tokenNetwork.participants(channelId, bob);
 
         assertEq(aliceDeposit, 1000 * 10 ** 18, "Alice deposit should be 1000 tokens");
         assertEq(bobDeposit, 2000 * 10 ** 18, "Bob deposit should be 2000 tokens");
@@ -320,7 +320,7 @@ contract TokenNetworkTest is Test {
         vm.stopPrank();
 
         // Assert alice's deposit is updated (even though charlie paid)
-        (uint256 aliceDeposit,,,,) = tokenNetwork.participants(channelId, alice);
+        (uint256 aliceDeposit,,) = tokenNetwork.participants(channelId, alice);
         assertEq(aliceDeposit, 1000 * 10 ** 18, "Alice deposit should be 1000 tokens");
     }
 
@@ -399,258 +399,39 @@ contract TokenNetworkTest is Test {
     function testCloseChannel() public {
         bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
 
-        // Create balance proof: alice transferred 250 to bob (nonce 1)
-        TokenNetwork.BalanceProof memory balanceProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 1,
-            transferredAmount: 250 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        // Sign balance proof with alice's private key
-        bytes memory signature = signBalanceProof(alicePrivateKey, channelId, 1, 250 * 10 ** 18, 0, bytes32(0));
-
-        // Bob calls closeChannel with alice's balance proof and signature
+        // Bob calls closeChannel with just channelId
         vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, balanceProof, signature);
+        tokenNetwork.closeChannel(channelId);
 
         // Assert: Channel state is Closed
         (, TokenNetwork.ChannelState state, uint256 closedAt,,,) = tokenNetwork.channels(channelId);
         assertEq(uint256(state), uint256(TokenNetwork.ChannelState.Closed), "Channel should be Closed");
         assertEq(closedAt, block.timestamp, "Channel closedAt should be current timestamp");
-
-        // Assert: Bob is marked as closer
-        (, uint256 bobWithdrawn, bool bobIsCloser,,) = tokenNetwork.participants(channelId, bob);
-        assertTrue(bobIsCloser, "Bob should be marked as closer");
-
-        // Assert: Alice's nonce and transferred amount updated
-        (, uint256 aliceWithdrawn, bool aliceIsCloser, uint256 aliceNonce, uint256 aliceTransferred) =
-            tokenNetwork.participants(channelId, alice);
-        assertEq(aliceNonce, 1, "Alice nonce should be 1");
-        assertEq(aliceTransferred, 250 * 10 ** 18, "Alice transferred amount should be 250");
     }
 
-    event ChannelClosed(
-        bytes32 indexed channelId, address indexed closingParticipant, uint256 nonce, bytes32 balanceHash
-    );
+    event ChannelClosed(bytes32 indexed channelId, address indexed closingParticipant);
 
     // Test: closeChannel reverts on invalid state
     function testCloseChannelRevertsOnInvalidState() public {
         bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
 
-        // Create balance proof
-        TokenNetwork.BalanceProof memory balanceProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 1,
-            transferredAmount: 250 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory signature = signBalanceProof(alicePrivateKey, channelId, 1, 250 * 10 ** 18, 0, bytes32(0));
-
         // Bob closes channel
         vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, balanceProof, signature);
+        tokenNetwork.closeChannel(channelId);
 
         // Try to close again
         vm.expectRevert(TokenNetwork.InvalidChannelState.selector);
         vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, balanceProof, signature);
-    }
-
-    // Test: closeChannel reverts on invalid signature
-    function testCloseChannelRevertsOnInvalidSignature() public {
-        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
-
-        // Create balance proof
-        TokenNetwork.BalanceProof memory balanceProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 1,
-            transferredAmount: 250 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        // Sign with wrong private key (charlie's, not alice's)
-        bytes memory signature = signBalanceProof(charliePrivateKey, channelId, 1, 250 * 10 ** 18, 0, bytes32(0));
-
-        // Expect revert
-        vm.expectRevert(TokenNetwork.InvalidSignature.selector);
-        vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, balanceProof, signature);
-    }
-
-    // Test: closeChannel reverts on stale nonce
-    function testCloseChannelRevertsOnStaleNonce() public {
-        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
-
-        // Manually set alice's nonce to 5
-        // Note: We need to close and challenge first to set a nonce
-        TokenNetwork.BalanceProof memory initialProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 5,
-            transferredAmount: 100 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory initialSignature = signBalanceProof(alicePrivateKey, channelId, 5, 100 * 10 ** 18, 0, bytes32(0));
-
-        // Bob closes with nonce 5
-        vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, initialProof, initialSignature);
-
-        // Reopen channel for next test (since we can't reuse closed channel)
-        // Skip this test variation as it requires complex setup
-    }
-
-    // Test: updateNonClosingBalanceProof - Happy path challenge
-    function testUpdateNonClosingBalanceProof() public {
-        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
-
-        // Bob closes with alice's state (nonce 1, transferred 250)
-        TokenNetwork.BalanceProof memory aliceProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 1,
-            transferredAmount: 250 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory aliceSignature = signBalanceProof(alicePrivateKey, channelId, 1, 250 * 10 ** 18, 0, bytes32(0));
-
-        vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, aliceProof, aliceSignature);
-
-        // Alice challenges with bob's newer state (nonce 2, bob transferred 500 to alice)
-        TokenNetwork.BalanceProof memory bobProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 2,
-            transferredAmount: 500 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory bobSignature = signBalanceProof(bobPrivateKey, channelId, 2, 500 * 10 ** 18, 0, bytes32(0));
-
-        vm.prank(alice);
-        tokenNetwork.updateNonClosingBalanceProof(channelId, bobProof, bobSignature);
-
-        // Assert: Bob's nonce and transferred amount updated
-        (, uint256 bobWithdrawn, bool bobIsCloser, uint256 bobNonce, uint256 bobTransferred) =
-            tokenNetwork.participants(channelId, bob);
-        assertEq(bobNonce, 2, "Bob nonce should be 2");
-        assertEq(bobTransferred, 500 * 10 ** 18, "Bob transferred amount should be 500");
-    }
-
-    event NonClosingBalanceProofUpdated(
-        bytes32 indexed channelId, address indexed participant, uint256 nonce, bytes32 balanceHash
-    );
-
-    // Test: updateNonClosingBalanceProof reverts on expired challenge
-    function testUpdateNonClosingBalanceProofRevertsOnExpiredChallenge() public {
-        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
-
-        // Close channel
-        TokenNetwork.BalanceProof memory balanceProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 1,
-            transferredAmount: 250 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory signature = signBalanceProof(alicePrivateKey, channelId, 1, 250 * 10 ** 18, 0, bytes32(0));
-
-        vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, balanceProof, signature);
-
-        // Fast forward time past settlement timeout
-        vm.warp(block.timestamp + 1 hours + 1);
-
-        // Try to update
-        TokenNetwork.BalanceProof memory bobProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 2,
-            transferredAmount: 500 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory bobSignature = signBalanceProof(bobPrivateKey, channelId, 2, 500 * 10 ** 18, 0, bytes32(0));
-
-        vm.expectRevert(TokenNetwork.ChallengePeriodExpired.selector);
-        vm.prank(alice);
-        tokenNetwork.updateNonClosingBalanceProof(channelId, bobProof, bobSignature);
-    }
-
-    // Test: updateNonClosingBalanceProof reverts on non-monotonic nonce
-    function testUpdateNonClosingBalanceProofRevertsOnNonMonotonicNonce() public {
-        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
-
-        // Bob closes with alice's nonce 1
-        TokenNetwork.BalanceProof memory aliceProof1 = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 1,
-            transferredAmount: 100 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory aliceSignature1 = signBalanceProof(alicePrivateKey, channelId, 1, 100 * 10 ** 18, 0, bytes32(0));
-
-        vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, aliceProof1, aliceSignature1);
-
-        // Alice challenges with bob's nonce 5, establishing bob's nonce
-        TokenNetwork.BalanceProof memory bobProof1 = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 5,
-            transferredAmount: 250 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory bobSignature1 = signBalanceProof(bobPrivateKey, channelId, 5, 250 * 10 ** 18, 0, bytes32(0));
-
-        vm.prank(alice);
-        tokenNetwork.updateNonClosingBalanceProof(channelId, bobProof1, bobSignature1);
-
-        // Try to update again with nonce 3 (not greater than 5)
-        TokenNetwork.BalanceProof memory bobProof2 = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 3,
-            transferredAmount: 500 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory bobSignature2 = signBalanceProof(bobPrivateKey, channelId, 3, 500 * 10 ** 18, 0, bytes32(0));
-
-        vm.expectRevert(TokenNetwork.InvalidNonce.selector);
-        vm.prank(alice);
-        tokenNetwork.updateNonClosingBalanceProof(channelId, bobProof2, bobSignature2);
+        tokenNetwork.closeChannel(channelId);
     }
 
     // Test: settleChannel - Happy path settlement
     function testSettleChannel() public {
         bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
 
-        // Bob closes with alice's state (alice transferred 250 to bob)
-        TokenNetwork.BalanceProof memory balanceProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 1,
-            transferredAmount: 250 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory signature = signBalanceProof(alicePrivateKey, channelId, 1, 250 * 10 ** 18, 0, bytes32(0));
-
+        // Bob closes channel
         vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, balanceProof, signature);
+        tokenNetwork.closeChannel(channelId);
 
         // Fast forward past challenge period
         vm.warp(block.timestamp + 1 hours + 1);
@@ -666,13 +447,13 @@ contract TokenNetworkTest is Test {
         (, TokenNetwork.ChannelState state,,,,) = tokenNetwork.channels(channelId);
         assertEq(uint256(state), uint256(TokenNetwork.ChannelState.Settled), "Channel should be Settled");
 
-        // Assert: Alice received 750 tokens (1000 - 250 transferred)
+        // Assert: Each depositor gets deposit - claimedAmounts back
+        // No claims were made, so Alice gets 1000, Bob gets 1000
         uint256 aliceBalanceAfter = token.balanceOf(alice);
-        assertEq(aliceBalanceAfter - aliceBalanceBefore, 750 * 10 ** 18, "Alice should receive 750 tokens");
+        assertEq(aliceBalanceAfter - aliceBalanceBefore, 1000 * 10 ** 18, "Alice should receive 1000 tokens");
 
-        // Assert: Bob received 1250 tokens (1000 + 250 received)
         uint256 bobBalanceAfter = token.balanceOf(bob);
-        assertEq(bobBalanceAfter - bobBalanceBefore, 1250 * 10 ** 18, "Bob should receive 1250 tokens");
+        assertEq(bobBalanceAfter - bobBalanceBefore, 1000 * 10 ** 18, "Bob should receive 1000 tokens");
 
         // Assert: TokenNetwork contract balance is reduced
         uint256 contractBalance = token.balanceOf(address(tokenNetwork));
@@ -681,74 +462,13 @@ contract TokenNetworkTest is Test {
 
     event ChannelSettled(bytes32 indexed channelId, uint256 participant1Amount, uint256 participant2Amount);
 
-    // Test: settleChannel with challenge - Settlement after challenge
-    function testSettleChannelWithChallenge() public {
-        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
-
-        // Bob closes with alice's state (alice transferred 250, nonce 1)
-        TokenNetwork.BalanceProof memory aliceProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 1,
-            transferredAmount: 250 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory aliceSignature = signBalanceProof(alicePrivateKey, channelId, 1, 250 * 10 ** 18, 0, bytes32(0));
-
-        vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, aliceProof, aliceSignature);
-
-        // Alice challenges with bob's newer state (bob transferred 500, nonce 2)
-        TokenNetwork.BalanceProof memory bobProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 2,
-            transferredAmount: 500 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory bobSignature = signBalanceProof(bobPrivateKey, channelId, 2, 500 * 10 ** 18, 0, bytes32(0));
-
-        vm.prank(alice);
-        tokenNetwork.updateNonClosingBalanceProof(channelId, bobProof, bobSignature);
-
-        // Fast forward past challenge period
-        vm.warp(block.timestamp + 1 hours + 1);
-
-        // Record balances
-        uint256 aliceBalanceBefore = token.balanceOf(alice);
-        uint256 bobBalanceBefore = token.balanceOf(bob);
-
-        // Settle
-        tokenNetwork.settleChannel(channelId);
-
-        // Assert: Alice received 1250 tokens (1000 - 250 transferred + 500 received)
-        uint256 aliceBalanceAfter = token.balanceOf(alice);
-        assertEq(aliceBalanceAfter - aliceBalanceBefore, 1250 * 10 ** 18, "Alice should receive 1250 tokens");
-
-        // Assert: Bob received 750 tokens (1000 - 500 transferred + 250 received)
-        uint256 bobBalanceAfter = token.balanceOf(bob);
-        assertEq(bobBalanceAfter - bobBalanceBefore, 750 * 10 ** 18, "Bob should receive 750 tokens");
-    }
-
     // Test: settleChannel reverts before timeout
     function testSettleChannelRevertsBeforeTimeout() public {
         bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
 
         // Close channel
-        TokenNetwork.BalanceProof memory balanceProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 1,
-            transferredAmount: 250 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        bytes memory signature = signBalanceProof(alicePrivateKey, channelId, 1, 250 * 10 ** 18, 0, bytes32(0));
-
         vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, balanceProof, signature);
+        tokenNetwork.closeChannel(channelId);
 
         // Try to settle immediately
         vm.expectRevert(TokenNetwork.SettlementTimeoutNotExpired.selector);
@@ -764,11 +484,11 @@ contract TokenNetworkTest is Test {
         tokenNetwork.settleChannel(channelId);
     }
 
-    // Test: bilateral transfers - Both participants transfer
+    // Test: bilateral transfers - Both participants claim then close and settle
     function testBilateralTransfers() public {
         bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
 
-        // Close with alice's state: alice transferred 300 to bob (nonce 1)
+        // Bob claims 300 from Alice's signed balance proof
         TokenNetwork.BalanceProof memory aliceProof = TokenNetwork.BalanceProof({
             channelId: channelId,
             nonce: 1,
@@ -776,13 +496,12 @@ contract TokenNetworkTest is Test {
             lockedAmount: 0,
             locksRoot: bytes32(0)
         });
-
         bytes memory aliceSignature = signBalanceProof(alicePrivateKey, channelId, 1, 300 * 10 ** 18, 0, bytes32(0));
 
         vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, aliceProof, aliceSignature);
+        tokenNetwork.claimFromChannel(channelId, aliceProof, aliceSignature);
 
-        // Challenge with bob's state: bob transferred 200 to alice (nonce 1)
+        // Alice claims 200 from Bob's signed balance proof
         TokenNetwork.BalanceProof memory bobProof = TokenNetwork.BalanceProof({
             channelId: channelId,
             nonce: 1,
@@ -790,13 +509,15 @@ contract TokenNetworkTest is Test {
             lockedAmount: 0,
             locksRoot: bytes32(0)
         });
-
         bytes memory bobSignature = signBalanceProof(bobPrivateKey, channelId, 1, 200 * 10 ** 18, 0, bytes32(0));
 
         vm.prank(alice);
-        tokenNetwork.updateNonClosingBalanceProof(channelId, bobProof, bobSignature);
+        tokenNetwork.claimFromChannel(channelId, bobProof, bobSignature);
 
-        // Fast forward and settle
+        // Close and settle
+        vm.prank(bob);
+        tokenNetwork.closeChannel(channelId);
+
         vm.warp(block.timestamp + 1 hours + 1);
 
         uint256 aliceBalanceBefore = token.balanceOf(alice);
@@ -804,13 +525,14 @@ contract TokenNetworkTest is Test {
 
         tokenNetwork.settleChannel(channelId);
 
-        // Assert: Alice received 900 tokens (1000 - 300 transferred + 200 received)
+        // Settlement returns deposit - claimedAmounts to each depositor
+        // Alice: 1000 - 300 (claimed by Bob) = 700
+        // Bob: 1000 - 200 (claimed by Alice) = 800
         uint256 aliceBalanceAfter = token.balanceOf(alice);
-        assertEq(aliceBalanceAfter - aliceBalanceBefore, 900 * 10 ** 18, "Alice should receive 900 tokens");
+        assertEq(aliceBalanceAfter - aliceBalanceBefore, 700 * 10 ** 18, "Alice should receive 700 tokens from settlement");
 
-        // Assert: Bob received 1100 tokens (1000 - 200 transferred + 300 received)
         uint256 bobBalanceAfter = token.balanceOf(bob);
-        assertEq(bobBalanceAfter - bobBalanceBefore, 1100 * 10 ** 18, "Bob should receive 1100 tokens");
+        assertEq(bobBalanceAfter - bobBalanceBefore, 800 * 10 ** 18, "Bob should receive 800 tokens from settlement");
     }
 
     // Test: Pause prevents all state-changing operations
@@ -849,43 +571,19 @@ contract TokenNetworkTest is Test {
         vm.stopPrank();
 
         // Test: closeChannel reverts when paused
-        TokenNetwork.BalanceProof memory aliceProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 1,
-            transferredAmount: 100 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-        bytes memory aliceSignature = signBalanceProof(alicePrivateKey, channelId, 1, 100 * 10 ** 18, 0, bytes32(0));
-
         vm.startPrank(bob);
         vm.expectRevert();
-        tokenNetwork.closeChannel(channelId, aliceProof, aliceSignature);
+        tokenNetwork.closeChannel(channelId);
         vm.stopPrank();
 
         // Unpause to close channel
         tokenNetwork.unpause();
 
         vm.prank(bob);
-        tokenNetwork.closeChannel(channelId, aliceProof, aliceSignature);
+        tokenNetwork.closeChannel(channelId);
 
         // Pause again
         tokenNetwork.pause();
-
-        // Test: updateNonClosingBalanceProof reverts when paused
-        TokenNetwork.BalanceProof memory bobProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 2,
-            transferredAmount: 200 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-        bytes memory bobSignature = signBalanceProof(bobPrivateKey, channelId, 2, 200 * 10 ** 18, 0, bytes32(0));
-
-        vm.startPrank(alice);
-        vm.expectRevert();
-        tokenNetwork.updateNonClosingBalanceProof(channelId, bobProof, bobSignature);
-        vm.stopPrank();
 
         // Fast forward past challenge period
         vm.warp(block.timestamp + 1 hours + 1);
@@ -957,7 +655,7 @@ contract TokenNetworkTest is Test {
         testNetwork.setTotalDeposit(channelId, alice, 900 * 10 ** 18);
 
         // Verify deposit
-        (uint256 aliceDeposit,,,,) = testNetwork.participants(channelId, alice);
+        (uint256 aliceDeposit,,) = testNetwork.participants(channelId, alice);
         assertEq(aliceDeposit, 900 * 10 ** 18, "Alice should have 900 tokens deposited");
 
         vm.stopPrank();
@@ -983,7 +681,7 @@ contract TokenNetworkTest is Test {
         feeTokenNetwork.setTotalDeposit(channelId, alice, 1000 * 10 ** 18);
 
         // Verify: Participant deposit equals actualReceived (900 tokens after 10% fee)
-        (uint256 aliceDeposit,,,,) = feeTokenNetwork.participants(channelId, alice);
+        (uint256 aliceDeposit,,) = feeTokenNetwork.participants(channelId, alice);
         assertEq(aliceDeposit, 900 * 10 ** 18, "Deposit should be 900 tokens (90% of 1000 after 10% fee)");
 
         vm.stopPrank();
@@ -1021,265 +719,6 @@ contract TokenNetworkTest is Test {
         // Try again (should still revert)
         vm.expectRevert(TokenNetwork.ChannelNotExpired.selector);
         tokenNetwork.forceCloseExpiredChannel(channelId);
-    }
-
-    function testCooperativeSettle() public {
-        // Open channel
-        vm.prank(alice);
-        bytes32 channelId = tokenNetwork.openChannel(bob, 1 hours);
-
-        // Both participants deposit 1000 tokens
-        vm.startPrank(alice);
-        token.approve(address(tokenNetwork), 1000 * 10 ** 18);
-        tokenNetwork.setTotalDeposit(channelId, alice, 1000 * 10 ** 18);
-        vm.stopPrank();
-
-        vm.startPrank(bob);
-        token.approve(address(tokenNetwork), 1000 * 10 ** 18);
-        tokenNetwork.setTotalDeposit(channelId, bob, 1000 * 10 ** 18);
-        vm.stopPrank();
-
-        // Create final state: Alice sent 250 to Bob, Bob sent 100 to Alice
-        // Alice final: 1000 - 250 + 100 = 850
-        // Bob final: 1000 - 100 + 250 = 1150
-
-        // Alice's balance proof (what Alice sent)
-        TokenNetwork.BalanceProof memory aliceProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 10,
-            transferredAmount: 250 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        // Bob's balance proof (what Bob sent)
-        TokenNetwork.BalanceProof memory bobProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 10, // Same nonce = agreed final state
-            transferredAmount: 100 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        // Sign balance proofs
-        bytes32 TYPE_HASH =
-            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
-        bytes32 nameHash = keccak256("TokenNetwork");
-        bytes32 versionHash = keccak256("1");
-        bytes32 domainSeparator =
-            keccak256(abi.encode(TYPE_HASH, nameHash, versionHash, block.chainid, address(tokenNetwork)));
-        bytes32 balanceProofTypeHash = keccak256(
-            "BalanceProof(bytes32 channelId,uint256 nonce,uint256 transferredAmount,uint256 lockedAmount,bytes32 locksRoot)"
-        );
-
-        bytes32 aliceStructHash = keccak256(
-            abi.encode(
-                balanceProofTypeHash,
-                aliceProof.channelId,
-                aliceProof.nonce,
-                aliceProof.transferredAmount,
-                aliceProof.lockedAmount,
-                aliceProof.locksRoot
-            )
-        );
-        bytes32 aliceDigest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, aliceStructHash));
-        (uint8 v1, bytes32 r1, bytes32 s1) = vm.sign(alicePrivateKey, aliceDigest);
-        bytes memory aliceSig = abi.encodePacked(r1, s1, v1);
-
-        bytes32 bobStructHash = keccak256(
-            abi.encode(
-                balanceProofTypeHash,
-                bobProof.channelId,
-                bobProof.nonce,
-                bobProof.transferredAmount,
-                bobProof.lockedAmount,
-                bobProof.locksRoot
-            )
-        );
-        bytes32 bobDigest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, bobStructHash));
-        (uint8 v2, bytes32 r2, bytes32 s2) = vm.sign(bobPrivateKey, bobDigest);
-        bytes memory bobSig = abi.encodePacked(r2, s2, v2);
-
-        // Record balances before settlement
-        uint256 aliceBalanceBefore = token.balanceOf(alice);
-        uint256 bobBalanceBefore = token.balanceOf(bob);
-
-        // Cooperatively settle (anyone can call with both signatures)
-        tokenNetwork.cooperativeSettle(channelId, aliceProof, aliceSig, bobProof, bobSig);
-
-        // Verify: Channel is Settled
-        (, TokenNetwork.ChannelState state,,,,) = tokenNetwork.channels(channelId);
-        assertEq(uint256(state), uint256(TokenNetwork.ChannelState.Settled), "Channel should be Settled");
-
-        // Verify: Alice received 850 tokens (1000 - 250 + 100)
-        assertEq(
-            token.balanceOf(alice),
-            aliceBalanceBefore + 850 * 10 ** 18,
-            "Alice should receive 850 tokens"
-        );
-
-        // Verify: Bob received 1150 tokens (1000 - 100 + 250)
-        assertEq(
-            token.balanceOf(bob),
-            bobBalanceBefore + 1150 * 10 ** 18,
-            "Bob should receive 1150 tokens"
-        );
-    }
-
-    function testCooperativeSettleRevertsOnNonceMismatch() public {
-        // Open channel with deposits
-        vm.prank(alice);
-        bytes32 channelId = tokenNetwork.openChannel(bob, 1 hours);
-
-        vm.startPrank(alice);
-        token.approve(address(tokenNetwork), 1000 * 10 ** 18);
-        tokenNetwork.setTotalDeposit(channelId, alice, 1000 * 10 ** 18);
-        vm.stopPrank();
-
-        vm.startPrank(bob);
-        token.approve(address(tokenNetwork), 1000 * 10 ** 18);
-        tokenNetwork.setTotalDeposit(channelId, bob, 1000 * 10 ** 18);
-        vm.stopPrank();
-
-        // Create proofs with different nonces
-        TokenNetwork.BalanceProof memory aliceProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 10, // Alice thinks final nonce is 10
-            transferredAmount: 250 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        TokenNetwork.BalanceProof memory bobProof = TokenNetwork.BalanceProof({
-            channelId: channelId,
-            nonce: 11, // Bob thinks final nonce is 11 - MISMATCH!
-            transferredAmount: 100 * 10 ** 18,
-            lockedAmount: 0,
-            locksRoot: bytes32(0)
-        });
-
-        // Sign proofs
-        bytes32 TYPE_HASH =
-            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
-        bytes32 nameHash = keccak256("TokenNetwork");
-        bytes32 versionHash = keccak256("1");
-        bytes32 domainSeparator =
-            keccak256(abi.encode(TYPE_HASH, nameHash, versionHash, block.chainid, address(tokenNetwork)));
-        bytes32 balanceProofTypeHash = keccak256(
-            "BalanceProof(bytes32 channelId,uint256 nonce,uint256 transferredAmount,uint256 lockedAmount,bytes32 locksRoot)"
-        );
-
-        bytes32 aliceStructHash = keccak256(
-            abi.encode(balanceProofTypeHash, aliceProof.channelId, aliceProof.nonce, aliceProof.transferredAmount, aliceProof.lockedAmount, aliceProof.locksRoot)
-        );
-        bytes32 aliceDigest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, aliceStructHash));
-        (uint8 v1, bytes32 r1, bytes32 s1) = vm.sign(alicePrivateKey, aliceDigest);
-        bytes memory aliceSig = abi.encodePacked(r1, s1, v1);
-
-        bytes32 bobStructHash = keccak256(
-            abi.encode(balanceProofTypeHash, bobProof.channelId, bobProof.nonce, bobProof.transferredAmount, bobProof.lockedAmount, bobProof.locksRoot)
-        );
-        bytes32 bobDigest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, bobStructHash));
-        (uint8 v2, bytes32 r2, bytes32 s2) = vm.sign(bobPrivateKey, bobDigest);
-        bytes memory bobSig = abi.encodePacked(r2, s2, v2);
-
-        // Test: Cooperative settle should revert on nonce mismatch
-        vm.expectRevert(TokenNetwork.NonceMismatch.selector);
-        tokenNetwork.cooperativeSettle(channelId, aliceProof, aliceSig, bobProof, bobSig);
-    }
-
-    function testWithdraw() public {
-        // Open channel
-        vm.prank(alice);
-        bytes32 channelId = tokenNetwork.openChannel(bob, 1 hours);
-
-        // Alice deposits 1000 tokens
-        vm.startPrank(alice);
-        token.approve(address(tokenNetwork), 1000 * 10 ** 18);
-        tokenNetwork.setTotalDeposit(channelId, alice, 1000 * 10 ** 18);
-        vm.stopPrank();
-
-        // Alice wants to withdraw 100 tokens with Bob's signature
-        uint256 withdrawnAmount = 100 * 10 ** 18;
-        uint256 nonce = 1;
-
-        // Create withdrawal proof struct (for signing)
-        bytes32 TYPE_HASH =
-            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
-        bytes32 nameHash = keccak256("TokenNetwork");
-        bytes32 versionHash = keccak256("1");
-        bytes32 domainSeparator =
-            keccak256(abi.encode(TYPE_HASH, nameHash, versionHash, block.chainid, address(tokenNetwork)));
-
-        bytes32 withdrawalProofTypeHash = keccak256(
-            "WithdrawalProof(bytes32 channelId,address participant,uint256 withdrawnAmount,uint256 nonce)"
-        );
-
-        bytes32 structHash = keccak256(
-            abi.encode(withdrawalProofTypeHash, channelId, alice, withdrawnAmount, nonce)
-        );
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
-
-        // Bob signs the withdrawal proof
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(bobPrivateKey, digest);
-        bytes memory bobSignature = abi.encodePacked(r, s, v);
-
-        // Record alice's balance before withdrawal
-        uint256 aliceBalanceBefore = token.balanceOf(alice);
-
-        // Alice withdraws with Bob's signature
-        vm.prank(alice);
-        tokenNetwork.withdraw(channelId, withdrawnAmount, nonce, bobSignature);
-
-        // Verify: Alice received 100 tokens
-        assertEq(
-            token.balanceOf(alice),
-            aliceBalanceBefore + withdrawnAmount,
-            "Alice should receive 100 tokens"
-        );
-
-        // Verify: withdrawnAmount updated
-        (, uint256 aliceWithdrawn,,,) = tokenNetwork.participants(channelId, alice);
-        assertEq(aliceWithdrawn, withdrawnAmount, "Alice withdrawnAmount should be 100");
-    }
-
-    function testWithdrawRevertsOnExcessiveAmount() public {
-        // Open channel and deposit
-        vm.prank(alice);
-        bytes32 channelId = tokenNetwork.openChannel(bob, 1 hours);
-
-        vm.startPrank(alice);
-        token.approve(address(tokenNetwork), 1000 * 10 ** 18);
-        tokenNetwork.setTotalDeposit(channelId, alice, 1000 * 10 ** 18);
-        vm.stopPrank();
-
-        // Try to withdraw more than deposited
-        uint256 excessiveWithdrawal = 2000 * 10 ** 18; // More than 1000 deposit
-        uint256 nonce = 1;
-
-        // Bob signs the excessive withdrawal (even though it will fail)
-        bytes32 TYPE_HASH =
-            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
-        bytes32 nameHash = keccak256("TokenNetwork");
-        bytes32 versionHash = keccak256("1");
-        bytes32 domainSeparator =
-            keccak256(abi.encode(TYPE_HASH, nameHash, versionHash, block.chainid, address(tokenNetwork)));
-
-        bytes32 withdrawalProofTypeHash = keccak256(
-            "WithdrawalProof(bytes32 channelId,address participant,uint256 withdrawnAmount,uint256 nonce)"
-        );
-
-        bytes32 structHash = keccak256(
-            abi.encode(withdrawalProofTypeHash, channelId, alice, excessiveWithdrawal, nonce)
-        );
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(bobPrivateKey, digest);
-        bytes memory bobSignature = abi.encodePacked(r, s, v);
-
-        // Test: Should revert
-        vm.prank(alice);
-        vm.expectRevert(TokenNetwork.WithdrawalExceedsDeposit.selector);
-        tokenNetwork.withdraw(channelId, excessiveWithdrawal, nonce, bobSignature);
     }
 
     function testEmergencyWithdrawOnlyWhenPaused() public {
@@ -1344,189 +783,247 @@ contract TokenNetworkTest is Test {
         assertEq(token.balanceOf(address(tokenNetwork)), 0);
     }
 
-    // Test: withdraw with non-increasing withdrawn amount
-    function testWithdrawRevertsOnNonIncreasingAmount() public {
-        // Open channel
-        vm.prank(alice);
-        bytes32 channelId = tokenNetwork.openChannel(bob, 1 hours);
 
-        // Deposit tokens
-        vm.startPrank(alice);
-        token.approve(address(tokenNetwork), 1000 * 10 ** 18);
-        tokenNetwork.setTotalDeposit(channelId, alice, 1000 * 10 ** 18);
-        vm.stopPrank();
+    // ===== claimFromChannel Tests =====
 
-        // Calculate domain separator
-        bytes32 TYPE_HASH =
-            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
-        bytes32 nameHash = keccak256("TokenNetwork");
-        bytes32 versionHash = keccak256("1");
-        bytes32 domainSeparator =
-            keccak256(abi.encode(TYPE_HASH, nameHash, versionHash, block.chainid, address(tokenNetwork)));
-        bytes32 withdrawalProofTypeHash = keccak256(
-            "WithdrawalProof(bytes32 channelId,address participant,uint256 withdrawnAmount,uint256 nonce)"
-        );
+    event ChannelClaimed(bytes32 indexed channelId, address indexed claimant, uint256 claimedAmount, uint256 totalClaimed);
 
-        // First withdrawal: 100 tokens
-        uint256 withdrawnAmount1 = 100 * 10 ** 18;
-        bytes32 structHash1 = keccak256(
-            abi.encode(withdrawalProofTypeHash, channelId, alice, withdrawnAmount1, uint256(1))
-        );
-        bytes32 digest1 = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash1));
-        (uint8 v1, bytes32 r1, bytes32 s1) = vm.sign(bobPrivateKey, digest1);
-        bytes memory counterpartySignature1 = abi.encodePacked(r1, s1, v1);
+    // Test: claimFromChannel - Happy path: B claims from A's signed balance proof, channel stays open
+    function testClaimFromChannel() public {
+        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 0);
 
-        vm.prank(alice);
-        tokenNetwork.withdraw(channelId, withdrawnAmount1, 1, counterpartySignature1);
+        uint256 bobBalanceBefore = token.balanceOf(bob);
 
-        // Second withdrawal attempt: same amount (should revert)
-        bytes32 structHash2 = keccak256(
-            abi.encode(withdrawalProofTypeHash, channelId, alice, withdrawnAmount1, uint256(2))
-        );
-        bytes32 digest2 = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash2));
-        (uint8 v2, bytes32 r2, bytes32 s2) = vm.sign(bobPrivateKey, digest2);
-        bytes memory counterpartySignature2 = abi.encodePacked(r2, s2, v2);
+        // Alice signs a balance proof transferring 300 to Bob
+        TokenNetwork.BalanceProof memory balanceProof = TokenNetwork.BalanceProof({
+            channelId: channelId,
+            nonce: 1,
+            transferredAmount: 300 * 10 ** 18,
+            lockedAmount: 0,
+            locksRoot: bytes32(0)
+        });
+        bytes memory aliceSignature = signBalanceProof(alicePrivateKey, channelId, 1, 300 * 10 ** 18, 0, bytes32(0));
 
-        vm.prank(alice);
-        vm.expectRevert(TokenNetwork.WithdrawalNotIncreasing.selector);
-        tokenNetwork.withdraw(channelId, withdrawnAmount1, 2, counterpartySignature2);
-    }
-
-    // Test: updateNonClosingBalanceProof reverts when caller is closer
-    function testUpdateNonClosingBalanceProofRevertsOnCallerIsCloser() public {
-        // Create and fund channel
-        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
-
-        // Bob closes channel with Alice's proof
-        uint256 nonce = 5;
-        uint256 transferredAmount = 100 * 10 ** 18;
-        bytes memory aliceSignature = signBalanceProof(alicePrivateKey, channelId, nonce, transferredAmount, 0, bytes32(0));
-
-        vm.prank(bob);
-        tokenNetwork.closeChannel(
-            channelId,
-            TokenNetwork.BalanceProof({
-                channelId: channelId,
-                nonce: nonce,
-                transferredAmount: transferredAmount,
-                lockedAmount: 0,
-                locksRoot: bytes32(0)
-            }),
-            aliceSignature
-        );
-
-        // Bob (the closer) tries to update balance proof (should revert)
-        uint256 newNonce = 6;
-        bytes memory bobSignature = signBalanceProof(bobPrivateKey, channelId, newNonce, transferredAmount, 0, bytes32(0));
-
-        vm.prank(bob);
-        vm.expectRevert(TokenNetwork.CallerIsCloser.selector);
-        tokenNetwork.updateNonClosingBalanceProof(
-            channelId,
-            TokenNetwork.BalanceProof({
-                channelId: channelId,
-                nonce: newNonce,
-                transferredAmount: transferredAmount,
-                lockedAmount: 0,
-                locksRoot: bytes32(0)
-            }),
-            bobSignature
-        );
-    }
-
-    // Test: updateNonClosingBalanceProof reverts when caller is not a participant
-    function testUpdateNonClosingBalanceProofRevertsOnInvalidParticipant() public {
-        // Create and fund channel
-        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 1000 * 10 ** 18);
-
-        // Bob closes channel with Alice's proof
-        uint256 nonce = 5;
-        uint256 transferredAmount = 100 * 10 ** 18;
-        bytes memory aliceSignature = signBalanceProof(alicePrivateKey, channelId, nonce, transferredAmount, 0, bytes32(0));
-
-        vm.prank(bob);
-        tokenNetwork.closeChannel(
-            channelId,
-            TokenNetwork.BalanceProof({
-                channelId: channelId,
-                nonce: nonce,
-                transferredAmount: transferredAmount,
-                lockedAmount: 0,
-                locksRoot: bytes32(0)
-            }),
-            aliceSignature
-        );
-
-        // Charlie (not a participant) tries to update balance proof (should revert)
-        uint256 newNonce = 6;
-        bytes memory charlieSignature = signBalanceProof(charliePrivateKey, channelId, newNonce, transferredAmount, 0, bytes32(0));
-
-        vm.prank(charlie);
-        vm.expectRevert(TokenNetwork.InvalidParticipant.selector);
-        tokenNetwork.updateNonClosingBalanceProof(
-            channelId,
-            TokenNetwork.BalanceProof({
-                channelId: channelId,
-                nonce: newNonce,
-                transferredAmount: transferredAmount,
-                lockedAmount: 0,
-                locksRoot: bytes32(0)
-            }),
-            charlieSignature
-        );
-    }
-
-    // Test: cooperativeSettle with reversed participant order (covers line 575-578)
-    function testCooperativeSettleReversedParticipants() public {
-        // Open channel
-        vm.prank(bob);
-        bytes32 channelId = tokenNetwork.openChannel(alice, 1 hours);
-
-        // Deposit tokens
-        vm.startPrank(alice);
-        token.approve(address(tokenNetwork), 1000 * 10 ** 18);
-        tokenNetwork.setTotalDeposit(channelId, alice, 1000 * 10 ** 18);
-        vm.stopPrank();
-
+        // Bob claims from channel
         vm.startPrank(bob);
-        token.approve(address(tokenNetwork), 1000 * 10 ** 18);
-        tokenNetwork.setTotalDeposit(channelId, bob, 1000 * 10 ** 18);
+        vm.expectEmit(true, true, false, true);
+        emit ChannelClaimed(channelId, bob, 300 * 10 ** 18, 300 * 10 ** 18);
+        tokenNetwork.claimFromChannel(channelId, balanceProof, aliceSignature);
         vm.stopPrank();
 
-        // Create balance proofs - Alice sent 100 to Bob, Bob sent 50 to Alice
-        uint256 aliceTransferred = 100 * 10 ** 18;
-        uint256 bobTransferred = 50 * 10 ** 18;
+        // Verify Bob received the tokens
+        assertEq(token.balanceOf(bob), bobBalanceBefore + 300 * 10 ** 18, "Bob should receive claimed tokens");
 
-        // Sign balance proofs
-        bytes memory bobSignature = signBalanceProof(bobPrivateKey, channelId, 5, bobTransferred, 0, bytes32(0));
-        bytes memory aliceSignature = signBalanceProof(alicePrivateKey, channelId, 5, aliceTransferred, 0, bytes32(0));
+        // Verify channel is STILL OPEN
+        (, TokenNetwork.ChannelState state,,,,) = tokenNetwork.channels(channelId);
+        assertEq(uint256(state), uint256(TokenNetwork.ChannelState.Opened), "Channel should remain open after claim");
+
+        // Verify claimed amounts tracking
+        assertEq(tokenNetwork.claimedAmounts(channelId, bob), 300 * 10 ** 18, "Claimed amount should be tracked");
+    }
+
+    // Test: claimFromChannel - Multiple sequential claims
+    function testClaimFromChannelMultipleClaims() public {
+        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 0);
+
+        uint256 bobBalanceBefore = token.balanceOf(bob);
+
+        // First claim: 200 tokens
+        TokenNetwork.BalanceProof memory proof1 = TokenNetwork.BalanceProof({
+            channelId: channelId,
+            nonce: 1,
+            transferredAmount: 200 * 10 ** 18,
+            lockedAmount: 0,
+            locksRoot: bytes32(0)
+        });
+        bytes memory sig1 = signBalanceProof(alicePrivateKey, channelId, 1, 200 * 10 ** 18, 0, bytes32(0));
+
+        vm.prank(bob);
+        tokenNetwork.claimFromChannel(channelId, proof1, sig1);
+
+        assertEq(token.balanceOf(bob), bobBalanceBefore + 200 * 10 ** 18, "After first claim");
+
+        // Second claim: cumulative 500 tokens (delta = 300)
+        TokenNetwork.BalanceProof memory proof2 = TokenNetwork.BalanceProof({
+            channelId: channelId,
+            nonce: 2,
+            transferredAmount: 500 * 10 ** 18,
+            lockedAmount: 0,
+            locksRoot: bytes32(0)
+        });
+        bytes memory sig2 = signBalanceProof(alicePrivateKey, channelId, 2, 500 * 10 ** 18, 0, bytes32(0));
+
+        vm.prank(bob);
+        tokenNetwork.claimFromChannel(channelId, proof2, sig2);
+
+        assertEq(token.balanceOf(bob), bobBalanceBefore + 500 * 10 ** 18, "After second claim");
+
+        // Verify channel is still open
+        (, TokenNetwork.ChannelState state,,,,) = tokenNetwork.channels(channelId);
+        assertEq(uint256(state), uint256(TokenNetwork.ChannelState.Opened), "Channel should still be open");
+
+        // Verify total claimed
+        assertEq(tokenNetwork.claimedAmounts(channelId, bob), 500 * 10 ** 18, "Total claimed should be cumulative");
+    }
+
+    // Test: claimFromChannel - Reverts on stale nonce
+    function testClaimFromChannelRevertsOnStaleNonce() public {
+        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 0);
+
+        // First claim with nonce 1
+        TokenNetwork.BalanceProof memory proof1 = TokenNetwork.BalanceProof({
+            channelId: channelId,
+            nonce: 1,
+            transferredAmount: 200 * 10 ** 18,
+            lockedAmount: 0,
+            locksRoot: bytes32(0)
+        });
+        bytes memory sig1 = signBalanceProof(alicePrivateKey, channelId, 1, 200 * 10 ** 18, 0, bytes32(0));
+
+        vm.prank(bob);
+        tokenNetwork.claimFromChannel(channelId, proof1, sig1);
+
+        // Try to claim again with same nonce (should revert)
+        vm.prank(bob);
+        vm.expectRevert(TokenNetwork.InvalidNonce.selector);
+        tokenNetwork.claimFromChannel(channelId, proof1, sig1);
+    }
+
+    // Test: claimFromChannel - Reverts when claim exceeds deposit
+    function testClaimFromChannelRevertsOnInsufficientBalance() public {
+        bytes32 channelId = createAndFundChannel(alice, bob, 500 * 10 ** 18, 0);
+
+        // Try to claim more than Alice deposited
+        TokenNetwork.BalanceProof memory balanceProof = TokenNetwork.BalanceProof({
+            channelId: channelId,
+            nonce: 1,
+            transferredAmount: 600 * 10 ** 18,
+            lockedAmount: 0,
+            locksRoot: bytes32(0)
+        });
+        bytes memory aliceSignature = signBalanceProof(alicePrivateKey, channelId, 1, 600 * 10 ** 18, 0, bytes32(0));
+
+        vm.prank(bob);
+        vm.expectRevert(TokenNetwork.InsufficientChannelBalance.selector);
+        tokenNetwork.claimFromChannel(channelId, balanceProof, aliceSignature);
+    }
+
+    // Test: claimFromChannel - Reverts on wrong signer
+    function testClaimFromChannelRevertsOnWrongSigner() public {
+        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 0);
+
+        // Charlie signs (not a participant)
+        TokenNetwork.BalanceProof memory balanceProof = TokenNetwork.BalanceProof({
+            channelId: channelId,
+            nonce: 1,
+            transferredAmount: 300 * 10 ** 18,
+            lockedAmount: 0,
+            locksRoot: bytes32(0)
+        });
+        bytes memory charlieSignature = signBalanceProof(charliePrivateKey, channelId, 1, 300 * 10 ** 18, 0, bytes32(0));
+
+        vm.prank(bob);
+        vm.expectRevert(TokenNetwork.InvalidSignature.selector);
+        tokenNetwork.claimFromChannel(channelId, balanceProof, charlieSignature);
+    }
+
+    // Test: claimFromChannel then settleChannel - No double-pay
+    function testClaimThenSettleNoDoublePay() public {
+        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 500 * 10 ** 18);
 
         uint256 aliceBalanceBefore = token.balanceOf(alice);
         uint256 bobBalanceBefore = token.balanceOf(bob);
 
-        // Cooperative settle with Bob's proof first (reversed order)
-        tokenNetwork.cooperativeSettle(
-            channelId,
-            TokenNetwork.BalanceProof({
-                channelId: channelId,
-                nonce: 5,
-                transferredAmount: bobTransferred,
-                lockedAmount: 0,
-                locksRoot: bytes32(0)
-            }),
-            bobSignature,
-            TokenNetwork.BalanceProof({
-                channelId: channelId,
-                nonce: 5,
-                transferredAmount: aliceTransferred,
-                lockedAmount: 0,
-                locksRoot: bytes32(0)
-            }),
-            aliceSignature
-        );
+        // Bob claims 300 from Alice's balance proof
+        TokenNetwork.BalanceProof memory claimProof = TokenNetwork.BalanceProof({
+            channelId: channelId,
+            nonce: 1,
+            transferredAmount: 300 * 10 ** 18,
+            lockedAmount: 0,
+            locksRoot: bytes32(0)
+        });
+        bytes memory aliceSig = signBalanceProof(alicePrivateKey, channelId, 1, 300 * 10 ** 18, 0, bytes32(0));
 
-        // Verify final balances: Alice gets 1000 - 100 + 50 = 950, Bob gets 1000 - 50 + 100 = 1050
-        assertEq(token.balanceOf(alice), aliceBalanceBefore + 950 * 10 ** 18);
-        assertEq(token.balanceOf(bob), bobBalanceBefore + 1050 * 10 ** 18);
+        vm.prank(bob);
+        tokenNetwork.claimFromChannel(channelId, claimProof, aliceSig);
+
+        // Bob already received 300 from claim
+        assertEq(token.balanceOf(bob), bobBalanceBefore + 300 * 10 ** 18, "Bob should have claimed 300");
+
+        // Bob closes channel
+        vm.prank(bob);
+        tokenNetwork.closeChannel(channelId);
+
+        // Fast forward past challenge period
+        vm.warp(block.timestamp + 1 hours + 1);
+
+        // Settle channel
+        tokenNetwork.settleChannel(channelId);
+
+        // Settlement returns deposit - claimedAmounts to each depositor:
+        // Alice: deposit=1000, claimedAmounts(alice)=300 (claimed by Bob) → settle returns 1000 - 300 = 700
+        // Bob: deposit=500, claimedAmounts(bob)=0 → settle returns 500 - 0 = 500
+        // Bob's total: 300 (from claim) + 500 (from settle) = 800
+        assertEq(token.balanceOf(alice), aliceBalanceBefore + 700 * 10 ** 18, "Alice final balance after settle");
+        assertEq(token.balanceOf(bob), bobBalanceBefore + 300 * 10 ** 18 + 500 * 10 ** 18, "Bob final balance (claim + settle)");
+    }
+
+    // Test: claimFromChannel - Reverts on settled channel
+    function testClaimFromChannelRevertsOnSettledChannel() public {
+        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 0);
+
+        // Close the channel
+        vm.prank(bob);
+        tokenNetwork.closeChannel(channelId);
+
+        // Fast forward past challenge period and settle
+        vm.warp(block.timestamp + 1 hours + 1);
+        tokenNetwork.settleChannel(channelId);
+
+        // Try to claim from settled channel
+        TokenNetwork.BalanceProof memory claimProof = TokenNetwork.BalanceProof({
+            channelId: channelId,
+            nonce: 1,
+            transferredAmount: 200 * 10 ** 18,
+            lockedAmount: 0,
+            locksRoot: bytes32(0)
+        });
+        bytes memory aliceSig = signBalanceProof(alicePrivateKey, channelId, 1, 200 * 10 ** 18, 0, bytes32(0));
+
+        vm.prank(bob);
+        vm.expectRevert(TokenNetwork.InvalidChannelState.selector);
+        tokenNetwork.claimFromChannel(channelId, claimProof, aliceSig);
+    }
+
+    // Test: claimFromChannel - Reverts when nothing to claim
+    function testClaimFromChannelRevertsOnNothingToClaim() public {
+        bytes32 channelId = createAndFundChannel(alice, bob, 1000 * 10 ** 18, 0);
+
+        // First claim: 200 tokens with nonce 1
+        TokenNetwork.BalanceProof memory proof1 = TokenNetwork.BalanceProof({
+            channelId: channelId,
+            nonce: 1,
+            transferredAmount: 200 * 10 ** 18,
+            lockedAmount: 0,
+            locksRoot: bytes32(0)
+        });
+        bytes memory sig1 = signBalanceProof(alicePrivateKey, channelId, 1, 200 * 10 ** 18, 0, bytes32(0));
+
+        vm.prank(bob);
+        tokenNetwork.claimFromChannel(channelId, proof1, sig1);
+
+        // Try to claim again with higher nonce but same transferredAmount (nothing new to claim)
+        TokenNetwork.BalanceProof memory proof2 = TokenNetwork.BalanceProof({
+            channelId: channelId,
+            nonce: 2,
+            transferredAmount: 200 * 10 ** 18,
+            lockedAmount: 0,
+            locksRoot: bytes32(0)
+        });
+        bytes memory sig2 = signBalanceProof(alicePrivateKey, channelId, 2, 200 * 10 ** 18, 0, bytes32(0));
+
+        vm.prank(bob);
+        vm.expectRevert(TokenNetwork.NothingToClaim.selector);
+        tokenNetwork.claimFromChannel(channelId, proof2, sig2);
     }
 }

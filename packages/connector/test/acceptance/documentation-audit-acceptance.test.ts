@@ -1,27 +1,20 @@
 /* eslint-disable no-console */
 /**
- * Documentation Completeness Audit Tests
- * Story 12.10: Production Acceptance Testing and Go-Live
+ * Documentation Completeness Audit
  *
- * Validates that all required documentation exists and meets quality standards:
- * - Architecture documentation
- * - API documentation
- * - Operational runbooks
- * - Security documentation
- * - Deployment guides
+ * NOTE: This is a filesystem compliance check, not a code test. It validates
+ * that required documentation files exist and contain expected sections.
+ * No production code is exercised. Consider moving to a pre-commit hook
+ * or CI lint step for faster feedback.
  *
- * Test Coverage (AC: 7):
- * - All required documentation files exist
- * - Documentation is not empty or placeholder-only
- * - Key sections are present in each document
- * - Cross-references are valid
+ * @see Story 12.10: Production Acceptance Testing and Go-Live
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 
-// Acceptance tests have 5 minute timeout per test
-jest.setTimeout(300000);
+// Filesystem checks are fast — 30 seconds is more than enough
+jest.setTimeout(30000);
 
 // Project root directory
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..', '..', '..');

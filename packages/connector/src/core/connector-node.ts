@@ -46,9 +46,6 @@ import {
 import { HealthServer } from '../http/health-server';
 import { AdminServer } from '../http/admin-server';
 import { HealthStatus, HealthStatusProvider } from '../http/types';
-import { TelemetryEmitter } from '../telemetry/telemetry-emitter';
-import { PeerStatus } from '../telemetry/types';
-import { EventStore, ExplorerServer } from '../explorer';
 import { PaymentChannelSDK } from '../settlement/payment-channel-sdk';
 import { ChannelManager } from '../settlement/channel-manager';
 import { SettlementExecutor } from '../settlement/settlement-executor';
@@ -81,9 +78,6 @@ export class ConnectorNode implements HealthStatusProvider {
   private readonly _btpServer: BTPServer;
   private readonly _healthServer: HealthServer;
   private _adminServer: AdminServer | null = null;
-  private readonly _telemetryEmitter: TelemetryEmitter | null;
-  private _eventStore: EventStore | null = null;
-  private _explorerServer: ExplorerServer | null = null;
   private _paymentChannelSDK: PaymentChannelSDK | null = null;
   private _chainSDKs: Map<number, PaymentChannelSDK> = new Map();
   private _channelManager: ChannelManager | null = null;
@@ -96,6 +90,15 @@ export class ConnectorNode implements HealthStatusProvider {
   private _healthStatus: 'healthy' | 'unhealthy' | 'starting' = 'starting';
   private readonly _startTime: Date = new Date();
   private _btpServerStarted: boolean = false;
+  private _defaultSettlementTokenId: string = 'M2M';
+
+  /**
+   * The canonical token symbol resolved from the on-chain ERC-20 contract at startup.
+   * Falls back to 'M2M' if the RPC call fails or settlement is disabled.
+   */
+  get defaultSettlementTokenId(): string {
+    return this._defaultSettlementTokenId;
+  }
 
   /**
    * Create ConnectorNode instance
@@ -152,33 +155,12 @@ export class ConnectorNode implements HealthStatusProvider {
       logger.child({ component: 'BTPClientManager' })
     );
 
-    // Initialize telemetry emitter if DASHBOARD_TELEMETRY_URL is set
-    const dashboardUrl = process.env.DASHBOARD_TELEMETRY_URL;
-    if (dashboardUrl) {
-      this._telemetryEmitter = new TelemetryEmitter(
-        dashboardUrl,
-        resolvedConfig.nodeId,
-        logger.child({ component: 'TelemetryEmitter' })
-      );
-      this._logger.info(
-        { event: 'telemetry_enabled', dashboardUrl },
-        'Telemetry emitter initialized'
-      );
-    } else {
-      this._telemetryEmitter = null;
-      this._logger.info(
-        { event: 'telemetry_disabled' },
-        'Telemetry disabled (DASHBOARD_TELEMETRY_URL not set)'
-      );
-    }
-
-    // Initialize packet handler (pass telemetryEmitter for telemetry integration)
+    // Initialize packet handler
     this._packetHandler = new PacketHandler(
       this._routingTable,
       this._btpClientManager,
       resolvedConfig.nodeId,
-      logger.child({ component: 'PacketHandler' }),
-      this._telemetryEmitter
+      logger.child({ component: 'PacketHandler' })
     );
 
     // Initialize BTP server
@@ -490,6 +472,36 @@ export class ConnectorNode implements HealthStatusProvider {
             this._logger
           );
 
+          // Resolve on-chain token symbol for canonical tokenId
+          try {
+            const resolvedSymbol = await this._paymentChannelSDK.getTokenSymbol(m2mTokenAddress);
+            if (resolvedSymbol) {
+              this._defaultSettlementTokenId = resolvedSymbol;
+              this._logger.info(
+                {
+                  event: 'token_symbol_resolved',
+                  symbol: resolvedSymbol,
+                  tokenAddress: m2mTokenAddress,
+                },
+                `Resolved on-chain token symbol: ${resolvedSymbol}`
+              );
+            } else {
+              this._logger.warn(
+                { event: 'token_symbol_empty', tokenAddress: m2mTokenAddress },
+                'ERC-20 symbol() returned empty string, falling back to M2M'
+              );
+            }
+          } catch (symbolError) {
+            this._logger.warn(
+              {
+                event: 'token_symbol_resolution_failed',
+                tokenAddress: m2mTokenAddress,
+                error: symbolError instanceof Error ? symbolError.message : String(symbolError),
+              },
+              'Failed to resolve on-chain token symbol, falling back to M2M'
+            );
+          }
+
           // Store primary SDK in chain map
           const primaryChainId =
             this._config.blockchain?.base?.chainId ?? this._config.blockchain?.arbitrum?.chainId;
@@ -576,10 +588,9 @@ export class ConnectorNode implements HealthStatusProvider {
             }
           }
 
-          // Build token address map (M2M token for test deployment)
+          // Build token address map using the resolved on-chain symbol
           const tokenAddressMap = new Map<string, string>();
-          tokenAddressMap.set('M2M', m2mTokenAddress);
-          tokenAddressMap.set('ILP', m2mTokenAddress); // ILP token maps to M2M for settlement
+          tokenAddressMap.set(this._defaultSettlementTokenId, m2mTokenAddress);
           tokenAddressMap.set(m2mTokenAddress, m2mTokenAddress); // Also map address to itself for direct lookups
 
           // Initialize ChannelManager with TigerBeetle accounting if configured
@@ -645,17 +656,13 @@ export class ConnectorNode implements HealthStatusProvider {
               await tigerBeetleClient.initialize();
               this._tigerBeetleClient = tigerBeetleClient;
 
-              // Create AccountManager with telemetry
+              // Create AccountManager
               accountManager = new AccountManager(
-                {
-                  nodeId: this._config.nodeId,
-                  telemetryEmitter: this._telemetryEmitter || undefined,
-                },
+                { nodeId: this._config.nodeId },
                 tigerBeetleClient,
                 this._logger
               );
 
-              // Store accountManager for later wiring to EventStore/EventBroadcaster (Story 19.3)
               this._accountManager = accountManager;
 
               this._logger.info(
@@ -723,9 +730,7 @@ export class ConnectorNode implements HealthStatusProvider {
                 pollingInterval: settlementPollingInterval,
               },
               peers: peerIds,
-              tokenIds: ['ILP'], // MVP: single token ID
-              telemetryEmitter: this._telemetryEmitter || undefined,
-              nodeId: this._config.nodeId,
+              tokenIds: [this._defaultSettlementTokenId],
             },
             accountManager,
             this._logger
@@ -749,9 +754,7 @@ export class ConnectorNode implements HealthStatusProvider {
             accountManager,
             this._paymentChannelSDK,
             settlementMonitor,
-            this._logger,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            this._telemetryEmitter as any
+            this._logger
           );
 
           // Start automatic settlement execution
@@ -799,8 +802,7 @@ export class ConnectorNode implements HealthStatusProvider {
             },
             this._paymentChannelSDK,
             this._settlementExecutor,
-            this._logger,
-            this._telemetryEmitter || undefined
+            this._logger
           );
 
           this._logger.info(
@@ -833,8 +835,7 @@ export class ConnectorNode implements HealthStatusProvider {
                 this._channelManager,
                 claimDb,
                 this._logger,
-                this._config.nodeId,
-                this._telemetryEmitter || undefined
+                this._config.nodeId
               );
               this._packetHandler.setPerPacketClaimService(perPacketClaimService);
               this._settlementExecutor?.setPerPacketClaimService(perPacketClaimService);
@@ -845,25 +846,30 @@ export class ConnectorNode implements HealthStatusProvider {
               );
             } catch (error) {
               const errorMessage = error instanceof Error ? error.message : String(error);
-              this._logger.warn(
+              this._logger.error(
                 { event: 'per_packet_claims_init_failed', error: errorMessage },
-                'Failed to initialize per-packet claim service (continuing without claims)'
+                'Failed to initialize per-packet claim service'
               );
+              throw error;
             }
           }
 
           // Wire AccountManager into PacketHandler for settlement recording
           if (accountManager) {
             const settlementConfig: SettlementConfig = {
-              connectorFeePercentage: 0.1, // 0.1% default fee
-              enableSettlement: process.env.SETTLEMENT_ENABLED === 'true',
-              tigerBeetleClusterId: tigerBeetleClusterId ? parseInt(tigerBeetleClusterId, 10) : 0, // Placeholder for in-memory ledger
+              connectorFeePercentage: this._config.settlement?.connectorFeePercentage ?? 0.1,
+              enableSettlement: settlementEnabled,
+              tigerBeetleClusterId: tigerBeetleClusterId ? parseInt(tigerBeetleClusterId, 10) : 0,
               tigerBeetleReplicas: tigerBeetleReplicas
                 ? tigerBeetleReplicas.split(',').map((s) => s.trim())
-                : [], // Placeholder for in-memory ledger
+                : [],
             };
 
-            this._packetHandler.setSettlement(accountManager, settlementConfig);
+            this._packetHandler.setSettlement(
+              accountManager,
+              settlementConfig,
+              this._defaultSettlementTokenId
+            );
           }
         } catch (error) {
           // Log error but continue without payment channels (graceful degradation)
@@ -924,6 +930,7 @@ export class ConnectorNode implements HealthStatusProvider {
           paymentChannelSDK: this._paymentChannelSDK ?? undefined,
           accountManager: this._accountManager ?? undefined,
           settlementMonitor: this._settlementMonitor ?? undefined,
+          defaultSettlementTokenId: this._defaultSettlementTokenId,
           packetSender: (params) => this.sendPacket(params),
           isReady: () => this._btpServerStarted,
         });
@@ -943,144 +950,6 @@ export class ConnectorNode implements HealthStatusProvider {
           { event: 'admin_api_disabled' },
           'Admin API disabled (set ADMIN_API_ENABLED=true or adminApi.enabled=true to enable)'
         );
-      }
-
-      // Start explorer if enabled (default: true)
-      if (this._config.explorer?.enabled !== false) {
-        try {
-          const explorerConfig = this._config.explorer || {};
-          const explorerPort = explorerConfig.port ?? 3001;
-          const retentionDays = explorerConfig.retentionDays ?? 7;
-          const maxEvents = explorerConfig.maxEvents ?? 1000000;
-
-          // Initialize EventStore
-          this._eventStore = new EventStore(
-            {
-              path: `./data/explorer-${this._config.nodeId}.db`,
-              maxEventCount: maxEvents,
-              maxAgeMs: retentionDays * 24 * 60 * 60 * 1000,
-            },
-            this._logger.child({ component: 'EventStore' })
-          );
-          await this._eventStore.initialize();
-
-          // Wire TelemetryEmitter to EventStore for persistence (if available)
-          if (this._telemetryEmitter) {
-            this._telemetryEmitter.onEvent((event) => {
-              this._eventStore?.storeEvent(event).catch((err) => {
-                this._logger.warn({ error: err.message }, 'Failed to store telemetry event');
-              });
-            });
-          } else {
-            // Standalone mode: Wire PacketHandler events directly to EventStore
-            this._logger.info(
-              { event: 'explorer_standalone_mode' },
-              'Explorer running in standalone mode - PacketHandler will emit events directly to EventStore'
-            );
-            // Pass EventStore to PacketHandler for direct event emission
-            this._packetHandler.setEventStore(this._eventStore);
-            // Note: EventBroadcaster will be wired after ExplorerServer starts
-          }
-
-          // Initialize ExplorerServer (works with or without telemetryEmitter)
-          this._explorerServer = new ExplorerServer(
-            {
-              port: explorerPort,
-              staticPath: './packages/connector/dist/explorer-ui', // Correct path in Docker container
-              nodeId: this._config.nodeId,
-              routesFetcher: () => Promise.resolve(this.getRoutingTable()),
-              peersFetcher: () => {
-                const peerIds = this._btpClientManager.getPeerIds();
-                const peerStatus = this._btpClientManager.getPeerStatus();
-                const routes = this._routingTable.getAllRoutes();
-
-                // Build a map from peerId to ILP address by finding routes that use this peer as nextHop
-                const peerToIlpAddress = new Map<string, string>();
-                for (const route of routes) {
-                  if (!peerToIlpAddress.has(route.nextHop)) {
-                    // Use the route prefix as the ILP address for this peer
-                    peerToIlpAddress.set(route.nextHop, route.prefix);
-                  }
-                }
-
-                return Promise.resolve(
-                  peerIds.map((id) => ({
-                    peerId: id,
-                    ilpAddress: peerToIlpAddress.get(id) || '',
-                    connected: peerStatus.get(id) ?? false,
-                  }))
-                );
-              },
-            },
-            this._eventStore,
-            this._telemetryEmitter,
-            this._logger
-          );
-          await this._explorerServer.start();
-
-          // Wire EventBroadcaster to PacketHandler for real-time event streaming
-          if (!this._telemetryEmitter) {
-            // In standalone mode, pass the EventBroadcaster to PacketHandler
-            const broadcaster = this._explorerServer.getBroadcaster();
-            this._packetHandler.setEventBroadcaster(broadcaster);
-            this._logger.info(
-              { event: 'event_broadcaster_wired' },
-              'EventBroadcaster wired to PacketHandler for live event streaming'
-            );
-
-            // Wire AccountManager to EventStore and EventBroadcaster (Story 19.3)
-            if (this._accountManager) {
-              this._accountManager.setEventStore(this._eventStore);
-              this._accountManager.setEventBroadcaster(broadcaster);
-              this._logger.info(
-                { event: 'account_manager_standalone_wired' },
-                'AccountManager wired to EventStore and EventBroadcaster for ACCOUNT_BALANCE events'
-              );
-            }
-
-            // Wire SettlementExecutor to EventStore and EventBroadcaster for settlement events
-            this._logger.debug(
-              { hasSettlementExecutor: this._settlementExecutor !== null },
-              'Checking SettlementExecutor for EventStore wiring'
-            );
-            if (this._settlementExecutor) {
-              this._settlementExecutor.setEventStore(this._eventStore);
-              this._settlementExecutor.setEventBroadcaster(broadcaster);
-              this._logger.info(
-                { event: 'settlement_executor_standalone_wired' },
-                'SettlementExecutor wired to EventStore and EventBroadcaster for settlement events'
-              );
-            } else {
-              this._logger.warn(
-                { event: 'settlement_executor_not_available' },
-                'SettlementExecutor not initialized - settlement events will not be stored'
-              );
-            }
-          }
-
-          const mode = this._telemetryEmitter
-            ? 'connected to telemetry dashboard'
-            : 'standalone mode';
-          this._logger.info(
-            {
-              event: 'explorer_server_started',
-              port: explorerPort,
-              retentionDays,
-              maxEvents,
-              mode,
-            },
-            `Explorer server started in ${mode}`
-          );
-        } catch (error) {
-          // Explorer failures should not prevent connector startup
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          this._logger.warn(
-            { event: 'explorer_start_failed', error: errorMessage },
-            'Failed to start explorer (connector continues running)'
-          );
-        }
-      } else {
-        this._logger.info({ event: 'explorer_disabled' }, 'Explorer UI disabled by configuration');
       }
 
       // Connect BTP clients to all configured peers
@@ -1131,7 +1000,7 @@ export class ConnectorNode implements HealthStatusProvider {
           // Create channel creation promise (don't await - run in parallel)
           const channelPromise = (async () => {
             try {
-              const tokenId = 'M2M'; // Use M2M token for test deployment
+              const tokenId = this._defaultSettlementTokenId;
               const channelId = await this._channelManager!.ensureChannelExists(peerId, tokenId);
               this._logger.info(
                 { event: 'payment_channel_ready', peerId, channelId },
@@ -1160,45 +1029,6 @@ export class ConnectorNode implements HealthStatusProvider {
 
       // Update health status to healthy after all components started
       this._updateHealthStatus();
-
-      // Connect telemetry emitter and emit NODE_STATUS if enabled
-      if (this._telemetryEmitter) {
-        try {
-          await this._telemetryEmitter.connect();
-          this._logger.info({ event: 'telemetry_connected' }, 'Telemetry connected to dashboard');
-
-          // Emit NODE_STATUS telemetry after successful connection
-          this._logger.info({ event: 'preparing_node_status' }, 'Preparing NODE_STATUS telemetry');
-          const routes = this._routingTable.getAllRoutes();
-          const peers: PeerStatus[] = this._config.peers.map((peerConfig) => ({
-            id: peerConfig.id,
-            url: peerConfig.url,
-            connected: connectedPeers.get(peerConfig.id) || false,
-          }));
-
-          this._logger.info(
-            {
-              event: 'emitting_node_status',
-              routes: routes.length,
-              peers: peers.length,
-              health: this._healthStatus,
-            },
-            'Emitting NODE_STATUS telemetry'
-          );
-          this._telemetryEmitter.emitNodeStatus(routes, peers, this._healthStatus);
-          this._logger.info(
-            { event: 'telemetry_node_status_emitted', routes: routes.length, peers: peers.length },
-            'NODE_STATUS telemetry emitted'
-          );
-        } catch (error) {
-          // Telemetry failures should not prevent connector startup
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          this._logger.warn(
-            { event: 'telemetry_connect_failed', error: errorMessage },
-            'Failed to connect telemetry (connector continues running)'
-          );
-        }
-      }
 
       this._logger.info(
         {
@@ -1231,7 +1061,7 @@ export class ConnectorNode implements HealthStatusProvider {
    */
   async stop(): Promise<void> {
     // Idempotent guard: if already stopped, return immediately
-    if (!this._btpServerStarted && !this._adminServer && !this._explorerServer) {
+    if (!this._btpServerStarted && !this._adminServer) {
       this._logger.debug(
         { event: 'connector_already_stopped' },
         'Connector already stopped, ignoring'
@@ -1248,18 +1078,20 @@ export class ConnectorNode implements HealthStatusProvider {
     );
 
     try {
-      // Stop settlement executor if running (before channel manager)
-      if (this._settlementExecutor) {
-        this._settlementExecutor.stop();
-        this._logger.info({ event: 'settlement_executor_stopped' }, 'Settlement executor stopped');
-        this._settlementExecutor = null;
-      }
-
-      // Stop settlement monitor if running (after executor)
+      // Stop settlement monitor FIRST to stop polling the ledger during drain.
+      // The executor already unsubscribes in its own stop(), so no new events fire.
       if (this._settlementMonitor) {
         await this._settlementMonitor.stop();
         this._logger.info({ event: 'settlement_monitor_stopped' }, 'Settlement monitor stopped');
         this._settlementMonitor = null;
+      }
+
+      // Stop settlement executor — awaits in-flight settlements to prevent
+      // on-chain/off-chain balance mismatches on SIGTERM/shutdown
+      if (this._settlementExecutor) {
+        await this._settlementExecutor.stop();
+        this._logger.info({ event: 'settlement_executor_stopped' }, 'Settlement executor stopped');
+        this._settlementExecutor = null;
       }
 
       // Stop channel manager if running
@@ -1301,26 +1133,6 @@ export class ConnectorNode implements HealthStatusProvider {
       }
 
       this._accountManager = null;
-
-      // Stop explorer server if running (before health server)
-      if (this._explorerServer) {
-        await this._explorerServer.stop();
-        this._logger.info({ event: 'explorer_server_stopped' }, 'Explorer server stopped');
-        this._explorerServer = null;
-      }
-
-      // Close event store if initialized
-      if (this._eventStore) {
-        await this._eventStore.close();
-        this._logger.info({ event: 'event_store_closed' }, 'Event store closed');
-        this._eventStore = null;
-      }
-
-      // Disconnect telemetry emitter if enabled
-      if (this._telemetryEmitter) {
-        await this._telemetryEmitter.disconnect();
-        this._logger.info({ event: 'telemetry_disconnected' }, 'Telemetry disconnected');
-      }
 
       // Disconnect all BTP clients
       const peerIds = this._btpClientManager.getPeerIds();
@@ -1384,16 +1196,6 @@ export class ConnectorNode implements HealthStatusProvider {
       nodeId: this._config.nodeId,
       version: packageJson.version,
     };
-
-    // Add explorer status if enabled
-    if (this._explorerServer && this._eventStore) {
-      healthStatus.explorer = {
-        enabled: true,
-        port: this._explorerServer.getPort(),
-        eventCount: 0, // Will be fetched asynchronously if needed
-        wsConnections: this._explorerServer.getBroadcaster().getClientCount(),
-      };
-    }
 
     return healthStatus;
   }
@@ -1545,10 +1347,7 @@ export class ConnectorNode implements HealthStatusProvider {
     this._inMemoryLedgerClient = inMemoryClient;
 
     const accountManager = new AccountManager(
-      {
-        nodeId: this._config.nodeId,
-        telemetryEmitter: this._telemetryEmitter || undefined,
-      },
+      { nodeId: this._config.nodeId },
       inMemoryClient,
       this._logger
     );
@@ -1841,11 +1640,14 @@ export class ConnectorNode implements HealthStatusProvider {
    * Equivalent to GET /admin/balances/:peerId — same response shape.
    *
    * @param peerId - Peer identifier
-   * @param tokenId - Token identifier (default: 'ILP')
+   * @param tokenId - Token identifier (defaults to the resolved on-chain symbol, e.g. 'M2M')
    * @returns PeerAccountBalance with debit/credit/net balances
    * @throws Error if account management is not enabled
    */
-  async getBalance(peerId: string, tokenId: string = 'ILP'): Promise<PeerAccountBalance> {
+  async getBalance(
+    peerId: string,
+    tokenId: string = this._defaultSettlementTokenId
+  ): Promise<PeerAccountBalance> {
     if (!this._accountManager) {
       throw new Error('Account management not enabled');
     }

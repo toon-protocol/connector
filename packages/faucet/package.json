@@ -1,7 +1,7 @@
 {
-  "name": "@m2m-connector/faucet",
+  "name": "@crosstown/faucet",
   "version": "1.0.0",
-  "description": "Token faucet for M2M Connector local EVM testing",
+  "description": "Token faucet for local development",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
@@ -10,15 +10,12 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "ethers": "^6.16.0",
+    "ethers": "^6.9.0",
     "cors": "^2.8.5"
   },
   "keywords": [
     "faucet",
-    "ethereum",
-    "anvil",
-    "testing"
+    "ethereum"
   ],
-  "author": "M2M Connector",
   "license": "MIT"
 }

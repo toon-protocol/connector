@@ -1,7 +1,0 @@
-# M2M Agent Runtime - Top-level Kustomization
-# Use this for basic deployment, or create overlays for staging/production
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-
-resources:
-  - base

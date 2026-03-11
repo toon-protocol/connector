@@ -26,7 +26,6 @@ import type { Logger } from 'pino';
 // import { WalletState } from '../wallet/agent-wallet-lifecycle';
 // import type { AgentWalletFunder, FundingResult } from '../wallet/agent-wallet-funder';
 import type { TreasuryWallet } from '../wallet/treasury-wallet';
-import type { TelemetryEmitter } from '../telemetry/telemetry-emitter';
 import type { FraudDetector, FraudCheckResult } from '../wallet/wallet-security';
 
 // ============================================================================
@@ -249,23 +248,6 @@ export function createMockTreasuryWallet(
     evmAddress: TEST_EVM_ADDRESS,
     ...overrides,
   } as unknown as jest.Mocked<TreasuryWallet>;
-}
-
-// ============================================================================
-// Telemetry Mocks
-// ============================================================================
-
-/**
- * Create a mock TelemetryEmitter with all required methods
- */
-export function createMockTelemetryEmitter(
-  overrides?: Partial<jest.Mocked<TelemetryEmitter>>
-): jest.Mocked<TelemetryEmitter> {
-  return {
-    emit: jest.fn(),
-    flush: jest.fn().mockResolvedValue(undefined),
-    ...overrides,
-  } as unknown as jest.Mocked<TelemetryEmitter>;
 }
 
 // ============================================================================

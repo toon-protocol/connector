@@ -148,8 +148,6 @@ export interface RouteConfig {
  * @property logLevel - Optional logging verbosity (default: 'info')
  * @property peers - List of peer connectors to connect to
  * @property routes - Initial routing table entries
- * @property dashboardTelemetryUrl - Optional WebSocket URL for telemetry
- *
  * @example
  * ```typescript
  * const config: ConnectorConfig = {
@@ -169,7 +167,7 @@ export interface RouteConfig {
 export interface ConnectorConfig {
   /**
    * Unique identifier for this connector instance
-   * Used in logging, telemetry, and network identification
+   * Used in logging and network identification
    * Should be descriptive and unique across the network
    *
    * Examples: 'connector-a', 'hub-node', 'spoke-1'
@@ -225,15 +223,6 @@ export interface ConnectorConfig {
   routes: RouteConfig[];
 
   /**
-   * Optional WebSocket URL for sending telemetry to dashboard
-   * Used for real-time monitoring and visualization
-   * Format: ws://hostname:port or wss://hostname:port
-   *
-   * Example: 'ws://dashboard.example.com:8080'
-   */
-  dashboardTelemetryUrl?: string;
-
-  /**
    * Optional settlement configuration for TigerBeetle integration
    * When provided, enables settlement recording for packet forwarding
    * Defaults to settlement disabled if not specified
@@ -256,9 +245,9 @@ export interface ConnectorConfig {
    * Defaults to 'development' if not specified
    *
    * Environment types:
-   * - development: Local Anvil for Base L2
-   * - staging: Public testnet (Base Sepolia)
-   * - production: Public mainnet (Base mainnet)
+   * - development: Local Anvil for Base L2 and Arbitrum
+   * - staging: Public testnets (Base Sepolia, Arbitrum Sepolia)
+   * - production: Public mainnets (Base mainnet, Arbitrum One)
    */
   environment: Environment;
 
@@ -322,34 +311,6 @@ export interface ConnectorConfig {
    * Supports backends: env (development), AWS KMS, GCP KMS, Azure Key Vault, HSM (PKCS#11)
    */
   security?: SecurityConfig;
-
-  /**
-   * Optional performance configuration for high-throughput optimization
-   * When provided, enables batching, buffering, and connection pooling for 10K+ TPS
-   * Defaults to performance optimizations disabled if not specified
-   *
-   * Epic 12 Story 12.5 (Performance Optimization for 10K+ TPS)
-   * Enables:
-   * - Packet processing parallelization with worker threads
-   * - TigerBeetle transfer batching
-   * - Telemetry event buffering
-   * - Connection pooling for blockchain RPC endpoints
-   */
-  performance?: PerformanceConfig;
-
-  /**
-   * Optional explorer UI configuration for embedded telemetry visualization
-   * When provided, enables the Packet/Event Explorer web interface
-   * Defaults to explorer enabled on port 3001 if not specified
-   *
-   * Epic 14 (Packet/Event Explorer UI)
-   * Environment variables:
-   * - EXPLORER_ENABLED: Enable/disable explorer (default: true)
-   * - EXPLORER_PORT: HTTP/WebSocket port (default: 3001)
-   * - EXPLORER_RETENTION_DAYS: Event retention in days (default: 7)
-   * - EXPLORER_MAX_EVENTS: Maximum events to retain (default: 1000000)
-   */
-  explorer?: ExplorerConfig;
 
   /**
    * Operating mode for the connector
@@ -511,7 +472,7 @@ export interface CreditLimitConfig {
  * ```typescript
  * const violation: CreditLimitViolation = {
  *   peerId: 'connector-a',
- *   tokenId: 'ILP',
+ *   tokenId: 'M2M',
  *   currentBalance: 4500n,
  *   requestedAmount: 600n,
  *   creditLimit: 5000n,
@@ -528,7 +489,7 @@ export interface CreditLimitViolation {
 
   /**
    * Token type being transferred
-   * Examples: 'ILP' (default), 'USDC', 'BTC', 'ETH'
+   * Examples: 'M2M' (default), 'USDC', 'BTC', 'ETH'
    * Used for token-specific limit lookup
    */
   tokenId: string;
@@ -1079,7 +1040,7 @@ export enum SettlementState {
  * ```typescript
  * const event: SettlementTriggerEvent = {
  *   peerId: 'connector-a',
- *   tokenId: 'ILP',
+ *   tokenId: 'M2M',
  *   currentBalance: 1200n,
  *   threshold: 1000n,
  *   exceedsBy: 200n,
@@ -1102,7 +1063,7 @@ export interface SettlementTriggerEvent {
 
   /**
    * Token type being settled
-   * Examples: 'ILP' (default), 'USDC', 'BTC', 'ETH'
+   * Examples: 'M2M' (default), 'USDC', 'BTC', 'ETH'
    * Used for token-specific threshold lookup and settlement execution
    */
   tokenId: string;
@@ -1143,9 +1104,11 @@ export interface SettlementTriggerEvent {
 /**
  * Blockchain Configuration Interface
  *
- * Top-level blockchain configuration containing optional Base L2 configuration.
+ * Top-level blockchain configuration containing optional EVM chain configurations.
+ * Supports multiple EVM-compatible chains (Base, Arbitrum) for multi-chain settlement.
  *
  * @property base - Optional Base L2 / EVM configuration
+ * @property arbitrum - Optional Arbitrum L2 / EVM configuration
  *
  * @example
  * ```typescript
@@ -1156,6 +1119,13 @@ export interface SettlementTriggerEvent {
  *     chainId: 84532,
  *     privateKey: '0xac0974...',
  *     registryAddress: '0x1234...'
+ *   },
+ *   arbitrum: {
+ *     enabled: true,
+ *     rpcUrl: 'https://sepolia-rollup.arbitrum.io/rpc',
+ *     chainId: 421614,
+ *     privateKey: '0xac0974...',
+ *     registryAddress: '0x5678...'
  *   }
  * };
  * ```
@@ -1166,56 +1136,67 @@ export interface BlockchainConfig {
    * Used for Epic 8 payment channel smart contracts
    * Enabled when connector needs to interact with Base L2
    */
-  base?: BaseBlockchainConfig;
+  base?: EVMChainConfig;
+
+  /**
+   * Optional Arbitrum L2 / EVM blockchain configuration
+   * Uses same contract ABIs as Base (EVM-compatible)
+   * Enabled when connector needs to settle on Arbitrum
+   */
+  arbitrum?: EVMChainConfig;
 }
 
 /**
- * Base L2 Blockchain Configuration
+ * EVM Chain Configuration
  *
- * Configuration for Base L2 (OP Stack) blockchain integration.
- * Supports both local Anvil development and public Base mainnet/testnet.
+ * Generic configuration for any EVM-compatible L2 blockchain integration.
+ * Used for Base, Arbitrum, and other EVM chains sharing the same contract ABIs.
  *
- * @property enabled - Whether Base blockchain integration is enabled
+ * @property enabled - Whether this chain's integration is enabled
  * @property rpcUrl - RPC endpoint URL (local Anvil or public mainnet/testnet)
- * @property chainId - Expected chain ID (84532 = Base Sepolia, 8453 = Base mainnet)
+ * @property chainId - Expected chain ID for validation
  * @property privateKey - Optional private key for contract interactions (dev only)
  * @property registryAddress - Optional payment channel registry contract address
+ * @property tokenAddress - Optional ERC-20 token contract address for this chain
  *
  * @example
  * ```typescript
- * // Development configuration
- * const baseDev: BaseBlockchainConfig = {
+ * // Base development configuration
+ * const baseDev: EVMChainConfig = {
  *   enabled: true,
  *   rpcUrl: 'http://anvil:8545',
  *   chainId: 84532,
  *   privateKey: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
  * };
  *
- * // Production configuration
- * const baseProd: BaseBlockchainConfig = {
+ * // Arbitrum production configuration
+ * const arbProd: EVMChainConfig = {
  *   enabled: true,
- *   rpcUrl: 'https://mainnet.base.org',
- *   chainId: 8453,
- *   privateKey: process.env.BASE_PRIVATE_KEY,  // From secure KMS
+ *   rpcUrl: 'https://arb1.arbitrum.io/rpc',
+ *   chainId: 42161,
+ *   privateKey: process.env.ARBITRUM_PRIVATE_KEY,
  *   registryAddress: '0x1234567890123456789012345678901234567890'
  * };
  * ```
  */
-export interface BaseBlockchainConfig {
+export interface EVMChainConfig {
   /**
-   * Feature flag to enable/disable Base blockchain integration
-   * When false, connector will not interact with Base L2
-   * Default: false (backward compatible with pre-Epic 8 connectors)
+   * Feature flag to enable/disable this chain's integration
+   * When false, connector will not interact with this chain
+   * Default: false (backward compatible)
    */
   enabled: boolean;
 
   /**
-   * RPC endpoint URL for Base L2 blockchain
+   * RPC endpoint URL for the EVM blockchain
    *
-   * Environment-specific defaults:
-   * - Development: http://anvil:8545 (local Anvil fork)
-   * - Staging: https://sepolia.base.org (Base Sepolia testnet)
-   * - Production: https://mainnet.base.org (Base mainnet)
+   * Environment-specific defaults vary by chain:
+   * - Base Development: http://anvil:8545 (local Anvil fork)
+   * - Base Staging: https://sepolia.base.org (Base Sepolia testnet)
+   * - Base Production: https://mainnet.base.org (Base mainnet)
+   * - Arbitrum Development: http://anvil-arbitrum:8546
+   * - Arbitrum Staging: https://sepolia-rollup.arbitrum.io/rpc
+   * - Arbitrum Production: https://arb1.arbitrum.io/rpc
    *
    * Custom endpoints (Alchemy, Infura) recommended for production reliability
    */
@@ -1227,6 +1208,8 @@ export interface BaseBlockchainConfig {
    * Standard chain IDs:
    * - 84532: Base Sepolia testnet
    * - 8453: Base mainnet
+   * - 421614: Arbitrum Sepolia testnet
+   * - 42161: Arbitrum One mainnet
    *
    * Validated at runtime against RPC endpoint's actual chain ID
    */
@@ -1246,13 +1229,27 @@ export interface BaseBlockchainConfig {
   /**
    * Optional payment channel registry contract address
    *
-   * Epic 8 will deploy PaymentChannelRegistry contract
    * Address varies by network (local Anvil vs testnet vs mainnet)
    *
    * Example: 0x1234567890123456789012345678901234567890
    */
   registryAddress?: string;
+
+  /**
+   * Optional ERC-20 token contract address for this chain
+   *
+   * Allows per-chain token address configuration when the same
+   * token is deployed at different addresses on different chains.
+   *
+   * Falls back to global M2M_TOKEN_ADDRESS if not specified.
+   */
+  tokenAddress?: string;
 }
+
+/**
+ * @deprecated Use EVMChainConfig instead. This alias is kept for backward compatibility.
+ */
+export type BaseBlockchainConfig = EVMChainConfig;
 
 /**
  * Security Configuration Interface
@@ -1298,274 +1295,6 @@ export interface SecurityConfig {
     backend: 'env' | 'aws-kms' | 'gcp-kms' | 'azure-kv' | 'hsm';
     nodeId: string;
     [key: string]: unknown; // Allow additional backend-specific fields
-  };
-}
-
-/**
- * Performance Configuration Interface
- *
- * Configures performance optimization settings for high-throughput scenarios.
- * Enables batching, buffering, and connection pooling to achieve 10K+ TPS.
- *
- * Epic 12 Story 12.5 (Performance Optimization for 10K+ TPS)
- *
- * @property packetProcessing - Packet processing parallelization settings
- * @property tigerbeetle - TigerBeetle transfer batching settings
- * @property telemetry - Telemetry event buffering settings
- * @property connectionPools - Connection pool configurations for external services
- *
- * @example
- * ```typescript
- * const performance: PerformanceConfig = {
- *   packetProcessing: {
- *     workerThreads: 8,
- *     batchSize: 100
- *   },
- *   tigerbeetle: {
- *     batchSize: 100,
- *     flushIntervalMs: 10
- *   },
- *   telemetry: {
- *     bufferSize: 1000,
- *     flushIntervalMs: 100
- *   },
- *   connectionPools: {
- *     evm: {
- *       poolSize: 10,
- *       rpcUrls: ['https://mainnet.base.org', 'https://base.llamarpc.com']
- *     }
- *   }
- * };
- * ```
- */
-export interface PerformanceConfig {
-  /**
-   * Packet processing parallelization configuration
-   * Uses worker threads to parallelize packet processing across CPU cores
-   *
-   * @property workerThreads - Number of worker threads (default: CPU cores)
-   * @property batchSize - Packets per batch (default: 100)
-   */
-  packetProcessing?: {
-    workerThreads?: number;
-    batchSize?: number;
-  };
-
-  /**
-   * TigerBeetle transfer batching configuration
-   * Batches transfers to reduce TigerBeetle round-trips
-   *
-   * @property batchSize - Transfers per batch (default: 100)
-   * @property flushIntervalMs - Periodic flush interval (default: 10ms)
-   * @property maxPendingTransfers - Maximum queued transfers (default: 1000)
-   */
-  tigerbeetle?: {
-    batchSize?: number;
-    flushIntervalMs?: number;
-    maxPendingTransfers?: number;
-  };
-
-  /**
-   * Telemetry event buffering configuration
-   * Batches telemetry events to reduce logging overhead
-   *
-   * @property bufferSize - Events per batch (default: 1000)
-   * @property flushIntervalMs - Periodic flush interval (default: 100ms)
-   */
-  telemetry?: {
-    bufferSize?: number;
-    flushIntervalMs?: number;
-  };
-
-  /**
-   * Connection pool configurations for external services
-   * Pools connections to blockchain RPC endpoints
-   *
-   * @property evm - EVM RPC connection pool configuration
-   */
-  connectionPools?: {
-    /**
-     * EVM RPC connection pool (for Base L2, Ethereum, etc.)
-     * @property poolSize - Number of RPC connections (default: 10)
-     * @property rpcUrls - List of RPC endpoint URLs
-     */
-    evm?: {
-      poolSize?: number;
-      rpcUrls?: string[];
-    };
-  };
-}
-
-/**
- * Observability Configuration Interface
- *
- * Configures production monitoring, metrics, tracing, and SLA settings.
- * Added in Epic 12 Story 12.6 (Production Monitoring and Alerting).
- *
- * @property prometheus - Prometheus metrics exporter configuration
- * @property opentelemetry - OpenTelemetry distributed tracing configuration
- * @property sla - SLA monitoring thresholds
- *
- * @example
- * ```typescript
- * const observability: ObservabilityConfig = {
- *   prometheus: {
- *     enabled: true,
- *     metricsPath: '/metrics',
- *     includeDefaultMetrics: true,
- *     labels: { environment: 'production', nodeId: 'connector-1' }
- *   },
- *   opentelemetry: {
- *     enabled: true,
- *     serviceName: 'connector',
- *     exporterEndpoint: 'http://jaeger:4318/v1/traces',
- *     samplingRatio: 1.0
- *   },
- *   sla: {
- *     packetSuccessRateThreshold: 0.999,
- *     settlementSuccessRateThreshold: 0.99,
- *     p99LatencyThresholdMs: 10
- *   }
- * };
- * ```
- */
-/**
- * Explorer UI Configuration Interface
- *
- * Configures the embedded Packet/Event Explorer for telemetry visualization.
- * All settings can be overridden via environment variables.
- *
- * @property enabled - Enable/disable explorer (ENV: EXPLORER_ENABLED, default: true)
- * @property port - Explorer server port (ENV: EXPLORER_PORT, default: 3001)
- * @property retentionDays - Event retention in days (ENV: EXPLORER_RETENTION_DAYS, default: 7)
- * @property maxEvents - Maximum events to retain (ENV: EXPLORER_MAX_EVENTS, default: 1000000)
- *
- * @example
- * ```typescript
- * const explorer: ExplorerConfig = {
- *   enabled: true,
- *   port: 3001,
- *   retentionDays: 7,
- *   maxEvents: 1000000
- * };
- * ```
- */
-export interface ExplorerConfig {
-  /**
-   * Enable/disable explorer UI
-   * When false, explorer server is not started
-   * Environment variable: EXPLORER_ENABLED (default: 'true')
-   * Default: true
-   */
-  enabled?: boolean;
-
-  /**
-   * Port for explorer HTTP/WebSocket server
-   * Must not conflict with BTP server port (default: 3000) or health port (default: 8080)
-   * Environment variable: EXPLORER_PORT (default: '3001')
-   * Valid range: 1-65535
-   * Default: 3001
-   */
-  port?: number;
-
-  /**
-   * Maximum event age in days
-   * Events older than this are automatically pruned
-   * Environment variable: EXPLORER_RETENTION_DAYS (default: '7')
-   * Valid range: 1-365
-   * Default: 7
-   */
-  retentionDays?: number;
-
-  /**
-   * Maximum number of events to retain
-   * Oldest events are pruned when limit is exceeded
-   * Environment variable: EXPLORER_MAX_EVENTS (default: '1000000')
-   * Valid range: 1000-10000000
-   * Default: 1000000
-   */
-  maxEvents?: number;
-}
-
-/**
- * Observability Configuration Interface
- *
- * Configures production monitoring, metrics, tracing, and SLA settings.
- * Added in Epic 12 Story 12.6 (Production Monitoring and Alerting).
- *
- * @property prometheus - Prometheus metrics exporter configuration
- * @property opentelemetry - OpenTelemetry distributed tracing configuration
- * @property sla - SLA monitoring thresholds
- *
- * @example
- * ```typescript
- * const observability: ObservabilityConfig = {
- *   prometheus: {
- *     enabled: true,
- *     metricsPath: '/metrics',
- *     includeDefaultMetrics: true,
- *     labels: { environment: 'production', nodeId: 'connector-1' }
- *   },
- *   opentelemetry: {
- *     enabled: true,
- *     serviceName: 'connector',
- *     exporterEndpoint: 'http://jaeger:4318/v1/traces',
- *     samplingRatio: 1.0
- *   },
- *   sla: {
- *     packetSuccessRateThreshold: 0.999,
- *     settlementSuccessRateThreshold: 0.99,
- *     p99LatencyThresholdMs: 10
- *   }
- * };
- * ```
- */
-export interface ObservabilityConfig {
-  /**
-   * Prometheus metrics exporter configuration
-   * Enables Prometheus metrics collection and export via /metrics endpoint
-   *
-   * @property enabled - Whether Prometheus metrics are enabled (default: true)
-   * @property metricsPath - Path for metrics endpoint (default: '/metrics')
-   * @property includeDefaultMetrics - Include Node.js default metrics (default: true)
-   * @property labels - Global labels for all metrics (e.g., environment, nodeId)
-   */
-  prometheus?: {
-    enabled?: boolean;
-    metricsPath?: string;
-    includeDefaultMetrics?: boolean;
-    labels?: Record<string, string>;
-  };
-
-  /**
-   * OpenTelemetry distributed tracing configuration
-   * Enables distributed tracing across connector hops via OTLP
-   *
-   * @property enabled - Whether tracing is enabled (default: false)
-   * @property serviceName - Service name for traces (default: 'agent-runtime')
-   * @property exporterEndpoint - OTLP exporter endpoint (default: http://localhost:4318)
-   * @property samplingRatio - Trace sampling ratio 0.0-1.0 (default: 1.0)
-   */
-  opentelemetry?: {
-    enabled?: boolean;
-    serviceName?: string;
-    exporterEndpoint?: string;
-    samplingRatio?: number;
-  };
-
-  /**
-   * SLA monitoring thresholds
-   * Defines thresholds for packet success, settlement success, and latency
-   * Health endpoint reports 'degraded' status when thresholds are breached
-   *
-   * @property packetSuccessRateThreshold - Min packet success rate (default: 0.999 = 99.9%)
-   * @property settlementSuccessRateThreshold - Min settlement success rate (default: 0.99 = 99%)
-   * @property p99LatencyThresholdMs - Max p99 latency in ms (default: 10)
-   */
-  sla?: {
-    packetSuccessRateThreshold?: number;
-    settlementSuccessRateThreshold?: number;
-    p99LatencyThresholdMs?: number;
   };
 }
 

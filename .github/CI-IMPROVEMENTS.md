@@ -250,7 +250,7 @@ npm test -- --coverage
 
 1. Shared package built first: Look for "✓ Shared package built successfully"
 2. Dist directories created: Review "Verifying build artifacts..." output
-3. Build order: Ensure shared builds before connector/dashboard
+3. Build order: Ensure shared builds before connector
 
 **Quick Fix:**
 

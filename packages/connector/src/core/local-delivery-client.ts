@@ -20,6 +20,7 @@ import {
   PaymentRequest,
   PaymentResponse,
   computeFulfillmentFromData,
+  validateFulfillment,
   generatePaymentId,
   mapRejectCode,
   validateResponseData,
@@ -182,6 +183,27 @@ export class LocalDeliveryClient {
       if (result.accept) {
         // Compute fulfillment = SHA256(data)
         const fulfillment = computeFulfillmentFromData(packet.data);
+
+        // Validate fulfillment matches the packet's execution condition.
+        // A mismatch here indicates a bug in condition generation.
+        if (!validateFulfillment(fulfillment, packet.executionCondition)) {
+          this.logger.error(
+            {
+              paymentId,
+              destination: request.destination,
+              event: 'invalid_fulfillment',
+            },
+            'Computed fulfillment does not match execution condition (bug in condition generation)'
+          );
+          return {
+            type: PacketType.REJECT,
+            code: ILPErrorCode.T00_INTERNAL_ERROR,
+            triggeredBy: '',
+            message: 'Fulfillment/condition mismatch',
+            data: Buffer.alloc(0),
+          };
+        }
+
         const validatedData = validateResponseData(result.data, this.logger);
 
         this.logger.info(

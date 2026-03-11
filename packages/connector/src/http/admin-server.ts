@@ -66,6 +66,7 @@ export class AdminServer {
     accountManager?: AccountManager;
     settlementMonitor?: SettlementMonitor;
     claimReceiver?: ClaimReceiver;
+    defaultSettlementTokenId?: string;
     packetSender?: PacketSenderFn;
     isReady?: IsReadyFn;
   };
@@ -92,6 +93,7 @@ export class AdminServer {
     accountManager?: AccountManager;
     settlementMonitor?: SettlementMonitor;
     claimReceiver?: ClaimReceiver;
+    defaultSettlementTokenId?: string;
     packetSender?: PacketSenderFn;
     isReady?: IsReadyFn;
   }) {
@@ -121,6 +123,7 @@ export class AdminServer {
       accountManager,
       settlementMonitor,
       claimReceiver,
+      defaultSettlementTokenId,
       packetSender,
       isReady,
     } = this._options;
@@ -142,6 +145,7 @@ export class AdminServer {
       accountManager,
       settlementMonitor,
       claimReceiver,
+      defaultSettlementTokenId,
       packetSender,
       isReady,
     });

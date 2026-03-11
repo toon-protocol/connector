@@ -15,7 +15,6 @@ import type { Logger } from 'pino';
 import type { BTPServer } from '../btp/btp-server';
 import type { BTPProtocolData, BTPMessage } from '../btp/btp-types';
 import { isBTPData } from '../btp/btp-types';
-import type { TelemetryEmitter } from '../telemetry/telemetry-emitter';
 import type { PaymentChannelSDK } from './payment-channel-sdk';
 import type { ChannelManager } from './channel-manager';
 import {
@@ -60,16 +59,13 @@ export interface ClaimVerificationResult {
  * - Verify EVM payment channel claims with signature validation
  * - Enforce monotonicity checks (nonce/amount must increase)
  * - Persist verified claims to database for later redemption
- * - Emit telemetry events for claim reception and verification
  *
  * @example
  * ```typescript
  * const claimReceiver = new ClaimReceiver(
  *   db,
  *   evmChannelSDK,
- *   logger,
- *   telemetryEmitter,
- *   'node-alice'
+ *   logger
  * );
  *
  * claimReceiver.registerWithBTPServer(btpServer);
@@ -80,8 +76,6 @@ export class ClaimReceiver {
     private readonly db: Database,
     private readonly evmChannelSDK: PaymentChannelSDK,
     private readonly logger: Logger,
-    private readonly telemetryEmitter?: TelemetryEmitter,
-    private readonly nodeId?: string,
     private readonly channelManager?: ChannelManager
   ) {}
 
@@ -133,9 +127,8 @@ export class ClaimReceiver {
 
       const messageId = claimMessage.messageId;
       const blockchain = claimMessage.blockchain;
-      const amount = this._getClaimAmount(claimMessage);
 
-      childLogger.info({ messageId, blockchain, amount }, 'Received claim message');
+      childLogger.info({ messageId, blockchain }, 'Received claim message');
 
       // Verify EVM claim
       if (!isEVMClaim(claimMessage)) {
@@ -155,36 +148,8 @@ export class ClaimReceiver {
           'Claim verification failed'
         );
       }
-
-      // Emit telemetry
-      this._emitClaimReceivedTelemetry(
-        peerId,
-        claimMessage,
-        verificationResult.valid,
-        verificationResult.error
-      );
     } catch (error) {
       childLogger.error({ error }, 'Failed to parse claim message');
-
-      // Emit failure telemetry
-      try {
-        if (this.telemetryEmitter) {
-          this.telemetryEmitter.emit({
-            type: 'CLAIM_RECEIVED',
-            nodeId: this.nodeId ?? 'unknown',
-            peerId,
-            blockchain: 'unknown' as BlockchainType,
-            messageId: 'unknown',
-            channelId: 'unknown',
-            amount: '0',
-            verified: false,
-            error: error instanceof Error ? error.message : 'Unknown error',
-            timestamp: new Date().toISOString(),
-          });
-        }
-      } catch (telemetryError) {
-        childLogger.error({ error: telemetryError }, 'Failed to emit telemetry');
-      }
     }
   }
 
@@ -431,58 +396,6 @@ export class ClaimReceiver {
         this.logger.error({ error }, 'Failed to persist claim to database');
       }
     }
-  }
-
-  /**
-   * Emit telemetry event for claim reception
-   *
-   * @param peerId - Peer ID of sender
-   * @param claim - Claim message
-   * @param verified - Whether claim passed verification
-   * @param error - Error message if verification failed
-   * @private
-   */
-  private _emitClaimReceivedTelemetry(
-    peerId: string,
-    claim: BTPClaimMessage,
-    verified: boolean,
-    error?: string
-  ): void {
-    try {
-      if (!this.telemetryEmitter) {
-        return;
-      }
-
-      // EVM claims use channelId
-      const channelId = claim.channelId;
-
-      this.telemetryEmitter.emit({
-        type: 'CLAIM_RECEIVED',
-        nodeId: this.nodeId ?? 'unknown',
-        peerId,
-        blockchain: claim.blockchain,
-        messageId: claim.messageId,
-        channelId,
-        amount: this._getClaimAmount(claim),
-        verified,
-        error,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (telemetryError) {
-      // Non-blocking: Log error but don't throw
-      this.logger.error({ error: telemetryError }, 'Failed to emit claim received telemetry');
-    }
-  }
-
-  /**
-   * Get amount from claim message (EVM uses transferredAmount field)
-   *
-   * @param claim - Claim message
-   * @returns Amount as string
-   * @private
-   */
-  private _getClaimAmount(claim: BTPClaimMessage): string {
-    return claim.transferredAmount;
   }
 
   /**

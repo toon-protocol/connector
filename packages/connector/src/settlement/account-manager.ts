@@ -26,15 +26,11 @@ import type { Transfer } from 'tigerbeetle-node';
 const ACCOUNT_FLAGS_NONE = 0;
 const TRANSFER_FLAGS_NONE = 0;
 
-import { SettlementState } from '@crosstown/shared';
 import type { ILedgerClient } from './ledger-client';
 import { TigerBeetleAccountError } from './tigerbeetle-errors';
 import { generateAccountId } from './account-id-generator';
 import { encodeAccountMetadata } from './account-metadata';
 import { CreditLimitConfig, CreditLimitViolation } from '../config/types';
-import { TelemetryEmitter } from '../telemetry/telemetry-emitter';
-import { EventStore } from '../explorer/event-store';
-import { EventBroadcaster } from '../explorer/event-broadcaster';
 import {
   AccountType,
   PeerAccountMetadata,
@@ -72,20 +68,6 @@ export interface AccountManagerConfig {
    * Defaults to unlimited credit (no enforcement) if not specified
    */
   creditLimits?: CreditLimitConfig;
-
-  /**
-   * Optional telemetry emitter for settlement event tracking (Story 6.8)
-   * When provided, emits ACCOUNT_BALANCE events after balance changes
-   * If not provided, telemetry emission is skipped (no-op)
-   */
-  telemetryEmitter?: TelemetryEmitter;
-
-  /**
-   * Optional settlement threshold configuration for settlement monitoring (Story 6.6)
-   * Map of peerId:tokenId -> threshold value (bigint as string)
-   * Used for telemetry emission to include threshold in ACCOUNT_BALANCE events
-   */
-  settlementThresholds?: Map<string, string>;
 
   /**
    * Optional batch writer configuration for high-throughput settlement (Story 12.5)
@@ -126,21 +108,12 @@ export interface AccountManagerConfig {
  */
 export class AccountManager {
   private readonly _config: Required<
-    Omit<
-      AccountManagerConfig,
-      'creditLimits' | 'telemetryEmitter' | 'settlementThresholds' | 'batchWriterConfig'
-    >
+    Omit<AccountManagerConfig, 'creditLimits' | 'batchWriterConfig'>
   >;
   private readonly _accountCache: Map<string, PeerAccountPair>;
   private readonly _confirmedAccounts: Set<string>; // Tracks accounts confirmed in TigerBeetle
   private readonly _creditLimitConfig: CreditLimitConfig | undefined;
-  private readonly _telemetryEmitter: TelemetryEmitter | undefined;
-  private readonly _settlementThresholds: Map<string, string> | undefined;
   private readonly _batchWriter: TigerBeetleBatchWriter | undefined;
-
-  // Standalone mode support (Story 19.3)
-  private _eventStore: EventStore | null = null;
-  private _eventBroadcaster: EventBroadcaster | null = null;
 
   constructor(
     config: AccountManagerConfig,
@@ -153,8 +126,6 @@ export class AccountManager {
     };
 
     this._creditLimitConfig = config.creditLimits;
-    this._telemetryEmitter = config.telemetryEmitter;
-    this._settlementThresholds = config.settlementThresholds;
     this._accountCache = new Map();
     this._confirmedAccounts = new Set();
 
@@ -199,35 +170,6 @@ export class AccountManager {
         'AccountManager initialized (credit limits disabled - unlimited exposure)'
       );
     }
-  }
-
-  /**
-   * Set EventStore reference for direct event emission in standalone mode (Story 19.3)
-   * @param eventStore - EventStore instance for storing account balance events
-   * @remarks
-   * Called by ConnectorNode when running in standalone mode (telemetryEmitter is null).
-   * Allows AccountManager to emit ACCOUNT_BALANCE events directly to EventStore.
-   */
-  setEventStore(eventStore: EventStore | null): void {
-    this._eventStore = eventStore;
-    this._logger.info(
-      { hasEventStore: eventStore !== null },
-      'AccountManager EventStore reference set for standalone event emission'
-    );
-  }
-
-  /**
-   * Set EventBroadcaster reference for real-time event streaming (Story 19.3)
-   * @param broadcaster - EventBroadcaster instance for live event streaming
-   * @remarks
-   * Called by ConnectorNode in standalone mode to enable real-time ACCOUNT_BALANCE broadcasting.
-   */
-  setEventBroadcaster(broadcaster: EventBroadcaster | null): void {
-    this._eventBroadcaster = broadcaster;
-    this._logger.info(
-      { hasBroadcaster: broadcaster !== null },
-      'AccountManager EventBroadcaster reference set for live event streaming'
-    );
   }
 
   /**
@@ -571,7 +513,7 @@ export class AccountManager {
    *
    * @param fromPeerId - Peer who sent us the packet
    * @param toPeerId - Peer we're forwarding to
-   * @param tokenId - Token identifier (e.g., 'ILP')
+   * @param tokenId - Token identifier (e.g., 'M2M')
    * @param incomingAmount - Original packet amount
    * @param outgoingAmount - Forwarded amount (after fee deduction)
    * @param transferId1 - Transfer ID for incoming transfer
@@ -582,7 +524,7 @@ export class AccountManager {
    *
    * @example
    * await accountManager.recordPacketTransfers(
-   *   'peer-a', 'peer-b', 'ILP',
+   *   'peer-a', 'peer-b', 'M2M',
    *   1000n, 999n,
    *   transferId1, transferId2,
    *   1, 1
@@ -674,11 +616,6 @@ export class AccountManager {
       },
       'Packet settlement transfers recorded successfully'
     );
-
-    // Emit telemetry for balance updates (Story 6.8)
-    // Emit for both peers whose balances changed
-    await this._emitAccountBalanceTelemetry(fromPeerId, tokenId);
-    await this._emitAccountBalanceTelemetry(toPeerId, tokenId);
   }
 
   /**
@@ -703,7 +640,7 @@ export class AccountManager {
    * @returns null if transfer allowed, CreditLimitViolation if limit exceeded
    *
    * @example
-   * const violation = await accountManager.checkCreditLimit('peer-a', 'ILP', 1000n);
+   * const violation = await accountManager.checkCreditLimit('peer-a', 'M2M', 1000n);
    * if (violation) {
    *   // Reject packet with T04_INSUFFICIENT_LIQUIDITY
    *   logger.warn({ violation }, 'Credit limit exceeded');
@@ -804,7 +741,7 @@ export class AccountManager {
    * @returns true if limit would be exceeded, false otherwise
    *
    * @example
-   * if (await accountManager.wouldExceedCreditLimit('peer-a', 'ILP', 1000n)) {
+   * if (await accountManager.wouldExceedCreditLimit('peer-a', 'M2M', 1000n)) {
    *   // Reject packet
    * }
    */
@@ -898,11 +835,11 @@ export class AccountManager {
    *
    * @example
    * // Record settlement for peer-a (settle entire balance)
-   * const balance = await accountManager.getAccountBalance('peer-a', 'ILP');
-   * await accountManager.recordSettlement('peer-a', 'ILP', balance.creditBalance);
+   * const balance = await accountManager.getAccountBalance('peer-a', 'M2M');
+   * await accountManager.recordSettlement('peer-a', 'M2M', balance.creditBalance);
    *
    * // Verify balance reduced to zero
-   * const newBalance = await accountManager.getAccountBalance('peer-a', 'ILP');
+   * const newBalance = await accountManager.getAccountBalance('peer-a', 'M2M');
    * console.log(newBalance.creditBalance); // 0n
    */
   async recordSettlement(peerId: string, tokenId: string, amount: bigint): Promise<void> {
@@ -993,9 +930,6 @@ export class AccountManager {
         }`
       );
     }
-
-    // Emit telemetry for balance update after settlement (Story 6.8)
-    await this._emitAccountBalanceTelemetry(peerId, tokenId);
   }
 
   /**
@@ -1129,98 +1063,6 @@ export class AccountManager {
    */
   private _getCacheKey(peerId: string, tokenId: string): string {
     return `${peerId}:${tokenId}`;
-  }
-
-  /**
-   * Emit ACCOUNT_BALANCE telemetry event after balance change (Story 6.8)
-   *
-   * Non-blocking telemetry emission after packet forward or settlement.
-   * Fetches current balance and emits ACCOUNT_BALANCE event with:
-   * - Debit/credit/net balances (bigint as string)
-   * - Credit limit (if configured)
-   * - Settlement threshold (if configured)
-   * - Settlement state (IDLE for AccountManager - SettlementMonitor tracks state)
-   *
-   * All errors are caught and logged to prevent settlement operation failures.
-   *
-   * @param peerId - Peer connector ID
-   * @param tokenId - Token identifier
-   * @returns Promise<void> - Non-blocking, errors logged
-   * @private
-   */
-  private async _emitAccountBalanceTelemetry(peerId: string, tokenId: string): Promise<void> {
-    // Skip if no emission mechanism configured (Story 19.3)
-    if (!this._telemetryEmitter && !this._eventStore && !this._eventBroadcaster) {
-      return;
-    }
-
-    try {
-      // Query current balance from TigerBeetle
-      const balance = await this.getAccountBalance(peerId, tokenId);
-
-      // Get credit limit (if configured)
-      const configuredLimit = this._getCreditLimitForPeer(peerId, tokenId);
-      const effectiveLimit = this._applyCeiling(configuredLimit);
-
-      // Get settlement threshold (if configured)
-      const thresholdKey = this._getCacheKey(peerId, tokenId);
-      const settlementThreshold = this._settlementThresholds?.get(thresholdKey);
-
-      // Build ACCOUNT_BALANCE event
-      const accountBalanceEvent = {
-        type: 'ACCOUNT_BALANCE' as const,
-        nodeId: this._config.nodeId,
-        peerId,
-        tokenId,
-        debitBalance: balance.debitBalance.toString(),
-        creditBalance: balance.creditBalance.toString(),
-        netBalance: balance.netBalance.toString(),
-        creditLimit: effectiveLimit?.toString(),
-        settlementThreshold,
-        settlementState: SettlementState.IDLE, // AccountManager doesn't track settlement state
-        timestamp: new Date().toISOString(),
-      };
-
-      // Emit via TelemetryEmitter if configured
-      if (this._telemetryEmitter) {
-        this._telemetryEmitter.emit(accountBalanceEvent);
-      }
-
-      // Store in EventStore if configured (standalone mode - Story 19.3)
-      if (this._eventStore) {
-        await this._eventStore.storeEvent(accountBalanceEvent);
-      }
-
-      // Broadcast to WebSocket clients if configured (standalone mode - Story 19.3)
-      if (this._eventBroadcaster) {
-        this._eventBroadcaster.broadcast(accountBalanceEvent);
-      }
-
-      this._logger.debug(
-        {
-          peerId,
-          tokenId,
-          debitBalance: balance.debitBalance.toString(),
-          creditBalance: balance.creditBalance.toString(),
-          emissionMode: this._telemetryEmitter
-            ? 'dashboard'
-            : this._eventStore
-              ? 'standalone'
-              : 'none',
-        },
-        'Account balance telemetry emitted'
-      );
-    } catch (error) {
-      // Non-blocking: Log error but don't throw (Story 6.8 requirement)
-      this._logger.warn(
-        {
-          error: error instanceof Error ? error.message : 'Unknown error',
-          peerId,
-          tokenId,
-        },
-        'Failed to emit account balance telemetry'
-      );
-    }
   }
 
   /**

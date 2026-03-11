@@ -10,15 +10,11 @@ module.exports = {
   // Ignore acceptance tests (run separately)
   testPathIgnorePatterns: [
     '/node_modules/',
-    'aws-kms-backend\.test\.ts$',
-    'azure-kv-backend\.test\.ts$',
-    'gcp-kms-backend\.test\.ts$',
     'wallet-disaster-recovery\.test\.ts$',
     'agent-wallet-integration\.doc\.test\.ts$',
     'tigerbeetle-5peer-deployment\.test\.ts$',
     'test/acceptance/', // Acceptance tests (run separately)
     'test/unit/performance/', // Unit performance tests (timing-sensitive)
-    'evm-payment-channel\.test\.ts$', // Requires live Anvil + Docker infrastructure
   ],
   testTimeout: 30000, // 30 second default timeout for integration tests
   collectCoverageFrom: [

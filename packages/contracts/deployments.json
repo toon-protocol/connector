@@ -62,6 +62,20 @@
         }
       }
     },
+    "arbitrum-sepolia": {
+      "name": "Arbitrum Sepolia",
+      "chainId": 421614,
+      "environment": "staging",
+      "blockExplorer": "https://sepolia.arbiscan.io",
+      "contracts": {}
+    },
+    "arbitrum-one": {
+      "name": "Arbitrum One",
+      "chainId": 42161,
+      "environment": "production",
+      "blockExplorer": "https://arbiscan.io",
+      "contracts": {}
+    },
     "localhost": {
       "name": "Local Anvil",
       "chainId": 31337,

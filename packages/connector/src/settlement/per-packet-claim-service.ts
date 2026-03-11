@@ -11,9 +11,9 @@
  * Key behaviors:
  * - Cumulative transferred amounts are tracked per channel
  * - Nonces are monotonically increasing per channel
- * - Claim failure never blocks packet forwarding
+ * - Claims are mandatory for peer-forwarded packets (PacketHandler rejects without them)
  * - Claims only generated for PREPARE direction (outgoing)
- * - Returns null gracefully if no channel exists for a peer
+ * - Returns null if no channel exists for a peer (caller must handle as rejection)
  *
  * @module settlement/per-packet-claim-service
  */
@@ -22,7 +22,6 @@ import type { Database } from 'better-sqlite3';
 import type { Logger } from 'pino';
 import type { PaymentChannelSDK } from './payment-channel-sdk';
 import type { ChannelManager } from './channel-manager';
-import type { TelemetryEmitter } from '../telemetry/telemetry-emitter';
 import { BTP_CLAIM_PROTOCOL, EVMClaimMessage } from '../btp/btp-claim-types';
 
 /**
@@ -72,8 +71,7 @@ export class PerPacketClaimService {
     private readonly channelManager: ChannelManager,
     private readonly db: Database,
     logger: Logger,
-    private readonly nodeId: string,
-    private readonly telemetryEmitter?: TelemetryEmitter
+    private readonly nodeId: string
   ) {
     this.logger = logger.child({ component: 'per-packet-claim-service' });
     this.recoverFromDb();
@@ -82,13 +80,13 @@ export class PerPacketClaimService {
   /**
    * Generate a signed claim for an outgoing packet.
    *
-   * Returns null if no channel exists for the peer (graceful degradation —
-   * packets still flow without claims).
+   * Returns null if no channel exists for the peer. PacketHandler treats
+   * a null return as a rejection condition (T00_INTERNAL_ERROR).
    *
    * @param toPeerId - Destination peer ID
-   * @param tokenId - Token identifier (e.g., 'ILP')
+   * @param tokenId - Token identifier (e.g., 'M2M')
    * @param amount - Packet amount to add to cumulative total
-   * @returns PerPacketClaimResult with protocolData and claim, or null
+   * @returns PerPacketClaimResult with protocolData and claim, or null if no channel
    */
   async generateClaimForPacket(
     toPeerId: string,
@@ -102,7 +100,7 @@ export class PerPacketClaimService {
     if (!ctx) {
       const builtCtx = await this.buildChannelContext(toPeerId, tokenId);
       if (!builtCtx) {
-        return null; // No channel for this peer — graceful degradation
+        return null; // No channel for this peer — caller handles as rejection
       }
       ctx = builtCtx;
       this.channelClaimCache.set(cacheKey, ctx);
@@ -156,9 +154,6 @@ export class PerPacketClaimService {
 
     // Persist to DB (non-blocking)
     this.persistClaim(toPeerId, claimMessage);
-
-    // Emit telemetry (non-blocking)
-    this.emitClaimTelemetry(toPeerId, claimMessage);
 
     // Serialize to BTP protocolData
     const data = Buffer.from(JSON.stringify(claimMessage), 'utf8');
@@ -221,9 +216,21 @@ export class PerPacketClaimService {
     peerId: string,
     tokenId: string
   ): Promise<ChannelClaimContext | null> {
-    const metadata = this.channelManager.getChannelForPeer(peerId, tokenId);
+    let metadata = this.channelManager.getChannelForPeer(peerId, tokenId);
     if (!metadata) {
-      return null;
+      // On-demand channel creation: peer may have connected after startup
+      try {
+        await this.channelManager.ensureChannelExists(peerId, tokenId);
+        metadata = this.channelManager.getChannelForPeer(peerId, tokenId);
+      } catch (error) {
+        this.logger.warn(
+          { peerId, tokenId, error: error instanceof Error ? error.message : String(error) },
+          'On-demand channel creation failed'
+        );
+      }
+      if (!metadata) {
+        return null;
+      }
     }
 
     try {
@@ -321,30 +328,6 @@ export class PerPacketClaimService {
           'Failed to persist claim to database'
         );
       }
-    }
-  }
-
-  /**
-   * Emit telemetry for a generated claim (non-blocking).
-   */
-  private emitClaimTelemetry(peerId: string, claim: EVMClaimMessage): void {
-    if (!this.telemetryEmitter) {
-      return;
-    }
-
-    try {
-      this.telemetryEmitter.emit({
-        type: 'CLAIM_SENT',
-        nodeId: this.nodeId,
-        peerId,
-        blockchain: claim.blockchain,
-        messageId: claim.messageId,
-        amount: claim.transferredAmount,
-        success: true,
-        timestamp: new Date().toISOString(),
-      });
-    } catch {
-      // Telemetry emission is non-blocking
     }
   }
 }

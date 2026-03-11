@@ -178,7 +178,6 @@ GitHub Actions allows manual retry:
 build-artifacts-{sha}/
 ├── packages/
 │   ├── connector/dist/
-│   ├── dashboard/dist/
 │   └── shared/dist/
 ```
 
@@ -305,7 +304,7 @@ npx tsc --noEmit --listFiles
 # Target specific package
 npm run build --workspace=packages/shared
 npm run test --workspace=packages/connector
-npm run lint --workspace=packages/dashboard
+npm run lint --workspace=packages/connector
 
 # List all workspaces
 npm query ".workspace"

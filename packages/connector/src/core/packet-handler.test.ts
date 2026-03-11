@@ -3,6 +3,7 @@
  * @packageDocumentation
  */
 
+import * as crypto from 'crypto';
 import { PacketHandler } from './packet-handler';
 import { RoutingTable } from '../routing/routing-table';
 import {
@@ -14,6 +15,8 @@ import {
 } from '@crosstown/shared';
 import { Logger } from '../utils/logger';
 import { BTPClientManager } from '../btp/btp-client-manager';
+import type { PerPacketClaimService } from '../settlement/per-packet-claim-service';
+import { computeFulfillmentFromData, validateFulfillment } from './payment-handler';
 
 /**
  * Mock logger for testing log output without console noise
@@ -32,16 +35,20 @@ const createMockLogger = (): jest.Mocked<Logger> =>
   }) as unknown as jest.Mocked<Logger>;
 
 /**
- * Mock BTPClientManager for testing without real BTP connections
+ * Mock BTPClientManager for testing without real BTP connections.
+ * sendToPeer computes the correct fulfillment from packet data
+ * so that SHA256(fulfillment) == condition validation passes.
  */
 const createMockBTPClientManager = (): jest.Mocked<BTPClientManager> =>
   ({
     addPeer: jest.fn().mockResolvedValue(undefined),
     removePeer: jest.fn().mockResolvedValue(undefined),
-    sendToPeer: jest.fn().mockResolvedValue({
-      type: PacketType.FULFILL,
-      fulfillment: Buffer.alloc(32),
-      data: Buffer.alloc(0),
+    sendToPeer: jest.fn().mockImplementation((_peerId: string, packet: ILPPreparePacket) => {
+      return Promise.resolve({
+        type: PacketType.FULFILL,
+        fulfillment: computeFulfillmentFromData(packet.data),
+        data: Buffer.alloc(0),
+      });
     }),
     getPeerStatus: jest.fn().mockReturnValue(new Map()),
     getPeerIds: jest.fn().mockReturnValue([]),
@@ -49,17 +56,39 @@ const createMockBTPClientManager = (): jest.Mocked<BTPClientManager> =>
   }) as unknown as jest.Mocked<BTPClientManager>;
 
 /**
- * Factory function to create valid ILP Prepare packet for testing
+ * Mock PerPacketClaimService for testing claim generation
+ */
+const createMockPerPacketClaimService = (): jest.Mocked<PerPacketClaimService> =>
+  ({
+    generateClaimForPacket: jest.fn().mockResolvedValue({
+      protocolData: {
+        protocolName: 'evm_claim',
+        contentType: 0,
+        data: Buffer.from('mock-claim-data'),
+      },
+      claimMessage: { version: '1.0', blockchain: 'evm' },
+    }),
+    getLatestClaim: jest.fn().mockReturnValue(null),
+    resetChannel: jest.fn(),
+  }) as unknown as jest.Mocked<PerPacketClaimService>;
+
+/**
+ * Factory function to create valid ILP Prepare packet for testing.
+ * Derives executionCondition from data by default so that
+ * SHA256(SHA256(data)) == condition (the simplified fulfillment scheme).
  */
 const createValidPreparePacket = (overrides?: Partial<ILPPreparePacket>): ILPPreparePacket => {
   const futureExpiry = new Date(Date.now() + 10000); // 10 seconds in future
+  const data = overrides?.data ?? Buffer.alloc(0);
+  const fulfillment = computeFulfillmentFromData(data);
+  const defaultCondition = crypto.createHash('sha256').update(fulfillment).digest();
   return {
     type: PacketType.PREPARE,
     amount: BigInt(1000),
     destination: 'g.alice.wallet',
-    executionCondition: Buffer.alloc(32), // 32-byte hash
+    executionCondition: defaultCondition,
     expiresAt: futureExpiry,
-    data: Buffer.alloc(0),
+    data,
     ...overrides,
   };
 };
@@ -477,6 +506,7 @@ describe('PacketHandler', () => {
       mockLogger = createMockLogger();
       const btpClientManager = createMockBTPClientManager();
       handler = new PacketHandler(routingTable, btpClientManager, 'test.connector', mockLogger);
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
     });
 
     it('should forward valid packet when route found and return fulfill packet', async () => {
@@ -736,6 +766,7 @@ describe('PacketHandler', () => {
         'test.connector',
         mockLogger
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
       const validPacket = createValidPreparePacket({ destination: 'g.alice.wallet.USD' });
 
       // Act
@@ -784,13 +815,15 @@ describe('PacketHandler', () => {
     });
 
     it('should call function handler with correct LocalDeliveryRequest and sourcePeerId when packet is local', async () => {
-      // Arrange
+      // Arrange - use valid fulfillment derived from packet data
+      const packetData = Buffer.from('handler-test-data');
+      const validFulfillment = computeFulfillmentFromData(packetData);
       const mockHandler = jest.fn().mockResolvedValue({
-        fulfill: { fulfillment: Buffer.alloc(32).toString('base64'), data: '' },
+        fulfill: { fulfillment: validFulfillment.toString('base64'), data: '' },
       });
       handler.setLocalDeliveryHandler(mockHandler);
 
-      const packet = createValidPreparePacket({ destination: 'g.local.wallet' });
+      const packet = createValidPreparePacket({ destination: 'g.local.wallet', data: packetData });
 
       // Act
       await handler.handlePreparePacket(packet, 'source-peer-1');
@@ -812,15 +845,16 @@ describe('PacketHandler', () => {
     });
 
     it('should produce ILPFulfillPacket when function handler returns fulfill', async () => {
-      // Arrange
-      const fulfillment = Buffer.alloc(32, 0xab).toString('base64');
+      // Arrange - use consistent fulfillment derived from packet data
+      const packetData = Buffer.from('test-local-data');
+      const expectedFulfillment = computeFulfillmentFromData(packetData);
       const responseData = Buffer.from('response-data').toString('base64');
       const mockHandler = jest.fn().mockResolvedValue({
-        fulfill: { fulfillment, data: responseData },
+        fulfill: { fulfillment: expectedFulfillment.toString('base64'), data: responseData },
       });
       handler.setLocalDeliveryHandler(mockHandler);
 
-      const packet = createValidPreparePacket({ destination: 'g.local.wallet' });
+      const packet = createValidPreparePacket({ destination: 'g.local.wallet', data: packetData });
 
       // Act
       const result = await handler.handlePreparePacket(packet, 'source-peer-1');
@@ -828,7 +862,7 @@ describe('PacketHandler', () => {
       // Assert
       expect(result.type).toBe(PacketType.FULFILL);
       const fulfill = result as ILPFulfillPacket;
-      expect(fulfill.fulfillment).toEqual(Buffer.from(fulfillment, 'base64'));
+      expect(fulfill.fulfillment).toEqual(expectedFulfillment);
       expect(fulfill.data).toEqual(Buffer.from(responseData, 'base64'));
     });
 
@@ -921,18 +955,20 @@ describe('PacketHandler', () => {
     });
 
     it('should use function handler over HTTP LocalDeliveryClient when both are configured', async () => {
-      // Arrange - set up both HTTP client and function handler
+      // Arrange - set up both HTTP client and function handler with valid fulfillment
       handler.setLocalDelivery({
         enabled: true,
         handlerUrl: 'http://connector:3100',
         timeout: 5000,
       });
+      const packetData = Buffer.from('combined-handler-data');
+      const expectedFulfillment = computeFulfillmentFromData(packetData);
       const mockHandler = jest.fn().mockResolvedValue({
-        fulfill: { fulfillment: Buffer.alloc(32, 0xcd).toString('base64') },
+        fulfill: { fulfillment: expectedFulfillment.toString('base64') },
       });
       handler.setLocalDeliveryHandler(mockHandler);
 
-      const packet = createValidPreparePacket({ destination: 'g.local.wallet' });
+      const packet = createValidPreparePacket({ destination: 'g.local.wallet', data: packetData });
 
       // Act
       const result = await handler.handlePreparePacket(packet, 'source-peer-1');
@@ -941,7 +977,7 @@ describe('PacketHandler', () => {
       expect(mockHandler).toHaveBeenCalledTimes(1);
       expect(result.type).toBe(PacketType.FULFILL);
       const fulfill = result as ILPFulfillPacket;
-      expect(fulfill.fulfillment).toEqual(Buffer.alloc(32, 0xcd));
+      expect(fulfill.fulfillment).toEqual(expectedFulfillment);
     });
   });
 
@@ -957,6 +993,7 @@ describe('PacketHandler', () => {
         'test.connector',
         mockLogger
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
       const originalExpiry = new Date(Date.now() + 10000);
       const validPacket = createValidPreparePacket({
         destination: 'g.alice.wallet',
@@ -987,6 +1024,7 @@ describe('PacketHandler', () => {
       mockLogger = createMockLogger();
       btpClientManager = createMockBTPClientManager();
       handler = new PacketHandler(routingTable, btpClientManager, 'test.connector', mockLogger);
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
     });
 
     it('should fire notification when perHopNotification enabled (HTTP path)', async () => {
@@ -1155,20 +1193,22 @@ describe('PacketHandler', () => {
         mockLogger
       );
 
-      // Enable local delivery with handler
+      // Enable local delivery with handler, using valid fulfillment
       localHandler.setLocalDelivery({
         enabled: true,
         handlerUrl: 'http://localhost:3100',
         timeout: 5000,
         perHopNotification: true, // Even with per-hop enabled
       });
+      const packetData = Buffer.from('local-final-hop-data');
+      const validFulfillment = computeFulfillmentFromData(packetData);
       const mockHandler = jest.fn().mockResolvedValue({
-        fulfill: { fulfillment: Buffer.alloc(32, 0xcd).toString('base64') },
+        fulfill: { fulfillment: validFulfillment.toString('base64') },
       });
       localHandler.setLocalDeliveryHandler(mockHandler);
 
       // Route to local (final-hop delivery, not forwarding)
-      const packet = createValidPreparePacket({ destination: 'g.local.wallet' });
+      const packet = createValidPreparePacket({ destination: 'g.local.wallet', data: packetData });
 
       // Act
       await localHandler.handlePreparePacket(packet, 'source-peer-1');
@@ -1206,155 +1246,398 @@ describe('PacketHandler', () => {
       const httpLog = debugCalls.find((call) => call[1]?.includes('(fire-and-forget, HTTP)'));
       expect(httpLog).toBeUndefined();
     });
+  });
 
-    it('should emit PER_HOP_NOTIFICATION telemetry via telemetryEmitter when notification dispatched', async () => {
-      // Arrange - create handler with mock telemetryEmitter
-      const mockEmit = jest.fn();
-      const mockTelemetryEmitter = {
-        emit: mockEmit,
-        emitPacketReceived: jest.fn(),
-        emitPacketSent: jest.fn(),
-        emitRouteLookup: jest.fn(),
-      } as unknown as import('../telemetry/telemetry-emitter').TelemetryEmitter;
+  describe('handlePreparePacket() - Mandatory Per-Packet Claims', () => {
+    let mockLogger: ReturnType<typeof createMockLogger>;
+    let btpClientManager: jest.Mocked<BTPClientManager>;
 
-      const telemetryHandler = new PacketHandler(
-        routingTable,
-        btpClientManager,
-        'test.connector',
-        mockLogger,
-        mockTelemetryEmitter
-      );
-      telemetryHandler.setLocalDelivery({
-        enabled: true,
-        handlerUrl: 'http://localhost:3100',
-        timeout: 5000,
-        perHopNotification: true,
-      });
-      const mockDeliveryHandler = jest.fn().mockResolvedValue({
-        fulfill: { fulfillment: Buffer.alloc(32, 0xcd).toString('base64') },
-      });
-      telemetryHandler.setLocalDeliveryHandler(mockDeliveryHandler);
-
-      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
-
-      // Act
-      await telemetryHandler.handlePreparePacket(packet, 'source-peer-1');
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      // Assert - PER_HOP_NOTIFICATION emitted via telemetryEmitter
-      const perHopCalls = mockEmit.mock.calls.filter(
-        (call: unknown[]) => (call[0] as { type: string }).type === 'PER_HOP_NOTIFICATION'
-      );
-      expect(perHopCalls.length).toBe(1);
-      const emittedEvent = perHopCalls[0][0] as {
-        type: string;
-        nodeId: string;
-        destination: string;
-        amount: string;
-        nextHop: string;
-        sourcePeer: string;
-        correlationId: string;
-        timestamp: number;
-      };
-      expect(emittedEvent.type).toBe('PER_HOP_NOTIFICATION');
-      expect(emittedEvent.nodeId).toBe('test.connector');
-      expect(emittedEvent.destination).toBe('g.alice.wallet');
-      expect(emittedEvent.amount).toBe('1000');
-      expect(emittedEvent.nextHop).toBe('peer-alice');
-      expect(emittedEvent.sourcePeer).toBe('source-peer-1');
-      expect(emittedEvent.correlationId).toMatch(/^pkt_[a-f0-9]{16}$/);
-      expect(emittedEvent.timestamp).toBeGreaterThan(0);
+    beforeEach(() => {
+      mockLogger = createMockLogger();
+      btpClientManager = createMockBTPClientManager();
     });
 
-    it('should NOT emit PER_HOP_NOTIFICATION telemetry when perHopNotification disabled', async () => {
-      // Arrange - create handler with mock telemetryEmitter, perHopNotification disabled
-      const mockEmit = jest.fn();
-      const mockTelemetryEmitter = {
-        emit: mockEmit,
-        emitPacketReceived: jest.fn(),
-        emitPacketSent: jest.fn(),
-        emitRouteLookup: jest.fn(),
-      } as unknown as import('../telemetry/telemetry-emitter').TelemetryEmitter;
-
-      const telemetryHandler = new PacketHandler(
+    it('should reject with T00 when perPacketClaimService is null and forwarding to peer', async () => {
+      // Arrange
+      const routingTable = new RoutingTable([{ prefix: 'g.alice', nextHop: 'peer-alice' }]);
+      const handler = new PacketHandler(
         routingTable,
         btpClientManager,
         'test.connector',
-        mockLogger,
-        mockTelemetryEmitter
+        mockLogger
       );
-      telemetryHandler.setLocalDelivery({
-        enabled: true,
-        handlerUrl: 'http://localhost:3100',
-        timeout: 5000,
-        // perHopNotification not set (defaults to false)
-      });
-
+      // No claim service set
       const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
 
       // Act
-      await telemetryHandler.handlePreparePacket(packet, 'source-peer-1');
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      const result = await handler.handlePreparePacket(packet);
 
-      // Assert - no PER_HOP_NOTIFICATION emitted
-      const perHopCalls = mockEmit.mock.calls.filter(
-        (call: unknown[]) => (call[0] as { type: string }).type === 'PER_HOP_NOTIFICATION'
-      );
-      expect(perHopCalls.length).toBe(0);
+      // Assert
+      expect(result.type).toBe(PacketType.REJECT);
+      const reject = result as ILPRejectPacket;
+      expect(reject.code).toBe(ILPErrorCode.T00_INTERNAL_ERROR);
+      expect(reject.message).toBe('Per-packet claim service not configured');
+      expect(btpClientManager.sendToPeer).not.toHaveBeenCalled();
     });
 
-    it('should emit PER_HOP_NOTIFICATION telemetry via eventStore in standalone mode', async () => {
-      // Arrange - create handler without telemetryEmitter but with eventStore
-      const mockStoreEvent = jest.fn().mockResolvedValue(undefined);
-      const mockEventStore = {
-        storeEvent: mockStoreEvent,
-      } as unknown as import('../explorer/event-store').EventStore;
-
-      const mockBroadcast = jest.fn();
-      const mockBroadcaster = {
-        broadcast: mockBroadcast,
-      } as unknown as import('../explorer/event-broadcaster').EventBroadcaster;
-
-      const standaloneHandler = new PacketHandler(
+    it('should reject with T00 when generateClaimForPacket returns null (no channel)', async () => {
+      // Arrange
+      const routingTable = new RoutingTable([{ prefix: 'g.alice', nextHop: 'peer-alice' }]);
+      const handler = new PacketHandler(
         routingTable,
         btpClientManager,
         'test.connector',
-        mockLogger,
-        null // no telemetryEmitter
+        mockLogger
       );
-      standaloneHandler.setEventStore(mockEventStore);
-      standaloneHandler.setEventBroadcaster(mockBroadcaster);
-      standaloneHandler.setLocalDelivery({
-        enabled: true,
-        handlerUrl: 'http://localhost:3100',
-        timeout: 5000,
-        perHopNotification: true,
+      const mockClaimService = createMockPerPacketClaimService();
+      mockClaimService.generateClaimForPacket.mockResolvedValue(null);
+      handler.setPerPacketClaimService(mockClaimService);
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      const result = await handler.handlePreparePacket(packet);
+
+      // Assert
+      expect(result.type).toBe(PacketType.REJECT);
+      const reject = result as ILPRejectPacket;
+      expect(reject.code).toBe(ILPErrorCode.T00_INTERNAL_ERROR);
+      expect(reject.message).toBe('No payment channel available for peer');
+      expect(btpClientManager.sendToPeer).not.toHaveBeenCalled();
+    });
+
+    it('should reject with T00 when generateClaimForPacket throws', async () => {
+      // Arrange
+      const routingTable = new RoutingTable([{ prefix: 'g.alice', nextHop: 'peer-alice' }]);
+      const handler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger
+      );
+      const mockClaimService = createMockPerPacketClaimService();
+      mockClaimService.generateClaimForPacket.mockRejectedValue(new Error('Signing failed'));
+      handler.setPerPacketClaimService(mockClaimService);
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      const result = await handler.handlePreparePacket(packet);
+
+      // Assert
+      expect(result.type).toBe(PacketType.REJECT);
+      const reject = result as ILPRejectPacket;
+      expect(reject.code).toBe(ILPErrorCode.T00_INTERNAL_ERROR);
+      expect(reject.message).toBe('Claim generation failed');
+      expect(btpClientManager.sendToPeer).not.toHaveBeenCalled();
+    });
+
+    it('should forward successfully with claim data when generation succeeds', async () => {
+      // Arrange
+      const routingTable = new RoutingTable([{ prefix: 'g.alice', nextHop: 'peer-alice' }]);
+      const handler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger
+      );
+      const mockClaimService = createMockPerPacketClaimService();
+      handler.setPerPacketClaimService(mockClaimService);
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
+
+      // Act
+      const result = await handler.handlePreparePacket(packet);
+
+      // Assert
+      expect(result.type).toBe(PacketType.FULFILL);
+      expect(mockClaimService.generateClaimForPacket).toHaveBeenCalledWith(
+        'peer-alice',
+        'M2M',
+        BigInt(1000)
+      );
+      expect(btpClientManager.sendToPeer).toHaveBeenCalledWith('peer-alice', expect.any(Object), [
+        expect.objectContaining({ protocolName: 'evm_claim' }),
+      ]);
+    });
+
+    it('should not require claims for local delivery (claim service null is fine)', async () => {
+      // Arrange
+      const routingTable = new RoutingTable([{ prefix: 'g.local', nextHop: 'test.connector' }]);
+      const handler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger
+      );
+      // No claim service set
+      const packet = createValidPreparePacket({ destination: 'g.local.wallet' });
+
+      // Act
+      const result = await handler.handlePreparePacket(packet);
+
+      // Assert - auto-fulfill stub for local delivery, no rejection
+      expect(result.type).toBe(PacketType.FULFILL);
+    });
+
+    it('should not require claims for zero-amount peer packets', async () => {
+      // Arrange
+      const routingTable = new RoutingTable([{ prefix: 'g.alice', nextHop: 'peer-alice' }]);
+      const handler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger
+      );
+      // No claim service set
+      const packet = createValidPreparePacket({ destination: 'g.alice.wallet', amount: 0n });
+
+      // Act
+      const result = await handler.handlePreparePacket(packet);
+
+      // Assert - forwarded without claims (zero-amount probe)
+      expect(result.type).toBe(PacketType.FULFILL);
+      expect(btpClientManager.sendToPeer).toHaveBeenCalled();
+    });
+  });
+
+  describe('handlePreparePacket() - Auto-Fulfill Stub Correctness', () => {
+    it('should return a fulfillment where SHA256(fulfillment) == condition', async () => {
+      // Arrange - route to local, no delivery handler/client → auto-fulfill stub
+      const data = Buffer.from('test-payload');
+      const fulfillment = computeFulfillmentFromData(data);
+      const condition = crypto.createHash('sha256').update(fulfillment).digest();
+
+      const routingTable = new RoutingTable([{ prefix: 'g.local', nextHop: 'test.connector' }]);
+      const mockLogger = createMockLogger();
+      const btpClientManager = createMockBTPClientManager();
+      const handler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger
+      );
+
+      const packet = createValidPreparePacket({
+        destination: 'g.local.wallet',
+        data,
+        executionCondition: condition,
       });
-      const mockDeliveryHandler = jest.fn().mockResolvedValue({
-        fulfill: { fulfillment: Buffer.alloc(32, 0xcd).toString('base64') },
+
+      // Act
+      const result = await handler.handlePreparePacket(packet);
+
+      // Assert
+      expect(result.type).toBe(PacketType.FULFILL);
+      const fulfill = result as ILPFulfillPacket;
+      expect(validateFulfillment(fulfill.fulfillment, condition)).toBe(true);
+      expect(fulfill.fulfillment).toEqual(fulfillment);
+    });
+  });
+
+  describe('handlePreparePacket() - Downstream Fulfillment Validation', () => {
+    it('should reject when downstream peer returns invalid fulfillment', async () => {
+      // Arrange
+      const data = Buffer.from('test-payload');
+      const fulfillment = computeFulfillmentFromData(data);
+      const condition = crypto.createHash('sha256').update(fulfillment).digest();
+
+      const routingTable = new RoutingTable([{ prefix: 'g.alice', nextHop: 'peer-alice' }]);
+      const mockLogger = createMockLogger();
+      const btpClientManager = createMockBTPClientManager();
+
+      // Mock downstream peer returning WRONG fulfillment
+      btpClientManager.sendToPeer.mockResolvedValue({
+        type: PacketType.FULFILL,
+        fulfillment: Buffer.alloc(32, 0xff), // Invalid fulfillment
+        data: Buffer.alloc(0),
       });
-      standaloneHandler.setLocalDeliveryHandler(mockDeliveryHandler);
+
+      const handler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger
+      );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
+
+      const packet = createValidPreparePacket({
+        destination: 'g.alice.wallet',
+        data,
+        executionCondition: condition,
+      });
+
+      // Act
+      const result = await handler.handlePreparePacket(packet);
+
+      // Assert - should be rejected due to invalid fulfillment
+      expect(result.type).toBe(PacketType.REJECT);
+      const reject = result as ILPRejectPacket;
+      expect(reject.code).toBe(ILPErrorCode.T00_INTERNAL_ERROR);
+      expect(reject.message).toContain('Invalid fulfillment from downstream peer');
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'invalid_fulfillment',
+          source: 'downstream_peer',
+          peerId: 'peer-alice',
+        }),
+        expect.any(String)
+      );
+    });
+
+    it('should pass through valid fulfillment from downstream peer', async () => {
+      // Arrange
+      const data = Buffer.from('test-payload');
+      const fulfillment = computeFulfillmentFromData(data);
+      const condition = crypto.createHash('sha256').update(fulfillment).digest();
+
+      const routingTable = new RoutingTable([{ prefix: 'g.alice', nextHop: 'peer-alice' }]);
+      const mockLogger = createMockLogger();
+      const btpClientManager = createMockBTPClientManager();
+
+      // Mock downstream peer returning VALID fulfillment
+      btpClientManager.sendToPeer.mockResolvedValue({
+        type: PacketType.FULFILL,
+        fulfillment,
+        data: Buffer.alloc(0),
+      });
+
+      const handler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger
+      );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
+
+      const packet = createValidPreparePacket({
+        destination: 'g.alice.wallet',
+        data,
+        executionCondition: condition,
+      });
+
+      // Act
+      const result = await handler.handlePreparePacket(packet);
+
+      // Assert - should pass through as FULFILL
+      expect(result.type).toBe(PacketType.FULFILL);
+      const fulfill = result as ILPFulfillPacket;
+      expect(fulfill.fulfillment).toEqual(fulfillment);
+    });
+
+    it('should pass through reject responses from downstream peer unchanged', async () => {
+      // Arrange
+      const routingTable = new RoutingTable([{ prefix: 'g.alice', nextHop: 'peer-alice' }]);
+      const mockLogger = createMockLogger();
+      const btpClientManager = createMockBTPClientManager();
+
+      // Mock downstream peer returning REJECT
+      btpClientManager.sendToPeer.mockResolvedValue({
+        type: PacketType.REJECT,
+        code: ILPErrorCode.F02_UNREACHABLE,
+        triggeredBy: 'peer-alice',
+        message: 'No route',
+        data: Buffer.alloc(0),
+      });
+
+      const handler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger
+      );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
 
       const packet = createValidPreparePacket({ destination: 'g.alice.wallet' });
 
       // Act
-      await standaloneHandler.handlePreparePacket(packet, 'source-peer-1');
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      const result = await handler.handlePreparePacket(packet);
 
-      // Assert - PER_HOP_NOTIFICATION stored via eventStore
-      const perHopStoreCalls = mockStoreEvent.mock.calls.filter(
-        (call: unknown[]) => (call[0] as { type: string }).type === 'PER_HOP_NOTIFICATION'
-      );
-      expect(perHopStoreCalls.length).toBe(1);
-      const storedEvent = perHopStoreCalls[0][0] as { type: string; nodeId: string };
-      expect(storedEvent.type).toBe('PER_HOP_NOTIFICATION');
-      expect(storedEvent.nodeId).toBe('test.connector');
+      // Assert - reject passes through without fulfillment validation
+      expect(result.type).toBe(PacketType.REJECT);
+      const reject = result as ILPRejectPacket;
+      expect(reject.code).toBe(ILPErrorCode.F02_UNREACHABLE);
+    });
+  });
 
-      // Also broadcast to WebSocket clients
-      const perHopBroadcastCalls = mockBroadcast.mock.calls.filter(
-        (call: unknown[]) => (call[0] as { type: string }).type === 'PER_HOP_NOTIFICATION'
+  describe('convertLocalDeliveryResponse() - Fulfillment Validation', () => {
+    it('should reject when function handler returns invalid fulfillment', async () => {
+      // Arrange
+      const data = Buffer.from('test-payload');
+      const fulfillment = computeFulfillmentFromData(data);
+      const condition = crypto.createHash('sha256').update(fulfillment).digest();
+
+      const routingTable = new RoutingTable([{ prefix: 'g.local', nextHop: 'test.connector' }]);
+      const mockLogger = createMockLogger();
+      const btpClientManager = createMockBTPClientManager();
+      const handler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger
       );
-      expect(perHopBroadcastCalls.length).toBe(1);
+
+      // Function handler returns WRONG fulfillment
+      const mockHandler = jest.fn().mockResolvedValue({
+        fulfill: { fulfillment: Buffer.alloc(32, 0xff).toString('base64') },
+      });
+      handler.setLocalDeliveryHandler(mockHandler);
+
+      const packet = createValidPreparePacket({
+        destination: 'g.local.wallet',
+        data,
+        executionCondition: condition,
+      });
+
+      // Act
+      const result = await handler.handlePreparePacket(packet, 'source-peer-1');
+
+      // Assert - should be rejected due to invalid fulfillment
+      expect(result.type).toBe(PacketType.REJECT);
+      const reject = result as ILPRejectPacket;
+      expect(reject.code).toBe(ILPErrorCode.T00_INTERNAL_ERROR);
+      expect(reject.message).toContain('Invalid fulfillment from local delivery handler');
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'invalid_fulfillment',
+          source: 'local_delivery_handler',
+        }),
+        expect.any(String)
+      );
+    });
+
+    it('should accept when function handler returns valid fulfillment', async () => {
+      // Arrange
+      const data = Buffer.from('test-payload');
+      const fulfillment = computeFulfillmentFromData(data);
+      const condition = crypto.createHash('sha256').update(fulfillment).digest();
+
+      const routingTable = new RoutingTable([{ prefix: 'g.local', nextHop: 'test.connector' }]);
+      const mockLogger = createMockLogger();
+      const btpClientManager = createMockBTPClientManager();
+      const handler = new PacketHandler(
+        routingTable,
+        btpClientManager,
+        'test.connector',
+        mockLogger
+      );
+
+      // Function handler returns CORRECT fulfillment
+      const mockHandler = jest.fn().mockResolvedValue({
+        fulfill: { fulfillment: fulfillment.toString('base64') },
+      });
+      handler.setLocalDeliveryHandler(mockHandler);
+
+      const packet = createValidPreparePacket({
+        destination: 'g.local.wallet',
+        data,
+        executionCondition: condition,
+      });
+
+      // Act
+      const result = await handler.handlePreparePacket(packet, 'source-peer-1');
+
+      // Assert
+      expect(result.type).toBe(PacketType.FULFILL);
+      const fulfill = result as ILPFulfillPacket;
+      expect(fulfill.fulfillment).toEqual(fulfillment);
     });
   });
 });

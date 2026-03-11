@@ -35,11 +35,6 @@ contract TokenNetwork is ReentrancyGuard, EIP712, Pausable, Ownable {
         "BalanceProof(bytes32 channelId,uint256 nonce,uint256 transferredAmount,uint256 lockedAmount,bytes32 locksRoot)"
     );
 
-    /// @notice EIP-712 type hash for withdrawal proof verification
-    bytes32 private constant WITHDRAWAL_PROOF_TYPEHASH = keccak256(
-        "WithdrawalProof(bytes32 channelId,address participant,uint256 withdrawnAmount,uint256 nonce)"
-    );
-
     /// @notice Channel lifecycle states
     enum ChannelState {
         NonExistent, /// Channel doesn't exist
@@ -57,19 +52,9 @@ contract TokenNetwork is ReentrancyGuard, EIP712, Pausable, Ownable {
         bytes32 locksRoot; /// Merkle root of hash-locked transfers (unused in Story 8.4)
     }
 
-    /// @notice Off-chain withdrawal proof for removing funds while channel is open
-    struct WithdrawalProof {
-        bytes32 channelId; /// Channel identifier
-        address participant; /// Participant withdrawing funds
-        uint256 withdrawnAmount; /// Cumulative amount withdrawn (monotonically increasing)
-        uint256 nonce; /// Monotonically increasing state counter (prevents replay)
-    }
-
     /// @notice Per-participant channel state
     struct ParticipantState {
         uint256 deposit; /// Total deposited by participant
-        uint256 withdrawnAmount; /// Withdrawn during channel lifetime
-        bool isCloser; /// True if this participant initiated close
         uint256 nonce; /// Monotonically increasing state counter
         uint256 transferredAmount; /// Cumulative amount sent to counterparty
     }
@@ -89,6 +74,10 @@ contract TokenNetwork is ReentrancyGuard, EIP712, Pausable, Ownable {
 
     /// @notice Mapping of channel IDs and participant addresses to participant state
     mapping(bytes32 => mapping(address => ParticipantState)) public participants;
+
+    /// @notice Mapping of channel IDs and participant addresses to cumulative claimed amounts
+    /// @dev Tracks tokens already transferred out via claimFromChannel to prevent double-pay at settlement
+    mapping(bytes32 => mapping(address => uint256)) public claimedAmounts;
 
     /// @notice Thrown when participant address is invalid (zero address or same as caller)
     error InvalidParticipant();
@@ -117,12 +106,6 @@ contract TokenNetwork is ReentrancyGuard, EIP712, Pausable, Ownable {
     /// @notice Thrown when nonce not greater than stored nonce
     error InvalidNonce();
 
-    /// @notice Thrown when updateNonClosingBalanceProof called by closer
-    error CallerIsCloser();
-
-    /// @notice Thrown when challenge period has ended
-    error ChallengePeriodExpired();
-
     /// @notice Thrown when settlement called too early
     error SettlementTimeoutNotExpired();
 
@@ -132,17 +115,15 @@ contract TokenNetwork is ReentrancyGuard, EIP712, Pausable, Ownable {
     /// @notice Thrown when attempting to force-close channel before expiry
     error ChannelNotExpired();
 
-    /// @notice Thrown when cooperative settlement nonces don't match
-    error NonceMismatch();
-
-    /// @notice Thrown when withdrawal exceeds participant's deposit
-    error WithdrawalExceedsDeposit();
-
-    /// @notice Thrown when withdrawal amount is not increasing (must be cumulative)
-    error WithdrawalNotIncreasing();
 
     /// @notice Thrown when emergency withdraw attempted but contract is not paused
     error ContractNotPaused();
+
+    /// @notice Thrown when claim amount exceeds counterparty's available deposit
+    error InsufficientChannelBalance();
+
+    /// @notice Thrown when there is nothing new to claim (no increase in transferred amount)
+    error NothingToClaim();
 
     /// @notice Emitted when a new channel is opened
     /// @param channelId The unique channel identifier
@@ -159,23 +140,10 @@ contract TokenNetwork is ReentrancyGuard, EIP712, Pausable, Ownable {
     /// @param totalDeposit The new cumulative deposit amount
     event ChannelNewDeposit(bytes32 indexed channelId, address indexed participant, uint256 totalDeposit);
 
-    /// @notice Emitted when a channel is closed
+    /// @notice Emitted when a channel is closed (grace period starts)
     /// @param channelId The unique channel identifier
-    /// @param closingParticipant The participant who closed the channel
-    /// @param nonce The nonce of the submitted balance proof
-    /// @param balanceHash The hash of the balance proof data
-    event ChannelClosed(
-        bytes32 indexed channelId, address indexed closingParticipant, uint256 nonce, bytes32 balanceHash
-    );
-
-    /// @notice Emitted when non-closing participant submits newer state during challenge
-    /// @param channelId The unique channel identifier
-    /// @param participant The non-closing participant who challenged
-    /// @param nonce The nonce of the newer balance proof
-    /// @param balanceHash The hash of the newer balance proof data
-    event NonClosingBalanceProofUpdated(
-        bytes32 indexed channelId, address indexed participant, uint256 nonce, bytes32 balanceHash
-    );
+    /// @param closingParticipant The participant who initiated the close
+    event ChannelClosed(bytes32 indexed channelId, address indexed closingParticipant);
 
     /// @notice Emitted when a channel is settled and funds distributed
     /// @param channelId The unique channel identifier
@@ -188,18 +156,12 @@ contract TokenNetwork is ReentrancyGuard, EIP712, Pausable, Ownable {
     /// @param timestamp Block timestamp when force-closed
     event ChannelClosedByExpiry(bytes32 indexed channelId, uint256 timestamp);
 
-    /// @notice Emitted when channel is cooperatively settled with mutual consent
+    /// @notice Emitted when a participant claims transferred funds from a channel
     /// @param channelId The unique channel identifier
-    /// @param participant1Amount Final amount transferred to participant1
-    /// @param participant2Amount Final amount transferred to participant2
-    event ChannelCooperativeSettled(bytes32 indexed channelId, uint256 participant1Amount, uint256 participant2Amount);
-
-    /// @notice Emitted when tokens are withdrawn from an open channel
-    /// @param channelId The unique channel identifier
-    /// @param participant The participant withdrawing funds
-    /// @param amount The amount withdrawn in this transaction
-    /// @param totalWithdrawn The cumulative withdrawn amount
-    event ChannelWithdrawal(bytes32 indexed channelId, address indexed participant, uint256 amount, uint256 totalWithdrawn);
+    /// @param claimant The participant who claimed the funds
+    /// @param claimedAmount The amount claimed in this transaction
+    /// @param totalClaimed The cumulative amount claimed by this participant
+    event ChannelClaimed(bytes32 indexed channelId, address indexed claimant, uint256 claimedAmount, uint256 totalClaimed);
 
     /// @notice Emitted when owner performs emergency token recovery
     /// @param channelId The channel identifier (if applicable)
@@ -293,12 +255,89 @@ contract TokenNetwork is ReentrancyGuard, EIP712, Pausable, Ownable {
         emit ChannelNewDeposit(channelId, participant, participants[channelId][participant].deposit);
     }
 
-    /// @notice Close a payment channel with a balance proof from the counterparty
-    /// @param channelId The unique identifier for the channel
-    /// @param balanceProof The off-chain balance proof signed by the non-closing participant
+    /// @notice Claim transferred funds from a channel using counterparty's signed balance proof
+    /// @param channelId The unique channel identifier
+    /// @param balanceProof The balance proof signed by the counterparty (sender)
     /// @param signature The EIP-712 signature of the balance proof
-    /// @dev Validates signature using EIP-712, records closer, starts challenge period
-    function closeChannel(bytes32 channelId, BalanceProof memory balanceProof, bytes memory signature)
+    /// @dev Works on both Opened and Closed channels. During the challenge period after close,
+    ///      the receiver can submit claims before settlement returns remaining funds to the depositor.
+    ///      Channel state is NOT changed by this function — only tokens are transferred.
+    ///      Only the delta since last claim is transferred (prevents double-pay).
+    function claimFromChannel(bytes32 channelId, BalanceProof memory balanceProof, bytes memory signature)
+        external
+        nonReentrant
+        whenNotPaused
+    {
+        // Validate channel exists and is open or closed (claims allowed during challenge period)
+        Channel storage channel = channels[channelId];
+        if (channel.state != ChannelState.Opened && channel.state != ChannelState.Closed) revert InvalidChannelState();
+
+        // Validate caller is a participant
+        if (msg.sender != channel.participant1 && msg.sender != channel.participant2) {
+            revert InvalidParticipant();
+        }
+
+        // Determine counterparty (the one who signed the balance proof / the sender)
+        address counterparty = msg.sender == channel.participant1 ? channel.participant2 : channel.participant1;
+
+        // Validate balance proof channelId matches
+        if (balanceProof.channelId != channelId) revert InvalidBalanceProof();
+
+        // Compute EIP-712 struct hash (same format as closeChannel)
+        bytes32 structHash = keccak256(
+            abi.encode(
+                BALANCE_PROOF_TYPEHASH,
+                balanceProof.channelId,
+                balanceProof.nonce,
+                balanceProof.transferredAmount,
+                balanceProof.lockedAmount,
+                balanceProof.locksRoot
+            )
+        );
+
+        // Compute EIP-712 digest and recover signer
+        bytes32 digest = _hashTypedDataV4(structHash);
+        address recovered = ECDSA.recover(digest, signature);
+
+        // Validate signer is the counterparty (sender of funds)
+        if (recovered != counterparty) revert InvalidSignature();
+
+        // Validate nonce is greater than stored nonce
+        ParticipantState storage counterpartyState = participants[channelId][counterparty];
+        if (balanceProof.nonce <= counterpartyState.nonce) revert InvalidNonce();
+
+        // Calculate claimable amount (delta since last claim)
+        uint256 previouslyClaimed = claimedAmounts[channelId][msg.sender];
+        uint256 newTransferred = balanceProof.transferredAmount;
+        if (newTransferred <= previouslyClaimed) revert NothingToClaim();
+        uint256 claimAmount = newTransferred - previouslyClaimed;
+
+        // Verify counterparty has enough deposit to cover all claims
+        // Available balance = deposit - withdrawn - total claimed by counterparty's peers
+        if (counterpartyState.deposit < newTransferred) {
+            revert InsufficientChannelBalance();
+        }
+
+        // Update counterparty's on-chain state (nonce and transferredAmount)
+        counterpartyState.nonce = balanceProof.nonce;
+        counterpartyState.transferredAmount = newTransferred;
+
+        // Update claimed amounts tracking
+        claimedAmounts[channelId][msg.sender] = newTransferred;
+
+        // Transfer the claimed tokens to the caller
+        IERC20(token).safeTransfer(msg.sender, claimAmount);
+
+        // Emit event
+        emit ChannelClaimed(channelId, msg.sender, claimAmount, newTransferred);
+    }
+
+    /// @notice Close a payment channel, starting the grace period
+    /// @param channelId The unique identifier for the channel
+    /// @dev Any participant can call. Starts the challenge period during which the receiver
+    ///      can submit claims via claimFromChannel. After the grace period, settleChannel
+    ///      returns remaining funds to each depositor.
+    function closeChannel(bytes32 channelId)
         external
         nonReentrant
         whenNotPaused
@@ -312,161 +351,44 @@ contract TokenNetwork is ReentrancyGuard, EIP712, Pausable, Ownable {
             revert InvalidParticipant();
         }
 
-        // Identify non-closing participant
-        address nonClosingParticipant = msg.sender == channel.participant1 ? channel.participant2 : channel.participant1;
-
-        // Validate balance proof channelId matches
-        if (balanceProof.channelId != channelId) revert InvalidBalanceProof();
-
-        // Compute EIP-712 struct hash
-        bytes32 structHash = keccak256(
-            abi.encode(
-                BALANCE_PROOF_TYPEHASH,
-                balanceProof.channelId,
-                balanceProof.nonce,
-                balanceProof.transferredAmount,
-                balanceProof.lockedAmount,
-                balanceProof.locksRoot
-            )
-        );
-
-        // Compute EIP-712 digest
-        bytes32 digest = _hashTypedDataV4(structHash);
-
-        // Recover signer from signature
-        address recovered = ECDSA.recover(digest, signature);
-
-        // Validate signer is non-closing participant
-        if (recovered != nonClosingParticipant) revert InvalidSignature();
-
-        // Validate nonce is greater than stored nonce
-        uint256 storedNonce = participants[channelId][nonClosingParticipant].nonce;
-        if (balanceProof.nonce <= storedNonce) revert InvalidNonce();
-
-        // Record closing participant
-        participants[channelId][msg.sender].isCloser = true;
-
-        // Update non-closing participant state
-        participants[channelId][nonClosingParticipant].nonce = balanceProof.nonce;
-        participants[channelId][nonClosingParticipant].transferredAmount = balanceProof.transferredAmount;
-
-        // Compute balance hash for event
-        bytes32 balanceHash = keccak256(
-            abi.encodePacked(balanceProof.transferredAmount, balanceProof.lockedAmount, balanceProof.locksRoot)
-        );
-
         // Update channel state to Closed and record timestamp
         channel.state = ChannelState.Closed;
         channel.closedAt = block.timestamp;
 
         // Emit event
-        emit ChannelClosed(channelId, msg.sender, balanceProof.nonce, balanceHash);
+        emit ChannelClosed(channelId, msg.sender);
     }
 
-    /// @notice Update balance proof during challenge period (non-closing participant only)
+    /// @notice Settle a channel after the grace period expires
     /// @param channelId The unique identifier for the channel
-    /// @param balanceProof The newer off-chain balance proof signed by the closing participant
-    /// @param signature The EIP-712 signature of the balance proof
-    /// @dev Allows non-closing participant to submit newer state during challenge period
-    function updateNonClosingBalanceProof(bytes32 channelId, BalanceProof memory balanceProof, bytes memory signature)
-        external
-        nonReentrant
-        whenNotPaused
-    {
-        // Validate channel is in Closed state
-        Channel storage channel = channels[channelId];
-        if (channel.state != ChannelState.Closed) revert InvalidChannelState();
-
-        // Validate caller is non-closing participant
-        if (participants[channelId][msg.sender].isCloser) revert CallerIsCloser();
-        if (msg.sender != channel.participant1 && msg.sender != channel.participant2) {
-            revert InvalidParticipant();
-        }
-
-        // Validate challenge period has not expired
-        if (block.timestamp >= channel.closedAt + channel.settlementTimeout) {
-            revert ChallengePeriodExpired();
-        }
-
-        // Identify closing participant
-        address closingParticipant =
-            participants[channelId][channel.participant1].isCloser ? channel.participant1 : channel.participant2;
-
-        // Validate balance proof channelId matches
-        if (balanceProof.channelId != channelId) revert InvalidBalanceProof();
-
-        // Compute EIP-712 struct hash
-        bytes32 structHash = keccak256(
-            abi.encode(
-                BALANCE_PROOF_TYPEHASH,
-                balanceProof.channelId,
-                balanceProof.nonce,
-                balanceProof.transferredAmount,
-                balanceProof.lockedAmount,
-                balanceProof.locksRoot
-            )
-        );
-
-        // Compute EIP-712 digest
-        bytes32 digest = _hashTypedDataV4(structHash);
-
-        // Recover signer from signature
-        address recovered = ECDSA.recover(digest, signature);
-
-        // Validate signer is closing participant
-        if (recovered != closingParticipant) revert InvalidSignature();
-
-        // Validate nonce is strictly greater than stored nonce
-        uint256 storedNonce = participants[channelId][closingParticipant].nonce;
-        if (balanceProof.nonce <= storedNonce) revert InvalidNonce();
-
-        // Update closing participant state with newer balance proof
-        participants[channelId][closingParticipant].nonce = balanceProof.nonce;
-        participants[channelId][closingParticipant].transferredAmount = balanceProof.transferredAmount;
-
-        // Compute balance hash for event
-        bytes32 balanceHash = keccak256(
-            abi.encodePacked(balanceProof.transferredAmount, balanceProof.lockedAmount, balanceProof.locksRoot)
-        );
-
-        // Emit event
-        emit NonClosingBalanceProofUpdated(channelId, msg.sender, balanceProof.nonce, balanceHash);
-    }
-
-    /// @notice Settle a channel and distribute final balances after challenge period
-    /// @param channelId The unique identifier for the channel
-    /// @dev Anyone can call this function after challenge period expires
+    /// @dev Anyone can call after the grace period. Returns remaining funds (deposit minus
+    ///      amounts already claimed via claimFromChannel) to each depositor.
     function settleChannel(bytes32 channelId) external nonReentrant whenNotPaused {
         // Validate channel is in Closed state
         Channel storage channel = channels[channelId];
         if (channel.state != ChannelState.Closed) revert InvalidChannelState();
 
-        // Validate challenge period has expired
+        // Validate grace period has expired
         if (block.timestamp < channel.closedAt + channel.settlementTimeout) {
             revert SettlementTimeoutNotExpired();
         }
 
-        // Calculate final balances for both participants
+        // Each depositor gets back: deposit - what the counterparty already claimed from them
+        // claimedAmounts[p2] = tokens p2 received from p1's signed proofs via claimFromChannel
         uint256 participant1Deposit = participants[channelId][channel.participant1].deposit;
-        uint256 participant1Withdrawn = participants[channelId][channel.participant1].withdrawnAmount;
-        uint256 participant1Transferred = participants[channelId][channel.participant1].transferredAmount;
-        uint256 participant2Transferred = participants[channelId][channel.participant2].transferredAmount;
-
         uint256 participant2Deposit = participants[channelId][channel.participant2].deposit;
-        uint256 participant2Withdrawn = participants[channelId][channel.participant2].withdrawnAmount;
 
-        // Participant 1 final balance: deposit - withdrawn - transferred_to_p2 + received_from_p2
-        uint256 participant1FinalBalance =
-            participant1Deposit - participant1Withdrawn - participant1Transferred + participant2Transferred;
+        // p2 claimed from p1's deposit, p1 claimed from p2's deposit
+        uint256 claimedFromP1 = claimedAmounts[channelId][channel.participant2]; // what p2 took from p1
+        uint256 claimedFromP2 = claimedAmounts[channelId][channel.participant1]; // what p1 took from p2
 
-        // Participant 2 final balance: deposit - withdrawn - transferred_to_p1 + received_from_p1
-        uint256 participant2FinalBalance =
-            participant2Deposit - participant2Withdrawn - participant2Transferred + participant1Transferred;
+        uint256 participant1FinalBalance = participant1Deposit - claimedFromP1;
+        uint256 participant2FinalBalance = participant2Deposit - claimedFromP2;
 
         // Update channel state to Settled
         channel.state = ChannelState.Settled;
 
-        // Transfer tokens to both participants using SafeERC20
+        // Return remaining funds to each depositor
         if (participant1FinalBalance > 0) {
             IERC20(token).safeTransfer(channel.participant1, participant1FinalBalance);
         }
@@ -499,186 +421,6 @@ contract TokenNetwork is ReentrancyGuard, EIP712, Pausable, Ownable {
 
         // Emit event
         emit ChannelClosedByExpiry(channelId, block.timestamp);
-    }
-
-    /// @notice Cooperatively settle channel with mutual consent (bypasses challenge period)
-    /// @param channelId The unique channel identifier
-    /// @param proof1 Balance proof from participant1
-    /// @param sig1 Signature from participant1
-    /// @param proof2 Balance proof from participant2
-    /// @param sig2 Signature from participant2
-    /// @dev Both participants must sign identical final state (same nonce)
-    function cooperativeSettle(
-        bytes32 channelId,
-        BalanceProof memory proof1,
-        bytes memory sig1,
-        BalanceProof memory proof2,
-        bytes memory sig2
-    ) external nonReentrant whenNotPaused {
-        Channel storage channel = channels[channelId];
-
-        // Validate channel is open
-        if (channel.state != ChannelState.Opened) revert InvalidChannelState();
-
-        // Validate channel IDs match
-        if (proof1.channelId != channelId || proof2.channelId != channelId) {
-            revert InvalidBalanceProof();
-        }
-
-        // Validate nonces match (both participants agree on final state)
-        if (proof1.nonce != proof2.nonce) revert NonceMismatch();
-
-        // Verify signatures - determine which participant signed which proof
-        bytes32 structHash1 = keccak256(
-            abi.encode(
-                BALANCE_PROOF_TYPEHASH,
-                proof1.channelId,
-                proof1.nonce,
-                proof1.transferredAmount,
-                proof1.lockedAmount,
-                proof1.locksRoot
-            )
-        );
-        address signer1 = ECDSA.recover(_hashTypedDataV4(structHash1), sig1);
-
-        bytes32 structHash2 = keccak256(
-            abi.encode(
-                BALANCE_PROOF_TYPEHASH,
-                proof2.channelId,
-                proof2.nonce,
-                proof2.transferredAmount,
-                proof2.lockedAmount,
-                proof2.locksRoot
-            )
-        );
-        address signer2 = ECDSA.recover(_hashTypedDataV4(structHash2), sig2);
-
-        // Verify both participants signed (order doesn't matter)
-        bool signer1IsParticipant1 = signer1 == channel.participant1;
-        bool signer1IsParticipant2 = signer1 == channel.participant2;
-        bool signer2IsParticipant1 = signer2 == channel.participant1;
-        bool signer2IsParticipant2 = signer2 == channel.participant2;
-
-        // One signer must be participant1, other must be participant2
-        bool validSignatures = (signer1IsParticipant1 && signer2IsParticipant2) ||
-                               (signer1IsParticipant2 && signer2IsParticipant1);
-        if (!validSignatures) revert InvalidSignature();
-
-        // Calculate final balances based on who signed what
-        uint256 participant1Deposit = participants[channelId][channel.participant1].deposit;
-        uint256 participant1Withdrawn = participants[channelId][channel.participant1].withdrawnAmount;
-        uint256 participant2Deposit = participants[channelId][channel.participant2].deposit;
-        uint256 participant2Withdrawn = participants[channelId][channel.participant2].withdrawnAmount;
-
-        // Determine which proof is from which participant
-        uint256 participant1Sent;
-        uint256 participant2Sent;
-
-        if (signer1IsParticipant1) {
-            // proof1 from participant1, proof2 from participant2
-            participant1Sent = proof1.transferredAmount;
-            participant2Sent = proof2.transferredAmount;
-        } else {
-            // proof1 from participant2, proof2 from participant1
-            participant1Sent = proof2.transferredAmount;
-            participant2Sent = proof1.transferredAmount;
-        }
-
-        // Participant1 final = deposit - withdrawn - sent + received
-        uint256 participant1Final = participant1Deposit - participant1Withdrawn - participant1Sent + participant2Sent;
-        // Participant2 final = deposit - withdrawn - sent + received
-        uint256 participant2Final = participant2Deposit - participant2Withdrawn - participant2Sent + participant1Sent;
-
-        // Update channel state to Settled (skip Closed state)
-        channel.state = ChannelState.Settled;
-
-        // Transfer tokens to both participants
-        if (participant1Final > 0) {
-            IERC20(token).safeTransfer(channel.participant1, participant1Final);
-        }
-
-        if (participant2Final > 0) {
-            IERC20(token).safeTransfer(channel.participant2, participant2Final);
-        }
-
-        // Emit event
-        emit ChannelCooperativeSettled(channelId, participant1Final, participant2Final);
-    }
-
-    /// @notice Withdraw funds from an open channel with counterparty consent
-    /// @param channelId The unique channel identifier
-    /// @param withdrawnAmount Cumulative total amount withdrawn (monotonically increasing)
-    /// @param nonce Monotonically increasing state counter (prevents replay)
-    /// @param counterpartySignature Signature from counterparty approving withdrawal
-    /// @dev Requires counterparty signature, allows removing funds while channel remains open
-    function withdraw(
-        bytes32 channelId,
-        uint256 withdrawnAmount,
-        uint256 nonce,
-        bytes memory counterpartySignature
-    ) external nonReentrant whenNotPaused {
-        Channel storage channel = channels[channelId];
-
-        // Validate channel is open
-        if (channel.state != ChannelState.Opened) revert InvalidChannelState();
-
-        // Validate caller is a participant
-        if (msg.sender != channel.participant1 && msg.sender != channel.participant2) {
-            revert InvalidParticipant();
-        }
-
-        // Determine counterparty
-        address counterparty = msg.sender == channel.participant1 ? channel.participant2 : channel.participant1;
-
-        // Create withdrawal proof struct
-        WithdrawalProof memory proof = WithdrawalProof({
-            channelId: channelId,
-            participant: msg.sender,
-            withdrawnAmount: withdrawnAmount,
-            nonce: nonce
-        });
-
-        // Verify counterparty signature
-        bytes32 structHash = keccak256(
-            abi.encode(
-                WITHDRAWAL_PROOF_TYPEHASH,
-                proof.channelId,
-                proof.participant,
-                proof.withdrawnAmount,
-                proof.nonce
-            )
-        );
-        address signer = ECDSA.recover(_hashTypedDataV4(structHash), counterpartySignature);
-        if (signer != counterparty) revert InvalidSignature();
-
-        // Get participant state
-        ParticipantState storage participantState = participants[channelId][msg.sender];
-
-        // Validate nonce is increasing (prevents replay)
-        if (nonce <= participantState.nonce) revert InvalidNonce();
-
-        // Validate withdrawn amount is increasing (cumulative)
-        if (withdrawnAmount <= participantState.withdrawnAmount) {
-            revert WithdrawalNotIncreasing();
-        }
-
-        // Validate withdrawn amount doesn't exceed deposit
-        if (withdrawnAmount > participantState.deposit) {
-            revert WithdrawalExceedsDeposit();
-        }
-
-        // Calculate actual withdrawal amount for this transaction
-        uint256 toWithdraw = withdrawnAmount - participantState.withdrawnAmount;
-
-        // Transfer tokens to participant
-        IERC20(token).safeTransfer(msg.sender, toWithdraw);
-
-        // Update participant state
-        participantState.withdrawnAmount = withdrawnAmount;
-        participantState.nonce = nonce;
-
-        // Emit event
-        emit ChannelWithdrawal(channelId, msg.sender, toWithdraw, withdrawnAmount);
     }
 
     /// @notice Emergency token recovery for stuck funds (owner only, contract must be paused)

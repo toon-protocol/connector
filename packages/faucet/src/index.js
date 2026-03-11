@@ -15,8 +15,7 @@ const TOKEN_PRIVATE_KEY =
   '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'; // Anvil Account 0 (deployer)
 const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS;
 const ETH_AMOUNT = process.env.ETH_AMOUNT || '100'; // 100 ETH
-const TOKEN_AMOUNT = process.env.TOKEN_AMOUNT || '10000'; // 10,000 AGENT tokens
-const RATE_LIMIT_HOURS = parseInt(process.env.RATE_LIMIT_HOURS || '1');
+const TOKEN_AMOUNT = process.env.TOKEN_AMOUNT || '10000'; // 10,000 USDC tokens
 
 // ERC20 ABI (minimal)
 const ERC20_ABI = [
@@ -26,25 +25,19 @@ const ERC20_ABI = [
   'function symbol() view returns (string)',
 ];
 
-// Rate limiting: address -> timestamp
-const rateLimits = new Map();
-
-// Request serialization lock to prevent nonce race conditions
-let requestLock = Promise.resolve();
-
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Setup provider and wallets with NonceManager to prevent stale nonce issues
+// Setup provider and wallets
 const provider = new ethers.JsonRpcProvider(RPC_URL);
-const ethWallet = new ethers.NonceManager(new ethers.Wallet(ETH_PRIVATE_KEY, provider));
-const tokenWallet = new ethers.NonceManager(new ethers.Wallet(TOKEN_PRIVATE_KEY, provider));
+const ethWallet = new ethers.Wallet(ETH_PRIVATE_KEY, provider);
+const tokenWallet = new ethers.Wallet(TOKEN_PRIVATE_KEY, provider);
 
 // Token contract instance (will be set after deployment)
 let tokenContract = null;
-let tokenSymbol = 'AGENT';
+let tokenSymbol = 'USDC';
 let tokenDecimals = 18;
 
 // Initialize token contract
@@ -64,30 +57,6 @@ async function initTokenContract() {
     console.error('❌ Failed to initialize token contract:', error.message);
     return false;
   }
-}
-
-// Check rate limit
-function checkRateLimit(address) {
-  const now = Date.now();
-  const lastRequest = rateLimits.get(address.toLowerCase());
-
-  if (lastRequest) {
-    const hoursSinceLastRequest = (now - lastRequest) / (1000 * 60 * 60);
-    if (hoursSinceLastRequest < RATE_LIMIT_HOURS) {
-      const waitMinutes = Math.ceil(RATE_LIMIT_HOURS * 60 - hoursSinceLastRequest * 60);
-      return {
-        allowed: false,
-        waitMinutes,
-      };
-    }
-  }
-
-  return { allowed: true };
-}
-
-// Update rate limit
-function updateRateLimit(address) {
-  rateLimits.set(address.toLowerCase(), Date.now());
 }
 
 // Validate Ethereum address
@@ -124,7 +93,6 @@ app.get('/api/info', async (req, res) => {
       tokenAmount: TOKEN_AMOUNT,
       tokenSymbol,
       tokenAddress: TOKEN_ADDRESS,
-      rateLimitHours: RATE_LIMIT_HOURS,
       faucetBalances: {
         eth: ethers.formatEther(ethBalance),
         token: tokenBalance,
@@ -139,36 +107,17 @@ app.get('/api/info', async (req, res) => {
   }
 });
 
-// Request tokens (serialized to prevent nonce race conditions)
+// Request tokens
 app.post('/api/request', async (req, res) => {
-  const { address } = req.body;
-
-  // Validate address (before lock)
-  if (!address || !isValidAddress(address)) {
-    return res.status(400).json({
-      error: 'Invalid Ethereum address',
-    });
-  }
-
-  // Check rate limit (before lock)
-  const rateCheck = checkRateLimit(address);
-  if (!rateCheck.allowed) {
-    return res.status(429).json({
-      error: 'Rate limit exceeded',
-      message: `Please wait ${rateCheck.waitMinutes} minutes before requesting again`,
-      waitMinutes: rateCheck.waitMinutes,
-    });
-  }
-
-  // Serialize all on-chain operations to prevent nonce conflicts
-  const currentLock = requestLock;
-  let resolve;
-  requestLock = new Promise((r) => {
-    resolve = r;
-  });
-
   try {
-    await currentLock;
+    const { address } = req.body;
+
+    // Validate address
+    if (!address || !isValidAddress(address)) {
+      return res.status(400).json({
+        error: 'Invalid Ethereum address',
+      });
+    }
 
     // Check if token contract is ready
     if (!tokenContract) {
@@ -189,16 +138,15 @@ app.post('/api/request', async (req, res) => {
       value: ethers.parseEther(ETH_AMOUNT),
     });
     console.log(`  📤 Sending ${ETH_AMOUNT} ETH: ${ethTx.hash}`);
-    await ethTx.wait();
 
     // Send tokens
     const tokenAmount = ethers.parseUnits(TOKEN_AMOUNT, tokenDecimals);
     const tokenTx = await tokenContract.transfer(address, tokenAmount);
     console.log(`  📤 Sending ${TOKEN_AMOUNT} ${tokenSymbol}: ${tokenTx.hash}`);
-    await tokenTx.wait();
 
-    // Update rate limit
-    updateRateLimit(address);
+    // Wait for confirmations
+    await ethTx.wait();
+    await tokenTx.wait();
 
     console.log(`  ✅ Faucet request completed for ${address}`);
 
@@ -222,8 +170,6 @@ app.post('/api/request', async (req, res) => {
       error: 'Faucet request failed',
       message: error.message,
     });
-  } finally {
-    resolve();
   }
 });
 
@@ -231,13 +177,12 @@ app.post('/api/request', async (req, res) => {
 app.listen(PORT, async () => {
   console.log('');
   console.log('═══════════════════════════════════════════════');
-  console.log('   🚰 M2M Connector Token Faucet');
+  console.log('   🚰 Token Faucet');
   console.log('═══════════════════════════════════════════════');
   console.log(`   Port:          ${PORT}`);
   console.log(`   RPC URL:       ${RPC_URL}`);
   console.log(`   ETH per drip:  ${ETH_AMOUNT} ETH`);
   console.log(`   Token per drip: ${TOKEN_AMOUNT} ${tokenSymbol}`);
-  console.log(`   Rate limit:    ${RATE_LIMIT_HOURS} hour(s)`);
   console.log('═══════════════════════════════════════════════');
   console.log('');
 

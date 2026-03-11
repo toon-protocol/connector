@@ -2,7 +2,6 @@ import pino from 'pino';
 import { FraudDetector } from '../../src/security/fraud-detector';
 import { ReputationTracker } from '../../src/security/reputation-tracker';
 import { AlertNotifier } from '../../src/security/alert-notifier';
-import { FraudMetricsCollector } from '../../src/security/fraud-metrics';
 import { AuditLogger } from '../../src/security/audit-logger';
 import {
   DoubleSpendDetectionRule,
@@ -19,7 +18,6 @@ describe('Fraud Detection Integration Tests', () => {
   let fraudDetector: FraudDetector;
   let reputationTracker: ReputationTracker;
   let alertNotifier: AlertNotifier;
-  let metricsCollector: FraudMetricsCollector;
   let auditLogger: AuditLogger;
   let logger: pino.Logger;
 
@@ -65,8 +63,6 @@ describe('Fraud Detection Integration Tests', () => {
       },
     });
 
-    metricsCollector = new FraudMetricsCollector(logger);
-
     auditLogger = new AuditLogger(logger, {
       nodeId: 'test-node',
       backend: 'test-backend',
@@ -79,9 +75,6 @@ describe('Fraud Detection Integration Tests', () => {
 
       // Send alert
       await alertNotifier.sendAlert(event);
-
-      // Record metrics
-      metricsCollector.recordDetection(event.ruleName, event.severity);
 
       // Log to audit trail
       auditLogger.logFraudDetection(event.peerId, event.ruleName, event.severity, event.details);
@@ -98,7 +91,6 @@ describe('Fraud Detection Integration Tests', () => {
     });
 
     fraudDetector.on('PEER_PAUSED', (event) => {
-      metricsCollector.recordBlockedTransaction(event.peerId, event.ruleViolated);
       auditLogger.logPeerPause(event.peerId, event.reason, event.ruleViolated, event.severity);
     });
 
@@ -112,7 +104,6 @@ describe('Fraud Detection Integration Tests', () => {
   afterEach(() => {
     fraudDetector.stop();
     reputationTracker.clearAll();
-    metricsCollector.clearAll();
   });
 
   describe('Double-Spend Attack Simulation', () => {
@@ -203,10 +194,6 @@ describe('Fraud Detection Integration Tests', () => {
       // Verify peer auto-paused
       expect(fraudDetector.isPeerPaused(peerId)).toBe(true);
 
-      // Verify metrics recorded
-      expect(metricsCollector.getDetectionsPerHour()).toBeGreaterThan(0);
-      expect(metricsCollector.getBlockedTransactions()).toBe(1);
-
       // Verify peer pause reason
       const pauseReason = fraudDetector.getPauseReason(peerId);
       expect(pauseReason).toBeDefined();
@@ -240,9 +227,6 @@ describe('Fraud Detection Integration Tests', () => {
       expect(reputation).toBeDefined();
       // Should have detected fraud on 4th and 5th closure
       expect(reputation!.score).toBeLessThan(100);
-
-      // Verify metrics
-      expect(metricsCollector.getDetectionsPerHour()).toBeGreaterThanOrEqual(2);
     });
   });
 
@@ -286,10 +270,8 @@ describe('Fraud Detection Integration Tests', () => {
       // Wait for async processing
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      // Verify fraud detection or metrics (may not detect on first spike)
+      // Verify fraud detection (may not detect on first spike)
       // Traffic spike rule needs at least 2 data points, so this is expected behavior
-      const detections = metricsCollector.getDetectionsPerHour();
-      expect(detections).toBeGreaterThanOrEqual(0);
     });
   });
 
@@ -320,8 +302,7 @@ describe('Fraud Detection Integration Tests', () => {
       // Note: Peer not auto-paused because score 75 > threshold 50
       expect(fraudDetector.isPeerPaused(peerId)).toBe(false);
 
-      // Verify metrics
-      expect(metricsCollector.getDetectionsPerHour()).toBeGreaterThan(0);
+      // Verify fraud was detected via reputation change
     });
 
     it('should detect unexpected balance decrease', async () => {
@@ -387,12 +368,7 @@ describe('Fraud Detection Integration Tests', () => {
       expect(reputation).toBeDefined();
       expect(reputation!.score).toBe(75); // 100 - 25 (critical penalty)
 
-      // 3. Verify metrics completeness
-      const prometheusMetrics = metricsCollector.exportPrometheusMetrics();
-      expect(prometheusMetrics).toContain('fraud_detections_total');
-      expect(prometheusMetrics).toContain('DoubleSpendDetectionRule');
-
-      // 4. Manually pause peer for testing
+      // 3. Manually pause peer for testing
       await fraudDetector.pausePeer(
         peerId,
         'Manual pause for testing',
@@ -401,12 +377,12 @@ describe('Fraud Detection Integration Tests', () => {
       );
       expect(fraudDetector.isPeerPaused(peerId)).toBe(true);
 
-      // 5. Verify pause reason
+      // 4. Verify pause reason
       const pauseReason = fraudDetector.getPauseReason(peerId);
       expect(pauseReason).toBeDefined();
       expect(pauseReason?.ruleViolated).toBe('DoubleSpendDetectionRule');
 
-      // 6. Manual review and resume
+      // 5. Manual review and resume
       await fraudDetector.resumePeer(peerId);
       expect(fraudDetector.isPeerPaused(peerId)).toBe(false);
     });
@@ -481,9 +457,6 @@ describe('Fraud Detection Integration Tests', () => {
 
       // Wait for processing
       await new Promise((resolve) => setTimeout(resolve, 200));
-
-      // Verify metrics are still functioning
-      expect(metricsCollector.getDetectionsPerHour()).toBeGreaterThanOrEqual(0);
 
       // Verify reputation tracker hasn't leaked memory
       const allScores = reputationTracker.getAllReputationScores();

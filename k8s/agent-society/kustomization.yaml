@@ -1,7 +1,0 @@
-# Agent Society - Default Kustomization
-# Use overlays for environment-specific configuration
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-
-resources:
-  - base

@@ -7,7 +7,6 @@ import { Database } from 'better-sqlite3';
 import { Logger } from 'pino';
 import { ClaimSender } from './claim-sender';
 import { BTPClient } from '../btp/btp-client';
-import { TelemetryEmitter } from '../telemetry/telemetry-emitter';
 
 // Mock types
 type MockDatabase = {
@@ -23,10 +22,6 @@ type MockLogger = {
   child: jest.Mock;
 };
 
-type MockTelemetryEmitter = {
-  emit: jest.Mock;
-};
-
 type MockBTPClient = {
   sendProtocolData: jest.Mock;
 };
@@ -35,7 +30,6 @@ describe('ClaimSender', () => {
   let claimSender: ClaimSender;
   let mockDb: MockDatabase;
   let mockLogger: MockLogger;
-  let mockTelemetryEmitter: MockTelemetryEmitter;
   let mockBtpClient: MockBTPClient;
   let mockPreparedStatement: { run: jest.Mock };
 
@@ -66,10 +60,6 @@ describe('ClaimSender', () => {
       child: jest.fn(() => childLogger),
     };
 
-    mockTelemetryEmitter = {
-      emit: jest.fn(),
-    };
-
     mockBtpClient = {
       sendProtocolData: jest.fn().mockResolvedValue(undefined),
     };
@@ -77,7 +67,6 @@ describe('ClaimSender', () => {
     claimSender = new ClaimSender(
       mockDb as unknown as Database,
       mockLogger as unknown as Logger,
-      mockTelemetryEmitter as unknown as TelemetryEmitter,
       'test-node-id'
     );
   });
@@ -132,15 +121,6 @@ describe('ClaimSender', () => {
         'evm',
         expect.any(String),
         expect.any(Number)
-      );
-
-      // Assert telemetry uses transferredAmount for EVM
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          blockchain: 'evm',
-          amount: transferredAmount,
-          success: true,
-        })
       );
     }, 50);
   });
@@ -237,14 +217,6 @@ describe('ClaimSender', () => {
       expect(result.success).toBe(false);
       expect(result.error).toBe('Connection refused');
       expect(mockBtpClient.sendProtocolData).toHaveBeenCalledTimes(3);
-
-      // Verify failure telemetry
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          success: false,
-          error: 'Connection refused',
-        })
-      );
     }, 10000);
   });
 
@@ -310,65 +282,6 @@ describe('ClaimSender', () => {
         }),
         'Failed to persist claim to database'
       );
-    }, 50);
-  });
-
-  describe('telemetry emission', () => {
-    it('should handle telemetry emission failures gracefully', async () => {
-      // Mock: telemetry emitter throws error
-      mockTelemetryEmitter.emit.mockImplementationOnce(() => {
-        throw new Error('Telemetry service unavailable');
-      });
-
-      const result = await claimSender.sendEVMClaim(
-        'peer-telemetry-fail',
-        mockBtpClient as unknown as BTPClient,
-        '0xchannelIdDEF',
-        1,
-        '5000',
-        '0',
-        '0x00',
-        '0xsig',
-        '0xaddr'
-      );
-
-      // Claim send should still succeed (telemetry is non-blocking)
-      expect(result.success).toBe(true);
-
-      // Verify error logged (in main logger, not child logger)
-      expect(mockLogger.error).toHaveBeenCalledWith(
-        expect.objectContaining({
-          error: expect.objectContaining({ message: 'Telemetry service unavailable' }),
-          messageId: result.messageId,
-        }),
-        'Failed to emit claim telemetry'
-      );
-    }, 50);
-
-    it('should not emit telemetry if telemetryEmitter is undefined', async () => {
-      // Create ClaimSender without telemetry emitter
-      const claimSenderNoTelemetry = new ClaimSender(
-        mockDb as unknown as Database,
-        mockLogger as unknown as Logger,
-        undefined, // No telemetry emitter
-        'test-node'
-      );
-
-      const result = await claimSenderNoTelemetry.sendEVMClaim(
-        'peer-no-telemetry',
-        mockBtpClient as unknown as BTPClient,
-        '0xchannelIdGHI',
-        1,
-        '6000',
-        '0',
-        '0x00',
-        '0xsig',
-        '0xaddr'
-      );
-
-      // Should succeed without attempting telemetry
-      expect(result.success).toBe(true);
-      expect(mockTelemetryEmitter.emit).not.toHaveBeenCalled();
     }, 50);
   });
 
@@ -483,8 +396,7 @@ describe('ClaimSender', () => {
     it('should handle missing nodeId gracefully', async () => {
       const claimSenderNoNodeId = new ClaimSender(
         mockDb as unknown as Database,
-        mockLogger as unknown as Logger,
-        mockTelemetryEmitter as unknown as TelemetryEmitter
+        mockLogger as unknown as Logger
         // nodeId is undefined
       );
 
@@ -502,16 +414,10 @@ describe('ClaimSender', () => {
 
       expect(result.success).toBe(true);
 
-      // Verify claim uses 'unknown' for senderId and nodeId
+      // Verify claim uses 'unknown' for senderId
       const [, , dataBuffer] = mockBtpClient.sendProtocolData.mock.calls[0];
       const claimData = JSON.parse(dataBuffer.toString('utf8'));
       expect(claimData.senderId).toBe('unknown');
-
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          nodeId: 'unknown',
-        })
-      );
     }, 50);
 
     it('should handle very large amounts correctly', async () => {

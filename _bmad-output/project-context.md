@@ -27,7 +27,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
 
 - **Language:** TypeScript 5.3.3 (strict mode enabled, ES2022 target, CommonJS modules)
 - **Runtime:** Node.js >= 22.11.0
-- **Monorepo:** npm workspaces (`packages/connector`, `packages/shared`, `packages/contracts`, `packages/dashboard`, `packages/faucet`)
+- **Monorepo:** npm workspaces (`packages/connector`, `packages/shared`, `packages/contracts`)
 - **Blockchain:** ethers 6.16.0 (EVM/Base L2 settlement)
 - **Transport:** ws 8.16.0 (BTP over WebSocket, RFC-0023)
 - **HTTP:** Express 4.18.x (admin API, health checks, explorer)

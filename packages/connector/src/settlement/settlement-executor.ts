@@ -9,13 +9,12 @@
  * - Opens new payment channels when no channel exists for a peer
  * - Signs balance proofs and executes cooperative settlements via existing channels
  * - Updates TigerBeetle accounts after successful on-chain settlement
- * - Handles settlement failures with retry logic and telemetry emission
+ * - Handles settlement failures with retry logic
  *
  * **Integration Points:**
  * - SettlementMonitor: Receives SETTLEMENT_REQUIRED events (Epic 6 Story 6.6)
  * - PaymentChannelSDK: Executes blockchain operations (Epic 8 Story 8.7)
  * - AccountManager: Updates TigerBeetle balances (Epic 6 Story 6.4)
- * - TelemetryEmitter: Emits settlement telemetry for dashboard (Epic 6 Story 6.8)
  *
  * Source: Epic 8 Story 8.8 - Settlement Engine Integration with Payment Channels
  *
@@ -29,8 +28,6 @@ import { BalanceProof } from '@crosstown/shared';
 import { AccountManager } from './account-manager';
 import { PaymentChannelSDK } from './payment-channel-sdk';
 import { SettlementMonitor } from './settlement-monitor';
-import { EventStore } from '../explorer/event-store';
-import { EventBroadcaster } from '../explorer/event-broadcaster';
 import type { PerPacketClaimService } from './per-packet-claim-service';
 
 /**
@@ -43,7 +40,7 @@ import type { PerPacketClaimService } from './per-packet-claim-service';
  * @property minDepositThreshold - Add funds when deposit < threshold × multiplier × minDepositThreshold (default: 0.5)
  * @property maxRetries - Maximum retry attempts for transient failures (default: 3)
  * @property retryDelayMs - Initial retry delay in milliseconds (default: 5000ms)
- * @property tokenAddressMap - Maps tokenId (e.g., "ILP", "USDC") to ERC20 contract address
+ * @property tokenAddressMap - Maps tokenId (e.g., "M2M", "USDC") to ERC20 contract address
  * @property peerIdToAddressMap - Maps peerId (e.g., "connector-b") to Ethereum address
  * @property registryAddress - TokenNetworkRegistry contract address
  * @property rpcUrl - Base L2 RPC URL (e.g., http://localhost:8545)
@@ -64,14 +61,6 @@ export interface SettlementExecutorConfig {
 }
 
 /**
- * TelemetryEmitter interface for settlement telemetry events
- * Source: Epic 6 Story 6.8 - Telemetry System
- */
-export interface TelemetryEmitter {
-  emit(event: Record<string, unknown>): void;
-}
-
-/**
  * SettlementExecutor Class
  *
  * Executes automated on-chain settlements via payment channels when
@@ -85,11 +74,11 @@ export interface TelemetryEmitter {
  * 4b. If channel exists: Generate balance proof and cooperative settle
  * 5. Update TigerBeetle accounts after on-chain confirmation
  * 6. Mark settlement as COMPLETED in SettlementMonitor
- * 7. Emit telemetry for settlement outcome
+ * 7. Log settlement outcome
  *
  * **Error Handling:**
  * - Transient errors (network failures, gas spikes): Retry with exponential backoff
- * - Permanent errors (insufficient funds, channel closed): Log error, emit telemetry, halt
+ * - Permanent errors (insufficient funds, channel closed): Log error, halt
  * - Settlement failures leave state as IN_PROGRESS for manual intervention
  *
  * @class SettlementExecutor
@@ -101,11 +90,20 @@ export class SettlementExecutor extends EventEmitter {
   private readonly paymentChannelSDK: PaymentChannelSDK;
   private readonly settlementMonitor: SettlementMonitor;
   private readonly logger: Logger;
-  private readonly telemetryEmitter?: TelemetryEmitter;
-  private readonly boundHandleSettlement: (event: SettlementTriggerEvent) => Promise<void>;
-  private eventStore: EventStore | null = null;
-  private eventBroadcaster: EventBroadcaster | null = null;
+  private readonly boundHandleSettlement: (event: SettlementTriggerEvent) => void;
   private perPacketClaimService: PerPacketClaimService | null = null;
+
+  /**
+   * Settlement chain serializes all on-chain operations to prevent nonce collisions.
+   * Each settlement is chained onto this promise so they execute sequentially.
+   */
+  private settlementChain: Promise<void> = Promise.resolve();
+
+  /**
+   * Flag to reject new settlements during shutdown.
+   * Set to true in stop() before awaiting in-flight settlements.
+   */
+  private stopping = false;
 
   /**
    * Constructor
@@ -118,22 +116,19 @@ export class SettlementExecutor extends EventEmitter {
    * @param paymentChannelSDK - Payment channel blockchain SDK
    * @param settlementMonitor - Settlement threshold monitor
    * @param logger - Pino logger instance
-   * @param telemetryEmitter - Optional telemetry emitter for monitoring
    */
   constructor(
     config: SettlementExecutorConfig,
     accountManager: AccountManager,
     paymentChannelSDK: PaymentChannelSDK,
     settlementMonitor: SettlementMonitor,
-    logger: Logger,
-    telemetryEmitter?: TelemetryEmitter
+    logger: Logger
   ) {
     super();
     this.config = config;
     this.accountManager = accountManager;
     this.paymentChannelSDK = paymentChannelSDK;
     this.settlementMonitor = settlementMonitor;
-    this.telemetryEmitter = telemetryEmitter;
 
     // Create child logger with component context
     this.logger = logger.child({ component: 'settlement-executor' });
@@ -149,30 +144,6 @@ export class SettlementExecutor extends EventEmitter {
         defaultSettlementTimeout: config.defaultSettlementTimeout,
       },
       'Settlement executor initialized'
-    );
-  }
-
-  /**
-   * Set EventStore reference for direct event emission in standalone mode
-   * @param eventStore - EventStore instance for storing settlement events
-   */
-  setEventStore(eventStore: EventStore | null): void {
-    this.eventStore = eventStore;
-    this.logger.info(
-      { hasEventStore: eventStore !== null },
-      'EventStore reference set for settlement event emission'
-    );
-  }
-
-  /**
-   * Set EventBroadcaster reference for real-time event streaming
-   * @param broadcaster - EventBroadcaster instance for live settlement events
-   */
-  setEventBroadcaster(broadcaster: EventBroadcaster | null): void {
-    this.eventBroadcaster = broadcaster;
-    this.logger.info(
-      { hasBroadcaster: broadcaster !== null },
-      'EventBroadcaster reference set for settlement event streaming'
     );
   }
 
@@ -194,41 +165,77 @@ export class SettlementExecutor extends EventEmitter {
    * Source: docs/architecture/test-strategy-and-standards.md Anti-Pattern 1
    */
   start(): void {
+    this.stopping = false;
+    this.settlementChain = Promise.resolve();
     this.settlementMonitor.on('SETTLEMENT_REQUIRED', this.boundHandleSettlement);
     this.logger.info('Settlement executor started');
   }
 
   /**
-   * Stop listening for settlement events
+   * Stop listening for settlement events and await in-flight settlements
    *
-   * Unregisters event listener using the same bound handler reference.
-   * CRITICAL: Must use same reference for cleanup to succeed.
+   * 1. Sets stopping flag to reject new settlement events
+   * 2. Unregisters event listener to prevent future events
+   * 3. Awaits the settlement chain to drain all in-flight operations
+   *
+   * This ensures no settlement is left partially completed on shutdown,
+   * preventing on-chain/off-chain balance mismatches.
    *
    * Source: docs/architecture/test-strategy-and-standards.md Anti-Pattern 1
    */
-  stop(): void {
+  async stop(): Promise<void> {
+    this.stopping = true;
     this.settlementMonitor.off('SETTLEMENT_REQUIRED', this.boundHandleSettlement);
-    this.logger.info('Settlement executor stopped');
+
+    // Await all in-flight settlements to complete before returning
+    await this.settlementChain;
+    this.logger.info('Settlement executor stopped (all in-flight settlements drained)');
   }
 
   /**
    * Handle settlement event
    *
-   * Main event handler that processes SETTLEMENT_REQUIRED events.
-   * Wraps executeSettlement in error handling and state management.
+   * Enqueues the settlement onto the serial settlement chain.
+   * This ensures all on-chain transactions from the same wallet execute
+   * sequentially, preventing nonce collisions on L2/mainnet.
+   *
+   * Events received after stop() is called are silently dropped.
+   *
+   * @param event - Settlement trigger event from SettlementMonitor
+   * @private
+   */
+  private handleSettlement(event: SettlementTriggerEvent): void {
+    if (this.stopping) {
+      this.logger.warn(
+        { peerId: event.peerId, tokenId: event.tokenId },
+        'Settlement event ignored during shutdown'
+      );
+      return;
+    }
+
+    // Chain this settlement onto the queue — serializes all on-chain operations
+    // to prevent nonce collisions from concurrent EVM transactions.
+    this.settlementChain = this.settlementChain.then(() => this._processSettlement(event));
+  }
+
+  /**
+   * Process a single settlement event
+   *
+   * Inner implementation that handles state transitions, execution,
+   * and error handling for a single settlement.
    *
    * **State Transitions:**
    * 1. Mark settlement IN_PROGRESS immediately
    * 2. Execute settlement (open channel or cooperative settle)
    * 3. On success: Mark settlement COMPLETED
-   * 4. On error: Log error, emit telemetry, leave state IN_PROGRESS
+   * 4. On error: Log error, leave state IN_PROGRESS
    *
    * Source: Epic 6 Story 6.6 Settlement Monitor state machine
    *
    * @param event - Settlement trigger event from SettlementMonitor
    * @private
    */
-  private async handleSettlement(event: SettlementTriggerEvent): Promise<void> {
+  private async _processSettlement(event: SettlementTriggerEvent): Promise<void> {
     this.logger.info(
       {
         peerId: event.peerId,
@@ -248,13 +255,6 @@ export class SettlementExecutor extends EventEmitter {
       'Marked settlement in progress'
     );
 
-    // Emit telemetry: SETTLEMENT_STARTED
-    this.emitSettlementTelemetry('SETTLEMENT_STARTED', event.peerId, event.tokenId, {
-      currentBalance: event.currentBalance.toString(),
-      threshold: event.threshold.toString(),
-      exceedsBy: event.exceedsBy.toString(),
-    });
-
     try {
       // Execute settlement logic
       await this.executeSettlement(event);
@@ -265,11 +265,6 @@ export class SettlementExecutor extends EventEmitter {
         { peerId: event.peerId, tokenId: event.tokenId },
         'Settlement completed, state reset to IDLE'
       );
-
-      // Emit telemetry: SETTLEMENT_COMPLETED
-      this.emitSettlementTelemetry('SETTLEMENT_COMPLETED', event.peerId, event.tokenId, {
-        currentBalance: event.currentBalance.toString(),
-      });
     } catch (error) {
       // Log error but do NOT call markSettlementCompleted
       // State remains IN_PROGRESS for manual intervention
@@ -286,12 +281,6 @@ export class SettlementExecutor extends EventEmitter {
         },
         'Settlement failed'
       );
-
-      // Emit telemetry: SETTLEMENT_FAILED
-      this.emitSettlementTelemetry('SETTLEMENT_FAILED', event.peerId, event.tokenId, {
-        error: errorMessage,
-        currentBalance: event.currentBalance.toString(),
-      });
     }
   }
 
@@ -461,15 +450,6 @@ export class SettlementExecutor extends EventEmitter {
       'TigerBeetle balance updated after channel deposit'
     );
 
-    // Emit settlement completed event with transaction hash
-    this.emitSettlementTelemetry('SETTLEMENT_COMPLETED', peerId, tokenId, {
-      channelId,
-      transactionHash: txHash,
-      settledAmount: amount.toString(), // Use settledAmount to match extractIndexedFields expectations
-      initialDeposit: initialDeposit.toString(),
-      settlementType: 'channel_opened',
-    });
-
     // Emit CHANNEL_ACTIVITY event for ChannelManager
     this.emit('CHANNEL_ACTIVITY', { channelId });
 
@@ -479,8 +459,9 @@ export class SettlementExecutor extends EventEmitter {
   /**
    * Settle via existing payment channel
    *
-   * Signs balance proof and executes cooperative settlement.
-   * Checks if channel deposit is sufficient, adds funds if needed.
+   * Claims transferred funds from the channel using the sender's latest
+   * per-packet signed balance proof. The channel remains open after claiming —
+   * the sender can continue sending packets and funding the channel.
    *
    * @param channelId - Payment channel ID
    * @param tokenAddress - ERC20 token address
@@ -496,41 +477,21 @@ export class SettlementExecutor extends EventEmitter {
     tokenId: string,
     amount: bigint
   ): Promise<void> {
-    // Query channel state
-    const channelState = await this.paymentChannelSDK.getChannelState(channelId, tokenAddress);
-
-    // Check if deposit needs to be increased
-    // Calculate: amount * initialDepositMultiplier * minDepositThreshold
-    const minDepositFloat =
-      Number(amount) * this.config.initialDepositMultiplier * this.config.minDepositThreshold;
-    const minDeposit = BigInt(Math.floor(minDepositFloat));
-    if (channelState.myDeposit < minDeposit) {
-      await this.depositAdditionalFunds(channelId, tokenAddress, amount);
-      // Refresh channel state after deposit
-      const updatedState = await this.paymentChannelSDK.getChannelState(channelId, tokenAddress);
-      channelState.myDeposit = updatedState.myDeposit;
-    }
-
-    // Check if deposit is sufficient for settlement
-    if (channelState.myDeposit < amount) {
-      await this.depositAdditionalFunds(channelId, tokenAddress, amount);
-    }
-
     // Use latest per-packet claim if available, otherwise generate fresh balance proof
-    let myBalanceProof: BalanceProof;
-    let mySignature: string;
+    let claimBalanceProof: BalanceProof;
+    let claimSignature: string;
 
     const latestClaim = this.perPacketClaimService?.getLatestClaim(channelId);
     if (latestClaim) {
       // Per-packet claims already accumulated the correct cumulative state
-      myBalanceProof = {
+      claimBalanceProof = {
         channelId,
         nonce: latestClaim.nonce,
         transferredAmount: BigInt(latestClaim.transferredAmount),
         lockedAmount: BigInt(latestClaim.lockedAmount),
         locksRoot: latestClaim.locksRoot,
       };
-      mySignature = latestClaim.signature;
+      claimSignature = latestClaim.signature;
 
       this.logger.info(
         {
@@ -538,12 +499,13 @@ export class SettlementExecutor extends EventEmitter {
           nonce: latestClaim.nonce,
           transferred: latestClaim.transferredAmount,
         },
-        'Using latest per-packet claim for on-chain settlement'
+        'Using latest per-packet claim for on-chain settlement (claimFromChannel)'
       );
     } else {
-      // Fallback: calculate new balance proof (legacy path)
-      const newNonce = channelState.myNonce + 1;
-      const newTransferred = channelState.myTransferred + amount;
+      // Fallback: calculate new balance proof
+      const channelState = await this.paymentChannelSDK.getChannelState(channelId, tokenAddress);
+      const newNonce = channelState.theirNonce + 1;
+      const newTransferred = channelState.theirTransferred + amount;
 
       this.logger.info(
         {
@@ -552,10 +514,10 @@ export class SettlementExecutor extends EventEmitter {
           newTransferred: newTransferred.toString(),
           amount: amount.toString(),
         },
-        'Signing balance proof for cooperative settlement'
+        'Generating balance proof for claimFromChannel (no per-packet claims available)'
       );
 
-      myBalanceProof = {
+      claimBalanceProof = {
         channelId,
         nonce: newNonce,
         transferredAmount: newTransferred,
@@ -563,12 +525,14 @@ export class SettlementExecutor extends EventEmitter {
         locksRoot: '0x' + '0'.repeat(64),
       };
 
-      mySignature = await this.retryWithBackoff(
+      // Note: In production, we should have the counterparty's signature.
+      // This fallback path signs with our own key (only works in test scenarios).
+      claimSignature = await this.retryWithBackoff(
         async () =>
           await this.paymentChannelSDK.signBalanceProof(
             channelId,
-            myBalanceProof.nonce,
-            myBalanceProof.transferredAmount,
+            claimBalanceProof.nonce,
+            claimBalanceProof.transferredAmount,
             0n,
             '0x' + '0'.repeat(64)
           ),
@@ -577,112 +541,48 @@ export class SettlementExecutor extends EventEmitter {
       );
     }
 
-    // In a real implementation, we would exchange balance proofs with peer off-chain
-    // For this story, we simulate the peer also signing their proof
-    // Their state remains unchanged (no transfers from them)
-    const theirBalanceProof: BalanceProof = {
-      channelId,
-      nonce: channelState.theirNonce,
-      transferredAmount: channelState.theirTransferred,
-      lockedAmount: 0n,
-      locksRoot: '0x' + '0'.repeat(64),
-    };
-
-    // Simulate peer signature (in production, peer would sign their proof)
-    const theirSignature = mySignature; // Placeholder
-
     this.logger.info(
       {
         channelId,
-        myNonce: myBalanceProof.nonce,
-        myTransferred: myBalanceProof.transferredAmount.toString(),
-        theirNonce: theirBalanceProof.nonce,
-        theirTransferred: theirBalanceProof.transferredAmount.toString(),
+        nonce: claimBalanceProof.nonce,
+        transferredAmount: claimBalanceProof.transferredAmount.toString(),
       },
-      'Executing cooperative settlement'
+      'Claiming from channel (channel stays open)'
     );
 
-    // Execute cooperative settlement
+    // Claim from channel — transfers delta tokens to us, channel stays open
     await this.retryWithBackoff(
       async () =>
-        await this.paymentChannelSDK.cooperativeSettle(
+        await this.paymentChannelSDK.claimFromChannel(
           channelId,
           tokenAddress,
-          myBalanceProof,
-          mySignature,
-          theirBalanceProof,
-          theirSignature
+          claimBalanceProof,
+          claimSignature
         ),
-      'cooperativeSettle',
+      'claimFromChannel',
       this.config.maxRetries
     );
 
     this.logger.info(
       { channelId, amount: amount.toString() },
-      'Settlement completed via existing channel'
+      'Claim from channel completed — channel remains open'
     );
 
-    // Update TigerBeetle after successful settlement
+    // Update TigerBeetle after successful on-chain claim
     await this.accountManager.recordSettlement(peerId, tokenId, amount);
 
-    // Reset per-packet claim tracking after successful on-chain settlement
+    // Reset per-packet claim tracking after successful claim
     if (this.perPacketClaimService) {
       this.perPacketClaimService.resetChannel(channelId);
     }
 
     this.logger.info(
       { peerId, tokenId, amount: amount.toString() },
-      'TigerBeetle balance updated after settlement'
+      'Accounting balance updated after claim'
     );
 
     // Emit CHANNEL_ACTIVITY event for ChannelManager
     this.emit('CHANNEL_ACTIVITY', { channelId });
-  }
-
-  /**
-   * Add additional funds to channel
-   *
-   * Deposits additional funds when channel deposit falls below minimum threshold.
-   * Target deposit = currentBalance × initialDepositMultiplier
-   *
-   * @param channelId - Payment channel ID
-   * @param tokenAddress - ERC20 token address
-   * @param requiredAmount - Amount required for settlement
-   * @private
-   */
-  private async depositAdditionalFunds(
-    channelId: string,
-    tokenAddress: string,
-    requiredAmount: bigint
-  ): Promise<void> {
-    const channelState = await this.paymentChannelSDK.getChannelState(channelId, tokenAddress);
-    const targetDeposit = requiredAmount * BigInt(this.config.initialDepositMultiplier);
-    const additionalDeposit = targetDeposit - channelState.myDeposit;
-
-    if (additionalDeposit <= 0n) {
-      return; // No additional deposit needed
-    }
-
-    this.logger.info(
-      {
-        channelId,
-        currentDeposit: channelState.myDeposit.toString(),
-        targetDeposit: targetDeposit.toString(),
-        additionalDeposit: additionalDeposit.toString(),
-      },
-      'Adding funds to channel'
-    );
-
-    await this.retryWithBackoff(
-      async () => await this.paymentChannelSDK.deposit(channelId, tokenAddress, additionalDeposit),
-      'deposit',
-      this.config.maxRetries
-    );
-
-    this.logger.info(
-      { channelId, additionalDeposit: additionalDeposit.toString() },
-      'Added funds to channel'
-    );
   }
 
   /**
@@ -783,76 +683,6 @@ export class SettlementExecutor extends EventEmitter {
 
     // Default: Treat unknown errors as non-retryable for safety
     return false;
-  }
-
-  /**
-   * Emit settlement telemetry event
-   *
-   * Emits telemetry events for settlement monitoring and alerting.
-   * Telemetry emission is non-blocking per coding standards.
-   *
-   * Source: docs/architecture/coding-standards.md telemetry emission is non-blocking
-   *
-   * @param eventType - Event type (SETTLEMENT_STARTED | SETTLEMENT_COMPLETED | SETTLEMENT_FAILED)
-   * @param peerId - Peer connector ID
-   * @param tokenId - Token identifier
-   * @param details - Additional event details
-   * @private
-   */
-  private emitSettlementTelemetry(
-    eventType: 'SETTLEMENT_STARTED' | 'SETTLEMENT_COMPLETED' | 'SETTLEMENT_FAILED',
-    peerId: string,
-    tokenId: string,
-    details: Record<string, unknown>
-  ): void {
-    const event = {
-      type: eventType,
-      nodeId: this.config.nodeId || 'unknown',
-      peerId: peerId || 'unknown',
-      tokenId: tokenId || 'unknown',
-      timestamp: new Date().toISOString(),
-      // Add all details, filtering out undefined values
-      ...Object.fromEntries(Object.entries(details).filter(([_, v]) => v !== undefined)),
-    };
-
-    // Emit via TelemetryEmitter if configured
-    if (this.telemetryEmitter) {
-      try {
-        this.telemetryEmitter.emit(event);
-      } catch (error) {
-        this.logger.error({ error }, 'Failed to emit settlement telemetry');
-      }
-    }
-
-    // Also emit to EventStore in standalone mode
-    if (this.eventStore) {
-      try {
-        // Log the event structure for debugging
-        this.logger.debug(
-          { event, eventKeys: Object.keys(event) },
-          'Attempting to store settlement event'
-        );
-
-        // Cast to any to bypass strict type checking - EventStore handles various event shapes
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        this.eventStore.storeEvent(event as any).catch((err: Error) => {
-          this.logger.warn(
-            {
-              error: err.message,
-              errorType: err.constructor.name,
-              eventType,
-              event: JSON.stringify(event),
-            },
-            'Failed to store settlement event'
-          );
-        });
-        // Broadcast to WebSocket clients for real-time updates
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        this.eventBroadcaster?.broadcast(event as any);
-      } catch (error) {
-        this.logger.error({ error, event }, 'Failed to store settlement event in EventStore');
-      }
-    }
   }
 
   /**

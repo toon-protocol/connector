@@ -34,21 +34,23 @@ const REGISTRY_ABI = [
 const TOKEN_NETWORK_ABI = [
   'function openChannel(address participant2, uint256 settlementTimeout) external returns (bytes32)',
   'function setTotalDeposit(bytes32 channelId, address participant, uint256 totalDeposit) external',
-  'function closeChannel(bytes32 channelId, tuple(bytes32 channelId, uint256 nonce, uint256 transferredAmount, uint256 lockedAmount, bytes32 locksRoot) balanceProof, bytes signature) external',
-  'function cooperativeSettle(bytes32 channelId, tuple(bytes32 channelId, uint256 nonce, uint256 transferredAmount, uint256 lockedAmount, bytes32 locksRoot) proof1, bytes sig1, tuple(bytes32 channelId, uint256 nonce, uint256 transferredAmount, uint256 lockedAmount, bytes32 locksRoot) proof2, bytes sig2) external',
+  'function closeChannel(bytes32 channelId) external',
+  'function claimFromChannel(bytes32 channelId, tuple(bytes32 channelId, uint256 nonce, uint256 transferredAmount, uint256 lockedAmount, bytes32 locksRoot) balanceProof, bytes signature) external',
   'function settleChannel(bytes32 channelId) external',
   'function channels(bytes32) external view returns (uint256 settlementTimeout, uint8 state, uint256 closedAt, uint256 openedAt, address participant1, address participant2)',
-  'function participants(bytes32, address) external view returns (uint256 deposit, uint256 withdrawnAmount, bool isCloser, uint256 nonce, uint256 transferredAmount)',
+  'function participants(bytes32, address) external view returns (uint256 deposit, uint256 nonce, uint256 transferredAmount)',
+  'function claimedAmounts(bytes32, address) external view returns (uint256)',
   'event ChannelOpened(bytes32 indexed channelId, address indexed participant1, address indexed participant2, uint256 settlementTimeout)',
-  'event ChannelClosed(bytes32 indexed channelId, address indexed closingParticipant, uint256 nonce, bytes32 balanceHash)',
+  'event ChannelClosed(bytes32 indexed channelId, address indexed closingParticipant)',
   'event ChannelSettled(bytes32 indexed channelId, uint256 participant1Amount, uint256 participant2Amount)',
-  'event ChannelCooperativeSettled(bytes32 indexed channelId, uint256 participant1Amount, uint256 participant2Amount)',
+  'event ChannelClaimed(bytes32 indexed channelId, address indexed claimant, uint256 claimedAmount, uint256 totalClaimed)',
 ];
 
-// Standard ERC20 ABI for approvals and allowance checks
+// Standard ERC20 ABI for approvals, allowance checks, and symbol queries
 const ERC20_ABI = [
   'function approve(address spender, uint256 amount) external returns (bool)',
   'function allowance(address owner, address spender) external view returns (uint256)',
+  'function symbol() external view returns (string)',
 ];
 
 /**
@@ -242,6 +244,21 @@ export class PaymentChannelSDK {
   async getChainId(): Promise<number> {
     const network = await this.provider.getNetwork();
     return Number(network.chainId);
+  }
+
+  /**
+   * Query the on-chain ERC-20 `symbol()` for a given token address.
+   *
+   * Uses the read-only provider (no signer needed).
+   *
+   * @param tokenAddress - ERC-20 contract address
+   * @returns The token symbol string (e.g. 'M2M', 'USDC')
+   */
+  async getTokenSymbol(tokenAddress: string): Promise<string> {
+    const { ethers } = await requireOptional<typeof import('ethers')>('ethers', 'EVM settlement');
+    const erc20 = new ethers.Contract(tokenAddress, ERC20_ABI, this.provider);
+    const symbol: string = await erc20.symbol!();
+    return symbol;
   }
 
   /**
@@ -633,19 +650,14 @@ export class PaymentChannelSDK {
   }
 
   /**
-   * Close a payment channel with a balance proof from counterparty
+   * Close a payment channel, starting the grace period for claims.
+   * The receiver can submit claims via claimFromChannel during the grace period.
+   * After the grace period, settleChannel returns remaining funds to the depositor.
    *
    * @param channelId - Channel identifier
    * @param tokenAddress - ERC20 token address
-   * @param balanceProof - Balance proof from counterparty
-   * @param signature - EIP-712 signature of balance proof
    */
-  async closeChannel(
-    channelId: string,
-    tokenAddress: string,
-    balanceProof: BalanceProof,
-    signature: string
-  ): Promise<void> {
+  async closeChannel(channelId: string, tokenAddress: string): Promise<void> {
     const tokenNetwork = await this.getTokenNetworkContract(tokenAddress);
     const state = await this.getChannelState(channelId, tokenAddress);
 
@@ -654,69 +666,80 @@ export class PaymentChannelSDK {
       throw new Error(`Cannot close channel in status: ${state.status}`);
     }
 
-    this.logger.info('Closing channel', { channelId, balanceProof });
+    this.logger.info('Closing channel (starting grace period)', { channelId });
 
-    // Call closeChannel on contract
-    const tx = await tokenNetwork.closeChannel!(channelId, balanceProof, signature);
+    // Call closeChannel on contract — starts grace period for claims
+    const tx = await tokenNetwork.closeChannel!(channelId);
     const receipt = await tx.wait();
 
     // Update cached state
     if (this.channelStateCache.has(channelId)) {
       const cached = this.channelStateCache.get(channelId)!;
       cached.status = 'closed';
-      cached.closedAt = Date.now() / 1000;
+      const block = await this.provider.getBlock(receipt.blockNumber);
+      cached.closedAt = block!.timestamp;
       this.channelStateCache.set(channelId, cached);
     }
 
-    this.logger.info('Channel closed', { channelId, txHash: receipt.hash });
+    this.logger.info('Channel closed, grace period started', { channelId, txHash: receipt.hash });
   }
 
   /**
-   * Cooperatively settle a channel with mutual consent (bypasses challenge period)
+   * Claim transferred funds from a channel using counterparty's signed balance proof.
+   * Works on both opened and closed channels (claims allowed during grace period).
+   * Only the delta since last claim is transferred (prevents double-pay).
    *
    * @param channelId - Channel identifier
    * @param tokenAddress - ERC20 token address
-   * @param myBalanceProof - My balance proof
-   * @param mySignature - My signature on my balance proof
-   * @param theirBalanceProof - Their balance proof
-   * @param theirSignature - Their signature on their balance proof
+   * @param balanceProof - Balance proof signed by the counterparty (sender)
+   * @param signature - EIP-712 signature of the balance proof
    */
-  async cooperativeSettle(
+  async claimFromChannel(
     channelId: string,
     tokenAddress: string,
-    myBalanceProof: BalanceProof,
-    mySignature: string,
-    theirBalanceProof: BalanceProof,
-    theirSignature: string
+    balanceProof: BalanceProof,
+    signature: string
   ): Promise<void> {
     const tokenNetwork = await this.getTokenNetworkContract(tokenAddress);
     const state = await this.getChannelState(channelId, tokenAddress);
 
-    // Validate channel is opened
-    if (state.status !== 'opened') {
-      throw new Error(`Cannot cooperatively settle channel in status: ${state.status}`);
+    // Validate channel is opened or closed (claims allowed during grace period)
+    if (state.status !== 'opened' && state.status !== 'closed') {
+      throw new Error(`Cannot claim from channel in status: ${state.status}`);
     }
 
-    this.logger.info('Cooperatively settling channel', { channelId });
-
-    // Call cooperativeSettle on contract
-    const tx = await tokenNetwork.cooperativeSettle!(
+    this.logger.info('Claiming from channel', {
       channelId,
-      myBalanceProof,
-      mySignature,
-      theirBalanceProof,
-      theirSignature
-    );
+      nonce: balanceProof.nonce,
+      transferredAmount: balanceProof.transferredAmount.toString(),
+    });
+
+    // Call claimFromChannel on contract
+    const tx = await tokenNetwork.claimFromChannel!(channelId, balanceProof, signature);
     const receipt = await tx.wait();
 
-    // Update cached state
-    if (this.channelStateCache.has(channelId)) {
-      const cached = this.channelStateCache.get(channelId)!;
-      cached.status = 'settled';
-      this.channelStateCache.set(channelId, cached);
-    }
+    // Invalidate cached state (deposit/balance changed on-chain)
+    this.channelStateCache.delete(channelId);
 
-    this.logger.info('Cooperative settlement completed', { channelId, txHash: receipt.hash });
+    this.logger.info('Claim from channel completed', { channelId, txHash: receipt.hash });
+  }
+
+  /**
+   * Query the cumulative amount already claimed by a participant from a channel
+   *
+   * @param channelId - Channel identifier
+   * @param tokenAddress - ERC20 token address
+   * @param participant - Address to query claimed amount for
+   * @returns Cumulative claimed amount
+   */
+  async getClaimedAmount(
+    channelId: string,
+    tokenAddress: string,
+    participant: string
+  ): Promise<bigint> {
+    const tokenNetwork = await this.getTokenNetworkContract(tokenAddress);
+    const claimed = await tokenNetwork.claimedAmounts!(channelId, participant);
+    return claimed as bigint;
   }
 
   /**
@@ -739,7 +762,8 @@ export class PaymentChannelSDK {
       throw new Error('Channel closedAt timestamp is missing');
     }
 
-    const now = Date.now() / 1000;
+    const latestBlock = await this.provider.getBlock('latest');
+    const now = latestBlock!.timestamp;
     const expiresAt = state.closedAt + state.settlementTimeout;
 
     if (now < expiresAt) {

@@ -129,41 +129,13 @@ export class KeyManager {
         });
         break;
       }
-      case 'aws-kms': {
-        if (!config.aws) {
-          throw new Error('AWS configuration required for aws-kms backend');
-        }
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { AWSKMSBackend } = require('./backends/aws-kms-backend');
-        this.backend = new AWSKMSBackend(config.aws, this.logger);
-        break;
-      }
-      case 'gcp-kms': {
-        if (!config.gcp) {
-          throw new Error('GCP configuration required for gcp-kms backend');
-        }
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { GCPKMSBackend } = require('./backends/gcp-kms-backend');
-        this.backend = new GCPKMSBackend(config.gcp, this.logger);
-        break;
-      }
-      case 'azure-kv': {
-        if (!config.azure) {
-          throw new Error('Azure configuration required for azure-kv backend');
-        }
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { AzureKeyVaultBackend } = require('./backends/azure-kv-backend');
-        this.backend = new AzureKeyVaultBackend(config.azure, this.logger);
-        break;
-      }
+      case 'aws-kms':
+      case 'gcp-kms':
+      case 'azure-kv':
       case 'hsm': {
-        if (!config.hsm) {
-          throw new Error('HSM configuration required for hsm backend');
-        }
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { HSMBackend } = require('./backends/hsm-backend');
-        this.backend = new HSMBackend(config.hsm, this.logger);
-        break;
+        throw new Error(
+          `Backend type '${config.backend}' is not supported. Only 'env' backend is available.`
+        );
       }
       default:
         throw new Error(`Unknown backend type: ${config.backend}`);

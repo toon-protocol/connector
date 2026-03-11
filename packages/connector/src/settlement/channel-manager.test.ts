@@ -1,17 +1,14 @@
 import { ChannelManager, ChannelManagerConfig } from './channel-manager';
 import { PaymentChannelSDK } from './payment-channel-sdk';
 import { SettlementExecutor } from './settlement-executor';
-import { TelemetryEmitter } from '../telemetry/telemetry-emitter';
 import { EventEmitter } from 'events';
 import pino from 'pino';
-import { ChannelState } from '@crosstown/shared';
 
 describe('ChannelManager', () => {
   let channelManager: ChannelManager;
   let mockPaymentChannelSDK: jest.Mocked<PaymentChannelSDK>;
   let mockSettlementExecutor: jest.Mocked<SettlementExecutor>;
   let mockLogger: pino.Logger;
-  let mockTelemetryEmitter: jest.Mocked<Partial<TelemetryEmitter>>;
   let config: ChannelManagerConfig;
 
   beforeEach(() => {
@@ -19,7 +16,6 @@ describe('ChannelManager', () => {
     mockPaymentChannelSDK = {
       openChannel: jest.fn(),
       getChannelState: jest.fn(),
-      cooperativeSettle: jest.fn(),
       closeChannel: jest.fn(),
       signBalanceProof: jest.fn(),
       settleChannel: jest.fn(),
@@ -30,10 +26,6 @@ describe('ChannelManager', () => {
     mockSettlementExecutor = new EventEmitter() as jest.Mocked<SettlementExecutor>;
 
     mockLogger = pino({ level: 'silent' });
-
-    mockTelemetryEmitter = {
-      emit: jest.fn(),
-    } as jest.Mocked<Partial<TelemetryEmitter>>;
 
     // Default mock for getChannelState (can be overridden in individual tests)
     mockPaymentChannelSDK.getChannelState.mockResolvedValue({
@@ -70,8 +62,7 @@ describe('ChannelManager', () => {
       config,
       mockPaymentChannelSDK,
       mockSettlementExecutor,
-      mockLogger,
-      mockTelemetryEmitter as TelemetryEmitter
+      mockLogger
     );
   });
 
@@ -222,21 +213,6 @@ describe('ChannelManager', () => {
       // Falls back to raw token address as tokenId
       expect(metadata.tokenId).toBe('0xUnknownToken');
     });
-
-    it('should emit EXTERNAL_CHANNEL_REGISTERED telemetry', () => {
-      channelManager.registerExternalChannel(externalChannelParams);
-
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'EXTERNAL_CHANNEL_REGISTERED',
-          channelId: externalChannelParams.channelId,
-          peerId: externalChannelParams.peerId,
-          chainId: externalChannelParams.chainId,
-          tokenNetworkAddress: externalChannelParams.tokenNetworkAddress,
-          tokenAddress: externalChannelParams.tokenAddress,
-        })
-      );
-    });
   });
 
   describe('markChannelActivity', () => {
@@ -317,83 +293,14 @@ describe('ChannelManager', () => {
     });
   });
 
-  describe('cooperative close', () => {
-    it('should close idle channel cooperatively', async () => {
+  describe('close idle channel', () => {
+    it('should close idle channel and set status to closing', async () => {
       const mockChannelId = '0xChannelId123';
       mockPaymentChannelSDK.openChannel.mockResolvedValue({
         channelId: mockChannelId,
         txHash: '0xMockTxHash',
       });
 
-      const mockChannelState: ChannelState = {
-        channelId: mockChannelId,
-        participants: ['0xMyAddress', '0xPeerAddress'] as [string, string],
-        myDeposit: BigInt(1000),
-        theirDeposit: BigInt(1000),
-        myNonce: 1,
-        theirNonce: 1,
-        myTransferred: BigInt(100),
-        theirTransferred: BigInt(50),
-        status: 'opened',
-        settlementTimeout: 86400,
-        openedAt: Math.floor(Date.now() / 1000),
-      };
-
-      mockPaymentChannelSDK.getChannelState.mockResolvedValue(mockChannelState);
-      mockPaymentChannelSDK.cooperativeSettle.mockResolvedValue();
-
-      await channelManager.ensureChannelExists('peer-a', 'TEST_TOKEN');
-
-      const metadata = channelManager.getChannelById(mockChannelId);
-      if (!metadata) throw new Error('Metadata not found');
-
-      // Set as idle
-      metadata.lastActivityAt = new Date(Date.now() - 25 * 60 * 60 * 1000);
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await (channelManager as any).closeIdleChannel(mockChannelId);
-
-      // Wait for async operations
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      expect(mockPaymentChannelSDK.cooperativeSettle).toHaveBeenCalled();
-      expect(metadata.status).toBe('closed');
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CHANNEL_CLOSED',
-          channelId: mockChannelId,
-        })
-      );
-    });
-  });
-
-  describe('unilateral close', () => {
-    it('should close channel unilaterally when cooperative fails', async () => {
-      const mockChannelId = '0xChannelId123';
-      mockPaymentChannelSDK.openChannel.mockResolvedValue({
-        channelId: mockChannelId,
-        txHash: '0xMockTxHash',
-      });
-
-      const mockChannelState: ChannelState = {
-        channelId: mockChannelId,
-        participants: ['0xMyAddress', '0xPeerAddress'] as [string, string],
-        myDeposit: BigInt(1000),
-        theirDeposit: BigInt(1000),
-        myNonce: 1,
-        theirNonce: 1,
-        myTransferred: BigInt(100),
-        theirTransferred: BigInt(50),
-        status: 'opened',
-        settlementTimeout: 86400,
-        openedAt: Math.floor(Date.now() / 1000),
-      };
-
-      mockPaymentChannelSDK.getChannelState.mockResolvedValue(mockChannelState);
-      mockPaymentChannelSDK.cooperativeSettle.mockRejectedValue(
-        new Error('Cooperative settle timeout')
-      );
-      mockPaymentChannelSDK.signBalanceProof.mockResolvedValue('0xSignature');
       mockPaymentChannelSDK.closeChannel.mockResolvedValue();
 
       await channelManager.ensureChannelExists('peer-a', 'TEST_TOKEN');
@@ -410,117 +317,36 @@ describe('ChannelManager', () => {
       // Wait for async operations
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      expect(mockPaymentChannelSDK.closeChannel).toHaveBeenCalled();
+      expect(mockPaymentChannelSDK.closeChannel).toHaveBeenCalledWith(
+        mockChannelId,
+        '0xTokenAddress'
+      );
       expect(metadata.status).toBe('closing');
     });
-  });
 
-  describe('telemetry emission', () => {
-    it('should emit legacy CHANNEL_OPENED telemetry', async () => {
+    it('should revert status to open if closeChannel fails', async () => {
       const mockChannelId = '0xChannelId123';
       mockPaymentChannelSDK.openChannel.mockResolvedValue({
         channelId: mockChannelId,
         txHash: '0xMockTxHash',
       });
 
-      await channelManager.ensureChannelExists('peer-a', 'TEST_TOKEN');
-
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CHANNEL_OPENED',
-          nodeId: 'test-node',
-          channelId: mockChannelId,
-          peerId: 'peer-a',
-          tokenId: 'TEST_TOKEN',
-        })
-      );
-    });
-
-    it('should emit PAYMENT_CHANNEL_OPENED telemetry event (Story 8.10)', async () => {
-      const mockChannelId = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
-      const mockChannelState: ChannelState = {
-        channelId: mockChannelId,
-        participants: ['0xMyAddress', '0xPeerAddress'],
-        myDeposit: BigInt(10000000000000000000),
-        theirDeposit: BigInt(0),
-        myNonce: 0,
-        theirNonce: 0,
-        myTransferred: BigInt(0),
-        theirTransferred: BigInt(0),
-        status: 'opened',
-        settlementTimeout: 86400,
-        openedAt: Date.now(),
-      };
-
-      mockPaymentChannelSDK.openChannel.mockResolvedValue({
-        channelId: mockChannelId,
-        txHash: '0xMockTxHash',
-      });
-      mockPaymentChannelSDK.getChannelState.mockResolvedValue(mockChannelState);
+      mockPaymentChannelSDK.closeChannel.mockRejectedValue(new Error('Close channel failed'));
 
       await channelManager.ensureChannelExists('peer-a', 'TEST_TOKEN');
 
-      // Verify PAYMENT_CHANNEL_OPENED event was emitted
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'PAYMENT_CHANNEL_OPENED',
-          nodeId: 'test-node',
-          channelId: mockChannelId,
-          participants: ['0xMyAddress', '0xPeerAddress'],
-          peerId: 'peer-a',
-          tokenAddress: '0xTokenAddress',
-          tokenSymbol: 'TEST_TOKEN',
-          settlementTimeout: 86400,
-          initialDeposits: {
-            '0xMyAddress': '10000000000000000000',
-            '0xPeerAddress': '0',
-          },
-        })
+      const metadata = channelManager.getChannelById(mockChannelId);
+      if (!metadata) throw new Error('Metadata not found');
+
+      // Set as idle
+      metadata.lastActivityAt = new Date(Date.now() - 25 * 60 * 60 * 1000);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await expect((channelManager as any).closeIdleChannel(mockChannelId)).rejects.toThrow(
+        'Close channel failed'
       );
-    });
 
-    it('should emit PAYMENT_CHANNEL_BALANCE_UPDATE telemetry event when activity marked', async () => {
-      const mockChannelId = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
-      const mockChannelState: ChannelState = {
-        channelId: mockChannelId,
-        participants: ['0xMyAddress', '0xPeerAddress'],
-        myDeposit: BigInt(10000000000000000000),
-        theirDeposit: BigInt(0),
-        myNonce: 5,
-        theirNonce: 3,
-        myTransferred: BigInt(5000000000000000000),
-        theirTransferred: BigInt(2000000000000000000),
-        status: 'opened',
-        settlementTimeout: 86400,
-        openedAt: Date.now(),
-      };
-
-      mockPaymentChannelSDK.openChannel.mockResolvedValue({
-        channelId: mockChannelId,
-        txHash: '0xMockTxHash',
-      });
-      mockPaymentChannelSDK.getChannelState.mockResolvedValue(mockChannelState);
-
-      await channelManager.ensureChannelExists('peer-a', 'TEST_TOKEN');
-
-      // Clear previous calls
-      (mockTelemetryEmitter.emit as jest.Mock).mockClear();
-
-      // Mark channel activity (this should trigger balance update telemetry)
-      await channelManager.markChannelActivity(mockChannelId);
-
-      // Verify PAYMENT_CHANNEL_BALANCE_UPDATE event was emitted
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'PAYMENT_CHANNEL_BALANCE_UPDATE',
-          nodeId: 'test-node',
-          channelId: mockChannelId,
-          myNonce: 5,
-          theirNonce: 3,
-          myTransferred: '5000000000000000000',
-          theirTransferred: '2000000000000000000',
-        })
-      );
+      expect(metadata.status).toBe('open');
     });
   });
 

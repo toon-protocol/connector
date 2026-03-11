@@ -33,7 +33,6 @@ import { requireOptional } from '../utils/optional-require';
 import type { AccountManager } from './account-manager';
 import type { SettlementMonitor } from './settlement-monitor';
 import { SettlementState, SettlementTriggerEvent } from '../config/types';
-import type { TelemetryEmitter } from '../telemetry/telemetry-emitter';
 
 /**
  * Settlement API Configuration
@@ -44,8 +43,6 @@ import type { TelemetryEmitter } from '../telemetry/telemetry-emitter';
  * @property settlementMonitor - SettlementMonitor for state tracking
  * @property logger - Pino logger for structured logging
  * @property authToken - Optional bearer token for authentication (omit to disable auth)
- * @property telemetryEmitter - Optional telemetry emitter for dashboard visualization (Story 6.8)
- * @property nodeId - Connector node ID for telemetry event identification (Story 6.8)
  */
 export interface SettlementAPIConfig {
   /**
@@ -75,16 +72,10 @@ export interface SettlementAPIConfig {
   authToken?: string;
 
   /**
-   * Optional telemetry emitter for dashboard visualization (Story 6.8)
-   * When provided, emits SETTLEMENT_COMPLETED events after settlement execution
+   * Default token ID for settlement operations.
+   * Resolved from the on-chain ERC-20 symbol at startup (e.g. 'M2M', 'USDC').
    */
-  telemetryEmitter?: TelemetryEmitter;
-
-  /**
-   * Connector node ID (e.g., "connector-a")
-   * Required for telemetry event nodeId field (Story 6.8)
-   */
-  nodeId?: string;
+  defaultTokenId?: string;
 }
 
 /**
@@ -93,7 +84,7 @@ export interface SettlementAPIConfig {
  * Request format for POST /settlement/execute endpoint.
  *
  * @property peerId - Peer ID to settle with (required)
- * @property tokenId - Token type to settle (optional, defaults to 'ILP')
+ * @property tokenId - Token type to settle (optional, defaults to resolved on-chain symbol)
  */
 export interface ExecuteSettlementRequest {
   /**
@@ -105,8 +96,8 @@ export interface ExecuteSettlementRequest {
 
   /**
    * Token ID to settle
-   * Defaults to 'ILP' if not provided
-   * Example: 'ILP', 'USDC', 'BTC'
+   * Defaults to the resolved on-chain token symbol if not provided
+   * Example: 'M2M', 'USDC', 'BTC'
    */
   tokenId?: string;
 }
@@ -322,35 +313,6 @@ async function executeMockSettlement(
       'MOCK: Settlement logged to TigerBeetle, but no real blockchain transaction sent (Epic 7)'
     );
 
-    // Emit SETTLEMENT_COMPLETED telemetry (Story 6.8)
-    if (config.telemetryEmitter) {
-      try {
-        config.telemetryEmitter.emit({
-          type: 'SETTLEMENT_COMPLETED',
-          nodeId: config.nodeId ?? 'unknown',
-          peerId,
-          tokenId,
-          previousBalance: balanceBefore.creditBalance.toString(),
-          newBalance: balanceAfter.creditBalance.toString(),
-          settledAmount: settledAmount.toString(),
-          settlementType: 'MOCK',
-          success: true,
-          timestamp: new Date().toISOString(),
-        });
-        logger.debug({ peerId, tokenId }, 'Settlement completion telemetry emitted');
-      } catch (telemetryError) {
-        // Non-blocking: Log but don't throw
-        logger.warn(
-          {
-            error: telemetryError instanceof Error ? telemetryError.message : 'Unknown error',
-            peerId,
-            tokenId,
-          },
-          'Failed to emit settlement completion telemetry'
-        );
-      }
-    }
-
     return {
       success: true,
       peerId,
@@ -369,38 +331,6 @@ async function executeMockSettlement(
       },
       'Mock settlement execution failed'
     );
-
-    // Emit SETTLEMENT_COMPLETED telemetry with success=false (Story 6.8)
-    if (config.telemetryEmitter) {
-      try {
-        // Get balance to report in error case
-        const balanceAfterError = await config.accountManager.getAccountBalance(peerId, tokenId);
-        config.telemetryEmitter.emit({
-          type: 'SETTLEMENT_COMPLETED',
-          nodeId: config.nodeId ?? 'unknown',
-          peerId,
-          tokenId,
-          previousBalance: balanceAfterError.creditBalance.toString(),
-          newBalance: balanceAfterError.creditBalance.toString(),
-          settledAmount: '0',
-          settlementType: 'MOCK',
-          success: false,
-          errorMessage: error instanceof Error ? error.message : 'Unknown error',
-          timestamp: new Date().toISOString(),
-        });
-        logger.debug({ peerId, tokenId, success: false }, 'Settlement failure telemetry emitted');
-      } catch (telemetryError) {
-        // Non-blocking: Log but don't throw
-        logger.warn(
-          {
-            error: telemetryError instanceof Error ? telemetryError.message : 'Unknown error',
-            peerId,
-            tokenId,
-          },
-          'Failed to emit settlement failure telemetry'
-        );
-      }
-    }
 
     throw error;
   }
@@ -565,7 +495,7 @@ export async function createSettlementRouter(config: SettlementAPIConfig): Promi
    * ```json
    * {
    *   "peerId": "connector-a",
-   *   "tokenId": "ILP"  // Optional, defaults to "ILP"
+   *   "tokenId": "M2M"  // Optional, defaults to resolved on-chain symbol
    * }
    * ```
    *
@@ -574,7 +504,7 @@ export async function createSettlementRouter(config: SettlementAPIConfig): Promi
    * {
    *   "success": true,
    *   "peerId": "connector-a",
-   *   "tokenId": "ILP",
+   *   "tokenId": "M2M",
    *   "previousBalance": "1000",
    *   "newBalance": "0",
    *   "settledAmount": "1000",
@@ -590,7 +520,8 @@ export async function createSettlementRouter(config: SettlementAPIConfig): Promi
    */
   router.post('/settlement/execute', async (req: Request, res: Response): Promise<void> => {
     try {
-      const { peerId, tokenId = 'ILP' } = req.body as ExecuteSettlementRequest;
+      const { peerId, tokenId = config.defaultTokenId ?? 'M2M' } =
+        req.body as ExecuteSettlementRequest;
 
       // Validate peerId
       if (!peerId || typeof peerId !== 'string') {
@@ -634,13 +565,13 @@ export async function createSettlementRouter(config: SettlementAPIConfig): Promi
    * Query current settlement status for a peer.
    *
    * **Query Parameters:**
-   * - tokenId: Token ID to query (optional, defaults to "ILP")
+   * - tokenId: Token ID to query (optional, defaults to resolved on-chain symbol)
    *
    * **Success Response (200 OK):**
    * ```json
    * {
    *   "peerId": "connector-a",
-   *   "tokenId": "ILP",
+   *   "tokenId": "M2M",
    *   "currentBalance": "500",
    *   "settlementState": "IDLE",
    *   "timestamp": "2026-01-03T12:00:00.000Z"
@@ -655,7 +586,7 @@ export async function createSettlementRouter(config: SettlementAPIConfig): Promi
   router.get('/settlement/status/:peerId', async (req: Request, res: Response): Promise<void> => {
     try {
       const { peerId } = req.params;
-      const tokenId = (req.query.tokenId as string) ?? 'ILP';
+      const tokenId = (req.query.tokenId as string) ?? config.defaultTokenId ?? 'M2M';
 
       // Validate peerId
       if (!peerId) {

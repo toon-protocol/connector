@@ -4,13 +4,10 @@
  * @remarks
  * Provides structured JSON logging with correlation IDs for packet tracking.
  * Outputs to stdout for Docker container log aggregation.
- * Optionally emits log entries as telemetry events to dashboard.
  */
 
 import pino from 'pino';
 import { randomBytes } from 'crypto';
-import { createTelemetryTransport } from '../telemetry/pino-telemetry-transport';
-import type { TelemetryEmitter } from '../telemetry/telemetry-emitter';
 
 /**
  * Logger type interface - wraps Pino logger
@@ -90,7 +87,6 @@ export function sanitizeWalletForLogs(wallet: Record<string, unknown>): Record<s
  * Create configured Pino logger instance with node ID context
  * @param nodeId - Connector node ID to include in all log entries
  * @param logLevel - Optional log level override (defaults to LOG_LEVEL env var or 'info')
- * @param telemetryEmitter - Optional TelemetryEmitter for sending logs to dashboard
  * @returns Configured Pino logger instance with nodeId as base context
  *
  * @example
@@ -100,34 +96,15 @@ export function sanitizeWalletForLogs(wallet: Record<string, unknown>): Record<s
  * // Output: {"level":"info","time":1703620800000,"nodeId":"connector-a","correlationId":"pkt_abc123","destination":"g.dest","msg":"Packet received"}
  * ```
  *
- * @example With telemetry
- * ```typescript
- * const telemetryEmitter = new TelemetryEmitter('ws://dashboard:9000', 'connector-a', logger);
- * const logger = createLogger('connector-a', 'info', telemetryEmitter);
- * logger.info('Packet received'); // Logged to stdout AND sent to dashboard
- * ```
- *
  * @remarks
  * - Outputs JSON to stdout for Docker log aggregation
  * - Log level configurable via LOG_LEVEL environment variable (DEBUG, INFO, WARN, ERROR)
  * - Default level: INFO if LOG_LEVEL not set
  * - All log entries include nodeId field for multi-node differentiation
  * - Uses child logger pattern to inject nodeId context
- * - If telemetryEmitter provided, log entries are also sent to dashboard as LOG telemetry events
- * - Telemetry emission is non-blocking and will not impact logging performance
  * - Wallet data serializers automatically redact sensitive cryptographic material
  */
-export function createLogger(nodeId: string, logLevel?: string): Logger;
-export function createLogger(
-  nodeId: string,
-  logLevel: string | undefined,
-  telemetryEmitter: TelemetryEmitter
-): Promise<Logger>;
-export function createLogger(
-  nodeId: string,
-  logLevel?: string,
-  telemetryEmitter?: TelemetryEmitter
-): Logger | Promise<Logger> {
+export function createLogger(nodeId: string, logLevel?: string): Logger {
   // Get log level from parameter, environment variable, or default
   const level = logLevel ? getValidLogLevel(logLevel) : getValidLogLevel(process.env.LOG_LEVEL);
 
@@ -142,38 +119,15 @@ export function createLogger(
     secret: () => '[REDACTED]',
   };
 
-  if (telemetryEmitter) {
-    // Async path: create telemetry transport for LOG emission
-    return (async () => {
-      const transport = await createTelemetryTransport((logEntry) => {
-        telemetryEmitter.emitLog(logEntry);
-      });
+  // Create standard logger
+  const baseLogger = pino({
+    level,
+    serializers,
+  });
 
-      // Create logger with multistream: stdout + telemetry
-      const baseLogger = pino(
-        {
-          level,
-          serializers,
-        },
-        pino.multistream([
-          { stream: process.stdout }, // Primary output to stdout
-          { stream: transport }, // Secondary output to telemetry
-        ])
-      );
-
-      return baseLogger.child({ nodeId });
-    })();
-  } else {
-    // Sync path: Create standard logger without telemetry
-    const baseLogger = pino({
-      level,
-      serializers,
-    });
-
-    // Return child logger with nodeId context
-    // All logs from this logger will include nodeId field
-    return baseLogger.child({ nodeId });
-  }
+  // Return child logger with nodeId context
+  // All logs from this logger will include nodeId field
+  return baseLogger.child({ nodeId });
 }
 
 /**
@@ -193,32 +147,4 @@ export function createLogger(
  */
 export function generateCorrelationId(): string {
   return `pkt_${randomBytes(8).toString('hex')}`;
-}
-
-/**
- * Generate correlation ID that includes OpenTelemetry trace ID if available
- * @param traceId - Optional OpenTelemetry trace ID to include
- * @returns Correlation ID with optional trace ID linkage
- *
- * @example
- * ```typescript
- * // Without trace ID
- * const correlationId = generateCorrelationIdWithTraceId();
- * // Returns: "pkt_abc123def4567890"
- *
- * // With trace ID
- * const correlationId = generateCorrelationIdWithTraceId('0123456789abcdef0123456789abcdef');
- * // Returns: "pkt_abc123def4567890|trace:0123456789abcdef0123456789abcdef"
- * ```
- *
- * @remarks
- * Links log entries to distributed traces when OpenTelemetry tracing is enabled.
- * The trace ID allows correlation between logs and traces in observability tools.
- */
-export function generateCorrelationIdWithTraceId(traceId?: string): string {
-  const baseId = `pkt_${randomBytes(8).toString('hex')}`;
-  if (traceId) {
-    return `${baseId}|trace:${traceId}`;
-  }
-  return baseId;
 }

@@ -12,7 +12,6 @@ import type { Database, Statement } from 'better-sqlite3';
 import type { Logger } from 'pino';
 import type { BTPServer } from '../btp/btp-server';
 import type { BTPProtocolData, BTPMessage, BTPData } from '../btp/btp-types';
-import type { TelemetryEmitter } from '../telemetry/telemetry-emitter';
 import type { PaymentChannelSDK } from './payment-channel-sdk';
 import type { ChannelManager } from './channel-manager';
 import type { EVMClaimMessage } from '../btp/btp-claim-types';
@@ -21,7 +20,6 @@ describe('ClaimReceiver', () => {
   let claimReceiver: ClaimReceiver;
   let mockDb: jest.Mocked<Database>;
   let mockLogger: jest.Mocked<Logger>;
-  let mockTelemetryEmitter: jest.Mocked<TelemetryEmitter>;
   let mockBTPServer: jest.Mocked<BTPServer>;
   let mockPaymentChannelSDK: jest.Mocked<PaymentChannelSDK>;
   let mockStatement: jest.Mocked<Statement>;
@@ -51,11 +49,6 @@ describe('ClaimReceiver', () => {
       child: jest.fn().mockReturnThis(),
     } as unknown as jest.Mocked<Logger>;
 
-    // Mock TelemetryEmitter
-    mockTelemetryEmitter = {
-      emit: jest.fn(),
-    } as unknown as jest.Mocked<TelemetryEmitter>;
-
     // Mock BTPServer
     mockBTPServer = {
       onMessage: jest.fn((handler) => {
@@ -69,13 +62,7 @@ describe('ClaimReceiver', () => {
     } as unknown as jest.Mocked<PaymentChannelSDK>;
 
     // Create ClaimReceiver instance (EVM-only)
-    claimReceiver = new ClaimReceiver(
-      mockDb,
-      mockPaymentChannelSDK,
-      mockLogger,
-      mockTelemetryEmitter,
-      'test-node'
-    );
+    claimReceiver = new ClaimReceiver(mockDb, mockPaymentChannelSDK, mockLogger);
   });
 
   describe('registerWithBTPServer', () => {
@@ -163,19 +150,6 @@ describe('ClaimReceiver', () => {
         null,
         null
       );
-
-      // Verify telemetry emission
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith({
-        type: 'CLAIM_RECEIVED',
-        nodeId: 'test-node',
-        peerId: 'peer-bob',
-        blockchain: 'evm',
-        messageId: validEVMClaim.messageId,
-        channelId: validEVMClaim.channelId,
-        amount: validEVMClaim.transferredAmount,
-        verified: true,
-        timestamp: expect.any(String),
-      });
     });
 
     it('should reject EVM claim with invalid EIP-712 signature', async () => {
@@ -196,14 +170,6 @@ describe('ClaimReceiver', () => {
         expect.any(Number),
         null,
         null
-      );
-
-      // Verify telemetry emission with error
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          verified: false,
-          error: 'Invalid EIP-712 signature',
-        })
       );
     });
 
@@ -235,14 +201,6 @@ describe('ClaimReceiver', () => {
         expect.any(Number),
         null,
         null
-      );
-
-      // Verify telemetry emission with monotonicity error
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          verified: false,
-          error: 'Nonce not monotonically increasing',
-        })
       );
     });
   });
@@ -277,15 +235,6 @@ describe('ClaimReceiver', () => {
       expect(mockLogger.error).toHaveBeenCalledWith(
         { error: expect.any(Error) },
         'Failed to parse claim message'
-      );
-
-      // Verify telemetry emitted with error
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CLAIM_RECEIVED',
-          verified: false,
-          error: expect.any(String),
-        })
       );
 
       // Verify no database insert
@@ -341,68 +290,6 @@ describe('ClaimReceiver', () => {
         { error: expect.any(Error) },
         'Failed to persist claim to database'
       );
-
-      // Verify telemetry still emitted (non-blocking)
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'CLAIM_RECEIVED',
-          verified: true,
-        })
-      );
-    });
-
-    it('should handle telemetry emission failure gracefully', async () => {
-      const validEVMClaim: EVMClaimMessage = {
-        version: '1.0',
-        blockchain: 'evm',
-        messageId: 'evm-test-123',
-        timestamp: '2026-02-02T12:00:00.000Z',
-        senderId: 'peer-bob',
-        channelId: '0x' + 'a'.repeat(64),
-        nonce: 1,
-        transferredAmount: '1000000',
-        lockedAmount: '0',
-        locksRoot: '0x' + '0'.repeat(64),
-        signature: '0x' + 'b'.repeat(130),
-        signerAddress: '0x' + 'c'.repeat(40),
-      };
-
-      const protocolData: BTPProtocolData = {
-        protocolName: 'payment-channel-claim',
-        contentType: 1,
-        data: Buffer.from(JSON.stringify(validEVMClaim), 'utf8'),
-      };
-
-      const btpMessage: BTPMessage = {
-        type: 6,
-        requestId: 1,
-        data: {
-          protocolData: [protocolData],
-          transfer: {
-            amount: '0',
-            expiresAt: new Date(Date.now() + 30000).toISOString(),
-          },
-        } as BTPData,
-      };
-
-      mockPaymentChannelSDK.verifyBalanceProof.mockResolvedValue(true);
-      mockStatement.get.mockReturnValue(undefined);
-      mockTelemetryEmitter.emit.mockImplementation(() => {
-        throw new Error('Telemetry error');
-      });
-
-      claimReceiver.registerWithBTPServer(mockBTPServer);
-      await btpMessageHandler!('peer-bob', btpMessage);
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      // Verify telemetry error logged
-      expect(mockLogger.error).toHaveBeenCalledWith(
-        { error: expect.any(Error) },
-        'Failed to emit claim received telemetry'
-      );
-
-      // Verify database insert still succeeded (non-blocking)
-      expect(mockStatement.run).toHaveBeenCalled();
     });
 
     it('should handle duplicate message IDs gracefully (idempotency)', async () => {
@@ -551,8 +438,6 @@ describe('ClaimReceiver', () => {
         mockDb,
         mockPaymentChannelSDK,
         mockLogger,
-        mockTelemetryEmitter,
-        'test-node',
         mockChannelManager
       );
 
@@ -618,11 +503,11 @@ describe('ClaimReceiver', () => {
       await dynamicBtpHandler!('peer-new', makeBTPMessage(claim));
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+      expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({
-          verified: false,
-          error: ERRORS.CHANNEL_NOT_FOUND,
-        })
+          channelId: mockChannelId,
+        }),
+        ERRORS.CHANNEL_NOT_FOUND
       );
     });
 
@@ -639,11 +524,11 @@ describe('ClaimReceiver', () => {
       await dynamicBtpHandler!('peer-new', makeBTPMessage(claim));
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+      expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({
-          verified: false,
-          error: ERRORS.CHANNEL_NOT_OPENED,
-        })
+          channelId: mockChannelId,
+        }),
+        ERRORS.CHANNEL_NOT_OPENED
       );
     });
 
@@ -660,11 +545,11 @@ describe('ClaimReceiver', () => {
       await dynamicBtpHandler!('peer-new', makeBTPMessage(claim));
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+      expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({
-          verified: false,
-          error: ERRORS.SIGNER_NOT_PARTICIPANT,
-        })
+          channelId: mockChannelId,
+        }),
+        ERRORS.SIGNER_NOT_PARTICIPANT
       );
     });
 
@@ -714,11 +599,11 @@ describe('ClaimReceiver', () => {
       await dynamicBtpHandler!('peer-new', makeBTPMessage(claim1));
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+      expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({
-          verified: false,
-          error: ERRORS.MISSING_SELF_DESCRIBING_FIELDS,
-        })
+          channelId: mockChannelId,
+        }),
+        ERRORS.MISSING_SELF_DESCRIBING_FIELDS
       );
 
       // Missing tokenNetworkAddress
@@ -728,11 +613,11 @@ describe('ClaimReceiver', () => {
       await dynamicBtpHandler!('peer-new', makeBTPMessage(claim2));
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+      expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({
-          verified: false,
-          error: ERRORS.MISSING_SELF_DESCRIBING_FIELDS,
-        })
+          channelId: mockChannelId,
+        }),
+        ERRORS.MISSING_SELF_DESCRIBING_FIELDS
       );
 
       // Missing tokenAddress
@@ -742,11 +627,11 @@ describe('ClaimReceiver', () => {
       await dynamicBtpHandler!('peer-new', makeBTPMessage(claim3));
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+      expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({
-          verified: false,
-          error: ERRORS.MISSING_SELF_DESCRIBING_FIELDS,
-        })
+          channelId: mockChannelId,
+        }),
+        ERRORS.MISSING_SELF_DESCRIBING_FIELDS
       );
     });
 
@@ -759,11 +644,11 @@ describe('ClaimReceiver', () => {
       await dynamicBtpHandler!('peer-new', makeBTPMessage(claim));
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
+      expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({
-          verified: false,
-          error: ERRORS.ON_CHAIN_VERIFICATION_FAILED,
-        })
+          channelId: mockChannelId,
+        }),
+        ERRORS.ON_CHAIN_VERIFICATION_FAILED
       );
     });
 
@@ -774,11 +659,17 @@ describe('ClaimReceiver', () => {
       await dynamicBtpHandler!('peer-new', makeBTPMessage(claim));
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          verified: false,
-          error: 'Invalid EIP-712 signature',
-        })
+      // Claim should be stored as unverified
+      expect(mockStatement.run).toHaveBeenCalledWith(
+        claim.messageId,
+        'peer-new',
+        'evm',
+        mockChannelId,
+        expect.any(String),
+        0, // verified=false
+        expect.any(Number),
+        null,
+        null
       );
 
       // Channel should NOT be registered if signature fails
