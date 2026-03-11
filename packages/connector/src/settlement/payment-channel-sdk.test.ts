@@ -45,6 +45,9 @@ describe('PaymentChannelSDK', () => {
         maxFeePerGas: 1000000000n,
         maxPriorityFeePerGas: 1000000000n,
       }),
+      getBlock: jest.fn().mockResolvedValue({
+        timestamp: Math.floor(Date.now() / 1000),
+      }),
     } as unknown as jest.Mocked<ethers.Provider>;
 
     // Mock KeyManager
