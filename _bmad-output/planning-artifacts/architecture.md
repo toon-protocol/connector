@@ -12,12 +12,11 @@
 - [8. Settlement Architecture](#8-settlement-architecture)
 - [9. Explorer UI](#9-explorer-ui)
 - [10. Configuration](#10-configuration)
-- [11. Infrastructure and Deployment](#11-infrastructure-and-deployment)
-- [12. Security](#12-security)
-- [13. Error Handling](#13-error-handling)
-- [14. Testing Strategy](#14-testing-strategy)
-- [15. Key Design Decisions](#15-key-design-decisions)
-- [16. RFC References](#16-rfc-references)
+- [11. Security](#11-security)
+- [12. Error Handling](#12-error-handling)
+- [13. Testing Strategy](#13-testing-strategy)
+- [14. Key Design Decisions](#14-key-design-decisions)
+- [15. RFC References](#15-rfc-references)
 
 ---
 
@@ -40,8 +39,8 @@ EVM settlement on Base L2.
 
 Sections 2-5 describe the static architecture (structure, modules, dependencies).
 Sections 6-8 describe runtime behavior (data flow, settlement, claims).
-Sections 9-14 cover operational concerns (UI, config, deployment, security, testing).
-Sections 15-16 capture rationale and standards compliance.
+Sections 9-13 cover operational concerns (UI, config, security, testing).
+Sections 14-15 capture rationale and standards compliance.
 
 ---
 
@@ -142,7 +141,6 @@ connector/
 ├── k8s/                    # Kubernetes manifests (Kustomize)
 ├── monitoring/             # Prometheus, Grafana, Alertmanager configs
 ├── Dockerfile              # Multi-stage build (builder → ui-builder → runtime)
-├── docker-compose*.yml     # Docker Compose configurations (5 files)
 ├── docs/                   # Documentation
 └── scripts/                # Dev/test scripts (generate-anvil-state, run-per-packet-claims-e2e, validate-packages)
 ```
@@ -163,16 +161,6 @@ connector/
 | ------------- | ------------------- | --------------------------------------------------- |
 | `send-packet` | `tools/send-packet` | Send ILP Prepare packets to a connector for testing |
 | `fund-peers`  | `tools/fund-peers`  | Fund peer EVM accounts with test tokens             |
-
-### Docker Compose Files (5)
-
-| File                               | Purpose                                                  |
-| ---------------------------------- | -------------------------------------------------------- |
-| `docker-compose.yml`               | Default development (3 connectors + TigerBeetle)         |
-| `docker-compose-dev.yml`           | Development with Anvil and hot-reload                    |
-| `docker-compose-base-e2e-test.yml` | Base E2E test (Anvil + faucet + 2 connectors)            |
-| `docker-compose-evm-test.yml`      | EVM settlement integration tests (Anvil + faucet)        |
-| `docker-compose-production.yml`    | Production with monitoring (Prometheus, Grafana, Jaeger) |
 
 ### Example Configurations (8)
 
@@ -615,47 +603,7 @@ routes:
 
 ---
 
-## 11. Infrastructure and Deployment
-
-### Docker Compose
-
-| File                               | Environment | Services                                                          |
-| ---------------------------------- | ----------- | ----------------------------------------------------------------- |
-| `docker-compose.yml`               | Development | 3 connectors (a, b, c), TigerBeetle                               |
-| `docker-compose-dev.yml`           | Development | Anvil, TigerBeetle (hot-reload)                                   |
-| `docker-compose-base-e2e-test.yml` | Testing     | Anvil, faucet, TigerBeetle, 2 connectors                          |
-| `docker-compose-evm-test.yml`      | Testing     | Anvil, faucet (EVM settlement tests)                              |
-| `docker-compose-production.yml`    | Production  | Connector, TigerBeetle, Prometheus, Grafana, Alertmanager, Jaeger |
-
-### Kubernetes
-
-Kustomize-based manifests for 4 services:
-
-- **connector** — Deployment, Service, ConfigMap, Secret, ServiceAccount, PDB, NetworkPolicy (staging + production overlays)
-- **agent-runtime** — Deployment, Service, ConfigMap, ServiceAccount
-- **agent-society** — Deployment, Service, ConfigMap, Secret, ServiceAccount, PDB, NetworkPolicy (staging + production overlays)
-- **tigerbeetle** — StatefulSet, HeadlessService, ConfigMap, ServiceAccount, PDB, PVC (test overlay)
-
-### CI/CD
-
-GitHub Actions workflows (`.github/workflows/`):
-
-- `ci.yml` — Build, lint, unit tests
-- `integration-tests.yml` — Docker-based integration test suite
-- `cd.yml` — Continuous deployment pipeline
-- `release.yml` — Package release automation
-
-### Deployment Modes
-
-| Mode        | How                                                        | Use Case                           |
-| ----------- | ---------------------------------------------------------- | ---------------------------------- |
-| **Library** | `npm install @crosstown/connector` + `new ConnectorNode()` | ElizaOS plugins, embedded agents   |
-| **CLI**     | `npx connector --config config.yaml`                       | Quick local testing                |
-| **Docker**  | `docker compose up`                                        | Multi-node deployments, production |
-
----
-
-## 12. Security
+## 11. Security
 
 ### Authentication
 
@@ -695,7 +643,7 @@ Key rotation is supported — new keys are used for signing while old keys remai
 
 ---
 
-## 13. Error Handling
+## 12. Error Handling
 
 ### ILP Error Codes (RFC-0027)
 
@@ -718,7 +666,7 @@ Failed BTP connections use exponential backoff with jitter. The `BTPClientManage
 
 ---
 
-## 14. Testing Strategy
+## 13. Testing Strategy
 
 ### Framework
 
@@ -726,29 +674,26 @@ Jest + ts-jest with co-located test files (`*.test.ts` next to source).
 
 ### Test Types
 
-| Type        | Command                      | Scope                                     |
-| ----------- | ---------------------------- | ----------------------------------------- |
-| Unit        | `npm test`                   | Individual modules, mocked dependencies   |
-| Integration | `npm run test:integration`   | Multi-module interaction, Docker services |
-| E2E         | `npm run test:crosstown-e2e` | Full multi-connector packet flow          |
-| Acceptance  | `npm run test:acceptance`    | User story acceptance criteria            |
-| Security    | `npm run test:security`      | Auth, key management, input validation    |
-| Load        | `npm run test:load`          | Throughput and latency benchmarks         |
-| Performance | `npm run test:performance`   | Performance regression detection          |
+| Type        | Command                    | Scope                                   |
+| ----------- | -------------------------- | --------------------------------------- |
+| Unit        | `npm test`                 | Individual modules, mocked dependencies |
+| Acceptance  | `npm run test:acceptance`  | User story acceptance criteria          |
+| Security    | `npm run test:security`    | Auth, key management, input validation  |
+| Load        | `npm run test:load`        | Throughput and latency benchmarks       |
+| Performance | `npm run test:performance` | Performance regression detection        |
 
 ### Domain-Specific Test Suites
 
 ```bash
 npm run test:settlement   # Settlement and claim tests
 npm run test:btp          # BTP protocol tests
-npm run test:evm          # EVM payment channel tests
 npm run test:explorer     # Explorer UI backend tests
-npm run test:tigerbeetle  # TigerBeetle integration tests
+npm run test:tigerbeetle  # TigerBeetle and accounting tests
 ```
 
 ---
 
-## 15. Key Design Decisions
+## 14. Key Design Decisions
 
 | Decision                        | Rationale                                                                                                                                     |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -765,7 +710,7 @@ npm run test:tigerbeetle  # TigerBeetle integration tests
 
 ---
 
-## 16. RFC References
+## 15. RFC References
 
 | RFC                                                                        | Title                             | Implementation                                                             |
 | -------------------------------------------------------------------------- | --------------------------------- | -------------------------------------------------------------------------- |
