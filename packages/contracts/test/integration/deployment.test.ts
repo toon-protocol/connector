@@ -62,7 +62,9 @@ describe('Foundry Deployment Integration Tests', () => {
     );
 
     // Parse deployment output to extract contract address
-    const addressMatch = deployOutput.match(/PaymentChannel deployed to: (0x[a-fA-F0-9]{40})/);
+    const addressMatch = deployOutput.match(
+      /TokenNetworkRegistry deployed to: (0x[a-fA-F0-9]{40})/
+    );
     expect(addressMatch).not.toBeNull();
 
     if (addressMatch) {
