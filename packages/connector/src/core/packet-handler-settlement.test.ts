@@ -10,6 +10,7 @@
  * @packageDocumentation
  */
 
+import * as crypto from 'crypto';
 import { PacketHandler } from './packet-handler';
 import { RoutingTable } from '../routing/routing-table';
 import { BTPClientManager } from '../btp/btp-client-manager';
@@ -23,6 +24,7 @@ import {
 } from '@crosstown/shared';
 import { SettlementConfig } from '../config/types';
 import type { PerPacketClaimService } from '../settlement/per-packet-claim-service';
+import { computeFulfillmentFromData } from './payment-handler';
 import pino from 'pino';
 
 // Mock AccountManager
@@ -32,14 +34,19 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
   // Test helpers
   const createMockLogger = (): pino.Logger => pino({ level: 'silent' });
 
-  const createValidPreparePacket = (): ILPPreparePacket => ({
-    type: PacketType.PREPARE,
-    amount: 100000n,
-    destination: 'g.alice.wallet.USD',
-    executionCondition: Buffer.from('a'.repeat(64), 'hex'), // 32 bytes
-    expiresAt: new Date(Date.now() + 30000), // 30 seconds from now
-    data: Buffer.alloc(0),
-  });
+  const createValidPreparePacket = (): ILPPreparePacket => {
+    const data = Buffer.alloc(0);
+    const fulfillment = computeFulfillmentFromData(data);
+    const condition = crypto.createHash('sha256').update(fulfillment).digest();
+    return {
+      type: PacketType.PREPARE,
+      amount: 100000n,
+      destination: 'g.alice.wallet.USD',
+      executionCondition: condition,
+      expiresAt: new Date(Date.now() + 30000), // 30 seconds from now
+      data,
+    };
+  };
 
   const createMockAccountManager = (): jest.Mocked<AccountManager> => {
     const mockAccountManager = {
@@ -59,11 +66,13 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
 
   const createMockBTPClientManager = (): jest.Mocked<BTPClientManager> => {
     const mockClientManager = {
-      sendToPeer: jest.fn().mockResolvedValue({
-        type: PacketType.FULFILL,
-        fulfillment: Buffer.from('b'.repeat(64), 'hex'),
-        data: Buffer.alloc(0),
-      } as ILPFulfillPacket),
+      sendToPeer: jest.fn().mockImplementation((_peerId: string, packet: ILPPreparePacket) => {
+        return Promise.resolve({
+          type: PacketType.FULFILL,
+          fulfillment: computeFulfillmentFromData(packet.data),
+          data: Buffer.alloc(0),
+        } as ILPFulfillPacket);
+      }),
       connect: jest.fn(),
       disconnect: jest.fn(),
       isConnected: jest.fn().mockReturnValue(true),

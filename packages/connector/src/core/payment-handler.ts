@@ -5,6 +5,18 @@
  * requiring knowledge of ILP packet types, fulfillment computation,
  * or error code mappings.
  *
+ * ## Fulfillment Scheme (Simplified, Non-STREAM)
+ *
+ * This connector uses a simplified data-based fulfillment scheme rather than
+ * STREAM's HMAC-based approach:
+ *
+ *   fulfillment = SHA256(packet.data)
+ *   condition   = SHA256(fulfillment)
+ *
+ * This is safe in trusted bilateral peering networks with on-chain settlement,
+ * where both sides cooperate and the fulfillment serves as a consistency check
+ * rather than a security boundary.
+ *
  * @packageDocumentation
  */
 
@@ -99,6 +111,19 @@ export const REJECT_CODE_MAP: Record<string, string> = {
  */
 export function computeFulfillmentFromData(data: Buffer): Buffer {
   return crypto.createHash('sha256').update(data).digest();
+}
+
+/**
+ * Validate that a fulfillment matches its expected condition.
+ * Checks: SHA256(fulfillment) === condition
+ *
+ * @param fulfillment - 32-byte fulfillment preimage
+ * @param condition - 32-byte execution condition
+ * @returns true if SHA256(fulfillment) equals condition
+ */
+export function validateFulfillment(fulfillment: Buffer, condition: Buffer): boolean {
+  const expected = crypto.createHash('sha256').update(fulfillment).digest();
+  return expected.equals(condition);
 }
 
 /**

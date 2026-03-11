@@ -27,6 +27,7 @@ import {
 } from '../config/types';
 import { AccountLedgerCodes } from '../settlement/types';
 import { LocalDeliveryClient } from './local-delivery-client';
+import { computeFulfillmentFromData, validateFulfillment } from './payment-handler';
 import type { PerPacketClaimService } from '../settlement/per-packet-claim-service';
 
 /**
@@ -628,14 +629,31 @@ export class PacketHandler {
   /**
    * Convert LocalDeliveryResponse to ILP packet.
    * Handles fulfill, reject, and invalid (neither) cases.
+   * Validates fulfillment against execution condition when present.
    */
   private convertLocalDeliveryResponse(
-    result: LocalDeliveryResponse
+    result: LocalDeliveryResponse,
+    executionCondition: Buffer
   ): ILPFulfillPacket | ILPRejectPacket {
     if (result.fulfill) {
+      const fulfillment = Buffer.from(result.fulfill.fulfillment, 'base64');
+      if (!validateFulfillment(fulfillment, executionCondition)) {
+        this.logger.warn(
+          {
+            event: 'invalid_fulfillment',
+            source: 'local_delivery_handler',
+          },
+          'Local delivery handler returned invalid fulfillment (SHA256(fulfillment) != condition)'
+        );
+        return this.generateReject(
+          ILPErrorCode.T00_INTERNAL_ERROR,
+          'Invalid fulfillment from local delivery handler',
+          this.nodeId
+        );
+      }
       return {
         type: PacketType.FULFILL,
-        fulfillment: Buffer.from(result.fulfill.fulfillment, 'base64'),
+        fulfillment,
         data: result.fulfill.data ? Buffer.from(result.fulfill.data, 'base64') : Buffer.alloc(0),
       };
     } else if (result.reject) {
@@ -911,7 +929,7 @@ export class PacketHandler {
         };
         try {
           const result = await this.localDeliveryHandler(request, sourcePeerId);
-          return this.convertLocalDeliveryResponse(result);
+          return this.convertLocalDeliveryResponse(result, packet.executionCondition);
         } catch (error) {
           return this.generateReject(
             ILPErrorCode.T00_INTERNAL_ERROR,
@@ -947,11 +965,11 @@ export class PacketHandler {
       }
 
       // Fallback: auto-fulfill local packets (educational/testing purposes)
-      // In a real deployment, use localDelivery config to forward to agent runtime
+      // Computes fulfillment = SHA256(data) per simplified scheme (see payment-handler.ts)
       const fulfillPacket: ILPFulfillPacket = {
         type: PacketType.FULFILL,
-        fulfillment: packet.executionCondition, // Educational implementation - using condition as fulfillment
-        data: Buffer.from('Local delivery - educational implementation'),
+        fulfillment: computeFulfillmentFromData(packet.data),
+        data: Buffer.from('Local delivery - auto-fulfill stub'),
       };
 
       this.logger.info(
@@ -1216,6 +1234,28 @@ export class PacketHandler {
       correlationId,
       claimProtocolData
     );
+
+    // Validate fulfillment from downstream peer before propagating upstream
+    if (response.type === PacketType.FULFILL) {
+      const fulfill = response as ILPFulfillPacket;
+      if (!validateFulfillment(fulfill.fulfillment, packet.executionCondition)) {
+        this.logger.warn(
+          {
+            correlationId,
+            event: 'invalid_fulfillment',
+            source: 'downstream_peer',
+            peerId: nextHop,
+            destination: packet.destination,
+          },
+          'Downstream peer returned invalid fulfillment (SHA256(fulfillment) != condition)'
+        );
+        return this.generateReject(
+          ILPErrorCode.T00_INTERNAL_ERROR,
+          'Invalid fulfillment from downstream peer',
+          this.nodeId
+        );
+      }
+    }
 
     this.logger.info(
       {
