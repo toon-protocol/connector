@@ -30,7 +30,7 @@ EVM settlement on Base L2.
 - **ILP packet routing** — Longest-prefix matching with static routing tables and BTP transport (RFC-0023, RFC-0027)
 - **Balance tracking** — Double-entry accounting via TigerBeetle or in-memory ledger with snapshot persistence
 - **EVM settlement** — Raiden-style payment channels on Base L2 with threshold-based on-chain settlement
-- **Per-packet claims** — Self-describing EIP-712 signed claims attached to every forwarded packet (Epic 31)
+- **Per-packet self-describing claims** — Every forwarded packet carries an EIP-712 signed claim with full on-chain context (`chainId`, `tokenNetworkAddress`, `tokenAddress`), enabling permissionless channel verification
 - **Multi-deployment modes** — Library (embedded), CLI (standalone), or Docker container
 
 ### How to Read This Document
@@ -123,14 +123,14 @@ connector/
 ├── packages/
 │   ├── connector/          # Core connector (main package)
 │   ├── shared/             # ILP types, OER encoding, telemetry types
-│   └── contracts/          # Solidity smart contracts (Foundry)
+│   ├── contracts/          # Solidity smart contracts (Foundry)
+│   └── faucet/             # Token faucet for local Anvil development
 ├── tools/
 │   ├── send-packet/        # CLI tool for sending test packets
-│   ├── fund-peers/         # CLI tool for funding peer accounts
-│   └── create-test-accounts.ts  # Utility for creating test accounts
-├── monitoring/             # Prometheus, Grafana, Alertmanager configs
+│   └── fund-peers/         # CLI tool for funding peer accounts
+├── docker-compose.yml      # Anvil + Faucet local blockchain infrastructure
 ├── Dockerfile              # Multi-stage build (builder → runtime)
-└── docs-archive/           # Archived documentation
+└── Makefile                # Dev workflow (build, test, anvil-up/down)
 ```
 
 ### Packages
@@ -140,14 +140,33 @@ connector/
 | `@crosstown/connector`     | `packages/connector` | Core ILP connector with BTP, routing, settlement                                              |
 | `@crosstown/shared` v1.2.0 | `packages/shared`    | ILP packet types, OER encoding/decoding, telemetry event types, routing types                 |
 | `contracts`                | `packages/contracts` | Solidity contracts: `TokenNetwork.sol`, `TokenNetworkRegistry.sol` (Foundry, Solidity 0.8.26) |
+| `@crosstown/faucet`        | `packages/faucet`    | Token faucet web service for local Anvil development (ETH + USDC distribution)                |
 
 ### Tools
 
-| Tool                   | Path                            | Description                                         |
-| ---------------------- | ------------------------------- | --------------------------------------------------- |
-| `send-packet`          | `tools/send-packet`             | Send ILP Prepare packets to a connector for testing |
-| `fund-peers`           | `tools/fund-peers`              | Fund peer EVM accounts with test tokens             |
-| `create-test-accounts` | `tools/create-test-accounts.ts` | Create test accounts for development                |
+| Tool          | Path                | Description                                         |
+| ------------- | ------------------- | --------------------------------------------------- |
+| `send-packet` | `tools/send-packet` | Send ILP Prepare packets to a connector for testing |
+| `fund-peers`  | `tools/fund-peers`  | Fund peer EVM accounts with test tokens             |
+
+### Local Blockchain Infrastructure
+
+The project includes self-contained Docker infrastructure for local EVM development and integration testing:
+
+| Service    | Image / Build                       | Port | Purpose                                                  |
+| ---------- | ----------------------------------- | ---- | -------------------------------------------------------- |
+| **anvil**  | `ghcr.io/foundry-rs/foundry:latest` | 8545 | Local Ethereum node (Anvil) with auto-deployed contracts |
+| **faucet** | `packages/faucet/Dockerfile`        | 3500 | Web UI + API for distributing test ETH and USDC tokens   |
+
+Managed via `docker-compose.yml` at the project root:
+
+```bash
+make anvil-up      # Start Anvil + Faucet (contracts auto-deploy)
+make anvil-down    # Stop all services
+make anvil-logs    # Follow logs
+```
+
+On startup, Anvil deploys the `DeployLocal.s.sol` script which creates a USDC token at the deterministic address `0x5FbDB2315678afecb367f032d93F642f64180aa3` and a TokenNetwork registry. The faucet distributes 100 ETH + 10,000 USDC per request from Anvil's well-known accounts.
 
 ---
 
@@ -238,6 +257,8 @@ graph TD
 
 ### BTP Claim Messages (`btp/btp-claim-types.ts`)
 
+Claims are **always self-describing**. Every claim includes the on-chain context needed for the receiver to verify it without pre-registration. The `chainId`, `tokenNetworkAddress`, and `tokenAddress` fields are TypeScript optionals for backward compatibility with legacy peers, but **all new code, tests, and integrations must always populate them**.
+
 ```typescript
 interface EVMClaimMessage {
   version: '1.0';
@@ -252,14 +273,14 @@ interface EVMClaimMessage {
   locksRoot: string; // 32-byte hex
   signature: string; // EIP-712 typed signature
   signerAddress: string; // 0x-prefixed Ethereum address
-  // Self-describing fields (Epic 31)
-  chainId?: number; // EVM chain ID
+  // Self-describing fields (always populated; TypeScript optional for legacy compat only)
+  chainId?: number; // EVM chain ID (e.g. 8453 for Base, 31337 for Anvil)
   tokenNetworkAddress?: string; // TokenNetwork contract address
   tokenAddress?: string; // ERC20 token address
 }
 ```
 
-Claims are transmitted via BTP protocolData with protocol name `payment-channel-claim` and content type `1` (JSON).
+Claims are transmitted via BTP protocolData with protocol name `payment-channel-claim` and content type `1` (JSON). The self-describing fields are cryptographically bound to the EIP-712 signature via the domain separator (`chainId` and `tokenNetworkAddress` are part of the signing domain), preventing spoofing.
 
 ### Configuration Types (`config/types.ts`)
 
@@ -339,7 +360,9 @@ sequenceDiagram
     CN-->>App: Ready
 ```
 
-### Per-Packet Claim Flow (Epic 31)
+### Per-Packet Self-Describing Claim Flow
+
+Every forwarded packet carries a self-describing EIP-712 signed claim. The claim always includes `chainId`, `tokenNetworkAddress`, and `tokenAddress` so that receivers can dynamically verify unknown channels on-chain.
 
 ```mermaid
 sequenceDiagram
@@ -353,7 +376,7 @@ sequenceDiagram
     PPC->>CM: getChannelForPeer(peerId, tokenId)
     CM-->>PPC: channelId, currentNonce
     PPC->>PPC: Build self-describing claim message
-    Note over PPC: Include chainId, tokenNetworkAddress,<br/>tokenAddress for dynamic verification
+    Note over PPC: Always includes chainId,<br/>tokenNetworkAddress, tokenAddress
     PPC->>SDK: signBalanceProof(channelId, nonce, amount)
     SDK-->>PPC: EIP-712 signature
     PPC->>DB: INSERT pending claim
@@ -408,7 +431,7 @@ Settlement is exclusively EVM-based on Base L2. XRP and Aptos settlement support
 | --------------------------- | ------------------------------------------- | ---------------------------------------------------------------------------------- |
 | `PaymentChannelSDK`         | `settlement/payment-channel-sdk.ts`         | Low-level EVM interaction (ethers.js provider, contract calls, signature creation) |
 | `ChannelManager`            | `settlement/channel-manager.ts`             | Channel lifecycle (create, deposit, close), peer-to-channel mapping                |
-| `PerPacketClaimService`     | `settlement/per-packet-claim-service.ts`    | Signs and attaches EIP-712 claims to every forwarded packet (Epic 31)              |
+| `PerPacketClaimService`     | `settlement/per-packet-claim-service.ts`    | Signs and attaches self-describing EIP-712 claims to every forwarded packet        |
 | `ClaimReceiver`             | `settlement/claim-receiver.ts`              | Validates and processes incoming claims from peers                                 |
 | `ClaimSender`               | `settlement/claim-sender.ts`                | Manages outbound claim delivery                                                    |
 | `ClaimRedemptionService`    | `settlement/claim-redemption-service.ts`    | Redeems accumulated claims on-chain                                                |
@@ -428,17 +451,17 @@ Settlement is exclusively EVM-based on Base L2. XRP and Aptos settlement support
 | `TigerBeetleErrors`         | `settlement/tigerbeetle-errors.ts`          | TigerBeetle-specific error types and handling                                      |
 | `InMemoryLedgerClient`      | `settlement/in-memory-ledger-client.ts`     | In-memory ledger with JSON snapshot persistence (fallback)                         |
 
-### Channel Registration
+### Channel Registration and Discovery
 
-Channels can be registered through three methods:
+Channels are discovered and registered through three methods, listed by expected frequency:
 
-1. **Admin API** — `POST /admin/channels` with explicit channel parameters
+1. **Dynamic verification (self-describing claims)** — The primary path. When a claim arrives for an unknown channel, the receiver uses the claim's `chainId`, `tokenNetworkAddress`, and `tokenAddress` to query the on-chain state, verify the channel exists and is open, confirm the signer is a participant, and validate the EIP-712 signature against the claimed domain. Once verified, the channel is cached in `ChannelManager` for fast-path lookups on subsequent claims.
 2. **At-connection** — Channels created automatically when BTP peers connect (if settlement infrastructure is enabled)
-3. **Dynamic verification** (Epic 31) — Self-describing claims include `chainId`, `tokenNetworkAddress`, and `tokenAddress`, enabling the receiver to verify unknown channels on-chain without pre-registration
+3. **Admin API** — `POST /admin/channels` with explicit channel parameters (manual override)
 
-### Self-Describing Claims (Epic 31)
+### Self-Describing Claims
 
-Each claim message includes optional fields that make it self-describing:
+All claims are self-describing. Every `EVMClaimMessage` includes the on-chain context necessary for permissionless verification:
 
 ```json
 {
@@ -455,7 +478,13 @@ Each claim message includes optional fields that make it self-describing:
 }
 ```
 
-These fields are cryptographically bound to the EIP-712 signature via the domain separator (`chainId` and `tokenNetworkAddress` are part of the signing domain), preventing spoofing.
+**Design invariants:**
+
+- `chainId`, `tokenNetworkAddress`, and `tokenAddress` are **always populated** by the sender
+- These fields are cryptographically bound to the EIP-712 signature via the domain separator (`chainId` and `tokenNetworkAddress` are part of the signing domain), preventing spoofing
+- The receiver verifies unknown channels on-chain using these fields, then caches the result (one-time RPC cost per channel)
+- Any integration test, mock, or fixture that creates claims **must include all three self-describing fields**
+- Legacy claims without self-describing fields are only accepted if the channel was pre-registered via admin API or at-connection
 
 ### Smart Contracts (Foundry)
 
@@ -529,24 +558,10 @@ routes:
 
 ### Authentication
 
-- **BTP auth** — Shared secret tokens for peer-to-peer WebSocket connections
+- **BTP auth** — Shared secret tokens for peer-to-peer WebSocket connections (accepts empty string by default)
 - **Admin API** — Optional API key via `X-Api-Key` header
 - **IP allowlisting** — CIDR-based access control for admin API (checked before API key)
 - **Deployment mode restrictions** — Embedded mode disables external HTTP interfaces by default
-
-### Key Management
-
-Five backends via `KeyManager`:
-
-| Backend    | Use Case                                                      |
-| ---------- | ------------------------------------------------------------- |
-| `env`      | Development (private key from environment variable or config) |
-| `aws-kms`  | Production (AWS Key Management Service)                       |
-| `gcp-kms`  | Production (Google Cloud KMS)                                 |
-| `azure-kv` | Production (Azure Key Vault)                                  |
-| `hsm`      | Enterprise (Hardware Security Module via PKCS#11)             |
-
-Key rotation is supported — new keys are used for signing while old keys remain valid for verification during a transition period.
 
 ### Fraud Detection
 
@@ -595,38 +610,80 @@ Jest + ts-jest with co-located test files (`*.test.ts` next to source).
 
 ### Test Types
 
-| Type        | Command                    | Scope                                   |
-| ----------- | -------------------------- | --------------------------------------- |
-| Unit        | `npm test`                 | Individual modules, mocked dependencies |
-| Acceptance  | `npm run test:acceptance`  | User story acceptance criteria          |
-| Security    | `npm run test:security`    | Auth, key management, input validation  |
-| Load        | `npm run test:load`        | Throughput and latency benchmarks       |
-| Performance | `npm run test:performance` | Performance regression detection        |
+| Type        | Command                    | Scope                                                | Mocks Allowed |
+| ----------- | -------------------------- | ---------------------------------------------------- | ------------- |
+| Unit        | `npm test`                 | Individual modules, isolated logic                   | Yes           |
+| Integration | `npm run test:integration` | Multi-module workflows against real Anvil blockchain | **No**        |
 
-### Domain-Specific Test Suites
+### Key Rule: Integration Tests Never Use Mocks
+
+**Integration tests run against real infrastructure — never mocks.** The local Anvil blockchain (`make anvil-up`) provides a deterministic, fast, cost-free EVM environment that eliminates the need for mocked EVM interactions in integration tests.
+
+This means:
+
+- **Real smart contracts** — `DeployLocal.s.sol` deploys real `TokenNetwork`, `TokenNetworkRegistry`, and `MockERC20` contracts to Anvil
+- **Real transactions** — Channel open, deposit, close, and settlement operations execute against real Solidity code
+- **Real signatures** — EIP-712 signing and on-chain verification use actual ethers.js + Anvil RPC
+- **Real balances** — Token transfers, ETH funding, and balance queries hit the Anvil state
+- **Real claim flow** — Self-describing claims are verified against on-chain channel state via RPC
+
+If a test needs a running blockchain, it is an integration test and uses Anvil. If a test does not need a blockchain, it is a unit test and may use mocks for non-EVM dependencies (e.g., BTP transport, TigerBeetle client).
+
+### Anvil Infrastructure for Integration Tests
+
+Integration tests require the Anvil Docker infrastructure to be running:
 
 ```bash
-npm run test:settlement   # Settlement and claim tests
-npm run test:btp          # BTP protocol tests
-npm run test:tigerbeetle  # TigerBeetle and accounting tests
-npm run test:evm          # EVM settlement tests
+make anvil-up                    # Start Anvil with deployed contracts
+npm run test:integration         # Run integration test suite
+make anvil-down                  # Tear down
 ```
+
+The Anvil environment provides:
+
+| Resource               | Value                                        | Source               |
+| ---------------------- | -------------------------------------------- | -------------------- |
+| RPC URL                | `http://localhost:8545`                      | Anvil service        |
+| Chain ID               | `31337`                                      | Anvil default        |
+| USDC Token             | `0x5FbDB2315678afecb367f032d93F642f64180aa3` | Deterministic deploy |
+| TokenNetwork           | `0xCafac3dD18aC6c6e92c921884f9E4176737C052c` | Deterministic deploy |
+| TokenNetworkRegistry   | `0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512` | Deterministic deploy |
+| Deployer (Account 0)   | Private key `0xac0974...`                    | Anvil well-known     |
+| ETH Funder (Account 1) | Private key `0x59c699...`                    | Anvil well-known     |
+| Peer accounts (2, 3)   | Pre-funded with 10k USDC each                | `DeployLocal.s.sol`  |
+
+### Unit Test Conventions
+
+Unit tests may mock dependencies to isolate the module under test. Common mocks:
+
+- `PaymentChannelSDK` — Mock for unit-testing claim signing logic without RPC
+- `AccountManager` / `LedgerClient` — Mock for testing settlement monitor thresholds
+- `BTPServer` / `BTPClientManager` — Mock for testing packet handler routing
+
+### Claim Testing Assumptions
+
+All tests that involve claims (unit and integration) **must assume self-describing claims**:
+
+- Every `EVMClaimMessage` fixture or mock must include `chainId`, `tokenNetworkAddress`, and `tokenAddress`
+- Integration tests must verify the dynamic on-chain verification path against real Anvil contracts (unknown channel → self-describing fields → RPC verification → channel cached)
+- Do not write tests that rely on pre-registered channels as the primary path — test the self-describing verification flow first, then add backward-compat coverage as a secondary case
+- Unit tests may mock `PaymentChannelSDK.getChannelStateByNetwork()` and `verifyBalanceProofWithDomain()` for the dynamic verification path; integration tests must not
 
 ---
 
 ## 13. Key Design Decisions
 
-| Decision                        | Rationale                                                                                                                                     |
-| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| **EVM-only settlement**         | XRP/Aptos removed in Epic 30 to reduce complexity. Base L2 chosen for low fees and EVM compatibility.                                         |
-| **Per-packet claims (Epic 31)** | Every forwarded packet carries an EIP-712 signed claim, enabling continuous micropayment settlement without batching delays.                  |
-| **Self-describing claims**      | Claims include chain ID, token network address, and token address so receivers can verify unknown channels on-chain without pre-registration. |
-| **Foundry (not Hardhat)**       | Faster compilation, built-in fuzzing, Solidity-native tests, better developer experience.                                                     |
-| **TigerBeetle optional**        | In-memory ledger with JSON snapshot persistence provides a zero-dependency fallback. TigerBeetle is recommended for production.               |
-| **Library-first**               | `ConnectorNode` is a class you instantiate in your code. CLI and Docker are wrappers around this library API.                                 |
-| **better-sqlite3 for claims**   | Per-packet claim persistence needs synchronous, low-latency writes. SQLite is embedded and requires no external service.                      |
-| **In-memory ledger snapshots**  | JSON file snapshots every 30s (configurable) provide persistence across restarts without TigerBeetle.                                         |
-| **BTP over WebSocket**          | RFC-0023 compliant. WebSocket provides full-duplex, low-latency communication for bilateral transfers and claim exchange.                     |
+| Decision                              | Rationale                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **EVM-only settlement**               | XRP/Aptos removed in Epic 30 to reduce complexity. Base L2 chosen for low fees and EVM compatibility.                                                                                                                                                                                                                                           |
+| **Per-packet self-describing claims** | Every forwarded packet carries a self-describing EIP-712 signed claim with `chainId`, `tokenNetworkAddress`, and `tokenAddress`. This enables permissionless peer connections with dynamic on-chain channel verification -- no pre-registration required. All claims, tests, and integrations assume self-describing fields are always present. |
+| **Foundry (not Hardhat)**             | Faster compilation, built-in fuzzing, Solidity-native tests, better developer experience.                                                                                                                                                                                                                                                       |
+| **TigerBeetle optional**              | In-memory ledger with JSON snapshot persistence provides a zero-dependency fallback. TigerBeetle is recommended for production.                                                                                                                                                                                                                 |
+| **Library-first**                     | `ConnectorNode` is a class you instantiate in your code. CLI and Docker are wrappers around this library API.                                                                                                                                                                                                                                   |
+| **better-sqlite3 for claims**         | Per-packet claim persistence needs synchronous, low-latency writes. SQLite is embedded and requires no external service.                                                                                                                                                                                                                        |
+| **In-memory ledger snapshots**        | JSON file snapshots every 30s (configurable) provide persistence across restarts without TigerBeetle.                                                                                                                                                                                                                                           |
+| **BTP over WebSocket**                | RFC-0023 compliant. WebSocket provides full-duplex, low-latency communication for bilateral transfers and claim exchange.                                                                                                                                                                                                                       |
+| **Anvil for integration tests**       | Integration tests run against a real local Anvil blockchain — never mocks. Anvil is deterministic, fast, and free, so there is no reason to mock EVM interactions in integration tests. This catches real contract bugs, signature issues, and gas problems that mocks would hide. Docker Compose orchestrates Anvil + contract deployment.     |
 
 ---
 

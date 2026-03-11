@@ -1,189 +1,90 @@
-# Docker Compose configuration for 3-node linear ILP network
-# Topology: Connector A → Connector B → Connector C
-#
-# This configuration deploys a simple linear chain of 3 ILP connectors:
-# - connector-a: Entry point (port 3000)
-# - connector-b: Transit node (port 3001)
-# - connector-c: Exit node (port 3002)
+# Local Blockchain Development Infrastructure
+# Anvil (local Ethereum node) + Token Faucet
 #
 # Usage:
-#   Start: docker-compose up -d
-#   Logs:  docker-compose logs -f
-#   Stop:  docker-compose down
-#
-# Prerequisites:
-#   1. Build the connector image: docker build -t agent-runtime .
-#   2. Docker Engine 20.10+ and Docker Compose 2.x installed
-#
-# Configuration:
-#   Each connector loads its configuration from a YAML file mounted as a volume.
-#   Configuration files are in the examples/ directory:
-#   - examples/linear-3-nodes-a.yaml
-#   - examples/linear-3-nodes-b.yaml
-#   - examples/linear-3-nodes-c.yaml
-#
-#   To customize topology, edit the YAML files or create new ones.
-
-version: '3.8'
+#   make anvil-up      Start Anvil + Faucet
+#   make anvil-down    Stop all services
+#   make anvil-logs    Follow logs
 
 services:
-  # TigerBeetle - Distributed accounting database for settlement layer
-  #
-  # TigerBeetle provides high-performance, ACID-compliant accounting for tracking
-  # settlement balances between ILP connector peers. It uses double-entry bookkeeping
-  # with microsecond-level latency for recording transfers and querying balances.
-  #
-  # Architecture:
-  #   - Single-node deployment for development (1 replica)
-  #   - Multi-replica configuration (3-5 replicas) recommended for production
-  #   - Quorum-based consensus requires majority of replicas healthy
-  #
-  # Data Persistence:
-  #   - Data stored in Docker volume: tigerbeetle-data
-  #   - Volume persists across container restarts
-  #   - Cluster ID is immutable after initialization
-  #
-  # Network Access:
-  #   - Internal port: 3000 (binary TCP protocol)
-  #   - NOT exposed to host (Docker network access only)
-  #   - Connectors access via hostname: tigerbeetle:3000
-  #
-  # Health Check:
-  #   - TCP socket check (TigerBeetle has no HTTP endpoint)
-  #   - Uses netcat to verify port 3000 is accepting connections
-  #
-  # Security:
-  #   - Requires --security-opt seccomp=unconfined for I/O operations
-  #   - Network isolation via Docker bridge network
-  #   - No authentication (relies on network-level access control)
-  tigerbeetle:
-    image: ghcr.io/tigerbeetle/tigerbeetle:latest
-    container_name: tigerbeetle
-    security_opt:
-      - seccomp=unconfined  # Required for TigerBeetle I/O operations
-    environment:
-      TIGERBEETLE_CLUSTER_ID: ${TIGERBEETLE_CLUSTER_ID:-0}
-      TIGERBEETLE_REPLICA_COUNT: ${TIGERBEETLE_REPLICA_COUNT:-1}
-      TIGERBEETLE_DATA_DIR: ${TIGERBEETLE_DATA_DIR:-/data}
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Anvil - Local Ethereum Node with Auto-Deployed Contracts
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    entrypoint: []
+    command:
+      - sh
+      - -c
+      - |
+        echo "Starting Anvil..."
+        anvil --host 0.0.0.0 --port 8545 --chain-id 31337 --accounts 10 --balance 10000 &
+        ANVIL_PID=$$!
+
+        echo "Waiting for Anvil to be ready..."
+        until cast client --rpc-url http://localhost:8545 2>/dev/null | grep -q 'anvil'; do
+          sleep 1
+        done
+
+        echo "Deploying contracts..."
+        cd /contracts
+        forge script script/DeployLocal.s.sol:DeployLocalScript --rpc-url http://localhost:8545 --broadcast --skip-simulation || echo "Deployment failed (non-fatal)"
+
+        echo "Anvil ready with contracts deployed!"
+        wait $$ANVIL_PID
     volumes:
-      - tigerbeetle-data:/data
-      - ./scripts/init-tigerbeetle.sh:/init-tigerbeetle.sh:ro
-    # Note: Port 3000 is internal-only, not exposed to host for security
-    # Connectors access TigerBeetle via Docker network: tigerbeetle:3000
-    networks:
-      - agent-network
+      - ./packages/contracts:/contracts
+    ports:
+      - '8545:8545'
     restart: unless-stopped
-    # TigerBeetle uses custom binary protocol over TCP, no HTTP endpoint available
-    # Health check uses netcat to verify TCP port 3000 accepts connections
     healthcheck:
-      test: ["CMD-SHELL", "(echo > /dev/tcp/localhost/3000) 2>/dev/null || exit 1"]
+      test:
+        [
+          'CMD-SHELL',
+          "cast client --rpc-url http://localhost:8545 2>&1 | grep -q 'anvil' || exit 1",
+        ]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 30s
-    entrypoint: ["/init-tigerbeetle.sh"]
+      retries: 3
+      start_period: 15s
 
-  # Connector A - Entry node
-  connector-a:
-    image: connector
-    container_name: connector-a
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Token Faucet - Provides ETH and USDC tokens for testing
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  faucet:
+    build:
+      context: ./packages/faucet
+      dockerfile: Dockerfile
     environment:
-      CONFIG_FILE: /app/config.yaml
-      NODE_ID: connector-a
-      LOG_LEVEL: info
-      HEALTH_CHECK_PORT: 8080
-      BTP_PEER_CONNECTOR_B_SECRET: secret-a-to-b
-      BTP_PEER_SEND_PACKET_CLIENT_SECRET: test-token
-    volumes:
-      - ./examples/linear-3-nodes-a.yaml:/app/config.yaml:ro
+      PORT: 3500
+      RPC_URL: http://anvil:8545
+
+      # Account 1 for ETH (has 10k ETH from Anvil)
+      ETH_PRIVATE_KEY: '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d'
+
+      # Account 0 (deployer) for USDC tokens
+      TOKEN_PRIVATE_KEY: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
+
+      # Token address (deterministic from Anvil deployment)
+      TOKEN_ADDRESS: '0x5FbDB2315678afecb367f032d93F642f64180aa3'
+
+      # Amounts to send per request
+      ETH_AMOUNT: '100'
+      TOKEN_AMOUNT: '10000'
+
     ports:
-      - "3000:3000"  # BTP server port
-      - "9080:8080"  # Health check HTTP port
-    networks:
-      - agent-network
+      - '3500:3500'
     depends_on:
-      tigerbeetle:
-        condition: service_started
+      anvil:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      test:
+        [
+          'CMD-SHELL',
+          'wget --no-verbose --tries=1 --spider http://localhost:3500/health || exit 1',
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
-
-  # Connector B - Transit node (middle)
-  connector-b:
-    image: connector
-    container_name: connector-b
-    environment:
-      CONFIG_FILE: /app/config.yaml
-      NODE_ID: connector-b
-      LOG_LEVEL: info
-      HEALTH_CHECK_PORT: 8080
-      EXPLORER_PORT: 3003
-    volumes:
-      - ./examples/linear-3-nodes-b.yaml:/app/config.yaml:ro
-    ports:
-      - "3001:3001"  # BTP server port
-      - "9081:8080"  # Health check HTTP port
-    networks:
-      - agent-network
-    depends_on:
-      tigerbeetle:
-        condition: service_started
-      connector-a:
-        condition: service_started
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
-  # Connector C - Exit node
-  connector-c:
-    image: connector
-    container_name: connector-c
-    environment:
-      CONFIG_FILE: /app/config.yaml
-      NODE_ID: connector-c
-      LOG_LEVEL: info
-      HEALTH_CHECK_PORT: 8080
-      BTP_PEER_CONNECTOR_B_SECRET: secret-b-to-c
-    volumes:
-      - ./examples/linear-3-nodes-c.yaml:/app/config.yaml:ro
-    ports:
-      - "3002:3002"  # BTP server port
-      - "9082:8080"  # Health check HTTP port
-    networks:
-      - agent-network
-    depends_on:
-      tigerbeetle:
-        condition: service_started
-      connector-b:
-        condition: service_started
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
-  # Dashboard (REMOVED - see DASHBOARD-DEFERRED.md)
-  # Visualization has been deferred to a future standalone project.
-  # Telemetry events are still emitted but not consumed.
-
-networks:
-  agent-network:
-    driver: bridge
-
-# Named volumes for persistent data
-volumes:
-  # TigerBeetle data volume for settlement accounting database
-  # Persists cluster data across container restarts
-  # WARNING: Do not delete this volume or cluster data will be lost
-  tigerbeetle-data:
-    driver: local
+      start_period: 10s

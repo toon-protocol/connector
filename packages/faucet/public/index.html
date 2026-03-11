@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Token Faucet</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu,
+          Cantarell, sans-serif;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+      }
+
+      .container {
+        background: white;
+        border-radius: 20px;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        padding: 40px;
+        max-width: 600px;
+        width: 100%;
+      }
+
+      h1 {
+        font-size: 2.5em;
+        margin-bottom: 10px;
+        color: #667eea;
+        text-align: center;
+      }
+
+      .subtitle {
+        text-align: center;
+        color: #666;
+        margin-bottom: 30px;
+        font-size: 1.1em;
+      }
+
+      .info-box {
+        background: #f8f9fa;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 30px;
+      }
+
+      .info-row {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 10px;
+        font-size: 0.95em;
+      }
+
+      .info-row:last-child {
+        margin-bottom: 0;
+      }
+
+      .info-label {
+        color: #666;
+        font-weight: 500;
+      }
+
+      .info-value {
+        color: #333;
+        font-weight: 600;
+      }
+
+      .form-group {
+        margin-bottom: 20px;
+      }
+
+      label {
+        display: block;
+        margin-bottom: 8px;
+        color: #333;
+        font-weight: 500;
+      }
+
+      input {
+        width: 100%;
+        padding: 12px;
+        border: 2px solid #e0e0e0;
+        border-radius: 8px;
+        font-size: 1em;
+        transition: border-color 0.3s;
+        font-family: 'Courier New', monospace;
+      }
+
+      input:focus {
+        outline: none;
+        border-color: #667eea;
+      }
+
+      button {
+        width: 100%;
+        padding: 14px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        font-size: 1.1em;
+        font-weight: 600;
+        cursor: pointer;
+        transition:
+          transform 0.2s,
+          box-shadow 0.2s;
+      }
+
+      button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+      }
+
+      button:active {
+        transform: translateY(0);
+      }
+
+      button:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      .message {
+        padding: 12px;
+        border-radius: 8px;
+        margin-top: 20px;
+        display: none;
+      }
+
+      .message.success {
+        background: #d4edda;
+        color: #155724;
+        border: 1px solid #c3e6cb;
+      }
+
+      .message.error {
+        background: #f8d7da;
+        color: #721c24;
+        border: 1px solid #f5c6cb;
+      }
+
+      .message.show {
+        display: block;
+      }
+
+      .tx-link {
+        color: #667eea;
+        text-decoration: none;
+        font-weight: 600;
+      }
+
+      .tx-link:hover {
+        text-decoration: underline;
+      }
+
+      .loading {
+        display: none;
+        text-align: center;
+        margin-top: 20px;
+      }
+
+      .spinner {
+        border: 3px solid #f3f3f3;
+        border-top: 3px solid #667eea;
+        border-radius: 50%;
+        width: 40px;
+        height: 40px;
+        animation: spin 1s linear infinite;
+        margin: 0 auto;
+      }
+
+      @keyframes spin {
+        0% {
+          transform: rotate(0deg);
+        }
+        100% {
+          transform: rotate(360deg);
+        }
+      }
+
+      .footer {
+        text-align: center;
+        margin-top: 30px;
+        color: #999;
+        font-size: 0.9em;
+      }
+
+      .not-ready {
+        background: #fff3cd;
+        color: #856404;
+        border: 1px solid #ffeaa7;
+        padding: 12px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>🚰 Token Faucet</h1>
+      <p class="subtitle">
+        Get free ETH and USDC tokens for local development
+      </p>
+
+      <div id="notReady" class="not-ready" style="display: none">
+        ⚠️ Waiting for token contract deployment...
+      </div>
+
+      <div class="info-box">
+        <div class="info-row">
+          <span class="info-label">ETH per request:</span>
+          <span class="info-value" id="ethAmount">-</span>
+        </div>
+        <div class="info-row">
+          <span class="info-label">Tokens per request:</span>
+          <span class="info-value" id="tokenAmount">-</span>
+        </div>
+        <div class="info-row">
+          <span class="info-label">Token contract:</span>
+          <span
+            class="info-value"
+            id="tokenAddress"
+            style="font-size: 0.8em; font-family: monospace"
+            >-</span
+          >
+        </div>
+      </div>
+
+      <form id="faucetForm">
+        <div class="form-group">
+          <label for="address">Your Ethereum Address</label>
+          <input
+            type="text"
+            id="address"
+            placeholder="0x..."
+            required
+            pattern="^0x[a-fA-F0-9]{40}$"
+          />
+        </div>
+
+        <button type="submit" id="submitBtn">Request Tokens 💧</button>
+      </form>
+
+      <div class="loading" id="loading">
+        <div class="spinner"></div>
+        <p style="margin-top: 10px">Processing your request...</p>
+      </div>
+
+      <div class="message" id="message"></div>
+
+      <div class="footer">Local Development Faucet</div>
+    </div>
+
+    <script>
+      const form = document.getElementById('faucetForm');
+      const addressInput = document.getElementById('address');
+      const submitBtn = document.getElementById('submitBtn');
+      const message = document.getElementById('message');
+      const loading = document.getElementById('loading');
+      const notReady = document.getElementById('notReady');
+
+      // Load faucet info
+      async function loadInfo() {
+        try {
+          const response = await fetch('/api/info');
+          const data = await response.json();
+
+          document.getElementById('ethAmount').textContent =
+            `${data.ethAmount} ETH`;
+          document.getElementById('tokenAmount').textContent =
+            `${data.tokenAmount} ${data.tokenSymbol}`;
+          document.getElementById('tokenAddress').textContent =
+            data.tokenAddress || 'Not deployed yet';
+
+          if (!data.ready) {
+            notReady.style.display = 'block';
+            submitBtn.disabled = true;
+          } else {
+            notReady.style.display = 'none';
+            submitBtn.disabled = false;
+          }
+        } catch (error) {
+          console.error('Failed to load faucet info:', error);
+        }
+      }
+
+      // Show message
+      function showMessage(text, type) {
+        message.textContent = text;
+        message.className = `message ${type} show`;
+      }
+
+      // Hide message
+      function hideMessage() {
+        message.className = 'message';
+      }
+
+      // Handle form submission
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        hideMessage();
+
+        const address = addressInput.value.trim();
+
+        // Validate address format
+        if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+          showMessage('Invalid Ethereum address format', 'error');
+          return;
+        }
+
+        // Disable form and show loading
+        submitBtn.disabled = true;
+        loading.style.display = 'block';
+
+        try {
+          const response = await fetch('/api/request', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ address }),
+          });
+
+          const data = await response.json();
+
+          if (response.ok) {
+            showMessage(
+              `✅ Success! Sent ${data.transactions.eth.amount} ETH and ${data.transactions.token.amount} ${data.transactions.token.symbol} to ${address}`,
+              'success'
+            );
+            addressInput.value = '';
+          } else {
+            showMessage(`❌ ${data.error}: ${data.message}`, 'error');
+          }
+        } catch (error) {
+          showMessage(`❌ Request failed: ${error.message}`, 'error');
+        } finally {
+          loading.style.display = 'none';
+          submitBtn.disabled = false;
+        }
+      });
+
+      // Load info on page load
+      loadInfo();
+
+      // Refresh info every 10 seconds
+      setInterval(loadInfo, 10000);
+    </script>
+  </body>
+</html>
