@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.21.0](https://github.com/ALLiDoizCode/connector/compare/v1.20.0...v1.21.0) (2026-03-11)
+
+### Features
+
+- add local Anvil infrastructure with faucet and update architecture ([1df938f](https://github.com/ALLiDoizCode/connector/commit/1df938fe5aad464eb102c89c9635b2863de15495))
+- **epic-30:** per-hop BLS notification, XRP/Aptos removal, EVM test infrastructure ([2514f71](https://github.com/ALLiDoizCode/connector/commit/2514f715d8ee174b2c36d83d7b21b7dd4bf03a21))
+- **epic-31:** add as-built PRD, archive docs, and full project cleanup ([0850c59](https://github.com/ALLiDoizCode/connector/commit/0850c5925cc213a3451b81aa4e6df640d177fc3f))
+- **epic-31:** self-describing claims, dynamic channel verification, and docs cleanup ([c31f645](https://github.com/ALLiDoizCode/connector/commit/c31f6456040aa25f1a662ef397e247597a92412b))
+- implement XRP-style payment channels with grace period model ([b991f2e](https://github.com/ALLiDoizCode/connector/commit/b991f2e906ab4a77f84912c952598d5f649618fc))
+- make per-packet claims mandatory for peer forwarding ([f9cfd54](https://github.com/ALLiDoizCode/connector/commit/f9cfd54cfb8a2d8d87298bc6aa70f796a2b04d2a))
+- serialize settlements and fix graceful shutdown sequencing ([fc7fd2b](https://github.com/ALLiDoizCode/connector/commit/fc7fd2b51aaf727c277d5a31a27df46fe57c85e5))
+
+### Bug Fixes
+
+- add fulfillment validation and fix auto-fulfill stub ([4d23625](https://github.com/ALLiDoizCode/connector/commit/4d2362573788520a106da72c6958c4a47d9df949))
+- add missing getBlock mock to payment-channel-sdk tests ([9a2e9d0](https://github.com/ALLiDoizCode/connector/commit/9a2e9d0ded118d4d024a15b8afd0a8d96a4218bb))
+- add missing multi-hop-helpers.ts to source control ([5d9b4e8](https://github.com/ALLiDoizCode/connector/commit/5d9b4e85203a144e8051c42250037c74f7d6ed0a))
+- add stubs for commented-out test infrastructure in doc test ([8ac71be](https://github.com/ALLiDoizCode/connector/commit/8ac71be61b1203ad73de99fc44d12cb75b01f6ba))
+- correct rfc-links test path from integration to unit ([a5f3fb7](https://github.com/ALLiDoizCode/connector/commit/a5f3fb75309b8d14d0fa9b50d2cccdf23c45148d))
+- remove obsolete mesh topology config test ([390c5bb](https://github.com/ALLiDoizCode/connector/commit/390c5bb06ac338b574a8c27d6a79da9779c92675))
+- resolve flaky connection-pool test blocking npm publish ([c290ad7](https://github.com/ALLiDoizCode/connector/commit/c290ad7347ab9c47c40791843ddbe0dffd6e5580))
+- resolve pre-existing test failures in doc test and security test ([8ddf736](https://github.com/ALLiDoizCode/connector/commit/8ddf736bd6d5754626ed7219a1009649f1136a88))
+- restore TigerBeetle init script and add docker-memory E2E test mode ([95403e5](https://github.com/ALLiDoizCode/connector/commit/95403e5313a4a7c1f572706252c387b70d046a02))
+- update environment-config test assertions to match chain-aware error messages ([ae02621](https://github.com/ALLiDoizCode/connector/commit/ae02621bdd1417999ad10f8ef0fd6c0969a10d45))
+
 ## [1.20.0](https://github.com/ALLiDoizCode/connector/compare/v1.19.0...v1.20.0) (2026-02-21)
 
 ### Features
