@@ -10,17 +10,13 @@
  * 3. Settlement via existing channel
  * 4. Channel deposit management
  * 5. Retry logic with exponential backoff
- * 6. Error handling and telemetry emission
+ * 6. Error handling
  * 7. Settlement monitor state transitions
  *
  * Source: Epic 8 Story 8.8 - Settlement Engine Integration Tests
  */
 
-import {
-  SettlementExecutor,
-  SettlementExecutorConfig,
-  TelemetryEmitter,
-} from './settlement-executor';
+import { SettlementExecutor, SettlementExecutorConfig } from './settlement-executor';
 import { AccountManager } from './account-manager';
 import { PaymentChannelSDK } from './payment-channel-sdk';
 import { SettlementMonitor } from './settlement-monitor';
@@ -38,7 +34,6 @@ describe('SettlementExecutor', () => {
   let mockAccountManager: jest.Mocked<AccountManager>;
   let mockPaymentChannelSDK: jest.Mocked<PaymentChannelSDK>;
   let mockSettlementMonitor: jest.Mocked<SettlementMonitor>;
-  let mockTelemetryEmitter: jest.Mocked<TelemetryEmitter>;
   let logger: pino.Logger;
   let config: SettlementExecutorConfig;
 
@@ -72,9 +67,6 @@ describe('SettlementExecutor', () => {
       {} as any
     ) as jest.Mocked<SettlementMonitor>;
     /* eslint-enable @typescript-eslint/no-explicit-any */
-    mockTelemetryEmitter = {
-      emit: jest.fn(),
-    };
 
     // Setup mock implementations
     mockAccountManager.recordSettlement = jest.fn().mockResolvedValue(undefined);
@@ -128,14 +120,13 @@ describe('SettlementExecutor', () => {
       mockAccountManager,
       mockPaymentChannelSDK,
       mockSettlementMonitor,
-      logger,
-      mockTelemetryEmitter
+      logger
     );
   });
 
-  afterEach(() => {
-    // Cleanup: Stop executor to remove listeners
-    executor.stop();
+  afterEach(async () => {
+    // Cleanup: Stop executor to remove listeners and drain in-flight settlements
+    await executor.stop();
   });
 
   describe('Constructor', () => {
@@ -190,13 +181,12 @@ describe('SettlementExecutor', () => {
       // Start executor
       executor.start();
 
-      // Simulate settlement event
+      // Simulate settlement event — handler enqueues onto settlement chain
       const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
-      const settlementPromise = handler(event);
+      handler(event);
 
-      // Wait for async processing
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      await settlementPromise;
+      // Drain the settlement chain by stopping the executor
+      await executor.stop();
 
       // Verify: openChannel called with correct parameters
       expect(mockPaymentChannelSDK.openChannel).toHaveBeenCalledWith(
@@ -224,24 +214,6 @@ describe('SettlementExecutor', () => {
         testPeerId,
         testTokenId
       );
-
-      // Verify: Telemetry emitted
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'SETTLEMENT_STARTED',
-          nodeId: config.nodeId,
-          peerId: testPeerId,
-          tokenId: testTokenId,
-        })
-      );
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'SETTLEMENT_COMPLETED',
-          nodeId: config.nodeId,
-          peerId: testPeerId,
-          tokenId: testTokenId,
-        })
-      );
     });
   });
 
@@ -263,13 +235,12 @@ describe('SettlementExecutor', () => {
       // Start executor
       executor.start();
 
-      // Simulate settlement event
+      // Simulate settlement event — handler enqueues onto settlement chain
       const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
-      const settlementPromise = handler(event);
+      handler(event);
 
-      // Wait for async processing
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      await settlementPromise;
+      // Drain the settlement chain by stopping the executor
+      await executor.stop();
 
       // Verify: claimFromChannel called
       expect(mockPaymentChannelSDK.claimFromChannel).toHaveBeenCalledWith(
@@ -315,8 +286,7 @@ describe('SettlementExecutor', () => {
         mockAccountManager,
         mockPaymentChannelSDK,
         mockSettlementMonitor,
-        logger,
-        mockTelemetryEmitter
+        logger
       );
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       executorWithClaims.setPerPacketClaimService(mockPerPacketClaimService as any);
@@ -334,13 +304,12 @@ describe('SettlementExecutor', () => {
       // Start executor
       executorWithClaims.start();
 
-      // Simulate settlement event
+      // Simulate settlement event — handler enqueues onto settlement chain
       const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
-      const settlementPromise = handler(event);
+      handler(event);
 
-      // Wait for async processing
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      await settlementPromise;
+      // Drain the settlement chain by stopping the executor
+      await executorWithClaims.stop();
 
       // Verify: claimFromChannel used per-packet claim data
       expect(mockPaymentChannelSDK.claimFromChannel).toHaveBeenCalledWith(
@@ -359,9 +328,6 @@ describe('SettlementExecutor', () => {
 
       // Verify: per-packet claim tracking reset after successful claim
       expect(mockPerPacketClaimService.resetChannel).toHaveBeenCalledWith(testChannelId);
-
-      // Cleanup
-      executorWithClaims.stop();
     });
   });
 
@@ -379,8 +345,7 @@ describe('SettlementExecutor', () => {
         mockAccountManager,
         mockPaymentChannelSDK,
         mockSettlementMonitor,
-        logger,
-        mockTelemetryEmitter
+        logger
       );
 
       // Mock: First 2 calls fail with retryable error, 3rd succeeds
@@ -405,16 +370,12 @@ describe('SettlementExecutor', () => {
       // Start executor
       fastRetryExecutor.start();
 
-      // Simulate settlement event
+      // Simulate settlement event — handler enqueues onto settlement chain
       const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
-      const settlementPromise = handler(event);
+      handler(event);
 
-      // Wait for retry operations (100ms sufficient for fast retries: 10ms + 20ms + 40ms + overhead)
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      await settlementPromise;
-
-      // Cleanup
-      fastRetryExecutor.stop();
+      // Drain the settlement chain (retries complete within the chain)
+      await fastRetryExecutor.stop();
 
       // Verify: openChannel called 3 times (2 failures + 1 success)
       expect(mockPaymentChannelSDK.openChannel).toHaveBeenCalledTimes(3);
@@ -428,7 +389,7 @@ describe('SettlementExecutor', () => {
   });
 
   describe('Error Handling', () => {
-    it('should emit telemetry on permanent failure and NOT mark completed', async () => {
+    it('should NOT mark completed on permanent failure', async () => {
       // Mock: Permanent failure (insufficient funds)
       mockPaymentChannelSDK.openChannel.mockRejectedValue(new Error('Insufficient funds'));
 
@@ -448,75 +409,15 @@ describe('SettlementExecutor', () => {
       // Start executor
       executor.start();
 
-      // Simulate settlement event
+      // Simulate settlement event — handler enqueues onto settlement chain
       const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
-      const settlementPromise = handler(event);
+      handler(event);
 
-      // Wait for async processing
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      await settlementPromise;
-
-      // Verify: SETTLEMENT_FAILED telemetry emitted
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'SETTLEMENT_FAILED',
-          nodeId: config.nodeId,
-          peerId: testPeerId,
-          tokenId: testTokenId,
-          error: 'Insufficient funds',
-        })
-      );
+      // Drain the settlement chain
+      await executor.stop();
 
       // Verify: markSettlementCompleted NOT called
       expect(mockSettlementMonitor.markSettlementCompleted).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('Telemetry Events', () => {
-    it('should emit telemetry events for all settlement outcomes', async () => {
-      // Mock: No existing channel
-      mockPaymentChannelSDK.getMyChannels.mockResolvedValue([]);
-
-      // Create settlement event
-      const event: SettlementTriggerEvent = {
-        peerId: testPeerId,
-        tokenId: testTokenId,
-        currentBalance: testCurrentBalance,
-        threshold: testThreshold,
-        exceedsBy: testCurrentBalance - testThreshold,
-        timestamp: new Date(),
-      };
-
-      // Start executor
-      executor.start();
-
-      // Simulate settlement event
-      const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
-      const settlementPromise = handler(event);
-
-      // Wait for async processing
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      await settlementPromise;
-
-      // Verify: SETTLEMENT_STARTED emitted
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'SETTLEMENT_STARTED',
-        })
-      );
-
-      // Verify: SETTLEMENT_COMPLETED emitted
-      expect(mockTelemetryEmitter.emit).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'SETTLEMENT_COMPLETED',
-        })
-      );
-
-      // Verify: All events include timestamp
-      const calls = (mockTelemetryEmitter.emit as jest.Mock).mock.calls;
-      calls.forEach((call) => {
-        expect(call[0]).toHaveProperty('timestamp');
-      });
     });
   });
 
@@ -538,13 +439,12 @@ describe('SettlementExecutor', () => {
       // Start executor
       executor.start();
 
-      // Simulate settlement event
+      // Simulate settlement event — handler enqueues onto settlement chain
       const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
-      const settlementPromise = handler(event);
+      handler(event);
 
-      // Wait for async processing
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      await settlementPromise;
+      // Drain the settlement chain
+      await executor.stop();
 
       // Verify: markSettlementInProgress called first
       expect(mockSettlementMonitor.markSettlementInProgress).toHaveBeenCalledWith(
@@ -586,13 +486,12 @@ describe('SettlementExecutor', () => {
       // Start executor
       executor.start();
 
-      // Simulate settlement event
+      // Simulate settlement event — handler enqueues onto settlement chain
       const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
-      const settlementPromise = handler(event);
+      handler(event);
 
-      // Wait for async processing
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      await settlementPromise;
+      // Drain the settlement chain
+      await executor.stop();
 
       // Verify: markSettlementInProgress called
       expect(mockSettlementMonitor.markSettlementInProgress).toHaveBeenCalledWith(
@@ -602,6 +501,129 @@ describe('SettlementExecutor', () => {
 
       // Verify: markSettlementCompleted NOT called
       expect(mockSettlementMonitor.markSettlementCompleted).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Settlement Serialization', () => {
+    it('should serialize concurrent settlement events to prevent nonce collisions', async () => {
+      // Track execution order
+      const executionOrder: string[] = [];
+
+      // Mock: No existing channels
+      mockPaymentChannelSDK.getMyChannels.mockResolvedValue([]);
+
+      // Mock: openChannel records execution order with a delay
+      mockPaymentChannelSDK.openChannel.mockImplementation(async (participant2: string) => {
+        const peerId = participant2 === testPeerAddress ? 'peer-a' : 'peer-b';
+        executionOrder.push(`start-${peerId}`);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        executionOrder.push(`end-${peerId}`);
+        return { channelId: testChannelId, txHash: '0xMockTxHash' };
+      });
+
+      // Setup second peer
+      const secondPeerAddress = '0x1111111111111111111111111111111111111111';
+      config.peerIdToAddressMap.set('connector-b', secondPeerAddress);
+
+      // Recreate executor with updated config
+      const serialExecutor = new SettlementExecutor(
+        config,
+        mockAccountManager,
+        mockPaymentChannelSDK,
+        mockSettlementMonitor,
+        logger
+      );
+
+      serialExecutor.start();
+
+      // Fire two settlement events concurrently
+      const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
+      handler({
+        peerId: testPeerId,
+        tokenId: testTokenId,
+        currentBalance: testCurrentBalance,
+        threshold: testThreshold,
+        exceedsBy: testCurrentBalance - testThreshold,
+        timestamp: new Date(),
+      });
+      handler({
+        peerId: 'connector-b',
+        tokenId: testTokenId,
+        currentBalance: testCurrentBalance,
+        threshold: testThreshold,
+        exceedsBy: testCurrentBalance - testThreshold,
+        timestamp: new Date(),
+      });
+
+      // Drain all settlements
+      await serialExecutor.stop();
+
+      // Verify: settlements executed sequentially (no interleaving)
+      expect(executionOrder[0]).toBe('start-peer-a');
+      expect(executionOrder[1]).toBe('end-peer-a');
+      expect(executionOrder[2]).toBe('start-peer-b');
+      expect(executionOrder[3]).toBe('end-peer-b');
+    });
+  });
+
+  describe('Graceful Shutdown', () => {
+    it('should ignore new settlement events after stop() is called', async () => {
+      // Start executor
+      executor.start();
+
+      // Stop executor first
+      await executor.stop();
+
+      // Try to fire a settlement event after stop
+      const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
+      handler({
+        peerId: testPeerId,
+        tokenId: testTokenId,
+        currentBalance: testCurrentBalance,
+        threshold: testThreshold,
+        exceedsBy: testCurrentBalance - testThreshold,
+        timestamp: new Date(),
+      });
+
+      // Give time for any async operations
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Verify: No settlement operations were attempted
+      expect(mockSettlementMonitor.markSettlementInProgress).not.toHaveBeenCalled();
+      expect(mockPaymentChannelSDK.openChannel).not.toHaveBeenCalled();
+    });
+
+    it('should await in-flight settlement before stop() resolves', async () => {
+      let settlementResolved = false;
+
+      // Mock: openChannel with a delay to simulate in-flight settlement
+      mockPaymentChannelSDK.getMyChannels.mockResolvedValue([]);
+      mockPaymentChannelSDK.openChannel.mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        settlementResolved = true;
+        return { channelId: testChannelId, txHash: '0xMockTxHash' };
+      });
+
+      // Start executor
+      executor.start();
+
+      // Fire settlement event
+      const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
+      handler({
+        peerId: testPeerId,
+        tokenId: testTokenId,
+        currentBalance: testCurrentBalance,
+        threshold: testThreshold,
+        exceedsBy: testCurrentBalance - testThreshold,
+        timestamp: new Date(),
+      });
+
+      // Stop executor — should await the in-flight settlement
+      await executor.stop();
+
+      // Verify: settlement completed before stop() resolved
+      expect(settlementResolved).toBe(true);
+      expect(mockSettlementMonitor.markSettlementCompleted).toHaveBeenCalled();
     });
   });
 

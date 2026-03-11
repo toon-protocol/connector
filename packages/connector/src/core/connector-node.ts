@@ -857,12 +857,12 @@ export class ConnectorNode implements HealthStatusProvider {
           // Wire AccountManager into PacketHandler for settlement recording
           if (accountManager) {
             const settlementConfig: SettlementConfig = {
-              connectorFeePercentage: 0.1, // 0.1% default fee
-              enableSettlement: process.env.SETTLEMENT_ENABLED === 'true',
-              tigerBeetleClusterId: tigerBeetleClusterId ? parseInt(tigerBeetleClusterId, 10) : 0, // Placeholder for in-memory ledger
+              connectorFeePercentage: this._config.settlement?.connectorFeePercentage ?? 0.1,
+              enableSettlement: settlementEnabled,
+              tigerBeetleClusterId: tigerBeetleClusterId ? parseInt(tigerBeetleClusterId, 10) : 0,
               tigerBeetleReplicas: tigerBeetleReplicas
                 ? tigerBeetleReplicas.split(',').map((s) => s.trim())
-                : [], // Placeholder for in-memory ledger
+                : [],
             };
 
             this._packetHandler.setSettlement(
@@ -1000,7 +1000,7 @@ export class ConnectorNode implements HealthStatusProvider {
           // Create channel creation promise (don't await - run in parallel)
           const channelPromise = (async () => {
             try {
-              const tokenId = 'M2M'; // Use M2M token for test deployment
+              const tokenId = this._defaultSettlementTokenId;
               const channelId = await this._channelManager!.ensureChannelExists(peerId, tokenId);
               this._logger.info(
                 { event: 'payment_channel_ready', peerId, channelId },
@@ -1078,18 +1078,20 @@ export class ConnectorNode implements HealthStatusProvider {
     );
 
     try {
-      // Stop settlement executor if running (before channel manager)
-      if (this._settlementExecutor) {
-        this._settlementExecutor.stop();
-        this._logger.info({ event: 'settlement_executor_stopped' }, 'Settlement executor stopped');
-        this._settlementExecutor = null;
-      }
-
-      // Stop settlement monitor if running (after executor)
+      // Stop settlement monitor FIRST to stop polling the ledger during drain.
+      // The executor already unsubscribes in its own stop(), so no new events fire.
       if (this._settlementMonitor) {
         await this._settlementMonitor.stop();
         this._logger.info({ event: 'settlement_monitor_stopped' }, 'Settlement monitor stopped');
         this._settlementMonitor = null;
+      }
+
+      // Stop settlement executor — awaits in-flight settlements to prevent
+      // on-chain/off-chain balance mismatches on SIGTERM/shutdown
+      if (this._settlementExecutor) {
+        await this._settlementExecutor.stop();
+        this._logger.info({ event: 'settlement_executor_stopped' }, 'Settlement executor stopped');
+        this._settlementExecutor = null;
       }
 
       // Stop channel manager if running
