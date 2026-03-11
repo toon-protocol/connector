@@ -19,16 +19,10 @@
     "format:check": "prettier --check \"**/*.{ts,tsx,js,json,md}\"",
     "send-packet": "npm run --workspace=tools/send-packet start",
     "benchmark": "npm run benchmark --workspace=packages/connector",
-    "tigerbeetle:install": "./scripts/install-tigerbeetle-macos.sh",
-    "tigerbeetle:start": "./scripts/start-tigerbeetle-dev.sh",
-    "tigerbeetle:stop": "./scripts/stop-tigerbeetle-dev.sh",
-    "dev": "npm run tigerbeetle:start && npm run --workspace=packages/connector dev",
-    "dev:stop": "npm run tigerbeetle:stop",
     "publish:shared": "npm run build --workspace=packages/shared && npm publish --workspace=packages/shared --access public",
     "publish:connector": "npm run build --workspace=packages/connector && npm publish --workspace=packages/connector --access public",
     "publish:all": "npm run publish:shared && npm run publish:connector",
     "publish:all:dry-run": "npm run publish:shared -- --dry-run && npm run publish:connector -- --dry-run",
-    "validate-packages": "node scripts/validate-packages.mjs",
     "prepare": "husky"
   },
   "devDependencies": {

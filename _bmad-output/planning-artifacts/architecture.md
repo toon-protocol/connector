@@ -10,19 +10,18 @@
 - [6. Data Models](#6-data-models)
 - [7. Core Workflows](#7-core-workflows)
 - [8. Settlement Architecture](#8-settlement-architecture)
-- [9. Explorer UI](#9-explorer-ui)
-- [10. Configuration](#10-configuration)
-- [11. Security](#11-security)
-- [12. Error Handling](#12-error-handling)
-- [13. Testing Strategy](#13-testing-strategy)
-- [14. Key Design Decisions](#14-key-design-decisions)
-- [15. RFC References](#15-rfc-references)
+- [9. Configuration](#9-configuration)
+- [10. Security](#10-security)
+- [11. Error Handling](#11-error-handling)
+- [12. Testing Strategy](#12-testing-strategy)
+- [13. Key Design Decisions](#13-key-design-decisions)
+- [14. RFC References](#14-rfc-references)
 
 ---
 
 ## 1. Introduction
 
-**Crosstown Connector** (`@crosstown/connector` v1.6.0) is a production-ready
+**Crosstown Connector** (`@crosstown/connector` v1.6.2) is a production-ready
 Interledger Protocol (ILP) connector for machine-to-machine payment routing with
 EVM settlement on Base L2.
 
@@ -32,15 +31,14 @@ EVM settlement on Base L2.
 - **Balance tracking** — Double-entry accounting via TigerBeetle or in-memory ledger with snapshot persistence
 - **EVM settlement** — Raiden-style payment channels on Base L2 with threshold-based on-chain settlement
 - **Per-packet claims** — Self-describing EIP-712 signed claims attached to every forwarded packet (Epic 31)
-- **Explorer UI** — Embedded React dashboard for real-time packet inspection, balance charts, and claim timeline
 - **Multi-deployment modes** — Library (embedded), CLI (standalone), or Docker container
 
 ### How to Read This Document
 
 Sections 2-5 describe the static architecture (structure, modules, dependencies).
 Sections 6-8 describe runtime behavior (data flow, settlement, claims).
-Sections 9-13 cover operational concerns (UI, config, security, testing).
-Sections 14-15 capture rationale and standards compliance.
+Sections 9-12 cover operational concerns (config, security, testing).
+Sections 13-14 capture rationale and standards compliance.
 
 ---
 
@@ -55,7 +53,7 @@ CLI, or deployed as a Docker container.
 ### Principles
 
 1. **Library-first** — The connector is designed to be embedded in application code via `new ConnectorNode(config, logger)`. Standalone mode is an opt-in deployment pattern.
-2. **Observability-first** — Every packet, balance change, settlement event, and claim is emitted as a structured telemetry event viewable in the Explorer UI.
+2. **Observability-first** — Every packet, balance change, settlement event, and claim is emitted as a structured telemetry event.
 3. **RFC-compliant** — Core protocols follow Interledger RFCs (ILPv4, BTP, OER encoding, ILP addressing).
 4. **EVM-only settlement** — Settlement is exclusively on EVM chains (Base L2). XRP and Aptos support were removed in Epic 30.
 
@@ -69,6 +67,7 @@ graph TB
         PacketHandler["Packet Handler<br/>(Routing + Settlement)"]
         RoutingTable["Routing Table<br/>(Longest-prefix match)"]
         PerPacketClaims["Per-Packet Claim Service<br/>(EIP-712 signing)"]
+        TelemetryEmitter["Telemetry Emitter"]
     end
 
     subgraph Settlement
@@ -77,13 +76,7 @@ graph TB
         AccountManager["Account Manager<br/>(TigerBeetle / In-Memory)"]
         SettlementMonitor["Settlement Monitor<br/>(Threshold polling)"]
         SettlementExecutor["Settlement Executor<br/>(On-chain submission)"]
-    end
-
-    subgraph Observability
-        TelemetryEmitter["Telemetry Emitter"]
-        EventStore["Event Store<br/>(SQLite)"]
-        ExplorerServer["Explorer Server<br/>(HTTP + WebSocket)"]
-        ExplorerUI["Explorer UI<br/>(React SPA)"]
+        SettlementCoordinator["Settlement Coordinator"]
     end
 
     subgraph External
@@ -103,12 +96,11 @@ graph TB
     PerPacketClaims --> ChannelManager
     SettlementMonitor --> AccountManager
     SettlementMonitor --> SettlementExecutor
+    SettlementCoordinator --> SettlementMonitor
+    SettlementCoordinator --> SettlementExecutor
     SettlementExecutor --> PaymentChannelSDK
     PaymentChannelSDK --> BaseL2
     AccountManager --> TigerBeetle
-    TelemetryEmitter --> EventStore
-    EventStore --> ExplorerServer
-    ExplorerServer --> ExplorerUI
 ```
 
 ### Primary Data Flow
@@ -131,100 +123,71 @@ connector/
 ├── packages/
 │   ├── connector/          # Core connector (main package)
 │   ├── shared/             # ILP types, OER encoding, telemetry types
-│   ├── contracts/          # Solidity smart contracts (Foundry)
-│   └── dashboard/          # Legacy dashboard (deprecated)
+│   └── contracts/          # Solidity smart contracts (Foundry)
 ├── tools/
 │   ├── send-packet/        # CLI tool for sending test packets
-│   └── fund-peers/         # CLI tool for funding peer accounts
-├── examples/               # YAML configuration examples (8 files)
-├── k8s/                    # Kubernetes manifests (Kustomize)
+│   ├── fund-peers/         # CLI tool for funding peer accounts
+│   └── create-test-accounts.ts  # Utility for creating test accounts
 ├── monitoring/             # Prometheus, Grafana, Alertmanager configs
-├── Dockerfile              # Multi-stage build (builder → ui-builder → runtime)
-├── docs/                   # Documentation
-└── scripts/                # Dev/test scripts (generate-anvil-state, run-per-packet-claims-e2e, validate-packages)
+├── Dockerfile              # Multi-stage build (builder → runtime)
+└── docs-archive/           # Archived documentation
 ```
 
 ### Packages
 
 | Package                    | Path                 | Description                                                                                   |
 | -------------------------- | -------------------- | --------------------------------------------------------------------------------------------- |
-| `@crosstown/connector`     | `packages/connector` | Core ILP connector with BTP, routing, settlement, Explorer UI                                 |
+| `@crosstown/connector`     | `packages/connector` | Core ILP connector with BTP, routing, settlement                                              |
 | `@crosstown/shared` v1.2.0 | `packages/shared`    | ILP packet types, OER encoding/decoding, telemetry event types, routing types                 |
 | `contracts`                | `packages/contracts` | Solidity contracts: `TokenNetwork.sol`, `TokenNetworkRegistry.sol` (Foundry, Solidity 0.8.26) |
-| `dashboard` (legacy)       | `packages/dashboard` | Build artifact only (`dist/`); superseded by Explorer UI                                      |
 
 ### Tools
 
-| Tool          | Path                | Description                                         |
-| ------------- | ------------------- | --------------------------------------------------- |
-| `send-packet` | `tools/send-packet` | Send ILP Prepare packets to a connector for testing |
-| `fund-peers`  | `tools/fund-peers`  | Fund peer EVM accounts with test tokens             |
-
-### Example Configurations (8)
-
-| File                          | Topology               |
-| ----------------------------- | ---------------------- |
-| `e2e-connector-a.yaml`        | E2E test node A        |
-| `e2e-connector-b.yaml`        | E2E test node B        |
-| `multihop-peer1.yaml`         | Multi-hop chain node 1 |
-| `multihop-peer2.yaml`         | Multi-hop chain node 2 |
-| `multihop-peer3.yaml`         | Multi-hop chain node 3 |
-| `multihop-peer4.yaml`         | Multi-hop chain node 4 |
-| `multihop-peer5.yaml`         | Multi-hop chain node 5 |
-| `production-single-node.yaml` | Production single-node |
-
-### Kubernetes
-
-Four services under `k8s/`, each with Kustomize base + overlays:
-
-| Service              | Description                                        |
-| -------------------- | -------------------------------------------------- |
-| `k8s/connector/`     | Main connector (staging + production overlays)     |
-| `k8s/agent-runtime/` | Agent execution runtime                            |
-| `k8s/agent-society/` | Agent coordination (staging + production overlays) |
-| `k8s/tigerbeetle/`   | TigerBeetle accounting engine (test overlay)       |
+| Tool                   | Path                            | Description                                         |
+| ---------------------- | ------------------------------- | --------------------------------------------------- |
+| `send-packet`          | `tools/send-packet`             | Send ILP Prepare packets to a connector for testing |
+| `fund-peers`           | `tools/fund-peers`              | Fund peer EVM accounts with test tokens             |
+| `create-test-accounts` | `tools/create-test-accounts.ts` | Create test accounts for development                |
 
 ---
 
 ## 4. Tech Stack
 
-| Category                  | Technology                                | Version           |
-| ------------------------- | ----------------------------------------- | ----------------- |
-| Language                  | TypeScript                                | ^5.3.3            |
-| Runtime                   | Node.js                                   | >=22.11.0         |
-| Transport                 | WebSocket (ws)                            | ^8.16.0           |
-| HTTP                      | Express                                   | 4.18.x            |
-| EVM                       | ethers.js                                 | ^6.16.0           |
-| Logging                   | pino                                      | ^8.21.0           |
-| Config                    | js-yaml                                   | ^4.1.0            |
-| Validation                | zod                                       | ^3.25.76          |
-| Database (claims)         | better-sqlite3                            | ^11.8.1           |
-| Accounting (optional)     | TigerBeetle                               | 0.16.68           |
-| Smart Contracts           | Solidity 0.8.26 (Foundry)                 | —                 |
-| Explorer UI               | React 18 + Vite + Tailwind + shadcn-ui v4 | —                 |
-| AI (optional)             | @ai-sdk/anthropic, @ai-sdk/openai         | ^1.2.12 / ^1.3.24 |
-| Observability (optional)  | OpenTelemetry, prom-client                | ^1.9.0 / ^15.1.0  |
-| Key Management (optional) | AWS KMS, GCP KMS, Azure Key Vault         | —                 |
-| Testing                   | Jest + ts-jest                            | ^29.7.0 / ^29.1.2 |
-| Build                     | tsc, tsx, Vite                            | —                 |
+| Category                  | Technology                        | Version           |
+| ------------------------- | --------------------------------- | ----------------- |
+| Language                  | TypeScript                        | ^5.3.3            |
+| Runtime                   | Node.js                           | >=22.11.0         |
+| Transport                 | WebSocket (ws)                    | ^8.16.0           |
+| HTTP                      | Express                           | 4.18.x            |
+| EVM                       | ethers.js                         | ^6.16.0           |
+| Logging                   | pino                              | ^8.21.0           |
+| Config                    | js-yaml                           | ^4.1.0            |
+| Validation                | zod                               | ^3.25.76          |
+| Database (claims)         | better-sqlite3                    | ^11.8.1           |
+| Accounting (optional)     | TigerBeetle                       | 0.16.68           |
+| Smart Contracts           | Solidity 0.8.26 (Foundry)         | —                 |
+| AI (optional)             | @ai-sdk/anthropic, @ai-sdk/openai | ^1.2.12 / ^1.3.24 |
+| Observability (optional)  | OpenTelemetry, prom-client        | ^1.9.0 / ^15.1.0  |
+| Key Management (optional) | AWS KMS, GCP KMS, Azure Key Vault | —                 |
+| Testing                   | Jest + ts-jest                    | ^29.7.0 / ^29.1.2 |
+| Build                     | tsc, tsx, Vite                    | —                 |
 
 ---
 
 ## 5. Connector Module Architecture
 
-The connector source lives in `packages/connector/src/` with 18 module directories:
+The connector source lives in `packages/connector/src/` with 17 module directories:
 
 | Module        | Directory        | Description                                                                                                |
 | ------------- | ---------------- | ---------------------------------------------------------------------------------------------------------- |
 | Core          | `core/`          | `ConnectorNode` orchestrator, `PacketHandler` routing/forwarding, `PaymentHandler`                         |
 | BTP           | `btp/`           | BTP server, client, client manager, claim types (RFC-0023)                                                 |
 | Routing       | `routing/`       | `RoutingTable` with longest-prefix matching                                                                |
-| Settlement    | `settlement/`    | Payment channels, claim signing, accounting, monitoring, execution                                         |
+| Settlement    | `settlement/`    | Payment channels, claim signing, accounting, monitoring, execution, coordination                           |
 | Wallet        | `wallet/`        | Treasury wallet, seed manager, wallet auth/security, audit logger, fraud detector, rate limiter            |
 | Security      | `security/`      | `KeyManager` (5 backends), `KeyRotationManager`, fraud detection rules, rate limiting, reputation tracking |
 | HTTP          | `http/`          | Health server, admin API server, admin REST endpoints                                                      |
 | Config        | `config/`        | `ConfigLoader`, YAML parsing, type definitions                                                             |
-| Explorer      | `explorer/`      | `EventStore` (SQLite), `ExplorerServer`, `EventBroadcaster` (WebSocket)                                    |
 | Telemetry     | `telemetry/`     | `TelemetryEmitter`, structured event types                                                                 |
 | Observability | `observability/` | Prometheus metrics, OpenTelemetry tracing                                                                  |
 | CLI           | `cli/`           | Command-line interface (`connector` binary)                                                                |
@@ -244,7 +207,6 @@ graph TD
     Core --> Settlement["settlement/"]
     Core --> Config["config/"]
     Core --> HTTP["http/"]
-    Core --> Explorer["explorer/"]
     Core --> Telemetry["telemetry/"]
     Core --> Security["security/"]
     Core --> Utils["utils/"]
@@ -257,8 +219,6 @@ graph TD
     HTTP --> Core
     HTTP --> Routing
     HTTP --> Settlement
-
-    Explorer --> Telemetry
 
     CLI --> Core
     CLI --> Config
@@ -305,12 +265,11 @@ Claims are transmitted via BTP protocolData with protocol name `payment-channel-
 
 Key interfaces:
 
-- `ConnectorConfig` — Top-level config (nodeId, peers, routes, settlement, explorer, adminApi, deploymentMode)
+- `ConnectorConfig` — Top-level config (nodeId, peers, routes, settlement, adminApi, deploymentMode)
 - `PeerConfig` — Peer connection (id, url, authToken, evmAddress)
 - `RouteConfig` — Static route (prefix, nextHop, priority)
 - `SettlementConfig` — TigerBeetle accounting params (fees, credit limits, thresholds)
 - `SettlementInfraConfig` — EVM infrastructure params (rpcUrl, registryAddress, privateKey, threshold)
-- `ExplorerConfig` — Explorer UI (port, retentionDays, maxEvents)
 - `AdminApiConfig` — Admin REST API (port, apiKey, allowedIPs, trustProxy)
 - `DeploymentMode` — `'embedded' | 'standalone'`
 
@@ -365,7 +324,6 @@ sequenceDiagram
     participant SM as Settlement Monitor
     participant SE as Settlement Executor
     participant BTP as BTP Server
-    participant Exp as Explorer Server
 
     App->>CN: new ConnectorNode(config, logger)
     App->>CN: start()
@@ -376,7 +334,6 @@ sequenceDiagram
     CN->>BTP: start(btpServerPort)
     CN->>CN: Start Health Server
     CN->>CN: Start Admin API (if enabled)
-    CN->>Exp: Start Explorer Server (if enabled)
     CN->>CN: Connect to configured peers
     CN->>CN: Create payment channels for peers
     CN-->>App: Ready
@@ -457,10 +414,18 @@ Settlement is exclusively EVM-based on Base L2. XRP and Aptos settlement support
 | `ClaimRedemptionService`    | `settlement/claim-redemption-service.ts`    | Redeems accumulated claims on-chain                                                |
 | `EIP712Helper`              | `settlement/eip712-helper.ts`               | EIP-712 typed data construction and signature utilities                            |
 | `AccountManager`            | `settlement/account-manager.ts`             | Double-entry balance tracking (TigerBeetle or InMemoryLedger)                      |
+| `AccountIdGenerator`        | `settlement/account-id-generator.ts`        | Generates unique account IDs for ledger entries                                    |
+| `AccountMetadata`           | `settlement/account-metadata.ts`            | Account metadata management and storage                                            |
+| `LedgerClient`              | `settlement/ledger-client.ts`               | Abstract ledger client interface                                                   |
 | `SettlementMonitor`         | `settlement/settlement-monitor.ts`          | Polls balances, emits SETTLEMENT_REQUIRED when threshold exceeded                  |
 | `SettlementExecutor`        | `settlement/settlement-executor.ts`         | Executes on-chain settlement transactions                                          |
+| `SettlementCoordinator`     | `settlement/settlement-coordinator.ts`      | Coordinates settlement workflow across monitor and executor                        |
+| `SettlementApi`             | `settlement/settlement-api.ts`              | REST API endpoints for settlement operations                                       |
 | `UnifiedSettlementExecutor` | `settlement/unified-settlement-executor.ts` | Unified settlement orchestration                                                   |
+| `MetricsCollector`          | `settlement/metrics-collector.ts`           | Collects and exposes settlement metrics                                            |
 | `TigerBeetleClient`         | `settlement/tigerbeetle-client.ts`          | TigerBeetle connection and transfer operations                                     |
+| `TigerBeetleBatchWriter`    | `settlement/tigerbeetle-batch-writer.ts`    | Batched write operations for TigerBeetle                                           |
+| `TigerBeetleErrors`         | `settlement/tigerbeetle-errors.ts`          | TigerBeetle-specific error types and handling                                      |
 | `InMemoryLedgerClient`      | `settlement/in-memory-ledger-client.ts`     | In-memory ledger with JSON snapshot persistence (fallback)                         |
 
 ### Channel Registration
@@ -503,47 +468,7 @@ Contracts are compiled and tested with **Foundry** (`forge build`, `forge test`)
 
 ---
 
-## 9. Explorer UI
-
-### Overview
-
-The Explorer UI is an embedded React single-page application for real-time connector telemetry visualization.
-
-**Location:** `packages/connector/explorer-ui/`
-
-**Tech Stack:** React 18, Vite, Tailwind CSS, shadcn-ui v4 (19 Radix UI primitives), date-fns, lucide-react, @tanstack/react-virtual
-
-### Features
-
-- **Event Table** — Filterable, sortable table of all connector events with virtualized scrolling
-- **Packet Inspector** — Detailed view of individual ILP packets (prepare/fulfill/reject)
-- **Balance Charts** — Real-time peer balance visualization
-- **Claim Timeline** — Per-packet claim history with status tracking
-- **Settlement Timeline** — On-chain settlement event history
-- **Peers View** — Connected peers with status and routing info
-- **Wallet Overview** — EVM wallet balances and key management
-- **Payment Channel Cards** — Channel state, deposits, and claim nonces
-
-### Architecture
-
-- **40 feature components** and **19 shadcn-ui primitives** (~59 .tsx files total)
-- Real-time updates via WebSocket connection to `ExplorerServer`
-- `EventStore` persists events to SQLite with configurable retention
-- `EventBroadcaster` pushes events to connected WebSocket clients
-
-### Configuration
-
-```yaml
-explorer:
-  enabled: true # default: true
-  port: 3001 # default: 3001
-  retentionDays: 7 # default: 7
-  maxEvents: 1000000 # default: 1000000
-```
-
----
-
-## 10. Configuration
+## 9. Configuration
 
 ### Sources (Precedence: highest to lowest)
 
@@ -591,7 +516,6 @@ routes:
 | `routes`          | RouteConfig[]         | required             | Static routing table                                    |
 | `settlement`      | SettlementConfig      | —                    | TigerBeetle accounting params                           |
 | `settlementInfra` | SettlementInfraConfig | —                    | EVM settlement infrastructure                           |
-| `explorer`        | ExplorerConfig        | `{ enabled: true }`  | Explorer UI settings                                    |
 | `adminApi`        | AdminApiConfig        | `{ enabled: false }` | Admin REST API settings                                 |
 | `localDelivery`   | LocalDeliveryConfig   | `{ enabled: false }` | HTTP packet forwarding to BLS                           |
 | `mode`            | string                | `'connector'`        | `connector` (standard) or `gateway` (messaging gateway) |
@@ -601,7 +525,7 @@ routes:
 
 ---
 
-## 11. Security
+## 10. Security
 
 ### Authentication
 
@@ -641,7 +565,7 @@ Key rotation is supported — new keys are used for signing while old keys remai
 
 ---
 
-## 12. Error Handling
+## 11. Error Handling
 
 ### ILP Error Codes (RFC-0027)
 
@@ -658,13 +582,12 @@ Failed BTP connections use exponential backoff with jitter. The `BTPClientManage
 ### Resilience Patterns
 
 - **Non-blocking telemetry** — Telemetry failures never prevent packet forwarding
-- **Non-blocking explorer** — Explorer startup failures don't block connector startup
 - **Graceful settlement degradation** — If payment channel infrastructure fails to initialize, the connector continues without settlement
 - **Structured logging** — All log entries include correlation IDs (`event`, `nodeId`, `peerId`) for distributed tracing
 
 ---
 
-## 13. Testing Strategy
+## 12. Testing Strategy
 
 ### Framework
 
@@ -685,13 +608,13 @@ Jest + ts-jest with co-located test files (`*.test.ts` next to source).
 ```bash
 npm run test:settlement   # Settlement and claim tests
 npm run test:btp          # BTP protocol tests
-npm run test:explorer     # Explorer UI backend tests
 npm run test:tigerbeetle  # TigerBeetle and accounting tests
+npm run test:evm          # EVM settlement tests
 ```
 
 ---
 
-## 14. Key Design Decisions
+## 13. Key Design Decisions
 
 | Decision                        | Rationale                                                                                                                                     |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -700,7 +623,6 @@ npm run test:tigerbeetle  # TigerBeetle and accounting tests
 | **Self-describing claims**      | Claims include chain ID, token network address, and token address so receivers can verify unknown channels on-chain without pre-registration. |
 | **Foundry (not Hardhat)**       | Faster compilation, built-in fuzzing, Solidity-native tests, better developer experience.                                                     |
 | **TigerBeetle optional**        | In-memory ledger with JSON snapshot persistence provides a zero-dependency fallback. TigerBeetle is recommended for production.               |
-| **Explorer embedded**           | Ships as part of the connector package (built with Vite, served by Express). No separate deployment needed.                                   |
 | **Library-first**               | `ConnectorNode` is a class you instantiate in your code. CLI and Docker are wrappers around this library API.                                 |
 | **better-sqlite3 for claims**   | Per-packet claim persistence needs synchronous, low-latency writes. SQLite is embedded and requires no external service.                      |
 | **In-memory ledger snapshots**  | JSON file snapshots every 30s (configurable) provide persistence across restarts without TigerBeetle.                                         |
@@ -708,7 +630,7 @@ npm run test:tigerbeetle  # TigerBeetle and accounting tests
 
 ---
 
-## 15. RFC References
+## 14. RFC References
 
 | RFC                                                                        | Title                             | Implementation                                                             |
 | -------------------------------------------------------------------------- | --------------------------------- | -------------------------------------------------------------------------- |
