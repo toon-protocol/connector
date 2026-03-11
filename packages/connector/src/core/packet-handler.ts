@@ -17,7 +17,6 @@ import { Logger, generateCorrelationId } from '../utils/logger';
 import { BTPClientManager } from '../btp/btp-client-manager';
 import { BTPServer } from '../btp/btp-server';
 import { BTPConnectionError, BTPAuthenticationError } from '../btp/btp-client';
-import { TelemetryEmitter } from '../telemetry/telemetry-emitter';
 import { AccountManager } from '../settlement/account-manager';
 import {
   SettlementConfig,
@@ -27,8 +26,6 @@ import {
   LocalDeliveryResponse,
 } from '../config/types';
 import { AccountLedgerCodes } from '../settlement/types';
-import { EventStore } from '../explorer/event-store';
-import { EventBroadcaster } from '../explorer/event-broadcaster';
 import { LocalDeliveryClient } from './local-delivery-client';
 import type { PerPacketClaimService } from '../settlement/per-packet-claim-service';
 
@@ -93,22 +90,9 @@ export class PacketHandler {
   private readonly nodeId: string;
 
   /**
-   * Telemetry emitter for sending telemetry to dashboard (optional)
-   */
-  private readonly telemetryEmitter: TelemetryEmitter | null;
-
-  /**
-   * Event store for direct event emission in standalone mode (optional)
-   */
-  private eventStore: EventStore | null = null;
-
-  /**
-   * Event broadcaster for real-time WebSocket event streaming (optional)
-   */
-  private eventBroadcaster: EventBroadcaster | null = null;
-
-  /**
-   * Per-packet claim service for attaching signed claims to outgoing packets (optional)
+   * Per-packet claim service for attaching mandatory signed claims to outgoing peer packets.
+   * Null until initialized via setPerPacketClaimService(). Packets forwarded to peers
+   * will be rejected with T00_INTERNAL_ERROR if this is null at forwarding time.
    */
   private perPacketClaimService: PerPacketClaimService | null = null;
 
@@ -157,7 +141,6 @@ export class PacketHandler {
    * @param btpClientManager - BTP client manager for forwarding packets to outbound peers
    * @param nodeId - Connector node ID for reject packet triggeredBy field
    * @param logger - Pino logger instance for structured logging
-   * @param telemetryEmitter - Optional telemetry emitter for dashboard reporting
    * @param btpServer - Optional BTP server for forwarding to incoming authenticated peers
    * @param accountManager - Optional account manager for settlement recording (Story 6.4)
    * @param settlementConfig - Optional settlement configuration for fee calculation and TigerBeetle
@@ -167,7 +150,6 @@ export class PacketHandler {
     btpClientManager: BTPClientManager,
     nodeId: string,
     logger: Logger,
-    telemetryEmitter: TelemetryEmitter | null = null,
     btpServer: BTPServer | null = null,
     accountManager: AccountManager | null = null,
     settlementConfig: SettlementConfig | null = null
@@ -177,7 +159,6 @@ export class PacketHandler {
     this.btpServer = btpServer;
     this.nodeId = nodeId;
     this.logger = logger;
-    this.telemetryEmitter = telemetryEmitter;
     this.accountManager = accountManager;
     this.settlementConfig = settlementConfig;
 
@@ -201,36 +182,6 @@ export class PacketHandler {
    */
   setBTPServer(btpServer: BTPServer): void {
     this.btpServer = btpServer;
-  }
-
-  /**
-   * Set EventStore reference for direct event emission in standalone mode
-   * @param eventStore - EventStore instance for storing packet events
-   * @remarks
-   * Called by ConnectorNode when running in standalone mode (telemetryEmitter is null).
-   * Allows PacketHandler to emit events directly to EventStore instead of via telemetry.
-   */
-  setEventStore(eventStore: EventStore | null): void {
-    this.eventStore = eventStore;
-    this.logger.info(
-      { hasEventStore: eventStore !== null },
-      'EventStore reference set for standalone event emission'
-    );
-  }
-
-  /**
-   * Set EventBroadcaster reference for real-time WebSocket event streaming
-   * @param broadcaster - EventBroadcaster instance for live event streaming
-   * @remarks
-   * Called by ConnectorNode in standalone mode to enable real-time event broadcasting.
-   * When set, PacketHandler will broadcast events to WebSocket clients in addition to storing them.
-   */
-  setEventBroadcaster(broadcaster: EventBroadcaster | null): void {
-    this.eventBroadcaster = broadcaster;
-    this.logger.info(
-      { hasBroadcaster: broadcaster !== null },
-      'EventBroadcaster reference set for live event streaming'
-    );
   }
 
   /**
@@ -265,7 +216,8 @@ export class PacketHandler {
   }
 
   /**
-   * Set PerPacketClaimService for attaching signed claims to outgoing packets
+   * Set PerPacketClaimService for attaching mandatory signed claims to outgoing peer packets.
+   * Must be called before forwarding any non-zero-amount packets to peers.
    * @param service - PerPacketClaimService instance
    */
   setPerPacketClaimService(service: PerPacketClaimService): void {
@@ -878,33 +830,6 @@ export class PacketHandler {
       'Packet received'
     );
 
-    // Emit PACKET_RECEIVED telemetry
-    if (this.telemetryEmitter) {
-      this.telemetryEmitter.emitPacketReceived(packet, sourcePeerId);
-    } else if (this.eventStore) {
-      // Standalone mode: emit event directly to EventStore
-      // Convert peer ID to full ILP address for UI display
-      const fromAddress = sourcePeerId.startsWith('g.') ? sourcePeerId : `g.${sourcePeerId}`;
-
-      const event = {
-        type: 'PACKET_RECEIVED' as const,
-        nodeId: this.nodeId,
-        packetId: packet.executionCondition.toString('hex'),
-        destination: packet.destination,
-        amount: packet.amount.toString(),
-        from: fromAddress,
-        timestamp: Date.now(),
-      };
-      this.eventStore.storeEvent(event).catch((err) => {
-        this.logger.warn(
-          { error: err.message, packetId: event.packetId },
-          'Failed to store PACKET_RECEIVED event'
-        );
-      });
-      // Broadcast event to WebSocket clients for real-time UI updates
-      this.eventBroadcaster?.broadcast(event);
-    }
-
     // Validate packet
     const validation = this.validatePacket(packet);
     if (!validation.isValid) {
@@ -935,11 +860,6 @@ export class PacketHandler {
         'Routing decision'
       );
 
-      // Emit ROUTE_LOOKUP telemetry for failed lookup
-      if (this.telemetryEmitter) {
-        this.telemetryEmitter.emitRouteLookup(packet.destination, null, 'no route found');
-      }
-
       this.logger.error(
         {
           correlationId,
@@ -967,11 +887,6 @@ export class PacketHandler {
       },
       'Routing decision'
     );
-
-    // Emit ROUTE_LOOKUP telemetry for successful lookup
-    if (this.telemetryEmitter) {
-      this.telemetryEmitter.emitRouteLookup(packet.destination, nextHop, 'longest prefix match');
-    }
 
     // Check for local delivery (destination handled by this connector)
     if (nextHop === this.nodeId || nextHop === 'local') {
@@ -1197,10 +1112,8 @@ export class PacketHandler {
     // Fire-and-forget BLS notification for transit packets (per-hop notification)
     const perHopEnabled = this.localDeliveryClient?.isPerHopNotificationEnabled() ?? false;
     if (perHopEnabled) {
-      let dispatched = false;
       if (this.localDeliveryHandler) {
         // In-process handler path (takes priority over HTTP)
-        dispatched = true;
         const transitRequest: LocalDeliveryRequest = {
           destination: packet.destination,
           amount: packet.amount.toString(),
@@ -1221,7 +1134,6 @@ export class PacketHandler {
         });
       } else if (this.isLocalDeliveryEnabled() && this.localDeliveryClient) {
         // HTTP client path
-        dispatched = true;
         this.localDeliveryClient
           .deliver(packet, sourcePeerId, { isTransit: true })
           .catch((err: unknown) => {
@@ -1234,60 +1146,65 @@ export class PacketHandler {
             );
           });
       }
-
-      // Emit PER_HOP_NOTIFICATION telemetry only when a notification was actually dispatched
-      if (dispatched) {
-        try {
-          const perHopEvent = {
-            type: 'PER_HOP_NOTIFICATION' as const,
-            nodeId: this.nodeId,
-            destination: packet.destination,
-            amount: packet.amount.toString(),
-            nextHop,
-            sourcePeer: sourcePeerId,
-            correlationId,
-            timestamp: Date.now(),
-          };
-          if (this.telemetryEmitter) {
-            this.telemetryEmitter.emit(perHopEvent);
-          } else if (this.eventStore) {
-            this.eventStore.storeEvent(perHopEvent).catch((err) => {
-              this.logger.warn(
-                { error: err.message, correlationId },
-                'Failed to store PER_HOP_NOTIFICATION event'
-              );
-            });
-            this.eventBroadcaster?.broadcast(perHopEvent);
-          }
-        } catch {
-          // Telemetry emission is non-blocking — swallow errors
-        }
-      }
     }
 
-    // Generate per-packet claim before forwarding (non-blocking on failure)
+    // Generate mandatory per-packet claim before forwarding to peer
     let claimProtocolData:
       | Array<{ protocolName: string; contentType: number; data: Buffer }>
       | undefined;
-    if (this.perPacketClaimService && !isLocalDelivery && forwardingPacket.amount > 0n) {
+    if (!isLocalDelivery && forwardingPacket.amount > 0n) {
+      if (!this.perPacketClaimService) {
+        this.logger.error(
+          {
+            correlationId,
+            peerId: nextHop,
+            errorCode: ILPErrorCode.T00_INTERNAL_ERROR,
+          },
+          'Per-packet claim service not configured'
+        );
+        return this.generateReject(
+          ILPErrorCode.T00_INTERNAL_ERROR,
+          'Per-packet claim service not configured',
+          this.nodeId
+        );
+      }
+
       try {
         const result = await this.perPacketClaimService.generateClaimForPacket(
           nextHop,
           this.defaultTokenId,
           forwardingPacket.amount
         );
-        if (result) {
-          claimProtocolData = [result.protocolData];
+        if (!result) {
+          this.logger.error(
+            {
+              correlationId,
+              peerId: nextHop,
+              errorCode: ILPErrorCode.T00_INTERNAL_ERROR,
+            },
+            'No payment channel available for peer'
+          );
+          return this.generateReject(
+            ILPErrorCode.T00_INTERNAL_ERROR,
+            'No payment channel available for peer',
+            this.nodeId
+          );
         }
+        claimProtocolData = [result.protocolData];
       } catch (error) {
-        // Claim failure MUST NOT block packet forwarding
-        this.logger.warn(
+        this.logger.error(
           {
             correlationId,
             peerId: nextHop,
             error: error instanceof Error ? error.message : String(error),
+            errorCode: ILPErrorCode.T00_INTERNAL_ERROR,
           },
-          'Claim generation failed, forwarding without claim'
+          'Claim generation failed'
+        );
+        return this.generateReject(
+          ILPErrorCode.T00_INTERNAL_ERROR,
+          'Claim generation failed',
+          this.nodeId
         );
       }
     }
@@ -1300,36 +1217,6 @@ export class PacketHandler {
       claimProtocolData
     );
 
-    // Emit PACKET_FORWARDED telemetry after successful forward
-    if (this.telemetryEmitter) {
-      const packetId = packet.executionCondition.toString('hex');
-      this.telemetryEmitter.emitPacketSent(packetId, nextHop);
-    } else if (this.eventStore) {
-      // Standalone mode: emit PACKET_FORWARDED event directly to EventStore
-      // Convert peer IDs to full ILP addresses for UI display
-      const fromAddress = sourcePeerId.startsWith('g.') ? sourcePeerId : `g.${sourcePeerId}`;
-      const toAddress = nextHop.startsWith('g.') ? nextHop : `g.${nextHop}`;
-
-      const event = {
-        type: 'PACKET_FORWARDED' as const,
-        nodeId: this.nodeId,
-        packetId: packet.executionCondition.toString('hex'),
-        destination: packet.destination,
-        amount: forwardingPacket.amount.toString(),
-        from: fromAddress,
-        to: toAddress,
-        timestamp: Date.now(),
-      };
-      this.eventStore.storeEvent(event).catch((err) => {
-        this.logger.warn(
-          { error: err.message, packetId: event.packetId },
-          'Failed to store PACKET_FORWARDED event'
-        );
-      });
-      // Broadcast event to WebSocket clients for real-time UI updates
-      this.eventBroadcaster?.broadcast(event);
-    }
-
     this.logger.info(
       {
         correlationId,
@@ -1341,68 +1228,6 @@ export class PacketHandler {
       },
       'Returning packet response'
     );
-
-    // Emit telemetry for packet response (FULFILL or REJECT)
-    // Use telemetryEmitter.emit() for connected mode, eventStore for standalone mode
-    const packetId = packet.executionCondition.toString('hex');
-    const fromAddress = sourcePeerId.startsWith('g.') ? sourcePeerId : `g.${sourcePeerId}`;
-
-    if (response.type === PacketType.FULFILL) {
-      const event = {
-        type: 'PACKET_FULFILLED' as const,
-        nodeId: this.nodeId,
-        packetId,
-        destination: packet.destination,
-        amount: packet.amount.toString(),
-        from: fromAddress,
-        fulfillment: response.fulfillment.toString('hex'),
-        timestamp: Date.now(),
-      };
-
-      // Emit via telemetryEmitter if available (connected mode)
-      if (this.telemetryEmitter) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        this.telemetryEmitter.emit(event as any);
-      } else if (this.eventStore) {
-        // Fallback to direct eventStore in standalone mode
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        this.eventStore.storeEvent(event as any).catch((err) => {
-          this.logger.warn(
-            { error: err.message, packetId },
-            'Failed to store PACKET_FULFILLED event'
-          );
-        });
-        this.eventBroadcaster?.broadcast(event);
-      }
-    } else if (response.type === PacketType.REJECT) {
-      const event = {
-        type: 'PACKET_REJECTED' as const,
-        nodeId: this.nodeId,
-        packetId,
-        destination: packet.destination,
-        amount: packet.amount.toString(),
-        from: fromAddress,
-        code: response.code,
-        message: response.message,
-        timestamp: Date.now(),
-      };
-
-      // Emit via telemetryEmitter if available (connected mode)
-      if (this.telemetryEmitter) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        this.telemetryEmitter.emit(event as any);
-      } else if (this.eventStore) {
-        // Fallback to direct eventStore in standalone mode
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        this.eventStore.storeEvent(event as any).catch((err) => {
-          this.logger.warn(
-            { error: err.message, packetId },
-            'Failed to store PACKET_REJECTED event'
-          );
-        });
-        this.eventBroadcaster?.broadcast(event);
-      }
-    }
 
     return response;
   }

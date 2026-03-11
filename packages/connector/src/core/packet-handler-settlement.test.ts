@@ -22,6 +22,7 @@ import {
   PacketType,
 } from '@crosstown/shared';
 import { SettlementConfig } from '../config/types';
+import type { PerPacketClaimService } from '../settlement/per-packet-claim-service';
 import pino from 'pino';
 
 // Mock AccountManager
@@ -77,6 +78,20 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
     tigerBeetleReplicas: ['localhost:3000'],
   });
 
+  const createMockPerPacketClaimService = (): jest.Mocked<PerPacketClaimService> =>
+    ({
+      generateClaimForPacket: jest.fn().mockResolvedValue({
+        protocolData: {
+          protocolName: 'evm_claim',
+          contentType: 0,
+          data: Buffer.from('mock-claim-data'),
+        },
+        claimMessage: { version: '1.0', blockchain: 'evm' },
+      }),
+      getLatestClaim: jest.fn().mockReturnValue(null),
+      resetChannel: jest.fn(),
+    }) as unknown as jest.Mocked<PerPacketClaimService>;
+
   describe('Fee Calculation Tests', () => {
     it('should calculate 0.1% fee correctly for 100000 units', async () => {
       // Arrange
@@ -91,11 +106,11 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         mockBTPClientManager,
         'connector-test',
         logger,
-        null, // telemetryEmitter
         null, // btpServer
         mockAccountManager,
         settlementConfig
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
 
       const packet = createValidPreparePacket();
       packet.amount = 100000n;
@@ -110,7 +125,7 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         expect.objectContaining({
           amount: 99900n, // 100000 - 100 = 99900
         }),
-        undefined
+        expect.any(Array)
       );
     });
 
@@ -128,10 +143,10 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         'connector-test',
         logger,
         null,
-        null,
         mockAccountManager,
         settlementConfig
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
 
       const packet = createValidPreparePacket();
       packet.amount = 1000n;
@@ -145,7 +160,7 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         expect.objectContaining({
           amount: 999n, // 1000 - 1 = 999
         }),
-        undefined
+        expect.any(Array)
       );
     });
 
@@ -163,10 +178,10 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         'connector-test',
         logger,
         null,
-        null,
         mockAccountManager,
         settlementConfig
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
 
       const packet = createValidPreparePacket();
       packet.amount = 999n;
@@ -180,7 +195,7 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         expect.objectContaining({
           amount: 999n, // 999 - 0 = 999 (no fee charged on small amounts)
         }),
-        undefined
+        expect.any(Array)
       );
     });
 
@@ -201,10 +216,10 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         'connector-test',
         logger,
         null,
-        null,
         mockAccountManager,
         settlementConfig
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
 
       const packet = createValidPreparePacket();
       packet.amount = 10000n;
@@ -218,7 +233,7 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         expect.objectContaining({
           amount: 9900n, // 10000 - 100 = 9900
         }),
-        undefined
+        expect.any(Array)
       );
     });
   });
@@ -238,10 +253,10 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         'connector-test',
         logger,
         null,
-        null,
         mockAccountManager,
         settlementConfig
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
 
       const packet = createValidPreparePacket();
 
@@ -275,11 +290,11 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         mockBTPClientManager,
         'connector-test',
         logger,
-        null,
-        null,
+        null, // btpServer
         null, // accountManager = null
         null // settlementConfig = null
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
 
       const packet = createValidPreparePacket();
       packet.amount = 1000n;
@@ -293,7 +308,7 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         expect.objectContaining({
           amount: 1000n, // Original amount, no fee
         }),
-        undefined
+        expect.any(Array)
       );
     });
 
@@ -314,10 +329,10 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         'connector-test',
         logger,
         null,
-        null,
         mockAccountManager,
         settlementConfig
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
 
       const packet = createValidPreparePacket();
       packet.amount = 1000n;
@@ -332,7 +347,7 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         expect.objectContaining({
           amount: 1000n,
         }),
-        undefined
+        expect.any(Array)
       );
     });
   });
@@ -358,10 +373,10 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         'connector-test',
         logger,
         null,
-        null,
         mockAccountManager,
         settlementConfig
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
 
       const packet = createValidPreparePacket();
 
@@ -391,7 +406,6 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         mockBTPClientManager,
         'connector-test',
         logger,
-        null,
         null,
         mockAccountManager,
         settlementConfig
@@ -425,7 +439,6 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         'connector-test',
         logger,
         null,
-        null,
         mockAccountManager,
         settlementConfig
       );
@@ -458,11 +471,11 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         mockBTPClientManager,
         'connector-test',
         logger,
-        null,
-        null,
+        null, // btpServer
         null, // No AccountManager
         null // No SettlementConfig
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
 
       const packet = createValidPreparePacket();
 
@@ -474,7 +487,7 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
       expect(mockBTPClientManager.sendToPeer).toHaveBeenCalledWith(
         'peer-a',
         expect.any(Object),
-        undefined
+        expect.any(Array)
       );
     });
 
@@ -490,6 +503,7 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         'connector-test',
         logger
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
 
       const packet = createValidPreparePacket();
       const originalAmount = packet.amount;
@@ -503,7 +517,7 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         expect.objectContaining({
           amount: originalAmount,
         }),
-        undefined
+        expect.any(Array)
       );
     });
   });
@@ -523,10 +537,10 @@ describe('PacketHandler Settlement Integration (Story 6.4)', () => {
         'connector-test',
         logger,
         null,
-        null,
         mockAccountManager,
         settlementConfig
       );
+      handler.setPerPacketClaimService(createMockPerPacketClaimService());
 
       const packet = createValidPreparePacket();
 
