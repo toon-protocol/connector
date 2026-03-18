@@ -15,7 +15,7 @@ import type {
   ChannelClosedEvent,
   ChannelSettledEvent,
   ChannelCooperativeSettledEvent,
-} from '@crosstown/shared';
+} from '@toon-protocol/shared';
 import { getDomainSeparator, getBalanceProofTypes } from './eip712-helper';
 import type { Logger } from '../utils/logger';
 import type { KeyManager } from '../security/key-manager';

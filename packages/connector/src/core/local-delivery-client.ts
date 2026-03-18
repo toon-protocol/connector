@@ -14,7 +14,7 @@ import {
   ILPRejectPacket,
   PacketType,
   ILPErrorCode,
-} from '@crosstown/shared';
+} from '@toon-protocol/shared';
 import { LocalDeliveryConfig } from '../config/types';
 import {
   PaymentRequest,

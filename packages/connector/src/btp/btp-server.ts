@@ -15,7 +15,7 @@ import {
   ILPFulfillPacket,
   ILPRejectPacket,
   PacketType,
-} from '@crosstown/shared';
+} from '@toon-protocol/shared';
 
 /**
  * BTP peer connection metadata

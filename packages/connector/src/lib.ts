@@ -98,4 +98,4 @@ export type { PaymentRequest, PaymentResponse, PaymentHandler } from './core/pay
 export type { PacketSenderFn, IsReadyFn } from './http/ilp-send-handler';
 
 // Re-export ILP packet types for library consumers
-export type { ILPPreparePacket, ILPFulfillPacket, ILPRejectPacket } from '@crosstown/shared';
+export type { ILPPreparePacket, ILPFulfillPacket, ILPRejectPacket } from '@toon-protocol/shared';

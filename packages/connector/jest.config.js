@@ -36,7 +36,7 @@ module.exports = {
   },
   moduleFileExtensions: ['ts', 'js', 'json'],
   moduleNameMapper: {
-    '^@crosstown/shared$': '<rootDir>/../shared/src/index.ts',
+    '^@toon-protocol/shared$': '<rootDir>/../shared/src/index.ts',
   },
   transform: {
     '^.+\\.ts$': [

@@ -1,6 +1,6 @@
 # Crosstown Connector — Product Requirements Document (As-Built)
 
-**Package:** `@crosstown/connector` v1.6.0
+**Package:** `@toon-protocol/connector` v1.6.0
 **Date:** 2026-03-09
 **Status:** As-Built — Documents the current state of the system
 **License:** MIT
@@ -148,7 +148,7 @@ Reports peer connection status, TigerBeetle connectivity (if enabled), EVM RPC c
 The connector runs in the same process as the business logic. Packets are handled via function callbacks. No HTTP communication between connector and application.
 
 ```typescript
-import { ConnectorNode } from '@crosstown/connector';
+import { ConnectorNode } from '@toon-protocol/connector';
 
 const node = new ConnectorNode(config, logger);
 node.setPacketHandler(async (packet) => {
@@ -471,7 +471,7 @@ Kustomize-based manifests in `k8s/connector/` with base, staging, and production
 
 ```
 packages/
-├── connector/                  @crosstown/connector v1.6.0
+├── connector/                  @toon-protocol/connector v1.6.0
 │   ├── src/
 │   │   ├── core/              ConnectorNode, PacketHandler
 │   │   ├── btp/               BTPServer, BTPClient, BTPClientManager, claim types
@@ -496,18 +496,18 @@ packages/
 │   ├── script/                Deployment scripts
 │   └── anvil-state.json       Pre-initialized Anvil state
 │
-├── shared/                     @crosstown/shared — ILP types, OER encoding, type guards
+├── shared/                     @toon-protocol/shared — ILP types, OER encoding, type guards
 ├── dashboard/                  Dashboard package (deprecated)
 └── faucet/                     Faucet service
 ```
 
 **Build & Entry Points:**
 
-| Entry   | Path                | Purpose                                                                      |
-| ------- | ------------------- | ---------------------------------------------------------------------------- |
-| Library | `dist/lib.js`       | Programmatic import (`import { ConnectorNode } from '@crosstown/connector'`) |
-| CLI     | `dist/cli/index.js` | `npx connector setup` / `npx connector health` / `npx connector validate`    |
-| Main    | `dist/main.js`      | Standalone server (`node dist/main.js` or `npm start`)                       |
+| Entry   | Path                | Purpose                                                                          |
+| ------- | ------------------- | -------------------------------------------------------------------------------- |
+| Library | `dist/lib.js`       | Programmatic import (`import { ConnectorNode } from '@toon-protocol/connector'`) |
+| CLI     | `dist/cli/index.js` | `npx connector setup` / `npx connector health` / `npx connector validate`        |
+| Main    | `dist/main.js`      | Standalone server (`node dist/main.js` or `npm start`)                           |
 
 **Node.js Requirement:** >=22.11.0
 
@@ -563,7 +563,7 @@ These requirements describe the system as currently implemented.
 
 **NFR5:** The connector maintains 80%+ unit test coverage for core ILP packet handling, routing, and settlement logic. Tests run via Jest.
 
-**NFR6:** The codebase follows conventional commits and publishes to npm as `@crosstown/connector` with dual library/CLI entry points.
+**NFR6:** The codebase follows conventional commits and publishes to npm as `@toon-protocol/connector` with dual library/CLI entry points.
 
 **NFR7:** In-memory ledger snapshots persist to disk on configurable intervals (default 30s) and restore on restart, ensuring balance continuity across connector restarts.
 

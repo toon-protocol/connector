@@ -21,7 +21,7 @@ import {
   ILPRejectPacket,
   ILPErrorCode,
   PacketType,
-} from '@crosstown/shared';
+} from '@toon-protocol/shared';
 import { SettlementConfig } from '../config/types';
 import type { PerPacketClaimService } from '../settlement/per-packet-claim-service';
 import { computeFulfillmentFromData } from './payment-handler';

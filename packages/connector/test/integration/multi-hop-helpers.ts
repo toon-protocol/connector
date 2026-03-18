@@ -17,7 +17,7 @@ import { ethers } from 'ethers';
 import { ConnectorNode } from '../../src/core/connector-node';
 import { createLogger } from '../../src/utils/logger';
 import type { ConnectorConfig, PeerAccountBalance, SendPacketParams } from '../../src/config/types';
-import type { ILPFulfillPacket, ILPRejectPacket } from '@crosstown/shared';
+import type { ILPFulfillPacket, ILPRejectPacket } from '@toon-protocol/shared';
 
 // ============================================================================
 // Anvil Deterministic Constants

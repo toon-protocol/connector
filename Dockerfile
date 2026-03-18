@@ -36,7 +36,7 @@ COPY packages/shared/src ./packages/shared/src
 
 # Build all packages (TypeScript compilation)
 # Build shared first, then connector (dependency order)
-RUN npm run build --workspace=@crosstown/shared && npm run build --workspace=@crosstown/connector
+RUN npm run build --workspace=@toon-protocol/shared && npm run build --workspace=@toon-protocol/connector
 
 # ============================================
 # Stage 2: Runtime

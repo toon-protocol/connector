@@ -12,7 +12,7 @@ import {
   PacketType,
   ILPRejectPacket,
   ILPFulfillPacket,
-} from '@crosstown/shared';
+} from '@toon-protocol/shared';
 import { Logger } from '../utils/logger';
 import { BTPClientManager } from '../btp/btp-client-manager';
 import type { PerPacketClaimService } from '../settlement/per-packet-claim-service';

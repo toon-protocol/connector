@@ -31,7 +31,7 @@ import { requireOptional } from '../utils/optional-require';
 import { RoutingTable } from '../routing/routing-table';
 import { BTPClientManager } from '../btp/btp-client-manager';
 import { Peer } from '../btp/btp-client';
-import { ILPAddress, isValidILPAddress } from '@crosstown/shared';
+import { ILPAddress, isValidILPAddress } from '@toon-protocol/shared';
 import {
   AdminSettlementConfig,
   PeerConfig as SettlementPeerConfig,

@@ -1,5 +1,5 @@
 {
-  "name": "@crosstown/fund-peers",
+  "name": "@toon-protocol/fund-peers",
   "version": "0.1.0",
   "description": "CLI tool to fund peer wallets from treasury",
   "main": "dist/index.js",
@@ -11,7 +11,7 @@
     "fund": "node dist/index.js"
   },
   "dependencies": {
-    "@crosstown/shared": "*",
+    "@toon-protocol/shared": "*",
     "commander": "^11.1.0",
     "dotenv": "^16.3.1",
     "ethers": "^6.9.0",

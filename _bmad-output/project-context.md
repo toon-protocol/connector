@@ -53,7 +53,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
 - **No `console.log`** — use Pino logger instead; ESLint `no-console: "error"` (only `console.warn` and `console.error` allowed)
 - **Named exports only** — no default exports; separate `export type {}` from runtime exports
 - **Use `import type` for type-only imports** — keeps runtime bundles clean
-- **Cross-package imports:** use `@crosstown/shared` (mapped in Jest via `moduleNameMapper`)
+- **Cross-package imports:** use `@toon-protocol/shared` (mapped in Jest via `moduleNameMapper`)
 - **Custom Error classes:** set `this.name`, call `Error.captureStackTrace`, use `instanceof` checks
 - **Async cleanup:** prefix fire-and-forget async calls with `void` (e.g., `void shutdown('SIGTERM')`)
 - **Target ES2022** — can use top-level await, `Array.at()`, `Object.hasOwn()`, etc.
@@ -86,7 +86,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
 - **ILP amounts use `BigInt`:** test data uses `100000n` notation, not `Number`
 - **Coverage thresholds:** branches 60%, functions 75%, lines 70%, statements 70%
 - **Default timeout:** 30s for most tests; specific overrides for integration (60s for security)
-- **Cross-package mapping:** `@crosstown/shared` mapped to source via `moduleNameMapper` in jest config
+- **Cross-package mapping:** `@toon-protocol/shared` mapped to source via `moduleNameMapper` in jest config
 
 ### Code Quality & Style Rules
 
@@ -123,7 +123,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
 - **ILP packet expiry decrement** — per RFC-0027, connectors MUST reduce packet expiry by safety margin (1s) before forwarding to prevent timeout cascades
 - **Settlement is threshold-based** — on-chain settlement triggers on balance or time thresholds, NOT per-packet; per-packet claims are signed and sent via BTP but accumulated off-chain
 - **Self-describing claims (Epic 31)** — claims carry chain/contract coordinates in BTP protocolData; receivers verify dynamically on-chain without pre-registration
-- **`@crosstown/shared` import path** — always `import { Type } from '@crosstown/shared'`; never import from dist or relative paths across packages
+- **`@toon-protocol/shared` import path** — always `import { Type } from '@toon-protocol/shared'`; never import from dist or relative paths across packages
 - **Buffer usage for binary data** — ILP packets use `Buffer` (not `Uint8Array`) for `data`, `executionCondition`, `fulfillment` fields
 - **PacketType enum values matter** — `PREPARE=12`, `FULFILL=13`, `REJECT=14` per RFC-0027; don't use arbitrary values
 - **Optional dependencies pattern** — many packages are `optionalDependencies`; use dynamic `require()` with try-catch or the project's `optional-require` utility

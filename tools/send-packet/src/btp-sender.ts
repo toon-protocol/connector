@@ -13,7 +13,7 @@ import {
   ILPRejectPacket,
   serializePacket,
   deserializePacket,
-} from '@crosstown/shared';
+} from '@toon-protocol/shared';
 
 // Copy essential BTP types locally since we don't export them from connector
 enum BTPMessageType {

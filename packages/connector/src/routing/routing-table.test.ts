@@ -4,7 +4,7 @@
  */
 
 import { RoutingTable } from './routing-table';
-import { RoutingTableEntry } from '@crosstown/shared';
+import { RoutingTableEntry } from '@toon-protocol/shared';
 
 /**
  * Mock logger for testing log output without console noise

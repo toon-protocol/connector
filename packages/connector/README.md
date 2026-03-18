@@ -1,6 +1,6 @@
-# @crosstown/connector
+# @toon-protocol/connector
 
-[![npm](https://img.shields.io/npm/v/@crosstown/connector)](https://www.npmjs.com/package/@crosstown/connector)
+[![npm](https://img.shields.io/npm/v/@toon-protocol/connector)](https://www.npmjs.com/package/@toon-protocol/connector)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 > ILP connector node for AI agent payment networks. Routes packets, tracks balances, settles on-chain.
@@ -10,13 +10,13 @@ See the [root README](../../README.md) for conceptual overview, network architec
 ## Install
 
 ```bash
-npm install @crosstown/connector
+npm install @toon-protocol/connector
 ```
 
 ## Quick Start
 
 ```typescript
-import { ConnectorNode, createLogger } from '@crosstown/connector';
+import { ConnectorNode, createLogger } from '@toon-protocol/connector';
 
 const node = new ConnectorNode('config.yaml', createLogger('my-agent', 'info'));
 
@@ -44,8 +44,8 @@ When `deploymentMode` is omitted, it is inferred from `localDelivery` and `admin
 Pass a `ConnectorConfig` object directly for programmatic usage:
 
 ```typescript
-import { ConnectorNode } from '@crosstown/connector';
-import type { ConnectorConfig } from '@crosstown/connector';
+import { ConnectorNode } from '@toon-protocol/connector';
+import type { ConnectorConfig } from '@toon-protocol/connector';
 import pino from 'pino';
 
 const config: ConnectorConfig = {

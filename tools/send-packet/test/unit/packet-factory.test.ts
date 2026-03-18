@@ -3,7 +3,7 @@
  */
 
 import { createHash } from 'crypto';
-import { PacketType, ILPErrorCode } from '@crosstown/shared';
+import { PacketType, ILPErrorCode } from '@toon-protocol/shared';
 import {
   createTestPreparePacket,
   createTestFulfillPacket,

@@ -1,5 +1,5 @@
 {
-  "name": "@crosstown/send-packet",
+  "name": "@toon-protocol/send-packet",
   "version": "0.1.0",
   "description": "CLI tool to inject test ILP packets into connector network",
   "main": "dist/index.js",
@@ -15,7 +15,7 @@
     "test:integration": "jest test/integration"
   },
   "dependencies": {
-    "@crosstown/shared": "*",
+    "@toon-protocol/shared": "*",
     "commander": "^11.1.0",
     "ws": "^8.16.0",
     "pino": "^8.17.0",

@@ -13,7 +13,7 @@ import {
   PacketType,
   ILPErrorCode,
   isValidILPAddress,
-} from '@crosstown/shared';
+} from '@toon-protocol/shared';
 
 /**
  * Result from creating a test Prepare packet

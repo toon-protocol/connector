@@ -46,7 +46,7 @@ import type { Logger } from 'pino';
 import type { ethers } from 'ethers';
 import type { PaymentChannelSDK } from './payment-channel-sdk';
 import type { BTPClaimMessage, EVMClaimMessage, BlockchainType } from '../btp/btp-claim-types';
-import type { BalanceProof } from '@crosstown/shared';
+import type { BalanceProof } from '@toon-protocol/shared';
 
 /**
  * Configuration for ClaimRedemptionService

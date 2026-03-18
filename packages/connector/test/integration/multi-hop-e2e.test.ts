@@ -26,8 +26,8 @@ import {
   sleep,
   type MultiHopTestNetwork,
 } from './multi-hop-helpers';
-import { PacketType, ILPErrorCode } from '@crosstown/shared';
-import type { ILPFulfillPacket, ILPRejectPacket } from '@crosstown/shared';
+import { PacketType, ILPErrorCode } from '@toon-protocol/shared';
+import type { ILPFulfillPacket, ILPRejectPacket } from '@toon-protocol/shared';
 
 // Gate: Only run when EVM_INTEGRATION=true and Anvil is available
 const RUN_EVM_TESTS = process.env.EVM_INTEGRATION === 'true';

@@ -16,8 +16,8 @@
 import * as crypto from 'crypto';
 import { Request, Response } from 'express';
 import { Logger } from '../utils/logger';
-import { PacketType, isValidILPAddress } from '@crosstown/shared';
-import type { ILPFulfillPacket, ILPRejectPacket } from '@crosstown/shared';
+import { PacketType, isValidILPAddress } from '@toon-protocol/shared';
+import type { ILPFulfillPacket, ILPRejectPacket } from '@toon-protocol/shared';
 import type { IlpSendRequest, IlpSendResponse, SendPacketParams } from '../config/types';
 
 /** Default timeout for outbound ILP packets in milliseconds */

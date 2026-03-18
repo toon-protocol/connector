@@ -10,8 +10,8 @@ import * as crypto from 'crypto';
 import express, { Express } from 'express';
 import request from 'supertest';
 import pino from 'pino';
-import { PacketType, ILPErrorCode } from '@crosstown/shared';
-import type { ILPFulfillPacket, ILPRejectPacket } from '@crosstown/shared';
+import { PacketType, ILPErrorCode } from '@toon-protocol/shared';
+import type { ILPFulfillPacket, ILPRejectPacket } from '@toon-protocol/shared';
 import {
   IlpSendHandler,
   computeConditionFromData,

@@ -1,5 +1,5 @@
 {
-  "name": "@crosstown/connector",
+  "name": "@toon-protocol/connector",
   "version": "1.7.1",
   "description": "Connector with BTP support and EVM settlement",
   "main": "dist/lib.js",
@@ -75,7 +75,7 @@
     "prepublishOnly": "npm run build:publish && npm test"
   },
   "dependencies": {
-    "@crosstown/shared": "^1.0.0",
+    "@toon-protocol/shared": "^1.0.0",
     "better-sqlite3": "^11.8.1",
     "cors": "^2.8.6",
     "ethers": "^6.16.0",

@@ -85,7 +85,7 @@ export type PaymentHandler = (request: PaymentRequest) => Promise<PaymentRespons
 
 /**
  * Map business logic reject codes to ILP error codes.
- * Copied from @crosstown/connector to avoid cross-package dependency.
+ * Copied from @toon-protocol/connector to avoid cross-package dependency.
  */
 export const REJECT_CODE_MAP: Record<string, string> = {
   insufficient_funds: 'T04',

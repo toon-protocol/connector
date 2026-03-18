@@ -21,7 +21,7 @@
 
 ## 1. Introduction
 
-**Crosstown Connector** (`@crosstown/connector` v1.6.2) is a production-ready
+**Crosstown Connector** (`@toon-protocol/connector` v1.6.2) is a production-ready
 Interledger Protocol (ILP) connector for machine-to-machine payment routing with
 EVM settlement on Base L2.
 
@@ -47,7 +47,7 @@ Sections 13-14 capture rationale and standards compliance.
 ### Architectural Style
 
 Monorepo library with containerized deployment option. The primary artifact is an
-npm package (`@crosstown/connector`) that can be imported as a library, run as a
+npm package (`@toon-protocol/connector`) that can be imported as a library, run as a
 CLI, or deployed as a Docker container.
 
 ### Principles
@@ -135,12 +135,12 @@ connector/
 
 ### Packages
 
-| Package                    | Path                 | Description                                                                                   |
-| -------------------------- | -------------------- | --------------------------------------------------------------------------------------------- |
-| `@crosstown/connector`     | `packages/connector` | Core ILP connector with BTP, routing, settlement                                              |
-| `@crosstown/shared` v1.2.0 | `packages/shared`    | ILP packet types, OER encoding/decoding, telemetry event types, routing types                 |
-| `contracts`                | `packages/contracts` | Solidity contracts: `TokenNetwork.sol`, `TokenNetworkRegistry.sol` (Foundry, Solidity 0.8.26) |
-| `@crosstown/faucet`        | `packages/faucet`    | Token faucet web service for local Anvil development (ETH + USDC distribution)                |
+| Package                        | Path                 | Description                                                                                   |
+| ------------------------------ | -------------------- | --------------------------------------------------------------------------------------------- |
+| `@toon-protocol/connector`     | `packages/connector` | Core ILP connector with BTP, routing, settlement                                              |
+| `@toon-protocol/shared` v1.2.0 | `packages/shared`    | ILP packet types, OER encoding/decoding, telemetry event types, routing types                 |
+| `contracts`                    | `packages/contracts` | Solidity contracts: `TokenNetwork.sol`, `TokenNetworkRegistry.sol` (Foundry, Solidity 0.8.26) |
+| `@toon-protocol/faucet`        | `packages/faucet`    | Token faucet web service for local Anvil development (ETH + USDC distribution)                |
 
 ### Tools
 
@@ -247,7 +247,7 @@ graph TD
 
 ## 6. Data Models
 
-### ILP Packets (`@crosstown/shared`)
+### ILP Packets (`@toon-protocol/shared`)
 
 | Type               | Fields                                                                                | RFC      |
 | ------------------ | ------------------------------------------------------------------------------------- | -------- |
@@ -689,10 +689,10 @@ All tests that involve claims (unit and integration) **must assume self-describi
 
 ## 14. RFC References
 
-| RFC                                                                        | Title                             | Implementation                                                             |
-| -------------------------------------------------------------------------- | --------------------------------- | -------------------------------------------------------------------------- |
-| [RFC-0027](https://interledger.org/rfcs/0027-interledger-protocol-v4/)     | Interledger Protocol v4 (ILPv4)   | Packet types, error codes, routing in `@crosstown/shared` and `core/`      |
-| [RFC-0023](https://interledger.org/rfcs/0023-bilateral-transfer-protocol/) | Bilateral Transfer Protocol (BTP) | `btp/` module — WebSocket transport, auth, protocolData for claims         |
-| [RFC-0030](https://interledger.org/rfcs/0030-notes-on-oer-encoding/)       | OER Encoding                      | `@crosstown/shared` encoding module — packet serialization/deserialization |
-| [RFC-0015](https://interledger.org/rfcs/0015-ilp-addresses/)               | ILP Addresses                     | Address validation, longest-prefix routing in `routing/`                   |
-| [RFC-0001](https://interledger.org/rfcs/0001-interledger-architecture/)    | Interledger Architecture          | Overall connector architecture and protocol layering                       |
+| RFC                                                                        | Title                             | Implementation                                                                 |
+| -------------------------------------------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------ |
+| [RFC-0027](https://interledger.org/rfcs/0027-interledger-protocol-v4/)     | Interledger Protocol v4 (ILPv4)   | Packet types, error codes, routing in `@toon-protocol/shared` and `core/`      |
+| [RFC-0023](https://interledger.org/rfcs/0023-bilateral-transfer-protocol/) | Bilateral Transfer Protocol (BTP) | `btp/` module — WebSocket transport, auth, protocolData for claims             |
+| [RFC-0030](https://interledger.org/rfcs/0030-notes-on-oer-encoding/)       | OER Encoding                      | `@toon-protocol/shared` encoding module — packet serialization/deserialization |
+| [RFC-0015](https://interledger.org/rfcs/0015-ilp-addresses/)               | ILP Addresses                     | Address validation, longest-prefix routing in `routing/`                       |
+| [RFC-0001](https://interledger.org/rfcs/0001-interledger-architecture/)    | Interledger Architecture          | Overall connector architecture and protocol layering                           |

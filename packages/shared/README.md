@@ -1,11 +1,11 @@
-# @crosstown/shared
+# @toon-protocol/shared
 
 Shared ILP types and OER codec for Connector.
 
 ## Install
 
 ```bash
-npm install @crosstown/shared
+npm install @toon-protocol/shared
 ```
 
 ## Usage
@@ -19,7 +19,7 @@ import {
   PacketType,
   serializePacket,
   deserializePacket,
-} from '@crosstown/shared';
+} from '@toon-protocol/shared';
 
 // Create an ILP Prepare packet
 const prepare: ILPPreparePacket = {
@@ -43,7 +43,7 @@ const decoded = deserializePacket(encoded);
 All telemetry events use a discriminated union on the `type` field. Switch on `event.type` to narrow to a specific interface:
 
 ```typescript
-import { TelemetryEvent, TelemetryEventType } from '@crosstown/shared';
+import { TelemetryEvent, TelemetryEventType } from '@toon-protocol/shared';
 
 function handleEvent(event: TelemetryEvent) {
   switch (event.type) {

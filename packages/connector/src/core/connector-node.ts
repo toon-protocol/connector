@@ -18,7 +18,7 @@ import {
   ILPRejectPacket,
   PacketType,
   ILPErrorCode,
-} from '@crosstown/shared';
+} from '@toon-protocol/shared';
 import {
   ConnectorConfig,
   SettlementConfig,

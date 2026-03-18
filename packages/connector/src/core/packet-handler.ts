@@ -11,7 +11,7 @@ import {
   ILPErrorCode,
   PacketType,
   isValidILPAddress,
-} from '@crosstown/shared';
+} from '@toon-protocol/shared';
 import { RoutingTable } from '../routing/routing-table';
 import { Logger, generateCorrelationId } from '../utils/logger';
 import { BTPClientManager } from '../btp/btp-client-manager';

@@ -16,7 +16,7 @@ import {
   ILPErrorCode,
   ILPFulfillPacket,
   ILPRejectPacket,
-} from '@crosstown/shared';
+} from '@toon-protocol/shared';
 import { ConfigLoader, ConnectorNotStartedError } from '../config/config-loader';
 import { HealthServer } from '../http/health-server';
 

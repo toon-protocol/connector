@@ -167,8 +167,8 @@ This project uses **Conventional Commits** for clear and structured commit histo
 
 The scope specifies which package or component is affected:
 
-- `connector` - Changes to @crosstown/connector package
-- `shared` - Changes to @crosstown/shared package
+- `connector` - Changes to @toon-protocol/connector package
+- `shared` - Changes to @toon-protocol/shared package
 - `explorer` - Changes to the built-in Explorer UI
 - `monorepo` - Changes affecting the entire monorepo
 - `btp` - BTP protocol implementation
@@ -310,8 +310,8 @@ All pull requests must pass:
 - ✅ Prettier formatting checks
 - ✅ TypeScript compilation (all packages)
 - ✅ Jest tests with coverage thresholds:
-  - `@crosstown/shared`: ≥90% coverage
-  - `@crosstown/connector`: ≥80% coverage
+  - `@toon-protocol/shared`: ≥90% coverage
+  - `@toon-protocol/connector`: ≥80% coverage
 
 ## Code Review Guidelines
 
@@ -333,8 +333,8 @@ All pull requests must pass:
 
 ### Test Coverage Thresholds
 
-- **@crosstown/shared**: Minimum 90% line coverage (critical protocol logic)
-- **@crosstown/connector**: Minimum 80% line coverage
+- **@toon-protocol/shared**: Minimum 90% line coverage (critical protocol logic)
+- **@toon-protocol/connector**: Minimum 80% line coverage
 
 ### Test Organization
 

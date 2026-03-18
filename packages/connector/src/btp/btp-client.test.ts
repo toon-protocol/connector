@@ -14,7 +14,7 @@ import {
   PacketType,
   ILPErrorCode,
   serializePacket,
-} from '@crosstown/shared';
+} from '@toon-protocol/shared';
 import WebSocket from 'ws';
 import { EventEmitter } from 'events';
 

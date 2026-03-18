@@ -82,7 +82,7 @@ The connector handles the hard parts (routing, accounting, settlement) so applic
 ## Install
 
 ```bash
-npm install @crosstown/connector
+npm install @toon-protocol/connector
 ```
 
 That's it. No external databases required—the connector ships with an in-memory ledger that persists to disk via JSON snapshots. For high-throughput production workloads, you can optionally plug in [TigerBeetle](https://tigerbeetle.com).
@@ -160,7 +160,7 @@ ILP uses a **two-phase commit** protocol with cryptographic escrow:
 - Easier debugging
 
 ```typescript
-import { ConnectorNode, createLogger } from '@crosstown/connector';
+import { ConnectorNode, createLogger } from '@toon-protocol/connector';
 
 const logger = createLogger('my-agent', 'info');
 const node = new ConnectorNode('config.yaml', logger);
@@ -395,12 +395,12 @@ The connector supports two deployment modes via the `deploymentMode` configurati
 
 This repo is a monorepo with multiple packages:
 
-| Package                                      | Description                                            |
-| -------------------------------------------- | ------------------------------------------------------ |
-| [`@crosstown/connector`](packages/connector) | Connector node — routing, accounting, settlement, CLI  |
-| [`@crosstown/shared`](packages/shared)       | Shared types and OER codec utilities                   |
-| [`@crosstown/contracts`](packages/contracts) | EVM payment channel smart contracts (Foundry/Solidity) |
-| [`@m2m-connector/faucet`](packages/faucet)   | Token faucet for local EVM testing                     |
+| Package                                          | Description                                            |
+| ------------------------------------------------ | ------------------------------------------------------ |
+| [`@toon-protocol/connector`](packages/connector) | Connector node — routing, accounting, settlement, CLI  |
+| [`@toon-protocol/shared`](packages/shared)       | Shared types and OER codec utilities                   |
+| [`@toon-protocol/contracts`](packages/contracts) | EVM payment channel smart contracts (Foundry/Solidity) |
+| [`@m2m-connector/faucet`](packages/faucet)       | Token faucet for local EVM testing                     |
 
 ## Explorer UI
 
@@ -440,12 +440,12 @@ Perfect for development and debugging. Disable in production.
 ```
 ┌─────────────────────────────────────────────┐
 │  Your Agent                                  │
-│  import @crosstown/connector             │
+│  import @toon-protocol/connector             │
 │  setPacketHandler() + sendPacket()           │
 └──────────────────┬──────────────────────────┘
                    │ (same process)
 ┌──────────────────▼──────────────────────────┐
-│  @crosstown/connector                   │
+│  @toon-protocol/connector                   │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐    │
 │  │ Routing  │ │ BTP/WS   │ │ Ledger   │    │
 │  │ Table    │ │ Peers    │ │ Accounts │    │
@@ -464,7 +464,7 @@ Perfect for development and debugging. Disable in production.
 
 ```
 ┌──────────────┐   /handle-packet   ┌──────────────┐
-│  Your BLS    │◄──────────────────│  @crosstown/ │
+│  Your BLS    │◄──────────────────│  @toon-protocol/ │
 │              │                    │  connector   │
 │  Outbound:   │  /admin/ilp/send  │              │
 │  POST ───────│──────────────────►│              │

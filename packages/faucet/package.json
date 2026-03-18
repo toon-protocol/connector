@@ -1,5 +1,5 @@
 {
-  "name": "@crosstown/faucet",
+  "name": "@toon-protocol/faucet",
   "version": "1.0.0",
   "description": "Token faucet for local development",
   "main": "src/index.js",

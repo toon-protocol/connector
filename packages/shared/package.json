@@ -1,5 +1,5 @@
 {
-  "name": "@crosstown/shared",
+  "name": "@toon-protocol/shared",
   "version": "1.2.0",
   "description": "Shared TypeScript types and utilities for Connector",
   "main": "dist/index.js",
