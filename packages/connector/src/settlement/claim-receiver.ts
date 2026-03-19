@@ -90,7 +90,8 @@ export class ClaimReceiver extends EventEmitter {
     private readonly db: Database,
     private readonly evmChannelSDK: PaymentChannelSDK,
     private readonly logger: Logger,
-    private readonly channelManager?: ChannelManager
+    private readonly channelManager?: ChannelManager,
+    private readonly peerIdToAddressMap?: Map<string, string>
   ) {
     super();
   }
@@ -336,6 +337,15 @@ export class ClaimReceiver extends EventEmitter {
         });
 
         this.logger.info({ channelId: claim.channelId, peerId }, 'External channel registered');
+
+        // Register peer's EVM address for SettlementExecutor lookup
+        if (this.peerIdToAddressMap && !this.peerIdToAddressMap.has(peerId)) {
+          this.peerIdToAddressMap.set(peerId, claim.signerAddress);
+          this.logger.info(
+            { peerId, signerAddress: claim.signerAddress },
+            'Peer EVM address registered from self-describing claim'
+          );
+        }
       } else {
         // Known channel (pre-registered or previously verified) -- use existing verification
         const isValid = await this.evmChannelSDK.verifyBalanceProof(

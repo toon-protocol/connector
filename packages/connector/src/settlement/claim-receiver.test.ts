@@ -709,6 +709,83 @@ describe('ClaimReceiver', () => {
       expect(mockChannelManager.registerExternalChannel).not.toHaveBeenCalled();
     });
 
+    it('should register peer EVM address in peerIdToAddressMap after successful self-describing claim', async () => {
+      const peerIdToAddressMap = new Map<string, string>();
+      const receiverWithMap = new ClaimReceiver(
+        mockDb,
+        mockPaymentChannelSDK,
+        mockLogger,
+        mockChannelManager,
+        peerIdToAddressMap
+      );
+
+      const mapBTPServer = {
+        onMessage: jest.fn((handler) => {
+          dynamicBtpHandler = handler;
+        }),
+      } as unknown as jest.Mocked<BTPServer>;
+      receiverWithMap.registerWithBTPServer(mapBTPServer);
+
+      const claim = makeClaimWithSelfDescribing();
+      mockStatement.get.mockReturnValue(undefined);
+
+      await dynamicBtpHandler!('peer-new', makeBTPMessage(claim));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Verify peer address was registered
+      expect(peerIdToAddressMap.get('peer-new')).toBe(mockSignerAddress);
+    });
+
+    it('should NOT overwrite pre-existing static config entry in peerIdToAddressMap', async () => {
+      const existingAddress = '0x' + '9'.repeat(40);
+      const peerIdToAddressMap = new Map<string, string>([['peer-new', existingAddress]]);
+      const receiverWithMap = new ClaimReceiver(
+        mockDb,
+        mockPaymentChannelSDK,
+        mockLogger,
+        mockChannelManager,
+        peerIdToAddressMap
+      );
+
+      const mapBTPServer = {
+        onMessage: jest.fn((handler) => {
+          dynamicBtpHandler = handler;
+        }),
+      } as unknown as jest.Mocked<BTPServer>;
+      receiverWithMap.registerWithBTPServer(mapBTPServer);
+
+      const claim = makeClaimWithSelfDescribing();
+      mockStatement.get.mockReturnValue(undefined);
+
+      await dynamicBtpHandler!('peer-new', makeBTPMessage(claim));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Verify pre-existing entry was NOT overwritten
+      expect(peerIdToAddressMap.get('peer-new')).toBe(existingAddress);
+    });
+
+    it('should work without error when peerIdToAddressMap is not provided', async () => {
+      // dynamicReceiver is created without peerIdToAddressMap (uses the beforeEach setup)
+      const claim = makeClaimWithSelfDescribing();
+      mockStatement.get.mockReturnValue(undefined);
+
+      await dynamicBtpHandler!('peer-new', makeBTPMessage(claim));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Verify claim still processed successfully (stored as verified)
+      expect(mockStatement.run).toHaveBeenCalledWith(
+        claim.messageId,
+        'peer-new',
+        'evm',
+        mockChannelId,
+        JSON.stringify(claim),
+        1, // verified=true
+        expect.any(Number),
+        null,
+        null
+      );
+    });
+
     it('should work with pre-registered channel without self-describing fields (backward compat)', async () => {
       // Channel is already known
       mockChannelManager.getChannelById.mockReturnValue({

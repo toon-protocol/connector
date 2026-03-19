@@ -876,7 +876,8 @@ export class ConnectorNode implements HealthStatusProvider {
                 receivedClaimDb,
                 this._paymentChannelSDK,
                 this._logger,
-                this._channelManager ?? undefined
+                this._channelManager ?? undefined,
+                peerIdToAddressMap
               );
 
               // Register with BTP server to receive claim messages

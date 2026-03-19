@@ -626,6 +626,93 @@ describe('SettlementExecutor', () => {
     });
   });
 
+  describe('Dynamic Peer Address Resolution', () => {
+    it('should fail settlement when peer address is missing from peerIdToAddressMap', async () => {
+      // Start with an empty peerIdToAddressMap
+      const emptyMapConfig = {
+        ...config,
+        peerIdToAddressMap: new Map<string, string>(),
+        maxRetries: 0,
+      };
+
+      const emptyMapExecutor = new SettlementExecutor(
+        emptyMapConfig,
+        mockAccountManager,
+        mockPaymentChannelSDK,
+        mockSettlementMonitor,
+        logger
+      );
+
+      mockPaymentChannelSDK.getMyChannels.mockResolvedValue([]);
+
+      const event: SettlementTriggerEvent = {
+        peerId: testPeerId,
+        tokenId: testTokenId,
+        currentBalance: testCurrentBalance,
+        threshold: testThreshold,
+        exceedsBy: testCurrentBalance - testThreshold,
+        timestamp: new Date(),
+      };
+
+      emptyMapExecutor.start();
+      const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
+      handler(event);
+      await emptyMapExecutor.stop();
+
+      // Settlement should fail because peer address is not in the map
+      expect(mockSettlementMonitor.markSettlementCompleted).not.toHaveBeenCalled();
+      expect(mockPaymentChannelSDK.openChannel).not.toHaveBeenCalled();
+    });
+
+    it('should succeed after peer address is dynamically added to shared peerIdToAddressMap', async () => {
+      // Shared mutable map — starts empty, then gets populated (simulating ClaimReceiver write)
+      const sharedMap = new Map<string, string>();
+      const dynamicConfig = {
+        ...config,
+        peerIdToAddressMap: sharedMap,
+      };
+
+      // Simulate ClaimReceiver dynamically registering the peer address
+      sharedMap.set(testPeerId, testPeerAddress);
+
+      mockPaymentChannelSDK.getMyChannels.mockResolvedValue([]);
+
+      const dynamicExecutor = new SettlementExecutor(
+        dynamicConfig,
+        mockAccountManager,
+        mockPaymentChannelSDK,
+        mockSettlementMonitor,
+        logger
+      );
+
+      const event: SettlementTriggerEvent = {
+        peerId: testPeerId,
+        tokenId: testTokenId,
+        currentBalance: testCurrentBalance,
+        threshold: testThreshold,
+        exceedsBy: testCurrentBalance - testThreshold,
+        timestamp: new Date(),
+      };
+
+      dynamicExecutor.start();
+      const handler = (mockSettlementMonitor.on as jest.Mock).mock.calls[0][1];
+      handler(event);
+      await dynamicExecutor.stop();
+
+      // Settlement should succeed with the dynamically added address
+      expect(mockPaymentChannelSDK.openChannel).toHaveBeenCalledWith(
+        testPeerAddress,
+        testTokenAddress,
+        dynamicConfig.defaultSettlementTimeout,
+        testCurrentBalance * BigInt(dynamicConfig.initialDepositMultiplier)
+      );
+      expect(mockSettlementMonitor.markSettlementCompleted).toHaveBeenCalledWith(
+        testPeerId,
+        testTokenId
+      );
+    });
+  });
+
   describe('getSettlementState', () => {
     it('should delegate to settlementMonitor.getSettlementState', () => {
       mockSettlementMonitor.getSettlementState.mockReturnValue(SettlementState.SETTLEMENT_PENDING);
