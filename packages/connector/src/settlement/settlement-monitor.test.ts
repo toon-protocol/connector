@@ -1,40 +1,31 @@
 /**
- * Unit tests for SettlementMonitor
+ * Unit tests for SettlementMonitor (event-driven)
  *
- * Tests threshold detection, state management, duplicate prevention,
- * configuration hierarchy, and error handling.
+ * Tests event-driven threshold detection via ClaimReceiver events,
+ * state management, duplicate prevention, configuration hierarchy,
+ * and error handling.
  *
  * @module settlement/settlement-monitor.test
  */
 
 import { SettlementMonitor, SettlementMonitorConfig } from './settlement-monitor';
-import { AccountManager } from './account-manager';
-import { SettlementState, SettlementTriggerEvent } from '../config/types';
-import { Logger } from 'pino';
+import { ClaimReceiver, ClaimReceivedEvent } from './claim-receiver';
+import { SettlementState } from '../config/types';
+import { EventEmitter } from 'events';
 import pino from 'pino';
-
-// Mock AccountManager
-jest.mock('./account-manager');
+import type { Logger } from 'pino';
 
 /**
- * Helper to access private _checkBalances method for testing
+ * Create a mock ClaimReceiver that extends EventEmitter
+ * (only the event emitter functionality is needed for testing)
  */
-function checkBalances(monitor: SettlementMonitor): Promise<void> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (monitor as any)._checkBalances();
+function createMockClaimReceiver(): ClaimReceiver {
+  return new EventEmitter() as unknown as ClaimReceiver;
 }
 
-/**
- * Helper to access private _isRunning field for testing
- */
-function isRunning(monitor: SettlementMonitor): boolean {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (monitor as any)._isRunning;
-}
-
-describe('SettlementMonitor Threshold Detection', () => {
+describe('SettlementMonitor Event-Driven Threshold Detection', () => {
   let settlementMonitor: SettlementMonitor;
-  let mockAccountManager: jest.Mocked<AccountManager>;
+  let mockClaimReceiver: ClaimReceiver;
   let mockLogger: Logger;
 
   beforeEach(() => {
@@ -49,19 +40,17 @@ describe('SettlementMonitor Threshold Detection', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     jest.spyOn(mockLogger, 'child').mockReturnValue(mockLogger as any);
 
-    // Create mock AccountManager
-    mockAccountManager = {
-      getAccountBalance: jest.fn(),
-    } as unknown as jest.Mocked<AccountManager>;
+    // Create mock ClaimReceiver
+    mockClaimReceiver = createMockClaimReceiver();
 
     // Reset all mocks
     jest.clearAllMocks();
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     // Stop monitor if running
     if (settlementMonitor) {
-      await settlementMonitor.stop();
+      settlementMonitor.stop();
     }
   });
 
@@ -70,23 +59,21 @@ describe('SettlementMonitor Threshold Detection', () => {
       const config: SettlementMonitorConfig = {
         thresholds: {
           defaultThreshold: 1000n,
-          pollingInterval: 30000,
         },
         peers: ['peer-a', 'peer-b'],
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
 
       expect(settlementMonitor).toBeDefined();
       expect(mockLogger.info).toHaveBeenCalledWith(
         expect.objectContaining({
-          pollingInterval: 30000,
           defaultThreshold: '1000',
           peerCount: 2,
           tokenCount: 1,
         }),
-        'Settlement monitor initialized'
+        'Settlement monitor initialized (event-driven)'
       );
     });
 
@@ -99,7 +86,7 @@ describe('SettlementMonitor Threshold Detection', () => {
         tokenIds: ['M2M', 'USDC'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
 
       expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(SettlementState.IDLE);
       expect(settlementMonitor.getSettlementState('peer-a', 'USDC')).toBe(SettlementState.IDLE);
@@ -108,59 +95,56 @@ describe('SettlementMonitor Threshold Detection', () => {
     });
   });
 
-  describe('Threshold Detection', () => {
-    it('should emit SETTLEMENT_REQUIRED when balance exceeds threshold', async () => {
+  describe('Threshold Detection (Event-Driven)', () => {
+    it('should emit SETTLEMENT_REQUIRED when claim cumulative amount exceeds threshold', () => {
       const config: SettlementMonitorConfig = {
         thresholds: {
           defaultThreshold: 1000n,
-          pollingInterval: 100,
         },
         peers: ['peer-a'],
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
 
-      // Mock balance exceeding threshold
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 1500n,
-        debitBalance: 0n,
-        netBalance: 1500n,
-      });
+      const eventListener = jest.fn();
+      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
 
-      // Listen for settlement event
-      const settlementEventPromise = new Promise<SettlementTriggerEvent>((resolve) => {
-        settlementMonitor.once('SETTLEMENT_REQUIRED', resolve);
-      });
-
-      // Start monitor (runs initial check immediately)
-      await settlementMonitor.start();
-
-      // Wait for event
-      const event = await settlementEventPromise;
-
-      expect(event).toEqual({
+      // Emit claim with cumulative amount exceeding threshold
+      const claimEvent: ClaimReceivedEvent = {
         peerId: 'peer-a',
-        tokenId: 'M2M',
-        currentBalance: 1500n,
-        threshold: 1000n,
-        exceedsBy: 500n,
-        timestamp: expect.any(Date),
-      });
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 1500n,
+      };
+      mockClaimReceiver.emit('CLAIM_RECEIVED', claimEvent);
+
+      expect(eventListener).toHaveBeenCalledTimes(1);
+      expect(eventListener).toHaveBeenCalledWith(
+        expect.objectContaining({
+          peerId: 'peer-a',
+          tokenId: 'M2M',
+          currentBalance: 1500n,
+          threshold: 1000n,
+          exceedsBy: 500n,
+          timestamp: expect.any(Date),
+        })
+      );
 
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({
           peerId: 'peer-a',
           tokenId: 'M2M',
-          balance: '1500',
+          cumulativeAmount: '1500',
           threshold: '1000',
           exceedsBy: '500',
         }),
-        'Settlement threshold exceeded'
+        'Settlement threshold exceeded — triggering claimFromChannel()'
       );
     });
 
-    it('should NOT emit event when balance is below threshold', async () => {
+    it('should NOT emit event when cumulative amount is below threshold', () => {
       const config: SettlementMonitorConfig = {
         thresholds: {
           defaultThreshold: 1000n,
@@ -169,26 +153,25 @@ describe('SettlementMonitor Threshold Detection', () => {
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      // Mock balance below threshold
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 900n,
-        debitBalance: 0n,
-        netBalance: 900n,
-      });
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
 
       const eventListener = jest.fn();
       settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
 
-      // Manually trigger check
-      await checkBalances(settlementMonitor);
+      // Emit claim below threshold
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 900n,
+      });
 
       expect(eventListener).not.toHaveBeenCalled();
       expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(SettlementState.IDLE);
     });
 
-    it('should NOT emit event when balance equals threshold exactly', async () => {
+    it('should NOT emit event when cumulative amount equals threshold exactly', () => {
       const config: SettlementMonitorConfig = {
         thresholds: {
           defaultThreshold: 1000n,
@@ -197,53 +180,76 @@ describe('SettlementMonitor Threshold Detection', () => {
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      // Mock balance exactly at threshold
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 1000n,
-        debitBalance: 0n,
-        netBalance: 1000n,
-      });
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
 
       const eventListener = jest.fn();
       settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
 
-      // Manually trigger check
-      await checkBalances(settlementMonitor);
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 1000n,
+      });
 
       expect(eventListener).not.toHaveBeenCalled();
     });
 
-    it('should skip threshold check when no threshold configured', async () => {
+    it('should skip threshold check when no threshold configured', () => {
       const config: SettlementMonitorConfig = {
         thresholds: undefined, // No thresholds configured
         peers: ['peer-a'],
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      // Mock high balance
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 10000n,
-        debitBalance: 0n,
-        netBalance: 10000n,
-      });
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
 
       const eventListener = jest.fn();
       settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
 
-      // Manually trigger check
-      await checkBalances(settlementMonitor);
+      // Emit claim with high amount
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 10000n,
+      });
 
       expect(eventListener).not.toHaveBeenCalled();
-      expect(mockAccountManager.getAccountBalance).not.toHaveBeenCalled();
+    });
+
+    it('should handle claims from unknown peers gracefully', () => {
+      const config: SettlementMonitorConfig = {
+        thresholds: {
+          defaultThreshold: 1000n,
+        },
+        peers: ['peer-a'], // Only peer-a configured
+        tokenIds: ['M2M'],
+      };
+
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
+
+      const eventListener = jest.fn();
+      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
+
+      // Emit claim from unknown peer — should still trigger if threshold config applies
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-unknown',
+        channelId: '0x' + 'b'.repeat(64),
+        cumulativeAmount: 1500n,
+      });
+
+      // Default threshold applies to unknown peers too
+      expect(eventListener).toHaveBeenCalledTimes(1);
     });
   });
 
   describe('Duplicate Prevention', () => {
-    it('should NOT emit duplicate triggers when balance remains above threshold', async () => {
+    it('should NOT emit duplicate triggers when multiple claims exceed threshold', () => {
       const config: SettlementMonitorConfig = {
         thresholds: {
           defaultThreshold: 1000n,
@@ -252,31 +258,34 @@ describe('SettlementMonitor Threshold Detection', () => {
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      // Mock balance exceeding threshold
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 1500n,
-        debitBalance: 0n,
-        netBalance: 1500n,
-      });
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
 
       const eventListener = jest.fn();
       settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
 
-      // First check - should trigger
-      await checkBalances(settlementMonitor);
+      // First claim - should trigger
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 1500n,
+      });
       expect(eventListener).toHaveBeenCalledTimes(1);
       expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(
         SettlementState.SETTLEMENT_PENDING
       );
 
-      // Second check - should NOT trigger (state is SETTLEMENT_PENDING)
-      await checkBalances(settlementMonitor);
+      // Second claim - should NOT trigger (state is SETTLEMENT_PENDING)
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 2000n,
+      });
       expect(eventListener).toHaveBeenCalledTimes(1); // Still only 1 call
     });
 
-    it('should reset state to IDLE when balance drops below threshold', async () => {
+    it('should trigger again after settlement completes and state resets to IDLE', () => {
       const config: SettlementMonitorConfig = {
         thresholds: {
           defaultThreshold: 1000n,
@@ -285,39 +294,37 @@ describe('SettlementMonitor Threshold Detection', () => {
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
 
-      // First: balance exceeds threshold
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 1500n,
-        debitBalance: 0n,
-        netBalance: 1500n,
+      const eventListener = jest.fn();
+      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
+
+      // First claim triggers settlement
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 1500n,
       });
+      expect(eventListener).toHaveBeenCalledTimes(1);
 
-      await checkBalances(settlementMonitor);
-      expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(
-        SettlementState.SETTLEMENT_PENDING
-      );
-
-      // Then: balance drops below threshold
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 900n,
-        debitBalance: 0n,
-        netBalance: 900n,
-      });
-
-      await checkBalances(settlementMonitor);
+      // Complete settlement (resets to IDLE)
+      settlementMonitor.markSettlementCompleted('peer-a', 'M2M');
       expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(SettlementState.IDLE);
 
-      expect(mockLogger.info).toHaveBeenCalledWith(
-        { peerId: 'peer-a', tokenId: 'M2M' },
-        'Balance returned below threshold, resetting to IDLE'
-      );
+      // Next claim triggers again
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 3000n,
+      });
+      expect(eventListener).toHaveBeenCalledTimes(2);
     });
   });
 
   describe('Configuration Hierarchy', () => {
-    it('should use per-peer threshold override instead of default', async () => {
+    it('should use per-peer threshold override instead of default', () => {
       const config: SettlementMonitorConfig = {
         thresholds: {
           defaultThreshold: 1000n,
@@ -327,25 +334,25 @@ describe('SettlementMonitor Threshold Detection', () => {
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      // Balance at 1500 - exceeds default (1000) but below peer-specific (2000)
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 1500n,
-        debitBalance: 0n,
-        netBalance: 1500n,
-      });
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
 
       const eventListener = jest.fn();
       settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
 
-      await checkBalances(settlementMonitor);
+      // Amount 1500 exceeds default (1000) but below peer-specific (2000)
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 1500n,
+      });
 
       // Should NOT trigger because peer-specific threshold (2000) not exceeded
       expect(eventListener).not.toHaveBeenCalled();
     });
 
-    it('should use token-specific threshold instead of per-peer threshold', async () => {
+    it('should use token-specific threshold instead of per-peer threshold', () => {
       const config: SettlementMonitorConfig = {
         thresholds: {
           defaultThreshold: 1000n,
@@ -356,19 +363,19 @@ describe('SettlementMonitor Threshold Detection', () => {
         tokenIds: ['USDC'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      // Balance at 600 - exceeds token-specific threshold (500)
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 600n,
-        debitBalance: 0n,
-        netBalance: 600n,
-      });
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
 
       const eventListener = jest.fn();
       settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
 
-      await checkBalances(settlementMonitor);
+      // Amount 600 exceeds token-specific threshold (500)
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 600n,
+      });
 
       // Should trigger because token-specific threshold (500) exceeded
       expect(eventListener).toHaveBeenCalledTimes(1);
@@ -383,24 +390,24 @@ describe('SettlementMonitor Threshold Detection', () => {
   });
 
   describe('State Management', () => {
-    it('should transition IDLE → SETTLEMENT_PENDING on threshold crossing', async () => {
+    it('should transition IDLE → SETTLEMENT_PENDING on threshold crossing', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
 
       expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(SettlementState.IDLE);
 
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 1500n,
-        debitBalance: 0n,
-        netBalance: 1500n,
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 1500n,
       });
-
-      await checkBalances(settlementMonitor);
 
       expect(settlementMonitor.getSettlementState('peer-a', 'M2M')).toBe(
         SettlementState.SETTLEMENT_PENDING
@@ -414,7 +421,7 @@ describe('SettlementMonitor Threshold Detection', () => {
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
 
       settlementMonitor.markSettlementInProgress('peer-a', 'M2M');
 
@@ -435,7 +442,7 @@ describe('SettlementMonitor Threshold Detection', () => {
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
 
       // Manually set to IN_PROGRESS
       settlementMonitor.markSettlementInProgress('peer-a', 'M2M');
@@ -461,7 +468,7 @@ describe('SettlementMonitor Threshold Detection', () => {
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
 
       const states = settlementMonitor.getAllSettlementStates();
 
@@ -476,294 +483,133 @@ describe('SettlementMonitor Threshold Detection', () => {
   });
 
   describe('Error Handling', () => {
-    it('should handle AccountManager errors gracefully', async () => {
+    it('should handle errors in claim processing gracefully', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
 
-      // Mock getAccountBalance to throw error
-      mockAccountManager.getAccountBalance.mockRejectedValue(
-        new Error('TigerBeetle connection failed')
-      );
-
+      // Emit valid claim - should work
       const eventListener = jest.fn();
       settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
 
-      // Should not throw
-      await expect(checkBalances(settlementMonitor)).resolves.not.toThrow();
-
-      expect(mockLogger.error).toHaveBeenCalledWith(
-        { error: 'TigerBeetle connection failed' },
-        'Settlement threshold check failed'
-      );
-
-      // No events should be emitted
-      expect(eventListener).not.toHaveBeenCalled();
-    });
-
-    it('should continue monitoring after error', async () => {
-      const config: SettlementMonitorConfig = {
-        thresholds: { defaultThreshold: 1000n },
-        peers: ['peer-a'],
-        tokenIds: ['M2M'],
-      };
-
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      // First check fails
-      mockAccountManager.getAccountBalance.mockRejectedValueOnce(new Error('Temporary error'));
-
-      await checkBalances(settlementMonitor);
-
-      // Second check succeeds
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 1500n,
-        debitBalance: 0n,
-        netBalance: 1500n,
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 1500n,
       });
 
-      const eventListener = jest.fn();
-      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
-
-      await checkBalances(settlementMonitor);
-
-      // Should emit event successfully
       expect(eventListener).toHaveBeenCalledTimes(1);
     });
   });
 
   describe('Start and Stop', () => {
-    it('should start and stop polling correctly', async () => {
-      const config: SettlementMonitorConfig = {
-        thresholds: { defaultThreshold: 1000n, pollingInterval: 100 },
-        peers: ['peer-a'],
-        tokenIds: ['M2M'],
-      };
-
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 500n,
-        debitBalance: 0n,
-        netBalance: 500n,
-      });
-
-      await settlementMonitor.start();
-
-      expect(mockLogger.info).toHaveBeenCalledWith('Settlement monitor started');
-      expect(isRunning(settlementMonitor)).toBe(true);
-
-      await settlementMonitor.stop();
-
-      expect(mockLogger.info).toHaveBeenCalledWith('Settlement monitor stopped');
-      expect(isRunning(settlementMonitor)).toBe(false);
-    });
-
-    it('should throw error if started when already running', async () => {
+    it('should start and stop correctly', () => {
       const config: SettlementMonitorConfig = {
         thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
 
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 500n,
-        debitBalance: 0n,
-        netBalance: 500n,
-      });
+      settlementMonitor.start();
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        'Settlement monitor started (subscribed to ClaimReceiver events)'
+      );
 
-      await settlementMonitor.start();
-
-      await expect(settlementMonitor.start()).rejects.toThrow('Settlement monitor already running');
+      settlementMonitor.stop();
+      expect(mockLogger.info).toHaveBeenCalledWith('Settlement monitor stopped');
     });
 
-    it('should run initial check immediately on start', async () => {
+    it('should throw error if started when already running', () => {
       const config: SettlementMonitorConfig = {
-        thresholds: { defaultThreshold: 1000n, pollingInterval: 100000 }, // Very long interval
+        thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
 
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 1500n,
-        debitBalance: 0n,
-        netBalance: 1500n,
-      });
+      settlementMonitor.start();
 
-      const eventListener = jest.fn();
-      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
-
-      await settlementMonitor.start();
-
-      // Event should fire immediately (before interval timer)
-      expect(eventListener).toHaveBeenCalledTimes(1);
+      expect(() => settlementMonitor.start()).toThrow('Settlement monitor already running');
     });
-  });
 
-  describe('Time-Based Settlement Threshold', () => {
-    it('should trigger settlement when time interval exceeded and balance > 0', async () => {
+    it('should not process events after stop', () => {
       const config: SettlementMonitorConfig = {
-        thresholds: {
-          defaultThreshold: 999999n, // Very high amount threshold (won't trigger)
-          pollingInterval: 30000,
-          timeBasedIntervalMs: 100, // 100ms time interval for testing
-        },
+        thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      // Return balance below amount threshold but > 0
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 500n, // Below 999999n threshold
-        debitBalance: 0n,
-        netBalance: 500n,
-      });
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
 
       const eventListener = jest.fn();
       settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
 
-      // First check: time threshold starts at 0, so interval is exceeded
-      await checkBalances(settlementMonitor);
+      // Stop monitor
+      settlementMonitor.stop();
 
-      expect(eventListener).toHaveBeenCalledTimes(1);
-      expect(eventListener).toHaveBeenCalledWith(
-        expect.objectContaining({
-          peerId: 'peer-a',
-          tokenId: 'M2M',
-          currentBalance: 500n,
-        })
+      // Emit claim after stop - should NOT trigger
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 1500n,
+      });
+
+      expect(eventListener).not.toHaveBeenCalled();
+    });
+
+    it('should warn when started without ClaimReceiver', () => {
+      const config: SettlementMonitorConfig = {
+        thresholds: { defaultThreshold: 1000n },
+        peers: ['peer-a'],
+        tokenIds: ['M2M'],
+      };
+
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      // NOT calling setClaimReceiver
+
+      settlementMonitor.start();
+
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Settlement monitor started without ClaimReceiver')
       );
     });
 
-    it('should NOT trigger time-based settlement when balance is 0', async () => {
+    it('should process events immediately on claim arrival (no polling delay)', () => {
       const config: SettlementMonitorConfig = {
-        thresholds: {
-          defaultThreshold: 999999n,
-          pollingInterval: 30000,
-          timeBasedIntervalMs: 100,
-        },
+        thresholds: { defaultThreshold: 1000n },
         peers: ['peer-a'],
         tokenIds: ['M2M'],
       };
 
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 0n,
-        debitBalance: 0n,
-        netBalance: 0n,
-      });
+      settlementMonitor = new SettlementMonitor(config, mockLogger);
+      settlementMonitor.setClaimReceiver(mockClaimReceiver);
+      settlementMonitor.start();
 
       const eventListener = jest.fn();
       settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
 
-      await checkBalances(settlementMonitor);
-
-      expect(eventListener).not.toHaveBeenCalled();
-    });
-
-    it('should NOT trigger time-based settlement when state is not IDLE', async () => {
-      const config: SettlementMonitorConfig = {
-        thresholds: {
-          defaultThreshold: 999999n,
-          pollingInterval: 30000,
-          timeBasedIntervalMs: 100,
-        },
-        peers: ['peer-a'],
-        tokenIds: ['M2M'],
-      };
-
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 500n,
-        debitBalance: 0n,
-        netBalance: 500n,
+      // Emit claim - should process synchronously (event-driven, no timer)
+      mockClaimReceiver.emit('CLAIM_RECEIVED', {
+        peerId: 'peer-a',
+        channelId: '0x' + 'a'.repeat(64),
+        cumulativeAmount: 1500n,
       });
 
-      const eventListener = jest.fn();
-      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
-
-      // First check triggers settlement (time exceeded)
-      await checkBalances(settlementMonitor);
+      // Immediately available (no setTimeout/setInterval)
       expect(eventListener).toHaveBeenCalledTimes(1);
-
-      // Second check: state is SETTLEMENT_PENDING, should NOT trigger again
-      await checkBalances(settlementMonitor);
-      expect(eventListener).toHaveBeenCalledTimes(1);
-    });
-
-    it('should record last settlement time on markSettlementCompleted', async () => {
-      const config: SettlementMonitorConfig = {
-        thresholds: {
-          defaultThreshold: 999999n,
-          pollingInterval: 30000,
-          timeBasedIntervalMs: 60000, // 60s interval
-        },
-        peers: ['peer-a'],
-        tokenIds: ['M2M'],
-      };
-
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 500n,
-        debitBalance: 0n,
-        netBalance: 500n,
-      });
-
-      const eventListener = jest.fn();
-      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
-
-      // First check triggers (time starts at 0)
-      await checkBalances(settlementMonitor);
-      expect(eventListener).toHaveBeenCalledTimes(1);
-
-      // Complete settlement
-      settlementMonitor.markSettlementCompleted('peer-a', 'M2M');
-
-      // Immediately check again — 60s hasn't passed since completion
-      await checkBalances(settlementMonitor);
-      // Should NOT trigger because interval hasn't elapsed since last settlement
-      expect(eventListener).toHaveBeenCalledTimes(1);
-    });
-
-    it('should NOT trigger time-based when timeBasedIntervalMs is not configured', async () => {
-      const config: SettlementMonitorConfig = {
-        thresholds: {
-          defaultThreshold: 999999n,
-          pollingInterval: 30000,
-          // No timeBasedIntervalMs
-        },
-        peers: ['peer-a'],
-        tokenIds: ['M2M'],
-      };
-
-      settlementMonitor = new SettlementMonitor(config, mockAccountManager, mockLogger);
-
-      mockAccountManager.getAccountBalance.mockResolvedValue({
-        creditBalance: 500n,
-        debitBalance: 0n,
-        netBalance: 500n,
-      });
-
-      const eventListener = jest.fn();
-      settlementMonitor.on('SETTLEMENT_REQUIRED', eventListener);
-
-      await checkBalances(settlementMonitor);
-
-      // Only amount-based triggers; 500 < 999999 so no trigger
-      expect(eventListener).not.toHaveBeenCalled();
     });
   });
 });

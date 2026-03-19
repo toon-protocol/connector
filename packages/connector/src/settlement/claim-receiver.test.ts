@@ -7,7 +7,7 @@
  * Epic 30 Story 30.4: Removed XRP/Aptos claim handling tests (EVM-only settlement).
  */
 
-import { ClaimReceiver, ERRORS } from './claim-receiver';
+import { ClaimReceiver, ClaimReceivedEvent, ERRORS } from './claim-receiver';
 import type { Database, Statement } from 'better-sqlite3';
 import type { Logger } from 'pino';
 import type { BTPServer } from '../btp/btp-server';
@@ -150,6 +150,39 @@ describe('ClaimReceiver', () => {
         null,
         null
       );
+    });
+
+    it('should emit CLAIM_RECEIVED event after successful verification', async () => {
+      mockPaymentChannelSDK.verifyBalanceProof.mockResolvedValue(true);
+      mockStatement.get.mockReturnValue(undefined); // No previous claim
+
+      const claimReceivedListener = jest.fn();
+      claimReceiver.on('CLAIM_RECEIVED', claimReceivedListener);
+
+      claimReceiver.registerWithBTPServer(mockBTPServer);
+      await btpMessageHandler!('peer-bob', btpMessage);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // Verify CLAIM_RECEIVED event emitted with correct data
+      expect(claimReceivedListener).toHaveBeenCalledTimes(1);
+      const emittedEvent: ClaimReceivedEvent = claimReceivedListener.mock.calls[0][0];
+      expect(emittedEvent.peerId).toBe('peer-bob');
+      expect(emittedEvent.channelId).toBe(validEVMClaim.channelId);
+      expect(emittedEvent.cumulativeAmount).toBe(BigInt(validEVMClaim.transferredAmount));
+    });
+
+    it('should NOT emit CLAIM_RECEIVED event when verification fails', async () => {
+      mockPaymentChannelSDK.verifyBalanceProof.mockResolvedValue(false);
+
+      const claimReceivedListener = jest.fn();
+      claimReceiver.on('CLAIM_RECEIVED', claimReceivedListener);
+
+      claimReceiver.registerWithBTPServer(mockBTPServer);
+      await btpMessageHandler!('peer-bob', btpMessage);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // CLAIM_RECEIVED should NOT be emitted for failed verification
+      expect(claimReceivedListener).not.toHaveBeenCalled();
     });
 
     it('should reject EVM claim with invalid EIP-712 signature', async () => {

@@ -63,7 +63,6 @@ describe('SettlementExecutor', () => {
     ) as jest.Mocked<PaymentChannelSDK>;
     mockSettlementMonitor = new SettlementMonitor(
       {} as any,
-      {} as any,
       {} as any
     ) as jest.Mocked<SettlementMonitor>;
     /* eslint-enable @typescript-eslint/no-explicit-any */

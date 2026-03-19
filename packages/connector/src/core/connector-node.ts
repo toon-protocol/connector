@@ -51,6 +51,8 @@ import { ChannelManager } from '../settlement/channel-manager';
 import { SettlementExecutor } from '../settlement/settlement-executor';
 import { AccountManager } from '../settlement/account-manager';
 import { SettlementMonitor } from '../settlement/settlement-monitor';
+import { ClaimReceiver } from '../settlement/claim-receiver';
+import { initializeClaimReceiverSchema } from '../settlement/claim-receiver-db-schema';
 import { KeyManager } from '../security/key-manager';
 import { requireOptional } from '../utils/optional-require';
 import { TigerBeetleClient } from '../settlement/tigerbeetle-client';
@@ -710,30 +712,24 @@ export class ConnectorNode implements HealthStatusProvider {
           const settlementThreshold = BigInt(
             this._config.settlementInfra?.threshold ?? process.env.SETTLEMENT_THRESHOLD ?? '1000000'
           );
-          const settlementPollingInterval =
-            this._config.settlementInfra?.pollingIntervalMs ??
-            parseInt(process.env.SETTLEMENT_POLLING_INTERVAL ?? '30000', 10);
 
           this._logger.info(
             {
               event: 'settlement_monitor_config',
               peerIds,
               threshold: settlementThreshold.toString(),
-              pollingInterval: settlementPollingInterval,
             },
-            'Initializing settlement monitor with peer list'
+            'Initializing event-driven settlement monitor with peer list'
           );
 
           const settlementMonitor = new SettlementMonitor(
             {
               thresholds: {
                 defaultThreshold: settlementThreshold,
-                pollingInterval: settlementPollingInterval,
               },
               peers: peerIds,
               tokenIds: [this._defaultSettlementTokenId],
             },
-            accountManager,
             this._logger
           );
           this._settlementMonitor = settlementMonitor;
@@ -765,27 +761,17 @@ export class ConnectorNode implements HealthStatusProvider {
             'Automatic settlement execution enabled'
           );
 
-          // Start monitoring after a short delay to ensure AccountManager is fully initialized
-          setTimeout(async () => {
-            try {
-              await settlementMonitor.start();
-              this._logger.info(
-                {
-                  event: 'settlement_monitor_started',
-                  threshold: settlementThreshold.toString(),
-                  peerCount: peerIds.length,
-                  pollingInterval: settlementPollingInterval,
-                },
-                'Settlement threshold monitoring started'
-              );
-            } catch (error) {
-              const errorMessage = error instanceof Error ? error.message : String(error);
-              this._logger.error(
-                { event: 'settlement_monitor_start_failed', error: errorMessage },
-                'Failed to start settlement monitor'
-              );
-            }
-          }, 5000); // 5 second delay
+          // Start event-driven settlement monitoring
+          // ClaimReceiver will be wired below after PerPacketClaimService setup
+          settlementMonitor.start();
+          this._logger.info(
+            {
+              event: 'settlement_monitor_started',
+              threshold: settlementThreshold.toString(),
+              peerCount: peerIds.length,
+            },
+            'Event-driven settlement monitoring started'
+          );
 
           this._channelManager = new ChannelManager(
             {
@@ -871,6 +857,51 @@ export class ConnectorNode implements HealthStatusProvider {
             { event: 'inbound_claim_validator_enabled' },
             'Inbound claim validator wired to BTP server'
           );
+
+          // Wire ClaimReceiver for event-driven settlement monitoring
+          // ClaimReceiver validates inbound claims and emits CLAIM_RECEIVED events
+          // that SettlementMonitor uses to trigger on-chain claimFromChannel()
+          if (this._paymentChannelSDK) {
+            try {
+              const BetterSqlite3Module = await requireOptional<{
+                default: new (path: string) => import('better-sqlite3').Database;
+              }>('better-sqlite3', 'claim receiver persistence');
+              const BetterSqlite3 = BetterSqlite3Module.default;
+
+              const receivedClaimDbPath = `./data/received-claims-${this._config.nodeId}.db`;
+              const receivedClaimDb = new BetterSqlite3(receivedClaimDbPath);
+              initializeClaimReceiverSchema(receivedClaimDb);
+
+              const claimReceiver = new ClaimReceiver(
+                receivedClaimDb,
+                this._paymentChannelSDK,
+                this._logger,
+                this._channelManager ?? undefined
+              );
+
+              // Register with BTP server to receive claim messages
+              claimReceiver.registerWithBTPServer(this._btpServer);
+
+              // Wire to SettlementMonitor for event-driven threshold detection
+              if (this._settlementMonitor) {
+                this._settlementMonitor.setClaimReceiver(claimReceiver);
+                // Restart monitor to subscribe to the new ClaimReceiver
+                this._settlementMonitor.stop();
+                this._settlementMonitor.start();
+              }
+
+              this._logger.info(
+                { event: 'claim_receiver_enabled' },
+                'ClaimReceiver wired to BTP server and SettlementMonitor'
+              );
+            } catch (error) {
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              this._logger.error(
+                { event: 'claim_receiver_init_failed', error: errorMessage },
+                'Failed to initialize ClaimReceiver'
+              );
+            }
+          }
 
           // Wire AccountManager into PacketHandler for settlement recording
           if (accountManager) {

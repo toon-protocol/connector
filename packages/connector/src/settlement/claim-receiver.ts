@@ -10,6 +10,7 @@
  * @see Epic 17 - BTP Off-Chain Claim Exchange Protocol
  */
 
+import { EventEmitter } from 'events';
 import type { Database } from 'better-sqlite3';
 import type { Logger } from 'pino';
 import type { BTPServer } from '../btp/btp-server';
@@ -24,6 +25,19 @@ import {
   isEVMClaim,
   validateClaimMessage,
 } from '../btp/btp-claim-types';
+
+/**
+ * Event emitted after a claim is successfully validated and persisted.
+ * Used by SettlementMonitor to trigger event-driven settlement checks.
+ */
+export interface ClaimReceivedEvent {
+  /** Peer ID of the claim sender */
+  peerId: string;
+  /** Payment channel ID */
+  channelId: string;
+  /** Cumulative transferred amount from the claim (bigint) */
+  cumulativeAmount: bigint;
+}
 
 /**
  * Error message constants for claim verification
@@ -71,13 +85,15 @@ export interface ClaimVerificationResult {
  * claimReceiver.registerWithBTPServer(btpServer);
  * ```
  */
-export class ClaimReceiver {
+export class ClaimReceiver extends EventEmitter {
   constructor(
     private readonly db: Database,
     private readonly evmChannelSDK: PaymentChannelSDK,
     private readonly logger: Logger,
     private readonly channelManager?: ChannelManager
-  ) {}
+  ) {
+    super();
+  }
 
   /**
    * Register claim message handler with BTP server
@@ -141,6 +157,20 @@ export class ClaimReceiver {
       if (verificationResult.valid) {
         this._persistReceivedClaim(peerId, claimMessage, true);
         childLogger.info({ messageId }, 'Claim verified and stored');
+
+        // Emit event for event-driven settlement monitoring
+        if (isEVMClaim(claimMessage)) {
+          const event: ClaimReceivedEvent = {
+            peerId,
+            channelId: claimMessage.channelId,
+            cumulativeAmount: BigInt(claimMessage.transferredAmount),
+          };
+          this.emit('CLAIM_RECEIVED', event);
+          childLogger.debug(
+            { channelId: event.channelId, cumulativeAmount: event.cumulativeAmount.toString() },
+            'CLAIM_RECEIVED event emitted'
+          );
+        }
       } else {
         this._persistReceivedClaim(peerId, claimMessage, false);
         childLogger.warn(

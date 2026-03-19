@@ -1,13 +1,14 @@
 /**
  * Settlement Monitor
  *
- * Monitors peer account balances and triggers settlement events when
- * balances exceed configured thresholds. Enables proactive settlement
- * BEFORE credit limits are reached, preventing packet rejections.
+ * Event-driven settlement monitor that subscribes to ClaimReceiver events
+ * and triggers settlement when cumulative claim amounts exceed configured
+ * thresholds. Replaces the previous polling-based approach with immediate
+ * reaction to incoming claims.
  *
  * **Threshold Detection Strategy:**
- * - Periodic polling of AccountManager balance queries (default: 30s interval)
- * - Monitors creditBalance (how much peer owes us)
+ * - Subscribes to ClaimReceiver 'CLAIM_RECEIVED' events
+ * - Checks cumulative transferred amount against configured thresholds
  * - Emits SETTLEMENT_REQUIRED event on first threshold crossing
  * - Prevents duplicate triggers using state machine (IDLE → PENDING → IN_PROGRESS → IDLE)
  *
@@ -18,17 +19,17 @@
  * 4. No threshold (monitoring disabled)
  *
  * **Integration Points:**
- * - AccountManager (Story 6.3): Balance queries
- * - SettlementAPI (Story 6.7): Listens for SETTLEMENT_REQUIRED events
+ * - ClaimReceiver: Subscribes to CLAIM_RECEIVED events
+ * - SettlementExecutor: Listens for SETTLEMENT_REQUIRED events → calls claimFromChannel()
  *
  * @packageDocumentation
  */
 
 import { EventEmitter } from 'events';
 import type { Logger } from 'pino';
-import type { AccountManager } from './account-manager';
 import type { SettlementThresholdConfig, SettlementTriggerEvent } from '../config/types';
 import { SettlementState } from '../config/types';
+import type { ClaimReceiver, ClaimReceivedEvent } from './claim-receiver';
 
 /**
  * Settlement Monitor Configuration
@@ -65,61 +66,61 @@ export interface SettlementMonitorConfig {
 /**
  * Settlement Monitor
  *
- * Monitors account balances and emits settlement trigger events when
- * thresholds are exceeded. Implements state machine to prevent duplicate
- * triggers and coordinates with SettlementAPI (Story 6.7) for settlement execution.
+ * Event-driven monitor that subscribes to ClaimReceiver events and emits
+ * settlement trigger events when cumulative claim amounts exceed thresholds.
+ * Implements state machine to prevent duplicate triggers and coordinates
+ * with SettlementExecutor for on-chain claimFromChannel() execution.
  *
  * **Events:**
- * - 'SETTLEMENT_REQUIRED': Emitted when balance exceeds threshold (SettlementTriggerEvent payload)
+ * - 'SETTLEMENT_REQUIRED': Emitted when cumulative claim amount exceeds threshold (SettlementTriggerEvent payload)
  *
  * **State Transitions:**
- * - IDLE → SETTLEMENT_PENDING: Balance exceeds threshold (first crossing)
- * - SETTLEMENT_PENDING → SETTLEMENT_IN_PROGRESS: Settlement API starts execution
- * - SETTLEMENT_IN_PROGRESS → IDLE: Settlement completes and balance reduced
- * - SETTLEMENT_PENDING → IDLE: Balance drops below threshold naturally
+ * - IDLE → SETTLEMENT_PENDING: Claim amount exceeds threshold (first crossing)
+ * - SETTLEMENT_PENDING → SETTLEMENT_IN_PROGRESS: SettlementExecutor starts execution
+ * - SETTLEMENT_IN_PROGRESS → IDLE: Settlement completes (claimFromChannel() succeeds)
  *
  * @example
  * ```typescript
- * const monitor = new SettlementMonitor(config, accountManager, logger);
+ * const monitor = new SettlementMonitor(config, logger);
+ * monitor.setClaimReceiver(claimReceiver);
  *
  * // Listen for settlement triggers
  * monitor.on('SETTLEMENT_REQUIRED', async (event: SettlementTriggerEvent) => {
  *   console.log(`Settlement needed for ${event.peerId}: ${event.currentBalance} > ${event.threshold}`);
- *   await settlementAPI.executeMockSettlement(event.peerId, event.tokenId);
+ *   await settlementExecutor.claimFromChannel(event);
  * });
  *
- * // Start monitoring
- * await monitor.start();
+ * // Start monitoring (subscribes to ClaimReceiver events)
+ * monitor.start();
  *
- * // Stop monitoring
- * await monitor.stop();
+ * // Stop monitoring (unsubscribes from ClaimReceiver events)
+ * monitor.stop();
  * ```
  */
 export class SettlementMonitor extends EventEmitter {
   private readonly _config: SettlementMonitorConfig;
-  private readonly _accountManager: AccountManager;
   private readonly _logger: Logger;
   private readonly _settlementStates: Map<string, SettlementState>;
   private readonly _lastSettlementTime: Map<string, number>;
-  private _pollingIntervalId: NodeJS.Timeout | null;
+  private _claimReceiver: ClaimReceiver | null;
+  private readonly _boundHandleClaimReceived: (event: ClaimReceivedEvent) => void;
   private _isRunning: boolean;
 
   /**
    * Create a new SettlementMonitor
    *
    * @param config - Settlement monitor configuration
-   * @param accountManager - AccountManager instance for balance queries
    * @param logger - Pino logger instance
    */
-  constructor(config: SettlementMonitorConfig, accountManager: AccountManager, logger: Logger) {
+  constructor(config: SettlementMonitorConfig, logger: Logger) {
     super();
 
     this._config = config;
-    this._accountManager = accountManager;
     this._logger = logger.child({ component: 'settlement-monitor' });
     this._settlementStates = new Map();
     this._lastSettlementTime = new Map();
-    this._pollingIntervalId = null;
+    this._claimReceiver = null;
+    this._boundHandleClaimReceived = this._handleClaimReceived.bind(this);
     this._isRunning = false;
 
     // Initialize settlement states: All peers start in IDLE state
@@ -132,56 +133,63 @@ export class SettlementMonitor extends EventEmitter {
 
     this._logger.info(
       {
-        pollingInterval: this._config.thresholds?.pollingInterval ?? 30000,
         defaultThreshold: this._config.thresholds?.defaultThreshold?.toString(),
         peerCount: this._config.peers.length,
         tokenCount: this._config.tokenIds.length,
       },
-      'Settlement monitor initialized'
+      'Settlement monitor initialized (event-driven)'
     );
+  }
+
+  /**
+   * Set ClaimReceiver for event-driven settlement monitoring
+   *
+   * Must be called before start() to enable claim-driven threshold checks.
+   * When a verified claim is received, the monitor checks the cumulative
+   * amount against the settlement threshold and triggers claimFromChannel()
+   * if exceeded.
+   *
+   * @param claimReceiver - ClaimReceiver instance to subscribe to
+   */
+  setClaimReceiver(claimReceiver: ClaimReceiver): void {
+    this._claimReceiver = claimReceiver;
+    this._logger.info('ClaimReceiver set for event-driven settlement monitoring');
   }
 
   /**
    * Start settlement threshold monitoring
    *
-   * Begins periodic polling of account balances. Runs initial check
-   * immediately before starting interval timer.
+   * Subscribes to ClaimReceiver 'CLAIM_RECEIVED' events for event-driven
+   * threshold detection. No polling interval is used.
    *
    * @throws Error if monitor is already running
    */
-  async start(): Promise<void> {
+  start(): void {
     if (this._isRunning) {
       throw new Error('Settlement monitor already running');
     }
 
     this._isRunning = true;
-    this._logger.info('Settlement monitor started');
 
-    // Run initial check immediately (don't wait for first interval)
-    await this._checkBalances();
-
-    // Start polling
-    const pollingInterval = this._config.thresholds?.pollingInterval ?? 30000;
-    this._pollingIntervalId = setInterval(() => {
-      this._checkBalances().catch((error) => {
-        // Log errors but don't stop interval (handled in _checkBalances)
-        this._logger.error(
-          { error: error.message },
-          'Uncaught error in settlement threshold polling'
-        );
-      });
-    }, pollingInterval);
+    if (this._claimReceiver) {
+      this._claimReceiver.on('CLAIM_RECEIVED', this._boundHandleClaimReceived);
+      this._logger.info('Settlement monitor started (subscribed to ClaimReceiver events)');
+    } else {
+      this._logger.warn(
+        'Settlement monitor started without ClaimReceiver — no events will be processed. ' +
+          'Call setClaimReceiver() and restart to enable event-driven settlement.'
+      );
+    }
   }
 
   /**
    * Stop settlement threshold monitoring
    *
-   * Clears polling interval and stops balance checks.
+   * Unsubscribes from ClaimReceiver events.
    */
-  async stop(): Promise<void> {
-    if (this._pollingIntervalId) {
-      clearInterval(this._pollingIntervalId);
-      this._pollingIntervalId = null;
+  stop(): void {
+    if (this._claimReceiver) {
+      this._claimReceiver.off('CLAIM_RECEIVED', this._boundHandleClaimReceived);
     }
 
     this._isRunning = false;
@@ -228,140 +236,84 @@ export class SettlementMonitor extends EventEmitter {
   }
 
   /**
-   * Check all peer-token balances against thresholds
+   * Handle incoming claim event from ClaimReceiver
    *
-   * Polls AccountManager for balances and emits SETTLEMENT_REQUIRED
-   * events when thresholds are exceeded. Uses state machine to prevent
-   * duplicate triggers.
+   * Checks the cumulative transferred amount against the settlement threshold
+   * for the peer. If the threshold is exceeded and the state is IDLE, emits
+   * a SETTLEMENT_REQUIRED event which triggers SettlementExecutor to call
+   * claimFromChannel() on-chain. The channel stays open for continued use.
    *
-   * Errors are caught and logged to keep monitor running.
-   *
+   * @param event - Claim received event with cumulative amount
    * @private
    */
-  private async _checkBalances(): Promise<void> {
+  private _handleClaimReceived(event: ClaimReceivedEvent): void {
     try {
+      const { peerId, channelId, cumulativeAmount } = event;
+
       this._logger.debug(
-        { peerCount: this._config.peers.length },
-        'Checking settlement thresholds'
+        { peerId, channelId, cumulativeAmount: cumulativeAmount.toString() },
+        'Processing claim for settlement threshold check'
       );
 
-      for (const peerId of this._config.peers) {
-        for (const tokenId of this._config.tokenIds) {
-          // Get threshold for this peer-token pair
-          const threshold = this._getThresholdForPeer(peerId, tokenId);
+      // Check threshold for this peer across all configured tokenIds
+      for (const tokenId of this._config.tokenIds) {
+        const threshold = this._getThresholdForPeer(peerId, tokenId);
 
-          // Skip if no threshold configured
-          if (!threshold) {
-            continue;
-          }
+        // Skip if no threshold configured
+        if (!threshold) {
+          continue;
+        }
 
-          // Get current balance
-          const balance = await this._accountManager.getAccountBalance(peerId, tokenId);
+        const stateKey = `${peerId}:${tokenId}`;
+        const currentState = this._settlementStates.get(stateKey) ?? SettlementState.IDLE;
 
-          // Get current settlement state
-          const stateKey = `${peerId}:${tokenId}`;
-          const currentState = this._settlementStates.get(stateKey) ?? SettlementState.IDLE;
+        if (cumulativeAmount > threshold) {
+          if (currentState === SettlementState.IDLE) {
+            // Threshold crossed — trigger settlement via claimFromChannel()
+            const exceedsBy = cumulativeAmount - threshold;
 
-          // Check if creditBalance exceeds threshold
-          if (balance.creditBalance > threshold) {
-            if (currentState === SettlementState.IDLE) {
-              // First threshold crossing - trigger settlement
-              const exceedsBy = balance.creditBalance - threshold;
+            const triggerEvent: SettlementTriggerEvent = {
+              peerId,
+              tokenId,
+              currentBalance: cumulativeAmount,
+              threshold,
+              exceedsBy,
+              timestamp: new Date(),
+            };
 
-              const event: SettlementTriggerEvent = {
+            // Emit event (SettlementExecutor listens → calls claimFromChannel())
+            this.emit('SETTLEMENT_REQUIRED', triggerEvent);
+
+            // Update state to SETTLEMENT_PENDING
+            this._settlementStates.set(stateKey, SettlementState.SETTLEMENT_PENDING);
+
+            this._logger.warn(
+              {
                 peerId,
                 tokenId,
-                currentBalance: balance.creditBalance,
-                threshold,
-                exceedsBy,
-                timestamp: new Date(),
-              };
-
-              // Emit event
-              this.emit('SETTLEMENT_REQUIRED', event);
-
-              // Update state to SETTLEMENT_PENDING
-              this._settlementStates.set(stateKey, SettlementState.SETTLEMENT_PENDING);
-
-              this._logger.warn(
-                {
-                  peerId,
-                  tokenId,
-                  balance: balance.creditBalance.toString(),
-                  threshold: threshold.toString(),
-                  exceedsBy: exceedsBy.toString(),
-                },
-                'Settlement threshold exceeded'
-              );
-            } else {
-              // State is SETTLEMENT_PENDING or SETTLEMENT_IN_PROGRESS
-              // Skip to prevent duplicate triggers
-              this._logger.debug(
-                { peerId, tokenId, state: currentState },
-                'Settlement already pending/in-progress, skipping duplicate trigger'
-              );
-            }
-          } else if (balance.creditBalance <= threshold) {
-            // Balance below threshold
-            // If state is SETTLEMENT_PENDING, reset to IDLE
-            // (balance reduced naturally before settlement started)
-            // When time-based triggers are active, only auto-reset when balance
-            // reaches zero, otherwise the time-based trigger would re-fire immediately
-            const hasTimeBasedTrigger =
-              !!this._config.thresholds?.timeBasedIntervalMs && balance.creditBalance > 0n;
-            if (currentState === SettlementState.SETTLEMENT_PENDING && !hasTimeBasedTrigger) {
-              this._settlementStates.set(stateKey, SettlementState.IDLE);
-              this._logger.info(
-                { peerId, tokenId },
-                'Balance returned below threshold, resetting to IDLE'
-              );
-            }
-          }
-
-          // Time-based settlement trigger (independent of amount threshold)
-          // Re-read state in case amount-based check already triggered
-          const timeInterval = this._config.thresholds?.timeBasedIntervalMs;
-          const stateAfterAmountCheck =
-            this._settlementStates.get(stateKey) ?? SettlementState.IDLE;
-          if (
-            timeInterval &&
-            stateAfterAmountCheck === SettlementState.IDLE &&
-            balance.creditBalance > 0n
-          ) {
-            const lastTime = this._lastSettlementTime.get(stateKey) ?? 0;
-            if (Date.now() - lastTime >= timeInterval) {
-              const event: SettlementTriggerEvent = {
-                peerId,
-                tokenId,
-                currentBalance: balance.creditBalance,
-                threshold: threshold ?? 0n,
-                exceedsBy: balance.creditBalance,
-                timestamp: new Date(),
-              };
-
-              this.emit('SETTLEMENT_REQUIRED', event);
-              this._settlementStates.set(stateKey, SettlementState.SETTLEMENT_PENDING);
-
-              this._logger.info(
-                {
-                  peerId,
-                  tokenId,
-                  balance: balance.creditBalance.toString(),
-                  intervalMs: timeInterval,
-                },
-                'Time-based settlement triggered'
-              );
-            }
+                channelId,
+                cumulativeAmount: cumulativeAmount.toString(),
+                threshold: threshold.toString(),
+                exceedsBy: exceedsBy.toString(),
+              },
+              'Settlement threshold exceeded — triggering claimFromChannel()'
+            );
+          } else {
+            // State is SETTLEMENT_PENDING or SETTLEMENT_IN_PROGRESS
+            // Skip to prevent duplicate triggers
+            this._logger.debug(
+              { peerId, tokenId, state: currentState },
+              'Settlement already pending/in-progress, skipping duplicate trigger'
+            );
           }
         }
       }
     } catch (error) {
-      // Log error but don't re-throw (keep monitor running)
       this._logger.error(
         {
           error: error instanceof Error ? error.message : String(error),
         },
-        'Settlement threshold check failed'
+        'Settlement threshold check failed for claim event'
       );
     }
   }
@@ -381,7 +333,7 @@ export class SettlementMonitor extends EventEmitter {
   /**
    * Mark settlement as in progress
    *
-   * Called by SettlementAPI (Story 6.7) when settlement execution starts.
+   * Called by SettlementExecutor when settlement execution starts.
    * Transitions state from SETTLEMENT_PENDING to SETTLEMENT_IN_PROGRESS.
    *
    * @param peerId - Peer ID
@@ -397,9 +349,9 @@ export class SettlementMonitor extends EventEmitter {
   /**
    * Mark settlement as completed
    *
-   * Called by SettlementAPI (Story 6.7) when settlement completes and
-   * balance is reduced below threshold. Transitions state to IDLE,
-   * ready for next threshold crossing.
+   * Called by SettlementExecutor when claimFromChannel() completes and
+   * on-chain settlement succeeds. Transitions state to IDLE, ready for
+   * next threshold crossing.
    *
    * @param peerId - Peer ID
    * @param tokenId - Token ID
