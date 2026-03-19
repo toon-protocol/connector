@@ -1,6 +1,6 @@
 {
   "name": "connector",
-  "version": "1.22.0",
+  "version": "1.23.0",
   "private": true,
   "description": "Connector with tri-chain settlement and real-time observability",
   "workspaces": [
