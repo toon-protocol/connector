@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.23.1](https://github.com/toon-protocol/connector/compare/v1.23.0...v1.23.1) (2026-03-19)
+
+### Bug Fixes
+
+- **connector:** resolve peer EVM address from self-describing claims for settlement ([ea521ec](https://github.com/toon-protocol/connector/commit/ea521ec54ba6accb577697760c00338ca4967b44))
+
 ## [1.23.0](https://github.com/toon-protocol/connector/compare/v1.22.0...v1.23.0) (2026-03-19)
 
 ### Features
