@@ -12,7 +12,7 @@
  * @packageDocumentation
  */
 
-import { randomBytes, createHash } from 'crypto';
+import { createHash } from 'crypto';
 import { ethers } from 'ethers';
 import { ConnectorNode } from '../../src/core/connector-node';
 import { createLogger } from '../../src/utils/logger';
@@ -310,15 +310,19 @@ export function createMultiHopTestNetwork(
       destination: string,
       amount: bigint
     ): Promise<ILPFulfillPacket | ILPRejectPacket> {
-      const preimage = randomBytes(32);
-      const condition = createHash('sha256').update(preimage).digest();
+      // The payment handler adapter computes: fulfillment = SHA256(data)
+      // The packet handler validates: SHA256(fulfillment) === condition
+      // So condition must be SHA256(SHA256(data))
+      const data = Buffer.alloc(0);
+      const fulfillment = createHash('sha256').update(data).digest();
+      const condition = createHash('sha256').update(fulfillment).digest();
 
       const params: SendPacketParams = {
         destination,
         amount,
         executionCondition: condition,
         expiresAt: new Date(Date.now() + 60_000),
-        data: Buffer.alloc(0),
+        data,
       };
 
       return peers[fromPeerIndex]!.sendPacket(params);
@@ -577,15 +581,19 @@ async function waitForAllConnections(
 
 /**
  * Create a valid ILP Prepare packet for testing.
- * Generates a random preimage and computes the SHA-256 condition.
+ *
+ * The payment handler adapter computes: fulfillment = SHA256(data)
+ * The packet handler validates: SHA256(fulfillment) === condition
+ * So condition must be SHA256(SHA256(data)).
  */
 export function createTestPacketParams(
   destination: string,
   amount: bigint,
   expiryMs: number = 60_000
-): { params: SendPacketParams; preimage: Buffer } {
-  const preimage = randomBytes(32);
-  const condition = createHash('sha256').update(preimage).digest();
+): { params: SendPacketParams; fulfillment: Buffer } {
+  const data = Buffer.alloc(0);
+  const fulfillment = createHash('sha256').update(data).digest();
+  const condition = createHash('sha256').update(fulfillment).digest();
 
   return {
     params: {
@@ -593,9 +601,9 @@ export function createTestPacketParams(
       amount,
       executionCondition: condition,
       expiresAt: new Date(Date.now() + expiryMs),
-      data: Buffer.alloc(0),
+      data,
     },
-    preimage,
+    fulfillment,
   };
 }
 

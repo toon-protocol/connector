@@ -16,6 +16,7 @@ import {
   ILPRejectPacket,
   PacketType,
 } from '@toon-protocol/shared';
+import type { InboundClaimValidatorFn } from './inbound-claim-validator';
 
 /**
  * BTP peer connection metadata
@@ -47,6 +48,7 @@ export class BTPServer {
   private readonly pendingRequests: Map<number, PendingRequest> = new Map();
   private onConnectionCallback?: (peerId: string, connection: WebSocket) => void;
   private onMessageCallback?: (peerId: string, message: BTPMessage) => void;
+  private inboundClaimValidator?: InboundClaimValidatorFn;
 
   /**
    * Create BTPServer instance
@@ -181,6 +183,17 @@ export class BTPServer {
    */
   onMessage(callback: (peerId: string, message: BTPMessage) => void): void {
     this.onMessageCallback = callback;
+  }
+
+  /**
+   * Set inbound claim validator for ILP PREPARE packets.
+   * When set, every ILP PREPARE arriving via BTP must pass claim validation
+   * before being forwarded to the packet handler. This prevents unpaid writes.
+   *
+   * @param validator - Async function that returns null (valid) or ILPRejectPacket (reject)
+   */
+  setInboundClaimValidator(validator: InboundClaimValidatorFn): void {
+    this.inboundClaimValidator = validator;
   }
 
   /**
@@ -699,6 +712,41 @@ export class BTPServer {
       // Validate packet type (must be PREPARE)
       if (ilpPacket.type !== PacketType.PREPARE) {
         throw new BTPError('F00', `Expected ILP PREPARE packet, got type ${ilpPacket.type}`);
+      }
+
+      // Validate inbound claim before forwarding to packet handler.
+      // This prevents unpaid writes: packets without valid signed claims
+      // are rejected at the BTP transport layer and never reach the handler.
+      if (this.inboundClaimValidator) {
+        const rejection = await this.inboundClaimValidator(
+          messageData.protocolData,
+          ilpPacket as ILPPreparePacket,
+          peerConn.peerId
+        );
+        if (rejection) {
+          childLogger.warn(
+            {
+              event: 'btp_claim_validation_rejected',
+              peerId: peerConn.peerId,
+              destination: (ilpPacket as ILPPreparePacket).destination,
+              errorCode: rejection.code,
+              reason: rejection.message,
+            },
+            'ILP PREPARE rejected: claim validation failed'
+          );
+
+          const rejectBuffer = serializePacket(rejection);
+          const btpRejectResponse: BTPMessage = {
+            type: BTPMessageType.RESPONSE,
+            requestId: message.requestId,
+            data: {
+              protocolData: [],
+              ilpPacket: rejectBuffer,
+            },
+          };
+          peerConn.ws.send(serializeBTPMessage(btpRejectResponse));
+          return;
+        }
       }
 
       // Process packet through PacketHandler (pass peer ID for settlement tracking)

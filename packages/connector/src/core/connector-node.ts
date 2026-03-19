@@ -60,6 +60,7 @@ import {
   SENT_CLAIMS_TABLE_SCHEMA,
   SENT_CLAIMS_INDEXES,
 } from '../settlement/claim-sender-db-schema';
+import { InboundClaimValidator } from '../btp/inbound-claim-validator';
 import { promises as dns } from 'dns';
 // Import package.json for version information
 import packageJson from '../../package.json';
@@ -853,6 +854,23 @@ export class ConnectorNode implements HealthStatusProvider {
               throw error;
             }
           }
+
+          // Wire inbound claim validator to BTP server to prevent unpaid writes.
+          // Every ILP PREPARE arriving via BTP must carry a valid signed claim
+          // before reaching the packet handler / local delivery.
+          const inboundClaimValidator = new InboundClaimValidator(
+            this._paymentChannelSDK,
+            this._config.nodeId,
+            this._logger,
+            this._channelManager ?? undefined
+          );
+          this._btpServer.setInboundClaimValidator((protocolData, ilpPacket, peerId) =>
+            inboundClaimValidator.validate(protocolData, ilpPacket, peerId)
+          );
+          this._logger.info(
+            { event: 'inbound_claim_validator_enabled' },
+            'Inbound claim validator wired to BTP server'
+          );
 
           // Wire AccountManager into PacketHandler for settlement recording
           if (accountManager) {

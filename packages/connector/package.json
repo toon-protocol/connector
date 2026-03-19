@@ -1,6 +1,6 @@
 {
   "name": "@toon-protocol/connector",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "description": "Connector with BTP support and EVM settlement",
   "main": "dist/lib.js",
   "types": "dist/lib.d.ts",

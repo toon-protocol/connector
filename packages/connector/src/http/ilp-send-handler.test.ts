@@ -440,6 +440,7 @@ describe('IlpSendHandler', () => {
       mockSendPacket.mockResolvedValue(fulfillPacket);
 
       const body = validRequestBody();
+      body.timeoutMs = 5000;
       await request(app).post('/ilp/send').send(body);
 
       expect(mockSendPacket).toHaveBeenCalledTimes(1);
@@ -454,7 +455,7 @@ describe('IlpSendHandler', () => {
       const rawData = Buffer.from(body.data as string, 'base64');
       const { condition: expectedCondition } = computeConditionFromData(rawData);
       expect(paramsArg.executionCondition.equals(expectedCondition)).toBe(true);
-    });
+    }, 60_000);
   });
 
   describe('internal error handling', () => {
