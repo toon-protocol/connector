@@ -121,6 +121,47 @@
 # existing lineage, not a hostname retirement. The probe to add is
 # `https://dvm.devnet.toonprotocol.dev/health` expecting 200; delete this whole
 # comment block at the same time.
+#
+# ── WHAT THE PROBES ABOVE CANNOT SEE: A FORWARDED ROUTE ─────────────────────
+# Everything above asks whether a node is up and answering for ITSELF. Nothing
+# above asks whether one node can still reach another, and on 2026-08-28 that
+# cost two multi-hour outages, both of them green on every check in this file
+# for their whole duration:
+#
+#   * **10:26Z, `T01 peer unreachable`** on `g.toon.relay.store` and
+#     `g.toon.relay.gas`, from a connector restart on the relay box. Every
+#     container was `running`, every `GET /ilp/identity` was 200, every public
+#     edge answered. Found at 17:20Z, by a human sending a job by hand.
+#   * **01:27Z, `T00 … would not report the claim state of channel FDi2TCT9…`**
+#     on `g.toon.store.relay`, from an SPL mint cutover. On Solana the channel
+#     PDA is seeded with the mint (`["channel", min(p1,p2), max(p1,p2), mint]`),
+#     so changing the mint on one box moves every channel id it shares — and
+#     the far side is then asked about a channel it has never heard of. Found
+#     at 13:45Z, the same way.
+#
+# Both are one hop away from anything this file used to look at, and both are
+# obvious within seconds of asking the right question. Two jobs ask it, and
+# they are deliberately NOT the same question:
+#
+#   `peering-crosscheck` — FREE, and on every run. It reads nothing but each
+#     node's public `GET /ilp` self-description (ADR 0050) and holds the three
+#     documents to each other: does every forwarded prefix land on a node that
+#     actually routes it, at a price the forward covers, over a peering whose
+#     two sides still derive channel ids from the SAME settlement facts. That
+#     last clause is the 01:27Z outage, caught with no credential and no money.
+#     It also catches two things nothing has ever checked — a forward to a
+#     prefix nobody routes, and a forward priced under the far side, both of
+#     which charge a payer and then refuse them.
+#
+#   `paid-probe` — DISPATCH ONLY, and OFF by default, because it SPENDS. It
+#     originates a real packet across a real peering and reads what comes back,
+#     which is the only thing that proves a packet crosses. See its own header
+#     for why it needs no funded CI wallet and what it does cost.
+#
+# The division is the honest one. A cross-check of two documents can prove the
+# two sides AGREE; it cannot prove a packet gets through, and nothing free can.
+# The 10:26Z outage is the proof: every document stayed correct throughout —
+# the peering was simply not up, and only a packet could say so.
 
 name: fleet-health
 
@@ -144,6 +185,12 @@ on:
         type: string
         required: false
         default: '0'
+      paid_probe:
+        description: 'Cross a paid forwarded route. `send` SPENDS (~2000 base units, ~$0.002) from the relay box own peer channels.'
+        type: choice
+        required: false
+        default: 'off'
+        options: ['off', dry-run, send]
 
 permissions:
   contents: read
@@ -274,6 +321,82 @@ jobs:
           echo "verdict=inconclusive" >> "$GITHUB_OUTPUT"
           echo "detail=exited $STATUS without INVALID_CONFIG" >> "$GITHUB_OUTPUT"
           echo "::warning::$IMAGE exited $STATUS against the committed config, but not with INVALID_CONFIG — not a config-schema break, see output above"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Do the three nodes still agree with each other about a FORWARDED route?
+  #
+  # Free, unauthenticated, and on every run. It reads nothing but each node's
+  # public `GET /ilp` self-description (ADR 0050) — no ssh key, no bearer
+  # token, no Linode token, no packet, no money — and holds the three
+  # documents to each other.
+  #
+  # It covers the GAS box, which no other job here touches: the box probes are
+  # a matrix over `relay` and `ario` only, and the gas node has been invisible
+  # to fleet-health since it moved to its own repo. Every check below applies
+  # to it for free, because a self-description is a self-description.
+  #
+  # WHAT IT CANNOT DO, stated here so nobody reads a green tick as more than
+  # it is: it proves the two sides AGREE. It does not prove a packet gets
+  # through. The 2026-08-28 10:26Z `T01` outage is the counter-example — every
+  # document stayed correct for all seven hours; the peering was simply down.
+  # Only `paid-probe` below can say otherwise.
+  #
+  # The assertions and their failure branches live in
+  # tools/ci/fleet-peering-crosscheck.py, which is a file rather than a
+  # heredoc because it is testable: its FAIL paths are unreachable from a
+  # healthy fleet by construction, so `--self-test` drives every one of them
+  # against synthetic documents, and this job runs that FIRST. A monitor whose
+  # failure branches have never executed is a green tick over nothing.
+  # ─────────────────────────────────────────────────────────────────────────
+  peering-crosscheck:
+    name: The fleet agrees with itself about a forwarded route
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Before the script is trusted against the live fleet, prove its FAIL
+      # branches still fire. A regression here is a monitor that reports
+      # health it never checked, which is worse than no monitor.
+      - name: The cross-check's own failure branches still fire
+        run: python3 tools/ci/fleet-peering-crosscheck.py --self-test
+
+      - name: Hold the three self-descriptions to each other
+        id: crosscheck
+        run: |
+          set -uo pipefail
+          python3 tools/ci/fleet-peering-crosscheck.py /tmp/peering.tsv || true
+          if [ ! -s /tmp/peering.tsv ]; then
+            printf 'FAIL\t(fleet)\tcross-check\tthe cross-check produced no output at all\n' > /tmp/peering.tsv
+          fi
+
+          FAILS=$(grep -c '^FAIL' /tmp/peering.tsv || true)
+          {
+            echo "### peering cross-check — $( [ "$FAILS" -eq 0 ] && echo 'the fleet agrees with itself' || echo "**$FAILS disagreement(s)**" )"
+            echo ""
+            echo "| | between | check | detail |"
+            echo "|---|---|---|---|"
+            while IFS=$'\t' read -r st subject chk det; do
+              icon=$( [ "$st" = "OK" ] && echo '✅' || echo '❌' )
+              echo "| $icon | \`$subject\` | $chk | $det |"
+            done < /tmp/peering.tsv
+            echo ""
+          } > /tmp/report-peering.md
+
+          cat /tmp/report-peering.md >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/peering.tsv
+          [ "$FAILS" -eq 0 ] || exit 1
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-health-peering
+          path: /tmp/report-peering.md
+          if-no-files-found: ignore
+          retention-days: 7
 
   # ─────────────────────────────────────────────────────────────────────────
   # The box probes.
@@ -546,11 +669,252 @@ jobs:
         run: rm -f ~/.ssh/devnet ~/.ssh/config
 
   # ─────────────────────────────────────────────────────────────────────────
+  # Does a packet ACTUALLY cross a peering?
+  #
+  # DISPATCH ONLY, and `off` by default. This is the only check in this file
+  # that spends, and arming it on the cron is an operator's decision, not a
+  # reviewer's — see "THE COST" below and
+  # docs/operators/fleet-release-and-health.md.
+  #
+  # ── WHY A PROBE HAS TO BE PAID ──────────────────────────────────────────
+  # A forwarded route is a PAID route. An unpaid request to `g.toon.relay.store`
+  # comes back as x402 payment terms, which the relay answers out of its own
+  # config without consulting the store at all — so it proves nothing about
+  # the peering. The `T01`/`T00`/FULFILL distinction only exists once a packet
+  # has been paid for and forwarded.
+  #
+  # ── IT NEEDS NO FUNDED CI WALLET ────────────────────────────────────────
+  # The obvious design — a dedicated CI wallet, a channel opened from CI, a
+  # client SDK, a channel-watermark file to reconcile on every run — needs a
+  # funded private key in GitHub secrets, and would be the operator's call.
+  # None of it is necessary, because the connector can originate a packet
+  # through its OWN routing: `POST /packets` (ADR 0008), which `connector send`
+  # forms and signs (ADR 0058 cites it as the precedent). Driven that way the
+  # money comes from the relay's own peer channel — the very channel being
+  # tested — and the packet takes exactly the path a client's would.
+  #
+  # So this job adds NO new secret. It needs:
+  #   * `DEVNET_SSH_KEY`, which this workflow already holds; and
+  #   * the relay box's own operator write key, which already lives at
+  #     `/root/relay/deploy/operator-write.key` and never leaves the box —
+  #     it is bind-mounted read-only into a throwaway container and nothing
+  #     is copied anywhere.
+  #
+  # ── THE COST, STATED PLAINLY ────────────────────────────────────────────
+  # ~1011 base units for the store leg and ~1001 for the gas leg: ~2000 units,
+  # about $0.002, per run, out of the relay's peer channels.
+  #
+  # A REJECT COSTS THE SAME AS A FULFILL. ADR 0042 retires ADR 0004's "value
+  # moves on fulfilment": a peer PREPARE carries its covering claim and the
+  # claim is banked on ARRIVAL, before the packet is handled at all. So
+  # pointing the probe at an envelope the app refuses makes it cheap in the
+  # sense that the app does no work — no Arweave upload, no gas transaction —
+  # and NOT in the sense that the packet is free. Anyone reasoning about
+  # arming this on the 15-minute cron should price it at ~$0.20/day and plan
+  # to `POST /channels/:id/fund` the relay's channels; hourly is ~$0.05/day.
+  #
+  # ── WHAT THE ANSWER MEANS ───────────────────────────────────────────────
+  #   FULFILL       the packet crossed the peering AND the far app answered.
+  #                 `connector send` checks the fulfilment against the one its
+  #                 own gift-wrap derives (ADR 0019), so this is proof the
+  #                 packet reached the node holding the shared secret — not
+  #                 merely *a* node willing to answer.
+  #   REJECT F..    the packet CROSSED the peering and the far side answered
+  #                 with a final error — `F99 app declined the delivery with
+  #                 HTTP 4xx` is the expected one, since the probe deliberately
+  #                 sends an envelope the app refuses. The peering is proven.
+  #                 F02 is the exception: it means the far side has no route
+  #                 for the name, which `peering-crosscheck` should have caught
+  #                 first and is a real failure.
+  #   REJECT T01    the peering itself is down. This is 10:26Z. The message
+  #                 names the peer.
+  #   REJECT T00    the claim or channel state is broken between the two — the
+  #                 01:27Z shape. Read `peering-crosscheck`'s settlement rows
+  #                 in the same run: a mint or token-network change on one box
+  #                 moves every channel id it shares.
+  #
+  # `dry-run` forms and signs the packet, prints what it would have sent, and
+  # sends nothing. It proves the credential, the container, the loopback
+  # address and the leg table without spending — worth running after any
+  # change to this job.
+  # ─────────────────────────────────────────────────────────────────────────
+  paid-probe:
+    name: A packet crosses a peering (${{ inputs.paid_probe }})
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.paid_probe != 'off'
+    needs: peering-crosscheck
+    # `always()`: a disagreeing fleet is exactly when an operator most wants
+    # to know which hop a packet dies at, so a failed cross-check must not
+    # cancel the one check that can say.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LINODE_API: https://api.linode.com/v4
+      MODE: ${{ inputs.paid_probe }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preconditions
+        env:
+          DEVNET_SSH_KEY: ${{ secrets.DEVNET_SSH_KEY }}
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+        run: |
+          set -euo pipefail
+          fail=0
+          [ -n "${DEVNET_SSH_KEY:-}" ] || { echo "::error::DEVNET_SSH_KEY is not set — cannot reach the relay box (see fleet-ops.yml)."; fail=1; }
+          [ -n "${LINODE_CLI_TOKEN:-}" ] || { echo "::error::LINODE_CLI_TOKEN is not set — cannot resolve a box label to an IP."; fail=1; }
+          [ "$fail" -eq 0 ] || exit 1
+
+      # Which legs exist, and what each costs, read off the SAME fleet map the
+      # cross-check uses — never a second table here. A copy is a copy that
+      # goes stale, and a paid probe aimed at a prefix nobody routes any more
+      # would report a real-looking failure about nothing.
+      - name: Read the fleet's forwarded legs
+        id: legs
+        run: |
+          set -euo pipefail
+          python3 tools/ci/fleet-peering-crosscheck.py --legs > /tmp/legs.tsv
+          echo "the fleet forwards:"
+          cat /tmp/legs.tsv
+          # Only the relay's own legs are drivable here: this job SSHes to the
+          # relay box, and the relay is the node with a peer-forwarding table
+          # and an operator key on disk. Adding another box means adding it to
+          # this step, not a new source of truth.
+          awk -F'\t' '$1 == "relay"' /tmp/legs.tsv > /tmp/relay-legs.tsv
+          if [ ! -s /tmp/relay-legs.tsv ]; then
+            echo "::error::the relay forwards nothing — there is no paid route to probe."
+            exit 1
+          fi
+
+      - name: Resolve the relay box IP from its Linode label
+        id: box
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+        run: |
+          set -euo pipefail
+          ip=$(curl -sf -H "Authorization: Bearer $LINODE_CLI_TOKEN" \
+                 "$LINODE_API/linode/instances" \
+               | jq -r '.data[] | select(.label=="relay") | .ipv4[0]' | head -1)
+          if [ -z "$ip" ] || [ "$ip" = "null" ]; then
+            echo "::error::No Linode labelled 'relay'."
+            exit 1
+          fi
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+
+      - name: Install SSH key
+        env:
+          DEVNET_SSH_KEY: ${{ secrets.DEVNET_SSH_KEY }}
+          BOX_IP: ${{ steps.box.outputs.ip }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEVNET_SSH_KEY" > ~/.ssh/devnet
+          chmod 600 ~/.ssh/devnet
+          {
+            echo "Host devnet-box"
+            echo "  HostName $BOX_IP"
+            echo "  User root"
+            echo "  IdentityFile ~/.ssh/devnet"
+            echo "  IdentitiesOnly yes"
+            echo "  StrictHostKeyChecking accept-new"
+            echo "  ConnectTimeout 30"
+            echo "  ServerAliveInterval 30"
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      - name: Send one packet down each forwarded leg
+        id: probe
+        run: |
+          set -uo pipefail
+          sshbox() { ssh -F ~/.ssh/config -o LogLevel=ERROR devnet-box "$@"; }
+
+          # The image the relay is ACTUALLY running, not a pin read from this
+          # repo: `connector send` has to be the same build as the node it is
+          # driving, and ADR 0068 put that pin in the relay's own repository.
+          IMAGE=$(sshbox 'docker inspect -f "{{.Config.Image}}" "$(docker ps --filter label=com.docker.compose.service=connector --format "{{.Names}}" | head -1)"' | tr -d '\r')
+          if [ -z "$IMAGE" ]; then
+            printf 'FAIL\t(relay)\tconnector container\tno container with compose service `connector` is running — nothing to originate from\n' > /tmp/paid.tsv
+            IMAGE=""
+          fi
+
+          : > /tmp/paid.tsv
+          FLAG=$( [ "$MODE" = "dry-run" ] && echo "--dry-run" || echo "" )
+
+          while IFS=$'\t' read -r near prefix far far_url amount; do
+            [ -n "$IMAGE" ] || break
+            # `--network host`: the relay's client edge and operator surface
+            # share 127.0.0.1:3000 on the box (docker-compose.operator.yml
+            # mounts the surface onto the port the edge already serves).
+            # The key is bind-mounted read only and never copied anywhere.
+            OUT=$(sshbox "docker run --rm --network host \
+                    -v /root/relay/deploy/operator-write.key:/k:ro '$IMAGE' \
+                    send --operator http://127.0.0.1:3000 --operator-key /k \
+                    --to '$prefix' --seal-to '$far_url' --amount '$amount' \
+                    --target /fleet-health-probe --method POST \
+                    --expires-in 30 $FLAG" 2>&1)
+            echo "── $near -> $far ($prefix, $amount units) ─────────"
+            echo "$OUT"
+
+            LEG="$near -> $far"
+            # One line, no tabs: this lands in a TSV field, and a stray tab
+            # or newline in a peer's message would silently split the row and
+            # render the alert table as nonsense.
+            HEAD=$(printf '%s' "$OUT" | head -1 | tr '\t\n' '  ')
+            case "$OUT" in
+              "DRY RUN"*)
+                printf 'OK\t%s\tdry run `%s`\tformed and signed, nothing sent and nothing paid — the key, the container and the leg table are all good\n' "$LEG" "$prefix" ;;
+              "FULFILL WITH THE WRONG FULFILMENT"*)
+                printf 'FAIL\t%s\tpaid probe `%s`\tfulfilled, but NOT by the node this packet was sealed to (ADR 0019). `%s` is not the connector terminating `%s`.\n' "$LEG" "$prefix" "$far_url" "$prefix" ;;
+              "FULFILL"*)
+                printf 'OK\t%s\tpaid probe `%s`\tFULFILL — the packet crossed the peering and the terminating app answered\n' "$LEG" "$prefix" ;;
+              "REJECT T01"*)
+                printf 'FAIL\t%s\tpaid probe `%s`\tT01 PEER UNREACHABLE — the peering itself is down; the packet never left this node. %s\n' "$LEG" "$prefix" "$HEAD" ;;
+              "REJECT T00"*)
+                printf 'FAIL\t%s\tpaid probe `%s`\tT00 — the two sides disagree about the channel. Read this run cross-check settlement rows: a mint or token-network change on one box moves every channel id it shares. %s\n' "$LEG" "$prefix" "$HEAD" ;;
+              "REJECT F02"*)
+                printf 'FAIL\t%s\tpaid probe `%s`\tF02 — the packet CROSSED the peering, and the far side routes no such name. The cross-check should have caught this first. %s\n' "$LEG" "$prefix" "$HEAD" ;;
+              "REJECT F"*)
+                printf 'OK\t%s\tpaid probe `%s`\tthe packet CROSSED the peering and the far side answered — %s. The probe sends an envelope the app refuses on purpose; a final error from the far end is the peering proving itself.\n' "$LEG" "$prefix" "$HEAD" ;;
+              *)
+                printf 'FAIL\t%s\tpaid probe `%s`\tunrecognised answer: %s\n' "$LEG" "$prefix" "$(printf '%s' "$OUT" | head -3 | tr '\t\n' '  ')" ;;
+            esac >> /tmp/paid.tsv
+          done < /tmp/relay-legs.tsv
+
+          FAILS=$(grep -c '^FAIL' /tmp/paid.tsv || true)
+          {
+            echo "### paid probe (\`$MODE\`) — $( [ "$FAILS" -eq 0 ] && echo 'every forwarded leg carries a packet' || echo "**$FAILS leg(s) failing**" )"
+            echo ""
+            echo "| | leg | check | detail |"
+            echo "|---|---|---|---|"
+            while IFS=$'\t' read -r st leg chk det; do
+              icon=$( [ "$st" = "OK" ] && echo '✅' || echo '❌' )
+              echo "| $icon | \`$leg\` | $chk | $det |"
+            done < /tmp/paid.tsv
+            echo ""
+          } > /tmp/report-paid.md
+
+          cat /tmp/report-paid.md >> "$GITHUB_STEP_SUMMARY"
+          [ "$FAILS" -eq 0 ] || exit 1
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-health-paid-probe
+          path: /tmp/report-paid.md
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/devnet ~/.ssh/config
+
+  # ─────────────────────────────────────────────────────────────────────────
   # The alert. This is the half that makes detection worth anything.
   # ─────────────────────────────────────────────────────────────────────────
   alert:
     name: Alert a human
-    needs: [probe, config-compat]
+    needs: [probe, config-compat, peering-crosscheck, paid-probe]
     # `always()` so this runs on the failure it exists to report. A skipped
     # `probe` (a PR run, or a dispatch scoped to one box) must not be treated
     # as a fleet-wide verdict, which the `result` checks below take care of.
@@ -579,16 +943,30 @@ jobs:
 
           PROBE='${{ needs.probe.result }}'
           COMPAT='${{ needs.config-compat.result }}'
+          PEERING='${{ needs.peering-crosscheck.result }}'
+          PAID='${{ needs.paid-probe.result }}'
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # A cancelled or skipped upstream job is not evidence of health, so
-          # only `success` on BOTH counts as green. Anything else alerts.
-          if [ "$PROBE" = "success" ] && [ "$COMPAT" = "success" ]; then
+          # only `success` counts as green. Anything else alerts.
+          #
+          # `paid-probe` is the ONE exception, and only for `skipped`: it is
+          # off by default and skipped on every scheduled run, which is its
+          # designed state and not a verdict. A paid probe that RAN and failed
+          # alerts like anything else — that is the whole point of running it.
+          if [ "$PAID" = "skipped" ]; then
+            PAID_VERDICT=success
+          else
+            PAID_VERDICT="$PAID"
+          fi
+
+          if [ "$PROBE" = "success" ] && [ "$COMPAT" = "success" ] \
+             && [ "$PEERING" = "success" ] && [ "$PAID_VERDICT" = "success" ]; then
             VERDICT=healthy
           else
             VERDICT=unhealthy
           fi
-          echo "probe=$PROBE compat=$COMPAT -> $VERDICT"
+          echo "probe=$PROBE compat=$COMPAT peering=$PEERING paid=$PAID -> $VERDICT"
 
           # Deliberately NOT `--search "... in:title"`: the title contains `[`
           # and `]`, which GitHub's search syntax does not treat as literals,
@@ -618,8 +996,23 @@ jobs:
             echo "One or more Watchtower-managed devnet services failed their health probe."
             echo ""
             echo "**Run:** $RUN_URL"
-            echo "**Box probes:** \`$PROBE\` · **Config compatibility:** \`$COMPAT\`"
+            echo "**Box probes:** \`$PROBE\` · **Config compatibility:** \`$COMPAT\` · **Peering cross-check:** \`$PEERING\` · **Paid probe:** \`$PAID\`"
             echo ""
+            if [ "$PEERING" != "success" ]; then
+              echo "> ⚠️ **Two nodes no longer agree about a forwarded route.**"
+              echo ">"
+              echo "> This is the class nothing used to check, and both 2026-08-28 outages"
+              echo "> were in it. The table below names the disagreement. A settlement-facts"
+              echo "> row means a mint or token-network changed on one box and not the other,"
+              echo "> which moves every channel id the two share — the far side is then asked"
+              echo "> about a channel it has never heard of (\`T00\`). A DANGLING FORWARD means"
+              echo "> a node sells a prefix nobody routes: the payer is charged and refused."
+              echo ">"
+              echo "> A green cross-check is NOT proof a packet crosses. To prove that, run"
+              echo "> this workflow with \`paid_probe: send\` — it spends ~\$0.002 and says"
+              echo "> which hop the packet dies at."
+              echo ""
+            fi
             if [ "$COMPAT" != "success" ]; then
               echo "> ⚠️ **The committed box config and the current \`:release\` image disagree.**"
               echo "> \`${{ needs.config-compat.outputs.detail }}\`"
@@ -649,6 +1042,32 @@ jobs:
             echo '#   gh workflow run fleet-ops.yml -f operation=deploy -f service=<svc> -f apply=true'
             echo '```'
             echo ""
+            if [ "$PEERING" != "success" ] || [ "$PAID_VERDICT" != "success" ]; then
+              echo "### Recovering a peering"
+              echo ""
+              echo "A peering is not rolled back — it is re-established, or re-priced, from the"
+              echo "operator surface of the node that owns the row (ADR 0058). Reads need only the"
+              echo "bearer token; writes are RFC 9421-signed with \`docs/operators/sign-write.sh\`."
+              echo ""
+              echo '```sh'
+              echo '# On the box, see what that node thinks it forwards and to whom:'
+              echo 'T=$(cat operator-bearer.token)'
+              echo 'curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<edge>/routes/peers'
+              echo 'curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<edge>/peers'
+              echo ''
+              echo '# A DANGLING FORWARD is a runtime row the config no longer owns. Delete it:'
+              echo './sign-write.sh -k operator-write.key -X DELETE -p /routes/peers/<prefix>'
+              echo ''
+              echo '# A peering whose channel ids moved, or that cannot be dialled, is'
+              echo '# re-established from the far side URL — the same write that made it:'
+              echo './sign-write.sh -k operator-write.key -X POST -p /peers \'
+              echo '  -b "{\"id\":\"<peer>\",\"url\":\"https://…/ilp\",\"fee\":1,\"max_packet_amount\":100000}"'
+              echo ''
+              echo '# Then prove a packet actually crosses, rather than assuming it does:'
+              echo 'gh workflow run fleet-health.yml -f paid_probe=send'
+              echo '```'
+              echo ""
+            fi
             echo "Full runbook: \`docs/operators/fleet-release-and-health.md\`."
             echo ""
             echo "<sub>Opened automatically by \`.github/workflows/fleet-health.yml\`. It closes itself when a later run is green.</sub>"

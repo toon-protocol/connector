@@ -574,3 +574,82 @@ fn codeql_covers_every_analysis_default_setup_ran() {
         );
     }
 }
+
+/// The two outages of 2026-08-28, as a test.
+///
+/// `fleet-health.yml` checked container state and `GET /ilp/identity`, and
+/// both stayed green through two multi-hour failures of a FORWARDED route:
+/// `T01 peer unreachable` on `g.toon.relay.{store,gas}` from 10:26Z to 17:20Z,
+/// and `T00 ... would not report the claim state of channel FDi2TCT9...` on
+/// `g.toon.store.relay` from 01:27Z to 13:45Z, from an SPL mint cutover. Both
+/// were found by a human sending a job by hand.
+///
+/// This asserts the workflow still asks the question those probes could not.
+/// It is a text assertion because that is what this file can hold a workflow
+/// to; the cross-check's own logic is tested where it lives, by
+/// `tools/ci/fleet-peering-crosscheck.py --self-test`, which is why the
+/// wiring of that self-test is asserted below rather than only its existence.
+#[test]
+fn fleet_health_still_cross_checks_a_forwarded_route() {
+    assert!(
+        FLEET_HEALTH_WORKFLOW.contains("tools/ci/fleet-peering-crosscheck.py --self-test"),
+        "fleet-health.yml no longer runs the cross-check's self-test before \
+         trusting it against the live fleet. Every FAIL branch in that script \
+         is unreachable from a healthy fleet, so the self-test is the only \
+         thing that ever executes them -- without it the job is a green tick \
+         over a monitor nobody has proven can go red."
+    );
+    assert!(
+        FLEET_HEALTH_WORKFLOW.contains("tools/ci/fleet-peering-crosscheck.py /tmp/peering.tsv"),
+        "fleet-health.yml no longer cross-checks the fleet's self-descriptions \
+         against each other. That is the only free check that catches an SPL \
+         mint cutover on one box and not the other (2026-08-28 01:27Z): on \
+         Solana the channel PDA is seeded with the mint, so the change moves \
+         every channel id the two nodes share and the far side is asked about \
+         a channel it has never heard of."
+    );
+    assert!(
+        FLEET_HEALTH_WORKFLOW
+            .contains("needs: [probe, config-compat, peering-crosscheck, paid-probe]"),
+        "fleet-health.yml's alert job no longer waits on the peering jobs, so \
+         a fleet that disagrees with itself would go green. The alert is the \
+         half that makes detection worth anything."
+    );
+}
+
+/// The paid probe is the only check here that spends, and it must stay
+/// dispatch-only and off by default.
+///
+/// Not because spending is wrong -- it is the only thing that proves a packet
+/// crosses a peering, and an unpaid request to a forwarded prefix returns
+/// payment terms the near node answers alone, which proves nothing. It is
+/// because arming a spend on a 15-minute cron is an operator's decision about
+/// their own channels' balance, not a reviewer's.
+#[test]
+fn the_paid_probe_is_off_unless_a_human_asks_for_it() {
+    assert!(
+        FLEET_HEALTH_WORKFLOW.contains("default: 'off'"),
+        "fleet-health.yml's `paid_probe` input no longer defaults to `off`. \
+         Every scheduled run would then spend from the relay box's peer \
+         channels -- roughly $0.20/day at the 15-minute cron -- and drain them \
+         until someone funds them. Arming it is the operator's call; see \
+         docs/operators/fleet-release-and-health.md."
+    );
+    assert!(
+        FLEET_HEALTH_WORKFLOW
+            .contains("if: always() && github.event_name == 'workflow_dispatch' && inputs.paid_probe != 'off'"),
+        "fleet-health.yml's paid probe is no longer dispatch-gated. A schedule \
+         trigger supplies no `inputs`, so a gate on the input alone is not \
+         enough to keep a cron from spending."
+    );
+    assert!(
+        !FLEET_HEALTH_WORKFLOW.contains("secrets.CI_WALLET")
+            && !FLEET_HEALTH_WORKFLOW.contains("PRIVATE_KEY"),
+        "fleet-health.yml now names a wallet secret. The paid probe deliberately \
+         needs none: `connector send` drives the relay's own `POST /packets`, so \
+         the money comes from the peer channel being tested and the only \
+         credential is the operator write key already on that box. A funded key \
+         in CI is a new class of secret and must be proposed to the operator, \
+         not introduced by a workflow edit."
+    );
+}
