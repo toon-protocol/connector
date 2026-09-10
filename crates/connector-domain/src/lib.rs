@@ -4,7 +4,9 @@
 //! TOON's own encoding, which is not byte-compatible with it (ADR 0063;
 //! `packet.rs` has the table) -- over OER primitives (RFC-0030),
 //! ILP address validation (RFC-0015), longest-prefix route selection,
-//! flat per-packet fee arithmetic (ADR 0010),
+//! flat per-packet fee arithmetic (ADR 0010) and the rational-over-base-units
+//! conversion a hop crosses a denomination boundary at, over the token identity
+//! a rate is declared between (ADR 0071, [`rate`], [`asset`]),
 //! what a terminated route charges for one packet -- a schedule over the
 //! packet's payload length, flat when its slope is zero (ADR 0065, [`price`]) --
 //! fulfilment / expiry rules (RFC-0022; the execution condition itself left
@@ -19,6 +21,7 @@
 //! projection of.
 
 mod address;
+pub mod asset;
 mod claim;
 pub mod client_claim;
 mod condition;
@@ -31,10 +34,12 @@ mod oer;
 mod packet;
 pub mod price;
 mod projection;
+pub mod rate;
 mod route;
 pub mod x402;
 
 pub use address::is_valid_ilp_address;
+pub use asset::{AssetChain, AssetId, AssetIdError};
 pub use claim::{advance_watermark, validate_claim, validate_price, ClaimError, Watermark};
 pub use condition::{
     delivery_budget, forwarded_expiry, fulfillment_matches_condition, is_expired,
@@ -42,7 +47,7 @@ pub use condition::{
 };
 pub use envelope::{EnvelopeError, EnvelopeRequest, EnvelopeResponse};
 pub use error::PacketError;
-pub use fee::amount_after_fee;
+pub use fee::{amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_fee};
 pub use identity::{
     anonymous_identity, resolve_identity, ConfiguredIdentity, SenderIdentity, UnauthorizedIdentity,
 };
@@ -53,4 +58,5 @@ pub use node::{
 pub use packet::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 pub use price::Price;
 pub use projection::{JournalEntry, Projection};
+pub use rate::{Rate, RateError};
 pub use route::select_route;
