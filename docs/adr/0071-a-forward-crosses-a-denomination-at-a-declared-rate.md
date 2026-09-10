@@ -16,15 +16,11 @@ one number in the prober's own unit.
 what the numbers on the wire mean. The sourcing machinery (decisions 3–6) is connector
 architecture, internal to this codebase.
 
-**Falsifiers:**
+**Falsifier:** `crates/connector-domain/src/**/*.rs` matching `\bf(32|64)\b` — decision 4 claims the conversion arithmetic is integer-rational only, so a float reaching the money path disproves it.
 
-- `grep -rE '\bf(32|64)\b' crates/connector-domain/src/` matching anything on the conversion
-  path — decision 4 claims the arithmetic is integer-rational only.
-- `grep -r 'slot0' crates/` matching outside a comment — decision 3 claims no spot read exists;
-  a pool is read by TWAP or not at all.
-- An asset, token or denomination field appearing in `vectors/wire-vectors.json` — decision 7
-  claims the wire stays unit-silent, in both directions, precisely because every number is kept
-  in the unit of the leg it is on.
+**Falsifier:** `crates/**/*.rs` matching `slot0` — decision 3 claims no spot read exists anywhere in this connector; a pool is read by TWAP over a window the operator set, or it is not read at all.
+
+**Falsifier:** `vectors/wire-vectors.json` matching `"([a-z_]*(asset|denomination)[a-z_]*|token|token_(address|mint|id|decimals))"` — decision 7 claims the wire stays unit-silent in both directions, precisely because every number is kept in the unit of the leg it is on.
 
 A packet's amount has no unit of its own: it is denominated by the channel it rides, which is RFC
 0027's own definition ("local amount, denominated in the minimum divisible unit of the asset of
