@@ -1,0 +1,31 @@
+[package]
+name = "connector-rate-source-evm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+connector-domain = { path = "../connector-domain" }
+connector-rate-source = { path = "../connector-rate-source" }
+async-trait = "0.1"
+chrono = "0.4"
+# The EVM RPC client and ABI codec, on the same terms
+# `connector-settlement-evm` takes them. No signer middleware and no wallet:
+# this crate makes `eth_call`s and nothing else (ADR 0071 decision 6 -- the
+# settlement backend is no part of any value path, and neither is this).
+ethers = { version = "2", default-features = false, features = ["rustls"] }
+thiserror = "2"
+
+[dev-dependencies]
+# The port's own contract suite, reached through its feature gate the way any
+# implementation reaches it: a reader is not an implementation of `RateSource`
+# until it passes that suite unmodified (ADR 0007).
+connector-rate-source = { path = "../connector-rate-source", features = ["test-util"] }
+# The shared disposable-`anvil` harness (issue #542), reused rather than
+# reimplemented -- `connector-bin` and `connector-cli` already reach for it the
+# same way. A *dev*-dependency only: `tests/the_reader_holds_no_settlement_backend.rs`
+# asserts no settlement crate reaches this one's real dependencies, which is
+# the separation ADR 0071 decision 6 turns on.
+connector-settlement-evm = { path = "../connector-settlement-evm", features = ["test-util"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
