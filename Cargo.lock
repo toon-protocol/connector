@@ -1102,6 +1102,7 @@ dependencies = [
  "connector-peer-btp",
  "connector-peer-http",
  "connector-rate-source",
+ "connector-rate-source-evm",
  "connector-runtime",
  "connector-settlement",
  "connector-settlement-evm",
