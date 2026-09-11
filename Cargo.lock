@@ -1171,6 +1171,7 @@ name = "connector-config"
 version = "0.1.0"
 dependencies = [
  "bs58",
+ "chrono",
  "connector-domain",
  "serde",
  "serde_json",

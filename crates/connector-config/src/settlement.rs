@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
+use connector_domain::{AssetChain, AssetId};
 use serde::Deserialize;
 use url::Url;
 
+use crate::client_channel::to_hex;
 use crate::error::ConfigError;
 use crate::secret::SecretLocation;
 
@@ -143,6 +145,30 @@ impl SettlementChain {
         match self {
             SettlementChain::Evm => "evm",
             SettlementChain::Solana => "solana",
+        }
+    }
+
+    /// The same chain as the domain names it (ADR 0071, issue #1290).
+    ///
+    /// The translation between the two enums lives here and not in
+    /// `connector-domain`, because that crate must not depend on config to
+    /// say what a token is -- its `asset` module says so in as many words.
+    /// One function each way ([`From<AssetChain>`](SettlementChain) is the
+    /// other), so that nothing downstream writes a second `match` over the
+    /// two chains that could one day answer differently.
+    pub const fn asset_chain(self) -> AssetChain {
+        match self {
+            SettlementChain::Evm => AssetChain::Evm,
+            SettlementChain::Solana => AssetChain::Solana,
+        }
+    }
+}
+
+impl From<AssetChain> for SettlementChain {
+    fn from(chain: AssetChain) -> SettlementChain {
+        match chain {
+            AssetChain::Evm => SettlementChain::Evm,
+            AssetChain::Solana => SettlementChain::Solana,
         }
     }
 }
@@ -360,6 +386,22 @@ impl SettlementConfig {
         match self {
             SettlementConfig::Evm(_) => SettlementChain::Evm,
             SettlementConfig::Solana(_) => SettlementChain::Solana,
+        }
+    }
+
+    /// The token every channel this backend opens settles in, named the way
+    /// a `[[tokens]]` row names one (ADR 0071, issue #1290): this table's
+    /// own `token_address`, on this table's own chain.
+    ///
+    /// Derived, never declared twice -- which is the point. A node that
+    /// deals has to be able to ask whether the token a channel holds is one
+    /// it declared, and the answer has to come from the table that already
+    /// states it rather than from a second place an operator could write a
+    /// different address.
+    pub fn asset(&self) -> AssetId {
+        match self {
+            SettlementConfig::Evm(evm) => AssetId::evm(to_hex(&evm.token_address)),
+            SettlementConfig::Solana(solana) => AssetId::solana(&solana.token_address),
         }
     }
 }
@@ -1183,5 +1225,50 @@ key_file = "{}"
         );
         let result: Result<RawSettlementSection, _> = toml::from_str(&text);
         assert!(result.is_err());
+    }
+
+    /// ADR 0071, issue #1290: a settlement table already states which token
+    /// its channels settle in, so the asset a `[[tokens]]` row would have to
+    /// match is derived from it rather than declared a second time.
+    #[test]
+    fn a_settlement_table_names_the_token_its_channels_settle_in() {
+        let key_file = temp_key_file();
+        let evm = resolve_settlement(Some(raw(
+            "evm",
+            "http://127.0.0.1:8545",
+            CONTRACT,
+            TOKEN,
+            6,
+            Some(key_file.path().to_path_buf()),
+        )))
+        .expect("resolve");
+        // The checksummed spelling the config carries and the lowercase one
+        // an `AssetId` keys by are one token.
+        assert_eq!(
+            SettlementConfig::Evm(expect_single_evm(evm)).asset(),
+            AssetId::evm(TOKEN)
+        );
+
+        let solana = SettlementConfig::Solana(SolanaSettlementConfig {
+            rpc_url: "http://127.0.0.1:8899".to_string(),
+            program_id: "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip".to_string(),
+            token_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            decimals: 6,
+            key: SecretLocation::File(key_file.path().to_path_buf()),
+        });
+        assert_eq!(
+            solana.asset(),
+            AssetId::solana("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+        );
+    }
+
+    #[test]
+    fn the_two_chain_enums_translate_both_ways() {
+        for chain in [SettlementChain::Evm, SettlementChain::Solana] {
+            assert_eq!(SettlementChain::from(chain.asset_chain()), chain);
+            // The two spellings are the same word, which is what keeps an
+            // `evm:` asset and an `[settlement.evm]` table comparable.
+            assert_eq!(chain.asset_chain().as_str(), chain.name());
+        }
     }
 }

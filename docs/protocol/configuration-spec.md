@@ -316,6 +316,9 @@ spell it however it likes.
 | `peer_expose`                              | `"neither"`/`"btp"`/`"http"`/`"both"` | no       | CF-17                                                |
 | `peer_allow_plaintext_endpoints`           | bool                                  | no       | CF-18's node-wide opt-in                             |
 | `socks_proxy`                              | `socks5h://` URL                      | no       | ADR 0070, the one onion dial path                    |
+| `[[tokens]]`                               | array of tables                       | —        | ADR 0071, the tokens this node deals                 |
+| `[[rates]]`                                | array of tables                       | —        | ADR 0071, one ordered pair's rate and guards         |
+| `[rate_guards]`                            | table                                 | —        | ADR 0071, this node's dealing policy                 |
 | `state_dir`                                | path                                  | CF-39    | where durable state lives                            |
 
 **How the file is read.** Every table in it is `deny_unknown_fields`, so an unrecognised key — a typo,
@@ -414,6 +417,35 @@ real backend is constructed for every chain configured before the node serves an
 units, and keeping those units uniform across chains is what leaves nothing to convert. It is checked
 instead, against the token's own `decimals()` at startup, and a disagreement names both and refuses to
 boot (CF-25). Zero is refused outright.
+
+**Declaring a denomination is optional, and declaring none costs nothing.** `[[tokens]]`, `[[rates]]`
+and `[rate_guards]` are how an operator says which tokens their node **deals**, what each is worth
+against one **numeraire**, and under what guards
+([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md) decisions 3 and 5). A
+node that writes none of the three loads, serves and forwards exactly as it did before they existed.
+A `[[tokens]]` row names its token as `evm:<contract>` or `solana:<mint>`, may set `numeraire = true`
+— exactly one row may, and two is refused by name — and may carry a `quote`: one or two pools on that
+token's **own settlement chain**, each with its own `twap_window_secs`, the last ending at the
+numeraire. A quote is read over its chain's `[settlement.<chain>]` RPC endpoint, so a quote on a chain
+with no such table is refused at load rather than becoming a poller that can never take a reading; and
+a path that ends anywhere but the numeraire is refused too, because a cross rate is composed as
+`(X/numeraire) ÷ (Y/numeraire)` and a leg answering in another unit would be composed as though it had
+not. A `[[rates]]` row is keyed by an **ordered** pair — `from` and `to`, never sorted, because
+direction is the trade — and carries a `rate = { numerator, denominator }` over base units, guard
+overrides, or both; a row naming a token no `[[tokens]]` row declares is refused, and a rate with a
+zero half is refused in the domain's own words with the row named. `[rate_guards]` states `spread`,
+`ttl_secs` and `max_move` once, and is **required as soon as anything can produce a rate** — none of
+the three has a safe default, and a defaulted spread is dealing at mid. `spread` and `max_move` are
+`{ numerator, denominator }` fractions rather than percentages or basis points, for the reason
+[ADR 0010](../adr/0010-flat-per-packet-fee-and-minimum-delivery.md) deleted the basis-point fee:
+there are no floats on this path, and an operator dealing at half a basis point writes `1/20000`
+rather than watching it round to zero. Each is validated by the same constructor the rate table
+builds one with, so config and the guards themselves can never disagree about what a guard is — a
+`max_move` of `0/1` is _pinned_, a coherent declaration about a par pair, and is not refused.
+Declaring tokens alone produces no rate and needs none, which is what a same-asset cross-chain hop
+declares.
+Nothing here is an environment variable and nothing is mutable: the file declares the _source_, and
+what a refresh changes is an observation.
 
 **`[[client_identities]]`.** Each entry is an `id` a request presents in `ILP-Peer-Id` and the `secret`
 it must present in `Authorization: Bearer <secret>`; an empty or omitted secret makes that identity a

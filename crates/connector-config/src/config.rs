@@ -7,6 +7,9 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::client_channel::{resolve_client_channels, ClientChannelConfig, RawClientChannel};
+use crate::denomination::{
+    resolve_denomination, DenominationConfig, RawRateGuards, RawRateRow, RawToken,
+};
 use crate::error::ConfigError;
 use crate::identity::{resolve_client_identities, ClientIdentityConfig, RawClientIdentity};
 use crate::node::{resolve_node, NodeConfig, RawNodeConfig};
@@ -250,6 +253,28 @@ struct RawConfig {
     /// `1` is the original lockstep session.
     #[serde(default)]
     btp_session_window: Option<u32>,
+    /// The tokens this node **deals** (ADR 0071 decision 3, issue #1290),
+    /// one row each: the token's chain and contract identity, which of them
+    /// is the node's numeraire, and optionally where its price is read
+    /// from. Absent -- the default, and every config that predates ADR 0071
+    /// -- means this node deals nothing, crosses no denomination boundary,
+    /// and forwards exactly as it did before the table existed.
+    #[serde(default)]
+    tokens: Vec<RawToken>,
+    /// What this node declares about one **ordered** token pair (ADR 0071
+    /// decision 3): a static rate for a pair that cannot self-source, a
+    /// per-pair override of one that can, and per-pair guards over the
+    /// `[rate_guards]` defaults. Ordered, never sorted -- direction is the
+    /// trade, and `X -> Y` and `Y -> X` are different prices from one mid.
+    #[serde(default)]
+    rates: Vec<RawRateRow>,
+    /// This node's dealing policy (ADR 0071 decision 5): the `spread` it
+    /// earns, the `ttl` past which a rate is dead, and the `max_move` a
+    /// single refresh may not jump. Required as soon as anything can
+    /// produce a rate, because none of the three has a safe default; a
+    /// `[[rates]]` row overrides any of them for its own pair.
+    #[serde(default)]
+    rate_guards: Option<RawRateGuards>,
 }
 
 /// The client edge's own defaults for the unresolvable-lookup shaper
@@ -309,6 +334,7 @@ pub struct Config {
     unresolvable_lookup_window: Option<Duration>,
     unresolvable_lookup_max_wait: Option<Duration>,
     btp_session_window: Option<NonZeroU32>,
+    denomination: DenominationConfig,
 }
 
 impl Config {
@@ -586,6 +612,17 @@ impl Config {
                 });
             }
         }
+        // ADR 0071 decisions 3 and 5 (issue #1290): the tokens this node
+        // deals, its numeraire, the rates and guards it has declared.
+        // Resolved against `settlement_tables` because a token's quote is
+        // read over its own chain's RPC endpoint, so a quote on a chain
+        // with no `[settlement.<chain>]` table is a poller that could never
+        // take its first reading -- refused here rather than logged
+        // forever. All three keys absent is the default value and checks
+        // nothing, which is what "a node that declares none of it behaves
+        // exactly as it does today" means here.
+        let denomination =
+            resolve_denomination(raw.tokens, raw.rates, raw.rate_guards, settlement_tables)?;
         let state_dir = raw.state_dir.map(PathBuf::from);
         let channel_liveness_ttl = match raw.channel_liveness_ttl_secs {
             Some(0) => return Err(ConfigError::ZeroChannelLivenessTtl),
@@ -792,7 +829,23 @@ impl Config {
             unresolvable_lookup_window,
             unresolvable_lookup_max_wait,
             btp_session_window,
+            denomination,
         })
+    }
+
+    /// Everything this node declares about denomination (ADR 0071
+    /// decisions 3 and 5, issue #1290): the tokens it deals, its numeraire,
+    /// the rates and guards it has written down, and its node-wide dealing
+    /// policy.
+    ///
+    /// Always a value, never `None`: a node that declares none of it holds
+    /// the empty declaration, whose
+    /// [`declares_tokens`](DenominationConfig::declares_tokens) is `false`
+    /// and whose every lookup answers nothing. That is deliberately the
+    /// same answer an absent section would give, with one fewer question
+    /// for a caller to ask.
+    pub fn denomination(&self) -> &DenominationConfig {
+        &self.denomination
     }
 
     /// How long a chain-resolved client channel's liveness may be believed
