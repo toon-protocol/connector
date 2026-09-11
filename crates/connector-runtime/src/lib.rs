@@ -12,6 +12,8 @@ mod outbound_client;
 mod peer_route_store;
 mod peer_transport;
 mod peering;
+mod rate_poller;
+mod rate_table;
 mod route;
 mod self_description;
 // Behind a feature rather than `#[cfg(test)]`, unlike `test_support` below:
@@ -69,6 +71,12 @@ pub use peering::{
     ChannelBranch, EstablishPeeringError, EstablishedChannel, PeeringEstablished,
     PEERING_SETTLEMENT_TIMEOUT_SECONDS,
 };
+// The rate table a forward reads and the background poller that keeps it
+// fresh (ADR 0071 decision 6, issue #1294). Two halves of one rule: the
+// poller is the only thing here that awaits anything, and the read side is
+// synchronous by construction so that no packet can wait on a rate.
+pub use rate_poller::{poll_interval, QuotePathUnusable, RatePoller};
+pub use rate_table::SharedRateTable;
 pub use route::{LeasedRoute, PeerRoute};
 // Reading ANOTHER node's self-description, so a peering can be established
 // from a URL (ADR 0058, ADR 0050). The one outbound request this connector

@@ -35,7 +35,11 @@ use axum::Router;
 use connector_config::{Config, ConfigError};
 use url::Url;
 
-pub use runtime::{build, router, Runtime, RuntimeError};
+// `spawn_rate_pollers` beside the two verbs' own entry points (ADR 0071
+// decision 6, issue #1294): it is the one place a built rate table and a
+// `RateSource` meet, and the reader that will supply the source (issue
+// #1293) is a crate of its own.
+pub use runtime::{build, router, spawn_rate_pollers, Runtime, RuntimeError};
 
 /// Everything that can stop the connector from producing a validated,
 /// running node.
