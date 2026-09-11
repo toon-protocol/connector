@@ -6,7 +6,9 @@
 //! ILP address validation (RFC-0015), longest-prefix route selection,
 //! flat per-packet fee arithmetic (ADR 0010) and the rational-over-base-units
 //! conversion a hop crosses a denomination boundary at, over the token identity
-//! a rate is declared between (ADR 0071, [`rate`], [`asset`]),
+//! a rate is declared between and the table of declared rates a forwarding
+//! path reads them from -- under the spread, ttl and max_move an operator
+//! guards a pair with (ADR 0071, [`rate`], [`asset`], [`rate_table`]),
 //! what a terminated route charges for one packet -- a schedule over the
 //! packet's payload length, flat when its slope is zero (ADR 0065, [`price`]) --
 //! fulfilment / expiry rules (RFC-0022; the execution condition itself left
@@ -35,6 +37,7 @@ mod packet;
 pub mod price;
 mod projection;
 pub mod rate;
+pub mod rate_table;
 mod route;
 pub mod x402;
 
@@ -59,4 +62,8 @@ pub use packet::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 pub use price::Price;
 pub use projection::{JournalEntry, Projection};
 pub use rate::{Rate, RateError};
+pub use rate_table::{
+    Freshness, GuardError, GuardOverride, Guards, MaxMove, RateLookup, RateTable, Refresh,
+    RefusedRefresh, Spread, Ttl,
+};
 pub use route::select_route;
