@@ -397,12 +397,56 @@ re-reading it.
 
 ### Item 3 is enforced somewhere for the first time
 
-`local/mixed-chain`'s `a-b` row reads `forwarded_claim_enforcement = "enforce"`. It is the only
+`local/mixed-chain`'s `a-b` row reads `forwarded_claim_enforcement = "enforce"`. ~~It is the only
 peering in the repository where a node forwards a packet that arrived from a peer, and therefore the
-only place the enforcing path can be exercised against a running image at all. It could not be
+only place the enforcing path can be exercised against a running image at all.~~ **The first clause
+of that sentence was overtaken by `local/dealing` (issue #1299); what it was claiming is still true,
+on a different fact.** See the issue #1303 Update below. It could not be
 turned on before this: A had no `[[pay_channels]]` row, so crossing 1 arrived uncovered by
 construction and enforcing would have deadlocked the peering rather than charging for it. A has one
 now, and covers `amount_after_fee(1200, 100)` — exactly the 1100 that arrives at B.
 
 `local/mixed-chain`'s `b-c` leg is prepay too, on Solana, which the Update above (issue #1146) made
 possible. **No topology in this repository runs ADR 0004's model any longer**, and ADR 0004 says so.
+
+## Update (issue #1303): a second topology forwards a peer arrival, and the conclusion rests on the setting
+
+**The section above derived its conclusion from the shape of the repository's topologies, and the
+shape moved.** It reasoned that `local/mixed-chain`'s B was the only node here forwarding a packet
+that arrived from a peer, and concluded from that alone that its `a-b` row was the only place item
+3's enforcing path could run against a running image. `local/dealing` (issue #1299, built for
+[ADR 0071](0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)) is a second such node, and
+forwarding a peer arrival is the whole of its subject: 6-decimal mock USDC in from A over EVM,
+9-decimal mock SPL out to C over Solana, converted at B's declared rate as it crosses. The premise
+is false as of that topology landing.
+
+**The conclusion is not, because `local/dealing` leaves the setting alone on purpose.** Its `a-b`
+row holds `forwarded_claim_enforcement` at its default `observe`, and
+`local/dealing/connector-b.toml` says why in the row itself: that topology's subject is the
+denomination boundary, turning the setting on there would give one fact two homes to drift between
+without proving anything new, and what rules out a crossing carried for free there is the rehearsal
+reading C's journal for the **converted** figure — a stronger check than admission, since a claim
+can be present and still be for the wrong number. So `local/mixed-chain`'s `a-b` remains the only
+row in this repository where `forwarded_claim_enforcement` does anything, and therefore still the
+only place item 3's enforcing path is exercised against a running image.
+
+**What carries the claim is now the setting rather than the forwarding shape**, which is the sturdier
+of the two: a third topology that forwards a peer arrival costs this record nothing, while a second
+row writing `"enforce"` costs it the sentence.
+[`docs/operators/claim-policy-rollout.md`](../operators/claim-policy-rollout.md) was re-read at this
+change and needed no amendment — it already reasoned from the setting, calling `a-b` "the worked
+example, and the only place in the repository this setting does anything".
+`local/mixed-chain/connector-b.toml` was corrected in #1299 and names `local/dealing` itself;
+`connector-a.toml` claims only that the setting is turned on nowhere else, which was true as
+written. The two doc comments in `crates/connector-bin/tests/local_topologies_load.rs` that had
+copied the old premise are corrected with this record.
+
+**No falsifier is written for this sentence, and the reason is worth recording.** The claim to check
+is "no row outside `local/mixed-chain/connector-b.toml` turns this setting on", and the marker's
+grammar is one path glob plus one regex, with no way to exempt a path and no way for a regex to see
+which file matched it. The natural pattern — the key, under `local/**/*.toml` — fires on the very
+row this record is describing, and a gate that cries wolf gets deleted. Enumerating the other
+topology directories one glob per line would pass today and silently cover no topology added
+tomorrow, which is a check that looks complete and is not — the same failure one level up. So this
+one stays a human's job, alongside `docs/adr/README.md`'s index rows, which
+`records_state_their_own_falsifier.rs` declines to cover for the same kind of reason.

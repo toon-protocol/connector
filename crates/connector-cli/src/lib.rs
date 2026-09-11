@@ -36,9 +36,10 @@ use connector_config::{Config, ConfigError};
 use url::Url;
 
 // `spawn_rate_pollers` beside the two verbs' own entry points (ADR 0071
-// decision 6, issue #1294): it is the one place a built rate table and a
-// `RateSource` meet, and the reader that will supply the source (issue
-// #1293) is a crate of its own.
+// decision 6, issue #1294): it is the one place a built rate table and the
+// node's `RateSources` meet, and the reader that supplies the EVM one
+// (issue #1293) is a crate of its own. A map rather than a source, because
+// decision 3 puts a token's pools on that token's own chain (issue #1302).
 pub use runtime::{build, router, spawn_rate_pollers, Runtime, RuntimeError};
 
 /// Everything that can stop the connector from producing a validated,

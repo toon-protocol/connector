@@ -1042,13 +1042,17 @@ fn the_mixed_chain_covers_both_legs_before_it_sends_them() {
     );
 }
 
-/// **ADR 0042 item 3, enforcing, on the one peering where it can be** (issue
+/// **ADR 0042 item 3, enforcing, on the one row where it is turned on** (issue
 /// #1142 built it; issue #1145 made it safe to turn on).
 ///
-/// `mixed-chain`'s B is the only node in this repository that forwards a
-/// packet which arrived from a peer, so its `a-b` row is the only row this
-/// setting binds on anywhere -- and therefore the only place the enforcing
-/// path is exercised against a running image at all.
+/// `mixed-chain`'s `a-b` is the only row in this repository where
+/// `forwarded_claim_enforcement` does anything, and therefore the only place
+/// the enforcing path is exercised against a running image at all. It is not
+/// the only peer arrival that gets forwarded any more -- `local/dealing`'s B
+/// forwards one too, and that crossing is the whole of its subject (issue
+/// #1299) -- but that topology leaves the setting at its default on purpose,
+/// so one fact keeps one home. ADR 0042's `## Update (issue #1303)` is where
+/// that premise was corrected and the conclusion kept.
 ///
 /// The arithmetic is what makes it survivable, and it is held here because no
 /// container can see it: the rule charges against the packet's **own amount**
@@ -1106,11 +1110,12 @@ fn the_mixed_chain_forwarded_arrival_is_enforced() {
 /// now runs `a-b` over BTP and leaves `b-c` on HTTP, which is the allocation
 /// this test exists to hold -- and it is an allocation, not a preference:
 ///
-/// * `a-b` is the only peering in this repository whose arrival is
-///   **forwarded**, and the only row where `forwarded_claim_enforcement`
-///   binds, so it is where a carriage has to move a covering claim through a
-///   gate that will refuse the packet without one rather than merely move
-///   bytes.
+/// * `a-b` is the only row in this repository where
+///   `forwarded_claim_enforcement` does anything -- `local/dealing`'s B
+///   forwards a peer arrival too and leaves the setting at its default on
+///   purpose (ADR 0042's `## Update (issue #1303)`) -- so it is where a
+///   carriage has to move a covering claim through a gate that will refuse
+///   the packet without one rather than merely move bytes.
 /// * `b-c` staying on HTTP is what makes this stack mixed-**carriage** as well
 ///   as mixed-**chain**, which is the property `CONTEXT.md` asserts: one
 ///   pipeline below the transport port, a PREPARE indistinguishable by the

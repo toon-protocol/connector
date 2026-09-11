@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use connector_domain::{AssetChain, AssetId, AssetIdError, GuardError, Price, RateError};
 
+use crate::settlement::SettlementChain;
+
 use thiserror::Error;
 
 /// Every way [`crate::Config::load`] can fail.
@@ -1442,5 +1444,39 @@ pub enum ConfigError {
         peer_id: String,
         first: AssetId,
         second: AssetId,
+    },
+
+    /// A chain whose client-edge channels hold a token no `[[tokens]]` row
+    /// declares (ADR 0071 decision 1, issue #1301) -- the client edge's
+    /// sibling of [`ConfigError::PeeringTokenNotDeclared`], and refused for
+    /// the stronger reason.
+    ///
+    /// Named by CHAIN rather than by channel, because the channel that
+    /// forces this refusal is the one no `[[client_channels]]` row names: a
+    /// settlement table registers the `ClientChannelSource` that admits a
+    /// buyer this operator has never heard of (ADR 0052, issue #502), so
+    /// every chain with a settlement table can carry an arrival whose
+    /// denomination a forward must know. Left unresolved on a dealing node,
+    /// such an arrival would forward across a real boundary at an implied
+    /// 1:1 -- decision 2's failure arriving by the one door the absence rule
+    /// does not cover.
+    ///
+    /// Only ever reached on a node that declares tokens; one that declares
+    /// none resolves no client channel at all and is not held to this rule.
+    #[error(
+        "client-edge channels on the '{chain}' chain are denominated in '{asset}', which is \
+         not a token this node deals: a node that declares [[tokens]] must be able to say \
+         which declared token every channel it accepts a claim on holds, because a forward \
+         out of a client arrival is a conversion exactly when that token and the outgoing \
+         peering's differ. This applies to every channel on the chain and not only to a \
+         declared [[client_channels]] row -- a [settlement.{chain}] table is what lets this \
+         node accept a claim on a channel it has never been configured for (ADR 0052). The \
+         token comes from that table's own 'token_address' -- declare it with a [[tokens]] \
+         row, remove the [settlement.{chain}] table, or remove the [[tokens]] table if this \
+         node deals nothing"
+    )]
+    ClientChannelTokenNotDeclared {
+        chain: SettlementChain,
+        asset: AssetId,
     },
 }

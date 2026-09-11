@@ -76,7 +76,7 @@ pub use peering::{
 // fresh (ADR 0071 decision 6, issue #1294). Two halves of one rule: the
 // poller is the only thing here that awaits anything, and the read side is
 // synchronous by construction so that no packet can wait on a rate.
-pub use rate_poller::{poll_interval, QuotePathUnusable, RatePoller};
+pub use rate_poller::{poll_interval, QuotePathUnusable, RatePoller, RateSources};
 pub use rate_table::SharedRateTable;
 pub use route::{LeasedRoute, PeerRoute};
 // Reading ANOTHER node's self-description, so a peering can be established
