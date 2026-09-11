@@ -24,11 +24,11 @@ use connector_config::{
 };
 use connector_rate_source::RateSource;
 use connector_runtime::{
-    BoundedHttpSelfDescription, ChannelDomain, ClaimStateChallengeSigner, Connector, EvmDomain,
-    FileJournal, HttpAppClient, InMemoryJournal, Journal, JournalError, OutboundClientError,
-    OutboundClientLedger, OwnedHttpClaimState, PeerRegistrar, PeerRoute, PeerRouteStore,
-    PeerRouteStoreError, PeerTransport, QuotePathUnusable, RatePoller, SharedRateTable,
-    SystemClock,
+    BoundedHttpSelfDescription, ChannelDomain, ClaimStateChallengeSigner, Connector, DeclaredRates,
+    EvmDomain, FileJournal, HttpAppClient, InMemoryJournal, Journal, JournalError,
+    OutboundClientError, OutboundClientLedger, OwnedHttpClaimState, PeerRegistrar, PeerRoute,
+    PeerRouteStore, PeerRouteStoreError, PeerTransport, QuotePathUnusable, RatePoller,
+    SharedRateTable, SystemClock,
 };
 use connector_settlement::{SettlementBackend, SettlementError};
 use connector_settlement_evm::{
@@ -2373,9 +2373,33 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
             signer,
             operator.bearer_token().to_string(),
             operator.write_keys().to_vec(),
+            declared_rates(runtime, config),
         )),
         None => app,
     })
+}
+
+/// What `GET /rates` reads on a dealing node, or `None` on one that deals
+/// nothing (ADR 0071, issue #1297).
+///
+/// The table itself is the one [`build`] put on the [`Runtime`] -- the same
+/// handle the forwarding path converts against and the poller refreshes, so
+/// the page cannot disagree with what packets see. What the table does not
+/// know is which pairs this node has *committed* to sourcing: a declared
+/// quote path holds no row until its poller's first observation lands, and
+/// a poller that never started would otherwise leave its pair missing from
+/// the one page that exists to say so. Those pairs are read back out of the
+/// config here, where the declaration lives.
+fn declared_rates(runtime: &Runtime, config: &Config) -> Option<DeclaredRates> {
+    let table = runtime.rate_table.as_ref()?;
+    let numeraire = config.denomination().numeraire()?;
+    Some(DeclaredRates::new(
+        table.clone(),
+        config
+            .denomination()
+            .quoted_tokens()
+            .map(|(token, _)| (token.clone(), numeraire.clone())),
+    ))
 }
 
 #[cfg(test)]

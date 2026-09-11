@@ -85,8 +85,8 @@ use connector_client_edge::ClientClaimGate;
 use connector_domain::{PacketResponse, Prepare, Price};
 use connector_runtime::{
     ChannelOperationError, ChannelView, ClaimBookKind, ClaimDirection, ClaimView, Connector,
-    EstablishPeeringError, LeaseRouteError, LeasedRouteView, PeerRouteTableError, PeerRouteView,
-    PeerView, RouteView, SelfDescriptionError, SettlementChain,
+    DeclaredRates, EstablishPeeringError, LeaseRouteError, LeasedRouteView, PeerRouteTableError,
+    PeerRouteView, PeerView, RateView, RouteView, SelfDescriptionError, SettlementChain,
 };
 use connector_settlement::{Claim, SettlementError};
 use connector_signer::{derive_evm_address, to_hex, Signer, SignerError};
@@ -121,11 +121,18 @@ struct OperatorState {
     signer: Arc<dyn Signer>,
     bearer_token: Arc<str>,
     write_auth: Arc<WriteAuth>,
+    /// This node's declared pairs, or `None` for a node that deals none
+    /// (issue #1297). `None` is every node that predates ADR 0071 and
+    /// every node that declares no `[[tokens]]`: `GET /rates` answers an
+    /// empty list for it, because "this node deals nothing" is an answer
+    /// and a `404` would make an operator wonder whether the surface was
+    /// too old to have the endpoint.
+    rates: Option<DeclaredRates>,
 }
 
 /// Mount the operator surface's read-only half at `connector`: `GET`
-/// endpoints for peers, routes, channels, claims, node identity and the
-/// write audit log, each requiring the bearer token
+/// endpoints for peers, routes, channels, claims, declared rates, node
+/// identity and the write audit log, each requiring the bearer token
 /// `bearer_token` and nothing more (ADR 0008). `write_keys` is the
 /// allowlist of ed25519 public keys permitted to sign a write once a
 /// write endpoint lands (issue #421); removing a key from this list and
@@ -133,12 +140,17 @@ struct OperatorState {
 /// client-edge claim book `connector_client_edge::router_with_node_facts`
 /// (or its callers) already built for `POST /ilp` -- this surface never
 /// constructs its own, so the two never drift (issue #1218).
+/// `declared_rates` is this node's dealing, read over the same shared
+/// table the forwarding path converts against (issue #1297, ADR 0071) --
+/// `None` for a node that declares no `[[tokens]]`, which is every node
+/// predating the record.
 pub fn router(
     connector: Arc<Connector>,
     claim_gate: Arc<ClientClaimGate>,
     signer: Arc<dyn Signer>,
     bearer_token: impl Into<String>,
     write_keys: Vec<[u8; 32]>,
+    declared_rates: Option<DeclaredRates>,
 ) -> Router {
     let state = OperatorState {
         connector,
@@ -146,6 +158,7 @@ pub fn router(
         signer,
         bearer_token: Arc::from(bearer_token.into()),
         write_auth: Arc::new(WriteAuth::new(write_keys)),
+        rates: declared_rates,
     };
 
     // Reads: gated by the bearer token and nothing else. Writes: gated by
@@ -159,6 +172,7 @@ pub fn router(
         .route("/routes/peers", get(peer_routes))
         .route("/channels", get(channels))
         .route("/claims", get(claims))
+        .route("/rates", get(rates))
         .route("/identity", get(identity))
         .route("/audit-log", get(audit_log))
         .route("/metrics", get(metrics))
@@ -324,6 +338,29 @@ async fn claims(State(state): State<OperatorState>) -> Json<Vec<ClaimView>> {
         },
     ));
     Json(views)
+}
+
+/// `GET /rates`: every pair this node has declared, live, stale or
+/// refused, as of one reading of the clock (issue #1297, ADR 0071).
+///
+/// A read, and only a read. Rates are declared in the config file and
+/// observed by the background poller; ADR 0071 decision 3 keeps the
+/// declaration immutable for the process lifetime (ADR 0009) and the
+/// record rejected the "set from outside" shape that would put a rate on
+/// this surface, so there is no `POST /rates` to pair with this and none
+/// should be added without amending the record.
+///
+/// Empty for a node that deals nothing, which is most of them.
+async fn rates(State(state): State<OperatorState>) -> Json<Vec<RateView>> {
+    Json(match &state.rates {
+        // The wall clock rather than a `Clock` port: this is a page being
+        // refreshed by a human, not a packet being priced, and the
+        // production clock is `Utc::now` anyway. Read once and handed to
+        // one snapshot, so every row on the page answers for the same
+        // instant.
+        Some(declared) => declared.views(chrono::Utc::now()),
+        None => Vec::new(),
+    })
 }
 
 async fn audit_log(State(state): State<OperatorState>) -> Json<Vec<AuditRecord>> {
@@ -1194,6 +1231,7 @@ mod tests {
             signer,
             bearer_token.to_string(),
             vec![],
+            None,
         )
     }
 
@@ -1267,6 +1305,7 @@ mod tests {
             "/peers",
             "/channels",
             "/claims",
+            "/rates",
             "/routes",
             "/routes/peers",
             "/routes/leased",
@@ -1369,6 +1408,7 @@ mod tests {
             signer,
             "correct-token".to_string(),
             vec![],
+            None,
         );
 
         let response = get(app, "/identity", Some("correct-token")).await;
@@ -1392,6 +1432,232 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// ADR 0071's operator read (issue #1297): which declared pairs are
+    /// live, stale or refused, so an operator can tell a dead poller from
+    /// a quiet market without reading logs.
+    ///
+    /// Driven as an external caller through the production `router()`, and
+    /// against the same `SharedRateTable` a forwarding path would hold --
+    /// not a projection of one, which is the whole point: the page reports
+    /// what packets actually see.
+    mod declared_rates {
+        use super::*;
+        use chrono::TimeDelta;
+        use connector_domain::{AssetId, Guards, MaxMove, Rate, RateTable, Spread, Ttl};
+        use connector_runtime::{RateViewState, SharedRateTable};
+
+        /// USDC on Base, the numeraire -- ADR 0071's own example.
+        const USDC: &str = "evm:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+        /// ANYONE on Base: the dealt token, 18 decimals against USDC's 6.
+        const ANYONE: &str = "evm:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+
+        fn asset(text: &str) -> AssetId {
+            text.parse::<AssetId>().expect("a declared asset")
+        }
+
+        fn rate(numerator: u64) -> Rate {
+            Rate::new(numerator, 1).expect("a rate")
+        }
+
+        /// A two-minute `ttl`, so "just observed" and "observed ten
+        /// minutes ago" land either side of it against the wall clock the
+        /// handler reads.
+        fn dealing_table() -> SharedRateTable {
+            SharedRateTable::new(RateTable::new(
+                asset(USDC),
+                Guards::new(
+                    Spread::none(),
+                    Ttl::new(TimeDelta::seconds(120)).expect("a positive ttl"),
+                    MaxMove::fraction(10, 100).expect("a max_move"),
+                ),
+            ))
+        }
+
+        fn dealing_router(rates: DeclaredRates) -> Router {
+            let clock = Arc::new(TestClock::new(chrono::Utc::now()));
+            let connector = Arc::new(Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                clock,
+            ));
+            router(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                vec![],
+                Some(rates),
+            )
+        }
+
+        async fn read_rates(app: Router) -> Vec<RateView> {
+            let response = get(app, "/rates", Some("correct-token")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            serde_json::from_slice(&bytes).expect("a list of declared pairs")
+        }
+
+        /// AC 5. A node that declares no tokens holds no table at all, and
+        /// the answer to "what do you deal" is "nothing" -- an empty list.
+        /// A `404` would leave an operator wondering whether the node was
+        /// too old to have the endpoint.
+        #[tokio::test]
+        async fn a_node_that_deals_nothing_reports_an_empty_set() {
+            let app = test_router(vec![], "correct-token");
+
+            let response = get(app, "/rates", Some("correct-token")).await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                serde_json::json!([])
+            );
+        }
+
+        /// AC 4, first half: this is a read, so it is behind the read gate
+        /// (ADR 0008's bearer token) and nothing else.
+        #[tokio::test]
+        async fn the_read_is_behind_the_bearer_token() {
+            let app = dealing_router(DeclaredRates::new(dealing_table(), []));
+
+            assert_eq!(
+                get(app.clone(), "/rates", None).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                get(app, "/rates", Some("wrong-token")).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        /// AC 4, second half: it adds no write path. ADR 0071 rejected the
+        /// "set from outside" shape (ADR 0049's) in favour of self-sourcing,
+        /// and a rate an operator could POST would be a declaration
+        /// changing mid-process, which ADR 0009 forbids outright.
+        #[tokio::test]
+        async fn there_is_no_way_to_set_a_rate_through_this_surface() {
+            let app = dealing_router(DeclaredRates::new(dealing_table(), []));
+
+            let request = Request::builder()
+                .method("POST")
+                .uri("/rates")
+                .header(header::AUTHORIZATION, "Bearer correct-token")
+                .body(Body::empty())
+                .unwrap();
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        }
+
+        /// ACs 1 and 2. Three pairs in one table, in the three states, read
+        /// in one request: the live one carries the rate a forward would
+        /// convert at and when it was last refreshed, and the other two
+        /// carry neither, because neither has a rate to carry.
+        #[tokio::test]
+        async fn every_declared_pair_reports_its_state() {
+            let table = dealing_table();
+            let now = chrono::Utc::now();
+            // Observed a moment ago: inside its ttl, so trading.
+            table.write(|rates| rates.refresh(asset(ANYONE), asset(USDC), rate(4), now));
+            // A second token, observed ten minutes ago: aged out, and the
+            // outage is its own -- ANYONE above is untouched by it.
+            let weth = asset("evm:0x4200000000000000000000000000000000000006");
+            table.write(|rates| {
+                rates.refresh(
+                    weth.clone(),
+                    asset(USDC),
+                    rate(3000),
+                    now - TimeDelta::seconds(600),
+                )
+            });
+            // A third, declared as a quote path and never yet observed:
+            // the poller that was meant to price it has landed nothing.
+            let unpriced = asset("evm:0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b");
+            let app = dealing_router(DeclaredRates::new(table, [(unpriced.clone(), asset(USDC))]));
+
+            let views = read_rates(app).await;
+
+            let find = |from: &str| {
+                views
+                    .iter()
+                    .find(|view| view.from == from)
+                    .unwrap_or_else(|| panic!("no row for {from} in {views:#?}"))
+                    .clone()
+            };
+            let live = find(ANYONE);
+            assert_eq!(live.state, RateViewState::Live);
+            assert_eq!(live.rate, Some(rate(4)));
+            assert_eq!(live.last_refreshed, Some(now));
+            assert_eq!(live.to, USDC);
+
+            let stale = find(&weth.to_string());
+            assert_eq!(stale.state, RateViewState::Stale);
+            assert_eq!(stale.rate, None);
+            assert_eq!(
+                stale.last_refreshed,
+                Some(now - TimeDelta::seconds(600)),
+                "a stale pair still says when it was last seen"
+            );
+
+            let refused = find(&unpriced.to_string());
+            assert_eq!(refused.state, RateViewState::Refused);
+            assert_eq!(refused.rate, None);
+            assert_eq!(refused.last_refreshed, None);
+        }
+
+        /// AC 3. The pair `max_move` is holding a line on is still
+        /// trading, and must not read as one that aged out -- which is why
+        /// the refusal is a field beside the state rather than a state of
+        /// its own. Both facts come out of the one lookup the forwarding
+        /// path makes, so there is no second surface to disagree with it.
+        #[tokio::test]
+        async fn a_guarded_pair_is_not_a_pair_that_aged_out() {
+            let table = dealing_table();
+            let now = chrono::Utc::now();
+            table.write(|rates| rates.refresh(asset(ANYONE), asset(USDC), rate(4), now));
+            // Ten times the standing rate, against a ten-percent bound:
+            // probable manipulation, refused, previous value left ageing.
+            table.write(|rates| rates.refresh(asset(ANYONE), asset(USDC), rate(40), now));
+            // A second pair that merely aged out, with no refusal on it.
+            let weth = asset("evm:0x4200000000000000000000000000000000000006");
+            table.write(|rates| {
+                rates.refresh(
+                    weth.clone(),
+                    asset(USDC),
+                    rate(3000),
+                    now - TimeDelta::seconds(600),
+                )
+            });
+            let app = dealing_router(DeclaredRates::new(table, []));
+
+            let views = read_rates(app).await;
+
+            let guarded = views
+                .iter()
+                .find(|view| view.from == ANYONE)
+                .expect("the guarded pair");
+            assert_eq!(guarded.state, RateViewState::Live);
+            assert_eq!(guarded.rate, Some(rate(4)), "the previous value stands");
+            let refused = guarded
+                .refused_refresh
+                .expect("a max_move refusal an operator is being woken for");
+            assert_eq!(refused.offered, rate(40));
+
+            let aged = views
+                .iter()
+                .find(|view| view.from == weth.to_string())
+                .expect("the pair that aged out");
+            assert_eq!(aged.state, RateViewState::Stale);
+            assert_eq!(
+                aged.refused_refresh, None,
+                "nothing refused this one; it simply went quiet"
+            );
+        }
     }
 
     /// The write-authentication mechanism (issue #421), exercised end to
@@ -1467,6 +1733,7 @@ mod tests {
                 signer,
                 "correct-token".to_string(),
                 write_keys,
+                None,
             )
         }
 
@@ -1774,6 +2041,7 @@ mod tests {
                 signer,
                 "correct-token".to_string(),
                 vec![keypair.public.to_bytes()],
+                None,
             );
 
             let mut prepare = sample_prepare();
@@ -1868,6 +2136,7 @@ mod tests {
                 signer,
                 "correct-token".to_string(),
                 write_keys,
+                None,
             )
         }
 
@@ -2207,6 +2476,7 @@ mod tests {
                 signer,
                 "correct-token".to_string(),
                 write_keys,
+                None,
             )
         }
 
@@ -2636,6 +2906,7 @@ mod tests {
                 signer,
                 "correct-token".to_string(),
                 vec![allowed.public.to_bytes()],
+                None,
             );
 
             let response = app
@@ -2695,6 +2966,7 @@ mod tests {
                 signer,
                 "correct-token".to_string(),
                 vec![keypair.public.to_bytes()],
+                None,
             );
 
             // Open.
@@ -2864,6 +3136,7 @@ mod tests {
                 signer,
                 "correct-token".to_string(),
                 vec![keypair.public.to_bytes()],
+                None,
             );
 
             // Fund, through the operator surface, exactly like the
@@ -3151,6 +3424,7 @@ mod tests {
                     signer,
                     "correct-token".to_string(),
                     vec![],
+                    None,
                 );
 
                 // `GET /claims` sees the client-edge claim, tagged as such.
@@ -3232,6 +3506,7 @@ mod tests {
                 signer,
                 "correct-token".to_string(),
                 vec![keypair.public.to_bytes()],
+                None,
             );
 
             let redeem_path = format!("/channels/{}/redeem-latest", channel_id.0);
