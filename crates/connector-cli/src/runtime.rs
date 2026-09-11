@@ -23,13 +23,12 @@ use connector_config::{
     SolanaSettlementConfig,
 };
 use connector_domain::AssetChain;
-use connector_rate_source::RateSource;
 use connector_rate_source_evm::UniswapV3RateSource;
 use connector_runtime::{
     BoundedHttpSelfDescription, ChannelDomain, ClaimStateChallengeSigner, Connector, DeclaredRates,
     EvmDomain, FileJournal, HttpAppClient, InMemoryJournal, Journal, JournalError,
     OutboundClientError, OutboundClientLedger, OwnedHttpClaimState, PeerRegistrar, PeerRoute,
-    PeerRouteStore, PeerRouteStoreError, PeerTransport, QuotePathUnusable, RatePoller,
+    PeerRouteStore, PeerRouteStoreError, PeerTransport, QuotePathUnusable, RatePoller, RateSources,
     SharedRateTable, SystemClock,
 };
 use connector_settlement::{SettlementBackend, SettlementError};
@@ -253,10 +252,18 @@ pub enum RuntimeError {
     /// compose, legs that do not meet, or a path ending somewhere other than
     /// this node's numeraire.
     ///
-    /// `Config::load` refuses every one of these by name already, so this is
-    /// the second lock on the same door -- and a refusal to start rather
-    /// than a poller quietly skipping the pair, because a skipped pair reads
-    /// as priced in the file while every forward across it refuses.
+    /// `Config::load` refuses every one of those by name already, so for
+    /// them this is the second lock on the same door -- and a refusal to
+    /// start rather than a poller quietly skipping the pair, because a
+    /// skipped pair reads as priced in the file while every forward across
+    /// it refuses.
+    ///
+    /// One variant is the *only* lock on its door:
+    /// [`QuotePathUnusable::NoSourceForChain`] (issue #1302), a quote path
+    /// on a chain no rate source linked into this binary can read. The
+    /// config crate cannot state that one, since which readers exist is a
+    /// fact about this binary's wiring rather than about the file -- see
+    /// `RateSources`.
     QuotePathUnpollable { source: QuotePathUnusable },
     /// The `[settlement.<chain>]` endpoint a declared quote path would be
     /// read over is not one a rate source can be pointed at (ADR 0071
@@ -1951,12 +1958,18 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
 /// This is the one place the two meet, and it takes the port rather than any
 /// implementation of it -- which is what lets the same wiring serve the EVM
 /// reader, a Solana one after it, and the in-memory source the tests drive.
+///
+/// `sources` is a map from chain to reader rather than one reader, because
+/// ADR 0071 decision 3 puts a token's quote pools on that token's own
+/// settlement chain (issue #1302): a token whose chain nothing in `sources`
+/// reads refuses startup here, rather than starting a poller whose every
+/// tick fails and whose pair goes dark one `ttl` later.
 pub fn spawn_rate_pollers(
     table: &SharedRateTable,
-    source: Arc<dyn RateSource>,
+    sources: &RateSources,
     config: &Config,
 ) -> Result<usize, RuntimeError> {
-    let pollers = RatePoller::for_config(table, source, config.denomination())
+    let pollers = RatePoller::for_config(table, sources, config.denomination())
         .map_err(|source| RuntimeError::QuotePathUnpollable { source })?;
     let started = pollers.len();
     for poller in pollers {
@@ -1992,6 +2005,14 @@ pub fn spawn_rate_pollers(
 /// nothing -- its pairs are the static `[[rates]]` rows an operator tends
 /// by hand, which is also what decision 6 leaves every Solana-side pair on
 /// until someone writes a source for that chain against the port.
+///
+/// **A quote path on a chain nothing here reads refuses startup** (issue
+/// #1302), named by [`QuotePathUnusable::NoSourceForChain`]. This function
+/// used to `warn!` about such a path and then hand it the EVM reader
+/// anyway; [`RateSources`] carries the reasoning for the change, including
+/// why the refusal is here rather than a sixth `ConfigError`. The warning
+/// is gone rather than kept beside the refusal: one fact with two homes is
+/// one fact that drifts.
 fn spawn_quote_path_pollers(
     table: &SharedRateTable,
     config: &Config,
@@ -2000,51 +2021,67 @@ fn spawn_quote_path_pollers(
     if denomination.quoted_tokens().next().is_none() {
         return Ok(0);
     }
-    // A quote path on a chain no source reads, said by name. The failure is
-    // otherwise confusing in exactly the way the missing-source warning this
-    // replaced was: the file prices the pair, and every forward across it
-    // refuses one `ttl` after boot.
-    for (token, quote) in denomination.quoted_tokens() {
-        if quote.chain() != AssetChain::Evm {
-            tracing::warn!(
-                %token,
-                chain = quote.chain().as_str(),
-                "no rate source reads pools on this chain yet (ADR 0071 decision 6), so this \
-                 token's quote path prices nothing; a [[rates]] row prices the pair by hand"
-            );
-        }
-    }
-    let Some(rpc_url) = config
+    let sources = rate_sources(config)?;
+    let started = spawn_rate_pollers(table, &sources, config)?;
+    tracing::info!(
+        started,
+        chains = %sources
+            .chains()
+            .map(|chain| chain.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        "reading declared quote paths by TWAP over each token's own settlement endpoint"
+    );
+    Ok(started)
+}
+
+/// Every chain this binary can read pools on, pointed at the endpoint the
+/// node already settles that chain over (ADR 0071 decision 6, issue #1302).
+///
+/// One entry today: the Uniswap-v3-compatible TWAP reader over
+/// `[settlement.evm] rpc_url`. A Solana reader written against the port
+/// (decision 6 leaves it unwritten) is one more `with` here and nothing
+/// else -- which is the point of building the map rather than teaching
+/// `connector-config` a list of chains it would have to be kept in step
+/// with.
+///
+/// **There is no endpoint key for this, and there should not be one.**
+/// Decision 3 puts a quote's pools on the token's *own settlement chain*
+/// precisely because that is the one chain a peering already guarantees
+/// this node RPC for, and `Config::load` refuses a quote on a chain with no
+/// `[settlement.<chain>]` table by name
+/// (`ConfigError::TokenQuoteWithoutSettlement`). So the endpoint is that
+/// table's `rpc_url`, read here, and a second key could only ever disagree
+/// with the one the node already dials.
+///
+/// Reading a pool is *not* settling: this builds its own reader over the
+/// same endpoint rather than reaching through a `SettlementBackend`, which
+/// decision 6 keeps out of every value path. The two share a URL and
+/// nothing else.
+fn rate_sources(config: &Config) -> Result<RateSources, RuntimeError> {
+    let mut sources = RateSources::none();
+    if let Some(rpc_url) = config
         .settlements()
         .iter()
         .find_map(|settlement| match settlement {
             SettlementConfig::Evm(evm) => Some(evm.rpc_url()),
             SettlementConfig::Solana(_) => None,
         })
-    else {
-        // Unreachable for an EVM quote path -- config refuses one whose
-        // chain has no settlement table -- and the honest answer for a node
-        // whose every quote path is on a chain the warning above just named.
-        return Ok(0);
-    };
-    // Rendered rather than carried: `RateSourceError` is a wide enum built
-    // for a *read* failure -- pool, pair, window -- and only its one
-    // construction-time variant can reach here. Keeping the whole of it in
-    // `RuntimeError` would make every `Result` in this module pay for a
-    // refusal `Config::load` has already made.
-    let source = UniswapV3RateSource::connect(rpc_url).map_err(|source| {
-        RuntimeError::RateSourceUnusable {
-            endpoint: rpc_url.to_string(),
-            message: source.to_string(),
-        }
-    })?;
-    let started = spawn_rate_pollers(table, Arc::new(source), config)?;
-    tracing::info!(
-        rpc_url,
-        started,
-        "reading declared quote paths by TWAP over the settlement chain's own endpoint"
-    );
-    Ok(started)
+    {
+        // Rendered rather than carried: `RateSourceError` is a wide enum
+        // built for a *read* failure -- pool, pair, window -- and only its
+        // one construction-time variant can reach here. Keeping the whole
+        // of it in `RuntimeError` would make every `Result` in this module
+        // pay for a refusal `Config::load` has already made.
+        let source = UniswapV3RateSource::connect(rpc_url).map_err(|source| {
+            RuntimeError::RateSourceUnusable {
+                endpoint: rpc_url.to_string(),
+                message: source.to_string(),
+            }
+        })?;
+        sources = sources.with(AssetChain::Evm, Arc::new(source));
+    }
+    Ok(sources)
 }
 
 /// How often [`router`]'s spawned loop sweeps the client edge's channels
@@ -6940,6 +6977,18 @@ key_file = "{key_path}"
         /// operator-named pool.
         const ANYONE: &str = "0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
         const POOL_ANYONE_USDC: &str = "0x1111111111111111111111111111111111111111";
+        /// The mock SPL mint `local/dealing` uses, here a Solana-side
+        /// node's dealt token. A quote path on Solana is only expressible
+        /// when the numeraire is on Solana too -- every leg stays on the
+        /// token's own chain and the last one lands on the numeraire -- so
+        /// `USDC_SOLANA` is that node's numeraire and this is what it
+        /// deals.
+        const SOL_DEALT: &str = "5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX";
+        /// A base58 32-byte pool name, which is all a Solana pool is here.
+        const POOL_SOL_DEALT_USDC: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
+        /// The payment-channel program id the local topology names. Nothing
+        /// in these tests dials it.
+        const SOL_PROGRAM_ID: &str = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR";
 
         fn asset(text: &str) -> AssetId {
             text.parse::<AssetId>().expect("a declared asset")
@@ -7082,8 +7131,12 @@ max_move = {{ numerator = 5, denominator = 100 }}
                 },
             );
 
-            let started = spawn_rate_pollers(&table, source as Arc<dyn RateSource>, &config)
-                .expect("a usable quote path");
+            let started = spawn_rate_pollers(
+                &table,
+                &RateSources::reading(AssetChain::Evm, source),
+                &config,
+            )
+            .expect("a usable quote path");
 
             assert_eq!(started, 1, "one token declared a quote path");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -7153,6 +7206,84 @@ max_move = {{ numerator = 5, denominator = 100 }}
                 .expect("a quote path on the chain this node settles on");
 
             assert_eq!(started, 1, "the one declared quote path is polled");
+        }
+
+        /// Issue #1302: a declared quote path on a chain no rate source
+        /// linked into this binary can read refuses startup, rather than
+        /// being handed the EVM reader and warned about.
+        ///
+        /// This is the whole of the loose end. `Config::load` accepts this
+        /// file -- the quote is on the token's own settlement chain, that
+        /// chain has a `[settlement]` table, and the path ends at the
+        /// numeraire -- and before the fix its one quoted token got the EVM
+        /// reader, whose every tick failed; one `ttl` later every forward
+        /// across the pair refused, with a boot `warn!` as the only clue.
+        /// `spawn_quote_path_pollers` is called from [`build`], so this
+        /// error is a node that does not start.
+        #[tokio::test]
+        async fn a_quote_path_on_a_chain_no_source_reads_refuses_to_start() {
+            let state_dir = tempfile::tempdir().expect("temp state dir");
+            let (config, _key_path) = config_with_raw_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement.solana]
+rpc_url = "http://127.0.0.1:8899"
+program_id = "{SOL_PROGRAM_ID}"
+token_address = "{USDC_SOLANA}"
+decimals = 6
+
+[settlement.solana.key]
+key_file = "{key_file}"
+
+[[tokens]]
+asset = "solana:{USDC_SOLANA}"
+numeraire = true
+
+[[tokens]]
+asset = "solana:{SOL_DEALT}"
+quote = [
+  {{ pool = "{POOL_SOL_DEALT_USDC}", quote_token = "solana:{USDC_SOLANA}", twap_window_secs = 900 }},
+]
+
+[rate_guards]
+spread = {{ numerator = 30, denominator = 10000 }}
+ttl_secs = 300
+max_move = {{ numerator = 5, denominator = 100 }}
+"#,
+                    state_dir = state_dir.path().display(),
+                    key_file = key_path.display()
+                )
+            });
+            let table = SharedRateTable::from_config(config.denomination())
+                .expect("a node that declares tokens deals");
+
+            let refused = spawn_quote_path_pollers(&table, &config)
+                .expect_err("no source reads Solana pools");
+
+            assert!(
+                matches!(
+                    &refused,
+                    RuntimeError::QuotePathUnpollable {
+                        source: QuotePathUnusable::NoSourceForChain {
+                            token,
+                            chain: AssetChain::Solana,
+                        },
+                    } if token == &asset(&format!("solana:{SOL_DEALT}"))
+                ),
+                "the refusal names the token and the chain: {refused:?}"
+            );
+            let said = refused.to_string();
+            assert!(
+                said.contains("no rate source") && said.contains("solana"),
+                "and says which refusal it is -- a chain nothing reads, not a chain with no \
+                 settlement table: {said}"
+            );
         }
 
         /// The other half, unchanged by the wiring: a node whose every pair

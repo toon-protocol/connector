@@ -8,6 +8,11 @@
 //! [`SharedRateTable`] a forward reads. A packet never waits on any of this.
 //! A slow RPC costs a refresh its latency; it costs no packet anything.
 //!
+//! Which source a token gets is [`RateSources`]'s question, not the node's:
+//! decision 3 puts a token's pools on that token's own settlement chain, so
+//! a quoted token on a chain nothing here can read is a refusal to start
+//! rather than a poller whose every tick fails (issue #1302).
+//!
 //! # What the poller decides, and what it does not
 //!
 //! Very little is decided here, deliberately. The three guards are the
@@ -57,12 +62,13 @@
 //! boot and never rewritten, and a restart starts from no observation at
 //! all, which is the correct state to start from.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::TimeDelta;
 use connector_config::DenominationConfig;
-use connector_domain::{AssetId, Refresh, Ttl};
+use connector_domain::{AssetChain, AssetId, Refresh, Ttl};
 use connector_rate_source::{PoolId, QuoteLeg, QuotePath, QuotePathError, RateSource};
 use thiserror::Error;
 
@@ -100,15 +106,40 @@ pub fn poll_interval(ttl: Ttl) -> Duration {
 
 /// Why a declared quote path cannot be polled.
 ///
-/// Every variant is something `Config::load` already refuses by name (ADR
-/// 0071 decision 3: one or two legs, on the token's own settlement chain,
-/// ending at the numeraire), so this is the second lock on the same door.
-/// It exists as an error rather than an `expect` because the price of being
+/// Every variant but [`NoSourceForChain`](QuotePathUnusable::NoSourceForChain)
+/// is something `Config::load` already refuses by name (ADR 0071 decision 3:
+/// one or two legs, on the token's own settlement chain, ending at the
+/// numeraire), so for those this is the second lock on the same door. It
+/// exists as an error rather than an `expect` because the price of being
 /// wrong about that is a node that panics mid-boot, and because a poller
 /// silently skipping a pair would leave the operator reading a config that
 /// says the pair is priced while every forward across it refuses.
+///
+/// `NoSourceForChain` is the one variant that is the *only* lock on its
+/// door, for the reason [`RateSources`] gives: which chains this binary can
+/// read pools on is a fact about the readers linked into it, not about the
+/// file, and the config crate cannot state it without keeping a second copy
+/// of it.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum QuotePathUnusable {
+    /// A quote path on a chain this node has no [`RateSource`] for (issue
+    /// #1302). Distinct from `Config::load`'s
+    /// `TokenQuoteWithoutSettlement`, which is the same token failing an
+    /// earlier and different test: that one is "this node has no
+    /// `[settlement.<chain>]` table, so it has no endpoint to read the
+    /// pools over", while this one is "the endpoint is there and nothing
+    /// linked into this binary knows how to read that chain's pools".
+    ///
+    /// ADR 0071 decision 6 leaves such a pair to a static `[[rates]]` row
+    /// until someone writes a source for the chain against the port, and
+    /// the row is what the message asks for.
+    #[error(
+        "the quote path for {token} reads pools on the {chain} chain, which no rate source \
+         linked into this node can read (ADR 0071 decision 6 leaves that source unwritten): \
+         drop the quote and price this token's pairs with [[rates]] rows"
+    )]
+    NoSourceForChain { token: AssetId, chain: AssetChain },
+
     /// A path with no leg at all -- nothing to read, and no rate that could
     /// come of reading it.
     #[error("the quote path for {token} names no pool")]
@@ -150,6 +181,92 @@ pub enum QuotePathUnusable {
     WindowOutOfRange { token: AssetId, window: Duration },
 }
 
+/// Which [`RateSource`] reads which chain's pools: the node's whole answer
+/// to "can this token's quote path be read at all" (issue #1302).
+///
+/// ADR 0071 decision 3 puts a token's quote pools on **that token's own
+/// settlement chain**, so the source a quoted token needs is a property of
+/// the token, not of the node. A node holding one source and handing it to
+/// every quoted token is therefore making an assumption the record does not
+/// license -- and while it holds trivially today, because
+/// `connector-rate-source-evm`'s TWAP reader is the only implementation and
+/// decision 6 leaves the Solana one unwritten, a config *can* declare a
+/// quote path on Solana (a node whose numeraire is an SPL mint, dealing
+/// another SPL token). That path used to be handed the EVM reader, whose
+/// every refresh tick failed, and one `ttl` later every forward across the
+/// pair went dark -- decision 5's staleness-is-an-outage arriving as a
+/// mystery rather than as a refusal.
+///
+/// # Why this rather than a boot refusal in `connector-config`
+///
+/// Issue #1302 weighed a `ConfigError` naming a quote path on a chain the
+/// node has no source for, beside the five ADR 0071 refusals
+/// `Config::load` already makes. It was not taken, and the reasoning is
+/// here because this is where the next reader will look for it:
+///
+/// * **It buys no earliness.** [`for_config`](RatePoller::for_config) is
+///   called from `build`, before the node serves anything, and its error
+///   refuses startup. A config refusal would name the same fault at the
+///   same boot, a few microseconds sooner.
+/// * **It would cost a second home for one fact.** `connector-config`
+///   knows about `[settlement.<chain>]` tables; it knows nothing about
+///   which source implementations exist, and it should not -- writing the
+///   Solana reader would then mean editing the config crate as well as
+///   this map, and a node whose two copies disagreed would either refuse a
+///   path it could read or start a poller it could not. That is exactly
+///   the drift the `warn!` this replaced already had.
+///
+/// So the knowledge lives where the sources are wired, in one place, and
+/// the second implementation is a `with` call rather than a signature
+/// change.
+#[derive(Clone)]
+pub struct RateSources {
+    by_chain: BTreeMap<AssetChain, Arc<dyn RateSource>>,
+}
+
+impl RateSources {
+    /// A node that can read no chain's pools. Every quoted token it is
+    /// asked about is a [`QuotePathUnusable::NoSourceForChain`]; a node
+    /// that declares no quote path never asks.
+    pub fn none() -> RateSources {
+        RateSources {
+            by_chain: BTreeMap::new(),
+        }
+    }
+
+    /// The one-chain map, which is every map this binary builds today.
+    pub fn reading(chain: AssetChain, source: Arc<dyn RateSource>) -> RateSources {
+        RateSources::none().with(chain, source)
+    }
+
+    /// Add the source that reads `chain`, replacing any already registered
+    /// for it. Taken by value and returned so that wiring reads as one
+    /// expression at the call site.
+    #[must_use]
+    pub fn with(mut self, chain: AssetChain, source: Arc<dyn RateSource>) -> RateSources {
+        self.by_chain.insert(chain, source);
+        self
+    }
+
+    /// The source that reads `chain`, or `None` when nothing linked into
+    /// this node does.
+    pub fn get(&self, chain: AssetChain) -> Option<&Arc<dyn RateSource>> {
+        self.by_chain.get(&chain)
+    }
+
+    /// Every chain this node can read pools on, in a stable order -- for
+    /// the log line that says so at boot.
+    pub fn chains(&self) -> impl Iterator<Item = AssetChain> + '_ {
+        self.by_chain.keys().copied()
+    }
+}
+
+impl std::fmt::Debug for RateSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.chains()).finish()
+    }
+}
+
 /// One quoted token's background poller: the pair `(token, numeraire)`, the
 /// path its price is read over, and the cadence that pair's `ttl` implies.
 ///
@@ -169,22 +286,37 @@ pub struct RatePoller {
 
 impl RatePoller {
     /// One poller per `[[tokens]]` row that declared a `quote` path, in the
-    /// order declared.
+    /// order declared, each connected to the source that reads **its own
+    /// token's** chain (issue #1302).
     ///
     /// A node whose tokens declare no quote path gets an empty `Vec` and
     /// starts nothing -- the static-rows-only configuration ADR 0071
     /// decision 3 leaves the operator to tend by hand, and every node that
-    /// predates the record.
+    /// predates the record. `sources` is not consulted at all for such a
+    /// node, so an empty map is only ever a refusal for a path that was
+    /// actually declared.
     pub fn for_config(
         table: &SharedRateTable,
-        source: Arc<dyn RateSource>,
+        sources: &RateSources,
         denomination: &DenominationConfig,
     ) -> Result<Vec<RatePoller>, QuotePathUnusable> {
         denomination
             .quoted_tokens()
             .map(|(token, declared)| {
+                // Selected by the path's own chain, before the path is
+                // built: a token whose chain nothing reads is that refusal
+                // and not a complaint about its pools, the same way
+                // `resolve_quote` states the node-shaped refusal before
+                // every per-leg one.
+                let chain = declared.chain();
+                let source = sources.get(chain).cloned().ok_or_else(|| {
+                    QuotePathUnusable::NoSourceForChain {
+                        token: token.clone(),
+                        chain,
+                    }
+                })?;
                 let path = port_quote_path(token, declared)?;
-                RatePoller::new(table, Arc::clone(&source), token.clone(), path)
+                RatePoller::new(table, source, token.clone(), path)
             })
             .collect()
     }
@@ -401,6 +533,28 @@ mod tests {
     const WETH: &str = "evm:0x4200000000000000000000000000000000000006";
     const POOL_ANYONE_WETH: &str = "0x1111111111111111111111111111111111111111";
     const POOL_WETH_USDC: &str = "0x2222222222222222222222222222222222222222";
+
+    // ---- the Solana side, for the source-selection tests --------------
+    //
+    // A quote path on Solana is only expressible when the NUMERAIRE is on
+    // Solana too: `resolve_quote` refuses a leg quoting into a token on
+    // another chain (`TokenQuoteOffChain`) and requires the last leg to
+    // land on the numeraire, so every quoted token on a node shares the
+    // numeraire's chain. That is why the two-chain assertion below runs two
+    // configs against one map rather than one config with two quoted
+    // tokens: the latter is not a file anyone can write.
+
+    /// The mock SPL mint `local/dealing` already uses, here standing as a
+    /// Solana-side node's own numeraire.
+    const SOL_NUMERAIRE: &str = "solana:5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX";
+    /// The token that node deals, quoted through one Solana pool.
+    const SOL_DEALT: &str = "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    /// A real Raydium account address: a base58 32-byte pool name, which is
+    /// all `canonical_pool` asks of a Solana pool.
+    const POOL_SOL_DEALT_NUMERAIRE: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
+    /// The payment-channel program id `local/dealing` names -- a
+    /// `[settlement.solana]` table needs one, and nothing here dials it.
+    const SOL_PROGRAM_ID: &str = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR";
 
     fn asset(text: &str) -> AssetId {
         text.parse::<AssetId>().expect("a declared asset")
@@ -711,6 +865,113 @@ max_move = {{ numerator = 5, denominator = 100 }}
         (config, dir)
     }
 
+    /// A node whose numeraire is an SPL mint, dealing a second SPL token
+    /// through one Raydium-shaped pool -- and holding an EVM settlement
+    /// table besides, whose token is declared and priced by a static
+    /// `[[rates]]` row.
+    ///
+    /// This is the config issue #1302 is about: `Config::load` accepts it
+    /// (every ADR 0071 refusal is satisfied -- the quote is on the token's
+    /// own settlement chain and ends at the numeraire), and before the fix
+    /// its quoted token was handed the EVM reader, whose every tick failed.
+    /// Two declared tokens on two chains, which is also what makes it the
+    /// fixture for "no quoted token gets a source that cannot read its
+    /// chain".
+    fn solana_numeraire_node() -> (Config, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let key_file = dir.path().join("signer.key");
+        std::fs::write(&key_file, [9u8; 32]).expect("write a raw 32-byte key");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).expect("create a state dir");
+
+        let config_file = dir.path().join("connector.toml");
+        let mut file = std::fs::File::create(&config_file).expect("create the config file");
+        write!(
+            file,
+            r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement.evm]
+rpc_url = "http://127.0.0.1:8545"
+contract_address = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
+token_address = "{usdc}"
+decimals = 6
+
+[settlement.evm.key]
+key_file = "{key_file}"
+
+[settlement.solana]
+rpc_url = "http://127.0.0.1:8899"
+program_id = "{program_id}"
+token_address = "{sol_numeraire}"
+decimals = 9
+
+[settlement.solana.key]
+key_file = "{key_file}"
+
+[[tokens]]
+asset = "{sol_numeraire_asset}"
+numeraire = true
+
+[[tokens]]
+asset = "{sol_dealt}"
+quote = [
+  {{ pool = "{pool}", quote_token = "{sol_numeraire_asset}", twap_window_secs = 900 }},
+]
+
+[[tokens]]
+asset = "evm:{usdc}"
+
+[[rates]]
+from = "evm:{usdc}"
+to = "{sol_numeraire_asset}"
+rate = {{ numerator = 1000, denominator = 1 }}
+
+[rate_guards]
+spread = {{ numerator = 30, denominator = 10000 }}
+ttl_secs = 300
+max_move = {{ numerator = 5, denominator = 100 }}
+"#,
+            state_dir = state_dir.display(),
+            key_file = key_file.display(),
+            usdc = USDC.trim_start_matches("evm:"),
+            program_id = SOL_PROGRAM_ID,
+            sol_numeraire = SOL_NUMERAIRE.trim_start_matches("solana:"),
+            sol_numeraire_asset = SOL_NUMERAIRE,
+            sol_dealt = SOL_DEALT,
+            pool = POOL_SOL_DEALT_NUMERAIRE,
+        )
+        .expect("write the config file");
+
+        let config = Config::load(&config_file).expect("load the config");
+        (config, dir)
+    }
+
+    /// The source that reads that node's one Solana pool, and only it: a
+    /// source holding no EVM pool at all, so handing it an EVM path would
+    /// price nothing and handing an EVM source this path would price
+    /// nothing either. That is what makes the selection assertion
+    /// behavioural rather than an inspection of which `Arc` went where.
+    fn solana_source() -> Arc<InMemoryRateSource> {
+        let source = Arc::new(InMemoryRateSource::new());
+        source.insert_pool(
+            PoolId(POOL_SOL_DEALT_NUMERAIRE.to_string()),
+            PoolContents {
+                base: asset(SOL_DEALT),
+                quote: asset(SOL_NUMERAIRE),
+                rate: rate(7, 1000),
+                observed_at: at(0),
+                shortest_window: TimeDelta::seconds(60),
+                longest_window: TimeDelta::seconds(3600),
+            },
+        );
+        source
+    }
+
     /// The source that node's two-leg path reads: ANYONE priced in WETH,
     /// WETH priced in USDC, composing to ANYONE in USDC.
     fn two_leg_source() -> Arc<InMemoryRateSource> {
@@ -776,8 +1037,12 @@ max_move = {{ numerator = 5, denominator = 100 }}
     async fn a_poller_per_declared_quote_path_prices_that_token() {
         let (config, _dir) = dealing_node();
         let table = SharedRateTable::from_config(config.denomination()).expect("a dealing node");
-        let pollers = RatePoller::for_config(&table, two_leg_source(), config.denomination())
-            .expect("usable quote paths");
+        let pollers = RatePoller::for_config(
+            &table,
+            &RateSources::reading(AssetChain::Evm, two_leg_source()),
+            config.denomination(),
+        )
+        .expect("usable quote paths");
 
         assert_eq!(pollers.len(), 1, "one token declared a quote path");
         assert_eq!(pollers[0].token(), &asset(ANYONE));
@@ -797,6 +1062,157 @@ max_move = {{ numerator = 5, denominator = 100 }}
             // base unit, less the node's 30/10000 spread.
             Some(rate(2991, 4_000_000_000_000_000)),
             "the two legs composed, and the spread came off the mid on the way out"
+        );
+    }
+
+    /// Issue #1302: each quoted token is read through the source for
+    /// **its own** chain, and nothing else.
+    ///
+    /// Two configs rather than one, for the reason the Solana constants
+    /// above give -- every quoted token on a node shares the numeraire's
+    /// chain, so "two quoted tokens on two chains" is not a file anyone can
+    /// write. What one *can* write is two nodes, and the assertion is the
+    /// same one either way: one map, two chains, and each poller priced its
+    /// pair. Neither source holds the other's pool, so a poller handed the
+    /// wrong one writes nothing at all and its pair stays `NotDeclared`.
+    #[tokio::test]
+    async fn each_quoted_token_is_polled_through_its_own_chains_source() {
+        let sources = RateSources::none()
+            .with(AssetChain::Evm, two_leg_source())
+            .with(AssetChain::Solana, solana_source());
+
+        let (evm_config, _evm_dir) = dealing_node();
+        let evm_table =
+            SharedRateTable::from_config(evm_config.denomination()).expect("a dealing node");
+        let evm_pollers = RatePoller::for_config(&evm_table, &sources, evm_config.denomination())
+            .expect("usable quote paths");
+        assert_eq!(evm_pollers.len(), 1);
+        evm_pollers[0].refresh_once().await;
+
+        let (solana_config, _solana_dir) = solana_numeraire_node();
+        let solana_table =
+            SharedRateTable::from_config(solana_config.denomination()).expect("a dealing node");
+        let solana_pollers =
+            RatePoller::for_config(&solana_table, &sources, solana_config.denomination())
+                .expect("usable quote paths");
+        assert_eq!(solana_pollers.len(), 1);
+        assert_eq!(solana_pollers[0].token(), &asset(SOL_DEALT));
+        solana_pollers[0].refresh_once().await;
+
+        assert!(
+            evm_table
+                .read()
+                .lookup(&asset(ANYONE), &asset(USDC), at(30))
+                .rate()
+                .is_some(),
+            "the EVM node's poller read the EVM source"
+        );
+        assert!(
+            solana_table
+                .read()
+                .lookup(&asset(SOL_DEALT), &asset(SOL_NUMERAIRE), at(30))
+                .rate()
+                .is_some(),
+            "the Solana node's poller read the SOLANA source -- handed the EVM one, which holds \
+             no Solana pool, this pair would still be NotDeclared"
+        );
+        assert_eq!(
+            solana_table
+                .read()
+                .lookup(&asset(USDC), &asset(SOL_NUMERAIRE), at(30))
+                .rate(),
+            // 1000/1 mid, less the node's 30/10000 spread.
+            Some(rate(997, 1)),
+            "and the static [[rates]] row for the cross-chain pair is untouched by any of it \
+             (ADR 0071 decision 6 leaves such a pair to the operator)"
+        );
+    }
+
+    /// Issue #1302, the refusal: a declared quote path on a chain this node
+    /// has no source for is an error at poller construction -- which
+    /// `build` calls before the node serves anything -- rather than a
+    /// poller whose every tick fails and whose pair goes dark one `ttl`
+    /// later.
+    ///
+    /// It names the token and the chain, and it is a different sentence
+    /// from `Config::load`'s `TokenQuoteWithoutSettlement`: this node has
+    /// the `[settlement.solana]` table, which is exactly why the config
+    /// loaded.
+    #[test]
+    fn a_quote_path_on_a_chain_no_source_reads_is_refused_rather_than_polled() {
+        let (config, _dir) = solana_numeraire_node();
+        let table = SharedRateTable::from_config(config.denomination()).expect("a dealing node");
+
+        let refused = RatePoller::for_config(
+            &table,
+            &RateSources::reading(AssetChain::Evm, two_leg_source()),
+            config.denomination(),
+        );
+
+        assert_eq!(
+            refused.err(),
+            Some(QuotePathUnusable::NoSourceForChain {
+                token: asset(SOL_DEALT),
+                chain: AssetChain::Solana,
+            })
+        );
+    }
+
+    /// The other half of issue #1302, and the one that must not change: a
+    /// node whose tokens are all priced by static `[[rates]]` rows declares
+    /// no quote path, so it is never asked for a source and an empty map
+    /// refuses nothing. Every node that predates ADR 0071 is this node.
+    #[test]
+    fn a_node_with_no_quote_path_is_never_asked_for_a_source() {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let key_file = dir.path().join("signer.key");
+        std::fs::write(&key_file, [11u8; 32]).expect("write a raw 32-byte key");
+        let config_file = dir.path().join("connector.toml");
+        let mut file = std::fs::File::create(&config_file).expect("create the config file");
+        write!(
+            file,
+            r#"
+client_edge_addr = "127.0.0.1:0"
+
+[signer]
+key_file = "{key_file}"
+
+[[tokens]]
+asset = "evm:{usdc}"
+numeraire = true
+
+[[tokens]]
+asset = "{sol_numeraire}"
+
+[[rates]]
+from = "{sol_numeraire}"
+to = "evm:{usdc}"
+rate = {{ numerator = 1, denominator = 1000 }}
+
+[rate_guards]
+spread = {{ numerator = 30, denominator = 10000 }}
+ttl_secs = 300
+max_move = {{ numerator = 5, denominator = 100 }}
+"#,
+            key_file = key_file.display(),
+            usdc = USDC.trim_start_matches("evm:"),
+            sol_numeraire = SOL_NUMERAIRE,
+        )
+        .expect("write the config file");
+        let config = Config::load(&config_file).expect("load the config");
+
+        let table = SharedRateTable::from_config(config.denomination()).expect("a dealing node");
+        let pollers = RatePoller::for_config(&table, &RateSources::none(), config.denomination())
+            .expect("a node with nothing to poll needs no source");
+
+        assert!(pollers.is_empty(), "nothing declared a quote path");
+        assert!(
+            table
+                .read()
+                .lookup(&asset(SOL_NUMERAIRE), &asset(USDC), at(30))
+                .rate()
+                .is_some(),
+            "and its hand-tended Solana-side pair prices exactly as it did before"
         );
     }
 
@@ -833,8 +1249,12 @@ max_move = {{ numerator = 5, denominator = 100 }}
         let before = snapshot(dir.path());
 
         let table = SharedRateTable::from_config(config.denomination()).expect("a dealing node");
-        let pollers = RatePoller::for_config(&table, two_leg_source(), config.denomination())
-            .expect("usable quote paths");
+        let pollers = RatePoller::for_config(
+            &table,
+            &RateSources::reading(AssetChain::Evm, two_leg_source()),
+            config.denomination(),
+        )
+        .expect("usable quote paths");
         for poller in &pollers {
             poller.refresh_once().await;
             poller.refresh_once().await;
