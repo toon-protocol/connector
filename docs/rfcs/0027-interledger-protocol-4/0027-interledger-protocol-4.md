@@ -132,14 +132,38 @@ public key ‖ AEAD(32-byte shared secret ‖ OER request envelope)`, sealed by
   sense after minimum delivery was retired
   ([ADR 0057](../../adr/0057-minimum-delivery-is-retired-a-claim-bounds-erosion.md);
   **PF-14**).
-- **No exchange rate is applied to `amount`.** The RFC's description of `amount`
-  has each connector applying its rate and rescaling; this connector subtracts a
-  flat per-packet fee attached to the **peering** and nothing else
-  ([ADR 0010](../../adr/0010-flat-per-packet-fee-and-minimum-delivery.md),
-  re-sited by
-  [ADR 0061](../../adr/0061-a-fee-attaches-to-a-peering-not-to-a-route.md);
-  **PF-12**, **PF-13**, **PM-17**). A cross-chain hop does not convert either —
-  a rate is the `swap` repository's job.
+- **A hop applies its own rate to `amount` — this RFC's own model. What differs
+  is the police, not the rewrite.** Where a forward's incoming and outgoing
+  channels hold different tokens, this connector converts at a rate it has
+  **declared**, rounding down and in its own favour, and subtracts the flat
+  per-packet fee in the **outgoing** leg's unit; where the two channels hold one
+  token there is no rate at all and the fee is the whole of the difference,
+  exactly as it has always been
+  ([ADR 0071](../../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md),
+  which amends
+  [ADR 0010](../../adr/0010-flat-per-packet-fee-and-minimum-delivery.md) and
+  re-sites the fee
+  [ADR 0061](../../adr/0061-a-fee-attaches-to-a-peering-not-to-a-route.md)
+  attaches to a peering; **PF-12**, **PF-13**, **PM-17**). §Forwarding, Not
+  Delivery is the model followed rather than departed from: each hop applies its
+  local rate and holds no price information about the rest of the network.
+
+  What this RFC leans on to make that safe is a transport layer this connector
+  does not have — STREAM lets a sender name a per-packet floor the receiver
+  enforces, and the sender retries elsewhere when a hop quotes badly — and TOON
+  retired the declared floor besides (ADR 0057). Three things stand in its
+  place. A client pays its own edge's posted price in its own unit, and the
+  packet amount **is** that charge (ADR 0028), so no buyer ever reads a number
+  denominated somewhere down the path. A rate is **declared or absent**: a pair
+  this node has priced nothing for is refused `F02` rather than passed through
+  at an implied 1:1 — the 10¹²× error a 6-vs-18-decimals pair would otherwise be
+  — and a rate whose observation has aged out is refused `T00` rather than dealt
+  on, because staleness here is an outage on purpose. What is left is the
+  dealing operator's own risk, which their **spread** is the payment for and
+  their declared guards the mitigation. That spread is a separate earning from
+  the fee, so this RFC's revenue sentence in §Terminology ("spreads on currency
+  conversion") is true here only of a hop actually on a boundary: a hop crossing
+  none still earns what PF-12 says it earns and nothing else.
 
 **Faithful:** the three packet types, less PREPARE's now-absent
 `executionCondition`; type bytes 12, 13 and 14; `Fulfill.fulfillment`

@@ -1442,7 +1442,16 @@ Required surface:
 - Per peer: `max_packet_amount` — [ADR 0042](../adr/0042-a-packet-carries-its-claim.md)'s **cap**,
   the largest amount this connector will forward to that peering in **one packet**, in the
   settlement asset's base units. A packet needing more is refused with `T04`, never carried and
-  never split. Optional and defaulted (`connector_config::DEFAULT_MAX_PACKET_AMOUNT`, 1 000 000 =
+  never split. Those base units are the **outgoing** channel's — the peering the row is written
+  on, never the peering the packet arrived over. The distinction is free while a whole path holds
+  one token and is the whole of the reading once it does not: a hop that crosses a denomination
+  applies its declared rate first and compares the **converted** figure against this number
+  ([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)), so a cap
+  beside a peering holding an 18-decimals token is a count of 10⁻¹⁸ of that token and nothing
+  else. There is also a ceiling below this one that no operator configures: an amount is a `u64`,
+  so one packet on an 18-decimals leg cannot exceed `u64::MAX / 10¹⁸ ≈ 18.4` tokens whatever this
+  row says, and a conversion landing past it is refused rather than wrapped. `max_packet_amount`
+  is where an operator says something smaller and deliberate. Optional and defaulted (`connector_config::DEFAULT_MAX_PACKET_AMOUNT`, 1 000 000 =
   1 USDC), so a peering that writes nothing is still bounded; there is deliberately no spelling
   that disables it, and `0` is a named load error rather than "off". This bounds one packet, not
   an accumulation — it is not `ceiling` returning (ADR 0033, retired above).

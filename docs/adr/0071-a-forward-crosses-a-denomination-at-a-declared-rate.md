@@ -1,6 +1,8 @@
 # A forward crosses a denomination at a declared rate
 
-**Status:** Accepted — not yet built (owner decision, 2026-09-10, issue #1286). Amends
+**Status:** Accepted — **built** (owner decision, 2026-09-10, issue #1286; epic #1287, tickets
+#1288–#1298), bar the local topology that proves a crossing against real chains, which is #1299
+and still open. Amends
 [0010](0010-flat-per-packet-fee-and-minimum-delivery.md): the flat per-packet fee, its earnings
 rule and cost discoverability all stand untouched — what falls is the corollary that no rate may
 exist at a hop ("value conversion is the `swap` repository's job"), stated in that record's

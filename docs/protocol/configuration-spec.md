@@ -414,9 +414,12 @@ real backend is constructed for every chain configured before the node serves an
 
 **`decimals` is a declaration, not a conversion.** Nothing scales by it: every amount on the value path
 — a route's price, a claim's amount, a channel's deposit — is already in the settlement token's base
-units, and keeping those units uniform across chains is what leaves nothing to convert. It is checked
-instead, against the token's own `decimals()` at startup, and a disagreement names both and refuses to
-boot (CF-25). Zero is refused outright.
+units, and stays in the units of the leg it is on. Where a forward's two legs hold different tokens the
+scale difference is folded into the **declared rate**'s ratio and taken from there
+([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md) decision 4), never
+derived from this key: scale is not price, and nothing about a market lives in a token's metadata. It
+is checked instead, against the token's own `decimals()` at startup, and a disagreement names both and
+refuses to boot (CF-25). Zero is refused outright.
 
 **Declaring a denomination is optional, and declaring none costs nothing.** `[[tokens]]`, `[[rates]]`
 and `[rate_guards]` are how an operator says which tokens their node **deals**, what each is worth

@@ -396,7 +396,8 @@ _Avoid_: payout, redemption (as a synonym for the whole act)
 What a connector charges to carry one packet across one peering relation. Flat per packet,
 not proportional to the amount carried — and not varying with where the packet is headed, because
 it pays for this hop's work and that work is the same whatever the destination. One number per
-peering, held by the peering, denominated in that peering's unit
+peering, held by the peering, denominated in that peering's unit — which at a hop crossing a
+denomination is the **outgoing** leg's, subtracted after the conversion and not before
 ([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). What varies
 by destination is the **price**; what a hop earns for crossing a denomination is the **spread**,
 a separate earning.
@@ -440,20 +441,31 @@ the terminating node's published **price**, on its greeting and its self-descrip
 _Avoid_: total fee, quote
 
 **Rate**:
-The declared terms on which one connector crosses one denomination boundary: how many of the
-outgoing channel's units its own declaration says one incoming unit buys, direction included
+The declared terms on which one connector crosses one denomination boundary: a rational over
+**base units** — so many of the outgoing channel's for so many of the incoming one's — with the
+two tokens' decimals folded into the ratio and direction included
 ([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). Declared or
-absent — a pair with no rate refuses to convert, nothing ever converts silently, and a same-asset
-pair has no rate because crossing a chain is not a conversion. A rate is one connector's own
+absent, and absence is the safety rule: a pair this node declared nothing for is refused with a
+final **`F02`** rather than passed through at an implied 1:1, and a rate whose observation has
+aged out past its ttl with a retryable **`T00`** rather than dealt on dead. Nothing ever converts
+silently. A node that declares no tokens resolves no denomination, crosses no boundary and
+forwards unconverted at the flat fee — which is every node this repository ships today; a node
+that declares them is held to the rule on every ordered pair it can resolve, same asset or not,
+because USDC on two chains is two of them. An operator who wants such a pair carried at par says
+so in a row: there is no 1:1 rate to fall back on, deliberately. A rate is one connector's own
 posted term, never a network fact: the network learns it the way it learns every cost, by probing
 the route.
 _Avoid_: exchange rate (a market's number; this is one connector's posted one), conversion factor
 
 **Spread**:
-What a connector earns at a denomination boundary: the margin between the rate it declares and
-the market it sources, paid for carrying the dealing risk — a stale source, a shoved pool, a
-packet held against a moving price
-([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). A separate
+What a connector earns at a denomination boundary: the part of the **mid** — the unwidened rate
+the node holds for a pair, sourced or hand-tended — that it keeps when it deals, taken against
+the sender in whichever direction the packet runs, and paid for carrying the dealing risk: a
+stale source, a shoved pool, a packet held against a moving price
+([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). Declared as a
+**fraction** strictly below one — as `max_move` and a static rate are, and for the reason ADR 0010
+deleted the basis-point fee: there are no floats on this path, and an operator dealing at half a
+basis point writes `1/20000` rather than watching it round to zero. A separate
 earning from the **fee**, which buys carriage; a hop that crosses no boundary earns no spread.
 _Avoid_: arbitrage (riskless profit between venues — this is priced risk), margin
 

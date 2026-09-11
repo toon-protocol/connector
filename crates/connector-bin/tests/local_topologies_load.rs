@@ -789,9 +789,19 @@ const TWO_HOP_CONFIG_PAIR: [&str; 2] = [TWO_HOP_A, TWO_HOP_B];
 /// Not a conversion, and this test is written so it could not be mistaken for
 /// one: the only thing that changes an amount between two hops here is a hop
 /// subtracting its own FLAT fee (issue #1144), so every gap on the path is a
-/// fixed number of base units rather than a share of what arrived. ADR 0010
-/// replaced the spread with a flat per-packet fee and value conversion is the
-/// `swap` repository's job.
+/// fixed number of base units rather than a share of what arrived. What has
+/// changed is *why*. Conversion is no longer somebody else's repository: ADR
+/// 0071 made crossing a denomination core forwarding behaviour, and the chain
+/// boundary in B's middle is exactly the place it would happen. What holds
+/// these figures still is that record's decision 2 -- no declared rate, no
+/// conversion, no forward. None of these three files declares a `[[tokens]]`
+/// row, so B resolves no token for either peering, sits on no denomination
+/// boundary at all, and runs the unconverted forward byte for byte as it did
+/// before 0071. A node that DID declare tokens would be held to the absence
+/// rule on this very pair -- USDC on anvil and USDC on the test validator are
+/// two `AssetId`s, and an `AssetId` is chain-qualified -- and would have to
+/// declare that pair at par, in as many words, before it forwarded anything
+/// across it.
 #[test]
 fn the_mixed_chain_topology_puts_one_node_on_both_chains() {
     let a = load("local/mixed-chain/connector-a.toml", MIXED_A);
@@ -890,9 +900,12 @@ fn the_mixed_chain_path_is_one_prefix_per_hop_and_one_flat_fee_per_hop() {
         flat(second.price()),
         "STILL NOT A CONVERSION. What leaves A is what arrived minus A's own FLAT fee, and that \
          is exactly B's price -- the whole difference between the two figures is one hop's fee \
-         and nothing else. Any other gap is a rate, which is the `swap` repository's job and \
-         not this connector's (ADR 0010 deleted the spread), and the chain boundary in the \
-         middle is exactly where somebody would be tempted to put one."
+         and nothing else. Any other gap would be a rate, and what forbids one here is ADR \
+         0071's absence rule (decision 2): these configs declare no tokens, so no hop on this \
+         path resolves a denomination to convert between, and a pair nobody declared refuses \
+         rather than guesses. The chain boundary in the middle is still exactly where somebody \
+         would be tempted to put a rate -- the difference is that they would now have to write \
+         one down."
     );
     assert!(
         flat(second.price()) - second_fee >= flat(app.price()),

@@ -12,7 +12,7 @@ TypeScript prototype — [ADR 0017](../adr/0017-the-typescript-connector-is-a-pr
 
 ```
 connector/
-  crates/          the connector — sixteen crates producing the `connector` binary
+  crates/          the connector — eighteen crates producing the `connector` binary
   packages/        not the connector: Solidity contracts, the Solana program, devnet tooling
   tools/           scripts: CI guards, contract and chain helpers, the RFC vendoring script
   local/           the shipped image run against real containerised chains
@@ -46,7 +46,10 @@ connector-domain                 pure logic: no async, no I/O, no clock, no keys
   ├─ packet.rs, oer.rs           ILPv4 packets (RFC-0027) and their canonical OER
   │                               encoding (RFC-0030, ADR 0023)
   ├─ address.rs, route.rs        ILP address validation (RFC-0015); longest-prefix selection
-  ├─ fee.rs                      flat per-packet fee arithmetic (ADR 0010)
+  ├─ fee.rs                      flat per-packet fee arithmetic (ADR 0010), and the
+  │                               converting forward and its inverse (ADR 0071)
+  ├─ rate.rs, rate_table.rs      a rate as a rational over base units, and the table a
+  │                               forward reads it from under three guards (ADR 0071)
   ├─ price.rs                    what a terminated route charges for one packet: a
   │                               schedule over payload length, flat when its slope
   │                               is zero (ADR 0065)
@@ -83,6 +86,16 @@ connector-settlement-solana      real Solana backend, speaking packages/solana-p
                                   own wire directly (that crate builds for SBF only and
                                   exports no client SDK)
 
+connector-rate-source            the chain-agnostic rate-source port + its contract suite
+                                  (ADR 0071): what reading a token's price off a market
+                                  means, with no chain, venue or RPC in it
+  ├─ port.rs, contract.rs        the port, and the one suite every reader is run against
+  └─ in_memory.rs                the fake — the first implementation to pass that suite
+connector-rate-source-evm        the first real reader: Uniswap-v3-compatible `observe()`
+                                  TWAPs over an EVM RPC endpoint, TWAP-only and over a
+                                  pool the operator named. Holds no key, sends no
+                                  transaction, and is no part of any settlement path
+
 connector-runtime                the packet plane and its ports
   ├─ connector.rs                Connector — routing, delivery, fees, rejects
   ├─ peer_transport.rs           the peer transport port (ADR 0027's seam)
@@ -96,6 +109,9 @@ connector-runtime                the packet plane and its ports
   ├─ outbound_client.rs          paying a next hop as an ordinary client of it
   ├─ attribution.rs              what a terminating connector tells the app about the
   │                               payment (ADR 0040)
+  ├─ rate_table.rs, rate_poller.rs  the handle a converting forward reads its rate off,
+  │                               and the background poller that refreshes it — the
+  │                               packet path does no I/O for a rate (ADR 0071)
   ├─ clock.rs                    the clock as an injected port, so expiry is tested by
   │                               advancing rather than sleeping
   └─ metrics.rs, operator_view.rs   ADR 0014's metrics; ADR 0008's read models
