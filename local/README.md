@@ -673,13 +673,14 @@ Two consequences worth knowing before editing a config here:
   value that never leaves a node the operator owns.
 
 - **One peering here enforces on a _forwarded_ arrival, and it is the only one
-  that could.** ADR 0042 item 3 (issue #1142) requires a forwarded arrival to
-  carry a claim covering the arriving amount, behind a per-peer
-  `forwarded_claim_enforcement` that defaults to `observe`. `mixed-chain`'s B is
-  the only node in this repository that forwards a packet which arrived from a
-  peer, so its `a-b` row is the only row the setting can bind on — and it now
-  reads `"enforce"`, which is the first and only time that path runs against a
-  running image anywhere.
+  that turns the setting on.** ADR 0042 item 3 (issue #1142) requires a
+  forwarded arrival to carry a claim covering the arriving amount, behind a
+  per-peer `forwarded_claim_enforcement` that defaults to `observe`.
+  `mixed-chain`'s B is no longer the only node here that forwards a packet which
+  arrived from a peer — `dealing`'s B does too, and holds the knob at its
+  default on purpose (ADR 0042's `## Update (issue #1303)`) — but `mixed-chain`'s
+  `a-b` row is the only one that reads `"enforce"`, which is the first and only
+  time that path runs against a running image anywhere.
 
   It could not be turned on before issue #1145. That peering was postpay, so its
   first crossing was uncovered by construction and enforcing would have
