@@ -1406,4 +1406,41 @@ pub enum ConfigError {
          override any of the three for its own pair"
     )]
     RateGuardsMissing,
+
+    /// A peering whose channels hold a token no `[[tokens]]` row declares
+    /// (ADR 0071 decision 1, issue #1292).
+    ///
+    /// Only ever reached on a node that declares tokens: one that declares
+    /// none resolves no peering at all and is not held to this rule, which
+    /// is what makes ADR 0071 free for every operator who deals nothing.
+    /// On a node that does deal, the alternative to this refusal is a
+    /// forward discovering mid-packet that it cannot say what unit it is
+    /// carrying -- and the packet is already paid for by then.
+    #[error(
+        "peering '{peer_id}' is denominated in '{asset}', which is not a token this node \
+         deals: a node that declares [[tokens]] must be able to say which declared token \
+         every peering holds, because a forward between two peerings is a conversion exactly \
+         when their tokens differ. The token comes from the [settlement] table that peering's \
+         channels settle through -- declare it with a [[tokens]] row, or remove the [[tokens]] \
+         table if this node deals nothing"
+    )]
+    PeeringTokenNotDeclared { peer_id: String, asset: AssetId },
+
+    /// One peering whose channel rows sit on two chains, and therefore in
+    /// two tokens (ADR 0071 decision 1, issue #1292). A packet's amount is
+    /// denominated by the channel it rides, so a peering with two units has
+    /// no unit at all: which one a forward was converting into would depend
+    /// on which of the two tables the reader consulted.
+    #[error(
+        "peering '{peer_id}' holds channels in two tokens, '{first}' and '{second}': a \
+         peering is one denomination -- a packet's amount is denominated by the channel it \
+         rides, and a forward out of this one has no single unit to convert into. Give each \
+         chain its own [[peers]] row, so that every peering's [[peer_channels]] and \
+         [[pay_channels]] rows settle through one [settlement] table"
+    )]
+    PeeringTokenAmbiguous {
+        peer_id: String,
+        first: AssetId,
+        second: AssetId,
+    },
 }

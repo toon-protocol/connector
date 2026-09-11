@@ -19,6 +19,7 @@ use crate::peer::{
     is_onion_endpoint, parse_peer_exposure, resolve_peers, PeerConfig, PeerExposure, RawPeer,
 };
 use crate::peer_channel::{resolve_peer_channels, PeerChannelConfig, RawPeerChannel};
+use crate::peering_asset::{resolve_peering_assets, PeeringAssets};
 use crate::route::{resolve_routes, PeerRouteConfig, RawChild, RawRoute, StaticRoute};
 use crate::secret::{RawSignerConfig, SecretLocation};
 use crate::settlement::{
@@ -335,6 +336,7 @@ pub struct Config {
     unresolvable_lookup_max_wait: Option<Duration>,
     btp_session_window: Option<NonZeroU32>,
     denomination: DenominationConfig,
+    peering_assets: PeeringAssets,
 }
 
 impl Config {
@@ -623,6 +625,21 @@ impl Config {
         // exactly as it does today" means here.
         let denomination =
             resolve_denomination(raw.tokens, raw.rates, raw.rate_guards, settlement_tables)?;
+        // ADR 0071 decision 1 (issue #1292): which of those declared tokens
+        // each peering's channels are denominated in, so that a forward can
+        // ask whether its two legs hold different ones without asking a
+        // chain. Last of the money tables, because it reads all of them --
+        // the peerings, both of their channel tables and the settlement
+        // tables those settle through -- and it holds every one of them to
+        // the declaration resolved immediately above. A node that declared
+        // no tokens resolves nothing here and is held to nothing.
+        let peering_assets = resolve_peering_assets(
+            &peers,
+            &peer_channels,
+            &pay_channels,
+            &settlements,
+            &denomination,
+        )?;
         let state_dir = raw.state_dir.map(PathBuf::from);
         let channel_liveness_ttl = match raw.channel_liveness_ttl_secs {
             Some(0) => return Err(ConfigError::ZeroChannelLivenessTtl),
@@ -830,6 +847,7 @@ impl Config {
             unresolvable_lookup_max_wait,
             btp_session_window,
             denomination,
+            peering_assets,
         })
     }
 
@@ -846,6 +864,21 @@ impl Config {
     /// for a caller to ask.
     pub fn denomination(&self) -> &DenominationConfig {
         &self.denomination
+    }
+
+    /// Which declared token each peering's channels are denominated in (ADR
+    /// 0071 decision 1, issue #1292) -- and therefore whether a forward
+    /// between two of them crosses a denomination boundary, which is the
+    /// one question a converting forward turns on.
+    ///
+    /// Always a value, and empty for every node that declares no
+    /// `[[tokens]]`: such a node resolves no peering, answers no boundary,
+    /// and forwards exactly as it did before ADR 0071. A node that does
+    /// declare tokens got every one of its peerings resolved here at boot,
+    /// so a reader on the packet path never has a chain to ask or a
+    /// refusal to make.
+    pub fn peering_assets(&self) -> &PeeringAssets {
+        &self.peering_assets
     }
 
     /// How long a chain-resolved client channel's liveness may be believed
@@ -1143,7 +1176,7 @@ mod tests {
     use crate::peer::{PeerCarriage, DEFAULT_MAX_PACKET_AMOUNT};
     use crate::route::TransportPolicy;
     use crate::settlement::SettlementChain;
-    use connector_domain::Price;
+    use connector_domain::{AssetId, Price};
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -2193,6 +2226,266 @@ counterparty_key = "{SOLANA_COUNTERPARTY_KEY}"
             |error| matches!(error, ConfigError::PeerChannelWithoutSolanaSettlement { peer_id } if peer_id == "store"),
         );
         assert!(message.contains("[settlement.solana]"), "got: {message}");
+    }
+
+    // -- a peering resolves to the token its channel holds (ADR 0071
+    // decision 1, issue #1292) --
+    //
+    // File-level proofs, because the rule is cross-table and no part of it
+    // is inside `[[peer_channels]]`: the token comes from the `[settlement]`
+    // table that peering's channels settle through, and whether it is a
+    // token this node deals comes from `[[tokens]]`.
+
+    /// The ERC-20 `evm_settlement` names, spelled as a `[[tokens]]` row
+    /// names one. Checksummed on purpose: a config file is where an
+    /// explorer's spelling gets pasted, and an `AssetId` reads it and the
+    /// lowercase one as a single token.
+    const SETTLEMENT_TOKEN: &str = "evm:0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
+    /// USDC on Base -- some other ERC-20. Declared alone, it makes a node
+    /// that deals a token none of its peerings hold.
+    const OTHER_TOKEN: &str = "evm:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    /// USDC on Solana, the mint `[settlement.solana]` names below.
+    const SOLANA_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+    /// One `[[tokens]]` row per asset, and nothing else: no rate, no quote,
+    /// and therefore no `[rate_guards]` needed (issue #1290). Declaring
+    /// tokens alone is exactly what a node crossing chains in one asset
+    /// writes, and it is the smallest declaration that turns the rule on.
+    fn declaring(assets: &[&str]) -> String {
+        assets
+            .iter()
+            .map(|asset| format!("\n[[tokens]]\nasset = \"{asset}\"\n"))
+            .collect()
+    }
+
+    /// Both settlement tables at once -- `local/solo`'s shape, and what a
+    /// node whose peerings sit on two chains needs before either can be
+    /// read as a token.
+    fn both_settlements(key_path: &Path) -> String {
+        format!(
+            r#"{evm}
+[settlement.solana]
+rpc_url = "https://api.devnet.solana.com"
+program_id = "{SOLANA_PROGRAM_ID}"
+token_address = "{SOLANA_MINT}"
+decimals = 6
+
+[settlement.solana.key]
+key_file = "{key_file}"
+"#,
+            evm = evm_settlement(key_path),
+            key_file = key_path.display(),
+        )
+    }
+
+    /// Two peerings on two chains -- `local/mixed-chain`'s middle node, in
+    /// miniature: one bound to an EVM channel, one to a Solana channel, on
+    /// a node settling on both. The shape a converting forward reads, since
+    /// the two peerings are denominated in two different tokens.
+    fn peerings_on_two_chains(key_path: &Path, state_dir: &Path, declaration: &str) -> String {
+        format!(
+            r#"
+client_edge_addr = "127.0.0.1:3000"
+peer_expose = "btp"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+{settlements}
+[[peers]]
+id = "from-evm"
+endpoint = "wss://evm.example:443/btp"
+
+[[peers]]
+id = "to-solana"
+endpoint = "wss://solana.example:443/btp"
+
+[[peer_channels]]
+peer_id = "from-evm"
+channel_id = "{PEER_CHANNEL}"
+counterparty_key = "{PEER_KEY}"
+chain_id = 31337
+token_network = "{PEER_TOKEN_NETWORK}"
+
+[[peer_channels]]
+peer_id = "to-solana"
+channel_account = "{SOLANA_CHANNEL_ACCOUNT}"
+counterparty_key = "{SOLANA_COUNTERPARTY_KEY}"
+{declaration}
+"#,
+            state_dir = state_dir.display(),
+            key_file = key_path.display(),
+            settlements = both_settlements(key_path),
+        )
+    }
+
+    /// The same two channels bound to **one** peering: an EVM row and a
+    /// Solana row both naming `store`. It loads today, and it is the shape
+    /// that has no single unit.
+    fn one_peering_on_two_chains(key_path: &Path, state_dir: &Path, declaration: &str) -> String {
+        peerings_on_two_chains(key_path, state_dir, declaration)
+            .replace("peer_id = \"to-solana\"", "peer_id = \"from-evm\"")
+            .replace(
+                "\n[[peers]]\nid = \"to-solana\"\nendpoint = \"wss://solana.example:443/btp\"\n",
+                "",
+            )
+    }
+
+    fn load_text(text: &str) -> Result<Config, ConfigError> {
+        Config::from_toml_str(text, Path::new("test.toml"))
+    }
+
+    /// The acceptance criterion itself: a config declaring tokens resolves
+    /// every peering to exactly one of them, from loaded config alone --
+    /// the `TokenNetwork` its `[[peer_channels]]` row names is never read,
+    /// and no chain is asked.
+    #[test]
+    fn a_peering_resolves_to_the_declared_token_its_channels_hold() {
+        let config =
+            load_peering(|text| format!("{text}{}", declaring(&[SETTLEMENT_TOKEN]))).expect("load");
+
+        let resolved = config.peering_assets();
+        assert!(!resolved.is_empty());
+        assert_eq!(
+            resolved.asset("store").map(ToString::to_string),
+            Some(SETTLEMENT_TOKEN.to_ascii_lowercase()),
+            "the peering holds what [settlement.evm] settles in, however the row spelled it"
+        );
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|(peer_id, _)| peer_id)
+                .collect::<Vec<_>>(),
+            vec!["store"]
+        );
+        // A peering with itself is not a boundary, whatever it holds.
+        assert_eq!(resolved.boundary_between("store", "store"), None);
+    }
+
+    /// The rule that protects every node not doing any of this: no
+    /// `[[tokens]]`, nothing resolved, no new required key and no new
+    /// refusal -- the same peering config loads, unchanged, and this is the
+    /// shape every fixture in this repository is committed in.
+    #[test]
+    fn a_node_that_declares_no_tokens_resolves_no_peering() {
+        let config = load_peering(|text| text).expect("load");
+
+        assert!(config.peering_assets().is_empty());
+        assert_eq!(config.peering_assets().asset("store"), None);
+        assert_eq!(
+            config.peering_assets().boundary_between("store", "store"),
+            None
+        );
+    }
+
+    /// A node that deals is held to it: a peering whose token it never
+    /// declared is refused at boot, naming the peering and the token it
+    /// holds, rather than reaching a forward that cannot say what unit it
+    /// is carrying.
+    #[test]
+    fn a_peering_holding_an_undeclared_token_is_refused_by_name() {
+        let result = load_peering(|text| format!("{text}{}", declaring(&[OTHER_TOKEN])));
+
+        let message = expect_error(result, |error| {
+            matches!(
+                error,
+                ConfigError::PeeringTokenNotDeclared { peer_id, asset }
+                    if peer_id == "store"
+                        && asset.to_string() == SETTLEMENT_TOKEN.to_ascii_lowercase()
+            )
+        });
+        assert!(
+            message.contains("'store'")
+                && message.contains(&SETTLEMENT_TOKEN.to_ascii_lowercase())
+                && message.contains("[[tokens]]"),
+            "got: {message}"
+        );
+    }
+
+    /// The ordered pair issue #1295 asks for, on the shape it asks it of:
+    /// two peerings on two chains hold two tokens, and the answer comes
+    /// back in the order asked -- direction is the trade, and the reverse
+    /// pair is a different price.
+    #[test]
+    fn two_peerings_on_two_chains_are_an_ordered_pair_of_tokens() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let solana_token = format!("solana:{SOLANA_MINT}");
+        let config = load_text(&peerings_on_two_chains(
+            key_file.path(),
+            state_dir.path(),
+            &declaring(&[SETTLEMENT_TOKEN, &solana_token]),
+        ))
+        .expect("load");
+
+        let resolved = config.peering_assets();
+        let evm: AssetId = SETTLEMENT_TOKEN.parse().expect("an asset");
+        let solana: AssetId = solana_token.parse().expect("an asset");
+        assert_eq!(resolved.asset("from-evm"), Some(&evm));
+        assert_eq!(resolved.asset("to-solana"), Some(&solana));
+        assert_eq!(
+            resolved.boundary_between("from-evm", "to-solana"),
+            Some((&evm, &solana))
+        );
+        assert_eq!(
+            resolved.boundary_between("to-solana", "from-evm"),
+            Some((&solana, &evm))
+        );
+    }
+
+    /// One peering, two chains, two tokens: refused, because a packet's
+    /// amount is denominated by the channel it rides and this peering rides
+    /// two. Reachable from a file that loads today, which is why it is a
+    /// named refusal rather than an assumption.
+    #[test]
+    fn one_peering_whose_channels_sit_on_two_chains_is_refused_by_name() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let solana_token = format!("solana:{SOLANA_MINT}");
+        let result = load_text(&one_peering_on_two_chains(
+            key_file.path(),
+            state_dir.path(),
+            &declaring(&[SETTLEMENT_TOKEN, &solana_token]),
+        ));
+
+        let message = expect_error(result, |error| {
+            matches!(
+                error,
+                ConfigError::PeeringTokenAmbiguous { peer_id, .. } if peer_id == "from-evm"
+            )
+        });
+        assert!(
+            message.contains("two tokens")
+                && message.contains(&SETTLEMENT_TOKEN.to_ascii_lowercase())
+                && message.contains(SOLANA_MINT),
+            "got: {message}"
+        );
+    }
+
+    /// And the same two-chain file with no `[[tokens]]` at all loads, as it
+    /// always has: the ambiguity is only a problem for a node that has to
+    /// name a unit, and a node that deals nothing never does.
+    #[test]
+    fn one_peering_on_two_chains_still_loads_when_nothing_is_declared() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let config = load_text(&one_peering_on_two_chains(
+            key_file.path(),
+            state_dir.path(),
+            "",
+        ))
+        .expect("a node that declares nothing is held to nothing");
+
+        assert!(config.peering_assets().is_empty());
     }
 
     // -- "the settlement table this channel needs is absent" (issue #1138)

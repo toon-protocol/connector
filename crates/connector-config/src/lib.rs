@@ -25,6 +25,7 @@ mod operator;
 mod pay_channel;
 mod peer;
 mod peer_channel;
+mod peering_asset;
 mod route;
 mod secret;
 mod settlement;
@@ -42,6 +43,7 @@ pub use peer::{
     PeerExposure, DEFAULT_MAX_PACKET_AMOUNT, DEFAULT_PEER_TIMEOUT_MS,
 };
 pub use peer_channel::{EvmPeerChannelConfig, PeerChannelConfig, SolanaPeerChannelConfig};
+pub use peering_asset::PeeringAssets;
 pub use route::{PeerRouteConfig, StaticRoute, TransportPolicy};
 pub use secret::SecretLocation;
 pub use settlement::{
