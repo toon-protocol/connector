@@ -1,8 +1,7 @@
 # A forward crosses a denomination at a declared rate
 
 **Status:** Accepted — **built** (owner decision, 2026-09-10, issue #1286; epic #1287, tickets
-#1288–#1298), bar the local topology that proves a crossing against real chains, which is #1299
-and still open. Amends
+#1288–#1299). Amends
 [0010](0010-flat-per-packet-fee-and-minimum-delivery.md): the flat per-packet fee, its earnings
 rule and cost discoverability all stand untouched — what falls is the corollary that no rate may
 exist at a hop ("value conversion is the `swap` repository's job"), stated in that record's
@@ -193,8 +192,13 @@ assertions keep their arithmetic — a same-asset chain crossing is _still_ not 
 by decision 2's absence rule rather than by exile — but the "swap repository's job" prose is
 rewritten to cite this record. The RFC 0027 profile's PF-12/PF-13 bullet is rewritten toward the
 RFC: a hop applies its local rate, which is ILPv4's own model, policed differently. A dealing
-topology belongs under `local/` beside the existing four, proving a USDC-in/ANYONE-out crossing
-against real chains.
+topology belongs under `local/` beside the existing four, proving a crossing against real chains.
+It is `local/dealing` (issue #1299), and it crosses **chains** as well as denominations: EVM mock
+USDC in, a 9-decimal Solana mock out. The motivating USDC/ANYONE pair is same-chain, and
+settlement backends are keyed `(chain, backend)` with one `token_address` per chain, so standing
+that pair up would have meant rekeying settlement per token. The cross-chain shape crosses a real
+denomination boundary — a thousandfold scale difference, which an unconverted pass-through is
+wrong by — under today's keying, and needs none.
 
 **`fee.rs` stops being one subtraction.** The converting arm is new arithmetic with new property
 tests: round-trip bounds (forward floors, reject-path ceils, the pair never understates a cost),

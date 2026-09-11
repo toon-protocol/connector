@@ -33,7 +33,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use connector_config::{Config, PayChannelConfig, PeerChannelConfig, SettlementChain};
-use connector_domain::Price;
+use connector_domain::{amount_after_rate_and_fee, Price};
+use connector_runtime::SharedRateTable;
 use connector_settlement_solana::test_support::LOCAL_TEST_PROGRAM_ID;
 
 const SOLO_CONFIG: &str = include_str!("../../../local/solo/connector.toml");
@@ -47,6 +48,11 @@ const MIXED_A: &str = include_str!("../../../local/mixed-chain/connector-a.toml"
 const MIXED_B: &str = include_str!("../../../local/mixed-chain/connector-b.toml");
 const MIXED_C: &str = include_str!("../../../local/mixed-chain/connector-c.toml");
 const MIXED_COMPOSE: &str = include_str!("../../../local/mixed-chain/compose.yml");
+
+const DEALING_A: &str = include_str!("../../../local/dealing/connector-a.toml");
+const DEALING_B: &str = include_str!("../../../local/dealing/connector-b.toml");
+const DEALING_C: &str = include_str!("../../../local/dealing/connector-c.toml");
+const DEALING_COMPOSE: &str = include_str!("../../../local/dealing/compose.yml");
 
 const ONION_A: &str = include_str!("../../../local/onion/connector-a.toml");
 const ONION_B: &str = include_str!("../../../local/onion/connector-b.toml");
@@ -80,7 +86,7 @@ const ANON_TLD: &str = ".anyone";
 const ONION_B_ADDR: &str = "172.31.0.10";
 
 /// The operator-facing guide to this directory, and the workflow that runs
-/// three of the four topologies in it. Read as text by
+/// four of the five topologies in it. Read as text by
 /// [`the_onion_topology_is_deliberately_not_on_the_ci_gate`], which is the one
 /// assertion here whose subject is an ABSENCE.
 const LOCAL_README: &str = include_str!("../../../local/README.md");
@@ -120,6 +126,9 @@ const EVERY_CONFIG: &[(&str, &str)] = &[
     ("local/mixed-chain/connector-a.toml", MIXED_A),
     ("local/mixed-chain/connector-b.toml", MIXED_B),
     ("local/mixed-chain/connector-c.toml", MIXED_C),
+    ("local/dealing/connector-a.toml", DEALING_A),
+    ("local/dealing/connector-b.toml", DEALING_B),
+    ("local/dealing/connector-c.toml", DEALING_C),
     ("local/onion/connector-a.toml", ONION_A),
     ("local/onion/connector-b.toml", ONION_B),
 ];
@@ -1375,6 +1384,557 @@ fn the_mixed_chain_configs_and_their_compose_file_agree() {
     );
 }
 
+// ─── dealing ─────────────────────────────────────────────────────────────────
+
+/// The one mid `local/dealing`'s boundary is priced at, and the one spread
+/// taken off it, written here so every assertion below compares against the
+/// committed config rather than against a number this file also invented.
+///
+/// They are read OUT of the config in the tests that matter; these are only
+/// the figures a failure message can name.
+const DEALING_SENT: u64 = 1200;
+
+/// What one crossing must advance each payee's channel by, in that payee's own
+/// unit. The second of these is the whole reason this topology exists, and the
+/// arithmetic that produces it is asserted rather than restated in
+/// [`the_dealing_crossing_is_covered_for_the_converted_figure`].
+const DEALING_OWED_AT_B: u64 = 1100;
+const DEALING_OWED_AT_C: u64 = 4_350_000;
+
+/// How many decimal places a settlement table's token has. Lives on the two
+/// typed tables rather than on the enum, because an EVM table and a Solana
+/// table name genuinely different on-chain facts (issue #628).
+fn settlement_decimals(settlement: &connector_config::SettlementConfig) -> u8 {
+    match settlement {
+        connector_config::SettlementConfig::Evm(evm) => evm.decimals(),
+        connector_config::SettlementConfig::Solana(solana) => solana.decimals(),
+    }
+}
+
+/// Which token a peering holds, as `Config::load` resolves it: the
+/// `token_address` of the `[settlement.<chain>]` table that peering's channels
+/// settle through (ADR 0071, issue #1292). Asked of the config rather than
+/// parsed out of it, so this cannot disagree with what the forwarding path
+/// sees.
+fn peering_asset<'a>(config: &'a Config, peer_id: &str) -> &'a connector_domain::AssetId {
+    config
+        .peering_assets()
+        .asset(peer_id)
+        .unwrap_or_else(|| panic!("peering '{peer_id}' resolves to no declared token"))
+}
+
+/// What one crossing forwards across the boundary, computed the way the
+/// forwarding path computes it and from nothing else.
+///
+/// `SharedRateTable::from_config` is the call `connector-cli`'s `build()`
+/// makes, `boundary_between` is what `Connector::crossing` asks, and
+/// `amount_after_rate_and_fee` is the arithmetic `forward_via_peer_route`
+/// runs -- so this cannot answer something a packet would not. Everything
+/// that feeds it (the route's price, the peering's fee, the declared rate and
+/// the node-level spread) is read out of the committed file.
+fn dealing_forwarded_amount(b: &Config) -> u64 {
+    let onward = &b.peer_routes()[0];
+    let table = SharedRateTable::from_config(b.denomination())
+        .expect("a node with a declared rate has a table");
+    let (incoming, outgoing) = b
+        .peering_assets()
+        .boundary_between("a-b", "b-c")
+        .expect("the b-c forward crosses a boundary");
+    let rate = table
+        .lookup(incoming, outgoing, chrono::Utc::now())
+        .rate()
+        .expect(
+            "a STATIC row never goes stale -- `ttl` governs an observation and a declaration is \
+             not one -- so this pair must be live at any instant, including an hour after the \
+             topology was brought up",
+        );
+    amount_after_rate_and_fee(flat(onward.price()), rate, fee_of(b, onward))
+        .expect("the converted amount must survive this hop's fee and fit the outgoing leg's u64")
+}
+
+/// **Only the middle node deals, and that is the assertion** (ADR 0071
+/// decision 1).
+///
+/// A denomination boundary is a property of one hop, never of a path. A and C
+/// here declare no `[[tokens]]`, so `Config::denomination()` is the default on
+/// both, `peering_assets()` is empty on both, and neither can reach the
+/// converting arm at all — which is the promise the record makes to every node
+/// that deals nothing, stated as two committed files rather than as a
+/// sentence.
+#[test]
+fn the_dealing_topologys_committed_configs_load() {
+    let a = load("local/dealing/connector-a.toml", DEALING_A);
+    let b = load("local/dealing/connector-b.toml", DEALING_B);
+    let c = load("local/dealing/connector-c.toml", DEALING_C);
+
+    for (name, config) in [
+        ("local/dealing/connector-a.toml", &a),
+        ("local/dealing/connector-c.toml", &c),
+    ] {
+        assert!(
+            !config.denomination().declares_tokens(),
+            "{name} declares tokens. The two ends of this path are ORDINARY nodes, and a \
+             topology where every node dealt could not show that ADR 0071 costs one that does \
+             not exactly nothing."
+        );
+        assert!(
+            config.peering_assets().is_empty(),
+            "{name} resolves a token for one of its peerings, which only a node that declares \
+             `[[tokens]]` ever does"
+        );
+    }
+
+    assert!(
+        b.denomination().declares_tokens(),
+        "local/dealing/connector-b.toml is the only committed config in this repository that \
+         deals. If this is now false the topology has stopped being what it is for."
+    );
+    let numeraire = b
+        .denomination()
+        .numeraire()
+        .expect("the dealing node declares a numeraire");
+    assert_eq!(
+        numeraire,
+        peering_asset(&b, "a-b"),
+        "the numeraire is the stable token, which here is the 6-decimal mock USDC the incoming \
+         leg holds. Exactly one `[[tokens]]` row may set it and mixing is refused at boot, so \
+         this is a check on WHICH one rather than on how many."
+    );
+    assert_eq!(
+        b.denomination().rates().len(),
+        1,
+        "one ordered pair, declared once. The reject path converts the same pair's rate the \
+         other way (`ceil((cost + fee) / rate)`, decision 7) rather than reading a second row, \
+         so a `to -> from` row appearing here would be a second declaration of one fact."
+    );
+    assert!(
+        b.denomination().guards().is_some(),
+        "`[rate_guards]` is required as a set the moment anything is declared, so its absence \
+         would not have loaded — this is the assertion that the set committed is the node-level \
+         one every pair here runs on, rather than a per-row override nothing falls back to."
+    );
+    assert_eq!(
+        b.denomination().quoted_tokens().count(),
+        0,
+        "neither row carries a `quote`: there is no AMM on either disposable chain and no \
+         Solana-side RateSource exists, so this pair runs the static row decision 3 provides \
+         for exactly that case. A quote here would start a poller with nothing to read."
+    );
+}
+
+/// **The two legs hold different tokens, which is what makes this a boundary**
+/// (ADR 0071 decision 1, issue #1292).
+///
+/// `Connector::crossing` asks `PeeringAssets::boundary_between` with the
+/// arriving peering first and the outgoing one second, and gets back `Some`
+/// only when the two hold different tokens. This asks the identical question
+/// of the committed files: there is no second surface that could answer it
+/// differently.
+///
+/// The pair is ordered and never sorted, because direction is the trade.
+#[test]
+fn the_dealing_hop_sits_on_a_real_denomination_boundary() {
+    let b = load("local/dealing/connector-b.toml", DEALING_B);
+
+    let (incoming, outgoing) = b
+        .peering_assets()
+        .boundary_between("a-b", "b-c")
+        .expect("the whole topology: a-b and b-c must hold DIFFERENT tokens");
+
+    assert_eq!(
+        incoming.chain(),
+        connector_domain::AssetChain::Evm,
+        "the arriving leg settles on anvil"
+    );
+    assert_eq!(
+        outgoing.chain(),
+        connector_domain::AssetChain::Solana,
+        "the outgoing leg settles on the local validator"
+    );
+    assert_ne!(
+        incoming, outgoing,
+        "two tokens, or there is no boundary here and this topology is `local/mixed-chain` with \
+         extra config"
+    );
+
+    // Not merely different: different in SCALE, which is the thing an
+    // unconverted pass-through would be wrong by. `local/mixed-chain` crosses
+    // two chains at one scale and is deliberately not this.
+    let evm = b
+        .settlements()
+        .iter()
+        .find(|settlement| settlement.chain() == SettlementChain::Evm)
+        .expect("B settles on EVM");
+    let solana = b
+        .settlements()
+        .iter()
+        .find(|settlement| settlement.chain() == SettlementChain::Solana)
+        .expect("B settles on Solana");
+    assert_eq!(&evm.asset(), incoming);
+    assert_eq!(&solana.asset(), outgoing);
+    assert_ne!(
+        settlement_decimals(evm),
+        settlement_decimals(solana),
+        "the two legs must differ in DECIMALS as well as in identity. A crossing at par cannot \
+         tell a correct conversion from no conversion at all -- the journal figure would be the \
+         same either way -- which is the whole reason this topology settles its outgoing leg in \
+         a second mock rather than in the mock USDC every other Solana leg here holds."
+    );
+
+    // The other direction is not a second boundary to declare. It is the same
+    // ordered pair read backwards, which is what a reject does.
+    assert!(
+        b.peering_assets().boundary_between("b-c", "a-b").is_some(),
+        "a boundary is symmetric in existence and asymmetric in price: asking the other way \
+         round must still answer, because a reject crosses back over it"
+    );
+}
+
+/// **The covering claim is minted for the CONVERTED figure, and the rehearsal
+/// asserts that figure** (ADR 0071 decision 1).
+///
+/// This is the test the topology exists to make possible. It builds the very
+/// rate table the forwarding path reads — `SharedRateTable::from_config`, the
+/// same call `connector-cli`'s `build()` makes — looks the pair up the way
+/// `Connector::crossing` does, and runs the committed fee through
+/// `amount_after_rate_and_fee`. What comes out is what `cover_forward` mints,
+/// and therefore what lands in the payee's journal.
+///
+/// Then it holds the compose file to that number. A rate, a spread or an
+/// outgoing fee edited in the config without the rehearsal's figure moving
+/// with it is a rehearsal asserting a number nobody pays, and no container can
+/// notice: the packet fulfils either way, because the app is
+/// payment-oblivious and a peer claim's verdict never gates a packet.
+#[test]
+fn the_dealing_crossing_is_covered_for_the_converted_figure() {
+    let a = load("local/dealing/connector-a.toml", DEALING_A);
+    let b = load("local/dealing/connector-b.toml", DEALING_B);
+    let c = load("local/dealing/connector-c.toml", DEALING_C);
+
+    // The un-converted half, in the sender's own unit. A crosses no boundary,
+    // so this is the same flat subtraction every other topology here makes.
+    let first = &a.peer_routes()[0];
+    let second = &b.peer_routes()[0];
+    assert_eq!(flat(first.price()), DEALING_SENT);
+    assert_eq!(
+        flat(first.price()) - fee_of(&a, first),
+        flat(second.price()),
+        "what A forwards is its posted price less its own flat fee, and that is B's price \
+         exactly -- ADR 0028's path invariant on the half of this path where both hops are \
+         denominated alike"
+    );
+    assert_eq!(flat(second.price()), DEALING_OWED_AT_B);
+
+    // The converted half. Built from the config, never typed out.
+    let forwarded = dealing_forwarded_amount(&b);
+
+    assert_eq!(
+        forwarded, DEALING_OWED_AT_C,
+        "`floor(1100 * 4000/1 * 99/100) - 6000`. The mid folds the 1000 of SCALE (6 decimals \
+         against 9) into the 4 of PRICE, which is decision 4's whole trick and the reason \
+         nothing separates them again."
+    );
+    assert!(
+        forwarded > flat(second.price()) * 1000,
+        "the converted figure must be more than a thousand times the arriving one, or the scale \
+         half of the rate has gone missing and this topology is measuring a flat fee again"
+    );
+
+    // And the compose file asserts exactly that, per crossing, on each payee's
+    // own channel.
+    let b_channel = evm_channel(&b, "a-b").channel_id();
+    let c_channel = solana_channel(&c, "b-c").channel_account();
+    assert!(
+        DEALING_COMPOSE.contains(&format!(
+            "paid /app/b-state {b_channel} \"B (EVM, 6dp USDC)\" {DEALING_OWED_AT_B} uUSDC"
+        )),
+        "the rehearsal must hold B's journal to {DEALING_OWED_AT_B} per crossing on {b_channel}"
+    );
+    assert!(
+        DEALING_COMPOSE.contains(&format!(
+            "paid /app/c-state {c_channel} \"C (Solana, 9dp mock)\" {DEALING_OWED_AT_C} base-units"
+        )),
+        "the rehearsal must hold C's journal to the CONVERTED {DEALING_OWED_AT_C} per crossing \
+         on {c_channel}. This is the one assertion `--expect-fulfill` cannot make for itself: a \
+         boundary converting at the wrong rate, or not converting at all, fulfils every packet \
+         just as happily and differs only here."
+    );
+    assert!(
+        DEALING_COMPOSE.contains(&format!("--amount       {DEALING_SENT}")),
+        "the sender must originate this path's cost in the SENDER's own unit ({DEALING_SENT} \
+         µUSDC), which is A's posted price. A buyer that had to hold the far-side asset would \
+         mean ADR 0071's design had failed."
+    );
+    assert_eq!(
+        DEALING_COMPOSE.matches("--- crossing ").count(),
+        2,
+        "two crossings, for issue #1102's reason: a payee answering claim-state out of the \
+         wrong book reports nonce 0 forever, so crossing 2 re-signs crossing 1's cumulative at \
+         a fresh nonce and advances nothing. One crossing cannot see that -- and the `paid` \
+         checks above multiply their per-crossing figure by the number of claims they find, so \
+         a third crossing added without this number moving would pass while proving less."
+    );
+
+    // C terminates unpriced, so what the last leg is paid IS the forwarded
+    // amount -- in ITS unit, which is the one place a plausible number would
+    // be wrong by a factor of a million.
+    assert_eq!(
+        flat(c.routes()[0].price()),
+        0,
+        "pricing a peer termination is what `local/two-hop` proves; this topology is about the \
+         boundary, and a price here would have to be written in 9-decimal base units"
+    );
+}
+
+/// **The outgoing peering writes its own cap, and it has to** (ADR 0071's "an
+/// 18-decimal leg has a real ceiling", met here at nine).
+///
+/// `max_packet_amount` defaults to one USDC at six decimals and is checked
+/// against the amount actually going out, post-conversion — so on a leg whose
+/// unit is a thousand times finer the default is a ceiling nobody meant, and a
+/// node that left the field unwritten would refuse every crossing `T04`. That
+/// is exactly the trap the record says is easy to miss once units differ, so
+/// this asserts the line is there AND that it is load-bearing.
+#[test]
+fn the_dealing_outgoing_cap_is_written_in_the_outgoing_leg_unit() {
+    let b = load("local/dealing/connector-b.toml", DEALING_B);
+    let onward = b
+        .peers()
+        .iter()
+        .find(|peer| peer.id() == "b-c")
+        .expect("B dials C");
+
+    let forwarded = dealing_forwarded_amount(&b);
+    assert!(
+        onward.max_packet_amount() >= forwarded,
+        "the cap must admit the converted amount this peering actually carries ({} against \
+         {forwarded})",
+        onward.max_packet_amount()
+    );
+    assert!(
+        forwarded > connector_config::DEFAULT_MAX_PACKET_AMOUNT,
+        "and the DEFAULT must not admit it, or this row is decoration and the trap it exists to \
+         demonstrate has stopped existing. The default is {} -- one token at six decimals -- \
+         and one crossing here forwards {forwarded} base units of a nine-decimal one.",
+        connector_config::DEFAULT_MAX_PACKET_AMOUNT
+    );
+
+    let incoming = b
+        .peers()
+        .iter()
+        .find(|peer| peer.id() == "a-b")
+        .expect("A dials B");
+    assert_eq!(
+        incoming.max_packet_amount(),
+        connector_config::DEFAULT_MAX_PACKET_AMOUNT,
+        "the arriving peering keeps the default, deliberately: it is denominated in 6-decimal \
+         USDC, which is the unit the default was chosen in, and writing one there would hide \
+         that the two legs are capped in different units for the same reason they are priced in \
+         different units."
+    );
+}
+
+/// The Solana peering's channel is FUNDED, in the outgoing leg's OWN unit, and
+/// the rehearsal reads the deposit back off the chain before it sends.
+///
+/// `local/mixed-chain` has the same check; what is different here is that the
+/// figure is not `CHANNEL_DEPOSIT`. A deposit is denominated in base units, so
+/// a hundred tokens on a nine-decimal leg is a thousand times a hundred tokens
+/// on a six-decimal one — the same mistake, on the collateral side, that
+/// forwarding an amount across a boundary unconverted would be.
+///
+/// And it reads `deposit_a` rather than `deposit_b`, because which slot the
+/// payer holds is decided by the 32-byte sort the channel PDA is derived from
+/// and this topology's Solana indices put B first.
+#[test]
+fn the_dealing_solana_channel_is_funded_in_the_outgoing_leg_unit() {
+    let deposit = keys_script_constant("DEALING_CHANNEL_DEPOSIT");
+    let usdc_deposit = keys_script_constant("CHANNEL_DEPOSIT");
+    let b = load("local/dealing/connector-b.toml", DEALING_B);
+    let channel_account = solana_channel(&b, "b-c").channel_account().to_string();
+
+    assert!(
+        deposit > usdc_deposit,
+        "the 9-decimal leg's collateral ({deposit}) must exceed the 6-decimal one's \
+         ({usdc_deposit}). Equal figures would mean a hundredth of the collateral behind the \
+         claims this peering signs, which looks identical from both journals."
+    );
+    assert!(
+        deposit >= u128::from(DEALING_OWED_AT_C),
+        "and it must cover at least one crossing ({DEALING_OWED_AT_C}), or the first claim this \
+         peering signs is already beyond what `ClaimFromChannel` would let the claimer redeem"
+    );
+    assert!(
+        KEYS_SCRIPT.contains("--deposit-base-units \"$SOLANA_CHANNEL_DEPOSIT\""),
+        "local/keys.sh's solana-channels stage must deposit the SOLANA leg's own figure. \
+         `SOLANA_CHANNEL_DEPOSIT` falls back to `CHANNEL_DEPOSIT` for every topology whose two \
+         legs hold the same token, so this one variable serves both."
+    );
+    assert!(
+        DEALING_COMPOSE.contains(&format!(
+            "channel_open {channel_account} {LOCAL_TEST_PROGRAM_ID} 104 {deposit}"
+        )),
+        "local/dealing/compose.yml's sender must check {channel_account} still holds the \
+         {deposit} base units local/keys.sh deposited, at deposit_a's offset (104, \
+         packages/solana-program/src/state.rs). B is the payer and its Solana key sorts BEFORE \
+         C's on this topology's indices, so B is participant_a -- the mirror of \
+         `local/mixed-chain`, which reads 112 for the same reason in the other direction."
+    );
+
+    // A node cannot deposit collateral it was never given, and the transfer is
+    // in UI amounts, which are scale-free -- which is why one `NODE_USDC`
+    // serves a 6-decimal and a 9-decimal mint alike.
+    let node_tokens = keys_script_constant("NODE_USDC");
+    let mint_decimals = keys_script_constant("DEALING_MINT_DECIMALS");
+    let node_base_units = node_tokens * 10u128.pow(mint_decimals as u32);
+    assert!(
+        node_base_units >= deposit,
+        "local/keys.sh gives each node {node_tokens} tokens ({node_base_units} base units at \
+         {mint_decimals} decimals) but asks this peering's payer to deposit {deposit}"
+    );
+}
+
+/// The topology's own mint, and the two facts about it that are not in any
+/// config: that `local/keys.sh` creates it, and that its KEYPAIR is derived
+/// rather than committed.
+///
+/// A mint is not a settlement address, so no committed file can be checked
+/// against a chain for it the way `keys.sh` checks the rest — what makes
+/// committing the ADDRESS legitimate is that the script asserts every config
+/// that settles on Solana names the one it derived, and that assertion lives
+/// in the script.
+#[test]
+fn the_dealing_topology_owns_its_mint_and_commits_no_key_for_it() {
+    let b = load("local/dealing/connector-b.toml", DEALING_B);
+    let c = load("local/dealing/connector-c.toml", DEALING_C);
+
+    let mint = peering_asset(&b, "b-c").to_string();
+    assert!(
+        !mint.contains("H8HSreUF2s8r8hem4qMttE3bWYCpFuh71jbuos5bA77H"),
+        "this topology must NOT settle its outgoing leg in the shared mock USDC mint: both legs \
+         would then be the same asset at the same scale, and the crossing would be at par"
+    );
+    assert_eq!(
+        peering_asset(&b, "b-c"),
+        &c.settlements()[0].asset(),
+        "both ends of the peering hold the same mint, which is not optional -- a channel PDA is \
+         derived from the mint, so a C naming another one would compute a different \
+         `channel_account` and refuse to start"
+    );
+
+    assert!(
+        KEYS_SCRIPT.contains("DEALING_MINT_INDEX="),
+        "local/keys.sh must derive the mint's keypair from an INDEX of anvil's published \
+         mnemonic, like every settlement key here: the address is committed, so it has to be \
+         the same on every machine and after every `--reset`, and no key material may be \
+         written down to achieve that."
+    );
+    assert!(
+        KEYS_SCRIPT.contains("spl-token create-token --config \"$SOLANA_SPL_CONFIG\""),
+        "and it must actually create the mint. `make solana-mint-usdc` seeds the mint every \
+         other config here names, devnet included; this one exists for one local topology and \
+         is created where that topology's keys are."
+    );
+    assert!(
+        KEYS_SCRIPT.contains("config_must_name \"$SOLANA_MINT\""),
+        "the committed address has to be falsifiable against what the script derived, or \
+         committing it is a claim nothing checks -- the same drift guard every settlement \
+         address in this directory gets."
+    );
+}
+
+/// The compose file and the three configs agree about the things neither can
+/// see about the other: service names, mount paths, published ports and the
+/// state volumes the rehearsal reads.
+#[test]
+fn the_dealing_configs_and_their_compose_file_agree() {
+    for node in ["connector-a", "connector-b", "connector-c"] {
+        assert!(
+            DEALING_COMPOSE.contains(&format!(
+                "./local/dealing/{node}.toml:/app/config/connector.toml:ro"
+            )),
+            "{node}'s committed config must be the one mounted, and at the path its `command:` \
+             names"
+        );
+        assert!(
+            DEALING_COMPOSE.contains(&format!("./local/.keys/dealing/{node}:/app/data:ro")),
+            "{node}'s key directory is named after its compose service -- local/keys.sh writes \
+             it there and nowhere else"
+        );
+    }
+
+    // The published ports, which only `local/keys.sh` and a human ever use.
+    // The Solana peering's channel is opened through the PAYER's operator
+    // surface, so the script's topology table has to name B's.
+    assert!(
+        DEALING_COMPOSE.contains("127.0.0.1:3008:3000"),
+        "B publishes 3008, and nothing else in this repository may: every topology here is one \
+         compose project on one machine"
+    );
+    assert!(
+        KEYS_SCRIPT.contains("b-c:solana:connector-b:connector-c:3008"),
+        "local/keys.sh's topology table names the port B's operator surface is published on, \
+         because `POST /channels` is the only submitter of this peering's `InitializeChannel`. \
+         A port that drifts from the compose file fails as a refused connection during \
+         bring-up, which says nothing a reader could trace back."
+    );
+
+    // The state volumes: the payees' journals, read-only, which is the money
+    // assertion's whole input.
+    for (volume, mount) in [
+        ("dealing-b-state", "b-state"),
+        ("dealing-c-state", "c-state"),
+    ] {
+        assert!(
+            DEALING_COMPOSE.contains(&format!("{volume}:/app/{mount}:ro")),
+            "the sender must mount {volume} read-only to read that payee's claim journal"
+        );
+    }
+    assert!(
+        DEALING_COMPOSE.contains("peer-claims.log"),
+        "the journal the sender reads is `peer-claims.log`, the name `connector-runtime`'s \
+         journal writes"
+    );
+
+    assert!(
+        MAKEFILE.contains("LOCAL_NODES_dealing := connector-a connector-b connector-c"),
+        "`make local-up` starts the services it is TOLD to start rather than every service in \
+         the enabled profiles, so a new topology that forgets this line brings up no connectors \
+         and waits on nothing"
+    );
+}
+
+/// **This topology IS on the CI gate, and that is the decision** — the mirror
+/// of [`the_onion_topology_is_deliberately_not_on_the_ci_gate`] below.
+///
+/// The rule this repository keeps is that a test either runs or fails loudly.
+/// What puts a topology on the gate is therefore its DEPENDENCIES, not its
+/// importance: this one needs an `anvil`, a `solana-test-validator` and a
+/// built image, every one of which the three topologies already on that gate
+/// need, so nothing about it can go red for a reason outside this repository.
+///
+/// And what it proves exists nowhere else. `cargo test` covers the conversion
+/// arithmetic, the rate table and every config refusal far better than a
+/// container can — but nothing under `crates/` can show a **mounted config
+/// that declares tokens** producing a **real Solana claim for the converted
+/// figure** on a channel derived from a mint that is not USDC. That is the
+/// composition, and a composition that only ever runs by hand rots.
+#[test]
+fn the_dealing_topology_is_on_the_ci_gate() {
+    assert!(
+        LOCAL_TOPOLOGIES_WORKFLOW.contains("topology: [solo, two-hop, mixed-chain, dealing]"),
+        "`.github/workflows/local-topologies.yml` must run `dealing`. It needs nothing this \
+         machine does not already provide for `mixed-chain`, and it is the only place a shipped \
+         image converts an amount at all."
+    );
+    assert!(
+        LOCAL_README.contains("### Why it IS on the CI gate"),
+        "local/README.md must say why it is ON the gate, beside the section saying why the \
+         hidden-service one is off it. Membership of that matrix is a judgement about \
+         dependencies, and a reader deserves to find the judgement rather than infer it."
+    );
+}
+
 // ─── onion ───────────────────────────────────────────────────────────────────
 
 /// The one service block `local/onion/compose.yml` declares under `service`.
@@ -2012,8 +2572,8 @@ fn the_onion_rehearsal_reads_the_payees_own_claim_journal() {
 #[test]
 fn the_onion_topology_is_deliberately_not_on_the_ci_gate() {
     assert!(
-        LOCAL_TOPOLOGIES_WORKFLOW.contains("topology: [solo, two-hop, mixed-chain]"),
-        "`.github/workflows/local-topologies.yml` must run exactly the three topologies that \
+        LOCAL_TOPOLOGIES_WORKFLOW.contains("topology: [solo, two-hop, mixed-chain, dealing]"),
+        "`.github/workflows/local-topologies.yml` must run exactly the four topologies that \
          need nothing but this machine. Adding `onion` to that matrix is the change this test \
          exists to refuse: read local/README.md's 'Why the onion topology is not on the CI \
          gate' before deciding this test is the thing that is wrong."
@@ -2396,10 +2956,13 @@ fn the_mixed_chain_solana_channel_is_funded_and_the_rehearsal_reads_it_off_the_c
     let channel_account = solana_channel(&b, "b-c").channel_account().to_string();
 
     assert!(
-        KEYS_SCRIPT.contains("--deposit-base-units \"$CHANNEL_DEPOSIT\""),
+        KEYS_SCRIPT.contains("--deposit-base-units \"$SOLANA_CHANNEL_DEPOSIT\""),
         "local/keys.sh's solana-channels stage must tell open-solana-channel.py how much \
          collateral the channel needs. Without it the stage opens a channel and funds nothing, \
-         which is the state this topology shipped in before issue #1118."
+         which is the state this topology shipped in before issue #1118. The variable is \
+         `SOLANA_CHANNEL_DEPOSIT` since issue #1299, and it falls back to `CHANNEL_DEPOSIT` \
+         for every topology whose two legs hold the same token -- which is this one, so the \
+         figure below is still the one read from `CHANNEL_DEPOSIT`."
     );
     assert!(
         MIXED_COMPOSE.contains(&format!("channel_open {channel_account} {LOCAL_TEST_PROGRAM_ID} 112 {deposit}")),

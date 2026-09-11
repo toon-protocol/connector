@@ -8,14 +8,24 @@
 # topology is FOR is the middle: ONE node holding two settlement backends and a
 # peering on each, so a packet crosses a chain boundary between two hops.
 #
-# It is NOT a conversion. The connector has no exchange rate -- ADR 0010
-# replaced the spread with a flat per-packet fee, and value conversion is the
-# `swap` repository's job. Every amount on this path is the same 6-decimal
-# USDC-shaped integer, and the only thing that ever changes it between hops is
-# a hop subtracting its own FLAT fee (issue #1144): 1200 in, 1100 across the
-# boundary, 1050 delivered -- each step a fixed number of base units, never a
-# rate applied to what arrived. What differs between the legs is which chain
-# each peering's claims are written against.
+# It is NOT a conversion, and what makes it one has changed. It used to be
+# exile: the connector had no exchange rate at all, ADR 0010 having replaced
+# the spread with a flat per-packet fee, and value conversion was the `swap`
+# repository's job. ADR 0071 ended that -- crossing a denomination is core
+# forwarding now -- and what keeps this path unconverted is the ABSENCE RULE
+# (decision 2): no config here declares `[[tokens]]`, so no hop resolves a
+# token for either of its peerings, no hop sits on a boundary, and every one of
+# them runs byte for byte the code it ran before the record. Both legs hold the
+# same 6-decimal mock USDC anyway, so there is nothing here to convert.
+#
+# Every amount on this path is therefore the same 6-decimal USDC-shaped
+# integer, and the only thing that ever changes it between hops is a hop
+# subtracting its own FLAT fee (issue #1144): 1200 in, 1100 across the boundary,
+# 1050 delivered -- each step a fixed number of base units, never a rate applied
+# to what arrived. What differs between the legs is which chain each peering's
+# claims are written against. `local/dealing` is the same three-node shape with
+# the middle node dealing, and the difference between the two directories is
+# exactly the `[[tokens]]` and `[[rates]]` blocks this one does not have.
 #
 # A's role in that is to be the ordinary end: one chain, one peering, no idea
 # that the hop after B is on a different one. Routing does not carry chain, and
@@ -116,11 +126,11 @@ price = 1200
 # carried a packet over BTP: all three topologies were ILP-over-HTTP, so
 # ADR 0027's first carriage was proven by `connector-peer-btp`'s in-process
 # suites and by nothing else. This is the peering worth spending on, because
-# it is the only one in this repository whose arrival is FORWARDED -- B's
-# `a-b` row is where `forwarded_claim_enforcement = "enforce"` binds (ADR 0042
-# item 3), so putting it on BTP proves the carriage moving a covering claim
-# through a gate that will refuse the packet without one, not just moving
-# bytes. `local/two-hop` stays on HTTP on purpose: it is the containerised
+# it is the one whose arrival is FORWARDED THROUGH A GATE -- B's `a-b` row is
+# the only row in the repository where `forwarded_claim_enforcement` is turned
+# on (ADR 0042 item 3), so putting it on BTP proves the carriage moving a
+# covering claim through a gate that will refuse the packet without one, not
+# just moving bytes. `local/two-hop` stays on HTTP on purpose: it is the containerised
 # counterpart of `two_connectors_peer.rs` and already diverges from it in
 # exactly one deliberate place.
 #

@@ -21,9 +21,11 @@
 //!
 //! A node that declares none of it loads and behaves exactly as it does
 //! today. [`a_config_declaring_no_tokens_declares_nothing`] is that as a
-//! unit, and [`every_committed_fixture_loads_and_declares_no_tokens`] is
-//! that over every config file this repository ships -- asserted by loading
-//! them, not by reading them.
+//! unit, and [`every_committed_fixture_loads_and_only_one_deals`] is that
+//! over every config file this repository ships -- asserted by loading
+//! them, not by reading them. Exactly one of them deals, and it is named:
+//! the middle node of `local/dealing`, the topology issue #1299 added to
+//! prove a crossing against real chains.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -455,8 +457,9 @@ fn a_config_declaring_no_tokens_declares_nothing() {
     );
 }
 
-/// The same rule over every config file this repository ships, asserted by
-/// **loading** each one rather than by reading it.
+/// The one committed fixture in this repository that deals, by name, and
+/// every other one asserted to declare nothing — by **loading** each rather
+/// than by reading it.
 ///
 /// The walk is over the tree rather than over a hand-kept list, for the
 /// reason `devnet_configs_load.rs`'s own nginx walk gives: a list of files
@@ -464,6 +467,22 @@ fn a_config_declaring_no_tokens_declares_nothing() {
 /// Its one exemption is the production skeleton, which
 /// `production_skeleton_is_inert.rs` owns and whose every value is invalid
 /// on purpose.
+///
+/// # Why this is an equality and not an exemption
+///
+/// It used to say that NO fixture declared a token, which was true until
+/// issue #1299 committed `local/dealing` — a topology whose whole subject
+/// is a hop converting at a declared rate against real chains. The honest
+/// update is not to exempt a directory: it is to name the one file that
+/// deals and go on asserting the rule over everything else, so a second
+/// fixture that starts declaring tokens still fails here and has to say why
+/// in this test rather than in silence. What the original check was
+/// protecting is untouched — ADR 0071 costs a node that declares none of it
+/// nothing, and every fleet and deploy fixture still declares none of it.
+///
+/// The dealing fixture's own arithmetic is not checked here.
+/// `local_topologies_load.rs` owns that, where the compose file it has to
+/// agree with is also in scope.
 ///
 /// Only what this sandbox physically cannot supply is substituted -- key
 /// files (real key material is never committed), the operator credential
@@ -473,7 +492,7 @@ fn a_config_declaring_no_tokens_declares_nothing() {
 /// here. Every other line, `[settlement]` values included, is the literal
 /// committed content.
 #[test]
-fn every_committed_fixture_loads_and_declares_no_tokens() {
+fn every_committed_fixture_loads_and_only_one_deals() {
     let fixtures = committed_config_fixtures();
     assert!(
         fixtures.len() >= 10,
@@ -483,19 +502,50 @@ fn every_committed_fixture_loads_and_declares_no_tokens() {
     );
 
     let sandbox = Sandbox::new();
+    let mut dealers = Vec::new();
     for path in fixtures {
         let text = sandbox.rewrite(&std::fs::read_to_string(&path).expect("read a fixture"));
         let config_file = write_config(&text);
         let config = Config::load(config_file.path())
             .unwrap_or_else(|error| panic!("{} must still load: {error}", path.display()));
+        if config.denomination().declares_tokens() {
+            dealers.push(named(&path));
+            continue;
+        }
         assert_eq!(
             config.denomination(),
             &DenominationConfig::default(),
-            "{} declares a token, which no committed fixture does yet -- and the point of \
-             this check is that ADR 0071 costs a node that declares none of it nothing",
+            "{} declares part of a denomination configuration without declaring a token. \
+             Every field of `DenominationConfig` arrives together or not at all, so this is \
+             a fixture that has half-started dealing.",
             path.display()
         );
     }
+
+    assert_eq!(
+        dealers,
+        vec!["dealing/connector-b.toml".to_string()],
+        "exactly one committed fixture deals, and it is `local/dealing`'s middle node -- the \
+         hop that topology exists to put on a denomination boundary. Everything else this \
+         repository ships, the two devnet fixtures and every deploy template included, \
+         declares nothing and runs the code it ran before ADR 0071. A new name in this list \
+         is a config that has started dealing; add it here deliberately, with the reason, \
+         rather than widening the check."
+    );
+}
+
+/// A fixture's last two path segments -- `dealing/connector-b.toml` --
+/// which is how this repository's prose names them and is stable under a
+/// moved checkout.
+fn named(path: &Path) -> String {
+    let mut parts: Vec<String> = path
+        .components()
+        .rev()
+        .take(2)
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts.reverse();
+    parts.join("/")
 }
 
 /// Every `*.toml` under `infra/`, `deploy/` and `local/` that is a
