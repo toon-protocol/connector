@@ -22,11 +22,15 @@ use connector_config::{
     PeerCarriage, PeerChannelConfig, SecretLocation, SettlementChain, SettlementConfig,
     SolanaSettlementConfig,
 };
+use connector_domain::AssetChain;
+use connector_rate_source::RateSource;
+use connector_rate_source_evm::UniswapV3RateSource;
 use connector_runtime::{
-    BoundedHttpSelfDescription, ChannelDomain, ClaimStateChallengeSigner, Connector, EvmDomain,
-    FileJournal, HttpAppClient, InMemoryJournal, Journal, JournalError, OutboundClientError,
-    OutboundClientLedger, OwnedHttpClaimState, PeerRegistrar, PeerRoute, PeerRouteStore,
-    PeerRouteStoreError, PeerTransport, SystemClock,
+    BoundedHttpSelfDescription, ChannelDomain, ClaimStateChallengeSigner, Connector, DeclaredRates,
+    EvmDomain, FileJournal, HttpAppClient, InMemoryJournal, Journal, JournalError,
+    OutboundClientError, OutboundClientLedger, OwnedHttpClaimState, PeerRegistrar, PeerRoute,
+    PeerRouteStore, PeerRouteStoreError, PeerTransport, QuotePathUnusable, RatePoller,
+    SharedRateTable, SystemClock,
 };
 use connector_settlement::{SettlementBackend, SettlementError};
 use connector_settlement_evm::{
@@ -244,6 +248,26 @@ pub enum RuntimeError {
     /// channel is exempt from a chain-derived *policy* but not from a
     /// chain-stated *fact*.
     ClientChannelDomainDisagreesWithSettlement(EvmDomainMismatch),
+    /// A `[[tokens]]` row's declared `quote` path is not one a poller can
+    /// read (ADR 0071 decision 3, issue #1294): no pool, more pools than
+    /// compose, legs that do not meet, or a path ending somewhere other than
+    /// this node's numeraire.
+    ///
+    /// `Config::load` refuses every one of these by name already, so this is
+    /// the second lock on the same door -- and a refusal to start rather
+    /// than a poller quietly skipping the pair, because a skipped pair reads
+    /// as priced in the file while every forward across it refuses.
+    QuotePathUnpollable { source: QuotePathUnusable },
+    /// The `[settlement.<chain>]` endpoint a declared quote path would be
+    /// read over is not one a rate source can be pointed at (ADR 0071
+    /// decision 6, issue #1293).
+    ///
+    /// `Config::load` already refuses an `rpc_url` that is not an `http(s)`
+    /// URL, so this is the second lock on that door too -- and a refusal to
+    /// start, for [`RuntimeError::QuotePathUnpollable`]'s reason: a node
+    /// whose pollers never started reads as priced in the file while every
+    /// forward across those pairs refuses.
+    RateSourceUnusable { endpoint: String, message: String },
 }
 
 impl fmt::Display for RuntimeError {
@@ -378,6 +402,19 @@ impl fmt::Display for RuntimeError {
                  to a different address on redemption, so this node would serve paid writes it \
                  could never collect on (ADR 0024, issue #1136). Fix the row, or point \
                  [settlement.evm] at the deployment the channel actually lives in"
+            ),
+            RuntimeError::QuotePathUnpollable { source } => write!(
+                f,
+                "a declared quote path cannot be polled: {source}. A token's quote is one or \
+                 two operator-named pools on that token's own settlement chain, ending at this \
+                 node's numeraire (ADR 0071 decision 3); a pair that cannot be sourced that way \
+                 runs a [[rates]] row instead"
+            ),
+            RuntimeError::RateSourceUnusable { endpoint, message } => write!(
+                f,
+                "no rate source can be pointed at '{endpoint}': {message}. A declared quote path \
+                 is read over the rpc_url of the settlement table for the token's own chain \
+                 (ADR 0071 decision 6); there is no separate endpoint to configure for it"
             ),
         }
     }
@@ -1503,6 +1540,24 @@ pub struct Runtime {
     /// there was never a second fact there to hold, only a second chance to
     /// disagree.
     pub settlements: Vec<connector_client_edge::X402ChainSettlementTerms>,
+    /// The rates this node deals at, or `None` for a node that declares no
+    /// token to deal (ADR 0071 decision 6, issue #1294) -- which is every
+    /// node that predates the record, and is why this is an `Option` rather
+    /// than an empty table.
+    ///
+    /// Built here, from the immutable declaration in `[[tokens]]`,
+    /// `[[rates]]` and `[rate_guards]`, for this struct's own reason: it is
+    /// composed once at boot and every reader afterwards shares it rather
+    /// than rebuilding one of its own. Two readers are expected --
+    /// the forwarding path, which reads it for every forward that crosses a
+    /// denomination boundary, and the operator surface, which renders what
+    /// it holds -- and both go through
+    /// [`connector_runtime::SharedRateTable`]'s synchronous read API, which
+    /// is what keeps ADR 0071's "the forwarding path does no I/O" true by
+    /// construction rather than by discipline.
+    ///
+    /// Writing it is [`spawn_rate_pollers`]'s job, and nothing else's.
+    pub rate_table: Option<SharedRateTable>,
 }
 
 /// Construct the live [`Connector`] and [`Signer`] a validated [`Config`]
@@ -1823,6 +1878,42 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         connector =
             connector.with_runtime_peer_route_store(store, runtime_peers, runtime_peer_routes);
     }
+    // ADR 0071 decision 6, issue #1294: the table a converting forward
+    // reads, built from what the file declares and from nothing else. A node
+    // that declares no token gets `None` here, starts no poller and forwards
+    // exactly as it did before the record -- no branch below this one is
+    // reached at all.
+    let rate_table = SharedRateTable::from_config(config.denomination());
+    if let Some(table) = &rate_table {
+        let held = table.read();
+        tracing::info!(
+            numeraire = %held.numeraire(),
+            declared_pairs = held.declared_pairs().count(),
+            quoted_tokens = config.denomination().quoted_tokens().count(),
+            "dealing across denominations at declared rates (ADR 0071)"
+        );
+        // Every declared quote path, connected to the reader that can
+        // actually read it and left polling in the background. A node whose
+        // pairs are all static `[[rates]]` rows starts nothing here.
+        spawn_quote_path_pollers(table, config)?;
+    }
+    // ADR 0071 decisions 1 and 2, issue #1295: the two facts the forwarding
+    // path's converting arm reads, and the only two. Which token each
+    // peering holds decides whether a forward crosses a denomination
+    // boundary at all, and the table decides what it crosses at -- or that
+    // it refuses.
+    //
+    // They are wired separately because they are independently absent, and
+    // the combination that matters is the awkward one: a node that declares
+    // tokens but no rate row has peering assets and no table, resolves
+    // boundaries it has priced nothing for, and must refuse every crossing
+    // rather than pass an integer across a scale difference. Handing the
+    // table only when both exist would turn that refusal back into the
+    // silent 10^12 pass-through ADR 0071 exists to make impossible.
+    connector = connector.with_peering_assets(config.peering_assets().clone());
+    if let Some(table) = &rate_table {
+        connector = connector.with_rate_table(table.clone());
+    }
     let connector = Arc::new(connector);
     Ok(Runtime {
         connector,
@@ -1831,7 +1922,120 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         client_channel_source_solana,
         solana_cluster,
         settlements,
+        rate_table,
     })
+}
+
+/// Start one background poller per declared quote path, each refreshing its
+/// pair into `table` at the cadence that pair's `ttl` implies (ADR 0071
+/// decision 6, issue #1294). Returns how many were started.
+///
+/// Spawned, never awaited: a packet must never wait on a rate source, and
+/// startup must never wait on a chain -- the same shape
+/// `EvmChannelIndexSyncer::run` already runs in. A node whose tokens declare
+/// no quote path starts nothing and says nothing; its pairs are the static
+/// `[[rates]]` rows the operator tends by hand.
+///
+/// Separate from [`build`] because the two halves arrive separately: the
+/// table is built from config alone, while a source is a chain reader
+/// (issue #1293) constructed from a settlement table's own RPC endpoint.
+/// This is the one place the two meet, and it takes the port rather than any
+/// implementation of it -- which is what lets the same wiring serve the EVM
+/// reader, a Solana one after it, and the in-memory source the tests drive.
+pub fn spawn_rate_pollers(
+    table: &SharedRateTable,
+    source: Arc<dyn RateSource>,
+    config: &Config,
+) -> Result<usize, RuntimeError> {
+    let pollers = RatePoller::for_config(table, source, config.denomination())
+        .map_err(|source| RuntimeError::QuotePathUnpollable { source })?;
+    let started = pollers.len();
+    for poller in pollers {
+        tracing::info!(
+            token = %poller.token(),
+            cadence_seconds = poller.cadence().as_secs(),
+            "polling a declared quote path to keep its rate fresh"
+        );
+        tokio::spawn(poller.run());
+    }
+    Ok(started)
+}
+
+/// Point a real rate source at this node's declared quote paths and start
+/// them polling (ADR 0071 decision 6) -- the production call
+/// [`spawn_rate_pollers`] was built for. Returns how many started.
+///
+/// **There is no endpoint key for this, and there should not be one.**
+/// Decision 3 puts a quote's pools on the token's *own settlement chain*
+/// precisely because that is the one chain a peering already guarantees
+/// this node RPC for, and `Config::load` refuses a quote on a chain with no
+/// `[settlement.<chain>]` table by name
+/// (`ConfigError::TokenQuoteWithoutSettlement`). So the endpoint is that
+/// table's `rpc_url`, read here, and a second key could only ever disagree
+/// with the one the node already dials.
+///
+/// Reading a pool is *not* settling: this builds its own reader over the
+/// same endpoint rather than reaching through a `SettlementBackend`, which
+/// decision 6 keeps out of every value path. The two share a URL and
+/// nothing else.
+///
+/// A node whose tokens declare no quote path starts nothing and says
+/// nothing -- its pairs are the static `[[rates]]` rows an operator tends
+/// by hand, which is also what decision 6 leaves every Solana-side pair on
+/// until someone writes a source for that chain against the port.
+fn spawn_quote_path_pollers(
+    table: &SharedRateTable,
+    config: &Config,
+) -> Result<usize, RuntimeError> {
+    let denomination = config.denomination();
+    if denomination.quoted_tokens().next().is_none() {
+        return Ok(0);
+    }
+    // A quote path on a chain no source reads, said by name. The failure is
+    // otherwise confusing in exactly the way the missing-source warning this
+    // replaced was: the file prices the pair, and every forward across it
+    // refuses one `ttl` after boot.
+    for (token, quote) in denomination.quoted_tokens() {
+        if quote.chain() != AssetChain::Evm {
+            tracing::warn!(
+                %token,
+                chain = quote.chain().as_str(),
+                "no rate source reads pools on this chain yet (ADR 0071 decision 6), so this \
+                 token's quote path prices nothing; a [[rates]] row prices the pair by hand"
+            );
+        }
+    }
+    let Some(rpc_url) = config
+        .settlements()
+        .iter()
+        .find_map(|settlement| match settlement {
+            SettlementConfig::Evm(evm) => Some(evm.rpc_url()),
+            SettlementConfig::Solana(_) => None,
+        })
+    else {
+        // Unreachable for an EVM quote path -- config refuses one whose
+        // chain has no settlement table -- and the honest answer for a node
+        // whose every quote path is on a chain the warning above just named.
+        return Ok(0);
+    };
+    // Rendered rather than carried: `RateSourceError` is a wide enum built
+    // for a *read* failure -- pool, pair, window -- and only its one
+    // construction-time variant can reach here. Keeping the whole of it in
+    // `RuntimeError` would make every `Result` in this module pay for a
+    // refusal `Config::load` has already made.
+    let source = UniswapV3RateSource::connect(rpc_url).map_err(|source| {
+        RuntimeError::RateSourceUnusable {
+            endpoint: rpc_url.to_string(),
+            message: source.to_string(),
+        }
+    })?;
+    let started = spawn_rate_pollers(table, Arc::new(source), config)?;
+    tracing::info!(
+        rpc_url,
+        started,
+        "reading declared quote paths by TWAP over the settlement chain's own endpoint"
+    );
+    Ok(started)
 }
 
 /// How often [`router`]'s spawned loop sweeps the client edge's channels
@@ -2254,9 +2458,33 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
             signer,
             operator.bearer_token().to_string(),
             operator.write_keys().to_vec(),
+            declared_rates(runtime, config),
         )),
         None => app,
     })
+}
+
+/// What `GET /rates` reads on a dealing node, or `None` on one that deals
+/// nothing (ADR 0071, issue #1297).
+///
+/// The table itself is the one [`build`] put on the [`Runtime`] -- the same
+/// handle the forwarding path converts against and the poller refreshes, so
+/// the page cannot disagree with what packets see. What the table does not
+/// know is which pairs this node has *committed* to sourcing: a declared
+/// quote path holds no row until its poller's first observation lands, and
+/// a poller that never started would otherwise leave its pair missing from
+/// the one page that exists to say so. Those pairs are read back out of the
+/// config here, where the declaration lives.
+fn declared_rates(runtime: &Runtime, config: &Config) -> Option<DeclaredRates> {
+    let table = runtime.rate_table.as_ref()?;
+    let numeraire = config.denomination().numeraire()?;
+    Some(DeclaredRates::new(
+        table.clone(),
+        config
+            .denomination()
+            .quoted_tokens()
+            .map(|(token, _)| (token.clone(), numeraire.clone())),
+    ))
 }
 
 #[cfg(test)]
@@ -6683,6 +6911,283 @@ key_file = "{key_path}"
         fn spl_token_program_id() -> Pubkey {
             Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
                 .expect("the canonical SPL Token program id")
+        }
+    }
+
+    /// ADR 0071 decision 6, issue #1294: what a dealing node's config
+    /// produces at boot, and what a node that declares nothing produces
+    /// instead.
+    mod denomination {
+        use super::*;
+        use connector_domain::AssetId;
+        use connector_rate_source::{InMemoryRateSource, PoolContents, PoolId};
+
+        /// USDC on Base -- the numeraire, and this node's settlement token.
+        const USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+        /// USDC on Solana: the same asset on the other chain, which is why
+        /// the pair below is 1:1 and is declared rather than sourced.
+        const USDC_SOLANA: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        /// ANYONE on Base: 18 decimals against USDC's 6, quoted through one
+        /// operator-named pool.
+        const ANYONE: &str = "0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+        const POOL_ANYONE_USDC: &str = "0x1111111111111111111111111111111111111111";
+
+        fn asset(text: &str) -> AssetId {
+            text.parse::<AssetId>().expect("a declared asset")
+        }
+
+        /// A node dealing the same asset across two chains at a hand-tended
+        /// rate. No `quote` anywhere, so it needs no settlement table and
+        /// [`build`] dials no chain -- the table is a pure product of the
+        /// file.
+        #[tokio::test]
+        async fn a_dealing_node_carries_its_rate_table_on_the_runtime() {
+            let (config, _key_path) = config_with_raw_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:0"
+
+[signer]
+key_file = "{key_file}"
+
+[[tokens]]
+asset = "evm:{USDC}"
+numeraire = true
+
+[[tokens]]
+asset = "solana:{USDC_SOLANA}"
+
+[[rates]]
+from = "solana:{USDC_SOLANA}"
+to = "evm:{USDC}"
+rate = {{ numerator = 1, denominator = 1 }}
+
+[rate_guards]
+spread = {{ numerator = 30, denominator = 10000 }}
+ttl_secs = 300
+max_move = {{ numerator = 5, denominator = 100 }}
+"#,
+                    key_file = key_path.display()
+                )
+            });
+
+            let runtime = build(&config).await.expect("build");
+
+            let table = runtime
+                .rate_table
+                .expect("a node that declares tokens deals");
+            let held = table.read();
+            assert_eq!(held.numeraire(), &asset(&format!("evm:{USDC}")));
+            assert!(
+                held.lookup(
+                    &asset(&format!("solana:{USDC_SOLANA}")),
+                    &asset(&format!("evm:{USDC}")),
+                    chrono::Utc::now(),
+                )
+                .is_live(),
+                "a declared row is in force from boot and never ages"
+            );
+        }
+
+        /// The easy path, and every node that predates ADR 0071: no token,
+        /// no numeraire, no table, nothing started.
+        #[tokio::test]
+        async fn a_node_that_declares_no_tokens_carries_no_rate_table() {
+            let (config, _key_path) = config_with_raw_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:0"
+
+[signer]
+key_file = "{}"
+"#,
+                    key_path.display()
+                )
+            });
+
+            let runtime = build(&config).await.expect("build");
+
+            assert!(runtime.rate_table.is_none());
+        }
+
+        /// The seam issue #1293's reader drops into: a declared quote path,
+        /// a source behind the port, and a poller spawned per path that
+        /// prices the pair without anything on the packet path asking it to.
+        ///
+        /// Against the in-memory source, which upholds the port's own
+        /// contract suite -- a fake, not a stub (ADR 0007). `start_paused`
+        /// asserts the schedule rather than spending it in real seconds.
+        #[tokio::test(start_paused = true)]
+        async fn a_spawned_poller_prices_a_declared_quote_path() {
+            let observed_at = chrono::Utc::now();
+            let (config, _key_path) = config_with_raw_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:0"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement.evm]
+rpc_url = "http://127.0.0.1:8545"
+contract_address = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
+token_address = "{USDC}"
+decimals = 6
+
+[settlement.evm.key]
+key_file = "{key_file}"
+
+[[tokens]]
+asset = "evm:{USDC}"
+numeraire = true
+
+[[tokens]]
+asset = "evm:{ANYONE}"
+quote = [
+  {{ pool = "{POOL_ANYONE_USDC}", quote_token = "evm:{USDC}", twap_window_secs = 1800 }},
+]
+
+[rate_guards]
+spread = {{ numerator = 30, denominator = 10000 }}
+ttl_secs = 300
+max_move = {{ numerator = 5, denominator = 100 }}
+"#,
+                    key_file = key_path.display()
+                )
+            });
+            // `build` is not called here: it would dial the RPC endpoint
+            // that settlement table names, and this test is about the
+            // poller, not about a chain.
+            let table = SharedRateTable::from_config(config.denomination())
+                .expect("a node that declares tokens deals");
+            let source = Arc::new(InMemoryRateSource::new());
+            source.insert_pool(
+                PoolId(POOL_ANYONE_USDC.to_string()),
+                PoolContents {
+                    base: asset(&format!("evm:{ANYONE}")),
+                    quote: asset(&format!("evm:{USDC}")),
+                    rate: connector_domain::Rate::new(4, 1_000_000_000_000).expect("a rate"),
+                    observed_at,
+                    shortest_window: chrono::Duration::seconds(60),
+                    longest_window: chrono::Duration::seconds(3600),
+                },
+            );
+
+            let started = spawn_rate_pollers(&table, source as Arc<dyn RateSource>, &config)
+                .expect("a usable quote path");
+
+            assert_eq!(started, 1, "one token declared a quote path");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            assert!(
+                table
+                    .lookup(
+                        &asset(&format!("evm:{ANYONE}")),
+                        &asset(&format!("evm:{USDC}")),
+                        observed_at,
+                    )
+                    .is_live(),
+                "the spawned poller read the path without anything asking it to"
+            );
+        }
+
+        /// The wiring `build` now does for real: a declared quote path is
+        /// read over the `rpc_url` of the settlement table for the token's
+        /// own chain, and the poller is running before the node serves
+        /// anything.
+        ///
+        /// No chain is dialed to assert it, and that is the reader's own
+        /// design -- `UniswapV3RateSource::connect` touches nothing, so a
+        /// source pointed at an endpoint nothing answers on is still a
+        /// source, and what this test proves is that production picks one
+        /// up and starts the poller rather than logging that it cannot.
+        #[tokio::test]
+        async fn a_declared_quote_path_is_polled_over_its_own_chains_endpoint() {
+            let (config, _key_path) = config_with_raw_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:0"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement.evm]
+rpc_url = "http://127.0.0.1:8545"
+contract_address = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
+token_address = "{USDC}"
+decimals = 6
+
+[settlement.evm.key]
+key_file = "{key_file}"
+
+[[tokens]]
+asset = "evm:{USDC}"
+numeraire = true
+
+[[tokens]]
+asset = "evm:{ANYONE}"
+quote = [
+  {{ pool = "{POOL_ANYONE_USDC}", quote_token = "evm:{USDC}", twap_window_secs = 1800 }},
+]
+
+[rate_guards]
+spread = {{ numerator = 30, denominator = 10000 }}
+ttl_secs = 300
+max_move = {{ numerator = 5, denominator = 100 }}
+"#,
+                    key_file = key_path.display()
+                )
+            });
+            let table = SharedRateTable::from_config(config.denomination())
+                .expect("a node that declares tokens deals");
+
+            let started = spawn_quote_path_pollers(&table, &config)
+                .expect("a quote path on the chain this node settles on");
+
+            assert_eq!(started, 1, "the one declared quote path is polled");
+        }
+
+        /// The other half, unchanged by the wiring: a node whose every pair
+        /// is a static `[[rates]]` row has nothing to poll and no endpoint
+        /// to poll it over. It starts nothing -- and, since this is the
+        /// path `build` takes for such a node, it also needs no settlement
+        /// table to boot.
+        #[tokio::test]
+        async fn a_node_with_no_quote_path_starts_no_poller() {
+            let (config, _key_path) = config_with_raw_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:0"
+
+[signer]
+key_file = "{key_file}"
+
+[[tokens]]
+asset = "evm:{USDC}"
+numeraire = true
+
+[[tokens]]
+asset = "solana:{USDC_SOLANA}"
+
+[[rates]]
+from = "solana:{USDC_SOLANA}"
+to = "evm:{USDC}"
+rate = {{ numerator = 1, denominator = 1 }}
+
+[rate_guards]
+spread = {{ numerator = 30, denominator = 10000 }}
+ttl_secs = 300
+max_move = {{ numerator = 5, denominator = 100 }}
+"#,
+                    key_file = key_path.display()
+                )
+            });
+            let table = SharedRateTable::from_config(config.denomination())
+                .expect("a node that declares tokens deals");
+
+            assert_eq!(
+                spawn_quote_path_pollers(&table, &config).expect("nothing to poll is not an error"),
+                0
+            );
         }
     }
 }

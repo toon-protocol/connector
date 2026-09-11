@@ -42,8 +42,20 @@ jobs:
     # One job per topology, and `fail-fast: false` because they answer
     # different questions: `solo` is about the image booting on a mounted
     # config, `two-hop` about two of them peering and paying, `mixed-chain`
-    # about one node holding a settlement backend on each of two chains.
-    # Cancelling the others on the first red hides which of those broke.
+    # about one node holding a settlement backend on each of two chains, and
+    # `dealing` about a hop CONVERTING between two denominations at a rate it
+    # declared (ADR 0071). Cancelling the others on the first red hides which
+    # of those broke.
+    #
+    # `dealing` is on this gate, and the test that ASSERTS which topologies are
+    # here (`local_topologies_load.rs`) reads this matrix as text -- so what
+    # decides membership is the dependency rather than the importance. This one
+    # needs an anvil, a solana-test-validator and a docker image, every one of
+    # which the three above already need. The topology that is deliberately
+    # absent needs a third-party anonymity network to be having a good day, and
+    # a gate that can go red for that reason is run-or-fail-loudly inverted;
+    # `local/README.md` argues that absence at length and is where a reader
+    # about to "fix" it will look.
     #
     # They cannot share a runner: every topology binds the same chain ports and
     # the same compose project, and `make local-down` removes both.
@@ -53,7 +65,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        topology: [solo, two-hop, mixed-chain]
+        topology: [solo, two-hop, mixed-chain, dealing]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -109,8 +121,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          # Per topology, because three concurrent jobs writing one cache key
-          # race each other for it and the loser's upload is discarded with a
+          # Per topology, because concurrent jobs writing one cache key race
+          # each other for it and the losers' uploads are discarded with a
           # warning. The restore key is shared, so a new topology still starts
           # from whichever cache exists rather than from cold.
           key: local-topologies-${{ runner.os }}-${{ matrix.topology }}-${{ hashFiles('Cargo.lock') }}

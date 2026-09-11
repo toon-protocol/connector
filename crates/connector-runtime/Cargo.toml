@@ -17,6 +17,12 @@ test-support = []
 [dependencies]
 connector-domain = { path = "../connector-domain" }
 connector-config = { path = "../connector-config" }
+# The rate-source port (ADR 0071 decision 6, issue #1291): what the
+# background poller in `rate_poller` drives. The port only -- the readers
+# behind it (the Uniswap-v3-compatible `observe()` TWAP one, issue #1293)
+# are their own crates and reach a node through `connector-cli`, never from
+# here.
+connector-rate-source = { path = "../connector-rate-source" }
 connector-settlement = { path = "../connector-settlement" }
 connector-signer = { path = "../connector-signer" }
 arc-swap = "1.9.2"
@@ -52,7 +58,9 @@ url = "2"
 
 [dev-dependencies]
 ed25519-dalek = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `test-util` for the poller's cadence test (issue #1294): a paused clock
+# asserts the schedule a `ttl` implies without spending it in real seconds.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 # A real HTTP server for the self-description fetch's own bounds (ADR
 # 0058): a redirect, a status, and a body that never ends are properties of
 # an exchange, not values a fake can hand back.

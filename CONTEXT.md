@@ -396,8 +396,12 @@ _Avoid_: payout, redemption (as a synonym for the whole act)
 What a connector charges to carry one packet across one peering relation. Flat per packet,
 not proportional to the amount carried — and not varying with where the packet is headed, because
 it pays for this hop's work and that work is the same whatever the destination. One number per
-peering, held by the peering. What varies by destination is the **price**.
-_Avoid_: spread, commission, rate
+peering, held by the peering, denominated in that peering's unit — which at a hop crossing a
+denomination is the **outgoing** leg's, subtracted after the conversion and not before
+([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). What varies
+by destination is the **price**; what a hop earns for crossing a denomination is the **spread**,
+a separate earning.
+_Avoid_: commission; using fee for the dealing margin — that is the **spread**
 
 **Price**:
 What a terminated route charges for the work the app does. Distinct from a fee — a fee buys
@@ -427,10 +431,51 @@ packet cost.
 What a caller must send for a packet to be delivered: the fees of every hop that carries it, plus
 the **charge** of the route that terminates it. A reject states the cost of the path _that
 packet_ travelled, which is how a probe discovers it. The sum only — never the per-hop breakdown,
-and never the split between fees and price. Because a terminating charge can depend on payload
-length (ADR 0065), a probe's figure is exact for a packet its own size; what answers every size is
+and never the split between fees and price. The sum arrives in the asker's own unit: each
+denomination boundary a reject crosses converts the running figure as it passes
+([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)), so the number
+is always readable where it lands and the wire never needs to name a unit. Because a terminating
+charge can depend on payload length (ADR 0065), a probe's figure is exact for a packet its own
+size; what answers every size is
 the terminating node's published **price**, on its greeting and its self-description.
 _Avoid_: total fee, quote
+
+**Rate**:
+The declared terms on which one connector crosses one denomination boundary: a rational over
+**base units** — so many of the outgoing channel's for so many of the incoming one's — with the
+two tokens' decimals folded into the ratio and direction included
+([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). Declared or
+absent, and absence is the safety rule: a pair this node declared nothing for is refused with a
+final **`F02`** rather than passed through at an implied 1:1, and a rate whose observation has
+aged out past its ttl with a retryable **`T00`** rather than dealt on dead. Nothing ever converts
+silently. A node that declares no tokens resolves no denomination, crosses no boundary and
+forwards unconverted at the flat fee — which is every node this repository ships today; a node
+that declares them is held to the rule on every ordered pair it can resolve, same asset or not,
+because USDC on two chains is two of them. An operator who wants such a pair carried at par says
+so in a row: there is no 1:1 rate to fall back on, deliberately. A rate is one connector's own
+posted term, never a network fact: the network learns it the way it learns every cost, by probing
+the route.
+_Avoid_: exchange rate (a market's number; this is one connector's posted one), conversion factor
+
+**Spread**:
+What a connector earns at a denomination boundary: the part of the **mid** — the unwidened rate
+the node holds for a pair, sourced or hand-tended — that it keeps when it deals, taken against
+the sender in whichever direction the packet runs, and paid for carrying the dealing risk: a
+stale source, a shoved pool, a packet held against a moving price
+([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). Declared as a
+**fraction** strictly below one — as `max_move` and a static rate are, and for the reason ADR 0010
+deleted the basis-point fee: there are no floats on this path, and an operator dealing at half a
+basis point writes `1/20000` rather than watching it round to zero. A separate
+earning from the **fee**, which buys carriage; a hop that crosses no boundary earns no spread.
+_Avoid_: arbitrage (riskless profit between venues — this is priced risk), margin
+
+**Segment**:
+A maximal run of hops sharing one denomination. One segment, one unit: every amount, fee and
+running cost inside a segment is in that segment's unit, and a **path** is its segments joined at
+denomination boundaries
+([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). A
+single-segment path is the only kind that existed before 0071, which is why older prose may use
+"path" where it means this word.
 
 **Minimum delivery** _(retired term, [ADR 0057](docs/adr/0057-minimum-delivery-is-retired-a-claim-bounds-erosion.md), issue #1143)_:
 The amount a packet declared must reach its destination, checked by every hop after its own fee

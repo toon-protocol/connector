@@ -14,8 +14,9 @@
 
 **This is the RFC an operator is closest to: it describes the job of the thing
 you are running.** It is also the one this connector departs from most, because
-two of its requirements — learn routes, and quote a rate — are decisions this
-project made in the opposite direction on purpose.
+two of its requirements — learn routes, and quote a rate on request — are
+decisions this project made in the opposite direction on purpose. Applying a
+rate is no longer one of them.
 
 - **No route discovery, no advertisement, no CCP.** This connector never learns,
   announces or discovers a route
@@ -38,14 +39,22 @@ project made in the opposite direction on purpose.
   config-file key
   ([ADR 0034](../../adr/0034-a-runtime-peer-route-table-never-shadows-the-config-file.md);
   `configuration-spec.md` **CF-32**).
-- **No exchange rates, no currency conversion, no quoting.** One settlement token
-  at uniform base units; `decimals` is a declaration checked against the token's
-  own `decimals()` at startup and never multiplied by. ILQP is not implemented,
-  and cost is discovered by **probe** from a reject carrying the accumulated sum
+- **Rates exist. Quoting still does not.** A hop whose two channels hold
+  different tokens converts at a rate it has **declared**, rounds down, and
+  earns a spread besides its flat fee
+  ([ADR 0071](../../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)),
+  which is this RFC's converting connector. This line used to record the no-FX
+  rule as an absence no record stated; it is a decision now, and that record
+  states it. What did not move: `decimals` is still a boot-time declaration
+  checked against the token's own `decimals()` and never multiplied by — the
+  scale difference folds into the declared ratio instead; ILQP is not
+  implemented and no rate is ever quoted on request; and cost is still
+  discovered by **probe** from a reject carrying the accumulated sum
   ([ADR 0011](../../adr/0011-rejects-accumulate-fees-and-probes-discover-cost.md);
-  `payment-spec.md` **PM-19**). _No record states the no-FX rule directly — it is
-  an absence rather than a decision, and this line is currently the clearest
-  statement of it anywhere in the repository._
+  `payment-spec.md` **PM-19**), each boundary converting that running figure as
+  the reject passes so it lands in the asker's own unit. A pair the operator
+  declared nothing for is refused rather than converted: no hop here applies a
+  rate nobody wrote down.
 - **A fee is flat, per packet, and attaches to a peering rather than a route**
   ([ADR 0010](../../adr/0010-flat-per-packet-fee-and-minimum-delivery.md) as
   amended by

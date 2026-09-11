@@ -103,21 +103,27 @@ PRs touching the crates, the Dockerfile, the compose files, the contracts or
 `local/` itself — the path filter is there because a docs-only change elsewhere
 cannot break it and the image build is the expensive part.
 
-There are four topologies, chosen with `LOCAL_TOPOLOGY` (default `solo`), and CI
-runs three of them: `solo` (one node, both settlement backends live at once),
-`two-hop` (two nodes peered over ILP-over-HTTP on anvil) and `mixed-chain` (three
+There are five topologies, chosen with `LOCAL_TOPOLOGY` (default `solo`), and CI
+runs four of them: `solo` (one node, both settlement backends live at once),
+`two-hop` (two nodes peered over ILP-over-HTTP on anvil), `mixed-chain` (three
 nodes, EVM on one leg and Solana on the other, with the middle node holding both
-backends). The fourth is `onion` (ADR 0070): two nodes, each with a real `anon`
+backends) and `dealing` (ADR 0071 — `mixed-chain`'s shape with the middle node
+**dealing**: 6-decimal mock USDC in, a 9-decimal mock SPL token out, converted at
+a rate it declares, and the only committed config here that declares
+`[[tokens]]`). The fifth is `onion` (ADR 0070): two nodes, each with a real `anon`
 sidecar, on separate docker networks with **no route between them**, so that a
 fulfilled packet is evidence of a circuit rather than of a docker network. It is
 deliberately **off** the CI gate and must stay off it — a gate that goes red when
 a third-party anonymity network has a bad day is this repository's run-or-fail-loudly
 rule inverted rather than honoured — so run it by hand with
-`make local-verify LOCAL_TOPOLOGY=onion`. The peered three do not stop at
+`make local-verify LOCAL_TOPOLOGY=onion`. The peered four do not stop at
 delivery — they cross the peering more than once and then read the payee's own
 claim journal, because a peer claim's
 verdict rides back in `Toon-Claim-Ack` and never gates the packet, so
-`--expect-fulfill` alone would go green over a peering carrying traffic for free.
+`--expect-fulfill` alone would go green over a peering carrying traffic for free
+— and on `dealing` it would go green over a boundary converting at the wrong
+rate, so that one asserts the **converted** figure rather than that a claim
+exists.
 `local/README.md` is the long version, and is worth reading before editing
 anything under `local/`.
 

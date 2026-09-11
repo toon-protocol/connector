@@ -60,6 +60,7 @@ help:
 	@echo "  make local-logs           Follow its logs"
 	@echo "  make local-preflight      Ask whether this machine's one stack is free"
 	@echo "  LOCAL_TOPOLOGY=<name>     Which topology: solo (default), two-hop, mixed-chain,"
+	@echo "                            dealing (one hop converts at a declared rate),"
 	@echo "                            onion (a real onion daemon; not on the CI gate)"
 	@echo ""
 	@echo "Maintenance:"
@@ -222,6 +223,7 @@ LOCAL_NODES_mixed-chain := connector-a connector-b connector-c
 # configs these two are about to mount (ADR 0070 decision 7). They are still waited on
 # -- each connector `depends_on` its own daemon's health gate.
 LOCAL_NODES_onion := connector-a connector-b
+LOCAL_NODES_dealing := connector-a connector-b connector-c
 LOCAL_NODES = $(LOCAL_NODES_$(LOCAL_TOPOLOGY))
 
 # The image the topologies run. Built from this working tree, deliberately: the
@@ -261,7 +263,7 @@ local-build:
 local-up: local-preflight contracts-libs local-build solana-build
 	@test -n "$(LOCAL_NODES)" || { \
 		echo "ERROR: LOCAL_TOPOLOGY='$(LOCAL_TOPOLOGY)' has no LOCAL_NODES_ entry in this Makefile."; \
-		echo "       Known topologies: solo two-hop mixed-chain onion."; \
+		echo "       Known topologies: solo two-hop mixed-chain onion dealing."; \
 		exit 1; \
 	}
 	@$(LOCAL_COMPOSE) up -d --wait anvil solana-validator || { \

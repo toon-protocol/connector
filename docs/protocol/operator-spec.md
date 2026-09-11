@@ -314,7 +314,7 @@ response to anything arriving over the network.
 **Non-normative.** How _this_ connector spells §3.
 
 **Reads** — bearer token: `GET /peers` · `/routes` · `/routes/leased` · `/routes/peers` · `/channels` ·
-`/claims` · `/identity` · `/audit-log` · `/metrics`
+`/claims` · `/rates` · `/identity` · `/audit-log` · `/metrics`
 
 **Writes** — RFC 9421 HTTP Message Signature from a key on an operator allowlist, with RFC 9530
 Content-Digest binding the signature to the body: `POST /packets` · `POST|DELETE /peers` ·

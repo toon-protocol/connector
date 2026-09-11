@@ -1,0 +1,150 @@
+# =============================================================================
+# local/dealing -- connector A. The ORDINARY end, and that is its whole job.
+#
+# LOCAL / DEV ONLY. `infra/linode-*` owns devnet; nothing here is deployed,
+# published or SSH'd anywhere, and every chain this file names is disposable.
+#
+# A -> B on EVM, B -> C on Solana, and B sits on a real DENOMINATION boundary:
+# 6-decimal mock USDC on the leg it accepts, a 9-decimal mock SPL token on the
+# leg it dials. B converts at a rate it has declared (ADR 0071); this file
+# declares nothing, deals nothing, and forwards exactly as it did before that
+# record existed.
+#
+# THAT IS THE ASSERTION THIS FILE MAKES. `[[tokens]]` is absent here, so
+# `Config::denomination()` is the default, `peering_assets()` is empty, no
+# forward A makes can resolve a boundary and the converting arm is not reached
+# at all. ADR 0071 costs a node that deals nothing exactly nothing: no new
+# required key, no new refusal, the same `amount_after_fee` subtraction on the
+# same flat fee. A topology whose every node had to declare tokens could not
+# show that.
+#
+# `local/mixed-chain` is this topology's sibling and the contrast worth
+# holding: three nodes, two chains, the same A/B/C shape -- and NOT a
+# conversion, because its B declares no tokens either and ADR 0071 decision 2's
+# absence rule then forwards the arriving integer unchanged but for a flat fee.
+# The difference between the two directories is `[[tokens]]` and one
+# `[[rates]]` row on the middle node.
+# =============================================================================
+
+client_edge_addr = "0.0.0.0:3000"
+
+# The peer claim ledger's home (issue #605).
+state_dir = "/app/state"
+
+# Issue #678, gap 3. B is a plain container port with no TLS terminator in
+# front of it, and this peering and the claim-state ask below both reach it
+# over plain HTTP. Node-wide and default false (CF-18); every deployed config
+# leaves it unset, and a node that sets it logs a WARN naming every plaintext
+# peering at startup.
+peer_allow_plaintext_endpoints = true
+
+[signer]
+key_file = "/app/data/signer.key"
+
+# ── The only path onward ─────────────────────────────────────────────────────
+# `g.local.dealing.b` is B's own subtree; the destination the rehearsal sends
+# to is `g.local.dealing.b.c.app`, three labels deeper. Longest-prefix matching
+# does the rest, and each hop's route is a prefix of the next hop's.
+#
+# 1200 is this path's COST (`CONTEXT.md`) IN THIS NODE'S OWN UNIT, and that
+# qualification is what ADR 0071 adds to the sentence. The path crosses a
+# denomination at B, so the figures downstream are not in µUSDC at all -- but
+# the sender never meets one of them. It pays this edge's posted price in the
+# unit its own channel holds, and the cost of everything past the boundary
+# arrives here already converted back (decision 7). A buyer needing the
+# far-side asset would mean this design had failed.
+#
+#     A collects 1200 µUSDC, retains 100, forwards 1100 µUSDC   <- this file
+#     B converts 1100 µUSDC -> 4356000 base units, retains 6000,
+#                             forwards 4350000                  <- connector-b.toml
+#     C terminates the 4350000, unpriced                        <- connector-c.toml
+#
+# The invariant that makes a path add up -- every hop's `price - fee` is at
+# least the next hop's `price` -- is ADR 0028's, is documented and is ENFORCED
+# BY NOTHING, because a connector cannot know what the next hop charges. It
+# holds on the un-converted half of this path by construction (1200 - 100 ==
+# 1100, which is B's price exactly) and `local_topologies_load.rs` is what
+# holds it that way.
+[[routes]]
+prefix = "g.local.dealing.b"
+peer_id = "a-b"
+price = 1200
+
+# ── The peering ──────────────────────────────────────────────────────────────
+# ILP-over-HTTP, and deliberately not BTP: `local/mixed-chain` is where a
+# shipped image carries a packet over ADR 0027's first carriage, and putting a
+# second topology on it would prove nothing this one is about. THE SCHEME IS
+# THE CARRIAGE and nothing else is (peer-carriage-spec.md §2.1).
+[[peers]]
+id = "a-b"
+endpoint = "http://connector-b:3000/ilp"
+# What this node retains for carrying one packet over this peering, flat and
+# per packet (ADR 0010), and a property of the counterparty rather than of any
+# prefix routed to it (ADR 0061). Denominated in the OUTGOING leg's unit, which
+# for this node is the only unit there is -- both of its legs are the same
+# 6-decimal mock USDC. ADR 0071 decision 1 amends ADR 0061 in exactly that
+# clause, and `connector-b.toml` is where the amendment is visible.
+fee = 100
+
+
+# The EVM half of the peering. `counterparty_key` is B's EVM settlement
+# address; B's own file names A's. `channel_id` is a real channel on the local
+# anvil, opened and funded by `local/keys.sh`, which refuses to proceed if the
+# chain does not produce exactly this id.
+[[peer_channels]]
+peer_id = "a-b"
+channel_id = "0xaabd147bc75ca72e8deaca1d7994716b6a29cb0ee4e3237ee629b440475e59fc"
+counterparty_key = "0x5E661B79FE2D3F6cE70F5AAC07d8Cd9abb2743F1"
+chain_id = 31337
+token_network = "0xCafac3dD18aC6c6e92c921884f9E4176737C052c"
+
+# ── Paying for the crossing, BEFORE it crosses (ADR 0042 item 2) ─────────────
+# Required, not optional: this node has a `[[routes]]` entry forwarding to
+# `a-b`, and a peering a node forwards to with no `[[pay_channels]]` row is
+# refused at load by name (`ConfigError::PayChannelUnbound`, issue #1145).
+#
+# ONE CHANNEL, TWO ROLES, WITH ONE HOP -- the same `channel_id` the
+# `[[peer_channels]]` row above names, which `Config::load` permits on purpose:
+# the peer role judges what arrives, the client role signs what this node
+# sends. `local/keys.sh` opens and funds exactly that one channel on anvil,
+# with A as the depositing participant, because A is the side signing claims on
+# it.
+#
+# The claim minted here is for `amount_after_fee(1200, 100)` -- 1100 µUSDC,
+# unconverted, because this hop crosses no boundary. What B does with that 1100
+# is B's file's business, and the packet carries no hint of it.
+[[pay_channels]]
+peer_id = "a-b"
+channel_id = "0xaabd147bc75ca72e8deaca1d7994716b6a29cb0ee4e3237ee629b440475e59fc"
+chain_id = 31337
+token_network = "0xCafac3dD18aC6c6e92c921884f9E4176737C052c"
+client_edge_url = "http://connector-b:3000/ilp"
+
+# ── Operator surface (ADR 0008) ──────────────────────────────────────────────
+# `connector send` originates the rehearsal's packet through `POST /packets`
+# here. B has one too, for a different reason (it is the only submitter of the
+# Solana peering's `InitializeChannel`); C has none.
+[operator]
+bearer_token_file = "/app/data/operator-bearer-token"
+write_keys_file = "/app/data/operator-write-keys"
+
+# ── Settlement: EVM only ─────────────────────────────────────────────────────
+# `contract_address` is the TokenNetworkRegistry, NOT the TokenNetwork the peer
+# channel above names (issue #576): `connect` resolves
+# `getTokenNetwork(token_address)` through the registry and refuses to start if
+# that comes back zero. The key here is also this node's peer-claim signing key
+# (ADR 0030), which is why its address is what B's `counterparty_key` names.
+#
+# `token_address` is the 6-decimal mock USDC `DeployLocal.s.sol` deploys, and
+# it is the token this node's one peering holds. Nothing here says so, and
+# nothing needs to: a node that declares no `[[tokens]]` resolves no peering to
+# a token at all (issue #1292), which is precisely why it can never find itself
+# on a boundary.
+[settlement.evm]
+rpc_url = "http://anvil:8545"
+contract_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+token_address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+decimals = 6
+
+[settlement.evm.key]
+key_file = "/app/data/settlement.key"

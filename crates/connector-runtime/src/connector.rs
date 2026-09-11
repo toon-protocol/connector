@@ -6,12 +6,15 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Duration, Utc};
-use connector_config::{SettlementChain, StaticRoute, TransportPolicy, DEFAULT_MAX_PACKET_AMOUNT};
+use connector_config::{
+    PeeringAssets, SettlementChain, StaticRoute, TransportPolicy, DEFAULT_MAX_PACKET_AMOUNT,
+};
 use connector_domain::x402::X402PaymentRequired;
 use connector_domain::{
-    amount_after_fee, delivery_budget, forwarded_expiry, is_expired, is_valid_ilp_address,
-    select_route, EnvelopeRequest, Fulfill, PacketResponse, Prepare, Price, Reject, RejectCode,
-    Watermark, FORWARDING_MESSAGE_WINDOW,
+    amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_fee, delivery_budget,
+    forwarded_expiry, is_expired, is_valid_ilp_address, select_route, AssetId, EnvelopeRequest,
+    Fulfill, PacketResponse, Prepare, Price, RateLookup, Reject, RejectCode, Watermark,
+    FORWARDING_MESSAGE_WINDOW,
 };
 use connector_settlement::{ChannelId, Claim, SettlementBackend, SettlementError};
 use connector_signer::giftwrap::{derive_fulfillment, open_request, seal_response};
@@ -42,6 +45,7 @@ use crate::peer_route_store::{
     PeerRouteStore, PeerRouteStoreError, RuntimePeerChannel, RuntimePeering, RuntimePeers,
 };
 use crate::peer_transport::{PeerRegistrar, PeerTransport};
+use crate::rate_table::SharedRateTable;
 use crate::route::{LeasedRoute, PeerRoute};
 use crate::self_description::{SelfDescriptionSource, UnreachableSelfDescription};
 
@@ -657,6 +661,35 @@ pub struct Connector {
     /// does not survive a restart, the same "degrade to in-memory-only"
     /// every other `state_dir`-scoped store on this connector takes.
     runtime_store: Option<PeerRouteStore>,
+    /// Which declared token each configured peering's channels hold (ADR
+    /// 0071 decision 1, issue #1292) -- the fact that decides whether a
+    /// forward crosses a **denomination boundary** at all.
+    ///
+    /// Empty on every node that declares no `[[tokens]]`, which is every
+    /// config this repository ships: nothing resolves, no forward can be a
+    /// crossing, and [`Self::forward_via_peer_route`] runs the one
+    /// subtraction it ran before ADR 0071 existed.
+    ///
+    /// Read on the packet path, which is why it is a pure function of
+    /// loaded config held by value rather than anything with a lock or a
+    /// chain behind it.
+    peering_assets: PeeringAssets,
+    /// The rates this node deals at (ADR 0071 decisions 1 and 5, issue
+    /// #1294), or `None` for a node that declares no token to deal.
+    ///
+    /// `None` is not "convert at par": a node holding no table refuses
+    /// every crossing [`Self::peering_assets`] reports, because decision
+    /// 2's absence rule is the safety rule -- no declared rate, no
+    /// conversion, no forward. The two fields are therefore independent,
+    /// and the combination that matters is the awkward one: a node that
+    /// declares tokens but no rate row resolves boundaries it will not
+    /// cross, and says so in a reject rather than passing an unconverted
+    /// integer across a 10^12 scale difference.
+    ///
+    /// The read is [`SharedRateTable::lookup`], which is a plain `fn` --
+    /// that is how "the forwarding path does no I/O" is kept true by
+    /// construction rather than by discipline (decision 6).
+    rate_table: Option<SharedRateTable>,
 }
 
 /// What a client-role hop's covering claims are signed under, by chain
@@ -757,6 +790,8 @@ impl Connector {
             peer_allow_plaintext: false,
             peer_packet_caps: HashMap::new(),
             peer_fees: HashMap::new(),
+            peering_assets: PeeringAssets::default(),
+            rate_table: None,
         }
     }
 
@@ -1099,6 +1134,57 @@ impl Connector {
                 .get(peer_id)
                 .map_or(0, |peering| peering.fee),
         }
+    }
+
+    /// Tell this node which declared token each of its peerings holds (ADR
+    /// 0071 decision 1, issues #1292, #1295) -- the table
+    /// [`Config::peering_assets`](connector_config::Config::peering_assets)
+    /// resolved once at boot.
+    ///
+    /// Without it every forward this node makes is a same-denomination
+    /// forward, which is the truth for every node that declares no
+    /// `[[tokens]]` and the reason the default is the empty table rather
+    /// than an `Option`.
+    pub fn with_peering_assets(mut self, assets: PeeringAssets) -> Self {
+        self.peering_assets = assets;
+        self
+    }
+
+    /// Give this node the rate table its converting forwards read (ADR 0071
+    /// decision 6, issues #1294, #1295) -- the handle a background poller
+    /// writes through and every crossing reads.
+    ///
+    /// Giving a node a table does not make it deal: what it deals is
+    /// whatever the table holds a live row for, and a boundary with no row
+    /// is refused exactly as it is on a node with no table at all.
+    /// Withholding one is therefore not a way to turn conversion off, only
+    /// a way to make every crossing refuse.
+    pub fn with_rate_table(mut self, table: SharedRateTable) -> Self {
+        self.rate_table = Some(table);
+        self
+    }
+
+    /// The **denomination boundary** a forward arriving from `arrived_from`
+    /// and leaving to `outgoing_peer_id` crosses, or `None` when it crosses
+    /// none (ADR 0071 decision 1).
+    ///
+    /// `None` covers three cases that all forward the same way -- the two
+    /// peerings hold one token, this node declares none, or the arrival
+    /// named no peering at all. That last one is the case worth stating:
+    /// only a **peer** arrival names an incoming channel this node can
+    /// denominate, and a packet handed straight to
+    /// [`Self::handle_prepare`] -- an operator write, a client-edge
+    /// delivery -- is not one. `[[client_channels]]` has no resolved token
+    /// yet (issue #1292 built the peering table and deliberately not a
+    /// client one), so a client arrival crosses no boundary this hop can
+    /// see, and this node forwards it as it always did.
+    fn crossing(
+        &self,
+        arrived_from: Option<&str>,
+        outgoing_peer_id: &str,
+    ) -> Option<(&AssetId, &AssetId)> {
+        self.peering_assets
+            .boundary_between(arrived_from?, outgoing_peer_id)
     }
 
     /// Reserve every peer id this node's config file names (issue #884):
@@ -1782,6 +1868,24 @@ impl Connector {
         prepare: Prepare,
         client_channel_id: Option<&str>,
     ) -> PacketResponse {
+        self.handle_prepare_spanned(prepare, client_channel_id, None)
+            .await
+    }
+
+    /// The one body [`Self::handle_prepare_with_client_channel`] and
+    /// [`Self::handle_peer_prepare`] share: open the `"packet"` span and
+    /// route inside it.
+    ///
+    /// `arrived_from` is the peering this packet came in over, and is the
+    /// incoming half of ADR 0071's denomination boundary (issue #1295).
+    /// Only a peer arrival has one -- see [`Self::crossing`] for what
+    /// `None` means and why it is the safe answer rather than a gap.
+    async fn handle_prepare_spanned(
+        &self,
+        prepare: Prepare,
+        client_channel_id: Option<&str>,
+        arrived_from: Option<&str>,
+    ) -> PacketResponse {
         let span = tracing::info_span!(
             "packet",
             correlation_id = %correlation_id(),
@@ -1791,7 +1895,7 @@ impl Connector {
         if let Some(channel_id) = client_channel_id {
             span.record("client_channel_id", channel_id);
         }
-        self.handle_prepare_traced(prepare, client_channel_id)
+        self.handle_prepare_traced(prepare, client_channel_id, arrived_from)
             .instrument(span)
             .await
     }
@@ -1820,8 +1924,19 @@ impl Connector {
     /// peer PREPARE whose claim does not cover this same `price` before
     /// this method is ever reached. A route priced at `0` (an operator's
     /// deliberate free termination, ADR 0020) never trips this check.
+    /// `arrived_from` names the peering this PREPARE came in over, which is
+    /// the incoming half of ADR 0071's **denomination boundary** (issue
+    /// #1295): a forward out of this packet converts when that peering and
+    /// the outgoing one hold different tokens. Both carriages authenticate
+    /// the peer before calling this and pass `Some`; the in-process
+    /// transport models no such identity and passes `None`, which makes
+    /// every forward out of it a same-denomination forward. It is a
+    /// parameter rather than something derived from the claim because a
+    /// peer PREPARE routinely carries none -- both accept pipelines judge
+    /// the claim above this method and hand it on already decided.
     pub async fn handle_peer_prepare(
         &self,
+        arrived_from: Option<&str>,
         prepare: Prepare,
         claim: Option<WireClaim>,
     ) -> (PacketResponse, ClaimAckOutcome) {
@@ -1851,7 +1966,9 @@ impl Connector {
             }
         }
 
-        let response = self.handle_prepare(prepare).await;
+        let response = self
+            .handle_prepare_spanned(prepare, None, arrived_from)
+            .await;
         (response, ack)
     }
 
@@ -2076,6 +2193,7 @@ impl Connector {
         &self,
         prepare: Prepare,
         client_channel_id: Option<&str>,
+        arrived_from: Option<&str>,
     ) -> PacketResponse {
         // Per-packet lines are debug, not info (issue #690): at huddle rates
         // (hundreds of packets/s) every INFO here becomes per-event disk I/O
@@ -2152,7 +2270,9 @@ impl Connector {
             RouteTarget::RuntimePeer(route) => Cow::Owned(route),
         };
         tracing::debug!(peer_id = %peer_route.peer_id(), "routed to peer");
-        let response = self.forward_via_peer_route(&peer_route, prepare).await;
+        let response = self
+            .forward_via_peer_route(&peer_route, prepare, arrived_from)
+            .await;
         if matches!(response, PacketResponse::Fulfill(_)) {
             self.metrics
                 .record_fee_earned(self.fee_for(peer_route.peer_id()));
@@ -2182,6 +2302,233 @@ impl Connector {
         response
     }
 
+    /// Cross a **denomination boundary**: what this hop forwards to
+    /// `peer_id`, in `outgoing`'s unit, for `amount` arriving in
+    /// `incoming`'s -- or the reject that says why it will not
+    /// ([ADR 0071](../../../docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)
+    /// decisions 1 and 2, issue #1295).
+    ///
+    /// `floor(amount * rate) - fee`, with the fee in the outgoing leg's
+    /// unit. The arithmetic is
+    /// [`amount_after_rate_and_fee`]'s and lives in `connector-domain`
+    /// where it can be property-tested without a connector around it; what
+    /// is decided here is which rate, and which reject when there is none.
+    ///
+    /// # No I/O, and why that is structural
+    ///
+    /// The only thing consulted is [`SharedRateTable::lookup`], a plain
+    /// synchronous `fn` over an `ArcSwap` (decision 6). This method is
+    /// deliberately **not** `async`: a rate source reached from here would
+    /// not compile, which is a stronger guarantee than watching a forward
+    /// for sockets.
+    ///
+    /// # The two refusals, and why they are different codes
+    ///
+    /// ADR 0051's test is whether a sender can take a different next action
+    /// on the code than on its class alone, and here it can -- the whole
+    /// reason ADR 0071 insists the two refusals be distinguishable.
+    ///
+    /// * **Not declared** is `F02`, final: RFC 0027's own gloss is "there
+    ///   was no way to forward the payment", which is exactly true of a
+    ///   crossing this node has declared no price for, and ADR 0051's `F02`
+    ///   row binds the move a sender makes about it -- *this path is wrong;
+    ///   find another*. It is final because a declaration is config and
+    ///   config is immutable for the process lifetime (ADR 0009): retrying
+    ///   this packet at this hop cannot succeed, and the sender's only real
+    ///   move is another path. Reusing the code is within ADR 0051's rule
+    ///   rather than around it: the situation a sender can act on is the
+    ///   same situation, since "no route" and "no price for the crossing
+    ///   this route needs" leave a sender the identical next step.
+    /// * **Stale** is `T00`, temporary: nothing about the packet is wrong
+    ///   and nothing about the path is wrong -- this node's own poller has
+    ///   failed to keep a price fresh, which is ADR 0051's `T00` situation
+    ///   ("this connector's own configuration error ... retry later") and
+    ///   ADR 0071's "staleness is an outage, on purpose". The class letter
+    ///   is the instruction: `T` says retry, and a stale rate is precisely
+    ///   the refusal worth retrying.
+    ///
+    /// `T04` and `R01` join them for the two ways the arithmetic itself
+    /// refuses, and those two are **opposite** instructions, which is why
+    /// they are told apart here rather than both reported as `R01`:
+    ///
+    /// * the converted amount does not fit the outgoing leg's `u64` -- ADR
+    ///   0071's real ceiling, ~18.4 tokens on an 18-decimals leg -- and the
+    ///   sender must send **less**. That is the cap's own situation and the
+    ///   cap's own code (ADR 0049, ADR 0051: *send smaller, and the message
+    ///   states the cap*), reached before the cap check only because there
+    ///   is no representable amount left to compare against it.
+    /// * the fee alone exceeds the converted amount and the sender must
+    ///   send **more**: `R01`, the same question the unconverted arm asks,
+    ///   now asked in the outgoing unit where decision 1 puts the fee.
+    ///
+    /// Telling a sender to send more when it must send less is worse than
+    /// either refusal, and `amount_after_rate_and_fee` answers `None` to
+    /// both; the second lookup below -- taken only on the refusal path, at
+    /// a fee of zero, where the subtraction cannot be what failed -- is how
+    /// the two are separated without restating the arithmetic here.
+    fn convert_for_forward(
+        &self,
+        incoming: &AssetId,
+        outgoing: &AssetId,
+        peer_id: &str,
+        amount: u64,
+        fee: u64,
+    ) -> Result<u64, Reject> {
+        let undeclared = || Reject {
+            code: RejectCode::f02_unreachable(),
+            triggered_by: String::new(),
+            message: format!(
+                "forwarding to peer '{peer_id}' crosses a denomination boundary from {incoming} \
+                 to {outgoing}, and this connector declares no rate for that pair: it will not \
+                 convert at a rate it has not declared. Take another path"
+            ),
+            data: Vec::new(),
+            accumulated_cost: 0,
+        };
+
+        // A node with no table at all is a node that declared no rate for
+        // this pair, and answers the same way -- decision 2's absence rule
+        // makes no distinction between "no row" and "no table", because
+        // both are the operator not having said so.
+        let Some(table) = &self.rate_table else {
+            return Err(undeclared());
+        };
+
+        let rate = match table.lookup(incoming, outgoing, self.clock.now()) {
+            RateLookup::Live { rate, .. } => rate,
+            RateLookup::Stale { observed_at, .. } => {
+                return Err(Reject {
+                    code: RejectCode::t00_internal_error(),
+                    triggered_by: String::new(),
+                    message: format!(
+                        "this connector's rate for {incoming} to {outgoing} was last observed at \
+                         {} and is older than the ttl declared for that pair, so the crossing to \
+                         peer '{peer_id}' is refused rather than dealt on a dead price. Retry \
+                         once a fresh rate lands",
+                        observed_at.to_rfc3339()
+                    ),
+                    data: Vec::new(),
+                    accumulated_cost: 0,
+                });
+            }
+            RateLookup::NotDeclared => return Err(undeclared()),
+        };
+
+        if let Some(forwarded_amount) = amount_after_rate_and_fee(amount, rate, fee) {
+            return Ok(forwarded_amount);
+        }
+
+        // Which of the two refusals this was. At a fee of zero the
+        // subtraction cannot fail, so `None` here is the outgoing leg's
+        // `u64` ceiling and `Some` is the fee having eaten everything.
+        match amount_after_rate_and_fee(amount, rate, 0) {
+            Some(converted) => Err(Reject {
+                code: RejectCode::r01_insufficient_source_amount(),
+                triggered_by: String::new(),
+                // Named in both units, because on a crossing the sender's
+                // "send more" is a figure in its OWN unit and the fee is
+                // not: `cost_before_rate_and_fee` un-converts the threshold
+                // back across the boundary, which is decision 7's
+                // arithmetic used one packet early.
+                message: format!(
+                    "peer '{peer_id}' charges a fee of {fee} in {outgoing}, and this packet's \
+                     {amount} in {incoming} converts to only {converted} at the declared rate \
+                     {rate}: nothing would be left to forward. Send more than {}",
+                    cost_before_rate_and_fee(0, rate, fee)
+                ),
+                data: Vec::new(),
+                accumulated_cost: 0,
+            }),
+            None => Err(Reject {
+                code: RejectCode::t04_insufficient_liquidity(),
+                triggered_by: String::new(),
+                message: format!(
+                    "peer '{peer_id}' has a maximum packet amount of {}, and this packet's \
+                     {amount} in {incoming} converts at the declared rate {rate} to more than \
+                     the {outgoing} leg can carry at all. Send less",
+                    self.packet_cap_for(peer_id)
+                ),
+                data: Vec::new(),
+                accumulated_cost: 0,
+            }),
+        }
+    }
+
+    /// Cross the same **denomination boundary** upstream: the running cost
+    /// a reject carries back to the peering it arrived over, given `cost` in
+    /// `outgoing`'s unit and this hop's own `fee`
+    /// ([ADR 0071](../../../docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)
+    /// decision 7, extending ADR 0011, issue #1296).
+    ///
+    /// `ceil((cost + fee) / rate)` -- [`cost_before_rate_and_fee`]'s
+    /// arithmetic, the exact inverse of the forward's
+    /// `floor(amount * rate) - fee`, with the fee added first because the
+    /// fee is the outgoing peering's and the cost arrived in the outgoing
+    /// unit too. The rounding goes up, against this connector, so the pair
+    /// of roundings can overstate a probed cost by a base unit and can
+    /// never understate one: a prober that pays what it was quoted clears.
+    ///
+    /// The wire is untouched by any of this. What changes is the unit the
+    /// integer in `accumulated_cost` is denominated in -- which is the unit
+    /// of the leg it is travelling on, as it was before this record and as
+    /// every other amount on that leg already is -- so no reader ever meets
+    /// a number whose unit it cannot already know, and no asset field is
+    /// needed anywhere to say so.
+    ///
+    /// # A reject cannot be refused, so this answers a number
+    ///
+    /// [`Self::convert_for_forward`] can say no; this cannot. The packet is
+    /// already gone, the reject is already travelling, and there is no one
+    /// upstream for "I will not answer" to mean anything to. So the rate is
+    /// re-read here -- the pair may have aged out of its ttl in the time the
+    /// packet spent downstream -- and when the table no longer hands one
+    /// back, the cost **saturates to `u64::MAX`** rather than travelling on
+    /// unconverted.
+    ///
+    /// That is the only honest answer available, on three counts. It cannot
+    /// understate, which is the one property a prober depends on and the
+    /// property an unconverted integer would break by a factor of the whole
+    /// decimals gap in one of the two directions. It is the saturation
+    /// [`cost_before_rate_and_fee`] itself makes for a cost it cannot state,
+    /// which is [`Price::charge`]'s doctrine: a cost no claim can cover
+    /// refuses the packet, and refuses it without lying about the price. And
+    /// it is *true* -- a pair with no live rate is a pair
+    /// [`Self::convert_for_forward`] now refuses every forward across, so
+    /// the path really does cost more than any packet can pay until a fresh
+    /// rate lands. Quoting the last observed price instead would be dealing
+    /// on a dead one, which is exactly what decision 5's ttl exists to stop.
+    ///
+    /// No I/O here either, for [`Self::convert_for_forward`]'s reason and
+    /// asserted the same way ([`CrossesADenominationUpstream`]): a reject is
+    /// as much the packet path as a forward is, and a hop that dialled a
+    /// rate source to answer one would hold the reject open while it did.
+    fn convert_for_reject(
+        &self,
+        incoming: &AssetId,
+        outgoing: &AssetId,
+        peer_id: &str,
+        cost: u64,
+        fee: u64,
+    ) -> u64 {
+        let Some(rate) = self
+            .rate_table
+            .as_ref()
+            .and_then(|table| table.lookup(incoming, outgoing, self.clock.now()).rate())
+        else {
+            tracing::warn!(
+                peer_id,
+                %incoming,
+                %outgoing,
+                "a reject crossed back over a denomination boundary this connector no longer \
+                 holds a live rate for -- reporting a cost no packet can pay rather than one \
+                 in the wrong unit"
+            );
+            return u64::MAX;
+        };
+
+        cost_before_rate_and_fee(cost, rate, fee)
+    }
+
     /// Forward `prepare` to `peer_route`'s peer, covered by a claim minted
     /// from the outbound CLIENT ledger before the packet is put on the wire
     /// (ADR 0042, issue #881). **There is no other way out of this method
@@ -2206,7 +2553,10 @@ impl Connector {
     /// ([`Self::packet_cap_for`]) and refused with `T04` if it exceeds it.
     /// The cap bounds a single packet -- how much this connector is willing
     /// to lose at once to a hop that takes the claim and does not carry --
-    /// and never an accumulation.
+    /// and never an accumulation. On a crossing that is the **converted**
+    /// amount (ADR 0071 decision 1): the cap is configured against the
+    /// outgoing peering, so it was always denominated in the outgoing
+    /// leg's unit, and it is the same check either way.
     ///
     /// # The message window (PF-19)
     ///
@@ -2256,56 +2606,75 @@ impl Connector {
         &self,
         peer_route: &PeerRoute,
         prepare: Prepare,
+        arrived_from: Option<&str>,
     ) -> PacketResponse {
-        // A packet that does not cover this hop's own flat fee is refused
-        // rather than forwarded at whatever is left. `R01` -- RFC 0027's
-        // "the amount received by a connector in the path was too little to
-        // forward (zero or less)", which is this case verbatim. ADR 0057's
-        // first sweep retired the code outright and ADR 0051's #1143 update
-        // rehomed this case to `F03`; both were wrong, and 0057's corrected
-        // update says so: only R01's *minimum-delivery* meaning dies with
-        // the field. `F03` is for an amount wrong against a price the
-        // sender can pay; here nothing survives the fee at all, the class
-        // letter is relative rather than final, and the move is "send
-        // more".
         // ADR 0061: this hop's fee belongs to the PEERING, so it is read off
         // `peer_route.peer_id()` rather than off the route the packet
         // matched. Every prefix forwarded to one counterparty therefore
-        // costs the same, which is what "flat, per packet" always meant.
-        let fee = self.fee_for(peer_route.peer_id());
-        let Some(forwarded_amount) = amount_after_fee(prepare.amount, fee) else {
-            return PacketResponse::Reject(Reject {
-                code: RejectCode::r01_insufficient_source_amount(),
-                triggered_by: String::new(),
-                // The message is the sender's only way to learn its next
-                // move, and for a relative code that move is "send more" --
-                // so both figures are named and so is the threshold to
-                // clear (ADR 0051, "what a reject carries besides its
-                // code").
-                message: format!(
-                    "peer '{}' charges a fee of {} and this packet carried only {}: nothing \
-                     would be left to forward. Send more than {}",
-                    peer_route.peer_id(),
-                    fee,
-                    prepare.amount,
-                    fee
-                ),
-                data: Vec::new(),
-                accumulated_cost: 0,
-            });
-        };
-
+        // costs the same, which is what "flat, per packet" always meant --
+        // and ADR 0071 decision 1 adds the unit: the fee is denominated in
+        // the OUTGOING leg, which is the peering it is attached to, so on a
+        // crossing it is subtracted after the conversion and not before.
         let peer_id = peer_route.peer_id();
+        let fee = self.fee_for(peer_id);
+
+        // The two arms ADR 0071 decision 2 keeps apart. A forward that
+        // crosses no denomination boundary -- every forward on a node that
+        // declares no `[[tokens]]`, and a same-token forward on one that
+        // does -- runs the one `checked_sub` it has always run, byte for
+        // byte. A forward that crosses one converts first, at a rate this
+        // node declared, or refuses. Sibling, never replacement.
+        let forwarded_amount = match self.crossing(arrived_from, peer_id) {
+            None => {
+                // A packet that does not cover this hop's own flat fee is
+                // refused rather than forwarded at whatever is left. `R01`
+                // -- RFC 0027's "the amount received by a connector in the
+                // path was too little to forward (zero or less)", which is
+                // this case verbatim. ADR 0057's first sweep retired the
+                // code outright and ADR 0051's #1143 update rehomed this
+                // case to `F03`; both were wrong, and 0057's corrected
+                // update says so: only R01's *minimum-delivery* meaning
+                // dies with the field. `F03` is for an amount wrong against
+                // a price the sender can pay; here nothing survives the fee
+                // at all, the class letter is relative rather than final,
+                // and the move is "send more".
+                let Some(forwarded_amount) = amount_after_fee(prepare.amount, fee) else {
+                    return PacketResponse::Reject(Reject {
+                        code: RejectCode::r01_insufficient_source_amount(),
+                        triggered_by: String::new(),
+                        // The message is the sender's only way to learn its
+                        // next move, and for a relative code that move is
+                        // "send more" -- so both figures are named and so
+                        // is the threshold to clear (ADR 0051, "what a
+                        // reject carries besides its code").
+                        message: format!(
+                            "peer '{}' charges a fee of {} and this packet carried only {}: \
+                             nothing would be left to forward. Send more than {}",
+                            peer_id, fee, prepare.amount, fee
+                        ),
+                        data: Vec::new(),
+                        accumulated_cost: 0,
+                    });
+                };
+                forwarded_amount
+            }
+            Some((incoming, outgoing)) => {
+                match self.convert_for_forward(incoming, outgoing, peer_id, prepare.amount, fee) {
+                    Ok(forwarded_amount) => forwarded_amount,
+                    Err(reject) => return PacketResponse::Reject(reject),
+                }
+            }
+        };
 
         // ADR 0042, "The cap": the most this connector will hand this peer
         // in ONE packet, and therefore the most a single theft by it can
         // take -- a packet carries its own claim now, so the value on this
         // forward is at risk from the moment it leaves. Checked here,
         // before the packet is covered or sent, against the amount actually
-        // going out (post-fee, the figure `cover_forward` would mint a
-        // claim for); refused with `T04` naming both numbers, never
-        // truncated and never split into two packets, which would defeat
-        // the bound rather than respect it.
+        // going out (post-conversion and post-fee, the figure
+        // `cover_forward` would mint a claim for); refused with `T04`
+        // naming both numbers, never truncated and never split into two
+        // packets, which would defeat the bound rather than respect it.
         //
         // Tempting and wrong: adding "and how much has this peer had
         // lately" here. That is an accumulation, ADR 0033 deleted the
@@ -2467,9 +2836,30 @@ impl Connector {
             // reject that peer itself decided on -- never on a reject this
             // transport synthesized locally (`reached_peer` false) because
             // the packet never actually traversed this hop in that case.
+            //
+            // ADR 0071 decision 7 adds the second half, and the two arms
+            // here are the same two `forward_via_peer_route` opened with,
+            // asked of the identical `Self::crossing` call so that a packet
+            // and its reject can never disagree about whether they crossed
+            // a boundary. Off a boundary the running total gains this hop's
+            // fee and nothing else, byte for byte as it has since issue
+            // #426. Across one it gains the fee IN THE OUTGOING UNIT --
+            // which is the unit the total arrived in, since the total was
+            // accumulated downstream -- and the whole is then un-converted
+            // into the incoming leg's unit, so that what goes upstream is
+            // denominated the way the peering it goes out over is.
             PacketResponse::Reject(mut reject) => {
                 if answer.reached_peer {
-                    reject.accumulated_cost += fee;
+                    reject.accumulated_cost = match self.crossing(arrived_from, peer_id) {
+                        None => reject.accumulated_cost + fee,
+                        Some((incoming, outgoing)) => self.convert_for_reject(
+                            incoming,
+                            outgoing,
+                            peer_id,
+                            reject.accumulated_cost,
+                            fee,
+                        ),
+                    };
                 }
                 PacketResponse::Reject(reject)
             }
@@ -3591,6 +3981,37 @@ fn leased_route_view(route: &LeasedRoute) -> LeasedRouteView {
     }
 }
 
+/// The shape a denomination crossing has: the incoming and outgoing tokens,
+/// the peering being forwarded to, what arrived and what that peering
+/// charges -- answering the outgoing amount, or the reject that refuses it.
+type CrossesADenomination =
+    fn(&Connector, &AssetId, &AssetId, &str, u64, u64) -> Result<u64, Reject>;
+
+/// ADR 0071 decision 6's "the forwarding path does **no I/O**", asserted at
+/// compile time rather than trusted -- the same argument
+/// [`crate::rate_table`] makes about the table's reader, made again about
+/// the one caller on the packet path that reads it.
+///
+/// Coercing [`Connector::convert_for_forward`] to a plain `fn` pointer only
+/// type-checks while it is a synchronous function: an `async fn` returns a
+/// future and would not coerce. So the day a crossing grows something to
+/// await -- a rate source dialed inline, a chain read, a lock with a
+/// timeout -- the build breaks here rather than a packet paying for it.
+const _: CrossesADenomination = Connector::convert_for_forward;
+
+/// The shape the same crossing has travelling upstream: the two tokens, the
+/// peering the reject came back from, the running cost in the outgoing
+/// leg's unit and that peering's fee -- answering the cost in the incoming
+/// leg's unit. There is no refusal in the return type because there is no
+/// one left to refuse: a reject is already on its way (ADR 0071 decision 7).
+type CrossesADenominationUpstream = fn(&Connector, &AssetId, &AssetId, &str, u64, u64) -> u64;
+
+/// Decision 6's no-I/O rule again, asserted about the reject path for the
+/// same reason it is asserted about the forward: the return leg is the
+/// packet path too, and a rate dialled from here would hold a reject open
+/// while a sender waited to learn what a path costs.
+const _: CrossesADenominationUpstream = Connector::convert_for_reject;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3605,6 +4026,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use chrono::{Duration, TimeZone, Utc};
+    use connector_domain::{Guards, MaxMove, Rate, RateTable, Spread, Ttl};
     use connector_signer::derive_evm_address;
 
     /// Seals `data` (issue #524) -- what a genuine sender does before ever
@@ -4571,6 +4993,819 @@ mod tests {
         assert_eq!(second_hop_app_client.deliveries().len(), 1);
     }
 
+    // -- ADR 0071's converting arm (issue #1295): a forward whose two
+    // peerings hold different tokens crosses a DENOMINATION BOUNDARY at a
+    // rate this node declared, or is refused. Every case below builds the
+    // same rig -- one hop, an upstream peering the packet arrives over, a
+    // downstream peering it leaves to, and a `CarriesAndRemembers` that
+    // keeps whatever actually went on the wire -- so the only thing under
+    // test is the arithmetic and the refusals.
+
+    /// USDC on Base: 6 decimals, and the numeraire throughout, as in ADR
+    /// 0071's own examples.
+    const USDC: &str = "evm:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    /// ANYONE on Base: 18 decimals against USDC's 6, which is where the
+    /// `10^12` in ADR 0071's motivating error comes from.
+    const ANYONE: &str = "evm:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+    /// USDC on Solana: the SAME asset as [`USDC`] on another chain, which
+    /// `AssetId` nevertheless distinguishes -- today's `mixed-chain`
+    /// crossing, and the pair ADR 0071 decision 2 talks about.
+    const USDC_SOLANA: &str = "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+    /// One 6-decimals USDC base unit in 18-decimals ANYONE base units at
+    /// four ANYONE to the USDC -- the decimals gap (`10^12`) and the market
+    /// price (4) folded into one ratio, which is the only place ADR 0071
+    /// decision 4 lets a scale difference live.
+    const USDC_TO_ANYONE: u64 = 4_000_000_000_000;
+
+    /// The peering a converting packet arrives over. Named rather than
+    /// derived: only a peer arrival has one, and that is what
+    /// `handle_peer_prepare` is handed by both carriages.
+    const UPSTREAM: &str = "first-hop";
+
+    fn asset(text: &str) -> AssetId {
+        text.parse::<AssetId>().expect("a declared asset")
+    }
+
+    fn rate(numerator: u64, denominator: u64) -> Rate {
+        Rate::new(numerator, denominator).expect("a rate with two non-zero halves")
+    }
+
+    /// Node defaults wide enough that no guard is what a test is about:
+    /// deal at the mid, a two-minute ttl, and a `max_move` nothing here
+    /// comes near.
+    fn rate_guards() -> Guards {
+        Guards::new(
+            Spread::none(),
+            Ttl::new(Duration::seconds(120)).expect("a positive ttl"),
+            MaxMove::fraction(50, 100).expect("a max_move"),
+        )
+    }
+
+    fn empty_table() -> SharedRateTable {
+        SharedRateTable::new(RateTable::new(asset(USDC), rate_guards()))
+    }
+
+    /// A table holding one **declared** row -- a static `[[rates]]` row,
+    /// which never goes stale because it is a declaration rather than an
+    /// observation (ADR 0009).
+    fn declaring(from: &str, to: &str, numerator: u64, denominator: u64) -> SharedRateTable {
+        let table = empty_table();
+        table.write(|table| table.declare(asset(from), asset(to), rate(numerator, denominator)));
+        table
+    }
+
+    /// A hop that forwards `g.example.app` to `second-hop`, holding the
+    /// tokens `peerings` says it holds and dealing at whatever `table`
+    /// holds.
+    ///
+    /// `table` of `None` is a node that declares no rate at all, which is
+    /// not the same thing as a node that declares no tokens: the first
+    /// resolves boundaries and refuses them, the second resolves none.
+    /// Both are exercised below.
+    fn dealing_hop(
+        peerings: &[(&str, &str)],
+        fee: u64,
+        cap: u64,
+        table: Option<SharedRateTable>,
+    ) -> (Connector, Arc<CarriesAndRemembers>, Arc<TestClock>) {
+        dealing_hop_quoting(peerings, fee, cap, table, 0)
+    }
+
+    /// [`dealing_hop`] whose downstream peer answers with a running cost of
+    /// `quoted` already on it -- what everything beyond this hop charges,
+    /// denominated in the OUTGOING leg's unit because the outgoing leg is
+    /// the one it travelled up (ADR 0011, ADR 0071 decision 7).
+    fn dealing_hop_quoting(
+        peerings: &[(&str, &str)],
+        fee: u64,
+        cap: u64,
+        table: Option<SharedRateTable>,
+        quoted: u64,
+    ) -> (Connector, Arc<CarriesAndRemembers>, Arc<TestClock>) {
+        let peer = Arc::new(CarriesAndRemembers::quoting(quoted));
+        let clock = test_clock();
+        let hop = dealing_hop_over(peer.clone(), peerings, fee, cap, table, clock.clone());
+        (hop, peer, clock)
+    }
+
+    /// The rig both of the above build on, over whatever peer transport the
+    /// case needs: a downstream that quotes a cost, one that takes time to
+    /// answer, or another `Connector` entirely.
+    fn dealing_hop_over(
+        peer: Arc<dyn PeerTransport>,
+        peerings: &[(&str, &str)],
+        fee: u64,
+        cap: u64,
+        table: Option<SharedRateTable>,
+        clock: Arc<TestClock>,
+    ) -> Connector {
+        let mut connector = covering(
+            Connector::new(
+                vec![],
+                vec![PeerRoute::new("g.example.app", "second-hop")],
+                Arc::new(FakeAppClient::new()),
+                peer,
+                clock,
+            )
+            .with_peer_fees([("second-hop".to_string(), fee)])
+            .with_peer_packet_caps([("second-hop".to_string(), cap)])
+            .with_peering_assets(
+                peerings
+                    .iter()
+                    .map(|(peer_id, token)| ((*peer_id).to_string(), asset(token)))
+                    .collect(),
+            ),
+            "second-hop",
+        );
+        if let Some(table) = table {
+            connector = connector.with_rate_table(table);
+        }
+        connector
+    }
+
+    /// Send `amount` into `hop` as a PEER arrival over [`UPSTREAM`] -- the
+    /// only arrival that names an incoming peering, and therefore the only
+    /// one that can cross a boundary.
+    async fn arrives_from_upstream(hop: &Connector, amount: u64) -> PacketResponse {
+        let (response, _ack) = hop
+            .handle_peer_prepare(
+                Some(UPSTREAM),
+                prepare_with_amount("g.example.app", amount),
+                None,
+            )
+            .await;
+        response
+    }
+
+    fn refusal(response: PacketResponse) -> Reject {
+        match response {
+            PacketResponse::Reject(reject) => reject,
+            other => panic!("expected a reject, got {other:?}"),
+        }
+    }
+
+    /// Decision 1, the whole of it: `floor(amount * rate) - fee`. One USDC
+    /// arrives, four ANYONE less this hop's fee leaves, and the two
+    /// integers differ by `10^12` times a price -- which is exactly the
+    /// error an unconverted pass-through would have made.
+    #[tokio::test]
+    async fn a_forward_across_a_boundary_converts_at_the_declared_rate() {
+        let (hop, peer, _clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            // 0.001 ANYONE, in the OUTGOING leg's unit.
+            1_000_000_000_000_000,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+        );
+
+        // One USDC.
+        arrives_from_upstream(&hop, 1_000_000).await;
+
+        let carried = peer.carried();
+        assert_eq!(carried.len(), 1, "the packet should have been forwarded");
+        assert_eq!(carried[0].amount, 3_999_000_000_000_000_000);
+    }
+
+    /// Decision 1's other half, and ADR 0061's clause this record amends:
+    /// the fee is the outgoing peering's, denominated in the outgoing leg's
+    /// unit, so it is subtracted AFTER the conversion and is never itself
+    /// converted. Two runs of the same crossing differing only in the fee
+    /// differ in the forwarded figure by exactly that fee.
+    #[tokio::test]
+    async fn the_fee_a_crossing_takes_is_the_outgoing_peerings_in_the_outgoing_unit() {
+        let fee = 1_000_000_000_000_000;
+        let (free, free_peer, _) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            0,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+        );
+        let (charging, charging_peer, _) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            fee,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+        );
+
+        arrives_from_upstream(&free, 1_000_000).await;
+        arrives_from_upstream(&charging, 1_000_000).await;
+
+        assert_eq!(
+            free_peer.carried()[0].amount - charging_peer.carried()[0].amount,
+            fee,
+            "the fee is taken in the outgoing unit, whole and unconverted"
+        );
+    }
+
+    /// Decision 1: the covering claim `cover_forward` mints is for the
+    /// CONVERTED figure, on the outgoing channel. Claims needed no change
+    /// for this -- they are denominated by channel identity alone -- which
+    /// is exactly why the figure on the claim has to be the outgoing one:
+    /// nothing else on it says what unit it is in.
+    #[tokio::test]
+    async fn the_covering_claim_is_minted_for_the_converted_outgoing_figure() {
+        let (hop, peer, _clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            1_000_000_000_000_000,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+        );
+
+        arrives_from_upstream(&hop, 1_000_000).await;
+
+        let claim = peer.covered_by()[0]
+            .clone()
+            .expect("ADR 0042: no PREPARE leaves this connector uncovered");
+        assert_eq!(claim.cumulative_amount, 3_999_000_000_000_000_000);
+        assert_eq!(
+            claim.cumulative_amount,
+            peer.carried()[0].amount,
+            "the claim covers what went out, not what came in"
+        );
+    }
+
+    /// The cap keeps being checked against the outgoing, post-conversion,
+    /// post-fee amount -- which was always the right leg, since the cap is
+    /// configured on the outgoing peering. The `T04` message still names
+    /// both numbers (ADR 0049: discovery of a cap is this refusal and
+    /// nothing else).
+    #[tokio::test]
+    async fn the_cap_is_measured_against_the_converted_amount_and_still_names_both_numbers() {
+        let cap = 3_000_000_000_000_000_000;
+        let (hop, peer, _clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            0,
+            cap,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+        );
+
+        // One USDC converts to four ANYONE, which is over a cap of three --
+        // while the amount that ARRIVED is far under it. Reading the cap
+        // against the incoming figure would have carried this packet.
+        let reject = refusal(arrives_from_upstream(&hop, 1_000_000).await);
+
+        assert_eq!(reject.code.as_str(), "T04");
+        assert!(
+            reject.message.contains(&cap.to_string()),
+            "{}",
+            reject.message
+        );
+        assert!(
+            reject.message.contains("4000000000000000000"),
+            "{}",
+            reject.message
+        );
+        assert!(peer.carried().is_empty(), "nothing may go out over the cap");
+    }
+
+    /// Decision 2, the record's whole reason for existing: an undeclared
+    /// pair is REFUSED, never passed through at an implied 1:1. `F02`,
+    /// final -- RFC 0027's "there was no way to forward the payment" and
+    /// ADR 0051's "this path is wrong; find another" -- because a
+    /// declaration is config and config is immutable for the process
+    /// lifetime (ADR 0009), so retrying here cannot help.
+    #[tokio::test]
+    async fn a_crossing_with_no_declared_rate_is_refused_rather_than_forwarded() {
+        let (hop, peer, _clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            0,
+            u64::MAX,
+            // A table, and no row for this pair.
+            Some(empty_table()),
+        );
+
+        let reject = refusal(arrives_from_upstream(&hop, 1_000_000).await);
+
+        assert_eq!(reject.code.as_str(), "F02");
+        assert!(reject.message.contains(USDC), "{}", reject.message);
+        assert!(reject.message.contains(ANYONE), "{}", reject.message);
+        assert!(
+            peer.carried().is_empty(),
+            "an unconverted pass-through here is wrong by 10^12 and must not happen"
+        );
+    }
+
+    /// A node that declares tokens but holds no table at all answers the
+    /// same way. "No row" and "no table" are one situation -- the operator
+    /// did not say so -- and decision 2's absence rule makes no
+    /// distinction.
+    #[tokio::test]
+    async fn a_crossing_on_a_node_with_no_rate_table_is_refused_identically() {
+        let (hop, peer, _clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            0,
+            u64::MAX,
+            None,
+        );
+
+        let reject = refusal(arrives_from_upstream(&hop, 1_000_000).await);
+
+        assert_eq!(reject.code.as_str(), "F02");
+        assert!(peer.carried().is_empty());
+    }
+
+    /// Decision 5's ttl: a rate not refreshed within it is dead, and the
+    /// pair goes down loudly rather than dealing on the last price before
+    /// the outage. The code differs from the undeclared one **on purpose**
+    /// -- `T`, retry, against `F`, re-route -- because those are opposite
+    /// instructions and a sender that cannot tell them apart takes the
+    /// wrong one.
+    #[tokio::test]
+    async fn a_crossing_whose_rate_has_gone_stale_is_refused_with_a_different_code() {
+        let table = empty_table();
+        let (hop, peer, clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            0,
+            u64::MAX,
+            Some(table.clone()),
+        );
+        let observed_at = clock.now();
+        table.write(|table| {
+            table.refresh(
+                asset(USDC),
+                asset(ANYONE),
+                rate(USDC_TO_ANYONE, 1),
+                observed_at,
+            )
+        });
+
+        // Inside the ttl this crossing deals.
+        arrives_from_upstream(&hop, 1_000_000).await;
+        assert_eq!(peer.carried().len(), 1);
+
+        // Past it, the same packet is refused.
+        clock.advance(Duration::seconds(121));
+        let reject = refusal(arrives_from_upstream(&hop, 1_000_000).await);
+
+        assert_eq!(
+            reject.code.as_str(),
+            "T00",
+            "a stale rate is worth retrying, and the class letter says so"
+        );
+        assert!(
+            reject.message.contains(&observed_at.to_rfc3339()),
+            "the refusal must say when the price it will not deal on was taken: {}",
+            reject.message
+        );
+        assert_eq!(
+            peer.carried().len(),
+            1,
+            "the stale crossing carried nothing"
+        );
+    }
+
+    /// Decision 2's same-asset sentence, in the case it actually names: a
+    /// node that declares no `[[tokens]]` resolves no peering, so today's
+    /// `mixed-chain` USDC-Base-to-USDC-Solana crossing is not a conversion
+    /// and runs the one subtraction it ran before this record existed.
+    #[tokio::test]
+    async fn a_node_that_declares_no_tokens_forwards_exactly_as_before() {
+        let (hop, peer, _clock) = dealing_hop(&[], 10, u64::MAX, None);
+
+        arrives_from_upstream(&hop, 1_000).await;
+
+        assert_eq!(peer.carried()[0].amount, 990);
+    }
+
+    /// Two peerings holding ONE token are no boundary even on a dealing
+    /// node: the flat fee and nothing else, with no rate consulted and none
+    /// needed.
+    #[tokio::test]
+    async fn two_peerings_holding_one_token_take_the_flat_fee_and_nothing_else() {
+        let (hop, peer, _clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", USDC)],
+            10,
+            u64::MAX,
+            // Empty on purpose: a same-token forward must not need a row.
+            Some(empty_table()),
+        );
+
+        arrives_from_upstream(&hop, 1_000).await;
+
+        assert_eq!(peer.carried()[0].amount, 990);
+    }
+
+    /// The same asset on two chains is two `AssetId`s, so on a node that
+    /// DOES declare tokens it is an ordered pair like any other and the
+    /// absence rule holds for it: the operator who wants it to forward at
+    /// par says so with a par row, and gets par. Declared par is not
+    /// implicit 1:1 -- which is why `Rate::new(1, 1)` is a value a config
+    /// can express and `Rate::ONE` is not a constant this code can reach
+    /// for.
+    #[tokio::test]
+    async fn a_dealing_node_crosses_one_asset_on_two_chains_at_the_par_rate_it_declared() {
+        let (declared, peer, _clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", USDC_SOLANA)],
+            10,
+            u64::MAX,
+            Some(declaring(USDC, USDC_SOLANA, 1, 1)),
+        );
+
+        arrives_from_upstream(&declared, 1_000).await;
+
+        assert_eq!(peer.carried()[0].amount, 990);
+
+        // And without the row, the same pair refuses -- the distinction the
+        // record draws, made executable.
+        let (undeclared, undeclared_peer, _clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", USDC_SOLANA)],
+            10,
+            u64::MAX,
+            Some(empty_table()),
+        );
+
+        let reject = refusal(arrives_from_upstream(&undeclared, 1_000).await);
+        assert_eq!(reject.code.as_str(), "F02");
+        assert!(undeclared_peer.carried().is_empty());
+    }
+
+    /// `R01`'s question asked where decision 1 puts it: AFTER the
+    /// conversion, in the outgoing unit. Ten incoming units convert to
+    /// three outgoing ones and a fee of four eats them, so nothing would be
+    /// forwarded -- and the sender's move is "send more", in its OWN unit,
+    /// which the message states by un-converting the threshold back across
+    /// the boundary.
+    #[tokio::test]
+    async fn a_crossing_whose_fee_exceeds_the_converted_amount_is_refused_r01() {
+        let (hop, peer, _clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            4,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, 1, 3)),
+        );
+
+        let reject = refusal(arrives_from_upstream(&hop, 10).await);
+
+        assert_eq!(reject.code.as_str(), "R01");
+        // `ceil((0 + 4) / (1/3))` = 12 incoming units, the smallest arrival
+        // that leaves anything at all.
+        assert!(reject.message.contains("12"), "{}", reject.message);
+        assert!(peer.carried().is_empty());
+    }
+
+    /// The other `None` [`amount_after_rate_and_fee`] answers, and the
+    /// reason it is not reported as `R01`: a converted amount past the
+    /// outgoing leg's `u64` is ADR 0071's real ceiling, and the sender must
+    /// send **less**. Telling it to send more would be the exact opposite
+    /// instruction.
+    #[tokio::test]
+    async fn a_crossing_the_outgoing_leg_cannot_hold_is_refused_t04_and_not_r01() {
+        let cap = 1_000_000;
+        let (hop, peer, _clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            0,
+            cap,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+        );
+
+        let reject = refusal(arrives_from_upstream(&hop, u64::MAX).await);
+
+        assert_eq!(
+            reject.code.as_str(),
+            "T04",
+            "an amount the outgoing leg cannot hold is 'send less', which is the cap's \
+             own situation and the cap's own code"
+        );
+        assert!(
+            reject.message.contains(&cap.to_string()),
+            "{}",
+            reject.message
+        );
+        assert!(peer.carried().is_empty());
+    }
+
+    /// The incoming half of the boundary comes from the arriving PEERING,
+    /// and an arrival that names none crosses nothing. That is what an
+    /// operator write or a client-edge delivery is today -- `[[client_channels]]`
+    /// has no resolved token yet -- and it must forward rather than refuse,
+    /// or every non-peer arrival on a dealing node would go dark.
+    #[tokio::test]
+    async fn an_arrival_that_names_no_peering_crosses_no_boundary() {
+        let (hop, peer, _clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            10,
+            u64::MAX,
+            Some(empty_table()),
+        );
+
+        // `handle_prepare`, not `handle_peer_prepare`: no peering named.
+        hop.handle_prepare(prepare_with_amount("g.example.app", 1_000))
+            .await;
+
+        assert_eq!(peer.carried()[0].amount, 990);
+    }
+
+    // -- ADR 0071's converting arm travelling the other way (decision 7,
+    // extending ADR 0011, issue #1296): a reject crossing the same boundary
+    // upstream adds this hop's fee in the outgoing unit and un-converts the
+    // running total into the incoming leg's, so what a prober finally reads
+    // is one number in its own unit. The wire is untouched -- nothing below
+    // reads or writes an asset field, because the unit of `accumulated_cost`
+    // is the unit of the leg it is on, exactly as `amount`'s always was.
+
+    /// Decision 7's own arithmetic, in the case that isolates it: nothing
+    /// beyond this hop charges anything, so the whole of the reported cost
+    /// is this hop's own fee -- stated in the outgoing unit where ADR 0061
+    /// attaches it, and un-converted into the unit the prober counts in.
+    #[tokio::test]
+    async fn a_reject_crossing_a_boundary_un_converts_its_cost_into_the_incoming_unit() {
+        // 0.001 ANYONE, which at four ANYONE to the USDC is 250 USDC base
+        // units -- and 10^12 times that as a raw integer, which is the
+        // number an un-converted pass-through would have reported.
+        let fee = 1_000_000_000_000_000;
+        let (hop, peer, _clock) = dealing_hop(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            fee,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+        );
+
+        let reject = refusal(arrives_from_upstream(&hop, 1_000_000).await);
+
+        assert_eq!(peer.carried().len(), 1, "the packet did reach the peer");
+        assert_eq!(reject.accumulated_cost, 250);
+        assert_ne!(
+            reject.accumulated_cost, fee,
+            "reporting the outgoing figure unconverted is the 10^12 error this record exists \
+             to make impossible, in the one direction where it understates"
+        );
+    }
+
+    /// The order decision 7 fixes: the fee goes on **first**, in the
+    /// outgoing unit, because the cost coming up from downstream is already
+    /// in that unit -- and only the total is un-converted. Converting the
+    /// fee separately and adding it afterwards would round twice.
+    #[tokio::test]
+    async fn a_reject_adds_this_hops_fee_in_the_outgoing_unit_before_un_converting() {
+        // Four ANYONE -- one USDC's worth -- charged by everything beyond
+        // this hop, plus this hop's own 0.001 ANYONE.
+        let quoted = 4_000_000_000_000_000_000;
+        let (hop, _peer, _clock) = dealing_hop_quoting(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            1_000_000_000_000_000,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+            quoted,
+        );
+
+        let reject = refusal(arrives_from_upstream(&hop, 1_000_000).await);
+
+        // `ceil((4e18 + 1e15) / 4e12)`: one USDC for the far end, 250 base
+        // units for this hop.
+        assert_eq!(reject.accumulated_cost, 1_000_250);
+    }
+
+    /// The rounding, and which way it leans. A cost that does not divide
+    /// evenly by the rate is rounded **up**, against this connector: a
+    /// prober quoted the exact figure clears, and one quoted a base unit
+    /// less would not.
+    #[tokio::test]
+    async fn un_converting_a_cost_rounds_up_against_this_connector() {
+        // Three outgoing units per incoming one, and a far end charging
+        // one: a third of an incoming unit, which is reported as one.
+        let (hop, _peer, _clock) = dealing_hop_quoting(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            0,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, 3, 1)),
+            1,
+        );
+
+        let reject = refusal(arrives_from_upstream(&hop, 1_000).await);
+
+        assert_eq!(
+            reject.accumulated_cost, 1,
+            "rounding down would quote a cost of zero for a hop that charges something"
+        );
+    }
+
+    /// The other half of AC4, and the one every node shipping today lives
+    /// on: off a boundary the running total gains this hop's fee and
+    /// nothing else, whether the node declares no tokens at all or declares
+    /// two peerings holding one.
+    #[tokio::test]
+    async fn a_reject_on_a_single_denomination_path_carries_exactly_what_it_did_before() {
+        let (silent, _peer, _clock) = dealing_hop_quoting(&[], 7, u64::MAX, None, 25);
+        let (same_token, _peer, _clock) = dealing_hop_quoting(
+            &[(UPSTREAM, USDC), ("second-hop", USDC)],
+            7,
+            u64::MAX,
+            Some(empty_table()),
+            25,
+        );
+
+        assert_eq!(
+            refusal(arrives_from_upstream(&silent, 1_000).await).accumulated_cost,
+            32
+        );
+        assert_eq!(
+            refusal(arrives_from_upstream(&same_token, 1_000).await).accumulated_cost,
+            32,
+            "two peerings holding one token are no boundary, and consult no rate"
+        );
+    }
+
+    /// ADR 0011's probe, across one boundary: one number, in the prober's
+    /// own unit, and a packet carrying exactly that number clears the hop.
+    /// The second half is the property decision 7's up-rounding exists for
+    /// -- a probed cost that could be a base unit short would make every
+    /// probed price a coin toss.
+    #[tokio::test]
+    async fn a_probe_across_one_boundary_answers_a_cost_that_pays_for_the_packet() {
+        let quoted = 4_000_000_000_000_000_000;
+        let (hop, peer, _clock) = dealing_hop_quoting(
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            1_000_000_000_000_000,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+            quoted,
+        );
+
+        // The probe: an ordinary packet this path was always going to
+        // reject (ADR 0011 -- there is no probe packet type).
+        let probed = refusal(arrives_from_upstream(&hop, 1_000_000).await).accumulated_cost;
+
+        // Pay it, in the prober's own unit, with no conversion done by the
+        // prober and no unit named anywhere on the wire.
+        arrives_from_upstream(&hop, probed).await;
+        assert!(
+            peer.carried()[1].amount >= quoted,
+            "a packet paying the probed cost must clear what lies beyond this hop: {} against \
+             {quoted}",
+            peer.carried()[1].amount
+        );
+
+        // And it is not merely generous: a base unit less does not clear.
+        arrives_from_upstream(&hop, probed - 1).await;
+        assert!(peer.carried()[2].amount < quoted);
+    }
+
+    /// The same across **two** boundaries, which is the criterion the
+    /// single-hop case cannot reach: USDC in at the prober's edge, ANYONE
+    /// across the middle, USDC on Solana at the far end, and one number
+    /// coming back in USDC. Each hop un-converts only its own crossing;
+    /// nothing accumulates a unit, and nothing on the wire says which one.
+    #[tokio::test]
+    async fn a_probe_across_two_boundaries_still_answers_in_the_probers_own_unit() {
+        // What the far end charges, in ITS unit.
+        let quoted = 1_000_000;
+        let far = Arc::new(CarriesAndRemembers::quoting(quoted));
+        let middle = Arc::new(dealing_hop_over(
+            far.clone(),
+            &[(UPSTREAM, ANYONE), ("second-hop", USDC_SOLANA)],
+            // 0.001 USDC on Solana.
+            1_000,
+            u64::MAX,
+            Some(declaring(ANYONE, USDC_SOLANA, 1, USDC_TO_ANYONE)),
+            test_clock(),
+        ));
+        let entry = dealing_hop_over(
+            Arc::new(HandsOnNaming {
+                downstream: middle,
+                arrives_as: UPSTREAM.to_string(),
+            }),
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            // 0.001 ANYONE.
+            1_000_000_000_000_000,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+            test_clock(),
+        );
+
+        let probed = refusal(arrives_from_upstream(&entry, 1_000_000).await).accumulated_cost;
+
+        // One USDC for the far end, 1000 base units for the middle hop's
+        // 0.001 USDC-on-Solana fee, 250 for the entry hop's 0.001 ANYONE --
+        // three fees in three units, summed in one.
+        assert_eq!(probed, 1_001_250);
+
+        arrives_from_upstream(&entry, probed).await;
+        assert!(
+            far.carried()[1].amount >= quoted,
+            "a packet paying a cost probed across two boundaries must clear both: {} against \
+             {quoted}",
+            far.carried()[1].amount
+        );
+    }
+
+    /// The question a reject cannot dodge: the pair may have aged out of
+    /// its ttl while the packet was downstream, and a reject already
+    /// travelling cannot be refused. It reports a cost no packet can pay
+    /// rather than one in the wrong unit -- which is also the truth, since
+    /// a pair with no live rate refuses every forward across it until a
+    /// fresh one lands, and is the saturation `cost_before_rate_and_fee`
+    /// itself makes for a cost it cannot state.
+    #[tokio::test]
+    async fn a_reject_whose_rate_died_in_flight_overstates_rather_than_understating() {
+        let clock = test_clock();
+        let table = empty_table();
+        table.write(|table| {
+            table.refresh(
+                asset(USDC),
+                asset(ANYONE),
+                rate(USDC_TO_ANYONE, 1),
+                clock.now(),
+            )
+        });
+        let hop = dealing_hop_over(
+            Arc::new(AnswersLater {
+                clock: clock.clone(),
+                // Longer than the two-minute ttl `rate_guards` declares:
+                // the forward is dealt on a live rate and the reject comes
+                // home to a dead one.
+                elapsed: Duration::seconds(121),
+            }),
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            1_000_000_000_000_000,
+            u64::MAX,
+            Some(table),
+            clock,
+        );
+
+        let reject = refusal(arrives_from_upstream(&hop, 1_000_000).await);
+
+        assert_eq!(
+            reject.accumulated_cost,
+            u64::MAX,
+            "quoting the last observed price would be dealing on a dead one, and reporting the \
+             outgoing figure unconverted would understate by the whole decimals gap"
+        );
+    }
+
+    /// A peer that hands the packet to another `Connector` in this process
+    /// **and names the peering it arrives over** -- which
+    /// [`InProcessPeerTransport`] deliberately does not, because a link
+    /// stands for a wire rather than an identity and the id a node knows
+    /// its upstream by is not the id its upstream knows itself by.
+    ///
+    /// A fake and not a mock (ADR 0007): the answer is whatever the
+    /// downstream connector genuinely decided, and it asserts nothing about
+    /// having been called. Naming the arrival is what a real carriage does
+    /// -- both `POST /packets` and BTP authenticate the peer before
+    /// `handle_peer_prepare` is reached -- so this is the more faithful of
+    /// the two stand-ins rather than a privileged one.
+    struct HandsOnNaming {
+        downstream: Arc<Connector>,
+        arrives_as: String,
+    }
+
+    #[async_trait]
+    impl PeerTransport for HandsOnNaming {
+        async fn forward(
+            &self,
+            _peer_id: &str,
+            prepare: Prepare,
+            claim: Option<WireClaim>,
+        ) -> PeerForward {
+            let (response, ack) = self
+                .downstream
+                .handle_peer_prepare(Some(&self.arrives_as), prepare, claim)
+                .await;
+            PeerForward::answered(response, ack)
+        }
+
+        async fn flush(&self, _peer_id: &str, _claim: WireClaim) -> ClaimAckOutcome {
+            ClaimAckOutcome::NotSent
+        }
+    }
+
+    /// A peer that takes `elapsed` to answer -- the time a packet really
+    /// spends downstream, during which a rate this node dealt the forward
+    /// on can age out of its ttl. A fake: it answers a reject of its own,
+    /// `reached_peer` true, and the only unusual thing about it is that the
+    /// clock has moved by the time it does.
+    struct AnswersLater {
+        clock: Arc<TestClock>,
+        elapsed: Duration,
+    }
+
+    #[async_trait]
+    impl PeerTransport for AnswersLater {
+        async fn forward(
+            &self,
+            _peer_id: &str,
+            _prepare: Prepare,
+            _claim: Option<WireClaim>,
+        ) -> PeerForward {
+            self.clock.advance(self.elapsed);
+            PeerForward::answered(
+                PacketResponse::Reject(Reject {
+                    code: RejectCode::f02_unreachable(),
+                    triggered_by: "g.peer".to_string(),
+                    message: "carried, and the far end had nowhere to put it".to_string(),
+                    data: Vec::new(),
+                    accumulated_cost: 0,
+                }),
+                ClaimAckOutcome::NotSent,
+            )
+        }
+
+        async fn flush(&self, _peer_id: &str, _claim: WireClaim) -> ClaimAckOutcome {
+            ClaimAckOutcome::NotSent
+        }
+    }
+
     #[tokio::test]
     async fn a_reject_from_the_next_hop_is_relayed_to_the_original_caller() {
         let second_hop = Arc::new(Connector::new(
@@ -5231,11 +6466,36 @@ mod tests {
     #[derive(Default)]
     struct CarriesAndRemembers {
         carried: Mutex<Vec<Prepare>>,
+        /// The claim that rode with each carried packet, in the same order
+        /// -- what `cover_forward` actually minted, which is the only way
+        /// to see whether ADR 0071's covering claim was written for the
+        /// converted figure (issue #1295).
+        covered_by: Mutex<Vec<Option<WireClaim>>>,
+        /// The running cost this peer's own reject arrives with: what
+        /// everything beyond it charges, in ITS unit, which is the outgoing
+        /// leg's (ADR 0011, ADR 0071 decision 7, issue #1296). Zero -- the
+        /// default, and what every case before #1296 wanted -- is a far end
+        /// that charges nothing, so the only cost a reject carries home is
+        /// the fee of the hop under test.
+        quotes: u64,
     }
 
     impl CarriesAndRemembers {
+        /// A peer beyond which the path costs `quoted`, in this peer's own
+        /// unit.
+        fn quoting(quoted: u64) -> CarriesAndRemembers {
+            CarriesAndRemembers {
+                quotes: quoted,
+                ..CarriesAndRemembers::default()
+            }
+        }
+
         fn carried(&self) -> Vec<Prepare> {
             self.carried.lock().unwrap().clone()
+        }
+
+        fn covered_by(&self) -> Vec<Option<WireClaim>> {
+            self.covered_by.lock().unwrap().clone()
         }
     }
 
@@ -5245,16 +6505,17 @@ mod tests {
             &self,
             _peer_id: &str,
             prepare: Prepare,
-            _claim: Option<WireClaim>,
+            claim: Option<WireClaim>,
         ) -> PeerForward {
             self.carried.lock().unwrap().push(prepare);
+            self.covered_by.lock().unwrap().push(claim);
             PeerForward::answered(
                 PacketResponse::Reject(Reject {
                     code: RejectCode::f02_unreachable(),
                     triggered_by: "g.peer".to_string(),
                     message: "carried, and the far end had nowhere to put it".to_string(),
                     data: Vec::new(),
-                    accumulated_cost: 0,
+                    accumulated_cost: self.quotes,
                 }),
                 ClaimAckOutcome::NotSent,
             )
@@ -7798,7 +9059,11 @@ mod tests {
             let connector = connector_with(vec![route], app_client.clone(), test_clock());
 
             let (response, ack) = connector
-                .handle_peer_prepare(prepare_with_amount("g.example.app", 10), None)
+                .handle_peer_prepare(
+                    Some("upstream"),
+                    prepare_with_amount("g.example.app", 10),
+                    None,
+                )
                 .await;
 
             match response {
@@ -7823,7 +9088,11 @@ mod tests {
             let connector = connector_with(vec![route], app_client.clone(), test_clock());
 
             let (response, _ack) = connector
-                .handle_peer_prepare(prepare_with_amount("g.example.app", 25), None)
+                .handle_peer_prepare(
+                    Some("upstream"),
+                    prepare_with_amount("g.example.app", 25),
+                    None,
+                )
                 .await;
 
             assert!(matches!(response, PacketResponse::Fulfill(_)));
@@ -7843,7 +9112,11 @@ mod tests {
             let connector = connector_with(vec![route], app_client.clone(), test_clock());
 
             let (response, _ack) = connector
-                .handle_peer_prepare(prepare_with_amount("g.example.app", 100), None)
+                .handle_peer_prepare(
+                    Some("upstream"),
+                    prepare_with_amount("g.example.app", 100),
+                    None,
+                )
                 .await;
 
             assert!(matches!(response, PacketResponse::Fulfill(_)));
@@ -7862,7 +9135,11 @@ mod tests {
             let connector = connector_with(vec![route], app_client.clone(), test_clock());
 
             let (response, _ack) = connector
-                .handle_peer_prepare(prepare_with_amount("g.example.app", 0), None)
+                .handle_peer_prepare(
+                    Some("upstream"),
+                    prepare_with_amount("g.example.app", 0),
+                    None,
+                )
                 .await;
 
             assert!(matches!(response, PacketResponse::Fulfill(_)));
@@ -8067,6 +9344,7 @@ mod tests {
             // `extra.price` would send.
             let (response, _ack) = connector
                 .handle_peer_prepare(
+                    Some("upstream"),
                     Prepare {
                         amount: 100,
                         ..large.clone()
@@ -8090,6 +9368,7 @@ mod tests {
             // Carrying the packet's own charge is admitted and delivered.
             let (response, _ack) = connector
                 .handle_peer_prepare(
+                    Some("upstream"),
                     Prepare {
                         amount: charge,
                         ..large

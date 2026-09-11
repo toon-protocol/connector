@@ -12,7 +12,7 @@ TypeScript prototype — [ADR 0017](../adr/0017-the-typescript-connector-is-a-pr
 
 ```
 connector/
-  crates/          the connector — sixteen crates producing the `connector` binary
+  crates/          the connector — eighteen crates producing the `connector` binary
   packages/        not the connector: Solidity contracts, the Solana program, devnet tooling
   tools/           scripts: CI guards, contract and chain helpers, the RFC vendoring script
   local/           the shipped image run against real containerised chains
@@ -46,7 +46,10 @@ connector-domain                 pure logic: no async, no I/O, no clock, no keys
   ├─ packet.rs, oer.rs           ILPv4 packets (RFC-0027) and their canonical OER
   │                               encoding (RFC-0030, ADR 0023)
   ├─ address.rs, route.rs        ILP address validation (RFC-0015); longest-prefix selection
-  ├─ fee.rs                      flat per-packet fee arithmetic (ADR 0010)
+  ├─ fee.rs                      flat per-packet fee arithmetic (ADR 0010), and the
+  │                               converting forward and its inverse (ADR 0071)
+  ├─ rate.rs, rate_table.rs      a rate as a rational over base units, and the table a
+  │                               forward reads it from under three guards (ADR 0071)
   ├─ price.rs                    what a terminated route charges for one packet: a
   │                               schedule over payload length, flat when its slope
   │                               is zero (ADR 0065)
@@ -83,6 +86,16 @@ connector-settlement-solana      real Solana backend, speaking packages/solana-p
                                   own wire directly (that crate builds for SBF only and
                                   exports no client SDK)
 
+connector-rate-source            the chain-agnostic rate-source port + its contract suite
+                                  (ADR 0071): what reading a token's price off a market
+                                  means, with no chain, venue or RPC in it
+  ├─ port.rs, contract.rs        the port, and the one suite every reader is run against
+  └─ in_memory.rs                the fake — the first implementation to pass that suite
+connector-rate-source-evm        the first real reader: Uniswap-v3-compatible `observe()`
+                                  TWAPs over an EVM RPC endpoint, TWAP-only and over a
+                                  pool the operator named. Holds no key, sends no
+                                  transaction, and is no part of any settlement path
+
 connector-runtime                the packet plane and its ports
   ├─ connector.rs                Connector — routing, delivery, fees, rejects
   ├─ peer_transport.rs           the peer transport port (ADR 0027's seam)
@@ -96,6 +109,9 @@ connector-runtime                the packet plane and its ports
   ├─ outbound_client.rs          paying a next hop as an ordinary client of it
   ├─ attribution.rs              what a terminating connector tells the app about the
   │                               payment (ADR 0040)
+  ├─ rate_table.rs, rate_poller.rs  the handle a converting forward reads its rate off,
+  │                               and the background poller that refreshes it — the
+  │                               packet path does no I/O for a rate (ADR 0071)
   ├─ clock.rs                    the clock as an injected port, so expiry is tested by
   │                               advancing rather than sleeping
   └─ metrics.rs, operator_view.rs   ADR 0014's metrics; ADR 0008's read models
@@ -204,16 +220,17 @@ One connector image, real containerised chains, a real packet. It is a **separat
 `connector.toml`, mounted key files and a real volume at `/app/state` — boots and moves a
 packet. That is this, and only this.
 
-| Topology       | Nodes | What it proves                                                                                                                                                                                         |
-| -------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `solo/`        | 1     | The image boots on a mounted config with **both** settlement backends live at once, and a real packet reaches the app behind its route.                                                                |
-| `two-hop/`     | 2     | Two images peered over ILP-over-HTTP on anvil. B prices the route it terminates; A covers each crossing with a real EIP-712 claim on a real funded channel.                                            |
-| `mixed-chain/` | 3     | A↔B on EVM over BTP, B↔C on Solana over ILP-over-HTTP, B holding both backends. One packet crosses two chains and two carriages.                                                                       |
-| `onion/`       | 2     | B reachable only at a hidden-service address a real `anon` sidecar generates, the two on separate docker networks with no route between them. Not on the CI gate.                                      |
-| `anyone/`      | 1     | The **client edge** over the same overlay: `toon-client` — a different repository's payer — discovering, pricing and paying this node over a circuit. Needs that repository built; not on the CI gate. |
+| Topology       | Nodes | What it proves                                                                                                                                                                                                                                          |
+| -------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `solo/`        | 1     | The image boots on a mounted config with **both** settlement backends live at once, and a real packet reaches the app behind its route.                                                                                                                 |
+| `two-hop/`     | 2     | Two images peered over ILP-over-HTTP on anvil. B prices the route it terminates; A covers each crossing with a real EIP-712 claim on a real funded channel.                                                                                             |
+| `mixed-chain/` | 3     | A↔B on EVM over BTP, B↔C on Solana over ILP-over-HTTP, B holding both backends. One packet crosses two chains and two carriages.                                                                                                                        |
+| `dealing/`     | 3     | `mixed-chain`'s shape with the middle node **dealing**: 6-decimal mock USDC in, a 9-decimal mock SPL token out, converted at a declared rate (ADR 0071). The only place a shipped image converts, and the only fixture here that declares `[[tokens]]`. |
+| `onion/`       | 2     | B reachable only at a hidden-service address a real `anon` sidecar generates, the two on separate docker networks with no route between them. Not on the CI gate.                                                                                       |
+| `anyone/`      | 1     | The **client edge** over the same overlay: `toon-client` — a different repository's payer — discovering, pricing and paying this node over a circuit. Needs that repository built; not on the CI gate.                                                  |
 
 `LOCAL_TOPOLOGY` picks one (`solo` is the default); `make local-verify` runs the cycle and
-`.github/workflows/local-topologies.yml` runs the first three — `onion` needs a third-party
+`.github/workflows/local-topologies.yml` runs the first four — `onion` needs a third-party
 anonymity network and is deliberately off that gate (ADR 0070), and `anyone` is run by its own
 `run.sh` rather than by `LOCAL_TOPOLOGY` at all. `anon-image/` builds the daemon both of those
 run: ghcr publishes none for the release whose hidden-service TLD is `.anyone` (issue #1284). The peered topologies cross more than

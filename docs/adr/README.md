@@ -1,6 +1,6 @@
 # Architecture decision records
 
-70 records. **Every one now carries a `**Status:**` line under its title** — that line, not this
+71 records. **Every one now carries a `**Status:**` line under its title** — that line, not this
 index, is the authority for whether a record is live. This page is the map: what is live, grouped
 by area; what is dead, grouped by what killed it; and what the folder still says that the code no
 longer does.
@@ -96,7 +96,8 @@ outside this repository.
 | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
 | [0042](0042-a-packet-carries-its-claim.md)                                             | A packet carries its claim                                                           | Accepted — **built** (#1145); supersedes 0031                                                           |
 | [0004](0004-value-moves-on-fulfilment.md)                                              | Value moves on fulfilment, one claim per packet                                      | Partly superseded by 0042 — its model no longer runs anywhere (#1145); one claim per packet still binds |
-| [0010](0010-flat-per-packet-fee-and-minimum-delivery.md)                               | A hop charges a flat per-packet fee; packets declare a minimum delivery              | Accepted, amended by 0042 and #1072                                                                     |
+| [0010](0010-flat-per-packet-fee-and-minimum-delivery.md)                               | A hop charges a flat per-packet fee; packets declare a minimum delivery              | Accepted, amended by 0042, #1072, 0061 and 0071                                                         |
+| [0071](0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)                    | A forward crosses a denomination at a declared rate                                  | Accepted — **built** (#1287), bar the dealing topology (#1299); amends 0010 and 0061, extends 0011      |
 | [0011](0011-rejects-accumulate-fees-and-probes-discover-cost.md)                       | Rejects accumulate fees; a probe is how cost is discovered                           | Accepted, amended by 0042; extended by 0044 and 0065                                                    |
 | [0051](0051-a-reject-code-binds-where-a-sender-must-act-differently.md)                | A reject code binds where a sender must act differently, and only there              | Accepted — extends 0011                                                                                 |
 | [0044](0044-a-probe-answers-what-a-route-costs-and-what-it-does.md)                    | A probe answers what a route costs **and what it does**                              | Accepted — **not yet built**                                                                            |

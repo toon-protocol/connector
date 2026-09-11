@@ -17,6 +17,7 @@
 
 mod client_channel;
 mod config;
+mod denomination;
 mod error;
 mod identity;
 mod node;
@@ -24,12 +25,14 @@ mod operator;
 mod pay_channel;
 mod peer;
 mod peer_channel;
+mod peering_asset;
 mod route;
 mod secret;
 mod settlement;
 
 pub use client_channel::{ClientChannelConfig, EvmClientChannelConfig, SolanaClientChannelConfig};
 pub use config::{parse_socks_proxy, Config};
+pub use denomination::{DeclaredToken, DenominationConfig, QuoteLeg, QuotePath, RateRow};
 pub use error::ConfigError;
 pub use identity::ClientIdentityConfig;
 pub use node::NodeConfig;
@@ -40,6 +43,7 @@ pub use peer::{
     PeerExposure, DEFAULT_MAX_PACKET_AMOUNT, DEFAULT_PEER_TIMEOUT_MS,
 };
 pub use peer_channel::{EvmPeerChannelConfig, PeerChannelConfig, SolanaPeerChannelConfig};
+pub use peering_asset::PeeringAssets;
 pub use route::{PeerRouteConfig, StaticRoute, TransportPolicy};
 pub use secret::SecretLocation;
 pub use settlement::{

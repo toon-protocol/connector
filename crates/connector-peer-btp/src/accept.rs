@@ -615,8 +615,15 @@ impl PeerSession {
             // Everything past admission, overlapping up to the window
             // (§7.1): routing and the downstream round trip.
             // `handle_peer_prepare` is handed no claim -- this frame's was
-            // judged inline above, in order.
-            let (response, _) = state.connector.handle_peer_prepare(prepare, None).await;
+            // judged inline above, in order. It IS handed the peering the
+            // frame arrived over, which is the incoming half of ADR 0071's
+            // denomination boundary (issue #1295): the session is
+            // authenticated, so this carriage knows who is on the other end
+            // of it and a forward out of this packet can be priced.
+            let (response, _) = state
+                .connector
+                .handle_peer_prepare(Some(&peer_id), prepare, None)
+                .await;
             let frame = encode_packet_response(&role, request_id, response, ack);
             let _ = reply(&replies, frame).await;
         });

@@ -1,0 +1,320 @@
+# =============================================================================
+# local/dealing -- three connectors, two peerings, TWO DENOMINATIONS.
+#
+# Merged ON TOP of the repository-root docker-compose.yml so the chains are the
+# SAME services `make anvil-up` / `make solana-up` bring up, on one network:
+#
+#   docker compose -f docker-compose.yml -f local/dealing/compose.yml \
+#     --profile evm --profile solana --profile dealing up -d
+#
+# `make local-up LOCAL_TOPOLOGY=dealing` does exactly that.
+#
+#   connector-a  --EVM peering-->  connector-b  --Solana peering-->  connector-c
+#                6-decimal USDC    (DEALS)       9-decimal mock       stub-app
+#
+# The packet is originated at A's operator surface and terminates at C's app,
+# and the DENOMINATION changes at B: 1100 µUSDC arrive, 4350000 base units of a
+# nine-decimal mock leave, at a rate B has declared and a spread B earns
+# (ADR 0071).
+#
+# `local/mixed-chain` is the same three-node shape on the same two chains and
+# is NOT this: both of its legs hold 6-decimal USDC, it declares no
+# `[[tokens]]`, and decision 2's absence rule leaves it on the ordinary
+# unconverted path. This is the only stack in the repository where a shipped
+# image converts anything.
+# =============================================================================
+
+services:
+  # ── The payment-oblivious app, behind C ────────────────────────────────────
+  stub-app:
+    image: connector-rust:local
+    profiles: [dealing]
+    entrypoint: ['/usr/local/bin/stub-app']
+    command: ['0.0.0.0:3100']
+    expose:
+      - '3100'
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+  # ── C: Solana only, terminates the app's prefix ────────────────────────────
+  # Brought up first and waited on by B, which is waited on by A: each node
+  # dials the next, and a peering whose far side is not serving answers `T01
+  # peer unreachable` rather than failing loudly, so an undefined start order
+  # would make the first rehearsal a coin toss.
+  connector-c:
+    image: connector-rust:local
+    profiles: [dealing]
+    command: ['/app/config/connector.toml']
+    # PATHS ARE RELATIVE TO THE REPOSITORY ROOT, not to this file. Compose
+    # resolves relative bind mounts against the PROJECT directory, which is the
+    # directory of the FIRST `-f` file -- always ./docker-compose.yml here.
+    volumes:
+      - ./local/dealing/connector-c.toml:/app/config/connector.toml:ro
+      - ./local/.keys/dealing/connector-c:/app/data:ro
+      # A NAMED volume, not a bind mount: the image creates /app/state owned by
+      # uid 10001 so a fresh named volume inherits that ownership.
+      - dealing-c-state:/app/state
+    ports:
+      - '127.0.0.1:3009:3000'
+    depends_on:
+      solana-validator:
+        condition: service_healthy
+      stub-app:
+        condition: service_started
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    healthcheck:
+      # 127.0.0.1, NOT localhost: `client_edge_addr = "0.0.0.0:3000"` binds
+      # IPv4 only, while `localhost` in-container resolves `::1` first.
+      test:
+        ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:3000/ilp/identity || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── B: the denomination boundary ───────────────────────────────────────────
+  # The only container here that depends on BOTH chains being healthy, which is
+  # the compose-level statement of what its config says: two settlement
+  # backends, either of which failing to connect is a refuse-to-start -- and
+  # since ADR 0071 those two tables are also where each of its peerings' TOKENS
+  # are read from, so a boundary this node could not verify both ends of is a
+  # node that does not start.
+  connector-b:
+    image: connector-rust:local
+    profiles: [dealing]
+    command: ['/app/config/connector.toml']
+    volumes:
+      - ./local/dealing/connector-b.toml:/app/config/connector.toml:ro
+      - ./local/.keys/dealing/connector-b:/app/data:ro
+      - dealing-b-state:/app/state
+    ports:
+      - '127.0.0.1:3008:3000'
+    depends_on:
+      anvil:
+        condition: service_healthy
+      solana-validator:
+        condition: service_healthy
+      connector-c:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    healthcheck:
+      test:
+        ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:3000/ilp/identity || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── A: EVM only, and the node the rehearsal is handed to ───────────────────
+  connector-a:
+    image: connector-rust:local
+    profiles: [dealing]
+    command: ['/app/config/connector.toml']
+    volumes:
+      - ./local/dealing/connector-a.toml:/app/config/connector.toml:ro
+      - ./local/.keys/dealing/connector-a:/app/data:ro
+      - dealing-a-state:/app/state
+    ports:
+      - '127.0.0.1:3007:3000'
+    depends_on:
+      anvil:
+        condition: service_healthy
+      connector-b:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    healthcheck:
+      test:
+        ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:3000/ilp/identity || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── The rehearsal ──────────────────────────────────────────────────────────
+  # Its own profile so `up` never starts it: a one-shot that exits 0 or 1, run
+  # by `make local-rehearse` via `docker compose run --rm`.
+  #
+  # TWO packets, for `local/two-hop`'s and `local/mixed-chain`'s reason (issue
+  # #1102): a covering payer asks its payee where its claims stand on every
+  # packet, and a payee answering out of the wrong book reports nonce 0 forever
+  # -- accepted every time, advancing nothing. One crossing cannot see that.
+  # Two can.
+  #
+  # Then BOTH journals are read, and on this topology that pair is not two
+  # spellings of one check. B's is 1100 per crossing, in µUSDC, unconverted:
+  # A crosses no boundary. C's is 4350000 per crossing, in base units of a
+  # nine-decimal token: B does. `--expect-fulfill` cannot see either, because a
+  # peer claim's verdict rides back in `Toon-Claim-Ack` and never gates the
+  # packet -- AND ON THIS TOPOLOGY IT WOULD MISS MORE THAN A FREE CROSSING. A
+  # boundary converting at the wrong rate, or not converting at all, fulfils
+  # exactly as happily: the packet reaches the app either way, and only the
+  # figure in C's journal is different. That figure is the whole point of this
+  # stack, so it is what is asserted.
+  #
+  # Around those, one on-chain read: the Solana channel account exists, belongs
+  # to the payment-channel program and holds B's collateral. A journal grep
+  # proves a claim was ACCEPTED, which is a signature check against a
+  # configured key and reads no chain (CF-23) -- so it stays green against a
+  # channel nobody ever opened.
+  sender:
+    image: connector-rust:local
+    profiles: [sender]
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        set -e
+
+        # The Solana peering's channel, BEFORE anything is sent, so a failure
+        # names the missing channel rather than a puzzling claim further down.
+        #
+        # Existence and owner establish the address is a real account of the
+        # payment-channel program: it is a PDA
+        # `find_program_address(["channel", min, max, mint])` produces -- and
+        # the MINT in those seeds is this topology's 9-decimal mock, not the
+        # mock USDC every other Solana leg here settles in, so this address is
+        # one only this topology's configuration derives.
+        #
+        # And that it still holds B's COLLATERAL. `deposit_a` (offset 104,
+        # `packages/solana-program/src/state.rs`) and NOT `deposit_b`, which is
+        # the offset `local/mixed-chain` reads: a channel is two-sided,
+        # `ClaimFromChannel` bounds a claim by the CLAIMER's own deposit, B is
+        # the payer here -- and which slot B holds is decided by the 32-byte
+        # sort the PDA is derived from. B's key sorts BEFORE C's on this
+        # topology's indices, so B is participant_a. That constant cannot pass
+        # by accident if those indices ever change: it would read C's side,
+        # which nothing here funds, and report zero.
+        #
+        # `commitment: confirmed`, named rather than defaulted, and
+        # load-bearing: getAccountInfo defaults to FINALIZED, which a channel
+        # opened seconds ago by `make local-up` is not yet. Confirmed is also
+        # the level the Solana backend itself reads and writes at, so this sees
+        # exactly what the node that opened it sees.
+        #
+        # `content-type: application/json` likewise: busybox wget sends
+        # `application/x-www-form-urlencoded` for a --post-data body, and the
+        # validator answers that with 415.
+        channel_open() {
+          if ! wget -q -O - --header 'content-type: application/json' \
+              --post-data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$$1\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]}" \
+              http://solana-validator:8899 >/tmp/channel.json; then
+            echo "NO CHANNEL: getAccountInfo for $$1 failed against the local validator." >&2
+            exit 1
+          fi
+          if ! grep -q "\"owner\":\"$$2\"" /tmp/channel.json; then
+            echo "NO CHANNEL: $$1 is not an account of the payment-channel program $$2 on the local validator." >&2
+            echo "            The Solana peering's claims would name a channel nobody could redeem." >&2
+            exit 1
+          fi
+          echo "--- the outgoing leg's channel $$1 is live on chain, owned by $$2"
+
+          # The account's own bytes: base64 out of the JSON, then the u64 at
+          # $$3. busybox `od -tu8` reads it little-endian, which is the layout
+          # a Solana account is written in.
+          sed 's/.*"data":\["\([^"]*\)".*/\1/' /tmp/channel.json | base64 -d >/tmp/channel.bin
+          held=$$(od -An -tu8 -j"$$3" -N8 /tmp/channel.bin | tr -d ' ')
+          if [ -z "$$held" ] || [ "$$held" -lt "$$4" ]; then
+            echo "NO COLLATERAL: $$1 holds $$held base units at deposit offset $$3, not the $$4 the payer deposited." >&2
+            echo "               A claim against an unfunded channel is a signature, not a payment: the" >&2
+            echo "               program's ClaimFromChannel bounds a claim by the claimer's OWN deposit," >&2
+            echo "               so every claim this peering signs would be refused on redemption." >&2
+            echo "               'local/keys.sh dealing solana-channels' is what deposits it." >&2
+            exit 1
+          fi
+          echo "--- it holds $$held base units of B's own collateral, at least the $$4 provisioning deposited"
+        }
+        channel_open AiCAdi9xJ5XhJQ3sRkeCYzbWozd7dbS3gwZ9rneJWk8W HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR 104 100000000000
+
+        # 1200 is this path's COST (`CONTEXT.md`) IN THE SENDER'S OWN UNIT, and
+        # on this topology that qualification is the whole of ADR 0071 decision
+        # 7: the sender pays A's posted price in µUSDC and never meets a
+        # 9-decimal figure, however many boundaries the path crosses. 1200
+        # leaves, A keeps its flat 100, and 1100 µUSDC arrives at the boundary.
+        send() {
+          /usr/local/bin/connector send \
+            --operator     http://connector-a:3000 \
+            --operator-key /app/data/operator-send.key \
+            --to           g.local.dealing.b.c.app \
+            --seal-to      http://connector-c:3000/ilp \
+            --target       / \
+            --amount       1200 \
+            --body         /app/data/payload.json \
+            --expect-fulfill
+        }
+        echo '--- crossing 1: A -> B (converts) -> C -> the app'
+        send
+        echo '--- crossing 2: a second covered crossing on BOTH peerings (issue #1102)'
+        send
+
+        # $$1 state dir, $$2 channel, $$3 label, $$4 what ONE crossing must
+        # advance that channel by, $$5 the unit that figure is in.
+        #
+        # The ADVANCE, not merely the existence of a claim. Both legs cover
+        # before they send (ADR 0042), so N crossings owe exactly N advances,
+        # and the figure each leg owes is in ITS OWN unit -- which on this
+        # topology is the difference between the two calls below rather than a
+        # detail of them.
+        #
+        # The last line for the channel is the highest cumulative: a claim book
+        # only ever advances, and only the highest-nonce claim is ever
+        # redeemable.
+        paid() {
+          if ! grep -q "$$2" "$$1/peer-claims.log" 2>/dev/null; then
+            echo "NOT PAID: $$3 records no accepted claim on $$2." >&2
+            cat "$$1/peer-claims.log" >&2 || echo '(the journal does not exist)' >&2
+            exit 1
+          fi
+          accepted=$$(grep -c "$$2" "$$1/peer-claims.log")
+          cumulative=$$(grep "$$2" "$$1/peer-claims.log" | tail -1 | cut -f4)
+          expected=$$((accepted * $$4))
+          if [ "$$cumulative" != "$$expected" ]; then
+            echo "WRONG FIGURE: $$3 accepted $$accepted claims on $$2 totalling $$cumulative $$5," >&2
+            echo "              not the $$expected that $$accepted crossings at $$4 each owe it." >&2
+            echo "              What one crossing owes each leg:" >&2
+            echo "                B, in 6-decimal USDC:  amount_after_fee(1200, 100)        = 1100" >&2
+            echo "                C, in the 9-decimal mock:" >&2
+            echo "                  floor(1100 * 4000/1 * 99/100) - 6000                    = 4350000" >&2
+            echo "              A figure wrong at C and right at B is the RATE, the SPREAD or the" >&2
+            echo "              outgoing FEE having moved -- or the boundary not converting at all," >&2
+            echo "              which would put 1100 there and fulfil every packet regardless." >&2
+            grep "$$2" "$$1/peer-claims.log" >&2
+            exit 1
+          fi
+          echo "--- $$3 accepted $$accepted claims on $$2, cumulative $$cumulative $$5 ($$4 per crossing)"
+        }
+        # The two units, side by side, which is the whole topology in two
+        # greps. B is paid in what arrived; C is paid in what the boundary
+        # converted it into.
+        paid /app/b-state 0xaabd147bc75ca72e8deaca1d7994716b6a29cb0ee4e3237ee629b440475e59fc "B (EVM, 6dp USDC)" 1100 uUSDC
+        paid /app/c-state AiCAdi9xJ5XhJQ3sRkeCYzbWozd7dbS3gwZ9rneJWk8W "C (Solana, 9dp mock)" 4350000 base-units
+    volumes:
+      # A's keys: the sender signs the operator write with A's allowlisted key
+      # and posts the fixture body from the same directory.
+      - ./local/.keys/dealing/connector-a:/app/data:ro
+      # The two payees' state volumes, READ-ONLY, purely to read their claim
+      # journals. The sender runs as the same uid 10001 that wrote them.
+      - dealing-b-state:/app/b-state:ro
+      - dealing-c-state:/app/c-state:ro
+
+volumes:
+  dealing-a-state:
+  dealing-b-state:
+  dealing-c-state:

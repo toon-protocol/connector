@@ -10,12 +10,18 @@
 # Solana validator -- so ONE node, ONE packet path, and the money changes chain
 # in the middle of it.
 #
-# Nothing in this file converts anything. The amount that leaves for C is the
-# amount that arrived from A minus this hop's FLAT fee (the `fee = 50` on the
-# `b-c` peering, see below) -- a fixed number of base units subtracted once,
-# never a share of what arrived. There is no rate, and ADR 0010 deleted the
-# spread that would have implied one. What the two peerings disagree about is
-# only which ledger a claim is redeemable on.
+# Nothing in this file converts anything, and since ADR 0071 that is a fact
+# about this file rather than about the connector. Crossing a denomination is
+# core forwarding now; what keeps this hop out of it is the ABSENCE RULE
+# (decision 2), which this config obeys by declaring no `[[tokens]]` -- so
+# neither peering resolves to a token, this node sits on no boundary, and the
+# converting arm is never reached. The amount that leaves for C is the amount
+# that arrived from A minus this hop's FLAT fee (the `fee = 50` on the `b-c`
+# peering, see below): a fixed number of base units subtracted once, never a
+# share of what arrived. What the two peerings disagree about is only which
+# ledger a claim is redeemable on -- both hold the same 6-decimal mock USDC.
+# `local/dealing`'s B is this node with a rate table; that is the topology to
+# read for what a crossing looks like.
 #
 # The shape has no coverage anywhere else in this repository.
 # `two_ledgers_never_merge.rs` proves the two backends stay separate inside one
@@ -122,10 +128,11 @@ price = 1100
 # `forwarded_claim_enforcement = "enforce"` HERE, AND THIS IS THE ONLY ROW IN
 # THE REPOSITORY WHERE IT DOES ANYTHING. ADR 0042 item 3 (issue #1142) says a
 # forwarded arrival must carry a claim covering the ARRIVING amount, behind a
-# per-peer knob that defaults to `observe`; this node is the only one anywhere
-# here that forwards a packet which arrived from a peer, so this is the only
-# peering the setting can bind on -- and therefore the only place #1142's
-# enforcing path is proven against a running image at all.
+# per-peer knob that defaults to `observe`; this is the only row anywhere here
+# that turns it on, and therefore the only place #1142's enforcing path is
+# proven against a running image at all. (`local/dealing`'s B forwards a peer
+# arrival too, and leaves the knob at its default on purpose -- one fact, one
+# home, and that topology's subject is the denomination boundary.)
 #
 # It could not be turned on until issue #1145. This peering used to be POSTPAY:
 # A had no `[[pay_channels]]` row, the claim covering crossing n rode crossing

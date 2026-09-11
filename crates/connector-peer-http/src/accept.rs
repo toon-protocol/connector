@@ -301,8 +301,15 @@ impl PeerHttpState {
         // The one pipeline below the port (§0.1): a peer PREPARE that
         // arrived over HTTP is indistinguishable here from one that arrived
         // over BTP. `handle_peer_prepare` is handed no claim -- this
-        // request's was judged above, before anything was routed.
-        let (response, _) = self.connector.handle_peer_prepare(prepare, None).await;
+        // request's was judged above, before anything was routed -- and IS
+        // handed the peering it arrived over, which is the incoming half of
+        // ADR 0071's denomination boundary (issue #1295): the request is
+        // signature-authenticated, so this carriage knows whose unit the
+        // amount on it is denominated in.
+        let (response, _) = self
+            .connector
+            .handle_peer_prepare(Some(&peer_id), prepare, None)
+            .await;
         self.finish(&role, packet_response(response), ack)
     }
 

@@ -247,6 +247,11 @@
         color: var(--ok-ink);
         border-color: transparent;
       }
+      .badge.err {
+        background: var(--err-bg);
+        color: var(--err-ink);
+        border-color: transparent;
+      }
       .badge.leased {
         background: var(--card);
       }
@@ -428,6 +433,7 @@
         <a href="#access">Access</a>
         <a href="#traffic">Traffic</a>
         <a href="#earnings">Earnings</a>
+        <a href="#dealing">Dealing</a>
         <a href="#peering">Peering</a>
         <a href="#routes">Routes</a>
         <a href="#audit">Audit log</a>
@@ -523,6 +529,18 @@
         <div class="table-wrap"><table id="claims-in-table"></table></div>
         <h3>Outbound claims — what you have signed away</h3>
         <div class="table-wrap"><table id="claims-out-table"></table></div>
+      </section>
+
+      <section class="card" id="dealing">
+        <h2>Dealing</h2>
+        <p class="lede">
+          A forward whose two legs hold different tokens converts at a rate this node has declared
+          (ADR 0071) — never silently, and never at a rate it has not got. A rate is declared in
+          the config file or observed from a pool by this node's own poller; nothing sets one from
+          here, and this table is a read. A pair that is stale or refused rejects every forward
+          across it, and only across it, so an outage no route table can explain shows up here.
+        </p>
+        <div class="table-wrap"><table id="rates-table"></table></div>
       </section>
 
       <section class="card" id="peering">
@@ -903,6 +921,34 @@
         table(document.getElementById('claims-out-table'), headers, outbound.map(claimRow), 'no outbound claims');
       }
 
+      // A rate is a fraction, exactly as the config file writes one, and it
+      // is not an amount: `decimals` would be the wrong scale for it, since
+      // the two sides of the ratio are in two different tokens' base units.
+      const fmtRate = (rate) => (rate ? `${rate.numerator.toLocaleString()} / ${rate.denominator.toLocaleString()}` : '—');
+      const RATE_BADGE = { live: 'runtime', stale: 'err', refused: 'config' };
+      function renderRates(rates) {
+        table(
+          document.getElementById('rates-table'),
+          [{ label: 'from' }, { label: 'to' }, { label: 'state' }, { label: 'rate', num: true }, { label: 'last refresh', num: true }, { label: 'guard' }],
+          rates.map((r) => [
+            td(el('code', { title: r.from }, short(r.from, 10))),
+            td(el('code', { title: r.to }, short(r.to, 10))),
+            td(badge(r.state, RATE_BADGE[r.state] || '')),
+            td(fmtRate(r.rate), 'num'),
+            // A live pair with no last refresh is a static row nothing
+            // refreshes; a stale one's instant is how long this node has
+            // been blind.
+            td(r.last_refreshed ? el('span', { title: new Date(r.last_refreshed).toLocaleString() }, `${ago(Date.now() - Date.parse(r.last_refreshed))} ago`) : '—', 'num'),
+            td(
+              r.refused_refresh
+                ? badge(`max_move refused ${fmtRate(r.refused_refresh.offered)}`, 'config')
+                : el('span', { class: 'sub' }, '—'),
+            ),
+          ]),
+          'no declared pairs — this node deals no tokens, and every forward it makes stays in one',
+        );
+      }
+
       function renderPeering(peers, channels) {
         state.peers = peers;
         table(
@@ -1070,12 +1116,13 @@
           return;
         }
         try {
-          const [metricsText, identity, peers, channels, claims, routes, peerRoutes, leased, audit] = await Promise.all([
+          const [metricsText, identity, peers, channels, claims, rates, routes, peerRoutes, leased, audit] = await Promise.all([
             read('/metrics', true),
             read('/identity'),
             read('/peers'),
             read('/channels'),
             read('/claims'),
+            read('/rates'),
             read('/routes'),
             read('/routes/peers'),
             read('/routes/leased'),
@@ -1088,6 +1135,7 @@
           renderNode(identity, description);
           renderTraffic(sample);
           renderEarnings(sample, claims);
+          renderRates(rates);
           renderPeering(peers, channels);
           renderRoutes(routes, peerRoutes, leased);
           renderAudit(audit);

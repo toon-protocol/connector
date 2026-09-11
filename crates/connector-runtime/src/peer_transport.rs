@@ -243,7 +243,18 @@ impl PeerLink {
                         claim,
                         respond_to,
                     } => {
-                        let result = connector.handle_peer_prepare(prepare, claim).await;
+                        // No arriving peering is named: this stand-in
+                        // models a link, not an identity, and the
+                        // `Connector` behind it has no way to know which
+                        // of its peerings this `PeerLink` stands for.
+                        // ADR 0071's converting arm therefore never fires
+                        // through this transport -- which is the safe
+                        // direction for a stand-in to be wrong in only
+                        // because a node that declares no `[[tokens]]`
+                        // has no crossing to miss, and a dealing node is
+                        // reached over a real carriage that does
+                        // authenticate the peer (issue #1295).
+                        let result = connector.handle_peer_prepare(None, prepare, claim).await;
                         let _ = respond_to.send(result);
                     }
                     PeerMessage::Flush { claim, respond_to } => {

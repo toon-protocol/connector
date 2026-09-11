@@ -470,8 +470,11 @@ your own output rather than on a block explorer later.
 `id` is your own local label for the relation; nothing puts it on the wire. `fee`
 is what you keep for carrying one packet over this peering — flat, per packet,
 never a share of the amount. `max_packet_amount` is the largest single packet you
-will carry for them, which is the most they can cost you at once. Neither can come
-from a document, which is why they are in the request.
+will carry for them, which is the most they can cost you at once. Both are counted
+in the base units of the channel this peering settles on — the one you pay them
+from — so neither figure carries over to a peering holding a different token, and
+`5000` is half a cent of 6-decimals USDC and a rounding error of an 18-decimals
+one. Neither can come from a document, which is why they are in the request.
 
 Two nodes that settle on **more than one chain in common** must say which: add
 `"chain": "evm"` or `"chain": "solana"`. Without it the write is refused by name
@@ -983,6 +986,9 @@ paying for anything.
 - **A new peering starts at a conservative cap**, and nothing raises it
   automatically. Post the same `id` again with a larger `max_packet_amount` to
   raise it; a cap is discovered by a `T04` reject naming it, never published.
+  There is one ceiling you cannot raise: an amount is a 64-bit integer, so one
+  packet on an 18-decimals leg tops out around 18.4 tokens whatever you write
+  here.
 
 ---
 

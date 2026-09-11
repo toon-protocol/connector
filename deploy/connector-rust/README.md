@@ -83,9 +83,9 @@ What replaced it is [`local/`](../../local/README.md), and the difference is
 the point: it is connector-layer only — the app behind its routes is the
 image's own `stub-app` — its chains are ordinary compose services the
 connector reaches by name, and it is a CI gate rather than a demonstration.
-`make local-verify LOCAL_TOPOLOGY=<solo|two-hop|mixed-chain>` builds this
-image, runs it against those chains, sends a real packet and asserts the
-outcome. `LOCAL_TOPOLOGY=onion` is a fourth, run by hand rather than on the
+`make local-verify LOCAL_TOPOLOGY=<solo|two-hop|mixed-chain|dealing>` builds
+this image, runs it against those chains, sends a real packet and asserts the
+outcome. `LOCAL_TOPOLOGY=onion` is a fifth, run by hand rather than on the
 gate: it needs a real onion daemon and a working anonymity network (ADR 0070).
 
 Skip to [step 6](#6-run-it) to run it — the config/key setup in steps 1-4
