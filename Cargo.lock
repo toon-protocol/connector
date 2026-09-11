@@ -1280,6 +1280,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-rate-source"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "connector-domain",
+ "connector-rate-source",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "connector-runtime"
 version = "0.1.0"
 dependencies = [

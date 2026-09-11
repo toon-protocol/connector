@@ -18,6 +18,7 @@ members = [
     "crates/connector-settlement",
     "crates/connector-settlement-evm",
     "crates/connector-settlement-solana",
+    "crates/connector-rate-source",
     "crates/connector-signer",
     "crates/connector-config",
     "crates/connector-peer-auth",
