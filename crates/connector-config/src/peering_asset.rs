@@ -94,6 +94,23 @@ impl PeeringAssets {
     }
 }
 
+/// Collect `(peer_id, token)` pairs into a table, in the order given.
+///
+/// [`Config::load`](crate::Config::load) builds the real one through
+/// `resolve_peering_assets`, which is where every boot refusal lives; this
+/// validates nothing and is for a caller that already holds the resolved
+/// pairs -- `connector-runtime`'s forwarding tests, which exercise a
+/// denomination crossing without a whole config file around it (issue
+/// #1295). Declaration order is preserved, because [`PeeringAssets::iter`]
+/// promises it.
+impl FromIterator<(String, AssetId)> for PeeringAssets {
+    fn from_iter<I: IntoIterator<Item = (String, AssetId)>>(peerings: I) -> PeeringAssets {
+        PeeringAssets {
+            peerings: peerings.into_iter().collect(),
+        }
+    }
+}
+
 /// The token a channel on `chain` settles in, read off the
 /// `[settlement.<chain>]` table that already states it
 /// ([`SettlementConfig::asset`], issue #1290).

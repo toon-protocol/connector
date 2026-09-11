@@ -1889,6 +1889,23 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
             );
         }
     }
+    // ADR 0071 decisions 1 and 2, issue #1295: the two facts the forwarding
+    // path's converting arm reads, and the only two. Which token each
+    // peering holds decides whether a forward crosses a denomination
+    // boundary at all, and the table decides what it crosses at -- or that
+    // it refuses.
+    //
+    // They are wired separately because they are independently absent, and
+    // the combination that matters is the awkward one: a node that declares
+    // tokens but no rate row has peering assets and no table, resolves
+    // boundaries it has priced nothing for, and must refuse every crossing
+    // rather than pass an integer across a scale difference. Handing the
+    // table only when both exist would turn that refusal back into the
+    // silent 10^12 pass-through ADR 0071 exists to make impossible.
+    connector = connector.with_peering_assets(config.peering_assets().clone());
+    if let Some(table) = &rate_table {
+        connector = connector.with_rate_table(table.clone());
+    }
     let connector = Arc::new(connector);
     Ok(Runtime {
         connector,
