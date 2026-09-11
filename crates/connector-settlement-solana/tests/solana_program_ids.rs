@@ -336,6 +336,13 @@ fn the_repository_names_a_solana_program_id_in_exactly_the_known_places() {
         "infra/linode-store/connector-rust.toml",
         "infra/linode/endpoints.json",
         "infra/solana/entrypoint.sh",
+        // The two topologies that put a node on the validator: `mixed-chain`
+        // crosses a chain without crossing a denomination, and `dealing`
+        // (ADR 0071) crosses both. Each names the disposable validator's
+        // genesis id, never a deployed one.
+        "local/dealing/compose.yml",
+        "local/dealing/connector-b.toml",
+        "local/dealing/connector-c.toml",
         "local/keys.sh",
         "local/mixed-chain/compose.yml",
         "local/mixed-chain/connector-b.toml",
