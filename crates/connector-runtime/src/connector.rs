@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Duration, Utc};
 use connector_config::{
-    PeeringAssets, SettlementChain, StaticRoute, TransportPolicy, DEFAULT_MAX_PACKET_AMOUNT,
+    ClientChannelAssets, PeeringAssets, SettlementChain, StaticRoute, TransportPolicy,
+    DEFAULT_MAX_PACKET_AMOUNT,
 };
 use connector_domain::x402::X402PaymentRequired;
 use connector_domain::{
@@ -674,6 +675,19 @@ pub struct Connector {
     /// loaded config held by value rather than anything with a lock or a
     /// chain behind it.
     peering_assets: PeeringAssets,
+    /// Which declared token a client channel this node accepts claims on
+    /// holds (ADR 0071 decision 1, issue #1301) -- the same fact
+    /// [`Self::peering_assets`] holds for a peering, for the other kind of
+    /// arrival a forward can come out of.
+    ///
+    /// Empty on every node that declares no `[[tokens]]`, exactly as its
+    /// sibling is, and for the same reason. On a node that DOES deal it is
+    /// the difference between a buyer's packet converting at this hop and
+    /// crossing a real boundary at an implied 1:1, which is why it is keyed
+    /// by the arriving channel key's chain rather than by any declared row:
+    /// the buyer whose channel this node discovered on chain (ADR 0052,
+    /// issue #502) has no row to be resolved from.
+    client_channel_assets: ClientChannelAssets,
     /// The rates this node deals at (ADR 0071 decisions 1 and 5, issue
     /// #1294), or `None` for a node that declares no token to deal.
     ///
@@ -690,6 +704,37 @@ pub struct Connector {
     /// that is how "the forwarding path does no I/O" is kept true by
     /// construction rather than by discipline (decision 6).
     rate_table: Option<SharedRateTable>,
+}
+
+/// Which leg a PREPARE arrived over, and therefore which denomination its
+/// amount is in (ADR 0071 decision 1, issues #1295 and #1301).
+///
+/// A packet's amount has no unit of its own -- it is denominated by the
+/// channel it rides -- so this is the incoming half of a **denomination
+/// boundary**, and the two variants are the two kinds of channel a packet
+/// can have been paid for over. Neither is derived from the packet: a
+/// PREPARE says nothing about what unit it is in and ADR 0071 decision 7
+/// keeps it that way, so each carriage hands the connector the leg it
+/// authenticated.
+///
+/// There is no third variant, and the absence is load-bearing: an arrival
+/// with no channel behind it -- an operator write, a test calling
+/// [`Connector::handle_prepare`] directly -- is `None` rather than a
+/// variant of this, because there is nothing to resolve rather than a
+/// denomination that happens to be unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arrival<'a> {
+    /// A peer arrival, named by the peering both carriages authenticate
+    /// before handing the packet on. Resolved through
+    /// [`Connector::peering_assets`].
+    Peer(&'a str),
+    /// A client-edge arrival, named by the chain-namespaced channel key of
+    /// the claim that admitted it
+    /// ([`ClientClaim::channel_key`](connector_domain::client_claim::ClientClaim::channel_key)).
+    /// Resolved through [`Connector::client_channel_assets`], which reads
+    /// the key's chain and not its id -- so a channel this node discovered
+    /// on chain is denominated exactly like a declared one.
+    ClientChannel(&'a str),
 }
 
 /// What a client-role hop's covering claims are signed under, by chain
@@ -791,6 +836,7 @@ impl Connector {
             peer_packet_caps: HashMap::new(),
             peer_fees: HashMap::new(),
             peering_assets: PeeringAssets::default(),
+            client_channel_assets: ClientChannelAssets::default(),
             rate_table: None,
         }
     }
@@ -1150,6 +1196,24 @@ impl Connector {
         self
     }
 
+    /// Tell this node which declared token a client channel it accepts
+    /// claims on holds (ADR 0071 decision 1, issue #1301) -- the table
+    /// [`Config::client_channel_assets`](connector_config::Config::client_channel_assets)
+    /// resolved once at boot, and the client edge's half of
+    /// [`Self::with_peering_assets`].
+    ///
+    /// Without it a buyer's packet crosses no boundary this hop can see and
+    /// forwards at the arriving integer, which is the truth for every node
+    /// that declares no `[[tokens]]` and the reason the default is the
+    /// empty table rather than an `Option`. On a node that deals, leaving
+    /// it out would be the unconverted crossing ADR 0071 exists to prevent
+    /// -- which is why `connector-cli` sets it wherever it sets the
+    /// peering table.
+    pub fn with_client_channel_assets(mut self, assets: ClientChannelAssets) -> Self {
+        self.client_channel_assets = assets;
+        self
+    }
+
     /// Give this node the rate table its converting forwards read (ADR 0071
     /// decision 6, issues #1294, #1295) -- the handle a background poller
     /// writes through and every crossing reads.
@@ -1164,27 +1228,38 @@ impl Connector {
         self
     }
 
-    /// The **denomination boundary** a forward arriving from `arrived_from`
-    /// and leaving to `outgoing_peer_id` crosses, or `None` when it crosses
-    /// none (ADR 0071 decision 1).
+    /// The **denomination boundary** a forward that `arrived` over one leg
+    /// and leaves to `outgoing_peer_id` crosses, or `None` when it crosses
+    /// none (ADR 0071 decision 1, issues #1295 and #1301).
+    ///
+    /// Both kinds of arrival are denominated, because both are: a peer's
+    /// packet is denominated by the peering's channel and a buyer's by the
+    /// client channel its covering claim was written against, and the
+    /// question asked of either is the identical one -- does the token it
+    /// arrived in differ from the token the outgoing peering holds.
     ///
     /// `None` covers three cases that all forward the same way -- the two
-    /// peerings hold one token, this node declares none, or the arrival
-    /// named no peering at all. That last one is the case worth stating:
-    /// only a **peer** arrival names an incoming channel this node can
-    /// denominate, and a packet handed straight to
-    /// [`Self::handle_prepare`] -- an operator write, a client-edge
-    /// delivery -- is not one. `[[client_channels]]` has no resolved token
-    /// yet (issue #1292 built the peering table and deliberately not a
-    /// client one), so a client arrival crosses no boundary this hop can
-    /// see, and this node forwards it as it always did.
+    /// legs hold one token, this node declares none, or the packet named no
+    /// arriving leg at all. That last one is the case worth stating: an
+    /// operator write, or any caller of [`Self::handle_prepare`] itself,
+    /// carries no channel and therefore no unit, so nothing can be said
+    /// about what it arrived in and this node forwards it as it always did.
+    /// A client-edge delivery is no longer one of those: since issue #1301
+    /// it carries the channel key its claim cleared, and on a dealing node
+    /// that key resolves -- including when the channel was discovered on
+    /// chain rather than declared (ADR 0052), which is the case that would
+    /// otherwise cross a real boundary unconverted.
     fn crossing(
         &self,
-        arrived_from: Option<&str>,
+        arrived: Option<Arrival<'_>>,
         outgoing_peer_id: &str,
     ) -> Option<(&AssetId, &AssetId)> {
+        let incoming = match arrived? {
+            Arrival::Peer(peer_id) => self.peering_assets.asset(peer_id)?,
+            Arrival::ClientChannel(channel_key) => self.client_channel_assets.asset(channel_key)?,
+        };
         self.peering_assets
-            .boundary_between(arrived_from?, outgoing_peer_id)
+            .boundary_from(incoming, outgoing_peer_id)
     }
 
     /// Reserve every peer id this node's config file names (issue #884):
@@ -1868,23 +1943,34 @@ impl Connector {
         prepare: Prepare,
         client_channel_id: Option<&str>,
     ) -> PacketResponse {
-        self.handle_prepare_spanned(prepare, client_channel_id, None)
-            .await
+        // That same channel key is this packet's DENOMINATION (ADR 0071
+        // decision 1, issue #1301), and it is the same value for the same
+        // reason: the channel whose covering claim admitted the packet is
+        // the channel the buyer paid over, and a claim is denominated by
+        // the channel it is written against. One value, read twice, so a
+        // span and a conversion can never name different channels.
+        self.handle_prepare_spanned(
+            prepare,
+            client_channel_id,
+            client_channel_id.map(Arrival::ClientChannel),
+        )
+        .await
     }
 
     /// The one body [`Self::handle_prepare_with_client_channel`] and
     /// [`Self::handle_peer_prepare`] share: open the `"packet"` span and
     /// route inside it.
     ///
-    /// `arrived_from` is the peering this packet came in over, and is the
-    /// incoming half of ADR 0071's denomination boundary (issue #1295).
-    /// Only a peer arrival has one -- see [`Self::crossing`] for what
-    /// `None` means and why it is the safe answer rather than a gap.
+    /// `arrived` is the leg this packet came in over, and is the incoming
+    /// half of ADR 0071's denomination boundary (issues #1295, #1301) --
+    /// the peering for a peer arrival, the client channel key for a buyer's
+    /// own. See [`Self::crossing`] for what `None` means and why it is the
+    /// safe answer rather than a gap.
     async fn handle_prepare_spanned(
         &self,
         prepare: Prepare,
         client_channel_id: Option<&str>,
-        arrived_from: Option<&str>,
+        arrived: Option<Arrival<'_>>,
     ) -> PacketResponse {
         let span = tracing::info_span!(
             "packet",
@@ -1895,7 +1981,7 @@ impl Connector {
         if let Some(channel_id) = client_channel_id {
             span.record("client_channel_id", channel_id);
         }
-        self.handle_prepare_traced(prepare, client_channel_id, arrived_from)
+        self.handle_prepare_traced(prepare, client_channel_id, arrived)
             .instrument(span)
             .await
     }
@@ -1967,7 +2053,7 @@ impl Connector {
         }
 
         let response = self
-            .handle_prepare_spanned(prepare, None, arrived_from)
+            .handle_prepare_spanned(prepare, None, arrived_from.map(Arrival::Peer))
             .await;
         (response, ack)
     }
@@ -2193,7 +2279,7 @@ impl Connector {
         &self,
         prepare: Prepare,
         client_channel_id: Option<&str>,
-        arrived_from: Option<&str>,
+        arrived: Option<Arrival<'_>>,
     ) -> PacketResponse {
         // Per-packet lines are debug, not info (issue #690): at huddle rates
         // (hundreds of packets/s) every INFO here becomes per-event disk I/O
@@ -2271,7 +2357,7 @@ impl Connector {
         };
         tracing::debug!(peer_id = %peer_route.peer_id(), "routed to peer");
         let response = self
-            .forward_via_peer_route(&peer_route, prepare, arrived_from)
+            .forward_via_peer_route(&peer_route, prepare, arrived)
             .await;
         if matches!(response, PacketResponse::Fulfill(_)) {
             self.metrics
@@ -2606,7 +2692,7 @@ impl Connector {
         &self,
         peer_route: &PeerRoute,
         prepare: Prepare,
-        arrived_from: Option<&str>,
+        arrived: Option<Arrival<'_>>,
     ) -> PacketResponse {
         // ADR 0061: this hop's fee belongs to the PEERING, so it is read off
         // `peer_route.peer_id()` rather than off the route the packet
@@ -2624,7 +2710,7 @@ impl Connector {
         // does -- runs the one `checked_sub` it has always run, byte for
         // byte. A forward that crosses one converts first, at a rate this
         // node declared, or refuses. Sibling, never replacement.
-        let forwarded_amount = match self.crossing(arrived_from, peer_id) {
+        let forwarded_amount = match self.crossing(arrived, peer_id) {
             None => {
                 // A packet that does not cover this hop's own flat fee is
                 // refused rather than forwarded at whatever is left. `R01`
@@ -2850,7 +2936,7 @@ impl Connector {
             // denominated the way the peering it goes out over is.
             PacketResponse::Reject(mut reject) => {
                 if answer.reached_peer {
-                    reject.accumulated_cost = match self.crossing(arrived_from, peer_id) {
+                    reject.accumulated_cost = match self.crossing(arrived, peer_id) {
                         None => reject.accumulated_cost + fee,
                         Some((incoming, outgoing)) => self.convert_for_reject(
                             incoming,
@@ -5475,11 +5561,13 @@ mod tests {
         assert!(peer.carried().is_empty());
     }
 
-    /// The incoming half of the boundary comes from the arriving PEERING,
-    /// and an arrival that names none crosses nothing. That is what an
-    /// operator write or a client-edge delivery is today -- `[[client_channels]]`
-    /// has no resolved token yet -- and it must forward rather than refuse,
-    /// or every non-peer arrival on a dealing node would go dark.
+    /// The incoming half of the boundary comes from the leg the packet
+    /// arrived over, and an arrival that names none crosses nothing. That
+    /// is an operator write, or any caller of `handle_prepare` itself: no
+    /// channel behind it, so nothing to denominate it by. It must forward
+    /// rather than refuse, or every channel-less arrival on a dealing node
+    /// would go dark. A client-edge arrival is NOT one of these -- it names
+    /// its channel, and issue #1301's block below is what it does.
     #[tokio::test]
     async fn an_arrival_that_names_no_peering_crosses_no_boundary() {
         let (hop, peer, _clock) = dealing_hop(
@@ -5804,6 +5892,372 @@ mod tests {
         async fn flush(&self, _peer_id: &str, _claim: WireClaim) -> ClaimAckOutcome {
             ClaimAckOutcome::NotSent
         }
+    }
+
+    // -- ADR 0071 decision 1 at the CLIENT EDGE (issue #1301): a buyer's
+    // own packet is denominated by the channel its covering claim was
+    // written against, exactly as a peer's is by the peering's, so a
+    // forward out of one crosses a denomination boundary on identical
+    // terms. Everything below drives `handle_prepare_with_client_channel`
+    // -- the entry point both carriages use once a claim has cleared the
+    // gate -- against the same downstream rig the peer cases use, so the
+    // only difference under test is which door the packet came in.
+
+    /// A channel a `[[client_channels]]` row declares: the buyer this
+    /// operator has heard of.
+    const DECLARED_CHANNEL: &str =
+        "evm:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    /// A channel resolved from chain and never declared anywhere (ADR
+    /// 0052, issue #502): the buyer this operator has NOT heard of, and
+    /// the one a rows-only resolution would leave unresolved.
+    const DISCOVERED_CHANNEL: &str =
+        "evm:0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// [`dealing_hop`] paid at its CLIENT EDGE instead of by a peer:
+    /// `client_chains` is what each chain's `[settlement.<chain>]` table
+    /// says a channel on it holds, which is the whole of how a client
+    /// arrival is denominated.
+    fn client_paying_hop(
+        client_chains: &[(SettlementChain, &str)],
+        peerings: &[(&str, &str)],
+        fee: u64,
+        cap: u64,
+        table: Option<SharedRateTable>,
+    ) -> (Connector, Arc<CarriesAndRemembers>, Arc<TestClock>) {
+        client_paying_hop_quoting(client_chains, peerings, fee, cap, table, 0)
+    }
+
+    /// [`client_paying_hop`] whose downstream answers with a running cost
+    /// already on it, in the OUTGOING leg's unit -- what a probe sent by a
+    /// buyer meets beyond this hop.
+    fn client_paying_hop_quoting(
+        client_chains: &[(SettlementChain, &str)],
+        peerings: &[(&str, &str)],
+        fee: u64,
+        cap: u64,
+        table: Option<SharedRateTable>,
+        quoted: u64,
+    ) -> (Connector, Arc<CarriesAndRemembers>, Arc<TestClock>) {
+        let peer = Arc::new(CarriesAndRemembers::quoting(quoted));
+        let clock = test_clock();
+        let hop = dealing_hop_over(peer.clone(), peerings, fee, cap, table, clock.clone())
+            .with_client_channel_assets(
+                client_chains
+                    .iter()
+                    .map(|(chain, token)| (*chain, asset(token)))
+                    .collect(),
+            );
+        (hop, peer, clock)
+    }
+
+    /// Send `amount` into `hop` as a CLIENT arrival over `channel_key` --
+    /// the chain-namespaced key of the claim that admitted it, which is
+    /// exactly what both carriages hand `handle_prepare_with_client_channel`
+    /// once the claim gate has cleared.
+    async fn arrives_over_client_channel(
+        hop: &Connector,
+        channel_key: &str,
+        amount: u64,
+    ) -> PacketResponse {
+        hop.handle_prepare_with_client_channel(
+            prepare_with_amount("g.example.app", amount),
+            Some(channel_key),
+        )
+        .await
+    }
+
+    /// The acceptance criterion stated directly, below the packet path:
+    /// `crossing` answers `Some` for a client arrival on a node whose
+    /// client channel and outgoing peering hold different tokens -- and the
+    /// pair is ordered, incoming first, because direction is the trade.
+    #[test]
+    fn a_client_arrival_crossing_into_another_token_is_a_boundary() {
+        let (hop, _peer, _clock) = client_paying_hop(
+            &[(SettlementChain::Evm, USDC)],
+            &[("second-hop", ANYONE)],
+            0,
+            u64::MAX,
+            None,
+        );
+
+        assert_eq!(
+            hop.crossing(Some(Arrival::ClientChannel(DECLARED_CHANNEL)), "second-hop"),
+            Some((&asset(USDC), &asset(ANYONE)))
+        );
+        // The same client channel against a peering holding the same token
+        // is not a boundary, and the flat fee is the whole of that forward.
+        let (same, _peer, _clock) = client_paying_hop(
+            &[(SettlementChain::Evm, USDC)],
+            &[("second-hop", USDC)],
+            0,
+            u64::MAX,
+            None,
+        );
+        assert_eq!(
+            same.crossing(Some(Arrival::ClientChannel(DECLARED_CHANNEL)), "second-hop"),
+            None
+        );
+    }
+
+    /// User stories 1 and 2 of issue #1287, as arithmetic: a buyer pays for
+    /// an ANYONE-denominated good with the USDC channel it already holds,
+    /// and the crossing happens at THIS hop -- `floor(amount * rate) - fee`,
+    /// the fee in the outgoing peering's unit. Before this, the same packet
+    /// left at 1_000_000 minus the fee, across a `10^12` scale difference.
+    #[tokio::test]
+    async fn a_client_arrival_across_a_boundary_converts_at_the_declared_rate() {
+        let fee = 1_000_000_000_000_000;
+        let (hop, peer, _clock) = client_paying_hop(
+            &[(SettlementChain::Evm, USDC)],
+            &[("second-hop", ANYONE)],
+            fee,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+        );
+
+        // One USDC, over the buyer's own channel.
+        arrives_over_client_channel(&hop, DECLARED_CHANNEL, 1_000_000).await;
+
+        let carried = peer.carried();
+        assert_eq!(carried.len(), 1, "the packet should have been forwarded");
+        assert_eq!(carried[0].amount, 3_999_000_000_000_000_000);
+        assert!(
+            carried[0].amount > 1_000_000,
+            "the arriving integer left unconverted is the 10^12 error this record exists to \
+             prevent, and before issue #1301 that is exactly what a buyer's packet did"
+        );
+    }
+
+    /// The hole this issue is really about, and the reason resolution
+    /// reads the channel key's CHAIN rather than a `[[client_channels]]`
+    /// row: a channel discovered on chain (ADR 0052, issue #502) has no row
+    /// to be resolved from, and left unresolved it would take the
+    /// unconverted arm across a real boundary. It converts identically to
+    /// the declared one, because it is the same chain and therefore the
+    /// same token.
+    #[tokio::test]
+    async fn a_channel_discovered_on_chain_converts_exactly_like_a_declared_one() {
+        let (hop, peer, _clock) = client_paying_hop(
+            &[(SettlementChain::Evm, USDC)],
+            &[("second-hop", ANYONE)],
+            0,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+        );
+
+        arrives_over_client_channel(&hop, DECLARED_CHANNEL, 1_000_000).await;
+        arrives_over_client_channel(&hop, DISCOVERED_CHANNEL, 1_000_000).await;
+
+        let carried = peer.carried();
+        assert_eq!(carried.len(), 2);
+        assert_eq!(carried[0].amount, 4_000_000_000_000_000_000);
+        assert_eq!(
+            carried[1].amount, carried[0].amount,
+            "a buyer this operator has never heard of is denominated by the chain its channel \
+             is on, exactly like one that is declared -- there is no door into the unconverted \
+             arm on a dealing node"
+        );
+    }
+
+    /// Decision 2's absence rule, at the client edge: no declared rate, no
+    /// conversion, no forward. `F02`, the same answer #1295 gave the
+    /// peer-to-peer arm -- not a new code, because a buyer's next move is
+    /// the same move.
+    #[tokio::test]
+    async fn a_client_arrival_with_no_declared_rate_is_refused_f02() {
+        let (hop, peer, _clock) = client_paying_hop(
+            &[(SettlementChain::Evm, USDC)],
+            &[("second-hop", ANYONE)],
+            0,
+            u64::MAX,
+            Some(empty_table()),
+        );
+
+        let reject = refusal(arrives_over_client_channel(&hop, DECLARED_CHANNEL, 1_000_000).await);
+
+        assert_eq!(reject.code.as_str(), "F02");
+        assert!(
+            peer.carried().is_empty(),
+            "a crossing with no declared rate forwards nothing at all"
+        );
+    }
+
+    /// And the other of the two answers: a rate this node's own poller let
+    /// go stale is `T00`, temporary, because staleness is an outage rather
+    /// than a verdict about the path.
+    #[tokio::test]
+    async fn a_client_arrival_on_a_stale_rate_is_refused_t00() {
+        let clock = test_clock();
+        let table = empty_table();
+        table.write(|table| {
+            table.refresh(
+                asset(USDC),
+                asset(ANYONE),
+                rate(USDC_TO_ANYONE, 1),
+                clock.now(),
+            )
+        });
+        let peer = Arc::new(CarriesAndRemembers::quoting(0));
+        let hop = dealing_hop_over(
+            peer.clone(),
+            &[("second-hop", ANYONE)],
+            0,
+            u64::MAX,
+            Some(table),
+            clock.clone(),
+        )
+        .with_client_channel_assets([(SettlementChain::Evm, asset(USDC))].into_iter().collect());
+
+        // Past the two-minute ttl `rate_guards` declares.
+        clock.advance(Duration::seconds(121));
+        let reject = refusal(arrives_over_client_channel(&hop, DECLARED_CHANNEL, 1_000_000).await);
+
+        assert_eq!(reject.code.as_str(), "T00");
+        assert!(peer.carried().is_empty());
+    }
+
+    /// Decision 7's inverse, applied at this hop (issue #1296): a probe a
+    /// buyer sent gets its running cost back in the unit the BUYER counts
+    /// in -- its own channel's -- rather than in the unit the far leg
+    /// happens to settle in.
+    #[tokio::test]
+    async fn a_reject_crossing_back_answers_in_the_buyers_own_unit() {
+        // 0.001 ANYONE of fee, which at four ANYONE to the USDC is 250 USDC
+        // base units -- and 10^12 times that as a raw integer, which is
+        // what an un-converted pass-through would have reported to a buyer.
+        let fee = 1_000_000_000_000_000;
+        let (hop, peer, _clock) = client_paying_hop(
+            &[(SettlementChain::Evm, USDC)],
+            &[("second-hop", ANYONE)],
+            fee,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+        );
+
+        let reject = refusal(arrives_over_client_channel(&hop, DECLARED_CHANNEL, 1_000_000).await);
+
+        assert_eq!(peer.carried().len(), 1, "the packet did reach the peer");
+        assert_eq!(reject.accumulated_cost, 250);
+        assert_ne!(
+            reject.accumulated_cost, fee,
+            "a buyer that reads the outgoing figure unconverted overstates what the path costs \
+             it by the whole decimals gap"
+        );
+    }
+
+    /// The same probe, over a chain-discovered channel: the reject path
+    /// reads the identical `crossing` call the forward did, so a packet and
+    /// its reject can never disagree about whether they crossed a boundary
+    /// -- whichever door the packet came in.
+    #[tokio::test]
+    async fn a_probe_over_a_chain_discovered_channel_answers_in_that_channels_unit() {
+        // Four ANYONE charged by everything beyond this hop, plus 0.001 of
+        // this hop's own.
+        let (hop, _peer, _clock) = client_paying_hop_quoting(
+            &[(SettlementChain::Evm, USDC)],
+            &[("second-hop", ANYONE)],
+            1_000_000_000_000_000,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+            4_000_000_000_000_000_000,
+        );
+
+        let reject =
+            refusal(arrives_over_client_channel(&hop, DISCOVERED_CHANNEL, 1_000_000).await);
+
+        // `ceil((4e18 + 1e15) / 4e12)`: one USDC for the far end, 250 base
+        // units for this hop, both in the buyer's unit.
+        assert_eq!(reject.accumulated_cost, 1_000_250);
+    }
+
+    /// The absence rule, which is the safety rule, at the client edge: a
+    /// node that declares no `[[tokens]]` resolves no client channel,
+    /// crosses no boundary, and runs `amount_after_fee` -- the one
+    /// `checked_sub` it has always run. Asserted against that function
+    /// directly, so "byte for byte the code it runs today" is a claim a
+    /// reader can check rather than a number someone worked out.
+    #[tokio::test]
+    async fn a_client_arrival_on_a_node_that_resolves_no_token_runs_amount_after_fee() {
+        let fee = 10;
+        let (hop, peer, _clock) = client_paying_hop(&[], &[], fee, u64::MAX, None);
+
+        arrives_over_client_channel(&hop, DECLARED_CHANNEL, 1_000).await;
+
+        assert!(hop.client_channel_assets.is_empty());
+        assert_eq!(
+            hop.crossing(Some(Arrival::ClientChannel(DECLARED_CHANNEL)), "second-hop"),
+            None
+        );
+        assert_eq!(
+            peer.carried()[0].amount,
+            amount_after_fee(1_000, fee).expect("the fee leaves something")
+        );
+    }
+
+    /// ADR 0028 and ADR 0065, unchanged by any of the above: what a buyer
+    /// pays is the charge its edge posted for the route, in the buyer's own
+    /// unit, and a downstream denomination boundary is none of its
+    /// business. The two hops below differ only in whether they deal -- the
+    /// posted charge is the same figure on both, and only what leaves
+    /// differs.
+    #[tokio::test]
+    async fn the_charge_a_buyer_pays_is_its_edges_own_price_whether_or_not_this_hop_deals() {
+        let price = 1_100;
+        let peer = Arc::new(CarriesAndRemembers::quoting(0));
+        let dealing = covering(
+            Connector::new(
+                vec![],
+                vec![PeerRoute::new_priced("g.example.app", "second-hop", price)],
+                Arc::new(FakeAppClient::new()),
+                peer.clone(),
+                test_clock(),
+            )
+            // The cap is in the OUTGOING unit and this leg's is a
+            // 18-decimals one, which is exactly why `local/dealing`'s own
+            // config writes it out rather than taking the default.
+            .with_peer_packet_caps([("second-hop".to_string(), u64::MAX)])
+            .with_peering_assets(
+                [("second-hop".to_string(), asset(ANYONE))]
+                    .into_iter()
+                    .collect(),
+            )
+            .with_client_channel_assets([(SettlementChain::Evm, asset(USDC))].into_iter().collect())
+            .with_rate_table(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+            "second-hop",
+        );
+
+        let plain_peer = Arc::new(CarriesAndRemembers::quoting(0));
+        let plain = covering(
+            Connector::new(
+                vec![],
+                vec![PeerRoute::new_priced("g.example.app", "second-hop", price)],
+                Arc::new(FakeAppClient::new()),
+                plain_peer.clone(),
+                test_clock(),
+            ),
+            "second-hop",
+        );
+
+        let posted = dealing
+            .client_route_price("g.example.app")
+            .expect("a priced forwarded route");
+        assert_eq!(
+            posted.charge(0),
+            plain
+                .client_route_price("g.example.app")
+                .expect("a priced forwarded route")
+                .charge(0),
+            "what a buyer is asked for is the route's own price, and dealing does not move it"
+        );
+        assert_eq!(posted.charge(0), price);
+
+        // A buyer that pays exactly what it was asked for is carried by
+        // both -- and only the figure that LEAVES differs.
+        arrives_over_client_channel(&dealing, DECLARED_CHANNEL, posted.charge(0)).await;
+        arrives_over_client_channel(&plain, DECLARED_CHANNEL, posted.charge(0)).await;
+
+        assert_eq!(peer.carried()[0].amount, 4_400_000_000_000_000);
+        assert_eq!(plain_peer.carried()[0].amount, price);
     }
 
     #[tokio::test]

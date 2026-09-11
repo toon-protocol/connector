@@ -16,6 +16,7 @@
 //! solely to be refused by name ([`ConfigError::PeerCredentialRemoved`]).
 
 mod client_channel;
+mod client_channel_asset;
 mod config;
 mod denomination;
 mod error;
@@ -31,6 +32,7 @@ mod secret;
 mod settlement;
 
 pub use client_channel::{ClientChannelConfig, EvmClientChannelConfig, SolanaClientChannelConfig};
+pub use client_channel_asset::ClientChannelAssets;
 pub use config::{parse_socks_proxy, Config};
 pub use denomination::{DeclaredToken, DenominationConfig, QuoteLeg, QuotePath, RateRow};
 pub use error::ConfigError;

@@ -88,7 +88,24 @@ impl PeeringAssets {
         incoming_peer_id: &str,
         outgoing_peer_id: &str,
     ) -> Option<(&AssetId, &AssetId)> {
-        let incoming = self.asset(incoming_peer_id)?;
+        self.boundary_from(self.asset(incoming_peer_id)?, outgoing_peer_id)
+    }
+
+    /// [`Self::boundary_between`] for an arrival whose token is already
+    /// resolved -- a client-edge arrival, whose incoming half comes from
+    /// [`ClientChannelAssets`](crate::ClientChannelAssets) rather than from
+    /// this table (issue #1301).
+    ///
+    /// The comparison itself lives here and only here, so that the two
+    /// kinds of arrival a forward can come out of cannot one day answer
+    /// "is this a crossing" differently. `incoming` borrows for the same
+    /// lifetime as this table because a caller holds both tables on one
+    /// value.
+    pub fn boundary_from<'a>(
+        &'a self,
+        incoming: &'a AssetId,
+        outgoing_peer_id: &str,
+    ) -> Option<(&'a AssetId, &'a AssetId)> {
         let outgoing = self.asset(outgoing_peer_id)?;
         (incoming != outgoing).then_some((incoming, outgoing))
     }
@@ -125,7 +142,15 @@ impl FromIterator<(String, AssetId)> for PeeringAssets {
 /// that reached this point has: `resolve_peer_channels` and
 /// `resolve_pay_channels` already refuse such a row by name and more
 /// precisely (issue #1138).
-fn settlement_asset(settlements: &[SettlementConfig], chain: SettlementChain) -> Option<AssetId> {
+///
+/// Shared with `resolve_client_channel_assets` (issue #1301), which asks
+/// the identical question of the client edge's channels -- one rule, one
+/// implementation, so the two sides of a hop can never disagree about what
+/// a chain's token is.
+pub(crate) fn settlement_asset(
+    settlements: &[SettlementConfig],
+    chain: SettlementChain,
+) -> Option<AssetId> {
     settlements
         .iter()
         .find(|settlement| settlement.chain() == chain)

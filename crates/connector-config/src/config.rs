@@ -7,6 +7,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::client_channel::{resolve_client_channels, ClientChannelConfig, RawClientChannel};
+use crate::client_channel_asset::{resolve_client_channel_assets, ClientChannelAssets};
 use crate::denomination::{
     resolve_denomination, DenominationConfig, RawRateGuards, RawRateRow, RawToken,
 };
@@ -337,6 +338,7 @@ pub struct Config {
     btp_session_window: Option<NonZeroU32>,
     denomination: DenominationConfig,
     peering_assets: PeeringAssets,
+    client_channel_assets: ClientChannelAssets,
 }
 
 impl Config {
@@ -640,6 +642,16 @@ impl Config {
             &settlements,
             &denomination,
         )?;
+        // ADR 0071 decision 1 (issue #1301): the same question asked of the
+        // client edge -- which declared token a channel a buyer pays over
+        // holds, so that a forward out of a client arrival crosses a
+        // boundary on the same terms a peer arrival does. After the
+        // peerings, so that a node whose peering already names an
+        // undeclared token is refused by the more specific message.
+        // Resolved from the settlement tables alone and keyed by chain,
+        // because the channel this has to cover is the one no
+        // `[[client_channels]]` row names (ADR 0052, issue #502).
+        let client_channel_assets = resolve_client_channel_assets(&settlements, &denomination)?;
         let state_dir = raw.state_dir.map(PathBuf::from);
         let channel_liveness_ttl = match raw.channel_liveness_ttl_secs {
             Some(0) => return Err(ConfigError::ZeroChannelLivenessTtl),
@@ -848,6 +860,7 @@ impl Config {
             btp_session_window,
             denomination,
             peering_assets,
+            client_channel_assets,
         })
     }
 
@@ -879,6 +892,22 @@ impl Config {
     /// refusal to make.
     pub fn peering_assets(&self) -> &PeeringAssets {
         &self.peering_assets
+    }
+
+    /// Which declared token a client channel this node accepts claims on is
+    /// denominated in (ADR 0071 decision 1, issue #1301) -- and therefore
+    /// whether a forward out of a buyer's own packet crosses a denomination
+    /// boundary, which is the same question [`Config::peering_assets`]
+    /// answers for a peer arrival.
+    ///
+    /// Always a value, and empty for every node that declares no
+    /// `[[tokens]]`: such a node resolves no channel, answers no boundary,
+    /// and forwards a client arrival exactly as it did before ADR 0071.
+    /// A node that does declare tokens got every chain it can be paid on
+    /// resolved here at boot -- including the chains whose channels no
+    /// `[[client_channels]]` row names, which is the point.
+    pub fn client_channel_assets(&self) -> &ClientChannelAssets {
+        &self.client_channel_assets
     }
 
     /// How long a chain-resolved client channel's liveness may be believed
@@ -2486,6 +2515,162 @@ counterparty_key = "{SOLANA_COUNTERPARTY_KEY}"
         .expect("a node that declares nothing is held to nothing");
 
         assert!(config.peering_assets().is_empty());
+    }
+
+    // -- a client channel resolves to the token its chain settles in (ADR
+    // 0071 decision 1, issue #1301) --
+    //
+    // The client edge's half of the rule above, and keyed by CHAIN rather
+    // than by declared row: a `[settlement.<chain>]` table is what lets
+    // this node accept a claim on a channel no `[[client_channels]]` row
+    // names (ADR 0052, issue #502), so every chain with such a table can
+    // carry an arrival a forward has to denominate.
+
+    /// A channel key exactly as
+    /// `connector_domain::client_claim::ClientClaim::channel_key` renders
+    /// one, on a channel this file never mentions. That is the point: the
+    /// id is not read, only the namespace before the colon.
+    const UNDECLARED_EVM_CHANNEL_KEY: &str =
+        "evm:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// [`peering_config`] plus a second settlement table and a
+    /// `[[client_channels]]` row on it -- an EVM peering and a Solana
+    /// client edge, which is the shape that separates the two rules: the
+    /// peering resolves against the EVM token and the client channel
+    /// against the Solana one.
+    fn client_channel_on_a_second_chain(key_path: &Path, declaration: &str) -> String {
+        format!(
+            r#"
+[settlement.solana]
+rpc_url = "https://api.devnet.solana.com"
+program_id = "{SOLANA_PROGRAM_ID}"
+token_address = "{SOLANA_MINT}"
+decimals = 6
+
+[settlement.solana.key]
+key_file = "{key_file}"
+
+[[client_channels]]
+channel_account = "{SOLANA_CHANNEL_ACCOUNT}"
+counterparty = "{SOLANA_COUNTERPARTY_KEY}"
+{declaration}"#,
+            key_file = key_path.display(),
+        )
+    }
+
+    /// The acceptance criterion: a client arrival resolves to the declared
+    /// token its channel holds, read off `[settlement.<chain>] token_address`
+    /// and nothing declared a second time -- the same rule the peering
+    /// table already uses, asked of the client edge.
+    #[test]
+    fn a_client_channel_resolves_to_the_declared_token_its_chain_settles_in() {
+        let config =
+            load_peering(|text| format!("{text}{}", declaring(&[SETTLEMENT_TOKEN]))).expect("load");
+
+        let resolved = config.client_channel_assets();
+        assert!(!resolved.is_empty());
+        assert_eq!(
+            resolved
+                .asset(UNDECLARED_EVM_CHANNEL_KEY)
+                .map(ToString::to_string),
+            Some(SETTLEMENT_TOKEN.to_ascii_lowercase()),
+            "a channel on the EVM chain holds what [settlement.evm] settles in -- including a \
+             channel this file never named, which is the one this rule exists for"
+        );
+        assert_eq!(
+            resolved.asset(&format!("solana:{SOLANA_CHANNEL_ACCOUNT}")),
+            None,
+            "no [settlement.solana] table, so no claim on a Solana channel could be admitted \
+             here and there is nothing to resolve"
+        );
+    }
+
+    /// The rule that protects every node not doing any of this, restated
+    /// for the client edge: no `[[tokens]]`, nothing resolved, and the same
+    /// file loads unchanged. This is the shape every config in this
+    /// repository is committed in.
+    #[test]
+    fn a_node_that_declares_no_tokens_resolves_no_client_channel() {
+        let config = load_peering(|text| text).expect("load");
+
+        assert!(config.client_channel_assets().is_empty());
+        assert_eq!(
+            config
+                .client_channel_assets()
+                .asset(UNDECLARED_EVM_CHANNEL_KEY),
+            None
+        );
+    }
+
+    /// A node that deals is held to it. The peering here resolves fine --
+    /// its EVM token is declared -- and the refusal is about the chain the
+    /// CLIENT EDGE can be paid on, which nothing else in the file would
+    /// have caught. Unresolved, a buyer paying over that chain would have
+    /// forwarded across a real boundary at an implied 1:1.
+    #[test]
+    fn a_client_channel_chain_holding_an_undeclared_token_is_refused_by_name() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let text = peering_config(
+            key_file.path(),
+            state_dir.path(),
+            &client_channel_on_a_second_chain(key_file.path(), &declaring(&[SETTLEMENT_TOKEN])),
+        );
+
+        let message = expect_error(load_text(&text), |error| {
+            matches!(
+                error,
+                ConfigError::ClientChannelTokenNotDeclared { chain, asset }
+                    if *chain == SettlementChain::Solana
+                        && asset.to_string() == format!("solana:{SOLANA_MINT}")
+            )
+        });
+        assert!(
+            message.contains("solana")
+                && message.contains(SOLANA_MINT)
+                && message.contains("[[tokens]]"),
+            "got: {message}"
+        );
+    }
+
+    /// And declaring that chain's token is what makes the same file load --
+    /// both chains resolved, each to its own settlement table's token, so
+    /// every arrival this node can be paid on has a unit.
+    #[test]
+    fn declaring_both_chains_tokens_resolves_both_client_edges() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let solana_token = format!("solana:{SOLANA_MINT}");
+        let text = peering_config(
+            key_file.path(),
+            state_dir.path(),
+            &client_channel_on_a_second_chain(
+                key_file.path(),
+                &declaring(&[SETTLEMENT_TOKEN, &solana_token]),
+            ),
+        );
+
+        let config = load_text(&text).expect("load");
+
+        let resolved = config.client_channel_assets();
+        assert_eq!(
+            resolved
+                .asset(UNDECLARED_EVM_CHANNEL_KEY)
+                .map(ToString::to_string),
+            Some(SETTLEMENT_TOKEN.to_ascii_lowercase())
+        );
+        assert_eq!(
+            resolved
+                .asset(&format!("solana:{SOLANA_CHANNEL_ACCOUNT}"))
+                .map(ToString::to_string),
+            Some(solana_token)
+        );
     }
 
     // -- "the settlement table this channel needs is absent" (issue #1138)

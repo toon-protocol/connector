@@ -1897,20 +1897,29 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         // pairs are all static `[[rates]]` rows starts nothing here.
         spawn_quote_path_pollers(table, config)?;
     }
-    // ADR 0071 decisions 1 and 2, issue #1295: the two facts the forwarding
-    // path's converting arm reads, and the only two. Which token each
-    // peering holds decides whether a forward crosses a denomination
-    // boundary at all, and the table decides what it crosses at -- or that
-    // it refuses.
+    // ADR 0071 decisions 1 and 2, issues #1295 and #1301: the facts the
+    // forwarding path's converting arm reads, and the only ones. Which
+    // token each leg holds decides whether a forward crosses a
+    // denomination boundary at all, and the table decides what it crosses
+    // at -- or that it refuses.
     //
-    // They are wired separately because they are independently absent, and
-    // the combination that matters is the awkward one: a node that declares
-    // tokens but no rate row has peering assets and no table, resolves
-    // boundaries it has priced nothing for, and must refuse every crossing
-    // rather than pass an integer across a scale difference. Handing the
-    // table only when both exist would turn that refusal back into the
-    // silent 10^12 pass-through ADR 0071 exists to make impossible.
-    connector = connector.with_peering_assets(config.peering_assets().clone());
+    // BOTH asset tables go on, always together. A packet can arrive over a
+    // peering or over a client channel, both are denominated, and a node
+    // given only one of the two would convert one kind of arrival and carry
+    // the other across the same boundary at an implied 1:1 -- which is the
+    // 10^12 error rather than a partial rollout of the fix. They are one
+    // wiring step for that reason, even though they are two tables.
+    //
+    // The rate table is wired separately because it is independently
+    // absent, and the combination that matters is the awkward one: a node
+    // that declares tokens but no rate row has asset tables and no rate
+    // table, resolves boundaries it has priced nothing for, and must refuse
+    // every crossing rather than pass an integer across a scale difference.
+    // Handing the table only when both exist would turn that refusal back
+    // into the silent pass-through ADR 0071 exists to make impossible.
+    connector = connector
+        .with_peering_assets(config.peering_assets().clone())
+        .with_client_channel_assets(config.client_channel_assets().clone());
     if let Some(table) = &rate_table {
         connector = connector.with_rate_table(table.clone());
     }
