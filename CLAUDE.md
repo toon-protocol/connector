@@ -24,9 +24,10 @@ binary. Nothing else in this repository is the connector:
   announcer sidecar. These are the only reason npm and `package.json` still exist
   here. `npm test` runs them; it does not test the connector.
 
-Mina is **gone from this repository** (ADR 0065). ADR 0002 had already dropped it as a
+Mina is **gone from this repository** (ADR 0065-mina, _Mina leaves the repository_ — the number
+is shared, see `docs/adr/README.md`). ADR 0002 had already dropped it as a
 settlement chain — o1js proof generation is JavaScript-only and a Node sidecar was
-refused — and 0065 deleted what that record left standing: the zkApp, the browser
+refused — and 0065-mina deleted what that record left standing: the zkApp, the browser
 faucet dApp, the Mina tooling and the faucet's Mina leg. What survives is the
 connector's refusal of a `mina` claim **by name**, which is wire behaviour owed to
 `toon-client`, not Mina support. Do not reintroduce an o1js dependency.
