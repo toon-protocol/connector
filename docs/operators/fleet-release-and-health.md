@@ -145,7 +145,7 @@ enable label" — precisely the set that can change without a human. A labelled 
 defined is a **failure**, not a skip: opting a service into auto-redeploy without saying how to tell
 whether it is serving is the omission the file exists to refuse.
 
-Three things are checked, because each catches what the others cannot:
+Five things are checked, because each catches what the others cannot:
 
 1. **Container state, sampled twice.** A crash-loop shows as `Up 3 seconds` on any single look; a
    rising `RestartCount` across the probe is the giveaway.
@@ -154,6 +154,11 @@ Three things are checked, because each catches what the others cannot:
    upstream: a recreate changes the container's Docker network IP, and an nginx that resolved the
    old one 502s to the world while loopback on the box looks perfect. Only an off-box request
    crosses nginx.
+4. **A forwarded route, cross-checked.** Every check above asks whether a node is up **for itself**;
+   this one asks whether two nodes still agree about the route and the peering between them. Free.
+   See "The forwarded route" below.
+5. **A forwarded route, actually crossed.** Only a paid packet can prove that. Off by default and
+   dispatch-only, because it spends.
 
 ### The probes, and why these
 
@@ -182,6 +187,126 @@ The issue carries the full probe table and the rollback commands. **A later gree
 recovery and closes it**, so the issue's open/closed state _is_ the fleet's current verdict; you
 never have to work out whether an old alert is still live. One issue, not one per failing run: a
 fleet that stays down for an hour would otherwise open four.
+
+### The forwarded route: what container health cannot see
+
+Everything above asks whether a node is up and answering **for itself**. Until 2026-08-28 nothing
+asked whether one node could still reach another, and that cost two multi-hour outages in one day —
+both of them green on every probe in the table above for their whole duration:
+
+|        | what broke                                                                                                        | how long | found by                      |
+| ------ | ----------------------------------------------------------------------------------------------------------------- | -------- | ----------------------------- |
+| 10:26Z | `T01 peer unreachable` on `g.toon.relay.store` and `g.toon.relay.gas`, after a connector restart on the relay box | ~7 h     | a human sending a job by hand |
+| 01:27Z | `T00 … would not report the claim state of channel FDi2TCT9…` on `g.toon.store.relay`, after an SPL mint cutover  | ~12 h    | the same way                  |
+
+The second one is worth understanding, because it is cheap to detect once you have seen it. On
+Solana the channel PDA is seeded with the mint — `["channel", min(p1,p2), max(p1,p2), mint]` — so
+changing the mint on one box **moves every channel id that box shares with anyone**. Both nodes then
+look perfectly healthy in isolation and disagree completely about which channel they are on.
+
+Two jobs close this, and they are deliberately different questions.
+
+#### `peering-crosscheck` — free, every run
+
+Reads each node's public `GET /ilp` self-description (ADR 0050) and holds the three documents to each
+other. No ssh key, no bearer token, no packet, **no money**. It also covers the **gas box**, which
+nothing else in `fleet-health.yml` touches — the box probes are a matrix over `relay` and `ario`
+only.
+
+| Assertion                                                               | What it catches                                                                                                                 |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Every forwarded prefix lands on a node that actually routes it          | a **dangling forward** — a node sells a name nobody routes, and the payer is charged and then refused `F02`                     |
+| A forward's price covers the far side's price                           | an **underpriced forward** — one side is repriced, the packet arrives short, and it is refused after the payer has been charged |
+| Both sides derive channel ids from the same settlement facts, per chain | the **01:27Z outage**: a mint or token-network change on one box only                                                           |
+| At least one side advertises a `peerCarriage`                           | a peering nothing can re-establish after a restart                                                                              |
+
+Exactly one side of a peering dials and the other only accepts, so one side advertising no carriage
+is normal and is reported as such. Both advertising none is not.
+
+**What a green cross-check does _not_ mean.** It proves the two sides _agree_. It does not prove a
+packet gets through, and nothing free can. The 10:26Z outage is the counter-example: every document
+stayed correct for all seven hours — the peering was simply down.
+
+The assertions live in `tools/ci/fleet-peering-crosscheck.py` rather than in the workflow, because
+every FAIL branch in them is unreachable from a healthy fleet by construction. `--self-test` drives
+all of them against synthetic documents; CI runs it on every PR and the workflow runs it again
+before trusting the script against the live fleet. A monitor whose failure branches have never
+executed is a green tick over nothing.
+
+#### `paid-probe` — dispatch only, `off` by default
+
+The only check here that spends, and the only one that proves a packet crosses.
+
+```sh
+gh workflow run fleet-health.yml -f paid_probe=dry-run   # proves the plumbing, spends nothing
+gh workflow run fleet-health.yml -f paid_probe=send      # sends real packets, spends real funds
+```
+
+**A forwarded route is a paid route.** An unpaid request to `g.toon.relay.store` comes back as x402
+payment terms, which the relay answers out of its own config without consulting the store at all —
+so it proves nothing about the peering. The `T01`/`T00`/FULFILL distinction only exists once a packet
+has been paid for and forwarded.
+
+**It needs no funded CI wallet, and adds no secret.** The obvious design — a dedicated CI wallet, a
+channel opened from CI, a client SDK, a channel-watermark file to reconcile every run — is
+unnecessary, because the connector can originate a packet through its own routing: `POST /packets`
+(ADR 0008), which `connector send` forms and signs. Driven that way the money comes from **the relay's
+own peer channel, the very channel being tested**, and the packet takes exactly the path a client's
+would. The job needs only `DEVNET_SSH_KEY`, which this workflow already holds, and the relay box's
+own operator write key, which already lives at `/root/relay/deploy/operator-write.key` and never
+leaves the box — it is bind-mounted read-only into a throwaway container.
+
+**What it costs, and why arming it is your call.** ~1011 base units for the store leg and ~1001 for
+the gas leg: about **$0.002 per run**, out of the relay's peer channels. On the 15-minute cron that
+is ~$0.20/day and the channels will need periodic `POST /channels/:id/fund`; hourly is ~$0.05/day.
+
+A **REJECT costs the same as a FULFILL.** ADR 0042 retires ADR 0004's "value moves on fulfilment": a
+peer PREPARE carries its covering claim, and the claim is banked on _arrival_, before the packet is
+handled. So pointing the probe at an envelope the app refuses makes it cheap in the sense that the
+app does no work — no Arweave upload, no gas transaction — and **not** in the sense that the packet is
+free. That is the whole reason this is dispatch-only: putting a spend on a cron is a decision about
+your own channels' balance, and a workflow edit should not make it for you.
+
+**Reading the answer.** The probe deliberately sends an envelope the terminating app refuses, so the
+expected healthy answer is a _final error from the far end_, not a fulfilment:
+
+| Answer                                 | Verdict                                                                                                                                                                                                                                         |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `FULFILL`                              | crossed, and the far app answered. `connector send` checks the fulfilment against the one its own gift-wrap derives (ADR 0019), so this is proof the packet reached the node holding the shared secret — not merely _a_ node willing to answer. |
+| `REJECT F99` (or another far-side `F`) | **pass** — the packet crossed the peering and the far side answered. This is the expected result.                                                                                                                                               |
+| `REJECT F02`                           | crossed, but the far side routes no such name. `peering-crosscheck` should have caught this first.                                                                                                                                              |
+| `REJECT T01`                           | the peering itself is down; the packet never left. **This is 10:26Z.** The message names the peer.                                                                                                                                              |
+| `REJECT T00`                           | the two sides disagree about the channel. **This is 01:27Z.** Read the same run's cross-check settlement rows.                                                                                                                                  |
+
+#### Recovering a peering
+
+A peering is not rolled back — it is re-established, or re-priced, from the operator surface of the
+node that owns the row (ADR 0058). Reads need only the bearer token; writes are RFC 9421-signed with
+`docs/operators/sign-write.sh`. The relay box ships a copy at `deploy/sign-write.sh` alongside the
+private half of its write key; the store and gas boxes hold only the public allowlist
+(`operator-write.keys`), so a write to those two is signed from wherever the operator keeps the
+private half — which is where it belongs.
+
+```sh
+# On the box: what does this node think it forwards, and to whom?
+T=$(cat operator-bearer.token)
+curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<edge>/routes/peers
+curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<edge>/peers
+
+# A DANGLING FORWARD is usually a runtime row the config file no longer owns.
+./sign-write.sh -k operator-write.key -X DELETE -p /routes/peers/<prefix>
+
+# A peering whose channel ids moved, or that cannot be dialled, is re-established
+# by the same write that made it — ADR 0059 lands on the same channel if one exists.
+./sign-write.sh -k operator-write.key -X POST -p /peers \
+  -b '{"id":"<peer>","url":"https://…/ilp","fee":1,"max_packet_amount":100000}'
+
+# Then prove a packet crosses, rather than assuming it does.
+gh workflow run fleet-health.yml -f paid_probe=send
+```
+
+The client edge is `127.0.0.1:4000` on the store and gas boxes and **`127.0.0.1:3000`** on the relay;
+the operator surface rides the same port on all three.
 
 ### Known gap, not alerted on
 
