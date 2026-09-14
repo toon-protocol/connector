@@ -1,6 +1,6 @@
 # A verified payment is stated to the app; an unverified one is stated by nobody
 
-**Status:** Accepted. **Supersedes [0036](0036-a-paid-deliverys-attribution-stays-on-the-connector.md)'s conclusion** and narrows [0020](0020-a-price-is-flat-and-attaches-to-a-handler.md). Narrowed in turn by [0065](0065-a-price-is-a-schedule-over-payload-length.md): `X-TOON-Amount` is the charge for that packet, which for a flat route is the flat price it always was. Live: `connector-runtime/src/attribution.rs`.
+**Status:** Accepted. **Supersedes [0036](0036-a-paid-deliverys-attribution-stays-on-the-connector.md)'s conclusion** and narrows [0020](0020-a-price-is-flat-and-attaches-to-a-handler.md). Narrowed in turn by [0065-price](0065-a-price-is-a-schedule-over-payload-length.md): `X-TOON-Amount` is the charge for that packet, which for a flat route is the flat price it always was. Live: `connector-runtime/src/attribution.rs`.
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 

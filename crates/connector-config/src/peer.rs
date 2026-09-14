@@ -38,8 +38,10 @@ pub const DEFAULT_PEER_TIMEOUT_MS: u64 = 30_000;
 ///   **1** µUSDC per write (buzz huddles, per audio frame at 49 fps), and
 ///   `infra/linode-store/connector-rust.toml` prices `g.toon.ario` at
 ///   **1000**. `crates/connector-bin/tests/devnet_configs_load.rs` pins both
-///   as `EXPECTED_RELAY_PRICE`/`EXPECTED_STORE_PRICE`, and
-///   `docs/devnet-pricing.md` is the committed table they come from.
+///   as `EXPECTED_RELAY_PRICE`/`EXPECTED_STORE_PRICE`. Both files are
+///   fixtures rather than what either box runs (ADR 0068, Decision 6); the
+///   live figures are each node repository's own, and are only larger by a
+///   slope (`docs/devnet-pricing.md`), so the margin below is unaffected.
 /// * The largest *forwarded* amount this fleet ever ran was the retired
 ///   apex's `g.toon.ario` leg: a client paid `1002`, the apex kept a fee of
 ///   `2`, and **1000** went over the peering (`docs/devnet-pricing.md`, "The

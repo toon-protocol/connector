@@ -228,8 +228,13 @@ const SOLANA_SETTLEMENT_SECTIONS: &[&str] = &["[settlement.solana]", "[settlemen
 /// passing if that value went back to `0`, which is exactly the regression
 /// issue #557 exists to prevent. The figure's origin is parity with the
 /// retired TypeScript fleet's own `price: '1000'` -- see
-/// `docs/devnet-pricing.md`, which is the committed source of truth now
-/// that both files that carried that literal are deleted (#901, #872).
+/// `docs/devnet-pricing.md`'s history sections for where the figure came
+/// from. That file is NOT where this literal's authority lives, and since
+/// ADR 0068 it says so itself: the store BOX's price is committed in
+/// `toon-protocol/store`'s own `deploy/` bundle, and the box has charged a
+/// schedule (`{ base = 1000, per_kib = 10 }`) since store#107. What this
+/// constant pins is the FIXTURE under `infra/linode-store/`, which is a
+/// file this repository still owns and still boots (ADR 0068, Decision 6).
 const EXPECTED_STORE_PRICE: u64 = 1000;
 
 /// The `price` the relay file puts on `g.toon.relay`, which is **not** the

@@ -1,79 +1,185 @@
 # Devnet route pricing
 
-The committed source of truth for what every devnet route charges, and why
-(connector#785). Before this existed the decisions were spread across comment
-blocks in four config files, which is how a hand-edit on one box sat
-unreconciled for twenty hours.
+**This file is not the price list any more, and re-pinning the numbers in it would not make it
+one.** [ADR 0068](adr/0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md)
+moved deploy ownership into the node repositories: what a box serves, and at what price, is
+committed in **that box's own repository** and guarded by that repository's own bundle test.
+Nothing in this repository decides it, and nothing here can notice when it changes.
 
-For the mechanism these numbers are plugged into — who pays whom, on which channel, and why
-`price - fee >= next hop price` is an F03 rather than a subsidy when it is violated — see
-[`protocol/money-model-pre-868.md`](protocol/money-model-pre-868.md).
+That is not a small correction to the table this file used to carry. Probed 2026-08-28 (#1250),
+that table was wrong in three separate ways at once — a prefix no route answers to, a flat figure
+for a route that had taken a slope, and a whole box it did not know existed — and every one of
+them had been true when it was written a fortnight earlier. **A copy of a number another
+repository owns goes stale without anything failing**, which is the same class of defect
+[ADR 0068](adr/0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md)
+retired a workflow over: reporting green about a box you no longer have a hand in.
+
+So what this file keeps is what no single node repository owns — the unit every figure is in, the
+arithmetic a multi-hop path has to satisfy, **where each box's authority actually lives**, and how
+to ask a box what it charges rather than reading it here. Plus the history of the arithmetic that
+is cited from elsewhere in this repo, which is history and cannot go stale.
+
+## Where a price is decided
+
+Three tiers, and only the first is committed anywhere.
+
+| What                                                     | Decided in                                                                                  | Guarded by                                     |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| A box's own **terminating** prefixes and their schedules | that node repository's `deploy/` bundle                                                     | that repository's own bundle test              |
+| A **forwarded** leg's price and fee                      | runtime peer-route state on the box, in its state volume — committed nowhere, **by design** | nothing; a runtime row is not a committed fact |
+| What any box is charging **right now**                   | the box                                                                                     | the free self-description, below               |
+
+The second tier is the one that surprises people, so it is worth saying plainly: the relay's
+`g.toon.relay.store` and `g.toon.relay.gas` legs, and the gas box's route back to `g.toon.relay`,
+appear in **no** committed file in any repository. They are established over the operator surface
+(`POST /peers`, then `POST /routes/peers` —
+[ADR 0058](adr/0058-a-peering-is-established-from-a-url.md),
+[ADR 0034](adr/0034-a-runtime-peer-route-table-never-shadows-the-config-file.md)) and live in
+`runtime-peers.json` beside the box's state. Each bundle says so in its own comments and explains
+why writing them into the config file would take them away from that surface for good. Read them
+back with `GET /peers`; a `"source"` of `"runtime"` is that arrangement working.
+
+## The fleet, and whose repository owns each box
+
+Four boxes and no apex — the apex (`toon`) was destroyed 2026-08-14 (#872, toon-meta#313).
+`g.toon` remains the namespace root in the wire protocol, and nothing answers at it.
+
+| Box            | Edge                                  | Terminates                               | Authority                                                                                                    |
+| -------------- | ------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| relay          | `proxy.relay.devnet.toonprotocol.dev` | `g.toon.relay`, `g.toon.relay.ephemeral` | [`toon-protocol/relay`](https://github.com/toon-protocol/relay) `deploy/connector.toml`                      |
+| store (`ario`) | `proxy.ario.devnet.toonprotocol.dev`  | `g.toon.store`, `g.toon.relay.store`     | [`toon-protocol/store`](https://github.com/toon-protocol/store) `deploy/connector.toml.template`             |
+| gas            | `proxy.gas.devnet.toonprotocol.dev`   | `g.toon.gas`, `g.toon.relay.gas`         | [`toon-protocol/gas-station`](https://github.com/toon-protocol/gas-station) `deploy/connector.toml.template` |
+| faucet         | `faucet.devnet.toonprotocol.dev`      | — no connector at all                    | `infra/linode-faucet/` in **this** repository                                                                |
+
+`ario` is a **box label and a DNS name**, and since store#109 (2026-08-27) it is nothing else:
+that box terminates `g.toon.store`, and a probe for `g.toon.ario` is a `404`. The two are easy to
+conflate precisely because the hostname still carries the older name — the box's own
+`[node].http_endpoint` is `https://proxy.ario.devnet.toonprotocol.dev/ilp` while its
+`[node].addresses` are `g.toon.store` and `g.toon.relay.store`. See "Retired names" below.
+
+The faucet box is the one whose deploy this repository still owns, and
+[ADR 0068](adr/0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md)
+says why: it has no connector, so it has no route and no price, and `fleet-ops.yml` offers it and
+nothing else.
+
+## What is genuinely fleet-wide
+
+### The unit
 
 All prices are in **base units of 6-decimal USDC** (ADR 0010;
-`docs/usdc-cross-chain-settlement.md`'s "6 decimals everywhere" is canonical
-across every chain the connector settles on, not a TypeScript-only asset config). So `1000` is
-0.001 USDC and `1` is 1 µUSDC.
+`docs/usdc-cross-chain-settlement.md`'s "6 decimals everywhere" is canonical across every chain the
+connector settles on, not a TypeScript-only asset config). So `1000` is 0.001 USDC and `1` is
+1 µUSDC. Nothing scales by `decimals` on the value path.
 
-**The apex is retired (issue #872, toon-meta#310 / toon-meta#313's live
-cutover).** Every row below that used to be a forward THROUGH the apex is
-gone along with it; the fleet is two boxes now, each terminating its own
-prefix directly for its own clients. `g.toon` remains the namespace root in
-the wire protocol, but nothing answers at it — see "The apex forward
-(retired)" below for the history this replaces.
+### A price is a schedule, and the fleet has taken one
 
-## The table
+`base + per_kib × ceil(payload_len / 1024)`, flat exactly when the slope is zero
+([ADR 0065-price](adr/0065-a-price-is-a-schedule-over-payload-length.md), #984). A flat price is
+written as the bare integer it always was, and publishes a greeting byte-identical to the
+pre-0065 one.
 
-| Route                                                | Price    | Fee | Where                                    | Guarded by             |
-| ---------------------------------------------------- | -------- | --- | ---------------------------------------- | ---------------------- |
-| relay `g.toon.relay` — terminate                     | **1**    | —   | `infra/linode-relay/connector-rust.toml` | `EXPECTED_RELAY_PRICE` |
-| store `g.toon.ario` — terminate                      | **1000** | —   | `infra/linode-store/connector-rust.toml` | `EXPECTED_STORE_PRICE` |
-| store `announcePrice` (retired TypeScript concept)\* | **2000** | —   | — (historical, file deleted #901)        | —                      |
+The store took a slope on 2026-08-27 in store#107 — two lines in its own bundle, no second box and
+no second backend, which was the outcome that record predicted. Anything in this repository still
+saying "the devnet fleet stays flat by choice" is describing the fleet as it was for one day; see
+that record's `## Update (issue #1250)`.
 
-\* The retired TypeScript config that carried this figure, `infra/linode-store/connector.yaml`, is
-deleted (issue #901) — it no longer fronted traffic (see "The TypeScript fleet" below) and was not a
-current source of truth for anything. The row survives only as the historical origin of the `2000`
-figure: the Rust `connector announce` that replaced `selfAnnounce` configures no announce price at
-all, so there is no committed literal to repoint this citation at. See "`announcePrice` 2000" below.
+### The path arithmetic, which now has two halves
 
-Last verified live **2026-08-14T12:14Z — post-cutover, against both surviving boxes' own
-edges** (the apex was destroyed earlier the same day, toon-meta#313), via the unauthenticated
-`GET /ilp/routes/price?destination=…` (ADR 0022 puts configuration answers on the free side of the
-answering/announcing line):
+A hop collects `price`, retains its `fee` and forwards the rest, so a path adds up only while every
+hop's `price − fee` is at least the next hop's price
+([ADR 0028](adr/0028-a-forwarded-route-is-priced-at-the-client-edge.md)). With a slope that must
+hold **at every length**: the bases must clear the fee **and** each hop's slope must be at least the
+next hop's, or a large enough packet erodes to a shortfall the small ones never revealed.
+
+The live relay→store leg is the worked example, and it satisfies both halves:
 
 ```
-relay box  proxy.relay.devnet  g.toon.relay -> 1
-store box  proxy.ario.devnet   g.toon.ario  -> 1000
+relay  g.toon.relay.store   base 1001, per_kib 10   forwards over the peering
+store  g.toon.relay.store   base 1000, per_kib 10   terminates
+
+  base:   1001 - fee >= 1000   =>  the relay may keep at most 1
+  slope:  10         >= 10     =>  holds at every payload length
 ```
 
-Both boxes were running `main@39f72a6e` on the `rust-sha-415531a` pin when probed
-(toon-meta#309's reconciliation), so these readings verify the committed config on the box that
-actually terminates each route — not a pre-#820 apex reading relabelled.
+No code enforces this across a peering, for the reason ADR 0028 gives — a connector cannot know
+what the next hop charges. It is checked by the operator who establishes the route, and it is why
+the figures above are worth writing down even though this file does not own them.
 
-## Why the relay route is 1 and the store legs are 1000
+### `g.toon` answers nothing
 
-**`g.toon.relay` carries buzz huddles**, which is per-audio-frame at 49 fps
-over BTP (toon-meta#262). 1 µUSDC is a coherent per-frame price; 0.001 USDC
-per frame is not. A general-write price is the wrong frame for that route.
-This was an owner decision on 2026-08-04, ratifying a value the live box had
-already been serving — the repo moved to the box, not the box to the repo.
+It is the namespace root, not an address. Every box terminates its own prefixes directly for its
+own clients; there is no hop in front of any of them.
 
-**The store legs stay at 1000** because a store write is a one-shot upload
-from an arbitrary buyer, not a high-frequency stream. Nothing amortises a
-handshake there, which is also why the relay route pins `transport = "btp"`
-(#701) while the store legs keep the default `both`.
+## Ask the box, do not read a table
 
-**Every fleet price is flat, by choice rather than by constraint.**
-[ADR 0065](adr/0065-a-price-is-a-schedule-over-payload-length.md) (#984) lets a
-route charge `{ base, per_kib }` over a packet's payload length, which is what a
-store leg fronting a per-byte upstream wants. The fleet has not taken it: a
-schedule is a config **shape** a pre-0065 binary refuses, so adopting one is a
-breaking deploy — the image moves first, then the config, per the usual
-ordering. Until then, `1000` here means the same flat figure it always did.
+Both surfaces are free and unauthenticated —
+[ADR 0022](adr/0022-a-connector-answers-it-does-not-announce.md) puts configuration
+answers on the answering side of the answering/announcing line, and
+[ADR 0050](adr/0050-a-connectors-url-resolves-to-its-self-description.md) makes a connector's URL
+resolve to its self-description:
+
+```
+GET https://<edge>/ilp                                  every prefix, with its whole schedule
+GET https://<edge>/ilp/routes/price?destination=<addr>  one prefix, resolved by longest match
+```
+
+The first is the one to reach for. It answers with the box's addresses, its settlement identity on
+each chain, and `routes[]` carrying `price` and — only where there is a slope — `pricePerKib`.
+That is the authority for what a box is charging, at the only moment the question can be answered
+truthfully, which is now.
+
+## Probed 2026-08-28T21:55Z
+
+Kept as **evidence that the surfaces above answer**, not as a table to maintain. It is dated
+because it is a reading, and a reading is stale the moment an operator edits a bundle.
+
+```
+relay  proxy.relay.devnet   g.toon.relay              1
+                            g.toon.relay.ephemeral    0
+                            g.toon.relay.gas          1001            (runtime, forwarded)
+                            g.toon.relay.store        1001 + 10/KiB   (runtime, forwarded)
+store  proxy.ario.devnet    g.toon.store              1000 + 10/KiB
+                            g.toon.relay.store        1000 + 10/KiB
+                            g.toon.ario               404 — no such route
+gas    proxy.gas.devnet     g.toon.gas                1000
+                            g.toon.relay.gas          1000
+                            g.toon.relay              2               (runtime, forwarded)
+```
+
+Three things in that reading are worth naming.
+
+**`g.toon.relay` is still 1**, and the reason has not changed — see below. It is the one figure the
+retired table got right.
+
+**The relay's two forwarded legs are 1001, not 1000.** The extra unit is the headroom ADR 0028's
+arithmetic requires: at 1001 the relay may keep a fee of at most 1 and still deliver the far side
+its 1000. The fee itself attaches to the peering rather than to the route
+([ADR 0061](adr/0061-a-fee-attaches-to-a-peering-not-to-a-route.md)) and is read from the operator
+surface, not from a free probe.
+
+**The gas box went live 2026-08-27**, from `toon-protocol/gas-station`'s own `deploy/` bundle, the
+same day both other boxes moved onto theirs. Its `g.toon.relay` route at 2 is its side of the same
+peering — a gas station spends real value on a caller's behalf, so it needs a way to pay for the
+writes that report the job.
+
+## Why the relay route is 1 and a store write is 1000
+
+**`g.toon.relay` carries buzz huddles**, which is per-audio-frame at 49 fps over BTP
+(toon-meta#262). 1 µUSDC is a coherent per-frame price; 0.001 USDC per frame is not. A general-write
+price is the wrong frame for that route. This was an owner decision on 2026-08-04, ratifying a value
+the live box had already been serving — the repo moved to the box, not the box to the repo, and the
+box that holds it is now the relay's own.
+
+**A store write starts at 1000** because it is a one-shot upload from an arbitrary buyer, not a
+high-frequency stream: nothing amortises a handshake there. That is also why the relay route pins
+`transport = "btp"` (#701) while the store legs keep the default `both`. Since store#107 the store
+also charges 10 per started KiB on top, which is the difference between a 1 KB note and a 50 MB
+object finally being visible in the price.
 
 ## The apex forward (retired, issue #872)
 
 Until issue #872 removed it, the apex sat in front of both boxes and forwarded to them over a paid
-peering — this section is kept as the historical record of the arithmetic that governed it, not as a
+peering — this section is the historical record of the arithmetic that governed it, not a
 description of anything currently live.
 
 The apex charged its own client `1002` for `g.toon.ario`, kept a `fee` of `2`, and forwarded the
@@ -91,80 +197,74 @@ The `EXPECTED_APEX_FORWARD_PRICE`/`EXPECTED_APEX_FORWARD_FEE` (and their relay-f
 constants that guarded this arithmetic in `crates/connector-bin/tests/devnet_configs_load.rs` are
 removed by issue #872 along with the peering and the `infra/linode-node/` config that named them —
 with no hop, there is no fee and no peer arrival, so the F03 peer-arrival case they guarded against
-cannot arise on this fleet any more. `EXPECTED_RELAY_PRICE` and `EXPECTED_STORE_PRICE` still guard
-each surviving box's own terminating price directly.
+cannot arise on this fleet any more.
 
 `transport = "btp"` was only ever legal alongside `handler_url` —
 `ConfigError::PeerRouteHasTransport` refuses it on a `peer_id` route
 (`crates/connector-config/src/error.rs:125`) — so the pin always lived on the relay's own
-terminating route (committed in #816/#823), never on the apex's forward. That is unchanged by the
-apex's removal: the relay box's `[[routes]]` entry for `g.toon.relay` still pins `btp` for its own
-direct clients.
+terminating route, never on the apex's forward. That is unchanged by the apex's removal.
 
 ## `announcePrice` 2000
 
-This was the retired TypeScript connector's fixed figure for what the store's
-self-announce had to cover: the apex's `g.toon.relay` terminate price plus this
-box's own forward fee, with headroom. It was never a route price and was never
-comparable to the figures above.
+This was the retired TypeScript connector's fixed figure for what the store's self-announce had to
+cover: the apex's `g.toon.relay` terminate price plus this box's own forward fee, with headroom. It
+was never a route price and was never comparable to any figure above. The TypeScript config that
+carried it, `infra/linode-store/connector.yaml`, was deleted by issue #901.
 
 The Rust `connector announce` mechanism that replaced `selfAnnounce`
-(`crates/connector-cli/src/announce.rs`) does not configure this figure at
-all — there is nothing to repoint the citation at. Each announce run asks the
-publish target's own x402 greeting for its live price and pays that; only when
-it originates through its own routing (`--via-own-routing`) does it add this
-box's own `[[routes]]` forwarding fee on top, ADR 0028's arithmetic from the
-originating side (`amount_to_pay`). Either way the amount tracks the target's
-live price instead of needing a hand-maintained buffer like `2000`.
+(`crates/connector-cli/src/announce.rs`) does not configure this figure at all — there is nothing to
+repoint the citation at. Each announce run asks the publish target's own x402 greeting for its live
+price and pays that; only when it originates through its own routing (`--via-own-routing`) does it
+add this box's own `[[routes]]` forwarding fee on top, ADR 0028's arithmetic from the originating
+side (`amount_to_pay`). Either way the amount tracks the target's live price instead of needing a
+hand-maintained buffer like `2000`.
 
 ## Retired names
 
-- **`g.toon.store`** — retired 2026-08-05 (owner decision). It was an alias for
-  the same store app at the same price, kept so a client arriving directly at
-  the store edge was priced identically to one arriving via the apex's forward.
-  The apex dropped that forward, so the alias had nothing left to mirror. One
-  name for one app; `g.toon.ario` survives because it is the one compiled into
-  a shipped client (`desktop/src/shared/api/toonTransportConfig.ts`).
+- **`g.toon.ario`** — retired by store#109 (2026-08-27), which renamed the store box's terminating
+  prefix and its `[node].addresses` to `g.toon.store`. It is now a **box label and a DNS name only**:
+  the edge is still `proxy.ario.devnet.toonprotocol.dev`, and a price probe for `g.toon.ario` there
+  is a `404`. Note the direction of travel — this file's predecessor recorded `g.toon.store` as the
+  retired alias and `g.toon.ario` as the survivor, which is what it was between 2026-08-05 and
+  store#109. A shipped client compiled against `g.toon.ario`
+  (`desktop/src/shared/api/toonTransportConfig.ts`, buzz's `storeDestination`) reaches nothing; the
+  name to compile in is `g.toon.store`, or `g.toon.relay.store` for a client that only ever learned
+  the relay box.
 
-- **`g.toon.relay.ario`** — retired by #820, resolving the divergence this
-  section used to track. It was never actually reachable: the apex's Rust
-  route table only ever declared `g.toon.relay` and `g.toon.ario`, so
-  longest-prefix matching always dropped `g.toon.relay.ario` into the
-  `g.toon.relay` route — which the apex TERMINATED (against `relay:3100`)
-  until #820, so every arrival here 404'd for free (the retired TypeScript
-  config's own comment had called this exact failure out: `g.toon.relay.ario`
-  "MUST be listed... so longest-prefix routing forwards it to the store box
-  instead of falling through to the relay terminate route"; the Rust port
-  dropped the route and reproduced the failure it warned about). #820's flip
-  of `g.toon.relay` to a peer forward would only have relocated the accident
-  and made it more expensive — traversing the apex↔relay peering, consuming a
-  real signed claim, only to 404 at the relay box's own `g.toon.relay`
-  terminate route, since that box's own table has no `.ario` child either.
-  Nothing in a shipped client addresses this name (buzz pins
-  `storeDestination: "g.toon.ario"` in compiled code), so #820 retired it —
-  deleting the store's `g.toon.relay.ario` route — rather than repairing it
-  with a dedicated forward-to-store row.
+- **`g.toon.relay.ario`** — retired by #820 alongside the apex-era alias. It was never actually
+  reachable: the apex's Rust route table only ever declared `g.toon.relay` and `g.toon.ario`, so
+  longest-prefix matching always dropped `g.toon.relay.ario` into the `g.toon.relay` route — which
+  the apex TERMINATED (against `relay:3100`) until #820, so every arrival 404'd for free. #820's
+  flip of `g.toon.relay` to a peer forward would only have relocated the accident and made it more
+  expensive. Its successor is `g.toon.relay.store`, which the store box genuinely terminates
+  (store#112) and the relay genuinely forwards.
 
 ## The TypeScript fleet
 
-Both surviving boxes (store, relay) serve the **Rust** connector on the public
-door — verified by
-`GET /ilp/identity` answering, by `invalid packet type byte` (a string that
-exists only in `crates/connector-domain/src/error.rs`), and by nginx returning
-`410 Gone` for the transitional `/rust/` prefix because Rust took over
-`location /`.
+No TypeScript `connector.yaml` is left in this repository at all: the store's copy went with
+issue #901, and the apex's went with the rest of `infra/linode-node/` (issue #872). Neither was ever a
+second source of pricing truth; the TypeScript retirement itself is tracked in #714.
 
-No TypeScript `connector.yaml` is left in this repo at all: the store's copy went
-with issue #901, along with the retired `connector` service in
-`infra/linode-store/docker-compose.store.yml` that read it, and the apex's went
-with the rest of `infra/linode-node/` (issue #872). Neither was ever a second
-source of pricing truth; the TypeScript retirement itself is tracked in #714.
+`infra/linode-relay/` and `infra/linode-store/` still hold a `connector-rust.toml` each, and
+**neither is what its box runs** — they are fixtures, boot-tested by
+`crates/connector-bin/tests/devnet_configs_load.rs`, and each directory's `README.md` says so
+([ADR 0068](adr/0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md),
+Decision 6). Their prices, and the `EXPECTED_RELAY_PRICE` / `EXPECTED_STORE_PRICE` constants that
+pin them, are properties of those fixtures. They are not a reading of the fleet and must not be
+cited as one.
 
-`infra/devnet-manage.sh redeploy` no longer needs to dodge a dead service (#851,
-simplified by #901, finished by #872): neither surviving box's base compose file
-declares a TypeScript `connector` any more — the store's was deleted, the relay
-never had one (#816), and the apex's went with the box — so both legs simply
-compose their base file with their Rust overlay and bring up the whole file set,
-with no service list and no `--no-deps`, like the relay leg always did. The
-provisioning paths (`up`, `store`) are a separate matter: they still run each
-box's `bootstrap.sh`, which brings up the base file alone.
+## What this file used to claim
+
+Kept because the failure is more instructive than the correction. Verified 2026-08-14 and
+re-probed 2026-08-28 (#1250), the table here was wrong three ways in a fortnight:
+
+| It said                                               | The box said                                               | Because                      |
+| ----------------------------------------------------- | ---------------------------------------------------------- | ---------------------------- |
+| the store terminates `g.toon.ario`                    | `g.toon.store` and `g.toon.relay.store`; `ario` is a `404` | store#109, store#112         |
+| the store leg is flat at `1000`                       | `base 1000, per_kib 10`                                    | store#107                    |
+| "the fleet has not taken [ADR 0065-price's] schedule" | it has                                                     | store#107, the same day      |
+| the fleet is two boxes                                | three with a connector, plus the faucet                    | the gas box, live 2026-08-27 |
+
+Not one of those was a hand-edit on a box drifting from a committed file — the failure this file
+was created to catch (#785). Every one was another repository's reviewed, committed change that
+this repository had no way to see. The fix for that is not a fresher copy.

@@ -633,6 +633,36 @@ watermarks.
 Where two paths exist, a connector SHOULD prefer the BTP path for claim-bearing traffic, because
 it is the one on which claims cannot race (§7).
 
+### 2.6 A held session is not the peering
+
+A connector that keeps a dialed session between packets — which BTP invites, since the session is
+the point — holds a cache, not the relation. The relation is §2.5's; the session is one path it
+currently has open, and the counterparty may take that path away at any time by restarting.
+
+> **A connector MUST NOT answer `T01` on a session it can already tell is dead.** §2.2's `T01` is
+> the answer to a dial that was **attempted and failed**. A held session that has died is not a
+> dial failure; it is a cache miss, and the packet is owed a fresh dial before any answer is
+> formed.
+
+A connector MAY additionally send a frame **once** more on a new session when the send on the held
+one failed in a way that proves the frame was never written. It MUST NOT retry a frame that was
+written and went unanswered: a timeout means the counterparty may be acting on it, and a second
+copy is a second packet. A claim riding such a resend is §6.3's byte-identical retransmission and
+carries the same nonce, which is exactly the case §6.3 requires a payee to answer `accepted`.
+
+> **Recorded 2026-08-28 (issue #1240).** Observed twice on the devnet relay, the second time under
+> deliberate reproduction: the store's connector restarted, and the relay's next packet to it was
+> refused `T01 peer 'store' unreachable` with **no dial attempted**, the one after it crossing and
+> fulfilling seconds later with nothing changed in between. The peering was registered and the
+> endpoint was sound; what was stale was the held session.
+>
+> The cost is the refused packet, and — on the evidence — only that. The issue as filed also said
+> the refusal burned a claim nonce, because the payer mints the covering claim before the send
+> fails. The reproduction does not bear that out: both packets signed the same nonce over the same
+> cumulative, and the second was fulfilled. A claim covering a packet that was never written is not
+> banked at either end, so the payer retransmits it rather than advancing past it — which is §6.3's
+> byte-identical retransmission arriving by a different road.
+
 ---
 
 ## 3. Frame carriage

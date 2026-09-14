@@ -49,7 +49,7 @@ the public devnet's chain endpoints, token addresses and program ids, and is the
 canonical answer to "what does a TOON node point at on devnet". It is read at
 cited as the source of truth by `docs/usdc-cross-chain-settlement.md` and
 `docs/operators/peer-channel-migration.md`. Its readers used to include a pile of
-Mina tooling; that went with Mina itself (ADR 0065), and so did its `mina` block.
+Mina tooling; that went with Mina itself (ADR 0065-mina), and so did its `mina` block.
 
 Nothing generates it any more — `devnet.sh endpoints`, which used to, is gone
 with the box. **Edit it by hand** when a devnet address changes.

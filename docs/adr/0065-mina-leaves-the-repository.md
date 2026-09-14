@@ -1,6 +1,6 @@
 # Mina leaves the repository
 
-**Status:** Accepted — **built** (#1205). Extends [0002](0002-drop-mina-from-the-rust-connector.md), which dropped Mina as a settlement chain but deliberately left the deployed zkApp and its tooling in the tree. This record deletes what that one left standing. Closes #1117.
+**Status:** Accepted — **built** (#1205). Extends [0002](0002-drop-mina-from-the-rust-connector.md), which dropped Mina as a settlement chain but deliberately left the deployed zkApp and its tooling in the tree. This record deletes what that one left standing. Closes #1117. **The number 0065 is shared** with [_A price is a schedule over payload length_](0065-a-price-is-a-schedule-over-payload-length.md), which landed an hour before this record on a branch this one could not see; cite this one as **0065-mina** or by title, and see the [index](README.md) for why neither is renumbered (#1249).
 
 **Scope:** repository scope — what this repository contains, not what any implementation must do. See the [ADR index](README.md).
 
