@@ -184,6 +184,27 @@ impl BtpSessionHandle {
         }
     }
 
+    /// Whether this session is dead: its writer is gone, so nothing more
+    /// can be written on it and nothing more can ever answer.
+    ///
+    /// The counterpart of [`OriginateError::SessionGone`], readable
+    /// *before* a caller commits a frame to it. A carriage that caches a
+    /// session across packets -- the peer carriage's dial side does -- needs
+    /// that: a peer's restart leaves a handle behind whose session died with
+    /// the socket, and answering `T01` off it rather than redialling is
+    /// issue #1240. It is a one-way door, `false` until the writer exits and
+    /// `true` forever after, so a `false` may always be stale by the time it
+    /// is read; the send's own `SessionGone` is what settles it.
+    ///
+    /// This is only as truthful as the carriage that owns the socket: a
+    /// writer task that outlives its read loop reports a live session over
+    /// a dead socket. `connector-peer-btp`'s `ws` module ties the two
+    /// together for exactly this reason.
+    #[must_use]
+    pub fn is_gone(&self) -> bool {
+        self.replies.is_closed()
+    }
+
     /// Originate a MESSAGE, allocating its requestId, and wait for the
     /// RESPONSE/ERROR it provokes.
     pub async fn send_message(

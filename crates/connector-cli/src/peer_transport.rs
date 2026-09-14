@@ -194,10 +194,24 @@ impl PeerRegistrar for ConfiguredPeerTransport {
             // place: the peering's answer is then §2.2's `T01` with the
             // peer named, which is what an unmapped id already falls
             // through to.
+            //
+            // Said out loud, because the `T01` it produces is
+            // indistinguishable from the one an id that was never
+            // registered at all gets. Replaying the durable rows at boot
+            // and registering nothing out of them is a silence that has
+            // already cost an investigation (issue #1240), and the endpoint
+            // is named because the endpoint is what decided it.
+            tracing::warn!(
+                peer_id,
+                endpoint = peering.endpoint.as_deref().unwrap_or("<none>"),
+                allow_plaintext = self.allow_plaintext,
+                "peering registers no carriage: its endpoint is missing, unparseable, \
+                 or its scheme selects none -- packets routed to this peer reject T01"
+            );
             self.deregister(peer_id);
             return;
         };
-        let (domains, programs) = claim_bindings(peering);
+        let (domains, programs) = claim_bindings(peer_id, peering);
         let answer_timeout = Duration::from_millis(DEFAULT_PEER_TIMEOUT_MS);
         match carriage {
             PeerCarriage::Btp => self.btp.add_peer(connector_peer_btp::PeerRelation::new(
@@ -244,6 +258,7 @@ impl PeerRegistrar for ConfiguredPeerTransport {
 /// verifies nowhere, and producing no claim at all is what a channel with
 /// no domain has always done.
 fn claim_bindings(
+    peer_id: &str,
     peering: &RuntimePeering,
 ) -> (HashMap<String, PeerClaimDomain>, HashMap<String, String>) {
     let mut domains = HashMap::new();
@@ -257,6 +272,15 @@ fn claim_bindings(
                 ..
             } => {
                 let Some(token_network) = parse_evm_address(token_network) else {
+                    // Same silence, same cost (issue #1240): a channel with
+                    // no domain produces no claim, and nothing said so.
+                    tracing::warn!(
+                        peer_id,
+                        channel_id = %channel_id,
+                        token_network = %token_network,
+                        "peer channel binds no claim domain: its token_network is not \
+                         a readable address -- claims on this channel ride without one"
+                    );
                     continue;
                 };
                 domains.insert(
@@ -518,6 +542,47 @@ token_network = "0x00000000000000000000000000000000000000bb"
         }
     }
 
+    /// Every WARN emitted while `record` runs, one string of fields per
+    /// event. A silence is only repaired if something fails when it comes
+    /// back, and a `T01` assertion cannot tell "registered nothing" from
+    /// "was never registered" -- which is the whole reason issue #1240 cost
+    /// an investigation of a peering that was, in fact, registered.
+    fn warnings_while<T>(record: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use std::fmt::Write as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Warned(Arc<std::sync::Mutex<Vec<String>>>);
+
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                let _ = write!(self.0, " {}={value:?}", field.name());
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warned {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
+                }
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().expect("warnings lock").push(fields.0);
+            }
+        }
+
+        let warned = Warned::default();
+        let subscriber = tracing_subscriber::registry().with(warned.clone());
+        let outcome = tracing::subscriber::with_default(subscriber, record);
+        let warnings = warned.0.lock().expect("warnings lock").clone();
+        (outcome, warnings)
+    }
+
     /// ADR 0058: **`build_peer_transport` adds and removes a carriage
     /// while the process serves.** Running it once at boot is what made a
     /// runtime peer row hollow.
@@ -596,8 +661,14 @@ token_network = "0x00000000000000000000000000000000000000bb"
     /// nothing, and the peer id stays unmapped. Its answer is §2.2's `T01`
     /// with the peer named, which is what an unmapped id already falls
     /// through to; a stale mapping would instead dial nowhere.
+    ///
+    /// And it is **logged**. The `T01` alone is not enough to hold: it is
+    /// the same answer an id that was never registered gets, so asserting
+    /// only the reject locks in a silence in which "the durable rows
+    /// replayed and bound nothing" and "there are no durable rows" look
+    /// identical from a running node (issue #1240).
     #[tokio::test]
-    async fn a_peering_whose_scheme_selects_no_carriage_registers_nothing() {
+    async fn a_peering_whose_scheme_selects_no_carriage_registers_nothing_and_says_so() {
         let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
         key_file.write_all(&[7u8; 32]).expect("write key file");
         let state_dir = tempfile::tempdir().expect("temp state dir");
@@ -619,7 +690,19 @@ key_file = "{key_file}"
         assert!(!config.peer_allow_plaintext_endpoints());
 
         let transport = build_peer_transport(&config, [0u8; 20], None, Arc::new(SystemClock));
-        transport.register("plaintext", &runtime_peering("http://127.0.0.1:1/ilp"));
+        let (_, warnings) = warnings_while(|| {
+            transport.register("plaintext", &runtime_peering("http://127.0.0.1:1/ilp"));
+        });
+
+        // ...and says so. Registering nothing out of a replayed durable row
+        // used to be completely silent, which made it indistinguishable at
+        // runtime from a peering that had never been written down at all.
+        let warned = warnings
+            .iter()
+            .find(|warning| warning.contains("registers no carriage"))
+            .unwrap_or_else(|| panic!("registering no carriage went unlogged: {warnings:?}"));
+        assert!(warned.contains("plaintext"), "{warned}");
+        assert!(warned.contains("http://127.0.0.1:1/ilp"), "{warned}");
 
         let PeerForward {
             response,
