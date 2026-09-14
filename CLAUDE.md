@@ -238,8 +238,22 @@ there is no separate deployer key to lose — which is what happened to the mint
 before 2026-08, killing that leg with no repair path. The faucet is a separate
 service and is not part of the connector.
 
-**Mainnet.** Nothing here funds it and no mainnet deployment exists. The Solana
-mint script and the local topology are devnet-and-below only.
+**Mainnet.** The contracts are live on Base mainnet (2026-09-01,
+`packages/contracts/deployments/base-mainnet.md`) and the payment-channel program on
+Solana mainnet-beta (2026-08-14, `packages/solana-program/deployments/mainnet-beta.md`),
+both against Circle's native USDC and both deployed by hand. One third-party operator's
+node — Drew Pierson's — uses them; this repository's fleet does not. Nothing here funds
+a mainnet node: it funds itself. The Solana mint script and the local topology are
+devnet-and-below only.
+
+**How anyone earns.** There is no protocol fee and no mechanism for one. A
+terminating operator keeps its route's whole `price`; a connector that carries
+someone else's packet keeps a flat per-packet `fee` on the peering it crossed (ADR
+0010, ADR 0061), paid by the caller as part of the path's cost — never deducted from
+the terminating price, which `price − fee ≥ next hop price` protects. Those routing
+fees, earned by the connectors Drew runs, are TOON's business model. A change that
+takes value off a path without a peering's `fee` saying so is a change to that model,
+not a refactor.
 
 ## Environments
 
@@ -247,16 +261,18 @@ mint script and the local topology are devnet-and-below only.
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **local**      | `docker-compose.yml` chain profiles, and the connector image run against them — that is `local/`. Disposable, funded from genesis, no shared state.                                                                                                                                                                                                                                                                                                                     |
 | **devnet**     | Two Linode boxes — relay and store (`ario`) — plus a connector-less faucet box. The relay and store boxes deploy the connector from their OWN repos' `deploy/` bundles (`toon-protocol/relay`, `toon-protocol/store`), each pinning it by release handle in one place (ADR 0068). `infra/linode-relay/` and `infra/linode-store/` are fixtures this repo's tests boot, not what either box runs. The faucet box still deploys from `infra/linode-faucet/` in this repo. |
-| **production** | **Named and empty** (ADR 0056). No machines, no mainnet contracts, no keys, no deploy. Its one artefact is `deploy/connector-rust/connector.production.toml`, a skeleton in which every value is invalid on purpose.                                                                                                                                                                                                                                                    |
+| **production** | The **fleet's** production tier is **named and empty** (ADR 0056): no fleet machine, no fleet key, no deploy. Its one artefact is `deploy/connector-rust/connector.production.toml`, a skeleton in which every value is invalid on purpose. Mainnet contracts exist (see "Where money comes from"), but they are run by a third-party operator, not by this tier.                                                                                                       |
 
-Production is blocked on two deployments, not on configuration: `packages/contracts`
-has never been deployed to an EVM mainnet, so there is no `TokenNetworkRegistry` to
-name, and the Solana payment-channel program is devnet-only — and ADR 0053 binds the
-settlement program into a claim's signed message, so a mainnet node naming the devnet
-program takes money for claims it can never redeem. Do not fill the skeleton in, and
-do not put it under `infra/`: those are gate-checked fixtures, not a place to add a
-file that must never load.
+ADR 0056 was written when no mainnet contract existed and says it is superseded, not
+amended, the moment one is; the mainnet deployments above made its "no mainnet
+contract" half false before any successor record landed. Its fleet half still holds.
+Do not fill the skeleton in, and do not put it under `infra/`: those are gate-checked
+fixtures, not a place to add a file that must never load.
 `crates/connector-bin/tests/production_skeleton_is_inert.rs` fails the build on either.
+A node pointed at mainnet takes its addresses from the deployment records, never from
+the devnet table: ADR 0053 binds the settlement program into a claim's signed message,
+and the mainnet program id (`8e7Bhzyd…`) is unrelated to the devnet one, so a mainnet
+node naming the devnet program takes money for claims it can never redeem.
 
 **Nothing in this repository moves a tag onto the relay or store box (ADR 0068).**
 `:rust-release` used to be a promotion tag, moved only by an explicit
@@ -309,6 +325,22 @@ terms-acceptance flag, its `HiddenServiceDir` on a persisted volume, and the fac
 `HiddenServicePort`'s target is resolved when the daemon _parses_ its config, so an
 unresolvable container name crashes it before it runs — is
 `docs/operators/onion-endpoint-bringup.md`, not the connector's.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in this repo's GitHub Issues (`toon-protocol/connector`, via the `gh` CLI).
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage labels, names unchanged — distinct from the `agent:*`
+Sandcastle triggers. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents/domain.md`.
 
 ## Pointers
 
