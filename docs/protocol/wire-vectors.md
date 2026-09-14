@@ -111,6 +111,32 @@ Held open by `connector-signer`'s `claim_signature::tests` module:
 `changing_any_evm_proof_field_invalidates_a_prior_signature` (covers every field, including the
 domain's `chain_id`/`token_network_address`), and `the_evm_digest_is_deterministic`.
 
+### 6. A route's charge is `base + per_kib * ceil(payload_len / 1024)`, saturating
+
+`connector_domain::Price::charge` counts kibibytes **started** — whole kibibytes plus one for any
+remainder, and none at all for an empty payload, which pays the base alone. A flat price is the
+same value as a zero-slope schedule (ADR 0065), so it charges its base at every length. The
+arithmetic saturates rather than wrapping or panicking: an operator can write a slope that exceeds
+a `u64` on a large payload, and the answer is then `u64::MAX` — a charge no claim can cover, which
+refuses the packet.
+
+**This invariant is arithmetic, not an encoding, and it is in the committed set anyway.** The
+justification is the same one that puts the ILP packet's bytes in scope: `payload_len` is
+`Prepare.data.len()`, a property of carriage rather than of content, measurable by every hop
+without opening the gift wrap. That is exactly what lets a sender compute its own charge before it
+sends, a forwarded route be priced at the client edge (ADR 0028) and a peer arrival be gated (ADR 0029) — one schedule, one number, four implementations of it across this repo, `toon-client`,
+`rig` and `swap`. Binding those four with prose alone was tried and failed: `toon-client`'s
+`chargeFor` computed `floor(len / 1024) + 1` and overpaid by a whole kibibyte at every exact
+multiple of 1024 (toon-client#629), with the correct rule stated in prose three lines above the
+code contradicting it.
+
+Held open by `connector-domain`'s `price::tests` — `a_started_kibibyte_is_a_whole_one`,
+`an_empty_payload_charges_the_base_alone`, `charging_saturates_rather_than_panicking`, and the
+proptests `a_whole_kibibyte_charges_for_exactly_that_many` (which pins both `kib * 1024` and one
+byte past it), `charging_never_falls_as_a_payload_grows` and `charging_is_total` — and pinned
+cross-repo by the `charge` section, whose generator re-derives every row in checked longhand
+arithmetic and asserts it against `Price::charge` before committing it.
+
 ## Generation
 
 `crates/connector-vectors` builds the committed set from **fixed literal fixtures** — hardcoded

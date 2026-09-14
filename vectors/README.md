@@ -461,3 +461,48 @@ auth_json, btp_message_hex, signature_verifies }`.
 signature}` -- byte-for-byte what rides as the BTP `auth` protocolData entry's `data`.
   `btp_message_hex` is the complete BTP MESSAGE frame carrying it (no `ilpPacket`), decoded and
   re-checked against `auth_json` by the generator before being emitted.
+
+### `charge`
+
+Issue toon-client#629, [ADR 0065](../docs/adr/0065-a-price-is-a-schedule-over-payload-length.md):
+what a route priced `base + per_kib/KiB` charges for one packet, as a function of that packet's
+payload length.
+
+**This is the one section that pins arithmetic rather than bytes**, and it is here because the
+arithmetic is a cross-repo contract in exactly the way an encoding is. A payload length is a
+property of _carriage_, not of content -- every hop can measure `Prepare.data.len()` without
+opening the gift wrap -- so a sender computes its own charge before it sends, and a client edge, a
+peer price gate and a termination all evaluate the same schedule over the same number. Four
+implementations, one answer required. When only prose bound them, one of them drifted: `toon-client`
+computed `floor(len / 1024) + 1`, overpaid by a whole kibibyte at every exact multiple of 1024, and
+went unnoticed for as long as it did because the error's direction was an overpay -- which a
+connector accepts in silence, so there was no reject to read.
+
+- `cases[]`: `{ name, base, per_kib, payload_len, kib, charge, saturated }`.
+- **`base`, `per_kib` and `charge` are decimal strings, not JSON numbers**, unlike `claim`'s
+  `transferred_amount`. The saturating rows reach `u64::MAX`, which is past 2^53 and would be
+  rounded by any reader parsing JSON numbers into IEEE doubles. It is the same reason `GET /ilp`
+  publishes `price` as a string. `payload_len` and `kib` stay numbers: both are small by
+  construction.
+- `payload_len` is `Prepare.data.len()` -- the length of the sealed gift wrap ([ADR 0018]), never
+  anything inside it, and never the encoded ILP packet around it. For a client that means the
+  bytes it just sealed, before base64 or OER framing: those add nothing to what is measured.
+- `kib` is `ceil(payload_len / 1024)` -- kibibytes **started**, and **zero** for an empty payload.
+  It is stated separately from `charge` so an SDK that arrives at the right total by a wrong route
+  still fails on the unit count. The rows at 0, 1023, 1024, 1025, 2048 and 2049 are the whole
+  point of this section: a boundary is the only place two plausible readings of "per kibibyte"
+  differ, and a suite that samples only middles cannot tell `ceil` from `floor + 1` at all.
+- `charge` is `base + per_kib * kib`, in **saturating** `u64` arithmetic. A flat price is a
+  schedule whose slope is zero -- the same value, not an equivalent one -- so the `flat_*` rows
+  charge `base` at every length, including the lengths where the metered rows all differ.
+- `saturated` is `true` exactly where the exact arithmetic would exceed `u64::MAX` and the answer
+  was clamped to it. An SDK computing in arbitrary-precision integers (JavaScript `BigInt`, Python
+  `int`) will not clamp on its own and **must** apply this ceiling: an amount past `u64::MAX`
+  cannot be encoded into the packet it would be paying for. The clamp is deliberate -- a charge no
+  claim can cover refuses the packet, where wrapping would silently make it nearly free.
+- The metered rows use `1000 + 10/KiB` because that is what the fleet's deployed store node
+  charges, so these are not invented figures. `metered_live_measured_5161` is independently
+  confirmed against that live node, whose x402 greeting quotes `price.charge(prepare.data.len())`
+  for the packet it was handed.
+
+[ADR 0018]: ../docs/adr/0018-a-payload-is-sealed-to-the-terminating-connector.md
