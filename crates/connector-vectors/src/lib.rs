@@ -24,7 +24,7 @@ use connector_btp::{
     CONTENT_TYPE_TEXT, FLUSH_REQUESTED_HEADER,
 };
 use connector_domain::{
-    EnvelopeError, EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject, RejectCode,
+    EnvelopeError, EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Price, Reject, RejectCode,
 };
 use connector_peer_btp::{ack, claim_json, fields, AcceptedClaims, PeerClaimDomain};
 use connector_peer_http::headers::{
@@ -136,6 +136,7 @@ pub struct WireVectors {
     pub claim: ClaimVectors,
     pub peer_carriage: PeerCarriageVectors,
     pub channel_control_declaration: ChannelControlDeclarationVectors,
+    pub charge: ChargeVectors,
 }
 
 #[derive(Debug, Serialize)]
@@ -1773,6 +1774,153 @@ fn generate_channel_control_declaration_vectors() -> ChannelControlDeclarationVe
     }
 }
 
+/// What a route charges for one packet, as a function of that packet's
+/// payload length ([ADR 0065](../../../docs/adr/0065-a-price-is-a-schedule-over-payload-length.md)).
+///
+/// **Not bytes on the wire, and deliberately in the set anyway.** Every other
+/// section here pins an encoding; this one pins arithmetic. It earns its place
+/// because the arithmetic is a *cross-repo* contract exactly like an encoding
+/// is: a sender computes the charge itself before it sends (a payload length is
+/// a property of carriage, which is what lets any hop price a packet without
+/// opening its wrap), so `toon-client`, `rig` and `swap` each reimplement this
+/// function and each must get the same answer as `connector_domain::Price`. One
+/// of them did not -- `toon-client`'s `chargeFor` computed
+/// `floor(len / 1024) + 1` and overpaid by a whole kibibyte at every exact
+/// multiple of 1024 (toon-client#629) -- and nothing caught it, because prose
+/// was the only thing binding the two: the client's own docstring stated the
+/// correct rule three lines above the code that contradicted it.
+#[derive(Debug, Serialize)]
+pub struct ChargeVectors {
+    pub cases: Vec<ChargeCase>,
+}
+
+/// One row of a price schedule: what `base + per_kib/KiB` charges for a packet
+/// whose `Prepare.data` is `payload_len` bytes.
+#[derive(Debug, Serialize)]
+pub struct ChargeCase {
+    pub name: &'static str,
+    /// **Decimal strings, not JSON numbers** -- unlike `claim`'s
+    /// `transferred_amount`, whose fixture is small. These three fields reach
+    /// `u64::MAX` on the saturating rows, which is past 2^53 and would be
+    /// silently rounded by any reader that parses JSON numbers as IEEE
+    /// doubles. It is the same reason `GET /ilp` publishes `price` as a string.
+    pub base: String,
+    pub per_kib: String,
+    /// `Prepare.data.len()`: the length of the sealed gift wrap, never anything
+    /// inside it, and never the encoded packet around it.
+    pub payload_len: u64,
+    /// `ceil(payload_len / 1024)` -- kibibytes *started*, and zero for an empty
+    /// payload. Stated separately from `charge` so a replaying SDK that gets
+    /// the total right by luck still fails on the unit count.
+    pub kib: u64,
+    pub charge: String,
+    /// Whether `u64` saturation clamped this row, i.e. whether the exact
+    /// arithmetic would have exceeded `u64::MAX`. An SDK computing in
+    /// arbitrary-precision integers (`BigInt`, `int`) will not clamp on its
+    /// own and must be told where the ceiling is: an amount past `u64::MAX`
+    /// cannot even be encoded into the packet it would be paying for.
+    pub saturated: bool,
+}
+
+/// Builds and self-verifies one [`ChargeCase`].
+///
+/// The charge comes from the real [`Price::charge`], then the rule is applied a
+/// second time here in **checked** arithmetic, written out longhand rather than
+/// with `div_ceil`, and the two are compared. That is what makes the row
+/// evidence rather than a transcript: a typo in either expression -- a `floor`
+/// where a `ceil` belongs, most of all -- fails the build instead of being
+/// committed as the contract.
+fn charge_case(name: &'static str, base: u64, per_kib: u64, payload_len: usize) -> ChargeCase {
+    let price = Price::scheduled(base, per_kib);
+    let charge = price.charge(payload_len);
+
+    // Whole kibibytes, plus one more if anything is left over. Longhand, so
+    // this is not the same expression `Price::charge` uses.
+    let kib = payload_len / 1024 + usize::from(!payload_len.is_multiple_of(1024));
+    let kib = u64::try_from(kib).expect("a fixture payload length fits in a u64");
+
+    // `None` exactly when the schedule overflows a u64 -- the case
+    // `Price::charge` saturates rather than panicking on.
+    let exact = per_kib
+        .checked_mul(kib)
+        .and_then(|slope| base.checked_add(slope));
+    let saturated = exact.is_none();
+    match exact {
+        Some(exact) => assert_eq!(
+            charge, exact,
+            "{name}: Price::charge disagrees with base + per_kib * ceil(len / 1024)"
+        ),
+        None => assert_eq!(
+            charge,
+            u64::MAX,
+            "{name}: an overflowing schedule must saturate, not wrap"
+        ),
+    }
+
+    ChargeCase {
+        name,
+        base: base.to_string(),
+        per_kib: per_kib.to_string(),
+        payload_len: u64::try_from(payload_len).expect("a fixture payload length fits in a u64"),
+        kib,
+        charge: charge.to_string(),
+        saturated,
+    }
+}
+
+/// The metered rows use `1000 + 10/KiB`, which is not an invented figure: it is
+/// what the fleet's deployed store node charges, and the row at 5161 bytes is
+/// the one independently confirmed against that live node (its x402 greeting
+/// quotes `price.charge(prepare.data.len())` for the packet it was handed).
+///
+/// The lengths are chosen as the boundaries and their neighbours, because that
+/// is the only place two plausible readings of "per kibibyte" differ: 0, 1,
+/// 1023/1024/1025 and 2048/2049. A vector set that sampled only round-ish
+/// middles -- which is what the client had been checked against -- cannot tell
+/// `ceil` from `floor + 1` at all.
+fn generate_charge_vectors() -> ChargeVectors {
+    const BASE: u64 = 1_000;
+    const PER_KIB: u64 = 10;
+
+    let mut cases = vec![
+        // An empty payload starts no kibibyte and pays the base alone. The row
+        // that most often comes out wrong, because "kibibytes started, counting
+        // from one" reads as though the floor were one rather than zero.
+        charge_case("metered_empty_payload", BASE, PER_KIB, 0),
+        charge_case("metered_one_byte", BASE, PER_KIB, 1),
+        charge_case("metered_just_under_one_kib", BASE, PER_KIB, 1023),
+        // The boundary. A whole kibibyte is ONE kibibyte.
+        charge_case("metered_exactly_one_kib", BASE, PER_KIB, 1024),
+        // ...and the next byte starts the second.
+        charge_case("metered_one_byte_past_one_kib", BASE, PER_KIB, 1025),
+        charge_case("metered_exactly_two_kib", BASE, PER_KIB, 2048),
+        charge_case("metered_one_byte_past_two_kib", BASE, PER_KIB, 2049),
+        // Confirmed against the deployed store node: 5161 bytes is quoted 1060.
+        charge_case("metered_live_measured_5161", BASE, PER_KIB, 5161),
+    ];
+
+    // A flat price is a schedule whose slope is zero (ADR 0065): the same value,
+    // not merely an equivalent one, so it must charge its base at every length
+    // -- including the lengths above where the metered rows all differ.
+    cases.extend([
+        charge_case("flat_empty_payload", BASE, 0, 0),
+        charge_case("flat_one_byte", BASE, 0, 1),
+        charge_case("flat_exactly_one_kib", BASE, 0, 1024),
+        charge_case("flat_one_mib", BASE, 0, 1024 * 1024),
+    ]);
+
+    // Saturation, both ways it can arise. An operator can write a schedule that
+    // overflows a u64 on a large payload, and the answer is then `u64::MAX` --
+    // a charge no claim can cover, which refuses the packet. Wrapping or
+    // panicking on the packet path would both be worse.
+    cases.extend([
+        charge_case("saturating_base", u64::MAX, 1, 1),
+        charge_case("saturating_slope", 0, u64::MAX, 2049),
+    ]);
+
+    ChargeVectors { cases }
+}
+
 /// Build the full committed vector set. See the module docs for what
 /// "generated from the properties" means here, and
 /// `docs/protocol/wire-vectors.md` for the invariant each section pins.
@@ -1783,6 +1931,7 @@ pub fn generate() -> WireVectors {
     let (claim, claim_fixture) = generate_claim_vectors();
     let peer_carriage = generate_peer_carriage_vectors(&claim_fixture, &giftwrap);
     let channel_control_declaration = generate_channel_control_declaration_vectors();
+    let charge = generate_charge_vectors();
 
     WireVectors {
         schema_version: SCHEMA_VERSION,
@@ -1792,6 +1941,7 @@ pub fn generate() -> WireVectors {
         claim,
         peer_carriage,
         channel_control_declaration,
+        charge,
     }
 }
 

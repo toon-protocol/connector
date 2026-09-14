@@ -481,5 +481,135 @@
         "signature_verifies": true
       }
     ]
+  },
+  "charge": {
+    "cases": [
+      {
+        "name": "metered_empty_payload",
+        "base": "1000",
+        "per_kib": "10",
+        "payload_len": 0,
+        "kib": 0,
+        "charge": "1000",
+        "saturated": false
+      },
+      {
+        "name": "metered_one_byte",
+        "base": "1000",
+        "per_kib": "10",
+        "payload_len": 1,
+        "kib": 1,
+        "charge": "1010",
+        "saturated": false
+      },
+      {
+        "name": "metered_just_under_one_kib",
+        "base": "1000",
+        "per_kib": "10",
+        "payload_len": 1023,
+        "kib": 1,
+        "charge": "1010",
+        "saturated": false
+      },
+      {
+        "name": "metered_exactly_one_kib",
+        "base": "1000",
+        "per_kib": "10",
+        "payload_len": 1024,
+        "kib": 1,
+        "charge": "1010",
+        "saturated": false
+      },
+      {
+        "name": "metered_one_byte_past_one_kib",
+        "base": "1000",
+        "per_kib": "10",
+        "payload_len": 1025,
+        "kib": 2,
+        "charge": "1020",
+        "saturated": false
+      },
+      {
+        "name": "metered_exactly_two_kib",
+        "base": "1000",
+        "per_kib": "10",
+        "payload_len": 2048,
+        "kib": 2,
+        "charge": "1020",
+        "saturated": false
+      },
+      {
+        "name": "metered_one_byte_past_two_kib",
+        "base": "1000",
+        "per_kib": "10",
+        "payload_len": 2049,
+        "kib": 3,
+        "charge": "1030",
+        "saturated": false
+      },
+      {
+        "name": "metered_live_measured_5161",
+        "base": "1000",
+        "per_kib": "10",
+        "payload_len": 5161,
+        "kib": 6,
+        "charge": "1060",
+        "saturated": false
+      },
+      {
+        "name": "flat_empty_payload",
+        "base": "1000",
+        "per_kib": "0",
+        "payload_len": 0,
+        "kib": 0,
+        "charge": "1000",
+        "saturated": false
+      },
+      {
+        "name": "flat_one_byte",
+        "base": "1000",
+        "per_kib": "0",
+        "payload_len": 1,
+        "kib": 1,
+        "charge": "1000",
+        "saturated": false
+      },
+      {
+        "name": "flat_exactly_one_kib",
+        "base": "1000",
+        "per_kib": "0",
+        "payload_len": 1024,
+        "kib": 1,
+        "charge": "1000",
+        "saturated": false
+      },
+      {
+        "name": "flat_one_mib",
+        "base": "1000",
+        "per_kib": "0",
+        "payload_len": 1048576,
+        "kib": 1024,
+        "charge": "1000",
+        "saturated": false
+      },
+      {
+        "name": "saturating_base",
+        "base": "18446744073709551615",
+        "per_kib": "1",
+        "payload_len": 1,
+        "kib": 1,
+        "charge": "18446744073709551615",
+        "saturated": true
+      },
+      {
+        "name": "saturating_slope",
+        "base": "0",
+        "per_kib": "18446744073709551615",
+        "payload_len": 2049,
+        "kib": 3,
+        "charge": "18446744073709551615",
+        "saturated": true
+      }
+    ]
   }
 }
