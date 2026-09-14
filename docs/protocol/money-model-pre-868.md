@@ -333,8 +333,8 @@ prepare.amount < route.price` (`connector.rs:691-708`).
 quietly absorb the difference — it hands the next hop an amount that hop refuses, so the packet dies
 at the far end, after the client has already been charged at the near end and after the near hop has
 already committed to carry it. It fails identically on the first packet and the millionth; there is
-no traffic level at which it starts working. `docs/devnet-pricing.md:74-90` records an owner decision
-taken precisely to keep this arithmetic solvent.
+no traffic level at which it starts working. `docs/devnet-pricing.md`'s "Why the relay route is 1 and
+a store write is 1000" records an owner decision taken precisely to keep this arithmetic solvent.
 
 Note what the invariant is **not**: it is not enforced anywhere at config load. Nothing in
 `connector-config` compares one box's `price − fee` against another box's `price`, because no box can
@@ -379,8 +379,8 @@ Had box 1 been configured `price = 1000, fee = 2`, it would forward 998, and ste
 `F03` — on every write, forever. That is the invariant, in one line of arithmetic.
 
 For the `g.toon.relay` leg the same arithmetic lands on `1 − 0 = 1 >= 1`
-(`docs/devnet-pricing.md:84-90`) — a deliberate zero fee, because that prefix is billed per audio
-frame at 49 fps and any non-zero fee would have doubled the per-frame client cost.
+(`docs/devnet-pricing.md`'s "The apex forward") — a deliberate zero fee, because that prefix is
+billed per audio frame at 49 fps and any non-zero fee would have doubled the per-frame client cost.
 
 ## Decided, and now built (#868)
 

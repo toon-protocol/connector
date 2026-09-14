@@ -1,6 +1,6 @@
 # The Rust connector settles on EVM and Solana only; Mina is dropped
 
-**Status:** Accepted — extended by [0065](0065-mina-leaves-the-repository.md). It holds in the tree: the Cargo workspace has no Mina crate. The one thing this record deliberately left standing, `packages/mina-zkapp` (the separately deployed zkApp), was deleted by 0065 along with the rest of the Mina surface.
+**Status:** Accepted — extended by [0065-mina](0065-mina-leaves-the-repository.md). It holds in the tree: the Cargo workspace has no Mina crate. The one thing this record deliberately left standing, `packages/mina-zkapp` (the separately deployed zkApp), was deleted by 0065-mina along with the rest of the Mina surface.
 
 **Scope:** connector architecture — internal to this codebase. See the [ADR index](README.md).
 

@@ -8,7 +8,7 @@
 #
 # USDC only (§4.6): the local-anvil EVM leg and the native-SOL leg are retired
 # from the faucet app itself (packages/faucet/src/index.js), and the Mina leg
-# left with Mina (ADR 0065). This box's env below configures only the two
+# left with Mina (ADR 0065-mina). This box's env below configures only the two
 # surviving USDC legs, Base Sepolia and Solana devnet.
 #
 # Run from the CONNECTOR REPO ROOT:

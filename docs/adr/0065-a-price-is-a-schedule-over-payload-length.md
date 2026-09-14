@@ -1,6 +1,6 @@
 # A price is a schedule over payload length
 
-**Status:** Accepted — **built** (#984). Amends [0020](0020-a-price-is-flat-and-attaches-to-a-handler.md): "a price is flat per packet" becomes "a price is a schedule over the packet's payload length", of which a flat price is the case whose slope is zero. Everything else in 0020 stands, its handler-granularity rule included. Extends [0011](0011-rejects-accumulate-fees-and-probes-discover-cost.md) — cacheability is preserved by publishing the schedule, not by the reject. Narrows [0040](0040-a-verified-payment-is-stated-to-the-app.md): `X-TOON-Amount` is the charge for that packet. [0010](0010-flat-per-packet-fee-and-minimum-delivery.md) and [0061](0061-a-fee-attaches-to-a-peering-not-to-a-route.md) are untouched — a **fee** is still flat.
+**Status:** Accepted — **built** (#984). Amends [0020](0020-a-price-is-flat-and-attaches-to-a-handler.md): "a price is flat per packet" becomes "a price is a schedule over the packet's payload length", of which a flat price is the case whose slope is zero. Everything else in 0020 stands, its handler-granularity rule included. Extends [0011](0011-rejects-accumulate-fees-and-probes-discover-cost.md) — cacheability is preserved by publishing the schedule, not by the reject. Narrows [0040](0040-a-verified-payment-is-stated-to-the-app.md): `X-TOON-Amount` is the charge for that packet. [0010](0010-flat-per-packet-fee-and-minimum-delivery.md) and [0061](0061-a-fee-attaches-to-a-peering-not-to-a-route.md) are untouched — a **fee** is still flat. **The number 0065 is shared** with [_Mina leaves the repository_](0065-mina-leaves-the-repository.md), which landed an hour after this record from a branch that could not see it; cite this one as **0065-price** or by title, and see the [index](README.md) for why neither is renumbered (#1249).
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 
@@ -201,3 +201,24 @@ encoding nor `accumulated_cost`'s meaning moved.
 **`docs/devnet-pricing.md` stays the price list**, and the store leg stays at 1000. What this
 record changes for the fleet is that pricing the store leg by size is now a config edit
 rather than a second box.
+
+## Update (issue #1250) — the fleet took the schedule, and the price list stopped being a list
+
+Both sentences above were true for one day and are now history, in opposite directions.
+
+**The store leg is a schedule.** Probed 2026-08-28, `g.toon.store` and `g.toon.relay.store` are
+both `{ base = 1000, per_kib = 10 }` on the store box, and the relay's forward to
+`g.toon.relay.store` carries the same slope beneath a base of `1001`. The paragraph above called
+the adoption "a config edit rather than a second box", and that is exactly what it cost: two lines
+in `toon-protocol/store`'s `deploy/connector.toml.template`, no second backend, and a store box
+that answers one prefix at one price at every size. The breaking-deploy ordering this record
+predicted held — the image landed before the config, as it must.
+
+**`docs/devnet-pricing.md` is no longer the price list**, because
+[0068](0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md) moved
+deploy ownership into the node repositories a fortnight later. A box's schedule is now committed in
+that box's own repository, guarded by that repository's own bundle test; a table in this one could
+only ever be a copy going stale. That file now says where each box's authority lives and keeps only
+what is genuinely fleet-wide — the unit, the path arithmetic, and how to ask a box directly.
+
+Nothing in the decision moves. What moved is which repository the numbers live in.

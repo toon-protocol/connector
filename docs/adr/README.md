@@ -17,6 +17,39 @@ The numbers are permanent and are never reused or renumbered — they are cited 
 times across this repo and from `toon-meta`, `relay` and `store`. This index groups them by
 scope; it does not move them.
 
+> **0065 is taken twice, and stays that way.** Seventy-two records, seventy-one numbers.
+> [_A price is a schedule over payload length_](0065-a-price-is-a-schedule-over-payload-length.md)
+> (#984) and [_Mina leaves the repository_](0065-mina-leaves-the-repository.md) (#1205) were both
+> written on branches cut while 0064 was the folder's highest number, and both landed on `main` on
+> 2026-08-27, an hour and seven minutes apart. Neither review could see the other's number, and
+> 0066 went to the next record as though nothing had happened. Found from `toon-meta`, not from
+> here (#1249).
+>
+> **Neither record is renumbered, and that is the resolution rather than a deferral of one.** The
+> rule above is not decoration. `0065-mina` is cited **by number** from `toon-meta`'s
+> `context/decisions.md`, `context/architecture.md` and `docs/settlement.md`, and both records are
+> cited by filename from a dozen documents more. A renumber rescues nothing a reader can see: a
+> stub at the old path would keep those URLs resolving, but nothing repairs the sentence _"Mina
+> left the connector repository (ADR 0065-mina)"_ in a document that was correct on the day it was
+> written. That sentence would not become ambiguous — it would become **wrong**, and wrong reads
+> as authoritative. An ambiguity announces itself and costs one clause to settle; a silently
+> falsified citation is the failure mode this index exists to prevent.
+>
+> There is also nothing honest to renumber _to_. A number here is dated evidence of when a
+> decision was taken, which is why the folder is read in order at all. Moving _Mina leaves the
+> repository_ to the next free number would file it after
+> [0068](0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md), decided
+> the following afternoon, and every record since. The tidier folder would be the less truthful one.
+>
+> **So cite 0065 by title, or as `0065-price` and `0065-mina`** — the distinguishing word of each
+> filename, and already the form `toon-meta` uses. Every Status line and index row here now names
+> which 0065 it means, every other citation in this folder carries the link, and every bare-number
+> citation of the Mina record elsewhere in the repository has been qualified; an unqualified `0065`
+> under `crates/` or `docs/protocol/` is therefore the price record, which is a fact about this
+> tree rather than licence to write one in new prose.
+> **0065 is closed** — no third record takes it, and no other number is taken twice, guarded by
+> `crates/connector-bin/tests/record_numbers_are_taken_once.rs`.
+
 | If you are…                                                                 | Read                                                                           |
 | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
 | changing the connector's code or structure                                  | **[Connector architecture](#connector-architecture)**                          |
@@ -64,7 +97,7 @@ not change what anything else must do.
 | #                                                                                            | Decision                                                                     | Status                                                                                                     |
 | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | [0001](0001-rust-workspace-library-first.md)                                                 | The connector is a Rust library first, a binary second                       | Accepted                                                                                                   |
-| [0002](0002-drop-mina-from-the-rust-connector.md)                                            | Settles on EVM and Solana only; Mina is dropped                              | Accepted — extended by 0065                                                                                |
+| [0002](0002-drop-mina-from-the-rust-connector.md)                                            | Settles on EVM and Solana only; Mina is dropped                              | Accepted — extended by 0065-mina                                                                           |
 | [0005](0005-claims-are-truth-balances-are-a-projection.md)                                   | Claims are the source of truth; balances are a projection                    | Accepted, amended by 0033                                                                                  |
 | [0006](0006-the-connector-is-mechanism-not-policy.md)                                        | The connector is mechanism; discovery and route policy live outside it       | Accepted — restored in full by 0043                                                                        |
 | [0007](0007-testing-doctrine-fakes-yes-mocks-no.md)                                          | Property tests over a pure core; fakes are allowed, mocks are not            | Accepted                                                                                                   |
@@ -98,11 +131,11 @@ outside this repository.
 | [0004](0004-value-moves-on-fulfilment.md)                                              | Value moves on fulfilment, one claim per packet                                      | Partly superseded by 0042 — its model no longer runs anywhere (#1145); one claim per packet still binds |
 | [0010](0010-flat-per-packet-fee-and-minimum-delivery.md)                               | A hop charges a flat per-packet fee; packets declare a minimum delivery              | Accepted, amended by 0042, #1072, 0061 and 0071                                                         |
 | [0071](0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)                    | A forward crosses a denomination at a declared rate                                  | Accepted — **built** (#1287), bar the dealing topology (#1299); amends 0010 and 0061, extends 0011      |
-| [0011](0011-rejects-accumulate-fees-and-probes-discover-cost.md)                       | Rejects accumulate fees; a probe is how cost is discovered                           | Accepted, amended by 0042; extended by 0044 and 0065                                                    |
+| [0011](0011-rejects-accumulate-fees-and-probes-discover-cost.md)                       | Rejects accumulate fees; a probe is how cost is discovered                           | Accepted, amended by 0042; extended by 0044 and 0065-price                                              |
 | [0051](0051-a-reject-code-binds-where-a-sender-must-act-differently.md)                | A reject code binds where a sender must act differently, and only there              | Accepted — extends 0011                                                                                 |
 | [0044](0044-a-probe-answers-what-a-route-costs-and-what-it-does.md)                    | A probe answers what a route costs **and what it does**                              | Accepted — **not yet built**                                                                            |
-| [0020](0020-a-price-is-flat-and-attaches-to-a-handler.md)                              | A price is flat, attaches to a handler, and buys an answer                           | Accepted, narrowed by 0040; amended by 0064 and 0065                                                    |
-| [0065](0065-a-price-is-a-schedule-over-payload-length.md)                              | A price is a schedule over payload length                                            | Accepted — **built** (#984); amends 0020, extends 0011                                                  |
+| [0020](0020-a-price-is-flat-and-attaches-to-a-handler.md)                              | A price is flat, attaches to a handler, and buys an answer                           | Accepted, narrowed by 0040; amended by 0064 and 0065-price                                              |
+| [0065-price](0065-a-price-is-a-schedule-over-payload-length.md)                        | A price is a schedule over payload length                                            | Accepted — **built** (#984); amends 0020, extends 0011; shares its number with 0065-mina                |
 | [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md)                        | Peer claims sign the EIP-712 balance-proof digest                                    | Accepted — amended by #1136                                                                             |
 | [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md)              | A Solana claim binds its domain, the way an EVM claim already does                   | Accepted — **built** (#1082); the wire change has landed                                                |
 | [0059](0059-a-channel-is-derived-from-its-participants.md)                             | A channel is derived from its participants, on both chains, by the same rule         | Accepted — **built** (#1158); the redeploy has not happened                                             |
@@ -166,7 +199,7 @@ how another repository is regarded.
 | [0041](0041-a-moving-tag-carries-the-fleets-committed-config-or-it-does-not-move.md)     | A moving tag carries the fleet's committed config, or it does not move    | Partly superseded by 0068 — Decision 3 (connector promotion) retired; 1, 2, 4 stand |
 | [0056](0056-production-is-a-named-empty-tier.md)                                         | Production is a named, empty tier                                         | **Proposed** — describes an absence                                                 |
 | [0057](0057-minimum-delivery-is-retired-a-claim-bounds-erosion.md)                       | Minimum delivery is retired; a claim bounds erosion                       | Accepted — **built** (#1143)                                                        |
-| [0065](0065-mina-leaves-the-repository.md)                                               | Mina leaves the repository                                                | Accepted — **built** (#1205); extends 0002                                          |
+| [0065-mina](0065-mina-leaves-the-repository.md)                                          | Mina leaves the repository                                                | Accepted — **built** (#1205); extends 0002; shares its number with 0065-price       |
 | [0068](0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md) | A node repository pins the connector; nothing here moves a tag onto a box | Accepted — **built** (#1213); partly supersedes 0041, supersedes 0055               |
 
 ---
@@ -215,7 +248,7 @@ does not go looking.
 | Record | Names                                                                   | State in the tree                                                                                                                                                                                                                                                                                                     |
 | ------ | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 0001   | `connector-api`, `connector-admin`                                      | Shipped as `connector-client-edge` and `connector-operator`. `ConnectorNode` deleted (#457).                                                                                                                                                                                                                          |
-| 0002   | `packages/mina-zkapp`                                                   | **Deleted** (0065), with the rest of the Mina surface. The zkApp deployed on Mina devnet is unaffected; the source is in git history.                                                                                                                                                                                 |
+| 0002   | `packages/mina-zkapp`                                                   | **Deleted** (0065-mina), with the rest of the Mina surface. The zkApp deployed on Mina devnet is unaffected; the source is in git history.                                                                                                                                                                            |
 | 0003   | the raw-TCP peer wire, `POST /ilp/v{N}`                                 | Wire deleted (0027). The versioned edge path was never built; the edge serves `/ilp`.                                                                                                                                                                                                                                 |
 | 0005   | `connector-core`, ceiling arithmetic                                    | The crate shipped as `connector-domain`. Exposure/ceiling retired (0033).                                                                                                                                                                                                                                             |
 | 0007   | `connector-core`                                                        | Shipped as `connector-domain`.                                                                                                                                                                                                                                                                                        |
@@ -307,7 +340,13 @@ project settled on; fix the glossary, never the record.
   **Supersedes**/**Retires**, and the killed record names its killer. Adding a record without a
   Status line is how this folder became untrustworthy the first time.
 - **Numbers are permanent.** Never renumber, never reuse, never delete a record. Supersede it
-  with a new one and update both Status lines.
+  with a new one and update both Status lines. The folder has one collision — 0065, taken by two
+  records an hour apart on 2026-08-27 — and it is resolved by being **stated**, not repaired:
+  renumbering would silently falsify citations that are correct today. See the note under the
+  opening paragraphs for the reasoning and for the `0065-price` / `0065-mina` citation form.
+  `crates/connector-bin/tests/record_numbers_are_taken_once.rs` fails on any other repeated
+  number, and on a third record at 0065 — on the branch, which is the last moment renumbering
+  costs nothing.
 - **A record states its decision in its first paragraph**, before any context or options.
 - **Amendments are appended in place** under an `## Update (issue #NNN)` heading rather than
   rewriting the original decision, so the trail stays readable.

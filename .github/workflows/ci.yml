@@ -53,7 +53,8 @@ jobs:
   # "Docs-only" is deliberately narrow -- every changed path is a Markdown
   # file or lives under docs/ -- and it is NOT "test-free". Markdown is read
   # by tests here: records_state_their_own_falsifier.rs walks all of docs/
-  # plus README.md, CONTEXT.md and CLAUDE.md; vendored_rfcs_are_unmodified.rs
+  # plus README.md, CONTEXT.md and CLAUDE.md; record_numbers_are_taken_once.rs
+  # reads docs/adr's filenames and its index; vendored_rfcs_are_unmodified.rs
   # diffs docs/rfcs/; documented_config_keys.rs reads
   # docs/protocol/configuration-spec.md; solana_program_ids.rs walks every
   # tracked file. So a docs-only PR runs exactly those harnesses in
@@ -403,6 +404,7 @@ jobs:
         run: |
           cargo test -p connector \
             --test records_state_their_own_falsifier \
+            --test record_numbers_are_taken_once \
             --test vendored_rfcs_are_unmodified \
             --test documented_config_keys \
             --test production_skeleton_is_inert 2>&1 | tee /tmp/cargo-test.log

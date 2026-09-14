@@ -1,6 +1,6 @@
 # Rejects accumulate fees; a probe is how cost is discovered
 
-**Status:** Accepted, amended by [0042](0042-a-packet-carries-its-claim.md) (fee honesty is bounded, not self-enforcing), extended by [0044](0044-a-probe-answers-what-a-route-costs-and-what-it-does.md) (a probe also answers what a route _does_) and by [0065](0065-a-price-is-a-schedule-over-payload-length.md) (a price may vary with payload length, so cacheability moves to the published schedule). Fee accumulation, the probe, and the sum-never-breakdown rule are unchanged.
+**Status:** Accepted, amended by [0042](0042-a-packet-carries-its-claim.md) (fee honesty is bounded, not self-enforcing), extended by [0044](0044-a-probe-answers-what-a-route-costs-and-what-it-does.md) (a probe also answers what a route _does_) and by [0065-price](0065-a-price-is-a-schedule-over-payload-length.md) (a price may vary with payload length, so cacheability moves to the published schedule). Fee accumulation, the probe, and the sum-never-breakdown rule are unchanged.
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 
