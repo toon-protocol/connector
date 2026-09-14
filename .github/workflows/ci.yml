@@ -167,6 +167,15 @@ jobs:
       - name: Check for tracked key-shaped files
         run: bash tools/ci/check-tracked-secrets.sh
 
+      # `fleet-health.yml`'s peering cross-check runs on a 15-minute cron and
+      # nowhere else, so a PR that breaks it would go green here and be found
+      # by a monitor silently reporting health it never checked. Its FAIL
+      # branches are unreachable from a healthy fleet, so `--self-test` drives
+      # every one of them against synthetic self-descriptions. It reads no
+      # network and no credential; it belongs on every PR.
+      - name: The fleet peering cross-check's failure branches still fire
+        run: python3 tools/ci/fleet-peering-crosscheck.py --self-test
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest
