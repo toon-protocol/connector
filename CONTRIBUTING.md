@@ -421,7 +421,12 @@ Four things sit outside it:
   the faucet and the announcer sidecar. It does **not** test the connector.
 - **[`local/`](local/README.md)** — the shipped **image**, as uid 10001, on a mounted config,
   against real containerised chains. A separate gate answering a question `cargo test`
-  structurally cannot: run one with `make local-verify LOCAL_TOPOLOGY=<solo|two-hop|mixed-chain>`.
+  structurally cannot: run one with
+  `make local-verify LOCAL_TOPOLOGY=<solo|two-hop|mixed-chain|dealing>`. `dealing` is where a hop
+  crosses a real denomination boundary at a declared rate
+  ([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). A fifth,
+  `onion`, runs a real onion daemon per node and is deliberately not on the CI gate
+  ([ADR 0070](docs/adr/0070-an-onion-address-is-a-host-not-a-carriage.md)) — run it by hand.
 
 ### Test Writing Guidelines
 

@@ -395,14 +395,11 @@ fn sealed_prepare_to(identity: &dyn Signer, destination: &str, amount: u64) -> (
     let (data, shared_secret) =
         connector_signer::giftwrap::seal_request(&envelope.encode(), &identity_public)
             .expect("seal");
-    let condition = connector_domain::derive_condition(
-        &connector_signer::giftwrap::derive_fulfillment(&shared_secret),
-    );
     (
         Prepare {
             amount,
             expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-            execution_condition: condition,
+            greeting: false,
             destination: destination.to_string(),
             data,
         },
@@ -424,7 +421,7 @@ fn prepare(destination: &str) -> Prepare {
     Prepare {
         amount: 100,
         expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-        execution_condition: [0x9a; 32],
+        greeting: false,
         destination: destination.to_string(),
         data: b"sealed to whoever terminates this route".to_vec(),
     }
@@ -1606,13 +1603,10 @@ async fn a_covering_claim_is_admitted_exactly_as_today() {
     let (data, shared_secret) =
         connector_signer::giftwrap::seal_request(&envelope.encode(), &identity_public)
             .expect("seal");
-    let condition = connector_domain::derive_condition(
-        &connector_signer::giftwrap::derive_fulfillment(&shared_secret),
-    );
     let prepare = Prepare {
         amount: 25,
         expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-        execution_condition: condition,
+        greeting: false,
         destination: "g.example.app".to_string(),
         data,
     };

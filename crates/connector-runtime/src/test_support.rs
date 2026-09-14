@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use connector_domain::{derive_condition, EnvelopeRequest, EnvelopeResponse};
+use connector_domain::{EnvelopeRequest, EnvelopeResponse};
 use connector_signer::giftwrap::{derive_fulfillment, open_response, seal_request};
 use connector_signer::{evm_balance_proof_digest, Address, LocalSigner, Signer};
 
@@ -102,18 +102,10 @@ pub(crate) fn expected_fulfillment(shared_secret: &[u8; 32]) -> [u8; 32] {
     derive_fulfillment(shared_secret)
 }
 
-/// The execution condition a sender must mint for `shared_secret`'s packet
-/// to fulfil (ADR 0019, issue #525): `derive_condition` of the fulfilment
-/// that secret itself derives.
-pub(crate) fn matching_condition(shared_secret: &[u8; 32]) -> [u8; 32] {
-    derive_condition(&expected_fulfillment(shared_secret))
-}
-
 /// The `AppOutcome` a `FakeAppClient` produces for an app that answers
 /// `200` with `body`. The app supplies nothing toward fulfilment (issue
-/// #525): whether the packet fulfils is decided entirely by whether its
-/// execution condition matches the fulfilment its own sealed secret
-/// derives, never by anything in this response.
+/// #525): a termination derives its own answer's fulfilment from the
+/// packet's sealed secret, never from anything in this response.
 pub(crate) fn answered(body: &[u8]) -> AppOutcome {
     answered_with_status(200, body)
 }

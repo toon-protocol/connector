@@ -1,0 +1,492 @@
+# =============================================================================
+# local/onion -- two connectors that CANNOT reach each other, peered over a
+# real onion network.
+#
+# Merged ON TOP of the repository-root docker-compose.yml so the chains are the
+# SAME services `make anvil-up` brings up:
+#
+#   docker compose -f docker-compose.yml -f local/onion/compose.yml \
+#     --profile evm --profile solana --profile onion up -d
+#
+# `make local-up LOCAL_TOPOLOGY=onion` does exactly that, with one extra step
+# no other topology needs -- see "The address does not exist yet" below.
+#
+# ── Why there are two networks ───────────────────────────────────────────────
+#
+# ADR 0070's Consequences are explicit that a fulfilled packet proves nothing
+# about the circuit: a SOCKS dial that silently fell back to a direct
+# connection would go green. So a direct dial has to be STRUCTURALLY
+# IMPOSSIBLE, not merely unobserved, and docker gives that if it is asked for
+# deliberately:
+#
+#   * `connector-a` and its `anon-a` sidecar sit on `onion-a`; `connector-b`,
+#     its `anon-b` sidecar and the app behind it sit on `onion-b`.
+#   * Containers on different user-defined bridge networks do not route to
+#     each other -- docker installs the isolation rules that drop it -- and
+#     docker's embedded DNS is PER NETWORK, so `connector-a` cannot resolve
+#     the name `connector-b` either. The peering's endpoint is the only name
+#     it has for that node, and that name is a hidden-service one.
+#   * `anvil` joins BOTH, because both nodes settle on it. A container on two
+#     bridges is not a router: it forwards nothing between them (`ip_forward`
+#     is off inside its own network namespace and nothing routes back), so
+#     this buys the chain reachability and no reachability between the peers.
+#   * Neither network is marked `internal`, and that is required rather than an
+#     oversight: the `anon` daemons have to reach the real onion network.
+#     What is isolated here is the two networks from EACH OTHER.
+#   * `connector-b` publishes NO host port. Its only door is the circuit.
+#
+# ── Two sidecars, not one ────────────────────────────────────────────────────
+#
+# `anon-b` publishes the hidden service. `anon-a` is the SOCKS5 proxy A dials
+# through -- and it has to be a second daemon, because a single one reachable
+# from both networks would be a process bridging exactly the two networks this
+# file went to the trouble of separating. Each daemon is infrastructure on its
+# own node's network, in the relationship this repository already has with
+# `anvil` and `solana-test-validator` (ADR 0070 decision 8).
+#
+# ── The address does not exist yet ───────────────────────────────────────────
+#
+# The daemon generates it, into `HiddenServiceDir/hostname`, the first time it
+# runs. The connector never reads that file and never speaks the daemon's
+# control protocol (ADR 0070 decision 7): the OPERATOR copies the address into
+# `[node]` and into the dialing node's peer `endpoint`. `local/keys.sh onion`
+# plays the operator -- it starts these two sidecars, reads the address, and
+# renders the committed `local/onion/*.toml` into
+# `local/.keys/onion/<node>/connector.toml` with the placeholder substituted.
+# THAT RENDERED FILE IS WHAT THE MOUNTS BELOW NAME. The committed ones are
+# still real configs that load -- a placeholder ends in `.anyone` too -- which
+# is what keeps `local_topologies_load.rs` able to read them.
+#
+# ── `.anyone`, not `.onion` ──────────────────────────────────────────────────
+#
+# The daemon above writes `<56-base32>.anyone`, because upstream renamed the
+# hidden-service TLD and this topology now runs the release that did (issue
+# #1284). The committed placeholders are spelled the same way, so the file an
+# operator reads names the TLD the daemon they run will actually generate. The
+# connector accepts BOTH spellings -- one suffix rule, `is_onion_endpoint`,
+# ADR 0070 as amended -- so the older daemon still peers; what it cannot do is
+# reach a node published by the newer one, which is a property of the network
+# rather than of any config here.
+#
+# ── BTP, deliberately ────────────────────────────────────────────────────────
+#
+# The peering is `ws://<addr>.anyone/ilp/btp`. The HTTP carriage asks its own
+# client for a proxy and gets one; the websocket library the BTP carriage
+# speaks has no proxy support at all, so its onion path builds a SOCKS5 stream
+# itself and hands the established stream to the websocket client. That is the
+# larger of the two carriage changes, the one a loopback SOCKS5 fake can least
+# stand in for, and therefore the one worth pointing at a real daemon. The
+# client edge rides the SAME onion service on the same port, because it is the
+# same listener -- one hidden service, both surfaces.
+# =============================================================================
+
+services:
+  # ── A's way onto the onion network ─────────────────────────────────────────
+  # A SOCKS5 proxy and nothing else: `anonrc-a` opens no ORPort and publishes
+  # no service. `connector-a`'s one `socks_proxy` key names this container.
+  anon-a:
+    # BUILT, not pulled (issue #1284). ghcr publishes no image for the daemon
+    # release whose hidden-service TLD is `.anyone`, so `local/anon-image`
+    # overlays the official binary onto the last image it does publish. The
+    # same image serves `local/anyone`; one pinned version, one place.
+    build:
+      context: ./local/anon-image
+    image: anon-live:v0.4.10.2
+    profiles: [onion]
+    init: true
+    volumes:
+      # PATHS ARE RELATIVE TO THE REPOSITORY ROOT, not to this file. Compose
+      # resolves relative bind mounts against the PROJECT directory, which is
+      # the directory of the FIRST `-f` file -- always ./docker-compose.yml.
+      - ./local/onion/anonrc-a:/etc/anon/anonrc:ro
+      # The DataDirectory. A named volume rather than a bind mount for the
+      # same reason /app/state is one on every connector here: the image ships
+      # this path owned by its own unprivileged user, and a fresh named volume
+      # inherits that ownership.
+      - onion-a-anon:/var/lib/anon
+    networks: [onion-a]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    healthcheck:
+      # A container that is Up is not a container with a circuit. `anon` logs
+      # its bootstrap progress, and 100% is the first moment a SOCKS request
+      # can be answered -- the same distinction the connectors' own gates draw
+      # between "started" and "serving".
+      test: ['CMD-SHELL', "grep -q 'Bootstrapped 100%' /var/lib/anon/notice.log"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+
+  # ── B's address ────────────────────────────────────────────────────────────
+  # The hidden service. Its `HiddenServiceDir` is inside the named volume
+  # below, so the address survives a restart -- ADR 0070's Consequences call an
+  # unpersisted one a config that goes stale on every counterparty SILENTLY,
+  # and put it beside `state_dir` for that reason. `make local-down` removes
+  # the volume with everything else, which is not the same thing: the address
+  # is re-read and re-rendered on the next bring-up, and no committed file
+  # names it.
+  # Its `HiddenServicePort` names `connector-b` by a FIXED IP rather than by
+  # service name, and that is forced: `anon` resolves that target when it
+  # parses its config, and this daemon starts before `connector-b` exists.
+  # See anonrc-b.
+  anon-b:
+    build:
+      context: ./local/anon-image
+    image: anon-live:v0.4.10.2
+    profiles: [onion]
+    init: true
+    volumes:
+      - ./local/onion/anonrc-b:/etc/anon/anonrc:ro
+      - onion-b-anon:/var/lib/anon
+    networks: [onion-b]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    healthcheck:
+      # Both halves. The hostname file appears at key generation, seconds in
+      # and long before the descriptor is published; `Bootstrapped 100%` is
+      # what says the daemon can actually publish it.
+      test:
+        - 'CMD-SHELL'
+        - "test -s /var/lib/anon/hidden_service/hostname && grep -q 'Bootstrapped 100%' /var/lib/anon/notice.log"
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+
+  # ── The payment-oblivious app, behind B ────────────────────────────────────
+  # The connector image's second binary. On B's network only: the sender
+  # cannot reach it, so "the app was reached" is evidence a packet crossed the
+  # peering rather than something the host could have arranged directly.
+  stub-app:
+    image: connector-rust:local
+    profiles: [onion]
+    entrypoint: ['/usr/local/bin/stub-app']
+    command: ['0.0.0.0:3100']
+    expose:
+      - '3100'
+    networks: [onion-b]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+  # ── B: the accepting half, reachable only at its hidden-service address ────
+  connector-b:
+    image: connector-rust:local
+    profiles: [onion]
+    command: ['/app/config/connector.toml']
+    volumes:
+      # THE RENDERED CONFIG, not the committed one: `local/keys.sh onion`
+      # writes it into this node's own key directory with the daemon's real
+      # address substituted for the committed placeholder.
+      - ./local/.keys/onion/connector-b/connector.toml:/app/config/connector.toml:ro
+      # Written by local/keys.sh, gitignored, never committed (ADR 0012). One
+      # directory per node, named after this service.
+      - ./local/.keys/onion/connector-b:/app/data:ro
+      # A NAMED volume, not a bind mount: the image creates /app/state owned by
+      # uid 10001 so a fresh named volume inherits that ownership. A host bind
+      # mount arrives root-owned and the connector refuses to start.
+      - onion-b-state:/app/state
+    networks:
+      onion-b:
+        # FIXED, because `anon-b`'s HiddenServicePort names this address and
+        # resolves it when it PARSES its config -- long before this container
+        # exists. It cannot name `connector-b` instead: the daemon has to start
+        # first, since this node's config carries an address only that daemon
+        # can generate. See anonrc-b.
+        ipv4_address: 172.31.0.10
+    # NO `ports`. Every other topology here publishes its connectors' client
+    # edges to loopback; this one deliberately does not for B, because the
+    # claim this topology makes is that the circuit is the only way in.
+    depends_on:
+      anvil:
+        condition: service_healthy
+      stub-app:
+        condition: service_started
+      # Backwards as a dependency and right as an ordering. B does not need
+      # the daemon in order to serve; `make local-up`'s contract is that when
+      # it returns the topology can be SENT TO, and for this node that means
+      # the descriptor is publishable. Waiting here is what keeps the first
+      # rehearsal from being a coin toss on bootstrap.
+      anon-b:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    healthcheck:
+      # GET /ilp/identity is unauthenticated and free, and answering it means
+      # the config loaded, the settlement backend connected, and the router is
+      # serving. `docker ps` showing "Up" proves none of that.
+      #
+      # 127.0.0.1, NOT localhost. `client_edge_addr = "0.0.0.0:3000"` binds
+      # IPv4 only, while `localhost` inside the container resolves `::1` first
+      # -- so busybox wget gets "Connection refused" from a healthy connector.
+      test:
+        ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:3000/ilp/identity || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── A: the dialing half, and the node the rehearsal is handed to ───────────
+  connector-a:
+    image: connector-rust:local
+    profiles: [onion]
+    command: ['/app/config/connector.toml']
+    volumes:
+      - ./local/.keys/onion/connector-a/connector.toml:/app/config/connector.toml:ro
+      - ./local/.keys/onion/connector-a:/app/data:ro
+      - onion-a-state:/app/state
+    networks: [onion-a]
+    ports:
+      # Published to loopback only, on a port no other topology uses. This
+      # reaches A and nothing beyond it -- there is no route from here to B,
+      # and a published port is not one either.
+      - '127.0.0.1:3006:3000'
+    depends_on:
+      anvil:
+        condition: service_healthy
+      # A's peer dial and its claim-state ask both leave through this daemon,
+      # so a bootstrapping proxy is the difference between a peering and a
+      # `T01`.
+      anon-a:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    healthcheck:
+      test:
+        ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:3000/ilp/identity || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── The rehearsal ──────────────────────────────────────────────────────────
+  # Its own profile so `up` never starts it: a one-shot that exits 0 or 1, run
+  # by `make local-rehearse` via `docker compose run --rm`.
+  #
+  # It sits on A's network, so its `--seal-to` -- B's self-description, whose
+  # identity the payload is sealed to (ADR 0018) -- can only be fetched over
+  # the circuit. That is what `--socks-proxy` is doing here, and it is the same
+  # host-selected rule applied to two URLs independently (ADR 0070 decision 5):
+  # `--operator` names a container on this network and goes direct, `--seal-to`
+  # names a hidden-service host and goes through `anon-a`.
+  #
+  # TWO CROSSINGS, then the payee's own claim journal, exactly as `two-hop`
+  # does and for the same two reasons. A peer claim's verdict rides back in
+  # `Toon-Claim-Ack` and never gates the packet (`handle_peer_prepare` returns
+  # the answer and the ack side by side), so a peering whose every claim was
+  # refused still FULFILLs -- `--expect-fulfill` alone would go green over a
+  # peering carrying traffic for free. And the second crossing is the one issue
+  # #1102 broke: a covering payer asks the payee where its claims stand on
+  # every packet, and a payee answering out of the wrong book reports nonce 0
+  # forever, so crossing 2 re-signs crossing 1's cumulative amount at a fresh
+  # nonce and advances nothing. One crossing cannot see that; two can.
+  #
+  # HERE THERE IS A THIRD REASON, and it is this topology's own: a fulfil says
+  # nothing about the circuit. What the journal read adds is that the claims
+  # arrived at all -- and, because B mounts no ILP-over-HTTP peer carriage
+  # (`peer_expose = "btp"`), an accepted PEER claim in its book cannot have
+  # arrived on anything but a BTP frame, over the only route into that network.
+  sender:
+    image: connector-rust:local
+    profiles: [sender]
+    entrypoint: ['/bin/sh', '-c']
+    networks: [onion-a]
+    command:
+      - |
+        set -e
+        # The figures this rehearsal is written around, and the arithmetic
+        # that relates them (ADR 0028, ADR 0010). They are NOT `two-hop`'s:
+        # a fee is one peering relation's bilateral price for carriage, and
+        # two topologies sharing one set of numbers is how a config copied
+        # from the other one passes unnoticed.
+        #
+        #   AMOUNT = FEE + PRICE -- the path's COST (`CONTEXT.md`): A's fee
+        #     for carrying the packet plus the price of the route B
+        #     terminates, which is also exactly A's own client-edge price.
+        #   PRICE  -- B's committed price, and the whole of what A forwards,
+        #     so the coverage gate has no slack.
+        #   FEE    -- A's committed fee, and what A must be left holding.
+        AMOUNT=1200
+        PRICE=1000
+        FEE=200
+        CROSSINGS=2
+        CHANNEL=0x339280164c007798a2c4ba9e7752d542dccd586866c53937f41f29702cbae801
+        JOURNAL=/app/payee-state/peer-claims.log
+        PROXY=socks5h://anon-a:9050
+
+        # B's onion address, read out of the config A is actually running --
+        # `local/keys.sh onion` rendered both from the same `hostname`, and
+        # this directory is A's own. Taking it from there rather than from a
+        # literal in this file is what makes the sender seal to the same node
+        # the payer dials: two copies of an address that is generated fresh on
+        # every bring-up would be one copy too many.
+        # The TLD is matched as [a-z]* rather than spelled out: `anon`
+        # renamed it (issue #1284) and a pattern naming one spelling would
+        # silently match nothing on a daemon that writes the other, leaving
+        # SEAL_TO empty and the failure two steps from its cause.
+        SEAL_TO=$$(sed -n 's|^client_edge_url = "\(http://[a-z2-7]*\.[a-z]*/ilp\)"$$|\1|p' \
+          /app/data/connector.toml | head -1)
+        if [ -z "$$SEAL_TO" ]; then
+          echo "A's rendered config names no onion client edge, so local/keys.sh never" >&2
+          echo "substituted the daemon's address into it." >&2
+          exit 1
+        fi
+        echo "--- B is at $$SEAL_TO, reached through $$PROXY"
+
+        send() {
+          /usr/local/bin/connector send \
+            --operator     http://connector-a:3000 \
+            --operator-key /app/data/operator-send.key \
+            --to           g.local.onion.b.app \
+            --seal-to      "$$SEAL_TO" \
+            --socks-proxy  "$$PROXY" \
+            --target       / \
+            --amount       "$$AMOUNT" \
+            --body         /app/data/payload.json \
+            "$$@"
+        }
+
+        # A circuit to a service whose descriptor was published a moment ago
+        # is not reachable the moment the daemon reports 100%. `--dry-run`
+        # fetches `--seal-to`'s self-description -- through the proxy, over the
+        # circuit -- and sends no packet, so this waits for the rendezvous
+        # WITHOUT putting a crossing on the wire that the money assertion below
+        # would then have to account for. It is a wait, not a retry: what it
+        # gives up on is the run, not the assertion.
+        echo '--- waiting for a circuit to B (connector send --dry-run reaches it or nothing does)'
+        reached=0
+        attempt=1
+        while [ "$$attempt" -le 20 ]; do
+          if send --dry-run >/dev/null 2>&1; then
+            reached=1
+            break
+          fi
+          echo "    attempt $$attempt: no rendezvous yet"
+          attempt=$$((attempt + 1))
+          sleep 15
+        done
+        if [ "$$reached" != "1" ]; then
+          echo "B's self-description was unreachable over the circuit after 5 minutes." >&2
+          echo "Nothing here can route to that container any other way, which is the point --" >&2
+          echo "check 'docker compose logs anon-a anon-b' for the bootstrap." >&2
+          send --dry-run || true
+          exit 1
+        fi
+
+        echo '--- crossing 1: priced at B, covered by A before it is sent'
+        send --expect-fulfill
+        echo '--- crossing 2: the covering claim must ADVANCE, not repeat'
+        send --expect-fulfill
+
+        if [ ! -f "$$JOURNAL" ]; then
+          echo "B kept no claim journal at $$JOURNAL, so nothing was ever accepted and" >&2
+          echo "both crossings were carried for free." >&2
+          exit 1
+        fi
+        echo "--- what B was actually paid, out of B's own claim journal"
+        # One line per accepted claim on this channel, in the order ClaimBook
+        # wrote them: `inbound_claim_accepted <channel> <nonce> <cumulative>
+        # <signature>`, tab separated (`connector_runtime::journal`).
+        if ! awk -F '\t' -v channel="$$CHANNEL" -v price="$$PRICE" -v crossings="$$CROSSINGS" \
+                 -v amount="$$AMOUNT" -v fee="$$FEE" '
+              $$1 == "inbound_claim_accepted" && $$2 == channel {
+                accepted = accepted + 1
+                advance = $$4 - cumulative
+                retained = amount - advance
+                printf "    claim %d: nonce %s, cumulative %s, advance %d, A retained %d\n", accepted, $$3, $$4, advance, retained
+                if (advance < price) {
+                  printf "    ^^ that advance does not cover the %d this route costs\n", price
+                  short = 1
+                }
+                # ADR 0010 as a measurement rather than a restatement of the
+                # config: a hops earnings are the difference between what it
+                # collected upstream and what it sent downstream, and that
+                # difference must be its fee EXACTLY. Not implied by the
+                # advance check above -- an advance of price + 1 satisfies
+                # that one and leaves A a unit short.
+                if (retained != fee) {
+                  printf "    ^^ A collected %d and forwarded %d, so it kept %d -- not the %d fee it charges\n", amount, advance, retained, fee
+                  earnings = 1
+                }
+                cumulative = $$4
+              }
+              END {
+                if (accepted < crossings) {
+                  printf "B accepted %d claims on this channel, but %d crossings were sent and every one of them had to be paid for\n", accepted, crossings
+                  exit 1
+                }
+                if (short || earnings) { exit 1 }
+                if (cumulative < crossings * price) {
+                  printf "the watermark on this channel stands at %d, and %d crossings at %d each is %d\n", cumulative, crossings, price, crossings * price
+                  exit 1
+                }
+                printf "    watermark %d = %d crossings x %d, and A kept %d x %d = %d of the %d it collected\n", cumulative, crossings, price, crossings, fee, crossings * fee, crossings * amount
+              }
+            ' "$$JOURNAL"; then
+          echo 'the onion peering was NOT paid for -- see the claim lines above.' >&2
+          echo '--- B/peer-claims.log follows ---' >&2
+          cat "$$JOURNAL" >&2
+          exit 1
+        fi
+        echo "--- the peering paid B for every crossing it carried, over the circuit"
+    volumes:
+      # A's keys and A's RENDERED config: the sender signs the operator write
+      # with A's allowlisted key, posts the fixture body from the same
+      # directory, and reads B's address out of the config beside them.
+      - ./local/.keys/onion/connector-a:/app/data:ro
+      # B's state volume, READ-ONLY, purely to read the claim journal. A volume
+      # is not a network: this mount gives the sender B's journal without
+      # giving it any route to B, which is exactly the separation this
+      # topology needs. The sender runs as the same uid 10001 that wrote it.
+      - onion-b-state:/app/payee-state:ro
+
+  # ── The chain both nodes settle on ─────────────────────────────────────────
+  # Declared again only to attach it to both networks. Everything else about
+  # this service -- image, uid, the contract deploy, the health gate -- comes
+  # from the repository-root docker-compose.yml this file is merged onto.
+  anvil:
+    networks: [onion-a, onion-b]
+
+networks:
+  # Two ordinary bridge networks. NOT `internal`: the `anon` daemons need the
+  # outside world. What they are isolated from is each other, which docker
+  # enforces without being asked -- and which is the whole evidentiary basis
+  # of this topology.
+  onion-a:
+  onion-b:
+    ipam:
+      config:
+        # Pinned so anonrc-b's HiddenServicePort can name an address in it.
+        # A different /16 from local/anyone's, so a stack left up in one
+        # checkout does not make the other's network un-creatable.
+        - subnet: 172.31.0.0/16
+
+volumes:
+  onion-a-state:
+  onion-b-state:
+  onion-a-anon:
+  # Holds `hidden_service/hostname` and the private key behind B's address.
+  # Neither is ever committed: `tools/ci/check-tracked-secrets.sh` would refuse
+  # the key, and a fixed onion key in a public repository is an address anyone
+  # could impersonate.
+  onion-b-anon:

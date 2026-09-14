@@ -18,6 +18,25 @@
 //! rather than silently dropping. It is held to the contract suite in this
 //! module's `tests::contract`, which each new carriage joins.
 
+/// Why an onion endpoint cannot be dialed on a node that configured no
+/// `socks_proxy` (ADR 0070 decision 3).
+///
+/// A dial failure and nothing more exotic: a `.onion` or `.anyone` name
+/// resolves nowhere without a proxy to resolve it, so this reads like every
+/// other "could not reach that host", and packets routed to the peer reject
+/// `T01` with the peer and the endpoint named -- never `T00` and never a
+/// silent drop (`peer-carriage-spec.md` §2.2).
+///
+/// **One string, shared by both carriages**, because `peer-carriage-spec.md`
+/// §9 holds that peer behaviour an operator can observe on one carriage and
+/// not the other is a defect -- and "what this node says when it cannot
+/// reach an onion peer" is exactly such a behaviour. The two carriage crates
+/// do not depend on each other, but both depend on this one, so this is
+/// where a sentence they must not diverge on belongs.
+pub const NO_SOCKS_PROXY: &str =
+    "the endpoint's host ends in .onion or .anyone and this node configured no socks_proxy, so \
+     there is nothing that can resolve or reach it (ADR 0070 decision 3)";
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -224,7 +243,18 @@ impl PeerLink {
                         claim,
                         respond_to,
                     } => {
-                        let result = connector.handle_peer_prepare(prepare, claim).await;
+                        // No arriving peering is named: this stand-in
+                        // models a link, not an identity, and the
+                        // `Connector` behind it has no way to know which
+                        // of its peerings this `PeerLink` stands for.
+                        // ADR 0071's converting arm therefore never fires
+                        // through this transport -- which is the safe
+                        // direction for a stand-in to be wrong in only
+                        // because a node that declares no `[[tokens]]`
+                        // has no crossing to miss, and a dealing node is
+                        // reached over a real carriage that does
+                        // authenticate the peer (issue #1295).
+                        let result = connector.handle_peer_prepare(None, prepare, claim).await;
                         let _ = respond_to.send(result);
                     }
                     PeerMessage::Flush { claim, respond_to } => {
@@ -331,44 +361,41 @@ mod tests {
     use crate::app_client::FakeAppClient;
     use crate::clock::TestClock;
     use crate::test_support::{
-        answered, expected_fulfillment, fulfill_envelope, identity_signer, matching_condition,
-        open_sealed_envelope, sealed_envelope_request_data, sign_wire_claim, with_test_channel,
+        answered, expected_fulfillment, fulfill_envelope, identity_signer, open_sealed_envelope,
+        sealed_envelope_request_data, sign_wire_claim, with_test_channel,
     };
     use chrono::{TimeZone, Utc};
     use connector_config::StaticRoute;
     use connector_signer::{LocalSigner, Signer};
 
-    /// Seals a fixed body and sets `execution_condition` to match the
-    /// fulfilment its own (discarded) shared secret derives (ADR 0019,
-    /// issue #525) -- what a genuine sender does before ever transmitting a
-    /// packet, so this is, by construction, one that fulfils if it reaches
-    /// an app that answers at all. A test that also needs the secret back
-    /// uses [`sealed_prepare`] instead.
+    /// Seals a fixed body (issue #524) -- what a genuine sender does before
+    /// ever transmitting a packet, so a termination reached through this
+    /// derives a fulfilment for the wrap's own secret and this is, by
+    /// construction, one that fulfils if it reaches an app that answers at
+    /// all. A test that also needs the secret back uses [`sealed_prepare`]
+    /// instead.
     fn prepare(destination: &str) -> Prepare {
-        let (data, shared_secret) = sealed_envelope_request_data(b"hello");
+        let (data, _shared_secret) = sealed_envelope_request_data(b"hello");
         Prepare {
             amount: 0,
             // Comfortably after `test_clock()`'s instant (2030-01-01).
             expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-            execution_condition: matching_condition(&shared_secret),
+            greeting: false,
             destination: destination.to_string(),
             data,
         }
     }
 
     /// A `Prepare` addressed to `"g.example.app"`, sealed to
-    /// [`identity_signer`]'s identity and carrying `body` (issue #524),
-    /// with `execution_condition` set to match the fulfilment this same
-    /// sealed secret derives (ADR 0019, issue #525). Returns the shared
-    /// secret alongside, to open the sealed `Fulfill`/termination-`Reject`
-    /// this produces, or to compute the expected fulfilment via
-    /// `expected_fulfillment`.
+    /// [`identity_signer`]'s identity and carrying `body` (issue #524).
+    /// Returns the shared secret alongside, to open the sealed
+    /// `Fulfill`/termination-`Reject` this produces, or to compute the
+    /// expected fulfilment via `expected_fulfillment`.
     fn sealed_prepare(body: &[u8]) -> (Prepare, [u8; 32]) {
         let (data, shared_secret) = sealed_envelope_request_data(body);
         (
             Prepare {
                 data,
-                execution_condition: matching_condition(&shared_secret),
                 ..prepare("g.example.app")
             },
             shared_secret,

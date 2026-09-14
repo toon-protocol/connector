@@ -61,7 +61,7 @@ if [ -n "$owners" ]; then
   # would leave them running beside this one's, both bound to the same chains
   # and each with its own state volumes -- and the money assertion of whichever
   # one is rehearsed would be read out of a journal the other is also writing.
-  other=$(grep -oE 'local/(solo|two-hop|mixed-chain)/compose\.yml' <<<"$owner_files" |
+  other=$(grep -oE 'local/(solo|two-hop|mixed-chain|onion|dealing)/compose\.yml' <<<"$owner_files" |
     sed -E 's|local/(.*)/compose\.yml|\1|' | sort -u | grep -v "^${topology}$" || true)
   if [ -n "$other" ]; then
     echo "ERROR: the '$other' topology is already up in this directory, and every topology"

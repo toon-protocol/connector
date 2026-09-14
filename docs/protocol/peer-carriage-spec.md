@@ -562,6 +562,17 @@ listener with mandatory authentication**. If it does:
   whose endpoint scheme selects no carriage this connector dials registers none, and packets routed
   to it get §2.2's `T01` with the peer named.
 
+  **A host ending in `.onion` or `.anyone` permits the plaintext schemes** ([ADR 0070](../adr/0070-an-onion-address-is-a-host-not-a-carriage.md),
+  amended by issue #1284): `ws://` → BTP and `http://` → HTTP when, and only when, the endpoint's
+  host has one of those suffixes. This adds no carriage — an onion address is a **host**, and both
+  carriages ride it unchanged — and it is independent of `peer_allow_plaintext_endpoints`, which
+  keeps its own meaning and its own scope. The exemption is narrow because of what a v3 onion
+  address is: the address _is_ the ed25519 public key the circuit is authenticated to, so such an
+  endpoint authenticates itself and ADR 0004's requirement is satisfied by a different mechanism
+  rather than waived — which is why the two spellings are one rule, since `anon` renamed the TLD it
+  publishes without changing what an address is. At every other host, a plaintext scheme remains the
+  error this sentence's second clause requires.
+
 These are independent. Exposing BTP says nothing about how any peer is dialed; dialing a peer over
 HTTP says nothing about what this connector listens on.
 
@@ -651,8 +662,8 @@ additively extensible) and MUST NOT be emitted.
 
 - **The ILP packets themselves are unchanged**, byte for byte, on both carriages: the same OER
   encodings `POST /ilp` already carries (`client-edge-spec.md` §1.1), the same as the deleted peer
-  wire carried in its §2. `vectors/wire-vectors.json`'s existing envelope, condition and fulfilment
-  sections were never peer-specific and are not re-derived here.
+  wire carried in its §2. `vectors/wire-vectors.json`'s existing envelope and fulfilment sections
+  were never peer-specific and are not re-derived here.
 - **ADR 0024's EIP-712 `BalanceProof` digest is untouched**, on both carriages. A peer claim signs
   exactly the digest `connector_signer::evm_balance_proof_digest` produces today, over exactly the
   fields the deployed `TokenNetwork.sol` typehash requires, `lockedAmount`/`locksRoot` included and
@@ -725,6 +736,33 @@ additively extensible) and MUST NOT be emitted.
   **A destination that resolves to no configured route is still gated by nothing**, and that
   includes a **leased** route: `Connector::client_route` excludes leases by construction (ADR 0028),
   so neither rule here reaches one. That is ADR 0028's own gap, unchanged by ADR 0042.
+
+  **Neither rule reaches a peering established at runtime, because on the accepting side there is
+  no peering** ([ADR 0058](../adr/0058-a-peering-is-established-from-a-url.md), whose dial half §2.1
+  already carries). `POST /peers` is one operator's own write on one node: it derives the channel,
+  binds it into that node's `ClaimBook` and registers the outbound client hop that pays over it
+  (`Connector::bind_runtime_peer_channel`, `Connector::register_outbound_client_hop`), and it puts
+  nothing into the counterparty's configuration -- ADR 0058 makes a peering establishable **from** a
+  URL, not **on** somebody else's node. Role there is still §1.2's P2 and P3, and P2 reads
+  `[[peer_channels]]`: `PeerAuthPolicy::from_config` is built once from the loaded config and no
+  runtime write mutates it, so a claim naming a runtime-derived channel binds no peering and the
+  arrival is a **client** arrival. On a node whose own config declares no `[[peers]]` row at all,
+  no peer handling is even mounted (`PeerCarriages::from_config` answers `None`), whatever
+  `peer_expose` says. This is §1.2's "Peer role is not a prerequisite for paid carriage" reached
+  from the other direction: the payer is paying an ordinary client edge, which is the shape the
+  runtime peering was built to work in.
+
+  **So over a runtime peering the refusal is the client edge's, and it is not `F06`.** An arrival
+  carrying no claim is greeted with the x402 terms of `client-edge-spec.md` §1.4 -- the same
+  `connector_domain::x402::terms_body` emitter, carrying this node's identity and settlement facts
+  where the peer greeting above quotes the figure alone. An arrival whose claim **under-covers** the
+  route's price is `F03` (Invalid Amount) with that price in `accumulatedCost`, not `F06` with a
+  greeting attached (`ClaimIngestRejection::Underpayment`, `client-edge-spec.md` §1.3). Both
+  differences are the client edge's own taxonomy, and neither is a hole in §0.1's one pipeline or a
+  drift under I7: the two peer carriages still answer this rule identically, and what changed is
+  which **edge** the packet arrived at, not which wire it rode. An operator who wants §3.1's rule to
+  govern what a counterparty sends writes `[[peers]]` and `[[peer_channels]]` on the **accepting**
+  side; there is no runtime write on the payer's node that can put them there.
 
 ### 3.2 The `WireClaim` binary encoding is not used on either carriage
 
@@ -1128,12 +1166,15 @@ between a **peer hop** and a **termination**, because the two carriages make it 
 - A forwarding connector MUST NOT derive a fulfilment. ADR 0019's derivation is a **termination-only**
   capability; issue #417's rule — a connector never produces a fulfilment itself — stands unchanged
   for every forwarding hop, on both carriages.
-- A forwarding connector MUST verify `sha256(fulfillment) == executionCondition` on every FULFILL it
-  relays upstream, **before** treating the packet as fulfilled for its own claim accounting
-  (`peer-semantics-pre-868.md` §3.1). This is what makes the far end's derivation safe to rely on without
-  opening anything: a hop is paid only against a preimage it cannot forge.
-- `peer-semantics-pre-868.md` §3.1's other rule is unchanged on both carriages: an absent or all-zero
-  `executionCondition` is `F01`, with no derived-preimage fallback.
+- **A forwarding connector relays a downstream FULFILL unchecked** (issue #1269,
+  [ADR 0069](../adr/0069-the-execution-condition-leaves-the-wire.md)). The PREPARE carries no
+  execution condition and there is no field left to verify a candidate fulfilment against: a hop
+  is paid on arrival (ADR 0042) regardless of what the FULFILL it relays turns out to contain, so
+  the check `peer-semantics-pre-868.md` §3.1 once required here protected nothing this hop owns.
+  The sender's own end-to-end check — comparing the fulfilment that comes back against
+  `derive_fulfillment` of its own sealed secret — is what a forged delivery actually meets.
+  `peer-semantics-pre-868.md` §3.1's F01-on-missing-condition rule is retired the same way: there is
+  no condition for a PREPARE to omit.
 
 ### 8.2 A termination reached over a peering
 
@@ -1401,7 +1442,16 @@ Required surface:
 - Per peer: `max_packet_amount` — [ADR 0042](../adr/0042-a-packet-carries-its-claim.md)'s **cap**,
   the largest amount this connector will forward to that peering in **one packet**, in the
   settlement asset's base units. A packet needing more is refused with `T04`, never carried and
-  never split. Optional and defaulted (`connector_config::DEFAULT_MAX_PACKET_AMOUNT`, 1 000 000 =
+  never split. Those base units are the **outgoing** channel's — the peering the row is written
+  on, never the peering the packet arrived over. The distinction is free while a whole path holds
+  one token and is the whole of the reading once it does not: a hop that crosses a denomination
+  applies its declared rate first and compares the **converted** figure against this number
+  ([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)), so a cap
+  beside a peering holding an 18-decimals token is a count of 10⁻¹⁸ of that token and nothing
+  else. There is also a ceiling below this one that no operator configures: an amount is a `u64`,
+  so one packet on an 18-decimals leg cannot exceed `u64::MAX / 10¹⁸ ≈ 18.4` tokens whatever this
+  row says, and a conversion landing past it is refused rather than wrapped. `max_packet_amount`
+  is where an operator says something smaller and deliberate. Optional and defaulted (`connector_config::DEFAULT_MAX_PACKET_AMOUNT`, 1 000 000 =
   1 USDC), so a peering that writes nothing is still bounded; there is deliberately no spelling
   that disables it, and `0` is a named load error rather than "off". This bounds one packet, not
   an accumulation — it is not `ceiling` returning (ADR 0033, retired above).
@@ -1515,7 +1565,7 @@ Named load-time errors this specification requires (spelling #677's, identity ou
 | Error                                           | Condition                                                                                                                                                                                                                                                                                                                   | Source             |
 | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
 | `PeerUndialable`                                | `expose` is empty **and** a configured peer has no `endpoint` — a peering that can never establish                                                                                                                                                                                                                          | §2.2               |
-| `PeerEndpointScheme`                            | an `endpoint` whose scheme is neither `wss://` nor `https://`                                                                                                                                                                                                                                                               | §2.1               |
+| `PeerEndpointScheme`                            | an `endpoint` whose scheme is neither `wss://` nor `https://` — nor, at a `.onion` or `.anyone` host, `ws://` or `http://` (ADR 0070)                                                                                                                                                                                       | §2.1               |
 | `PeerCredentialRemoved`                         | a `[[peers]]` entry setting `credential` at all — the `{peerId, secret}` shared secret is deleted and nothing replaces it, so a file writing one is stopped **by name** rather than peered without it. Replaces `PeerCredentialMissing` ("no credential — it could never satisfy P1"), a requirement that no longer exists  | §1.2, ADR 0060     |
 | `PeerChannelUnbound`                            | a `[[peers]]` entry with no `[[peer_channels]]` row — it could never satisfy P2                                                                                                                                                                                                                                             | §1.2               |
 | `PeerChannelOrphaned`                           | a `[[peer_channels]]` row naming an unknown `peer_id`                                                                                                                                                                                                                                                                       | §1.2               |
@@ -1660,8 +1710,9 @@ and carries, without restating,
 [ADR 0019](../adr/0019-a-terminating-connector-derives-the-fulfilment.md),
 [ADR 0021](../adr/0021-vectors-are-normative-prose-is-not.md),
 [ADR 0023](../adr/0023-oer-length-determinants-are-canonical.md),
-[ADR 0024](../adr/0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and
-[ADR 0025](../adr/0025-an-envelope-target-is-confined-beneath-the-handler-path.md).
+[ADR 0024](../adr/0024-peer-wire-claims-sign-the-eip-712-balance-proof.md),
+[ADR 0025](../adr/0025-an-envelope-target-is-confined-beneath-the-handler-path.md) and
+[ADR 0069](../adr/0069-the-execution-condition-leaves-the-wire.md).
 
 It does not reintroduce raw-TCP framing, a `transport` selector, a peer-specific claim encoding, a
 quoting protocol, `lockedAmount`/`locksRoot`, the derived-preimage condition path, or a

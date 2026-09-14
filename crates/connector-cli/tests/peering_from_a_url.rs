@@ -44,8 +44,8 @@ use tower::ServiceExt;
 
 use connector_domain::x402::{X402ChainSettlementTerms, X402SettlementTerms};
 use connector_domain::{
-    derive_condition, EdgeIdentity, EnvelopeRequest, EnvelopeResponse, Fulfill, NodeFacts,
-    NodeSelfDescription, Prepare, Reject,
+    EdgeIdentity, EnvelopeRequest, EnvelopeResponse, Fulfill, NodeFacts, NodeSelfDescription,
+    Prepare, Reject,
 };
 use connector_operator::test_support::sign_request;
 use connector_runtime::PeerView;
@@ -53,7 +53,7 @@ use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
 use connector_settlement_evm::EvmSettlementBackend;
-use connector_signer::giftwrap::{derive_fulfillment, open_response, seal_request};
+use connector_signer::giftwrap::{open_response, seal_request};
 use connector_signer::{
     derive_evm_address, to_hex, verify_evm_balance_proof, EvmBalanceProof, LocalSigner,
     PublicKeyBytes, Signer,
@@ -992,7 +992,7 @@ async fn originate_and_expect_fulfil(
     let prepare = Prepare {
         amount: AMOUNT,
         expires_at: Utc::now() + ChronoDuration::minutes(5),
-        execution_condition: derive_condition(&derive_fulfillment(&shared_secret)),
+        greeting: false,
         destination: NODE_A_APP_PREFIX.to_string(),
         data,
     };

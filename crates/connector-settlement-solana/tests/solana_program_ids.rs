@@ -1,14 +1,15 @@
 //! THE record of which Solana payment-channel program ids this repository
 //! names, and the guard that stops a fourth one appearing.
 //!
-//! There are exactly two, and they are not interchangeable:
+//! There are exactly three, and they are not interchangeable:
 //!
 //! | Id | Where it lives | Recorded in |
 //! | -- | -- | -- |
+//! | [`MAINNET_BETA_PROGRAM_ID`] | Solana mainnet-beta | `packages/solana-program/deployments/mainnet-beta.md` |
 //! | [`DEVNET_PUBLIC_PROGRAM_ID`] | public Solana devnet | `packages/solana-program/deployments/devnet-public.md` |
 //! | [`LOCAL_TEST_PROGRAM_ID`] | a disposable `solana-test-validator`'s genesis | `crates/connector-settlement-solana/src/test_support.rs` |
 //!
-//! Every committed file that names one names one of those two, and
+//! Every committed file that names one names one of those three, and
 //! [`every_committed_program_id_is_one_of_the_two_this_repository_records`] is
 //! what makes that true. The literal is necessarily repeated at each site --
 //! two box TOMLs, a JSON endpoint record, a shell entrypoint, four local
@@ -63,6 +64,15 @@ use std::str::FromStr;
 
 use connector_settlement_solana::test_support::LOCAL_TEST_PROGRAM_ID;
 use solana_sdk::pubkey::Pubkey;
+
+/// The `payment-channel` program deployed to **Solana mainnet-beta** on
+/// 2026-08-14 by the first third-party operator, and upgraded in place to the
+/// V2 layout on 2026-08-29. No file in this repository configures a node
+/// against it: it is named only by its deployment record,
+/// `packages/solana-program/deployments/mainnet-beta.md`, which is where an
+/// operator copies it from. Recorded here so the walk knows it is a deploy
+/// and not drift.
+const MAINNET_BETA_PROGRAM_ID: &str = "8e7BhzydH1EqL486tw6Lp99BXviH3i5JN8qNpMSNmHj3";
 
 /// The `payment-channel` program deployed to **public Solana devnet** on
 /// 2026-07-18, which both fleet boxes settle through. Provenance is
@@ -139,7 +149,11 @@ fn repo_root() -> PathBuf {
 }
 
 fn recorded() -> BTreeSet<&'static str> {
-    BTreeSet::from([DEVNET_PUBLIC_PROGRAM_ID, LOCAL_TEST_PROGRAM_ID])
+    BTreeSet::from([
+        MAINNET_BETA_PROGRAM_ID,
+        DEVNET_PUBLIC_PROGRAM_ID,
+        LOCAL_TEST_PROGRAM_ID,
+    ])
 }
 
 /// Every value `raw` assigns to a program-id key, as a Solana pubkey.
@@ -293,9 +307,10 @@ fn every_committed_program_id_is_one_of_the_two_this_repository_records() {
     assert!(
         drifted.is_empty(),
         "a committed file names a Solana payment-channel program id this file does not \
-         record:\n  {}\n\nThis repository has exactly two, deliberately: \
-         {DEVNET_PUBLIC_PROGRAM_ID} on PUBLIC DEVNET (packages/solana-program/deployments/\
-         devnet-public.md), and {LOCAL_TEST_PROGRAM_ID} inside a disposable \
+         record:\n  {}\n\nThis repository has exactly three, deliberately: \
+         {MAINNET_BETA_PROGRAM_ID} on MAINNET-BETA (packages/solana-program/deployments/\
+         mainnet-beta.md), {DEVNET_PUBLIC_PROGRAM_ID} on PUBLIC DEVNET (packages/solana-program/\
+         deployments/devnet-public.md), and {LOCAL_TEST_PROGRAM_ID} inside a disposable \
          solana-test-validator's genesis. They are not interchangeable, and since ADR 0053 the \
          program id is bound into a claim's signed balance proof -- a claim signed under one for \
          a channel that lives under the other does not verify. If the new id really is a deploy, \
@@ -321,12 +336,20 @@ fn the_repository_names_a_solana_program_id_in_exactly_the_known_places() {
         "infra/linode-store/connector-rust.toml",
         "infra/linode/endpoints.json",
         "infra/solana/entrypoint.sh",
+        // The two topologies that put a node on the validator: `mixed-chain`
+        // crosses a chain without crossing a denomination, and `dealing`
+        // (ADR 0071) crosses both. Each names the disposable validator's
+        // genesis id, never a deployed one.
+        "local/dealing/compose.yml",
+        "local/dealing/connector-b.toml",
+        "local/dealing/connector-c.toml",
         "local/keys.sh",
         "local/mixed-chain/compose.yml",
         "local/mixed-chain/connector-b.toml",
         "local/mixed-chain/connector-c.toml",
         "local/solo/connector.toml",
         "packages/solana-program/deployments/devnet-public.md",
+        "packages/solana-program/deployments/mainnet-beta.md",
         "vectors/wire-vectors.json",
     ]);
     let actual: BTreeSet<String> = program_id_sites().into_keys().collect();
@@ -335,7 +358,7 @@ fn the_repository_names_a_solana_program_id_in_exactly_the_known_places() {
     assert_eq!(
         actual, expected,
         "the set of non-Rust files naming a Solana program id changed. A new one is not \
-         forbidden -- it just has to be a deliberate choice between the two ids this file \
+         forbidden -- it just has to be a deliberate choice between the three ids this file \
          records, and named here so the next drift is still visible. A file that DISAPPEARED \
          from this set is the more interesting direction: it usually means a site's id was \
          mangled into something that is no longer a valid address, which the value check above \

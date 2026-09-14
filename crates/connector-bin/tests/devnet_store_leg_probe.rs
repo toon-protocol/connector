@@ -62,12 +62,11 @@
 //!     asserts the two identities actually differ, so a probe pointed at one
 //!     URL twice fails loudly instead of proving nothing.
 //!
-//!   * **The execution condition is not free.** It must be
-//!     `sha256(HKDF-SHA256(shared_secret, salt = zeros(32),
-//!     info = "toon-giftwrap-fulfillment", 32))` -- the terminating node
-//!     derives its fulfilment from the same shared secret, so a random
-//!     condition can never be matched. Here that is
-//!     `derive_condition(&derive_fulfillment(&secret))`, from the workspace's
+//!   * **There is no execution condition to get right, or wrong (issue
+//!     #1269 / ADR 0069).** The PREPARE carries none; the terminating node
+//!     derives its fulfilment straight from the shared secret the gift wrap
+//!     carries, and this probe's own end-to-end check compares the FULFILL
+//!     it gets back against `derive_fulfillment(&secret)` -- the workspace's
 //!     own signer, so there is no second implementation to drift.
 //!
 //!   * **The PREPARE encoding is not stock ILPv4.** The amount is an OER
@@ -126,9 +125,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
-use connector_domain::{
-    derive_condition, EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject,
-};
+use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Price, Reject};
 use connector_signer::giftwrap::{derive_fulfillment, open_response, seal_request};
 use connector_signer::{
     derive_evm_address, evm_balance_proof_digest, to_hex, EvmBalanceProof, LocalSigner,
@@ -237,7 +234,16 @@ async fn fetch_identity(base: &str) -> PublicKeyBytes {
 /// What an edge charges a client for `destination`, from its own greeting --
 /// so the probe's arithmetic is checked against the running config, not
 /// against a number written down here.
-async fn fetch_price(base: &str, destination: &str) -> u64 {
+///
+/// The answer is a schedule, not a number (ADR 0065): `price` is the flat
+/// part and `price_per_kib` the slope, and what a packet is charged is
+/// `Price::charge(data.len())`, evaluated on the SEALED payload. A flat route
+/// answers with no slope, which is the zero-slope schedule. Issue #1265: this
+/// used to return the flat part alone, and against a scheduled route the
+/// probe then either under-paid the far hop (F03 on arrival, the client
+/// refunded and the forwarding operator eating it) or, if it guessed high,
+/// was refused by the edge for declaring more than the charge.
+async fn fetch_price(base: &str, destination: &str) -> Price {
     let body: serde_json::Value =
         reqwest::get(format!("{base}/ilp/routes/price?destination={destination}"))
             .await
@@ -245,9 +251,20 @@ async fn fetch_price(base: &str, destination: &str) -> u64 {
             .json()
             .await
             .expect("price json");
-    body["price"]
+    let flat = body["price"]
         .as_u64()
-        .unwrap_or_else(|| panic!("no price for {destination}: {body}"))
+        .unwrap_or_else(|| panic!("no price for {destination}: {body}"));
+    let per_kib = body["price_per_kib"].as_u64().unwrap_or(0);
+    Price::scheduled(flat, per_kib)
+}
+
+/// The one-KiB point on a schedule: what any sealed packet of up to 1024
+/// bytes is charged. The probe's blobs are a few hundred bytes plus the seal,
+/// so this is the number that goes into a job's `bid` before the packet
+/// exists; [`sealed_prepare`] then charges the real length, and the paid test
+/// asserts the two agree rather than spending on a guess.
+fn one_kib_charge(schedule: &Price) -> u64 {
+    schedule.charge(1024)
 }
 
 // ── the kind:5094 job ────────────────────────────────────────────────────────
@@ -335,15 +352,16 @@ fn store_job_body(event: &serde_json::Value) -> Vec<u8> {
 // ── the packet ───────────────────────────────────────────────────────────────
 
 /// A `Prepare` a real sender forms: an OER `EnvelopeRequest` gift-wrapped to
-/// the TERMINATING connector's identity (ADR 0018), under a condition minted
-/// from the fulfilment that same wrap's shared secret derives (ADR 0019).
+/// the TERMINATING connector's identity (ADR 0018), which derives its
+/// fulfilment from that same wrap's shared secret (ADR 0019) -- there is no
+/// execution condition to mint any more (ADR 0069).
 ///
 /// `identity` is deliberately a parameter rather than something this function
 /// fetches: the ONE thing a forwarded packet gets wrong is sealing to the hop
 /// instead of the terminus, and passing it in keeps that choice visible at
 /// every call site.
 fn sealed_prepare(
-    amount: u64,
+    schedule: &Price,
     destination: &str,
     target: &str,
     body: &[u8],
@@ -357,13 +375,17 @@ fn sealed_prepare(
     }
     .encode();
     let (data, shared_secret) = seal_request(&plaintext, identity).expect("seal");
+    // The edge charges `schedule.charge(data.len())` on the sealed bytes and
+    // refuses an amount that differs from it in EITHER direction, so the
+    // amount is decided here, after the seal, where the length is known.
+    let amount = schedule.charge(data.len());
     (
         Prepare {
             amount,
             // Generous, because this packet crosses a peering and an Arweave
             // upload before it can be answered.
             expires_at: Utc::now() + ChronoDuration::minutes(2),
-            execution_condition: derive_condition(&derive_fulfillment(&shared_secret)),
+            greeting: false,
             destination: destination.to_string(),
             data,
         },
@@ -595,8 +617,8 @@ async fn the_terminating_connector_is_a_different_node_from_the_forwarding_one()
 async fn the_apex_price_covers_what_the_terminating_side_charges_on_arrival() {
     let Some(edge) = edge() else { return };
     let destination = destination();
-    let hop_price = fetch_price(&edge, &destination).await;
-    let terminus_price = fetch_price(&terminus(), &destination).await;
+    let hop_price = one_kib_charge(&fetch_price(&edge, &destination).await);
+    let terminus_price = one_kib_charge(&fetch_price(&terminus(), &destination).await);
 
     println!("{destination}: apex charges {hop_price}, terminus charges {terminus_price}");
     assert!(hop_price > 0, "a free forwarded route is a free gateway");
@@ -620,7 +642,7 @@ async fn an_unpaid_store_job_is_answered_with_x402_terms_and_never_reaches_the_a
         1,
     );
     let (prepare, _secret) = sealed_prepare(
-        fetch_price(&edge, &destination()).await,
+        &fetch_price(&edge, &destination()).await,
         &destination(),
         &target(),
         &store_job_body(&event),
@@ -669,7 +691,8 @@ async fn a_paid_kind_5094_job_crosses_the_peering_and_the_payload_reads_back_fro
         return;
     };
 
-    let price = fetch_price(&edge, &destination()).await;
+    let schedule = fetch_price(&edge, &destination()).await;
+    let price = one_kib_charge(&schedule);
     let identity = fetch_identity(&terminus()).await;
 
     // Unique per run, so the tx id fetched back can only be this run's upload.
@@ -681,11 +704,24 @@ async fn a_paid_kind_5094_job_crosses_the_peering_and_the_payload_reads_back_fro
     .into_bytes();
     let (event, id) = signed_blob_storage_job(&blob, "text/plain", price);
     let (prepare, shared_secret) = sealed_prepare(
-        price,
+        &schedule,
         &destination(),
         &target(),
         &store_job_body(&event),
         &identity,
+    );
+    // The bid inside the sealed event was written before the packet existed,
+    // at the one-KiB point; the amount was charged on the sealed length. If
+    // they differ the blob outgrew a KiB and the run stops here, before any
+    // claim is signed, rather than paying one number and bidding another.
+    assert_eq!(
+        prepare.amount,
+        price,
+        "the sealed packet is {} bytes and is charged {} by the schedule, but the job's bid \
+         was written at the one-KiB point ({price}) -- the probe's blob has outgrown a KiB; \
+         raise the bid's assumption rather than spending on a mismatch",
+        prepare.data.len(),
+        prepare.amount
     );
     println!(
         "paying {price} for {} -- kind:5094 event {id}, {} byte blob",

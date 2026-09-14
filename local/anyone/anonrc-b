@@ -1,0 +1,57 @@
+##================= /etc/anon/anonrc -- local/anyone, B's side ===============##
+#
+# The hidden SERVICE. This daemon generates the connector's address, publishes a
+# descriptor for it, and forwards what arrives to the connector's one listener.
+# It opens no SOCKS port: this node dials nothing.
+#
+# Mounted READ-ONLY at /etc/anon/anonrc; see `anonrc-a` for why the `Nickname`
+# line below cannot be dropped.
+
+# WITHOUT THIS THE DAEMON DOES NOT START -- see `anonrc-a`.
+AgreeToTerms 1
+
+User anond
+DataDirectory /var/lib/anon
+Nickname toonlocalanyoneB
+
+ClientOnly 1
+SocksPort 0
+ORPort 0
+DirPort 0
+ControlSocket 0
+
+# ── The address, and where it lives ─────────────────────────────────────────
+# `anon` writes the generated address to `HiddenServiceDir/hostname` and the
+# private key beside it. On v0.4.10.2 that address ends in `.anyone`, NOT
+# `.onion` -- which is the whole difference between this topology and
+# `local/onion`.
+#
+# THIS DIRECTORY IS INSIDE THE NAMED VOLUME compose mounts at /var/lib/anon,
+# for the reason ADR 0070's Consequences give: an unpersisted HiddenServiceDir
+# means a new address on every restart and every counterparty's config goes
+# stale SILENTLY. It belongs beside `state_dir` in an operator's head.
+#
+# The key is never committed and never leaves the volume.
+HiddenServiceDir /var/lib/anon/hidden_service
+
+# ── A FIXED IP, and it has to be ────────────────────────────────────────────
+# `anon` resolves this target when it PARSES its config, not when a stream
+# arrives. A container name here aborts the daemon before it ever runs:
+#
+#     [warn] Unparseable address in hidden service port configuration.
+#     free(): invalid size
+#
+# ...because the connector does not exist yet. It cannot: its config names an
+# address only THIS daemon can generate, so the daemon must start first. The
+# fixed IP is what breaks that circle, and `compose.yml` pins the connector to
+# it. (The `free()` abort is an upstream bug in the error path -- the warning
+# above it is the real message.)
+#
+# ONE port for BOTH surfaces. The connector binds a single listener: `GET
+# /ilp/btp` upgrades the peering's websocket and `POST /ilp` serves the client
+# edge. An address is a host, so it is addressed the way any host is -- port 80,
+# and the paths decide the rest.
+HiddenServicePort 80 172.30.0.10:3000
+
+Log notice stdout
+Log notice file /var/lib/anon/notice.log

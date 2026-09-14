@@ -49,7 +49,7 @@ use connector_btp::{
     PAYMENT_REQUIRED_PROTOCOL, PAYOUT_CLAIM_PROTOCOL,
 };
 use connector_domain::client_claim::{ClientClaim, EVM_NAMESPACE};
-use connector_domain::{condition_is_present, PacketResponse, Prepare, Price, Reject, RejectCode};
+use connector_domain::{PacketResponse, Prepare, Price, Reject, RejectCode};
 use connector_signer::{verify_evm_claim_state_challenge, EvmClaimStateChallenge};
 
 use crate::channels::decode_hex_bytes;
@@ -664,10 +664,10 @@ async fn handle_frame(
     let request = client_route
         .as_ref()
         .and_then(|route| route.request.as_ref());
-    // Issue #807: see `handle_ilp`'s mirror of this on the HTTP carriage --
-    // a condition-less PREPARE is structurally a bootstrap/greeting probe,
-    // never a real payment attempt, regardless of destination.
-    let condition_present = condition_is_present(&prepare.execution_condition);
+    // Issue #807 / #1269: see `handle_ilp`'s mirror of this on the HTTP
+    // carriage -- a PREPARE that declares `greeting` is structurally a
+    // bootstrap probe, never a real payment attempt, regardless of
+    // destination.
 
     // Transport policy (issue #701, toon-meta#262 decision 11), BTP-shaped:
     // checked before payment is considered at all, exactly like the HTTP
@@ -719,9 +719,9 @@ async fn handle_frame(
     // The §1.4 greeting, BTP-shaped (§1.9 step 3): BTP cannot answer HTTP
     // 402, so the same terms JSON rides as protocolData on an F06 REJECT.
     // A claimless PREPARE to an unpriced route falls through unchanged,
-    // exactly as on HTTP -- unless the PREPARE itself carries no execution
-    // condition (issue #807), the same broadening `handle_ilp` applies.
-    if claim_json.is_none() && (charge > 0 || !condition_present) {
+    // exactly as on HTTP -- unless the PREPARE itself declares `greeting`
+    // (issue #807), the same broadening `handle_ilp` applies.
+    if claim_json.is_none() && (charge > 0 || prepare.greeting) {
         let terms = x402_terms_body(
             &prepare.destination,
             schedule,
@@ -900,8 +900,7 @@ async fn finish_frame(
     // uses -- a configured route first, then whatever client session
     // `state.session_registry` has bound to this destination.
     let packet_response =
-        crate::session_route::route_prepare(&state, prepare, charge, client_channel_id.as_deref())
-            .await;
+        crate::session_route::route_prepare(&state, prepare, client_channel_id.as_deref()).await;
     crate::roll_back_uncarried_forward(
         &state,
         is_forwarded_route,
@@ -1103,10 +1102,10 @@ mod tests {
 
         record_accepted_claim(&state, &claim, Some("g.toon.agent"));
 
-        let condition = [9u8; 32];
+        let fulfillment = [9u8; 32];
         let payout = state
             .claim_gate
-            .credit_session_payout("g.toon.agent", &condition, 500, chrono::Utc::now())
+            .credit_session_payout("g.toon.agent", &fulfillment, 500, chrono::Utc::now())
             .await
             .expect("the session's channel was just taught by the claim above");
         assert_eq!(payout.channel_id, channel_id);
@@ -1311,10 +1310,10 @@ mod tests {
             Some("g.toon.agent".to_string())
         );
 
-        let condition = [9u8; 32];
+        let fulfillment = [9u8; 32];
         let payout = state
             .claim_gate
-            .credit_session_payout("g.toon.agent", &condition, 500, chrono::Utc::now())
+            .credit_session_payout("g.toon.agent", &fulfillment, 500, chrono::Utc::now())
             .await
             .expect("the auth-time proof taught the session's channel with no claim ever sent");
         assert_eq!(payout.channel_id, channel_id);
@@ -1368,10 +1367,10 @@ mod tests {
         );
         run_auth_frame(&state, &frame).await;
 
-        let condition = [9u8; 32];
+        let fulfillment = [9u8; 32];
         let payout = state
             .claim_gate
-            .credit_session_payout("g.toon.agent", &condition, 500, chrono::Utc::now())
+            .credit_session_payout("g.toon.agent", &fulfillment, 500, chrono::Utc::now())
             .await;
         assert!(
             payout.is_none(),
@@ -1426,10 +1425,10 @@ mod tests {
         );
         run_auth_frame(&state, &frame).await;
 
-        let condition = [9u8; 32];
+        let fulfillment = [9u8; 32];
         let payout = state
             .claim_gate
-            .credit_session_payout("g.toon.agent", &condition, 500, chrono::Utc::now())
+            .credit_session_payout("g.toon.agent", &fulfillment, 500, chrono::Utc::now())
             .await;
         assert!(
             payout.is_none(),
@@ -1486,11 +1485,11 @@ mod tests {
             binding.as_ref().map(|(address, _)| address.clone()),
             Some("g.toon.agent".to_string())
         );
-        let condition = [9u8; 32];
+        let fulfillment = [9u8; 32];
         assert!(
             state
                 .claim_gate
-                .credit_session_payout("g.toon.agent", &condition, 500, chrono::Utc::now())
+                .credit_session_payout("g.toon.agent", &fulfillment, 500, chrono::Utc::now())
                 .await
                 .is_none(),
             "a bare bind with no declaration and no claim must not yet be creditable"
@@ -1533,7 +1532,7 @@ mod tests {
 
         let payout = state
             .claim_gate
-            .credit_session_payout("g.toon.agent", &condition, 500, chrono::Utc::now())
+            .credit_session_payout("g.toon.agent", &fulfillment, 500, chrono::Utc::now())
             .await
             .expect("the re-auth's declaration taught the session's channel");
         assert_eq!(payout.channel_id, channel_id);
@@ -1673,17 +1672,16 @@ mod tests {
     }
 
     /// Issue #807's BTP mirror of `handle_ilp`'s HTTP-side broadening: a
-    /// PREPARE whose execution condition is all-zero is structurally a
-    /// bootstrap/greeting probe, never a real payment attempt (issue #417
-    /// refuses to route one regardless of destination), so it must be
-    /// answered with the §1.4 greeting even when -- as here -- `destination`
-    /// matches no configured route at all. Before this fix the session saw
-    /// `F01 prepare carries no execution condition` (`reject_ineligible`)
-    /// for exactly this shape, which is `edge-client.ts`'s `fetchGreeting`
-    /// probe and is what left a client with a stale or missing genesis peer
-    /// seed unable to bootstrap.
+    /// `greeting`-flagged PREPARE is structurally a bootstrap probe, never a
+    /// real payment attempt, so it must be answered with the §1.4 greeting
+    /// even when -- as here -- `destination` matches no configured route at
+    /// all. This is `edge-client.ts`'s `fetchGreeting` probe, and is what
+    /// left a client with a stale or missing genesis peer seed unable to
+    /// bootstrap before this fix. Until issue #1269 the same shape was
+    /// inferred from an all-zero execution condition; it is now the
+    /// packet's own explicit `greeting` flag.
     #[tokio::test]
-    async fn a_zero_condition_prepare_over_btp_is_answered_with_the_greeting_not_f01() {
+    async fn a_greeting_prepare_over_btp_is_answered_with_the_greeting() {
         use crate::claim_gate::ClientClaimGate;
         use crate::X402PaymentRequired;
         use chrono::TimeZone;
@@ -1696,7 +1694,7 @@ mod tests {
         let prepare = Prepare {
             amount: 0,
             expires_at: chrono::Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-            execution_condition: [0u8; 32],
+            greeting: true,
             destination: "g.nowhere".to_string(),
             data: Vec::new(),
         };
@@ -1716,7 +1714,7 @@ mod tests {
         assert_eq!(
             reject.code.as_str(),
             "F06",
-            "a zero-condition PREPARE to an unmatched destination must be greeted, not F01'd"
+            "a greeting PREPARE to an unmatched destination must be greeted, not F02'd"
         );
 
         let terms_bytes = decoded
@@ -1775,7 +1773,7 @@ mod tests {
         let prepare = Prepare {
             amount: 0,
             expires_at: chrono::Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-            execution_condition: [1u8; 32],
+            greeting: false,
             destination: "g.toon.gas".to_string(),
             data: Vec::new(),
         };

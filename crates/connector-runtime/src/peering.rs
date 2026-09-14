@@ -298,20 +298,19 @@ impl Connector {
 /// leaves both directions open is the choice that forecloses least, and an
 /// operator who wants the other one writes the peering in the config file.
 ///
-/// `None` when neither published endpoint's scheme selects a carriage this
-/// node will dial -- a `wss://`/`https://` endpoint always does, and a
-/// plaintext one only on a node that opted in.
+/// `None` when neither published endpoint selects a carriage this node will
+/// dial -- a `wss://`/`https://` endpoint always does, a plaintext one at a
+/// `.onion` host always does (ADR 0070), and any other plaintext one only on
+/// a node that opted in. Asked through `PeerCarriage::for_endpoint`, so a
+/// peering established from a URL reads the same answer a config-file one
+/// does rather than a second copy of it.
 fn peer_endpoint(
     document: &connector_domain::NodeSelfDescription,
     allow_plaintext: bool,
 ) -> Option<Url> {
     let dialable = |published: &Option<String>| -> Option<Url> {
         let url = Url::parse(published.as_deref()?).ok()?;
-        connector_config::PeerCarriage::from_scheme_allowing_plaintext(
-            url.scheme(),
-            allow_plaintext,
-        )
-        .map(|_| url)
+        connector_config::PeerCarriage::for_endpoint(&url, allow_plaintext).map(|_| url)
     };
     dialable(&document.btp_endpoint).or_else(|| dialable(&document.http_endpoint))
 }
@@ -740,7 +739,7 @@ mod tests {
             .handle_prepare(connector_domain::Prepare {
                 amount: 100,
                 expires_at: chrono::Utc::now() + chrono::Duration::seconds(30),
-                execution_condition: [0u8; 32],
+                greeting: false,
                 destination: "g.nowhere".to_string(),
                 data: Vec::new(),
             })

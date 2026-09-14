@@ -43,7 +43,25 @@ use async_trait::async_trait;
 use thiserror::Error;
 use url::Url;
 
+use connector_config::{is_onion_endpoint, plaintext_permitted};
 use connector_domain::NodeSelfDescription;
+
+/// Why an onion URL cannot be read on a node that configured no
+/// `socks_proxy` (ADR 0070 decision 3).
+///
+/// [`crate::NO_SOCKS_PROXY`]'s sentence is the carriages', and says
+/// "endpoint" because that is what a peering has. This surface reads a
+/// **URL** an operator handed to `POST /peers`, which is not an endpoint
+/// until the document behind it has been read -- so the wording differs on
+/// purpose, and §9's parity requirement does not reach here: it binds the
+/// two carriages to each other, and this is neither of them.
+///
+/// Reported as [`SelfDescriptionError::Unreachable`] rather than as a
+/// scheme refusal, because that is what it is: the URL is perfectly legal
+/// and this node has no way to get there.
+const NO_SOCKS_PROXY: &str =
+    "the URL's host ends in .onion or .anyone and this node configured no socks_proxy, so there \
+     is nothing that can resolve or reach it (ADR 0070 decision 3)";
 
 /// The whole exchange's budget -- connect, headers and body together.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,11 +78,12 @@ pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 /// is no such check to fail (ADR 0058).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SelfDescriptionError {
-    /// The URL is not `https://` on a node that has not opted into
-    /// plaintext peer endpoints. Trust-on-first-use over TLS is the whole
-    /// of the assurance ADR 0058 offers, and there is none at all without
-    /// the TLS.
-    #[error("a peer URL must be https (got '{0}'); set peer_allow_plaintext_endpoints to rehearse over http")]
+    /// The URL is not `https://`, is not at a hidden-service host, and this node
+    /// has not opted into plaintext peer endpoints. Trust-on-first-use over
+    /// TLS is the whole of the assurance ADR 0058 offers, and there is none
+    /// at all without either the TLS or the onion address that stands in
+    /// for it (ADR 0070 decision 2).
+    #[error("a peer URL must be https, or http at a '.onion' or '.anyone' host (got '{0}'); set peer_allow_plaintext_endpoints to rehearse over http elsewhere")]
     InsecureScheme(String),
 
     /// The host could not be reached, or the exchange ran past
@@ -108,23 +127,62 @@ pub trait SelfDescriptionSource: Send + Sync {
 /// this connector runs on a host it was pointed at.
 pub struct BoundedHttpSelfDescription {
     client: reqwest::Client,
+    /// The client an **onion** URL is read on, or the reason there is none
+    /// (ADR 0070 decision 3). Two clients selected by host, exactly as the
+    /// two peer carriages select: this fetch is the ILP wire's own
+    /// bootstrap, not settlement RPC and not a `handler_url`, so decision
+    /// 4 leaves it in scope rather than out.
+    onion: Result<reqwest::Client, String>,
     allow_plaintext: bool,
 }
 
 impl BoundedHttpSelfDescription {
     /// `allow_plaintext` is the node's own `peer_allow_plaintext_endpoints`
     /// -- the same opt-in a `ws://`/`http://` peer endpoint already needs,
-    /// and for the same reason.
+    /// and for the same reason. `socks_proxy` is the node's own
+    /// `Config::socks_proxy`, `None` on a node that configured none.
+    ///
+    /// Without the proxy half, ADR 0058's write could not establish a
+    /// peering with an onion node at all: `POST /peers` takes the
+    /// counterparty's URL and *reads* it, so a node whose only published
+    /// URL is a `.onion` one would be unpeerable at runtime however well
+    /// the carriages could then have dialed it.
     #[must_use]
-    pub fn new(allow_plaintext: bool) -> BoundedHttpSelfDescription {
-        let client = reqwest::Client::builder()
-            .timeout(FETCH_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
+    pub fn new(allow_plaintext: bool, socks_proxy: Option<&Url>) -> BoundedHttpSelfDescription {
+        let bounded = || {
+            reqwest::Client::builder()
+                .timeout(FETCH_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+        };
+        let client = bounded()
             .build()
             .expect("a reqwest client with a timeout and no redirect policy always builds");
+        let onion = match socks_proxy {
+            None => Err(NO_SOCKS_PROXY.to_string()),
+            Some(proxy) => reqwest::Proxy::all(proxy.as_str())
+                .and_then(|socks| bounded().proxy(socks).build())
+                .map_err(|error| format!("socks_proxy '{proxy}' could not be used: {error}")),
+        };
         BoundedHttpSelfDescription {
             client,
+            onion,
             allow_plaintext,
+        }
+    }
+
+    /// The client `url` is read on, or why there is none.
+    ///
+    /// [`is_onion_endpoint`] is called rather than re-derived: the suffix
+    /// that decides which client reads a self-description, the suffix that
+    /// decides a peering's carriage and the suffix that decides that
+    /// carriage's own proxy are one implementation, so the URL a runtime
+    /// peering is established from is read over the same path the peering
+    /// will then be dialed over.
+    fn client_for(&self, url: &Url) -> Result<&reqwest::Client, String> {
+        if is_onion_endpoint(url) {
+            self.onion.as_ref().map_err(Clone::clone)
+        } else {
+            Ok(&self.client)
         }
     }
 }
@@ -132,24 +190,33 @@ impl BoundedHttpSelfDescription {
 #[async_trait]
 impl SelfDescriptionSource for BoundedHttpSelfDescription {
     async fn fetch(&self, url: &Url) -> Result<NodeSelfDescription, SelfDescriptionError> {
+        // ADR 0070 decision 2, the same exception `[[peers]]` endpoints and
+        // `[[pay_channels]]` rows take: a `.onion` host permits `http://`
+        // on its own, because the address *is* the key the circuit is
+        // authenticated to. Trust-on-first-use over a circuit addressed by
+        // its own public key is a stronger assurance than this fetch gets
+        // from web PKI, not a weaker one.
         let readable = match url.scheme() {
             "https" => true,
-            "http" => self.allow_plaintext,
+            "http" => plaintext_permitted(url, self.allow_plaintext),
             _ => false,
         };
         if !readable {
             return Err(SelfDescriptionError::InsecureScheme(url.to_string()));
         }
+        let client = self
+            .client_for(url)
+            .map_err(|reason| SelfDescriptionError::Unreachable {
+                url: url.to_string(),
+                reason,
+            })?;
 
-        let response = self
-            .client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|source| SelfDescriptionError::Unreachable {
+        let response = client.get(url.clone()).send().await.map_err(|source| {
+            SelfDescriptionError::Unreachable {
                 url: url.to_string(),
                 reason: source.to_string(),
-            })?;
+            }
+        })?;
 
         let status = response.status();
         if status.is_redirection() {
@@ -295,7 +362,7 @@ mod tests {
         );
         let addr = serve(router);
 
-        let fetched = BoundedHttpSelfDescription::new(true)
+        let fetched = BoundedHttpSelfDescription::new(true, None)
             .fetch(&url(addr, "/ilp"))
             .await
             .expect("the document reads back");
@@ -322,7 +389,7 @@ mod tests {
         );
         let addr = serve(router);
 
-        let error = BoundedHttpSelfDescription::new(true)
+        let error = BoundedHttpSelfDescription::new(true, None)
             .fetch(&url(addr, "/ilp"))
             .await
             .expect_err("a redirect is not followed");
@@ -355,7 +422,7 @@ mod tests {
         );
         let addr = serve(router);
 
-        let error = BoundedHttpSelfDescription::new(true)
+        let error = BoundedHttpSelfDescription::new(true, None)
             .fetch(&url(addr, "/ilp"))
             .await
             .expect_err("an endless body is refused");
@@ -388,7 +455,7 @@ mod tests {
         );
         let addr = serve(router);
 
-        let error = BoundedHttpSelfDescription::new(true)
+        let error = BoundedHttpSelfDescription::new(true, None)
             .fetch(&url(addr, "/ilp"))
             .await
             .expect_err("a declared oversize is refused");
@@ -404,7 +471,7 @@ mod tests {
         );
         let addr = serve(router);
 
-        let error = BoundedHttpSelfDescription::new(true)
+        let error = BoundedHttpSelfDescription::new(true, None)
             .fetch(&url(addr, "/ilp"))
             .await
             .expect_err("a 404 is not a document");
@@ -420,7 +487,7 @@ mod tests {
         let router = Router::new().route("/ilp", get(|| async { "not json at all" }));
         let addr = serve(router);
 
-        let error = BoundedHttpSelfDescription::new(true)
+        let error = BoundedHttpSelfDescription::new(true, None)
             .fetch(&url(addr, "/ilp"))
             .await
             .expect_err("prose is not a document");
@@ -435,12 +502,78 @@ mod tests {
     async fn plaintext_is_refused_unless_the_node_opted_in() {
         let url = Url::parse("http://peer.example/ilp").expect("url");
 
-        let error = BoundedHttpSelfDescription::new(false)
+        let error = BoundedHttpSelfDescription::new(false, None)
             .fetch(&url)
             .await
             .expect_err("http is refused by default");
 
         assert!(matches!(error, SelfDescriptionError::InsecureScheme(_)));
+    }
+
+    /// ADR 0070 decision 2: a `.onion` host permits `http://` on its own,
+    /// on a node that opted into nothing. The exemption is what makes a
+    /// runtime peering with an onion node possible at all -- `POST /peers`
+    /// reads the counterparty's URL, and an onion node's only published URL
+    /// is an onion one.
+    ///
+    /// Refused as **unreachable** rather than as an insecure scheme when no
+    /// proxy is configured, which is the distinction that matters to the
+    /// operator reading it: the URL is legal and this node has no way to
+    /// get there.
+    ///
+    /// Both spellings (issue #1284): a runtime peering is established from
+    /// whatever URL the counterparty's own daemon made it publish, and this
+    /// node has no say in which `anon` release that was.
+    #[tokio::test]
+    async fn an_onion_url_is_readable_without_the_plaintext_opt_in() {
+        for host in [
+            "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion",
+            "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.anyone",
+        ] {
+            let url = Url::parse(&format!("http://{host}/ilp")).expect("url");
+
+            let error = BoundedHttpSelfDescription::new(false, None)
+                .fetch(&url)
+                .await
+                .expect_err("no proxy is configured, so it cannot be reached");
+
+            match error {
+                SelfDescriptionError::Unreachable { reason, .. } => assert!(
+                    reason.contains("socks_proxy"),
+                    "{host}: the refusal has to name what is missing, got: {reason}"
+                ),
+                other => {
+                    panic!("{host} is not an insecure scheme (ADR 0070): {other}")
+                }
+            }
+        }
+    }
+
+    /// And the suffix is a suffix. A host that merely contains `.onion` or
+    /// `.anyone` without ending in it is an ordinary clearnet host, and
+    /// `http://` at one is refused exactly as it was before ADR 0070 --
+    /// including at the second spelling the rule gained in issue #1284,
+    /// which is the case a widening is most likely to have widened too far.
+    #[tokio::test]
+    async fn a_host_that_only_looks_onion_is_still_refused_as_plaintext() {
+        for host in [
+            "onion.example",
+            "notreally.onion.example",
+            "anyone.example",
+            "notreally.anyone.example",
+        ] {
+            let url = Url::parse(&format!("http://{host}/ilp")).expect("url");
+
+            let error = BoundedHttpSelfDescription::new(false, None)
+                .fetch(&url)
+                .await
+                .expect_err(host);
+
+            assert!(
+                matches!(error, SelfDescriptionError::InsecureScheme(_)),
+                "{host} must still be plaintext, got: {error}"
+            );
+        }
     }
 
     /// A URL that is neither http nor https is refused whatever the
@@ -450,7 +583,7 @@ mod tests {
     async fn a_non_http_scheme_is_refused_even_with_plaintext_allowed() {
         let url = Url::parse("file:///etc/passwd").expect("url");
 
-        let error = BoundedHttpSelfDescription::new(true)
+        let error = BoundedHttpSelfDescription::new(true, None)
             .fetch(&url)
             .await
             .expect_err("file:// is not a peer URL");

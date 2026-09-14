@@ -45,6 +45,11 @@ serde_json = "1"
 # router.
 tokio = { version = "1", features = ["time", "sync"] }
 tracing = "0.1"
+# Hashes the outgoing PREPARE bytes into a job id for the payout dedupe (issue
+# #770 AC3, ADR 0069): must be derived from what THIS connector asked a
+# session to do, never from what the session answers, since nothing verifies
+# that answer any more and a job id taken from it would be payee-forgeable.
+sha2 = "0.10"
 
 [dev-dependencies]
 connector-settlement = { path = "../connector-settlement" }

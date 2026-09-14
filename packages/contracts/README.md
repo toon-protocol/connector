@@ -67,6 +67,11 @@ Base-mainnet fork in CI (`.github/workflows/contracts.yml`, `mainnet-fork-test` 
 public `https://mainnet.base.org` RPC. Nothing in this repo ever runs `--broadcast` against Base
 mainnet or holds a funded deployer key; the actual broadcast below is a manual, human-only step.
 
+> **Broadcast on 2026-09-01.** The record, addresses, transaction hashes and on-chain verification
+> are in `deployments/base-mainnet.md`. Read it before this runbook: the node does NOT bind the
+> capped `TokenNetwork` this script deploys (#1264), and the live one was created through the
+> registry afterwards.
+
 To run the fork test locally:
 
 ```shell
@@ -92,14 +97,14 @@ intentionally not registered there.
 
 ### Required environment variables
 
-| Variable               | Required                   | Notes                                                                                                                                                                                                        |
-| ---------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `PRIVATE_KEY`          | Yes (for a real broadcast) | Funded Base-mainnet deployer key, without `0x` prefix. If unset, the script still runs but only _simulates_ -- nothing is broadcast, even with `--broadcast`.                                                |
-| `USDC`                 | No                         | ERC20 token address to bind the `TokenNetwork` to. Defaults to native USDC on Base: `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`. Only override for a rehearsal against a different token.                   |
-| `MAX_CHANNEL_DEPOSIT`  | No                         | Max deposit per participant per channel, in the token's smallest unit. Defaults to `1_000 * 10**6` (1,000 USDC -- **6 decimals, not 18**). Raise for a larger soak once the initial deployment is validated. |
-| `MAX_CHANNEL_LIFETIME` | No                         | Max channel lifetime in seconds before force-close is allowed. Defaults to `30 days`.                                                                                                                        |
-| `BASE_MAINNET_RPC_URL` | Yes                        | Base mainnet RPC endpoint (see `foundry.toml`'s `base_mainnet` alias and `.env.example`).                                                                                                                    |
-| `ETHERSCAN_API_KEY`    | For `--verify`             | Basescan API key so the deployed contracts verify automatically.                                                                                                                                             |
+| Variable               | Required                   | Notes                                                                                                                                                                                                                                                                                                                    |
+| ---------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `PRIVATE_KEY`          | Yes (for a real broadcast) | Funded Base-mainnet deployer key, **with** the `0x` prefix (`vm.envOr(uint256)` cannot parse bare hex, and an unparsed key silently degrades to a keyless simulation that prints "No transactions to broadcast"). If unset, the script still runs but only _simulates_ -- nothing is broadcast, even with `--broadcast`. |
+| `USDC`                 | No                         | ERC20 token address to bind the `TokenNetwork` to. Defaults to native USDC on Base: `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`. Only override for a rehearsal against a different token.                                                                                                                               |
+| `MAX_CHANNEL_DEPOSIT`  | No                         | Max deposit per participant per channel, in the token's smallest unit. Defaults to `1_000 * 10**6` (1,000 USDC -- **6 decimals, not 18**). Raise for a larger soak once the initial deployment is validated.                                                                                                             |
+| `MAX_CHANNEL_LIFETIME` | No                         | Max channel lifetime in seconds before force-close is allowed. Defaults to `30 days`.                                                                                                                                                                                                                                    |
+| `BASE_MAINNET_RPC_URL` | Yes                        | Base mainnet RPC endpoint (see `foundry.toml`'s `base_mainnet` alias and `.env.example`).                                                                                                                                                                                                                                |
+| `ETHERSCAN_API_KEY`    | For `--verify`             | Basescan API key so the deployed contracts verify automatically.                                                                                                                                                                                                                                                         |
 
 ### One-command broadcast
 

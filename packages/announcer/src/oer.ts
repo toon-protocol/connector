@@ -58,33 +58,35 @@ export function encodeGeneralizedTime(when: Date): Buffer {
 /** ILPv4 PREPARE packet type byte (RFC-0027 §3.1). */
 export const TYPE_PREPARE = 12;
 
-/** The fields of an ILPv4 PREPARE packet this sidecar needs to build. */
+/**
+ * The fields of a PREPARE packet this sidecar needs to build.
+ *
+ * `greeting` replaces the all-zero `executionCondition` this connector's
+ * PREPARE used to carry as the bootstrap-probe discriminator (issue #1269 /
+ * ADR 0069): the field is gone from the wire entirely, and a probe now
+ * states its shape explicitly instead of being inferred from a missing
+ * value.
+ */
 export interface PrepareFields {
   amount: number;
   expiresAt: Date;
-  /** Exactly 32 bytes. All-zero is a valid (if never-fulfillable) condition on the wire. */
-  executionCondition: Buffer;
+  /** Whether this PREPARE is a bootstrap/greeting probe rather than a real payment attempt. */
+  greeting: boolean;
   destination: string;
   data?: Buffer;
 }
 
 /**
- * Encode a minimal ILPv4 PREPARE packet: just enough to `POST /ilp` and have
- * the Rust edge's `Prepare::decode` accept it and route to the greeting
- * branch. Never sent with a genuine intent to transfer value — see the
- * module doc.
+ * Encode a minimal PREPARE packet: just enough to `POST /ilp` and have the
+ * Rust edge's `Prepare::decode` accept it and route to the greeting branch.
+ * Never sent with a genuine intent to transfer value — see the module doc.
  */
 export function encodePrepare(fields: PrepareFields): Buffer {
-  if (fields.executionCondition.length !== 32) {
-    throw new RangeError(
-      `encodePrepare: executionCondition must be exactly 32 bytes, got ${fields.executionCondition.length}`
-    );
-  }
   return Buffer.concat([
     Buffer.from([TYPE_PREPARE]),
     encodeVarUint(fields.amount),
     encodeGeneralizedTime(fields.expiresAt),
-    fields.executionCondition,
+    Buffer.from([fields.greeting ? 1 : 0]),
     encodeVarOctetString(Buffer.from(fields.destination, 'utf8')),
     encodeVarOctetString(fields.data ?? Buffer.alloc(0)),
   ]);

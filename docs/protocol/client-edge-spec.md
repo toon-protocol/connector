@@ -574,21 +574,25 @@ serves and prices is answered `402` with that route's terms instead of being rou
 never asked to do free work for an anonymous, unpaying caller. A present claim header (valid or
 not) suppresses this response unconditionally — its validation is §1.3's job, not this section's
 — and an unpaid request to an unpriced or unmatched destination falls through unchanged, exactly
-as it always has, **unless the PREPARE itself carries no execution condition at all**.
+as it always has, **unless the PREPARE itself declares `greeting`**.
 
-**A claimless, condition-less PREPARE is answered this way regardless of destination** ([issue
-#807](https://github.com/toon-protocol/connector/issues/807)). Issue #417's rule (enforced by
-`Connector::reject_ineligible`, `crates/connector-runtime/src/connector.rs`) refuses to route one
-at all — `F01_INVALID_PACKET`, "prepare carries no execution condition" — before any route is even
-selected, whatever it addresses, so it can never be a genuine payment attempt; it is structurally
-a bootstrap probe (`packages/announcer/src/edge-client.ts`'s `fetchGreeting` builds exactly this
-shape: zero amount, all-zero condition). Answering it the same way lets a client whose genesis
-peer seed is stale or missing learn this node's settlement facts by asking the edge directly,
-rather than needing a `[[routes]]`-matching, priced destination to probe with — which is precisely
-what such a client does not have. This is still an answer, not an announce: nothing is sent unless
-this connector is asked, over the connection that asked it. A present claim header still suppresses
-the response unconditionally, whatever the condition — a claim-bearing, condition-less PREPARE
-still falls through to `F01`, unchanged by this paragraph.
+**A claimless, greeting-flagged PREPARE is answered this way regardless of destination** ([issue
+#807](https://github.com/toon-protocol/connector/issues/807)). `Prepare` carries no execution
+condition at all since [ADR 0069](../adr/0069-the-execution-condition-leaves-the-wire.md) (issue
+#1269) — until then, this section identified a bootstrap probe by a missing or all-zero condition,
+which issue #417's `reject_ineligible` refused outright before any route was selected; that rule
+and the field it checked are both gone, and the probe is now identified by its own explicit
+`greeting` flag instead, whatever it addresses
+(`packages/announcer/src/edge-client.ts`'s `fetchGreeting` builds exactly this shape: zero
+amount, `greeting: true`). Answering it the same way lets a client whose genesis peer seed is
+stale or missing learn this node's settlement facts by asking the edge directly, rather than
+needing a `[[routes]]`-matching, priced destination to probe with — which is precisely what such
+a client does not have. This is still an answer, not an announce: nothing is sent unless this
+connector is asked, over the connection that asked it. A present claim header still suppresses the
+response unconditionally, whatever `greeting` says — a claim-bearing, greeting-flagged PREPARE is
+never distinguished from an ordinary one and is routed exactly like any other claimed request,
+which is what keeps the flag from ever being usable to get a packet routed, priced or delivered
+for free.
 
 **"Serves" spans both kinds of configured route** ([ADR
 0028](../adr/0028-a-forwarded-route-is-priced-at-the-client-edge.md), [issue
@@ -1045,8 +1049,8 @@ silently dropped exactly as it was before TRANSFER existed.
    `No payment channel claim attached`, with the x402 v2 terms JSON — byte-identical to §1.4's
    body — as a protocolData entry named `payment-required` (again mirroring the HTTP header of
    the same name). A claimless PREPARE to an unpriced route passes through unchanged, as on HTTP —
-   unless, per §1.4's issue #807 update, the PREPARE itself carries no execution condition at all,
-   in which case this same `F06` greeting fires regardless of destination or price.
+   unless, per §1.4's issue #807 update, the PREPARE itself declares `greeting`, in which case this
+   same `F06` greeting fires regardless of destination or price.
 5. **Standalone claim**: a MESSAGE with an empty `ilpPacket` and a `payment-channel-claim` entry
    is a fire-and-forget claim registration: it is ingested against price `0` (full validation, a
    replay still refused, no value need advance — §1.6's identify-not-pay semantics) and answered

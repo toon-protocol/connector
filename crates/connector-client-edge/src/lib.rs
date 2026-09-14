@@ -77,8 +77,8 @@ use connector_config::TransportPolicy;
 use connector_domain::client_claim::ClientClaim;
 use connector_domain::identity::{anonymous_identity, resolve_identity, ConfiguredIdentity};
 use connector_domain::{
-    agreed_required_transport, condition_is_present, EdgeIdentity, NodeFacts, NodeSelfDescription,
-    PacketResponse, Prepare, Price, Reject, RejectCode, RoutePrice,
+    agreed_required_transport, EdgeIdentity, NodeFacts, NodeSelfDescription, PacketResponse,
+    Prepare, Price, Reject, RejectCode, RoutePrice,
 };
 use connector_runtime::{ClientRouteFacts, ClientRouteKind, Connector, ProbeDenied};
 use connector_signer::nip59::{unwrap_claim, WrappedClaim};
@@ -696,11 +696,10 @@ pub use connector_domain::x402::{
 /// and prices at `price` ("Serves" spans both kinds of configured route
 /// since ADR 0028: a route that terminates here, whose price buys the
 /// app's work, and one that forwards over a peering, whose price buys the
-/// carriage); or the request carries no execution condition at all (issue
-/// #807) -- structurally not a real payment attempt, since issue #417
-/// refuses to route one regardless of destination, so it is answered the
-/// same way regardless of whether `destination` matches anything this node
-/// prices. The terms are byte-identical either way -- nothing in this
+/// carriage); or the request declares `greeting` (issue #807, ADR 0069) --
+/// structurally not a real payment attempt, so it is answered the same way
+/// regardless of whether `destination` matches anything this node prices.
+/// The terms are byte-identical either way -- nothing in this
 /// shape names a route kind, and a client cannot tell, and has no reason
 /// to care, which case it hit. `node` is this node's own facts -- the same
 /// value `GET /ilp` serves as its self-description, projected into `extra`
@@ -1186,22 +1185,20 @@ async fn handle_ilp(
     // suppresses the greeting unconditionally (its validation, including
     // underpayment, is §1.3's job below); an unpriced or unmatched
     // destination is unaffected and falls through unchanged, exactly as it
-    // always has -- unless the PREPARE itself carries no execution
-    // condition (issue #807), checked below.
+    // always has -- unless the PREPARE itself declares `greeting` (issue
+    // #807), checked below.
     let has_claim_header =
         headers.contains_key(CLAIM_HEADER) || headers.contains_key(CLAIM_WRAPPED_HEADER);
-    // Issue #807: a condition-less PREPARE can never be routed regardless
-    // of destination -- issue #417's `reject_ineligible` refuses it before
-    // any route is even selected (`connector_runtime::connector::
-    // reject_ineligible`, F01) -- so it is structurally a bootstrap/
-    // greeting probe, not a real payment attempt, and `packages/announcer/
-    // src/edge-client.ts`'s `fetchGreeting` builds exactly this shape. A
-    // client whose genesis peer seed is stale or missing has no `[[routes]]`-
-    // matching destination to probe with either, so gating the greeting on
-    // a route match at all (the pre-#807 behaviour, still required for a
-    // real, conditioned PREPARE just below) left it with nothing but an F01
-    // it cannot act on.
-    let condition_present = condition_is_present(&prepare.execution_condition);
+    // Issue #807 / #1269: a greeting probe can never be routed regardless of
+    // destination, so it is answered here rather than falling through to
+    // `Connector::handle_prepare`. `packages/announcer/src/edge-client.ts`'s
+    // `fetchGreeting` builds exactly this shape. A client whose genesis peer
+    // seed is stale or missing has no `[[routes]]`-matching destination to
+    // probe with either, so gating the greeting on a route match at all (the
+    // pre-#807 behaviour, still required for a real, non-greeting PREPARE
+    // just below) left it with nothing to probe with at all. Until issue
+    // #1269 this was inferred from an all-zero execution condition; it is
+    // now the packet's own explicit `greeting` flag.
     // No matching configured route means nothing here is priced -- routing
     // itself (not this gate) is what refuses an unroutable destination,
     // with F02. One lookup serves every fact (issue #701, ADR 0028): the
@@ -1246,7 +1243,7 @@ async fn handle_ilp(
         }
     }
 
-    if !has_claim_header && (charge > 0 || !condition_present) {
+    if !has_claim_header && (charge > 0 || prepare.greeting) {
         return payment_required(
             &prepare.destination,
             schedule,
@@ -1331,7 +1328,7 @@ async fn handle_ilp(
     // sources first, then whatever client session `state.session_registry`
     // has bound to this destination -- see `session_route::route_prepare`.
     let response =
-        session_route::route_prepare(&state, prepare, charge, client_channel_id.as_deref()).await;
+        session_route::route_prepare(&state, prepare, client_channel_id.as_deref()).await;
     roll_back_uncarried_forward(
         &state,
         is_forwarded_route(client_route),
@@ -1458,15 +1455,13 @@ mod tests {
     use axum::http::Request;
     use chrono::{TimeZone, Utc};
     use connector_config::StaticRoute;
-    use connector_domain::{derive_condition, EnvelopeRequest, EnvelopeResponse, Fulfill, Reject};
+    use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, Reject};
     use connector_runtime::{
         AppOutcome, FakeAppClient, InMemoryJournal, InProcessPeerTransport, PeerRoute,
         RuntimePeerChannel, RuntimePeering, TestClock,
     };
     use connector_signer::LocalSigner;
     use tower::ServiceExt;
-
-    const FULFILLMENT: [u8; 32] = [7u8; 32];
 
     /// A claim gate over `channels`, journaling to a store that lives no
     /// longer than the test does. These tests are about the HTTP surface
@@ -1505,9 +1500,8 @@ mod tests {
 
     /// The `AppOutcome` a `FakeAppClient` produces for an app that answers
     /// `200` with `body`. The app supplies nothing toward fulfilment (issue
-    /// #525): whether the packet fulfils is decided entirely by whether its
-    /// execution condition matches the fulfilment its own sealed secret
-    /// derives, never by anything in this response.
+    /// #525): a termination derives its own answer's fulfilment from the
+    /// packet's sealed secret, never from anything in this response.
     fn answered(body: &[u8]) -> AppOutcome {
         answered_with_status(200, body)
     }
@@ -1609,27 +1603,26 @@ mod tests {
         Arc::new(LocalSigner::generate("test-signer"))
     }
 
-    /// A `Prepare` never expected to reach a genuine fulfilment -- its
-    /// `execution_condition` is a fixed placeholder unrelated to any
-    /// sealed secret, so a test using this bare (rather than
+    /// A `Prepare` with no sealed wrap -- `data` is a plain, unsealed
+    /// envelope, so a test using this bare (rather than
     /// [`sealed_sample_prepare`]) must not expect a `Fulfill`.
     fn sample_prepare(destination: &str) -> Prepare {
         Prepare {
             amount: 0,
             // Comfortably after `test_clock()`'s instant (2030-01-01).
             expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-            execution_condition: derive_condition(&FULFILLMENT),
+            greeting: false,
             destination: destination.to_string(),
             data: envelope_request_data(b"hello app"),
         }
     }
 
     /// As [`sample_prepare`], but with `data` sealed to `receiver_public`
-    /// (issue #524) and `execution_condition` set to match the fulfilment
-    /// this same sealed secret derives (ADR 0019, issue #525) -- for a test
-    /// whose `Prepare` genuinely reaches `Connector::deliver_to_app` and
-    /// expects it to fulfil. Returns the shared secret alongside, to open
-    /// the sealed `Fulfill`/termination-`Reject` this produces.
+    /// (issue #524) -- for a test whose `Prepare` genuinely reaches
+    /// `Connector::deliver_to_app` and expects it to fulfil, the termination
+    /// deriving its fulfilment from this same sealed secret (ADR 0019, issue
+    /// #525). Returns the shared secret alongside, to open the sealed
+    /// `Fulfill`/termination-`Reject` this produces.
     fn sealed_sample_prepare(
         destination: &str,
         receiver_public: &PublicKeyBytes,
@@ -1655,13 +1648,9 @@ mod tests {
         .encode();
         let (data, shared_secret) =
             connector_signer::giftwrap::seal_request(&envelope, receiver_public).expect("seal");
-        let condition = derive_condition(&connector_signer::giftwrap::derive_fulfillment(
-            &shared_secret,
-        ));
         (
             Prepare {
                 data,
-                execution_condition: condition,
                 ..sample_prepare(destination)
             },
             shared_secret,
@@ -1686,13 +1675,9 @@ mod tests {
         .encode();
         let (data, shared_secret) =
             connector_signer::giftwrap::seal_request(&envelope, receiver_public).expect("seal");
-        let condition = derive_condition(&connector_signer::giftwrap::derive_fulfillment(
-            &shared_secret,
-        ));
         (
             Prepare {
                 data,
-                execution_condition: condition,
                 ..sample_prepare(destination)
             },
             shared_secret,
@@ -2305,25 +2290,17 @@ mod tests {
         );
     }
 
-    /// Issue #803: an all-zero `executionCondition` addressed at a priced
-    /// route is greeted (`402`), not `F01`-rejected -- the opposite of what
-    /// issue #417's blanket "every PREPARE needs a real condition" rule
-    /// might suggest. `handle_ilp`'s greeting branch (client-edge-spec.md
-    /// §1.4) runs entirely before `Connector::handle_prepare`/
-    /// `reject_ineligible` are ever reached: an unpaid request to a route
-    /// this connector serves and prices is answered with terms "instead of
-    /// being routed at all" (§1.4), so the condition on a PREPARE that never
-    /// gets routed is never inspected. This is what makes
+    /// Issue #803: a `greeting`-flagged PREPARE addressed at a priced route
+    /// is greeted (`402`), never routed. `handle_ilp`'s greeting branch
+    /// (client-edge-spec.md §1.4) runs entirely before
+    /// `Connector::handle_prepare` is ever reached: an unpaid request to a
+    /// route this connector serves and prices is answered with terms
+    /// "instead of being routed at all" (§1.4), so the flag on a PREPARE
+    /// that never gets routed changes nothing else about it. This is what
     /// `packages/announcer`'s x402 probe (`edge-client.ts`'s
-    /// `ZERO_CONDITION`) work correctly today; #803's actual F01 came from
-    /// an unconditioned PREPARE sent somewhere this shortcut does not
-    /// apply -- either an unpriced or unmatched destination, which §1.4
-    /// leaves falling through unchanged, or a peer-role PREPARE, which is
-    /// never greeted at all (peer-carriage-spec.md §3.1). Both land in
-    /// `reject_ineligible` -- see the message-content assertion added to
-    /// `connector-runtime`'s `rejects_a_packet_with_no_execution_condition`.
+    /// `fetchGreeting`) relies on.
     #[tokio::test]
-    async fn an_unpaid_request_with_an_all_zero_condition_to_a_priced_route_is_still_greeted() {
+    async fn an_unpaid_greeting_prepare_to_a_priced_route_is_still_greeted() {
         let route = StaticRoute::new_priced("g.example.app", "http://localhost:4000", 100).unwrap();
         let app_client = Arc::new(FakeAppClient::new());
         let connector = Arc::new(Connector::new(
@@ -2335,13 +2312,10 @@ mod tests {
         ));
         let app = router(connector, test_signer());
 
-        let mut zero_condition_prepare = sample_prepare("g.example.app");
-        zero_condition_prepare.execution_condition = [0u8; 32];
-
         let request = Request::builder()
             .method("POST")
             .uri("/ilp")
-            .body(Body::from(zero_condition_prepare.encode()))
+            .body(Body::from(greeting_prepare("g.example.app").encode()))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
 
@@ -2650,10 +2624,9 @@ mod tests {
     /// An unpaid request to an explicitly free (`price == 0`) route is
     /// unaffected -- it still reaches the app exactly as it always has,
     /// since there is nothing to charge and so nothing to answer with
-    /// terms instead of. This holds because `sealed_sample_prepare` carries
-    /// a real, non-zero condition; see the `a_zero_condition_prepare_*`
-    /// tests below (issue #807) for the different case where the PREPARE
-    /// itself carries none.
+    /// terms instead of. This holds because `sealed_sample_prepare` does not
+    /// declare `greeting`; see the `a_greeting_prepare_*` tests below (issue
+    /// #807) for the different case where the PREPARE itself does.
     #[tokio::test]
     async fn an_unpaid_request_to_a_free_route_still_reaches_the_app() {
         let route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
@@ -2687,35 +2660,32 @@ mod tests {
         assert_eq!(app_client.deliveries().len(), 1);
     }
 
-    /// A PREPARE with an all-zero `execution_condition` and no claim
-    /// header. Never expected to reach a route or be fulfilled -- issue
-    /// #417's `reject_ineligible` refuses to route one regardless of
-    /// destination -- so every zero-condition test below uses this rather
-    /// than [`sample_prepare`], whose condition is real.
-    fn zero_condition_prepare(destination: &str) -> Prepare {
+    /// A `greeting`-flagged PREPARE with no claim header. Never expected to
+    /// reach a route or be fulfilled -- so every greeting test below uses
+    /// this rather than [`sample_prepare`], whose `greeting` is `false`.
+    fn greeting_prepare(destination: &str) -> Prepare {
         Prepare {
-            execution_condition: [0u8; 32],
+            greeting: true,
             ..sample_prepare(destination)
         }
     }
 
     /// The core fix for issue #807: `packages/announcer/src/edge-client.ts`'s
     /// `fetchGreeting` probe builds exactly this shape -- a well-formed,
-    /// zero-amount PREPARE with an all-zero condition -- and expects `402`
-    /// back. Before this fix, a destination matching no configured route
-    /// fell through the old `price > 0`-gated greeting straight into
-    /// `Connector::handle_prepare`, which issue #417's `reject_ineligible`
-    /// refuses with `F01 prepare carries no execution condition` before any
-    /// route is even selected -- an opaque packet-level reject a
-    /// bootstrapping client (whose genesis peer seed is exactly what it is
-    /// missing, so it has no destination to probe with that this connector
-    /// prices) cannot act on. A zero-condition PREPARE can never be routed
-    /// at all regardless of destination, so it is structurally a bootstrap
-    /// probe and is answered the same way a priced route's unpaid request
-    /// is -- with terms, never performed.
+    /// zero-amount, `greeting`-flagged PREPARE -- and expects `402` back,
+    /// even when its destination matches no configured route. Before this
+    /// fix, such a destination fell through the old `price > 0`-gated
+    /// greeting straight into `Connector::handle_prepare`, which -- back
+    /// when a bootstrap probe was inferred from a missing execution
+    /// condition rather than stated as its own flag -- refused it with an
+    /// opaque packet-level reject a bootstrapping client (whose genesis peer
+    /// seed is exactly what it is missing, so it has no destination to
+    /// probe with that this connector prices) could not act on. A greeting
+    /// probe can never be routed at all regardless of destination, so it is
+    /// answered the same way a priced route's unpaid request is -- with
+    /// terms, never performed.
     #[tokio::test]
-    async fn a_zero_condition_prepare_to_an_unmatched_destination_is_answered_with_the_greeting_not_f01(
-    ) {
+    async fn a_greeting_prepare_to_an_unmatched_destination_is_answered_with_the_greeting() {
         let app_client = Arc::new(FakeAppClient::new());
         let connector = Arc::new(Connector::new(
             vec![],
@@ -2729,14 +2699,14 @@ mod tests {
         let request = Request::builder()
             .method("POST")
             .uri("/ilp")
-            .body(Body::from(zero_condition_prepare("g.nowhere").encode()))
+            .body(Body::from(greeting_prepare("g.nowhere").encode()))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(
             response.status(),
             StatusCode::PAYMENT_REQUIRED,
-            "a zero-condition PREPARE must be greeted even when its destination matches \
-             no configured route, not F01'd or F02'd"
+            "a greeting PREPARE must be greeted even when its destination matches no \
+             configured route, not F02'd"
         );
 
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
@@ -2751,10 +2721,10 @@ mod tests {
     /// The same probe shape, but addressing a route this connector matches
     /// and explicitly prices at 0 (free) -- distinguishing "the destination
     /// happens to be free" from "there is no destination at all" above.
-    /// Both fall under the same rule: a zero-condition PREPARE is a probe
-    /// regardless of what -- if anything -- it addresses.
+    /// Both fall under the same rule: a `greeting`-flagged PREPARE is a
+    /// probe regardless of what -- if anything -- it addresses.
     #[tokio::test]
-    async fn a_zero_condition_prepare_to_a_free_route_is_also_answered_with_the_greeting() {
+    async fn a_greeting_prepare_to_a_free_route_is_also_answered_with_the_greeting() {
         let route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
         let app_client = Arc::new(FakeAppClient::new());
         app_client.respond(route.handler_url(), answered(b"free work"));
@@ -2770,28 +2740,29 @@ mod tests {
         let request = Request::builder()
             .method("POST")
             .uri("/ilp")
-            .body(Body::from(zero_condition_prepare("g.example.app").encode()))
+            .body(Body::from(greeting_prepare("g.example.app").encode()))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         assert!(
             app_client.deliveries().is_empty(),
-            "a zero-condition probe must never reach the app, priced or not"
+            "a greeting probe must never reach the app, priced or not"
         );
     }
 
     /// The one case issue #807 deliberately leaves alone: a present claim
     /// header suppresses the greeting unconditionally (client-edge-spec.md
-    /// §1.4, unchanged by this issue), so a zero-condition PREPARE that
+    /// §1.4, unchanged by this issue), so a `greeting`-flagged PREPARE that
     /// also carries a claim header still falls through to
-    /// `Connector::handle_prepare` and is F01'd there. This is the
-    /// remaining gap between this fix and issue #803: a client whose
-    /// zero-condition announce carries no claim header is now greeted
-    /// (actionable terms, replacing an opaque F01); one that pairs a claim
-    /// header with a zero condition -- an inherently inconsistent shape,
-    /// since ADR/issue #417 never treats a condition as optional -- is not.
+    /// `Connector::handle_prepare` -- the flag is never consulted once a
+    /// claim is attached, which is what keeps it from ever being usable to
+    /// route a packet for free (issue #1269). This particular fixture's
+    /// connector has no identity key configured, so the fall-through still
+    /// lands on `F01` -- but now for the honest reason that its gift wrap
+    /// cannot be opened at all, not because the packet failed some
+    /// condition invariant that no longer exists.
     #[tokio::test]
-    async fn a_zero_condition_prepare_with_a_claim_header_still_falls_through_to_f01() {
+    async fn a_greeting_prepare_with_a_claim_header_falls_through_and_is_routed_normally() {
         let route = StaticRoute::new_priced("g.example.app", "http://localhost:4000", 100).unwrap();
         let app_client = Arc::new(FakeAppClient::new());
         let connector = Arc::new(Connector::new(
@@ -2813,7 +2784,7 @@ mod tests {
             .method("POST")
             .uri("/ilp")
             .header(CLAIM_HEADER, BASE64.encode(claim_json.as_bytes()))
-            .body(Body::from(zero_condition_prepare("g.example.app").encode()))
+            .body(Body::from(greeting_prepare("g.example.app").encode()))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         // An ILP-level outcome, even a reject, is always HTTP 200 (client-edge-spec.md §1.1).
@@ -2823,8 +2794,14 @@ mod tests {
         let reject = Reject::decode(&bytes).expect("decode reject");
         assert_eq!(reject.code.as_str(), "F01");
         assert!(
+            reject.message.contains("identity"),
+            "F01 here comes from this fixture's connector having no identity key to open the \
+             gift wrap with, not from any longer-retired condition check: {}",
+            reject.message
+        );
+        assert!(
             app_client.deliveries().is_empty(),
-            "a claim-bearing zero-condition PREPARE must not reach the app either"
+            "a claim-bearing greeting PREPARE must not reach the app either"
         );
     }
 
@@ -3133,7 +3110,7 @@ mod tests {
         let request = Request::builder()
             .method("POST")
             .uri("/ilp")
-            .body(Body::from(zero_condition_prepare("g.example.app").encode()))
+            .body(Body::from(greeting_prepare("g.example.app").encode()))
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
@@ -3238,7 +3215,7 @@ mod tests {
         let request = Request::builder()
             .method("POST")
             .uri("/ilp")
-            .body(Body::from(zero_condition_prepare("g.example.app").encode()))
+            .body(Body::from(greeting_prepare("g.example.app").encode()))
             .unwrap();
         let response = described_node().oneshot(request).await.unwrap();
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
@@ -3319,7 +3296,7 @@ mod tests {
         let request = Request::builder()
             .method("POST")
             .uri("/ilp")
-            .body(Body::from(zero_condition_prepare("g.whatever").encode()))
+            .body(Body::from(greeting_prepare("g.whatever").encode()))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);

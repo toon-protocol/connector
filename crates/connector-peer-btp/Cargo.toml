@@ -29,22 +29,46 @@ chrono = "0.4"
 hex = "0.4"
 serde_json = "1"
 # `sync` for the session's reply channel and the per-relation ledgers;
-# `time` for §6.3's two deadlines. No runtime is started here -- whoever
+# `time` for §6.3's two deadlines. `net` and `io-util` since ADR 0070: the
+# onion dial opens its own `TcpStream` to the SOCKS5 proxy and hands the
+# established stream to the websocket client, because the websocket library
+# below has no proxy support at all. No runtime is started here -- whoever
 # owns the socket owns the runtime.
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["sync", "time", "net", "io-util"] }
 tracing = "0.1"
 # The one place this crate touches a socket (`ws`): the same 0.20 the
 # client edge's own BTP integration test speaks, and the same rustls +
-# webpki roots already in the lockfile. `wss://` only -- a peering carries
-# signed balance proofs, so `ws://` selects no carriage at all.
+# webpki roots already in the lockfile. `wss://` for every endpoint whose
+# identity a CA attests -- a peering carries signed balance proofs -- and
+# `ws://` only where an operator opted in or where the host is a `.onion`
+# one, whose address is itself the key the circuit authenticates to.
 tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
+# The SOCKS5 client half of ADR 0070 decision 3. `tokio-tungstenite` takes
+# an already-established stream (`client_async_tls_with_config`) but cannot
+# establish one through a proxy, so the CONNECT is made here and the stream
+# handed over. Already in the lockfile -- reqwest's `socks` feature pulled
+# it in for the HTTP carriage -- so both carriages speak one SOCKS5.
+tokio-socks = "0.5"
 # `split` on the dialed websocket: one writer task owns the send half while
 # the read loop correlates answers and serves the far side's requests.
 futures-util = "0.3"
 url = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+# `test-support` for the SOCKS5 server fake the onion dial tests dial through
+# (ADR 0070). A dev-dependency, so `cargo build` never carries a listener.
+connector-runtime = { path = "../connector-runtime", features = ["test-support"] }
+# `net` and `io-util` on top of the library's own features: the onion-dial
+# test stands up a real websocket server beside `connector-runtime`'s real
+# SOCKS5 server, because "which socket did that dial reach" is a question
+# no in-process fake can answer (ADR 0070 decision 3).
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "test-util",
+    "net",
+    "io-util",
+] }
 libsecp256k1 = "0.6"
 # A genuinely signed Solana balance proof, for the tests that hold what
 # this carriage does with a peer claim's declared `programId`

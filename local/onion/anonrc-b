@@ -1,0 +1,69 @@
+##=================== /etc/anon/anonrc -- local/onion, B's side ==============##
+#
+# The onion SERVICE. This daemon generates `connector-b`'s address, publishes
+# a descriptor for it, and forwards what arrives to the connector's one
+# listener. It opens no SOCKS port: B dials nothing.
+#
+# Mounted READ-ONLY at /etc/anon/anonrc; see `anonrc-a` for why the `Nickname`
+# line below cannot be dropped.
+
+# WITHOUT THIS THE DAEMON DOES NOT START -- see `anonrc-a`.
+AgreeToTerms 1
+
+User anond
+DataDirectory /var/lib/anon
+Nickname toonlocalonionB
+
+ClientOnly 1
+SocksPort 0
+ORPort 0
+DirPort 0
+ControlSocket 0
+
+# ── The address, and where it lives ─────────────────────────────────────────
+# `anon` writes the generated address to `HiddenServiceDir/hostname` and the
+# private key beside it. THIS DIRECTORY IS INSIDE THE NAMED VOLUME compose
+# mounts at /var/lib/anon, which is what ADR 0070's Consequences require: "if
+# HiddenServiceDir is not on a persisted volume, the node's address changes on
+# every restart and every counterparty's config goes stale silently". It
+# belongs beside `state_dir` in an operator's head for exactly that reason.
+#
+# A SUBDIRECTORY of the DataDirectory volume rather than a second mount of its
+# own, and that is an ownership argument, not tidiness: the image ships
+# /var/lib/anon owned by its unprivileged user, so a fresh named volume
+# mounted there inherits that ownership -- the same reason every connector
+# here mounts a NAMED volume at /app/state rather than a host bind mount.
+#
+# The key is never committed and never leaves the volume.
+# `tools/ci/check-tracked-secrets.sh` would refuse it, and a fixed onion key in
+# a public repository is an address anyone could impersonate.
+HiddenServiceDir /var/lib/anon/hidden_service
+
+# ── A FIXED IP, and it has to be ────────────────────────────────────────────
+# `anon` resolves this target when it PARSES its config, not when a stream
+# arrives. A container NAME here aborts the daemon before it ever runs:
+#
+#     [warn] Unparseable address in hidden service port configuration.
+#     free(): invalid size
+#
+# ...because `connector-b` does not exist yet, and cannot: its config names an
+# address only THIS daemon can generate, so `local/keys.sh onion` starts the
+# sidecars first and renders the address into that config afterwards (ADR 0070
+# decision 7). The fixed IP breaks that circle, and `compose.yml` pins
+# `connector-b` to it on the `onion-b` network. (The `free()` abort is an
+# upstream bug in the error path -- the warning above it is the real message.)
+#
+# `local_topologies_load.rs` holds this literal and compose's `ipv4_address` to
+# one string: an IP changed in one file and not the other publishes a
+# descriptor for a port nothing is listening on, which arrives as a circuit
+# that connects and then times out.
+#
+# ONE port for BOTH surfaces. That address is the single listener the connector
+# binds: `GET /ilp/btp` upgrades the peering's websocket and `POST /ilp` serves
+# the client edge A asks claim-state on. An onion address is a host, so it is
+# addressed the way any other host would be -- port 80, and the paths decide
+# the rest.
+HiddenServicePort 80 172.31.0.10:3000
+
+Log notice stdout
+Log notice file /var/lib/anon/notice.log

@@ -10,6 +10,12 @@ license.workspace = true
 # one definition of it rather than a config-side twin. `connector-domain` is
 # pure and depends on no workspace crate, so this edge adds no cycle.
 connector-domain = { path = "../connector-domain" }
+# `[rate_guards] ttl_secs` becomes `connector_domain::Ttl`, which is a
+# `TimeDelta` -- the span a freshness answer is computed against (ADR 0071
+# decision 5). The conversion happens once, at load, so that a loaded
+# `Config` hands out a validated guard rather than a number someone
+# downstream still has to build one from.
+chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

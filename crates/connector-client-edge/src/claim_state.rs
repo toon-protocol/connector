@@ -1198,7 +1198,7 @@ mod tests {
         let prepare = Prepare {
             amount: 0,
             expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-            execution_condition: [0u8; 32],
+            greeting: false,
             destination: "g.nowhere".to_string(),
             data: Vec::new(),
         };

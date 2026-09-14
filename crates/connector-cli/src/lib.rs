@@ -33,8 +33,14 @@ use std::path::Path;
 
 use axum::Router;
 use connector_config::{Config, ConfigError};
+use url::Url;
 
-pub use runtime::{build, router, Runtime, RuntimeError};
+// `spawn_rate_pollers` beside the two verbs' own entry points (ADR 0071
+// decision 6, issue #1294): it is the one place a built rate table and the
+// node's `RateSources` meet, and the reader that supplies the EVM one
+// (issue #1293) is a crate of its own. A map rather than a source, because
+// decision 3 puts a token's pools on that token's own chain (issue #1302).
+pub use runtime::{build, router, spawn_rate_pollers, Runtime, RuntimeError};
 
 /// Everything that can stop the connector from producing a validated,
 /// running node.
@@ -99,7 +105,8 @@ const USAGE: &str = "usage:\n  \
      connector <config-file>\n  \
      connector send --operator <url> --operator-key <file> --to <ilp-address> \
      --seal-to <url> [--amount <n>] [--target <path>] [--method <verb>] \
-     [--body <file|-> ] [--expires-in <seconds>] [--expect-fulfill] [--dry-run]\n  \
+     [--body <file|-> ] [--expires-in <seconds>] [--socks-proxy <socks5h-url>] \
+     [--expect-fulfill] [--dry-run]\n  \
      connector send --operator-key <file> --print-keyid";
 
 /// What the process arguments asked for, before anything has been loaded.
@@ -109,7 +116,11 @@ enum Invocation {
         config_path: String,
     },
     Send {
-        options: send::SendOptions,
+        /// Boxed because it is by far the largest thing an invocation can
+        /// be, and every other variant is one `String` -- clippy's
+        /// `large_enum_variant`, which would otherwise make every parse
+        /// carry a send's worth of stack for the sake of a config path.
+        options: Box<send::SendOptions>,
     },
     /// `connector send --operator-key <file> --print-keyid`: derive and print
     /// the allowlist value for a key file, touching no network.
@@ -269,6 +280,7 @@ fn parse_send_args(rest: &[&str]) -> Result<Invocation, CliError> {
     let mut body_arg: Option<String> = None;
     let mut amount_arg: Option<String> = None;
     let mut expires_arg: Option<String> = None;
+    let mut socks_proxy_arg: Option<String> = None;
     let mut dry_run = false;
     let mut expect_fulfill = false;
     let mut print_keyid = false;
@@ -286,6 +298,7 @@ fn parse_send_args(rest: &[&str]) -> Result<Invocation, CliError> {
             "--body" => Some(&mut body_arg),
             "--amount" => Some(&mut amount_arg),
             "--expires-in" => Some(&mut expires_arg),
+            "--socks-proxy" => Some(&mut socks_proxy_arg),
             _ => None,
         };
         if let Some(slot) = slot {
@@ -343,6 +356,24 @@ fn parse_send_args(rest: &[&str]) -> Result<Invocation, CliError> {
             ))
         })?,
     };
+    // ADR 0070 decision 5. Refused here, before anything is read from disk
+    // or dialed, for the reason `Config::load` refuses its own `socks_proxy`
+    // at boot: a proxy URL that is not a proxy URL fails every onion dial for
+    // a reason the dial failure itself cannot explain -- and this verb has no
+    // config file to be refused by, which is exactly why the flag exists.
+    //
+    // **This value is read from the argument vector and nowhere else, and
+    // there is no default address.** Someone reaching for `$ALL_PROXY`,
+    // `$SOCKS_PROXY` or a `127.0.0.1:9050` fallback should stop here: this
+    // repository has no environment-variable layer at all (ADR 0009), a
+    // default port assumes a deployment this binary knows nothing about, and
+    // this value decides where a SIGNED OPERATOR WRITE is sent -- which must
+    // never arrive invisibly (ADR 0070, "An env var or a default port for
+    // `connector send`"). An operator who wants the proxy types it.
+    let socks_proxy = socks_proxy_arg
+        .as_deref()
+        .map(parse_socks_proxy)
+        .transpose()?;
     let body = match body_arg.as_deref() {
         None => Vec::new(),
         Some("-") => {
@@ -359,7 +390,7 @@ fn parse_send_args(rest: &[&str]) -> Result<Invocation, CliError> {
     };
 
     Ok(Invocation::Send {
-        options: send::SendOptions {
+        options: Box::new(send::SendOptions {
             operator_url: required(
                 operator_url,
                 "--operator <url>",
@@ -387,10 +418,43 @@ fn parse_send_args(rest: &[&str]) -> Result<Invocation, CliError> {
             method: method.unwrap_or_else(|| "POST".to_string()),
             body,
             expires_in_seconds,
+            socks_proxy,
             dry_run,
             expect_fulfill,
-        },
+        }),
     })
+}
+
+/// The one `--socks-proxy` value, checked the way `Config::load` checks the
+/// `socks_proxy` key it can never reach this verb through (ADR 0070 decision
+/// 5). Two refusals, and neither is a formality:
+///
+/// - **The scheme must be `socks5h`.** The `h` is what makes the *proxy*
+///   resolve the name. A `socks5://` proxy resolves it locally first, and no
+///   resolver on this machine can resolve a `.onion` -- so the flag would be
+///   accepted and the dial would then fail for a reason nothing printed
+///   explains.
+/// - **It must name a host.** `socks5h` is not a *special* scheme in the URL
+///   standard, so -- unlike an `https://` value -- `socks5h://` parses with an
+///   empty host, and `socks5h:9050` parses as a scheme and an opaque path
+///   rather than as the `host:port` it looks like. Both would sail through a
+///   scheme check and then fail at the dial on an address that is not one.
+///
+/// [`CliError::Usage`] rather than a [`send::SendError`] variant, and for the
+/// same reason `--amount abc` is a usage error: this is a malformed *flag
+/// value*, knowable from the argument vector alone, with nothing read and
+/// nothing dialed. `SendError` is what a send reports once it has touched a
+/// key file, a self-description or a socket.
+fn parse_socks_proxy(value: &str) -> Result<Url, CliError> {
+    // ADR 0070 decision 3's rule, **called** rather than restated. `send`
+    // loads no config file, so the `socks_proxy` key cannot reach it
+    // (decision 5) -- but a second copy of what a proxy URL *is* could
+    // reach it, and that is how a value an operator's node accepts becomes
+    // one their probe refuses (or worse, the other way round). One rule,
+    // one set of reasons; only the wrapper differs, because a bad flag is a
+    // usage error and prints the usage.
+    connector_config::parse_socks_proxy(value)
+        .map_err(|error| CliError::Usage(format!("--socks-proxy: {error}\n\n{USAGE}")))
 }
 
 #[cfg(test)]
@@ -571,6 +635,154 @@ key_file = "{}"
             panic!("send --print-keyid must still parse");
         };
         assert_eq!(key_file, "/operator.key");
+    }
+
+    // -- `--socks-proxy` (ADR 0070 decision 5) --
+    //
+    // The flag exists because this verb loads no config file: `socks_proxy`
+    // is a `Config` key and there is no `Config` here, so the only way an
+    // operator can probe an onion node is to type the proxy. These tests are
+    // about the argument vector alone -- which client each of the two URLs
+    // then leaves on is `send.rs`'s, and is asserted there against a real
+    // SOCKS5 server, because no parse can answer where a connection went.
+
+    /// The shortest `connector send` that parses: every required flag and
+    /// nothing else, so a test about one optional flag says only that.
+    fn send_args<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+        let mut args = vec![
+            "connector",
+            "send",
+            "--operator",
+            "http://node.example:3000",
+            "--operator-key",
+            "/operator.key",
+            "--to",
+            "g.example.app",
+            "--seal-to",
+            "http://node.example:3000/ilp",
+        ];
+        args.extend_from_slice(extra);
+        args
+    }
+
+    fn parse_send(extra: &[&str]) -> Result<send::SendOptions, CliError> {
+        match parse(&send_args(extra))? {
+            Invocation::Send { options } => Ok(*options),
+            other => panic!("these arguments must be a send, got {other:?}"),
+        }
+    }
+
+    /// The flag parses, and what it parses to is the proxy the two dials
+    /// select by host.
+    #[test]
+    fn send_takes_a_socks_proxy() {
+        let options = parse_send(&["--socks-proxy", "socks5h://127.0.0.1:9050"])
+            .expect("--socks-proxy is a flag this verb takes");
+
+        assert_eq!(
+            options.socks_proxy.as_ref().map(Url::as_str),
+            Some("socks5h://127.0.0.1:9050")
+        );
+    }
+
+    /// An invocation that names no proxy carries none.
+    ///
+    /// The absence is the whole of the default: nothing substitutes
+    /// `127.0.0.1:9050`, and nothing reads `$ALL_PROXY` or any other
+    /// environment variable to fill it in (ADR 0009, and ADR 0070's "An env
+    /// var or a default port for `connector send`"). A send that named no
+    /// proxy dials every URL direct, and an onion one fails saying so.
+    #[test]
+    fn a_send_that_names_no_proxy_carries_none() {
+        let options = parse_send(&[]).expect("the proxy is optional");
+
+        assert_eq!(options.socks_proxy, None);
+    }
+
+    /// It is in the usage text: a flag an operator cannot discover from
+    /// `connector send` with no arguments is a flag that does not exist for
+    /// the person who needs it.
+    #[test]
+    fn the_socks_proxy_flag_is_in_the_usage_text() {
+        assert!(
+            USAGE.contains("--socks-proxy"),
+            "the usage text must name the flag: {USAGE}"
+        );
+        assert!(
+            USAGE.contains("socks5h"),
+            "and the scheme it takes, which is the one thing about it nobody guesses: {USAGE}"
+        );
+    }
+
+    /// `--socks-proxy` with nothing after it is the same "needs a value"
+    /// usage error every other valued flag on this verb gives -- it is not a
+    /// boolean, and a bare one must never be read as "use some default".
+    #[test]
+    fn a_socks_proxy_with_no_value_is_a_usage_error() {
+        let Err(CliError::Usage(message)) = parse_send(&["--socks-proxy"]) else {
+            panic!("a valued flag with no value must be a usage error");
+        };
+
+        assert!(
+            message.contains("--socks-proxy needs a value"),
+            "and it must name the flag that is missing one: {message}"
+        );
+        assert!(
+            message.contains("--socks-proxy <socks5h-url>"),
+            "with the usage text under it: {message}"
+        );
+    }
+
+    /// `socks5://` is refused, and the refusal explains the `h`.
+    ///
+    /// The same refusal `Config::load` gives the `socks_proxy` key, for the
+    /// same reason: a `socks5://` proxy resolves the hostname LOCALLY, and no
+    /// resolver on this machine can resolve a `.onion`. Accepting it here
+    /// would move the failure to the dial, where nothing printed explains it
+    /// -- which is exactly the silent failure both checks exist to prevent.
+    #[test]
+    fn a_socks_proxy_that_drops_the_h_is_refused_and_says_why() {
+        for written in [
+            "socks5://127.0.0.1:9050",
+            "socks4://127.0.0.1:9050",
+            "http://127.0.0.1:9050",
+        ] {
+            let Err(CliError::Usage(message)) = parse_send(&["--socks-proxy", written]) else {
+                panic!("{written} is not a socks5h proxy and must be refused");
+            };
+            assert!(
+                message.contains("socks5h"),
+                "the refusal must name the scheme it wanted: {message}"
+            );
+            assert!(
+                message.contains(".onion") && message.contains("LOCALLY"),
+                "and say why the 'h' is not a preference: {message}"
+            );
+        }
+    }
+
+    /// A value naming no host is refused by name.
+    ///
+    /// `socks5h` is not a *special* URL scheme, so -- unlike `https://` --
+    /// both of these parse: `socks5h://` with an empty host, and
+    /// `socks5h:9050` as a scheme plus an opaque path that merely looks like
+    /// a `host:port`. Without this check either would be accepted and every
+    /// onion dial would then fail on a proxy address that is not an address.
+    #[test]
+    fn a_socks_proxy_naming_no_host_is_refused() {
+        for written in ["socks5h://", "socks5h:9050", "socks5h:///path"] {
+            let Err(CliError::Usage(message)) = parse_send(&["--socks-proxy", written]) else {
+                panic!("{written} names no proxy to reach and must be refused");
+            };
+            assert!(
+                message.contains("names no host"),
+                "the refusal must say what is missing: {message}"
+            );
+            assert!(
+                message.contains("socks5h://127.0.0.1:9050"),
+                "and show a value that would work: {message}"
+            );
+        }
     }
 
     /// `[node]` is read on the serving path (it feeds the greeting and the

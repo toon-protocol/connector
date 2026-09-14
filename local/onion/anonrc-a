@@ -1,0 +1,50 @@
+##=================== /etc/anon/anonrc -- local/onion, A's side ==============##
+#
+# The SOCKS5 proxy `connector-a` dials its onion peer through, and nothing
+# else. This daemon publishes no service and relays no traffic for anyone.
+#
+# Mounted READ-ONLY at /etc/anon/anonrc. The image's entrypoint appends a
+# `Nickname` line to that file when it finds none, so the `Nickname` below is
+# load-bearing rather than decorative: without it the entrypoint would try to
+# write a read-only mount and `set -o errexit` would take the container down
+# before `anon` ever started.
+
+# WITHOUT THIS THE DAEMON DOES NOT START. `anon` refuses to run until the
+# terms are accepted, and in a non-interactive container it fails fast --
+# "User has not agreed to the terms and conditions. Exiting." -- rather than
+# prompting. ADR 0070 decision 8 names it as one of the two things this
+# sidecar needs said out loud; the other is the persisted directory, which is
+# B's business rather than this daemon's.
+AgreeToTerms 1
+
+# Drop from root to the image's own unprivileged user, whose home the
+# DataDirectory is. The entrypoint has already chowned it.
+User anond
+DataDirectory /var/lib/anon
+Nickname toonlocalonionA
+
+# A CLIENT, not a relay: no ORPort, no DirPort, and nothing anyone else can
+# route through. This node exists to open circuits, not to carry other
+# people's.
+ClientOnly 1
+ORPort 0
+DirPort 0
+ControlSocket 0
+
+# The one surface: SOCKS5 on this container's network address, because the
+# thing dialing it is another container. `SocksPolicy` keeps that to the
+# private ranges docker allocates from -- the network this daemon is attached
+# to is the only place a request can come from anyway, and saying so is
+# cheaper than reasoning about it later.
+SocksPort 0.0.0.0:9050
+SocksPolicy accept 10.0.0.0/8
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy accept 192.168.0.0/16
+SocksPolicy reject *
+
+# Twice, deliberately. stdout is where `docker compose logs` reads, and the
+# file is what the healthcheck greps for `Bootstrapped 100%` -- a container
+# that is Up is not a container that has a circuit, which is the same
+# distinction every connector healthcheck here draws.
+Log notice stdout
+Log notice file /var/lib/anon/notice.log

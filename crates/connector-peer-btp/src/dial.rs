@@ -45,7 +45,7 @@ use async_trait::async_trait;
 use connector_btp::{BtpFrame, BtpSessionHandle, ProtocolData, BTP_ERROR};
 use connector_config::{PeerCarriage, PeerChannelConfig, PeerConfig};
 use connector_domain::x402::{GreetingError, X402PaymentRequired};
-use connector_domain::{Fulfill, PacketResponse, Prepare, Reject};
+use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 use connector_runtime::{ClaimAckOutcome, Clock, PeerForward, PeerTransport, WireClaim};
 use url::Url;
 
@@ -450,6 +450,37 @@ impl PeerAnswer {
     }
 }
 
+/// §2.2: a dial that did not reach the peer rejects **`T01` naming both
+/// the peer and the endpoint that was attempted** -- never `T00`, and
+/// never a silent drop.
+///
+/// [`PeerForward::unreachable`] names only the peer, which is right where
+/// there is no endpoint to name -- a peer id this connector never dials --
+/// and short of §2.2 everywhere else. The endpoint is here for the same
+/// two reasons it is on the HTTP carriage's own `dial_failed`: §2.2
+/// requires a dial failure to name it rather than become a runtime
+/// mystery, and since ADR 0070 the endpoint is the whole of why a dial
+/// went where it went -- an operator reading this reject on a node with no
+/// `socks_proxy` sees the `.onion` host that could not be reached, and the
+/// log line beside it says why. §9 is why the two carriages spell it the
+/// same way: an operator who can read the endpoint off one carriage's
+/// `T01` and not the other's is looking at a defect.
+///
+/// The reason itself stays in the log rather than riding upstream -- what
+/// the previous hop needs is that this hop could not deliver.
+fn unreachable_at(peer_id: &str, endpoint: &Url) -> PeerForward {
+    PeerForward {
+        response: PacketResponse::Reject(Reject {
+            code: RejectCode::t01_peer_unreachable(),
+            triggered_by: String::new(),
+            message: format!("peer '{peer_id}' unreachable at {endpoint}"),
+            data: Vec::new(),
+            accumulated_cost: 0,
+        }),
+        ..PeerForward::unreachable(peer_id)
+    }
+}
+
 /// Read a peer's answer back off the RESPONSE frame: the packet's own
 /// verdict from `ilpPacket`, a REJECT's running cost from the
 /// `toon-accumulated-cost` entry the client edge already uses (§5.2), and
@@ -496,7 +527,7 @@ impl PeerTransport for BtpPeerTransport {
             Ok(handle) => handle,
             Err(error) => {
                 tracing::warn!(%error, "peer dial failed");
-                return PeerForward::unreachable(peer_id);
+                return unreachable_at(peer_id, &state.relation.endpoint);
             }
         };
 
@@ -518,7 +549,7 @@ impl PeerTransport for BtpPeerTransport {
             Ok(Ok(frame)) => frame,
             _ => {
                 self.drop_session(state).await;
-                return PeerForward::unreachable(peer_id);
+                return unreachable_at(peer_id, &state.relation.endpoint);
             }
         };
         // An ERROR means the peer could not decode our frame: there is no
@@ -530,7 +561,7 @@ impl PeerTransport for BtpPeerTransport {
                 reason = %String::from_utf8_lossy(&frame.ilp_packet),
                 "peer answered a forwarded PREPARE with a BTP ERROR"
             );
-            return PeerForward::unreachable(peer_id);
+            return unreachable_at(peer_id, &state.relation.endpoint);
         }
 
         let ack = self.read_ack(state, claim.as_ref(), &frame);

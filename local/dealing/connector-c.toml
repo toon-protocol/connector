@@ -1,0 +1,108 @@
+# =============================================================================
+# local/dealing -- connector C. The far side of the boundary.
+#
+# LOCAL / DEV ONLY. `infra/linode-*` owns devnet; nothing here is deployed,
+# published or SSH'd anywhere, and every chain this file names is disposable.
+#
+# The mirror of A: one chain, one peering, no idea that the hop before B was
+# denominated in anything else. A packet arriving here has crossed anvil and
+# then the Solana validator, and its amount has been through a rate -- and this
+# node cannot tell, because nothing on the wire says so and nothing needs to.
+# The number it is paid is in the unit of the channel it is paid on, which is
+# the only unit an amount has ever had (ADR 0071 decision 7).
+#
+# THIS NODE DECLARES NO `[[tokens]]`, which is the second half of the same
+# point. Dealing is a property of the hop that sits on a boundary, not of the
+# path: A and C are ordinary nodes running the code they ran before the record,
+# and only B has a rate table at all.
+#
+# The rehearsal's payload is sealed to THIS node's `[signer]` identity (ADR
+# 0018) -- neither A nor B can open it, and `connector send --seal-to` naming
+# either of them is reported as "FULFILL WITH THE WRONG FULFILMENT" rather than
+# quietly passing.
+# =============================================================================
+
+client_edge_addr = "0.0.0.0:3000"
+
+# Where the Solana peering's inbound claim watermarks are written, and the file
+# the rehearsal reads to prove the crossing was paid for AT THE CONVERTED
+# FIGURE rather than merely traversed (`peer-claims.log`).
+state_dir = "/app/state"
+
+# CF-17: the peer carriage rides this node's own listener. C dials nobody, so
+# there is no `peer_allow_plaintext_endpoints` here -- the opt-in widens which
+# schemes this node may DIAL, and C never does.
+peer_expose = "http"
+
+[signer]
+key_file = "/app/data/signer.key"
+
+# ── The terminated route ─────────────────────────────────────────────────────
+# `stub-app` is the connector image's second binary: it answers `POST /`, holds
+# no secret and performs no cryptography, so it contributes nothing to the
+# packet's fulfilment -- this connector derives that itself from the sealed
+# request (ADR 0019). The trailing slash is load-bearing (`handler_url.join`
+# and RFC 3986).
+#
+# `price = 0`, by choice rather than by constraint. B holds a `[[pay_channels]]`
+# row for `b-c` and covers each PREPARE before it is sent (issue #1145), so a
+# price here would be perfectly payable -- pricing a peer termination is what
+# `local/two-hop` exists to prove, and there is no second thing this topology
+# would learn from doing it again. What this node is actually paid is the
+# forwarded amount: 4350000 base units of the 9-decimal mock, which is what
+# 1100 µUSDC became at B's declared rate less B's flat fee.
+#
+# A PRICE HERE WOULD BE IN THIS NODE'S OWN UNIT, which is worth saying because
+# it is the one place the units could be got wrong by writing a plausible
+# number. 1050 would not be "the same price as `local/mixed-chain`'s C charges"
+# -- it would be roughly a millionth of a token.
+[[routes]]
+prefix = "g.local.dealing.b.c.app"
+handler_url = "http://stub-app:3100/"
+price = 0
+
+# ── The Solana peering ───────────────────────────────────────────────────────
+# No `endpoint`: B dials us, which on ILP-over-HTTP makes this node the payee
+# (peer-semantics-pre-868.md §6.4).
+[[peers]]
+id = "b-c"
+
+
+# The other half of B's Solana row. `counterparty_key` is B's Solana SETTLEMENT
+# public key -- the identity a claim on this channel must be signed by, and the
+# one thing this node checks a signature against (CF-23).
+#
+# The settlement program is bound into the signed message since ADR 0053, so a
+# claim rendered against another deployment of the same program does not verify
+# here even though every other field matches. The row does not name it: it is
+# read from `[settlement.solana] program_id` below, the only program this node
+# could redeem such a claim through (issue #1128).
+[[peer_channels]]
+peer_id = "b-c"
+channel_account = "AiCAdi9xJ5XhJQ3sRkeCYzbWozd7dbS3gwZ9rneJWk8W"
+counterparty_key = "7H4WxJGLmy9h4rPP7wP7rLGC9ay2RB6mjbvWm6bdjBpZ"
+
+# No `[operator]` section, deliberately (CF-31): an absent table means the
+# surface is not started at all, rather than started unauthenticated. The
+# rehearsal hands its packet to A.
+
+# ── Settlement: Solana only ──────────────────────────────────────────────────
+# No `[settlement.evm]`, and that is the assertion this node makes: it holds no
+# EVM identity, cannot sign an EIP-712 balance proof and could not verify one
+# -- so a packet reaching it has genuinely been handed across a boundary rather
+# than carried in one denomination the whole way with a differently-shaped
+# config in the middle.
+#
+# `token_address` is the 9-decimal mock `local/keys.sh dealing` creates, and
+# `decimals = 9` is asserted against the mint itself at boot. Both halves of
+# the peering name the same mint, because a channel's PDA is derived from it --
+# a node that named the mock USDC mint here would compute a different
+# `channel_account` and refuse to start long before a claim was ever judged.
+[settlement.solana]
+rpc_url = "http://solana-validator:8899"
+program_id = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR"
+token_address = "5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX"
+decimals = 9
+
+[settlement.solana.key]
+key_file = "/app/data/settlement-solana.key"

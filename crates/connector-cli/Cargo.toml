@@ -18,6 +18,16 @@ connector-operator = { path = "../connector-operator" }
 # loaded `Config` and a `Connector` are both in scope.
 connector-peer-btp = { path = "../connector-peer-btp" }
 connector-peer-http = { path = "../connector-peer-http" }
+# The rate-source port (ADR 0071 decision 6, issue #1294): `spawn_rate_pollers`
+# takes one and starts a background poller per declared quote path. The port
+# only -- a reader behind it is its own crate, and this is the one place a
+# loaded `Config`, a built rate table and a source are all in scope.
+connector-rate-source = { path = "../connector-rate-source" }
+# The one reader behind that port (ADR 0071 decision 6, issue #1293): the
+# Uniswap-v3-compatible `observe()` TWAP, over the settlement backend's own
+# RPC endpoint. Named here and nowhere else -- `spawn_rate_pollers` takes the
+# port, and this is the single place a concrete source is chosen.
+connector-rate-source-evm = { path = "../connector-rate-source-evm" }
 connector-runtime = { path = "../connector-runtime" }
 connector-settlement = { path = "../connector-settlement" }
 connector-settlement-evm = { path = "../connector-settlement-evm" }
@@ -37,7 +47,13 @@ chrono = "0.4"
 # the same curve and the same crate `connector-operator` verifies with.
 ed25519-dalek = "1"
 ethers = { version = "2", default-features = false, features = ["rustls"] }
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
+# `socks` because ADR 0070 decision 5 gives `connector send` a
+# `--socks-proxy` flag, and an onion URL -- the operator surface it signs a
+# write to, or the `--seal-to` node whose self-description it fetches -- is
+# dialed through that proxy, which is a dial reqwest cannot make without
+# this feature. Same 0.11 the carriage and the runtime already resolve to,
+# and the same `tokio-socks` already in the lockfile.
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json", "socks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 solana-sdk = "=2.1.0"
@@ -47,8 +63,16 @@ tokio = { version = "1", features = ["net", "time"] }
 tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 tracing = "0.1"
+# `is_onion_endpoint` takes a parsed `Url`, and a proxy value is refused at
+# parse time by its scheme and its host (ADR 0070 decision 5) -- both are
+# questions about a URL, asked of the same crate every other URL in this
+# workspace is parsed by.
+url = "2"
 
 [dev-dependencies]
+# `test-support` for the SOCKS5 server fake the onion dial tests dial through
+# (ADR 0070). A dev-dependency, so `cargo build` never carries a listener.
+connector-runtime = { path = "../connector-runtime", features = ["test-support"] }
 base64 = "0.22"
 # Reads a Solana channel account and program id back off a rendered claim
 # and a rendered claim-state ask (issue #1146's `[[pay_channels]]` wiring
@@ -78,5 +102,7 @@ solana-rpc-client = "=2.1.0"
 # builds its instructions with.
 spl-associated-token-account = "=4.0.0"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+# `test-util` for the rate poller's spawn test (issue #1294): a paused clock
+# asserts the cadence a `ttl` implies without spending it in real seconds.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 tower = { version = "0.4", features = ["util"] }

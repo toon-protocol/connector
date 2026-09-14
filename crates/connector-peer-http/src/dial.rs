@@ -530,8 +530,18 @@ impl HttpPeerTransport {
                 );
                 None
             }
+            // `HttpDialError` carries the endpoint it attempted but not the
+            // peer id -- the client that mints one holds a URL and nothing
+            // else -- so the relation's own id is logged beside it. Without
+            // that, the one line naming *why* a dial failed (a refused
+            // connection, or an onion endpoint on a node with no
+            // `socks_proxy`) does not say which peering it was for.
             Ok(Err(error)) => {
-                tracing::warn!(%error, "peer request failed; {NAT_NOTE}");
+                tracing::warn!(
+                    peer_id = %state.relation.peer_id,
+                    %error,
+                    "peer request failed; {NAT_NOTE}"
+                );
                 None
             }
             // §6.3 on expiry: the claim is **not acknowledged**. The peering
@@ -566,6 +576,27 @@ fn peer_not_dialable(peer_id: &str) -> PacketResponse {
              dialing side can originate, so packets flow only in the dialing direction \
              (peer-carriage-spec.md §6.4(1)). {NAT_NOTE}"
         ),
+        data: Vec::new(),
+        accumulated_cost: 0,
+    })
+}
+
+/// §2.2: a dial that did not reach the peer rejects **`T01` naming both the
+/// peer and the endpoint that was attempted** -- never `T00`, and never a
+/// silent drop.
+///
+/// The endpoint is here because §2.2 requires a dial failure to name it
+/// rather than become a runtime mystery, and because since ADR 0070 an
+/// endpoint is the whole of why a dial went where it went: an operator
+/// reading this reject on a node with no `socks_proxy` sees the `.onion`
+/// host that could not be reached, and the log line beside it says why.
+/// The reason itself stays in the log rather than riding upstream --
+/// what the previous hop needs is that this hop could not deliver.
+fn dial_failed(peer_id: &str, endpoint: &Url) -> PacketResponse {
+    PacketResponse::Reject(Reject {
+        code: RejectCode::t01_peer_unreachable(),
+        triggered_by: String::new(),
+        message: format!("peer '{peer_id}' unreachable at {endpoint}"),
         data: Vec::new(),
         accumulated_cost: 0,
     })
@@ -642,7 +673,10 @@ impl PeerTransport for HttpPeerTransport {
             .post(state, request, state.relation.peer_answer_timeout)
             .await
         else {
-            return PeerForward::unreachable(peer_id);
+            return PeerForward {
+                response: dial_failed(peer_id, &state.relation.endpoint),
+                ..PeerForward::unreachable(peer_id)
+            };
         };
         self.note_flush_hints(state, &response);
 

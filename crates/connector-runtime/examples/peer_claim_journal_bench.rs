@@ -67,15 +67,13 @@ use std::time::{Duration, Instant};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use connector_config::StaticRoute;
-use connector_domain::{
-    derive_condition, EnvelopeRequest, EnvelopeResponse, PacketResponse, Prepare,
-};
+use connector_domain::{EnvelopeRequest, EnvelopeResponse, PacketResponse, Prepare};
 use connector_runtime::{
     AppOutcome, ChannelDomain, ClaimBook, ClaimStateDomain, ClaimStateSource, ClaimWatermark,
     Connector, EvmDomain, FakeAppClient, FileJournal, InProcessPeerTransport, OutboundClientError,
     OutboundClientLedger, PeerRoute, SystemClock, WireClaim,
 };
-use connector_signer::giftwrap::{derive_fulfillment, seal_request};
+use connector_signer::giftwrap::seal_request;
 use connector_signer::{derive_evm_address, Address, LocalSigner, Signer};
 
 /// The prefix box 1 forwards over its peer route, and the address every
@@ -245,9 +243,9 @@ fn upstream_claim_source(signer: Arc<dyn Signer>) -> ClaimBook {
     book
 }
 
-/// A PREPARE sealed to `identity`, whose execution condition matches the
-/// fulfilment its own sealed secret derives -- so it fulfils when it
-/// reaches an app that answers at all (ADR 0019).
+/// A PREPARE sealed to `identity` -- so it fulfils when it reaches an app
+/// that answers at all, the termination deriving the fulfilment from this
+/// same sealed secret (ADR 0019).
 fn sealed_prepare(identity: &dyn Signer) -> Prepare {
     let plaintext = EnvelopeRequest {
         method: "POST".to_string(),
@@ -256,12 +254,12 @@ fn sealed_prepare(identity: &dyn Signer) -> Prepare {
         body: b"frame".to_vec(),
     }
     .encode();
-    let (data, shared_secret) =
+    let (data, _shared_secret) =
         seal_request(&plaintext, &identity.public_key().expect("public key")).expect("seal");
     Prepare {
         amount: AMOUNT,
         expires_at: Utc::now() + ChronoDuration::hours(1),
-        execution_condition: derive_condition(&derive_fulfillment(&shared_secret)),
+        greeting: false,
         destination: DESTINATION.to_string(),
         data,
     }
@@ -379,7 +377,9 @@ async fn main() {
             }
         }
         let started = Instant::now();
-        let (response, _ack) = box_1.handle_peer_prepare(prepare, claim).await;
+        let (response, _ack) = box_1
+            .handle_peer_prepare(Some("upstream"), prepare, claim)
+            .await;
         latencies.push(started.elapsed());
         if matches!(response, PacketResponse::Fulfill(_)) {
             fulfilled += 1;

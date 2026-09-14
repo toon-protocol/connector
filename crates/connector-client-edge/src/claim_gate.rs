@@ -525,7 +525,7 @@ impl ClientClaimGate {
         self.payout_ledger.as_ref()
     }
 
-    /// Credit `channel_id` `amount` against `condition` (issue #770), the
+    /// Credit `channel_id` `amount` against `job_id` (issue #770), the
     /// same as [`ClientPayoutLedger::record_payout_once`], except a channel
     /// this gate's ledger has no domain for yet is first resolved through
     /// this gate's own budgeted [`ClientChannelRegistry`] -- the one the
@@ -551,7 +551,7 @@ impl ClientClaimGate {
     pub(crate) async fn credit_payout(
         &self,
         channel_id: &str,
-        condition: &[u8; 32],
+        job_id: &[u8; 32],
         amount: u64,
         now: DateTime<Utc>,
     ) -> Option<WireClaim> {
@@ -559,7 +559,7 @@ impl ClientClaimGate {
         if !ledger.has_channel_domain(channel_id) {
             self.resolve_payout_domain(ledger, channel_id).await;
         }
-        ledger.record_payout_once(channel_id, condition, amount, now)
+        ledger.record_payout_once(channel_id, job_id, amount, now)
     }
 
     /// [`Self::credit_payout`]'s on-demand resolution step, split out so its
@@ -651,7 +651,7 @@ impl ClientClaimGate {
     pub(crate) async fn credit_session_payout(
         &self,
         destination: &str,
-        condition: &[u8; 32],
+        job_id: &[u8; 32],
         amount: u64,
         now: DateTime<Utc>,
     ) -> Option<WireClaim> {
@@ -662,8 +662,7 @@ impl ClientClaimGate {
             );
             return None;
         };
-        self.credit_payout(&channel_id, condition, amount, now)
-            .await
+        self.credit_payout(&channel_id, job_id, amount, now).await
     }
 
     /// The watermark this gate currently holds for `channel_key` (the
@@ -4537,9 +4536,9 @@ mod tests {
             let gate = gate().with_payout_ledger(Arc::clone(&ledger));
             gate.record_session_channel(address, channel_id.clone());
 
-            let condition = [3u8; 32];
+            let job_id = [3u8; 32];
             let claim = gate
-                .credit_session_payout(address, &condition, 5_000, now())
+                .credit_session_payout(address, &job_id, 5_000, now())
                 .await
                 .expect("the session's channel was known, and is payable");
             assert_eq!(claim.channel_id, channel_id);
@@ -4556,9 +4555,9 @@ mod tests {
             let ledger = Arc::new(ClientPayoutLedger::new());
             let gate = gate().with_payout_ledger(ledger);
 
-            let condition = [4u8; 32];
+            let job_id = [4u8; 32];
             let claim = gate
-                .credit_session_payout("g.toon.unpaid", &condition, 5_000, now())
+                .credit_session_payout("g.toon.unpaid", &job_id, 5_000, now())
                 .await;
             assert!(
                 claim.is_none(),

@@ -287,13 +287,14 @@ pub fn open_response(shared_secret: &[u8; 32], bytes: &[u8]) -> Result<Vec<u8>, 
 
 /// The fulfilment a terminating connector derives from a request's shared
 /// secret (ADR 0019, issue #525) -- `HKDF-SHA256(shared_secret,
-/// "toon-giftwrap-fulfillment")`. A sender mints its packet's execution
-/// condition as `derive_condition` of exactly this value before ever
-/// sealing the request, so recovering `shared_secret` (via [`open_request`])
-/// is sufficient to derive a fulfilment that verifies, with no app
-/// participation. Domain-separated from [`REQUEST_INFO`]/[`RESPONSE_INFO`]
-/// by its own HKDF `info` string, so it can never collide with either AEAD
-/// key the same secret also derives.
+/// "toon-giftwrap-fulfillment")`. The sender checks its own end-to-end
+/// delivery by comparing a returned fulfilment against this same derivation
+/// (`connector send`, issue #1269 / ADR 0069 -- the packet itself no longer
+/// carries a condition to mint), so recovering `shared_secret` (via
+/// [`open_request`]) is sufficient to derive a fulfilment that verifies, with
+/// no app participation. Domain-separated from
+/// [`REQUEST_INFO`]/[`RESPONSE_INFO`] by its own HKDF `info` string, so it
+/// can never collide with either AEAD key the same secret also derives.
 pub fn derive_fulfillment(shared_secret: &[u8; 32]) -> [u8; 32] {
     hkdf_key(shared_secret, FULFILLMENT_INFO)
 }

@@ -1,0 +1,62 @@
+# local/anyone -- the node the toon client pays over a .anyone hidden service.
+#
+# COMMITTED WITH A PLACEHOLDER HOST. `run.sh` renders this into
+# `local/.keys/anyone/connector/connector.toml` with the daemon's real generated
+# address substituted, and THAT rendered file is what compose mounts. The
+# placeholder is 56 characters of the base32 alphabet a v3 address is drawn
+# from and ends in `.anyone`, so this file is still a real config that loads --
+# which is what keeps `local_topologies_load.rs` able to read it.
+
+client_edge_addr = "0.0.0.0:3000"
+state_dir        = "/app/state"
+
+# ── Why this opt-in is still here: the IMAGE, not the rule ──────────────────
+# The `[node]` endpoints below are plaintext (`http://`, `ws://`) at a `.anyone`
+# host, and ADR 0070's exemption -- a hidden-service address authenticates
+# itself, so plaintext needs no opt-in -- now covers them: `is_onion_endpoint`
+# matches `.onion` AND `.anyone` (issue #1284, ADR 0070 as amended). On a
+# connector built from this tree, this line is unnecessary.
+#
+# It stays because the image this topology runs by default is a RELEASED one
+# that predates the fix (see compose.yml: `main` is ahead of what toon-client
+# has vendored, so a build of main is refused at the packet layer for an
+# unrelated reason). On that binary the suffix check is `.onion` only, and
+# `plaintext_permitted = allow_plaintext || is_onion_endpoint` is what lets
+# these endpoints load at all. It is enough only because the connector SERVES
+# here and never dials out over the overlay, so the other thing that function
+# decides -- which socket a dial leaves on -- is never asked.
+#
+# DELETE THIS LINE in the same change that bumps ANYONE_CONNECTOR_IMAGE to a
+# release carrying the fix. Do NOT read it as a pattern for a deployed node:
+# it is a loopback-and-test switch and it means every plaintext endpoint
+# loads, not just this one.
+peer_allow_plaintext_endpoints = true
+
+[signer]
+key_file = "/app/data/signer.key"
+
+[node]
+addresses     = ["g.lab.hs"]
+http_endpoint = "http://placeholderplaceholderplaceholderplaceholderplaceholderb.anyone/ilp"
+btp_endpoint  = "ws://placeholderplaceholderplaceholderplaceholderplaceholderb.anyone/ilp/btp"
+
+# `[node]` is all-or-nothing: `http_endpoint` without `btp_endpoint` is a
+# startup refusal, because a node behind a terminator cannot learn its own
+# public name and a published dead URL is worse than none.
+
+[[routes]]
+prefix      = "g.lab.hs"
+handler_url = "http://stub-app:3100/"
+price       = 1000
+
+[settlement.evm]
+rpc_url = "http://anvil:8545"
+# The TokenNetworkRegistry, NOT a token network: the connector resolves
+# getTokenNetwork(token_address) through it and refuses to start if that comes
+# back zero. Both are the deterministic output of DeployLocal.s.sol.
+contract_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+token_address    = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+decimals         = 6
+
+[settlement.evm.key]
+key_file = "/app/data/settlement.key"

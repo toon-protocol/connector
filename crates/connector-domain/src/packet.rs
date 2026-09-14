@@ -3,7 +3,7 @@
 //!
 //! A packet these types produce will not decode in a conforming ILPv4
 //! implementation, and one from a conforming implementation will not decode
-//! here. Three things differ from RFC-0027 §Packet Format, and nothing else
+//! here. Four things differ from RFC-0027 §Packet Format, and nothing else
 //! does:
 //!
 //! | RFC-0027                                                | This codec                                     |
@@ -11,11 +11,16 @@
 //! | Outer type-length wrapper: `type` then a VarOctetString | Type byte, then fields inline -- no wrapper    |
 //! | `amount` is a fixed `UInt64` (8 bytes)                  | `encode_var_uint` -- a VarUInt                 |
 //! | `expiresAt` is a 17-byte Interledger Timestamp          | 19-byte GeneralizedTime, `YYYYMMDDHHMMSS.fffZ` |
+//! | `executionCondition`, a 32-byte `UInt256`               | Gone (issue #1269); a one-byte `greeting` flag |
 //!
+//! The fourth is not an encoding quirk like the first three -- it removes a
+//! field RFC-0027 requires and states a decision that field never bought
+//! anything a forwarding hop was paid to check (issue #1269 / ADR 0069).
 //! Everything else here is RFC-0027's: the three type bytes (12, 13, 14), the
-//! field order and meanings, `condition = sha256(fulfilment)`, and the
-//! `F`/`T`/`R` error taxonomy. The OER primitives the fields are built from are
-//! RFC-0030's, tightened by ADR 0023 -- see `oer.rs`.
+//! remaining field order and meanings, `Fulfill.fulfillment` and its relation
+//! to a request's shared secret (ADR 0019), and the `F`/`T`/`R` error
+//! taxonomy. The OER primitives the fields are built from are RFC-0030's,
+//! tightened by ADR 0023 -- see `oer.rs`.
 //!
 //! **The bytes are pinned, not merely described.**
 //! `vectors/wire-vectors.json`'s `peer_carriage.prepare.http_body_hex` is a
@@ -71,16 +76,35 @@ fn decode_type_byte(buf: &[u8], expected: u8) -> Result<usize, PacketError> {
 /// An ILP PREPARE packet (RFC-0027 Section 3.1): a conditional payment
 /// addressed to `destination`, carrying an opaque application payload.
 ///
-/// `execution_condition` is all-zero exactly when the sender attached none --
-/// RFC-0027's wire format has no separate "absent" representation, so zero
-/// is the only way "no condition" can be expressed on the wire. That state
-/// is invalid, not a legacy auto-fulfill path: see
-/// [`crate::condition_is_present`] and issue #417.
+/// Carries no execution condition (issue #1269 / ADR 0069): the condition was
+/// `derive_condition(derive_fulfillment(shared_secret))`, invariant across
+/// every hop and distinctive per packet -- a perfect join key for any two
+/// hops on a path -- while buying no hop anything it does not already have.
+/// A hop is paid on arrival (ADR 0042), a mismatch still charges
+/// (`f99_application_error`'s old mismatch branch), and a termination's own
+/// check was a tautology: it derives the fulfilment from the same secret the
+/// sender minted the condition from. The sender already verifies end to end
+/// (`connector send` against its own `derive_fulfillment`), which is the only
+/// check that ever protected anything. `greeting` replaces the all-zero
+/// condition as the bootstrap-probe discriminator (issue #807's fix,
+/// restated as a stated shape rather than an inferred one).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepare {
     pub amount: u64,
     pub expires_at: DateTime<Utc>,
-    pub execution_condition: [u8; 32],
+    /// Whether this PREPARE declares itself a bootstrap/greeting probe
+    /// rather than a real payment attempt. Consulted only by
+    /// `connector-client-edge`'s `handle_ilp`/`handle_frame`, and only when
+    /// no claim header is attached: an unclaimed request with `greeting`
+    /// set is never routed, priced or fulfilled, always answered with the
+    /// x402 `payment-required` terms instead. A claim header suppresses
+    /// this unconditionally regardless of `greeting`'s value, so a
+    /// claim-bearing PREPARE is routed normally whether or not it declares
+    /// itself a greeting -- the flag can broaden when the unclaimed case is
+    /// greeted, never narrow when the claimed case is charged. Replaces the
+    /// old all-zero-condition discriminator: a shape the protocol states,
+    /// not one inferred from the absence of a field that no longer exists.
+    pub greeting: bool,
     pub destination: String,
     pub data: Vec<u8>,
 }
@@ -91,7 +115,7 @@ impl Prepare {
         out.push(TYPE_PREPARE);
         out.extend(encode_var_uint(self.amount));
         out.extend(encode_generalized_time(self.expires_at));
-        out.extend_from_slice(&self.execution_condition);
+        out.push(u8::from(self.greeting));
         out.extend(encode_var_octet_string(self.destination.as_bytes()));
         out.extend(encode_var_octet_string(&self.data));
         out
@@ -106,8 +130,13 @@ impl Prepare {
         let (expires_at, n) = decode_generalized_time(buf, offset)?;
         offset += n;
 
-        let (execution_condition, n) = decode_fixed_octet_string(buf, offset, 32)?;
-        offset += n;
+        let greeting_byte = *buf.get(offset).ok_or(PacketError::BufferUnderflow)?;
+        let greeting = match greeting_byte {
+            0 => false,
+            1 => true,
+            _ => return Err(PacketError::InvalidType),
+        };
+        offset += 1;
 
         let (destination_bytes, n) = decode_var_octet_string(buf, offset)?;
         offset += n;
@@ -127,7 +156,7 @@ impl Prepare {
         Ok(Prepare {
             amount,
             expires_at,
-            execution_condition,
+            greeting,
             destination,
             data,
         })
@@ -184,8 +213,7 @@ impl RejectCode {
         RejectCode("F00".to_string())
     }
 
-    /// F01: Invalid Packet -- malformed, or (per issue #417) a missing or
-    /// all-zero execution condition.
+    /// F01: Invalid Packet -- malformed.
     pub fn f01_invalid_packet() -> RejectCode {
         RejectCode("F01".to_string())
     }
@@ -215,9 +243,14 @@ impl RejectCode {
         RejectCode("F06".to_string())
     }
 
-    /// F99: Application Error -- the terminating app declined the delivery,
-    /// or (per issue #417) supplied no fulfilment matching the execution
-    /// condition it was handed.
+    /// F99: Application Error -- the terminating app declined the delivery.
+    /// Until issue #1269, also raised when a candidate fulfilment failed to
+    /// verify against the packet's execution condition; that check (and the
+    /// condition itself) is retired, so this constructor has no caller in
+    /// this workspace today. Kept rather than deleted: it names one of
+    /// RFC-0027's own error codes, not a mechanism this connector invented,
+    /// and this type otherwise enumerates that vocabulary exhaustively
+    /// whether or not every code currently has a producer.
     pub fn f99_application_error() -> RejectCode {
         RejectCode("F99".to_string())
     }
@@ -414,7 +447,7 @@ mod tests {
         Prepare {
             amount: 100,
             expires_at: Utc.with_ymd_and_hms(2030, 6, 15, 12, 0, 0).unwrap(),
-            execution_condition: [0u8; 32],
+            greeting: false,
             destination: "g.example.app".to_string(),
             data: b"hello app".to_vec(),
         }
@@ -427,6 +460,50 @@ mod tests {
         assert_eq!(encoded[0], TYPE_PREPARE);
         let decoded = Prepare::decode(&encoded).expect("decode");
         assert_eq!(decoded, prepare);
+    }
+
+    /// The `greeting` flag is the one field this codec added over RFC-0027's
+    /// own set (issue #1269) -- it must survive a round trip exactly like
+    /// every other field, in both states.
+    #[test]
+    fn greeting_flag_round_trips_in_both_states() {
+        let greeting_probe = Prepare {
+            greeting: true,
+            ..sample_prepare()
+        };
+        let decoded = Prepare::decode(&greeting_probe.encode()).expect("decode");
+        assert_eq!(decoded, greeting_probe);
+        assert!(decoded.greeting);
+
+        let ordinary = Prepare {
+            greeting: false,
+            ..sample_prepare()
+        };
+        let decoded = Prepare::decode(&ordinary.encode()).expect("decode");
+        assert_eq!(decoded, ordinary);
+        assert!(!decoded.greeting);
+    }
+
+    /// The `greeting` byte is a single octet immediately after `expiresAt`
+    /// and before `destination` -- any value other than 0 or 1 is a
+    /// malformed packet, not a truthy/falsy coercion, so a decoder never
+    /// silently accepts a byte a well-formed encoder would never produce.
+    #[test]
+    fn a_greeting_byte_other_than_zero_or_one_is_rejected() {
+        let mut encoded = sample_prepare().encode();
+        // Type byte (1) + `amount: 100`'s single-byte VarUInt (1) +
+        // GeneralizedTime (19) = offset 21 -- the same layout
+        // `prepare_decode_rejects_a_non_canonical_amount_determinant` above
+        // pins for `encoded[1]`.
+        let greeting_offset = 21;
+        // Sanity: the byte we are about to corrupt really is the greeting
+        // flag `sample_prepare()` encoded as `false` (0x00).
+        assert_eq!(encoded[greeting_offset], 0x00);
+        encoded[greeting_offset] = 0x02;
+        assert!(matches!(
+            Prepare::decode(&encoded),
+            Err(PacketError::InvalidType)
+        ));
     }
 
     /// Issue #546 tightens canonicality in the shared `oer.rs` primitives

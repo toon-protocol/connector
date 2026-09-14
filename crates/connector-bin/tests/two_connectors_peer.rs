@@ -696,10 +696,10 @@ fn peer_journal(state_dir: &std::path::Path) -> String {
 /// test that used a zero amount here would be asserting the fee check, not
 /// the peering.
 fn peer_bound_prepare(destination: &str, body: &'static [u8], payee: &PublicKeyBytes) -> Prepare {
-    let (data, shared_secret) = sealed_prepare_data(body, payee);
+    let (data, _shared_secret) = sealed_prepare_data(body, payee);
     Prepare {
         amount: 10 * PEER_FEE,
-        ..sample_prepare(destination, data, &shared_secret)
+        ..sample_prepare(destination, data)
     }
 }
 
@@ -839,8 +839,8 @@ async fn a_claim_that_fails_p2_or_p3_reaches_no_peer_handling_over_http() {
     let client = reqwest::Client::new();
 
     for (case, claim) in fixture.refused_claims() {
-        let (data, shared) = sealed_prepare_data(case.as_bytes(), &payee_identity);
-        let prepare = sample_prepare(APP_PREFIX, data, &shared);
+        let (data, _shared) = sealed_prepare_data(case.as_bytes(), &payee_identity);
+        let prepare = sample_prepare(APP_PREFIX, data);
         let (status, _body, ack) =
             post_peer_request(&client, &payee.client_edge_addr, claim.as_deref(), &prepare).await;
         assert!(
@@ -876,8 +876,8 @@ async fn a_claim_that_fails_p2_or_p3_reaches_no_peer_handling_over_btp() {
     let payee_identity = identity_from_key_seed(PAYEE_SIGNER_SEED);
 
     for (case, claim) in fixture.refused_claims() {
-        let (data, shared) = sealed_prepare_data(case.as_bytes(), &payee_identity);
-        let prepare = sample_prepare(APP_PREFIX, data, &shared);
+        let (data, _shared) = sealed_prepare_data(case.as_bytes(), &payee_identity);
+        let prepare = sample_prepare(APP_PREFIX, data);
         let (_packet, ack) =
             send_peer_message(&payee.client_edge_addr, claim.as_deref(), &prepare).await;
         assert_eq!(
@@ -1232,10 +1232,10 @@ async fn a_client_may_not_declare_more_than_the_forwarded_route_charges() {
     );
 
     let payee_identity = identity_from_key_seed(PAYEE_SIGNER_SEED);
-    let (data, shared_secret) = sealed_prepare_data(b"over-carried", &payee_identity);
+    let (data, _shared_secret) = sealed_prepare_data(b"over-carried", &payee_identity);
     let over_carried = Prepare {
         amount: CLIENT_PRICE + 1,
-        ..sample_prepare(APP_PREFIX, data, &shared_secret)
+        ..sample_prepare(APP_PREFIX, data)
     };
 
     let response = reqwest::Client::new()
@@ -1333,8 +1333,8 @@ async fn a_peer_claim_is_acknowledged(carriage: Carriage) {
     let claim = fixture.claim(1);
 
     let ack_of = |body: &'static [u8], claim: &str| {
-        let (data, shared) = sealed_prepare_data(body, &payee_identity);
-        let prepare = sample_prepare(APP_PREFIX, data, &shared);
+        let (data, _shared) = sealed_prepare_data(body, &payee_identity);
+        let prepare = sample_prepare(APP_PREFIX, data);
         let claim = claim.to_string();
         let addr = payee.client_edge_addr.clone();
         let client = client.clone();

@@ -112,6 +112,19 @@ pub(crate) fn build_peer_transport(
         }
     }
 
+    // ADR 0070 decision 3: the one `socks_proxy` this node dials onion
+    // endpoints through, read here because here is where the carriages are
+    // built and here is the only place it is needed. It is handed to the
+    // thing that owns the *socket* on each carriage -- the HTTP client and
+    // the websocket dialer -- never to the transport, and each selects per
+    // endpoint by host. So a peering registered at runtime onto either of
+    // these same two transports (ADR 0058, `PeerRegistrar` below) dials
+    // through the proxy for free, with no second decision anywhere that
+    // could disagree with this one. Nothing else on this node is proxied:
+    // settlement RPC and the app's `handler_url` hold their own clients
+    // (decision 4).
+    let socks_proxy = config.socks_proxy();
+
     // Ask-only (`TungsteniteDialer::new`) rather than symmetric
     // (`::serving`): §2.3's inbound half of a *dialed* session needs a
     // `PeerCarriageState`, which needs the `Connector` this transport is
@@ -120,15 +133,15 @@ pub(crate) fn build_peer_transport(
     // no gate of issue #678 exercises -- the far side of a `wss://` peering
     // reaches this node on its own listener like everybody else.
     let mut btp = BtpPeerTransport::new(
-        Arc::new(TungsteniteDialer::new()),
+        Arc::new(TungsteniteDialer::new().through_socks_proxy(socks_proxy)),
         signer_address,
         Arc::clone(&clock),
     );
-    let mut http = HttpPeerTransport::new(
-        Arc::new(ReqwestPeerClient::default()),
-        signer_address,
-        clock,
-    );
+    let http_client = match socks_proxy {
+        Some(proxy) => ReqwestPeerClient::through_socks_proxy(proxy),
+        None => ReqwestPeerClient::default(),
+    };
+    let mut http = HttpPeerTransport::new(Arc::new(http_client), signer_address, clock);
     if let Some(public_key) = signer_solana_public_key {
         btp.set_solana_signer_public_key(public_key);
         http.set_solana_signer_public_key(public_key);
@@ -377,7 +390,7 @@ token_network = "0x00000000000000000000000000000000000000bb"
         Prepare {
             amount: 100,
             expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-            execution_condition: [0u8; 32],
+            greeting: false,
             destination: destination.to_string(),
             data: Vec::new(),
         }

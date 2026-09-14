@@ -77,8 +77,6 @@ export interface RouteGreeting {
 }
 
 const PAYMENT_REQUIRED_HEADER = 'payment-required';
-/** All-zero execution condition: this PREPARE is never meant to fulfill (see oer.ts). */
-const ZERO_CONDITION = Buffer.alloc(32);
 
 export interface EdgeClientOptions {
   /** Base URL of the Rust client edge, e.g. `http://connector-rust:4000`. Never advertised. */
@@ -153,7 +151,7 @@ export async function fetchGreeting(
   const prepare = encodePrepare({
     amount: 0,
     expiresAt: new Date(Date.now() + 30_000),
-    executionCondition: ZERO_CONDITION,
+    greeting: true,
     destination,
     data: Buffer.alloc(0),
   });

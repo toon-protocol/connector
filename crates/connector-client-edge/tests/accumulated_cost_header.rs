@@ -87,7 +87,7 @@ fn prepare(destination: &str) -> Prepare {
         // for its own carriage gets (RFC 0027; ADR 0057 as corrected).
         amount: 100,
         expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-        execution_condition: [9u8; 32],
+        greeting: false,
         destination: destination.to_string(),
         data: vec![0xff; 40],
     }

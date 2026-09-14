@@ -179,17 +179,19 @@ pub struct RuntimePeering {
 
 impl RuntimePeering {
     /// Which carriage this connector dials this peering on, decided
-    /// **solely** by the endpoint's scheme
-    /// (`peer-carriage-spec.md` §2.1) -- the same rule
-    /// `connector_config::PeerConfig::dial` applies to a config-file
-    /// peering, read from the same place rather than restated.
+    /// **solely** by the endpoint (`peer-carriage-spec.md` §2.1) -- the
+    /// same rule `connector_config::PeerConfig::dial` applies to a
+    /// config-file peering, read from the same place rather than restated.
+    /// That includes ADR 0070's host clause: a `.onion` endpoint decides
+    /// its carriage here exactly as it does in the config file, because
+    /// both ask `PeerCarriage::for_endpoint`.
     ///
     /// `None` for a peering with no endpoint, and for one whose endpoint
     /// names a scheme this node will not dial.
     #[must_use]
     pub fn dial(&self, allow_plaintext: bool) -> Option<PeerCarriage> {
         let url = self.endpoint_url()?;
-        PeerCarriage::from_scheme_allowing_plaintext(url.scheme(), allow_plaintext)
+        PeerCarriage::for_endpoint(&url, allow_plaintext)
     }
 
     /// This peering's endpoint as a parsed URL, or `None` when it has none

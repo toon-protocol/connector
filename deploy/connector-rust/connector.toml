@@ -61,6 +61,48 @@ state_dir = "/app/state"
 #
 # peer_expose = "btp"
 
+# ── Onion endpoints (ADR 0070) ───────────────────────────────────────────
+# The ONE SOCKS5 proxy this node dials `.onion`/`.anyone` endpoints through
+# -- also a root-level key, so it has the same constraint `peer_expose` above
+# does and for the same reason: it MUST be written up here, before the first
+# [section] header, because TOML cannot express a root-table key once a
+# table header has appeared earlier in the file.
+#
+# Set it only if this node peers with a node published at a hidden-service
+# address. Absent -- as this file leaves it, and as every deployed config in
+# this repository leaves it -- every dial goes direct.
+#
+# `socks5h://` and nothing else, and the `h` is not a preference: a
+# `socks5://` proxy resolves the hostname LOCALLY and dials the address it
+# gets back, and no local resolver resolves a hidden-service name. A node
+# that accepted one would come up clean and then fail every onion dial for a
+# reason nothing in its log explains, so it is refused at load, by name
+# (ConfigError::SocksProxyScheme). So is a value that names no host --
+# `socks5h://` alone, or a `socks5h:9050` that looks like a host:port and
+# is not one (ConfigError::SocksProxyNoHost).
+#
+# THERE IS NOTHING ELSE TO CONFIGURE. Which dials take the proxy is read off
+# each endpoint's own HOST: a host ending in `.onion` or `.anyone` goes
+# through it, everything else goes direct. There is no per-peer `proxy` key
+# and no all-outbound mode -- the address already carries the answer, and a
+# second place to state it is how a peering gets dialed the wrong way.
+#
+# It covers the ILP wire ONLY. Settlement RPC and a route's `handler_url`
+# below dial DIRECT, on purpose (ADR 0070 decision 4), so an onion endpoint
+# does not relieve this box of ordinary outbound network access. An onion
+# endpoint hides WHERE THIS NODE IS REACHABLE and nothing else: every claim
+# names an on-chain channel and address, and every operator write is signed
+# under a keyid.
+#
+# The daemon that generates the address runs as a SIDECAR, never inside this
+# binary, and two of its facts are yours rather than this file's -- its
+# terms-acceptance flag, and its HiddenServiceDir on a persisted volume
+# (unpersisted, this node's address changes on every restart and every
+# counterparty's config goes stale silently -- the same rule `state_dir`
+# above keeps). docs/operators/onion-endpoint-bringup.md is the runbook.
+#
+# socks_proxy = "socks5h://127.0.0.1:9050"
+
 # ── Signer ───────────────────────────────────────────────────────────────
 # Where this node's signing key material lives -- a location, never the
 # key itself (ADR 0012). key_file must contain either 32 raw bytes or 64
@@ -200,8 +242,12 @@ write_keys = ["REPLACE-WITH-A-64-HEX-CHARACTER-ED25519-PUBLIC-KEY-SEE-README-STE
 # # ILP-over-HTTP. Both are TLS-only -- a peering carries signed balance
 # # proofs -- so ws:// and http:// are refused at load unless this node
 # # sets `peer_allow_plaintext_endpoints = true`, which is a loopback and
-# # test switch and must never be set here. Omit `endpoint` entirely for a
-# # peering that dials IN to this node instead.
+# # test switch and must never be set here. The ONE exception needs no
+# # switch: at a host ending in `.onion` or `.anyone`, ws:// and http://
+# # select a carriage on their own, because a v3 onion address IS the key the
+# # circuit is authenticated to (ADR 0070; see `socks_proxy` up near
+# # `state_dir`). Omit `endpoint` entirely for a peering that dials IN to
+# # this node instead.
 # endpoint = "wss://store.example.net:443/ilp/btp"
 #
 # # `ceiling`/`flush_interval_ms` used to be set here -- retired along with

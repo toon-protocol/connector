@@ -6,9 +6,9 @@
 //!
 //! Every vector [`generate`] emits is checked, before being returned,
 //! against the same function that would validate it for real (`decode`,
-//! `open_request`/`open_response`, or `fulfillment_matches_condition`) --
-//! this module cannot silently commit a vector its own implementation would
-//! reject or fail to reproduce.
+//! `open_request`/`open_response`, or `derive_fulfillment`) -- this module
+//! cannot silently commit a vector its own implementation would reject or
+//! fail to reproduce.
 //!
 //! Fixtures (`identity_secret`, `ephemeral_secret`, ...) are literal,
 //! non-secret bytes chosen only so this crate compiles to the same output
@@ -24,8 +24,7 @@ use connector_btp::{
     CONTENT_TYPE_TEXT, FLUSH_REQUESTED_HEADER,
 };
 use connector_domain::{
-    derive_condition, fulfillment_matches_condition, EnvelopeError, EnvelopeRequest,
-    EnvelopeResponse, Fulfill, Prepare, Reject, RejectCode,
+    EnvelopeError, EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject, RejectCode,
 };
 use connector_peer_btp::{ack, claim_json, fields, AcceptedClaims, PeerClaimDomain};
 use connector_peer_http::headers::{
@@ -97,7 +96,24 @@ use serde::Serialize;
 /// which every peer frame already carried (ADR 0042) and which is strictly
 /// stronger than the string it replaces. A removal, which is what this number
 /// exists to announce.
-pub const SCHEMA_VERSION: u32 = 4;
+///
+/// **5** (issue #1269 / ADR 0069): `executionCondition` is deleted from
+/// `Prepare` and a `greeting` boolean takes its place -- `-31` bytes per
+/// packet per hop, since a `bool` where a 32-byte `UInt256` was is not
+/// merely a smaller field but the field's own semantics changing kind, from
+/// a cryptographic commitment to a stated flag. `PreparePacketFields.
+/// execution_condition_hex` is gone; `PreparePacketFields.greeting` takes
+/// its place, so `peer_prepare.prepare`/`prepare_no_claim`'s
+/// `btp_message_hex`/`http_body_hex` all changed bytes. The `fulfilment`
+/// section narrows to what still holds: `derive_fulfillment`'s own
+/// determinism, with no condition left to derive from a fulfilment or match
+/// one against -- `FulfilmentCase.condition_hex` and `.matches` are gone. A
+/// replaying SDK that still sends a 32-byte condition is sending a field no
+/// connector reads or checks; one still checking a returned fulfilment
+/// against a condition it minted should instead compare the fulfilment
+/// directly against `derive_fulfillment(shared_secret)`, which is what
+/// `connector send`'s own end-to-end check now does.
+pub const SCHEMA_VERSION: u32 = 5;
 
 fn seq_bytes<const N: usize>(start: u8) -> [u8; N] {
     let mut out = [0u8; N];
@@ -181,6 +197,14 @@ pub struct GiftwrapCase {
     pub response_wrap_hex: String,
 }
 
+/// Issue #1269 / ADR 0069 retired the execution condition from the wire, so
+/// this section is narrower than it once was: it pins only
+/// `derive_fulfillment`'s own determinism -- the one relation a downstream
+/// implementer still needs, since a termination derives its fulfilment from
+/// a request's shared secret (ADR 0019) and a sender checks a delivery end
+/// to end by comparing what comes back against that same derivation
+/// (`connector send`). There is no condition left to derive one from or to
+/// match against.
 #[derive(Debug, Serialize)]
 pub struct FulfilmentVectors {
     pub cases: Vec<FulfilmentCase>,
@@ -191,8 +215,6 @@ pub struct FulfilmentCase {
     pub name: &'static str,
     pub shared_secret_hex: String,
     pub fulfilment_hex: String,
-    pub condition_hex: String,
-    pub matches: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -530,34 +552,25 @@ fn generate_giftwrap_vectors() -> (GiftwrapVectors, [u8; 32]) {
 
 fn generate_fulfilment_vectors(giftwrap_shared_secret: [u8; 32]) -> FulfilmentVectors {
     let fulfilment = derive_fulfillment(&giftwrap_shared_secret);
-    let condition = derive_condition(&fulfilment);
-    assert!(
-        fulfillment_matches_condition(&condition, &fulfilment),
-        "a fulfilment must satisfy the condition derived from it"
-    );
 
     let other_secret = seq_bytes::<32>(0x81);
     let other_fulfilment = derive_fulfillment(&other_secret);
-    assert!(
-        !fulfillment_matches_condition(&condition, &other_fulfilment),
-        "a different secret's fulfilment must not satisfy this condition"
+    assert_ne!(
+        fulfilment, other_fulfilment,
+        "two different secrets must never derive the same fulfilment in this fixture"
     );
 
     FulfilmentVectors {
         cases: vec![
             FulfilmentCase {
-                name: "derived_fulfilment_satisfies_its_own_condition",
+                name: "derived_fulfilment_from_the_giftwrap_sections_secret",
                 shared_secret_hex: hex_of(&giftwrap_shared_secret),
                 fulfilment_hex: hex_of(&fulfilment),
-                condition_hex: hex_of(&condition),
-                matches: true,
             },
             FulfilmentCase {
-                name: "a_different_secrets_fulfilment_does_not_satisfy_this_condition",
+                name: "derived_fulfilment_from_a_different_secret",
                 shared_secret_hex: hex_of(&other_secret),
                 fulfilment_hex: hex_of(&other_fulfilment),
-                condition_hex: hex_of(&condition),
-                matches: false,
             },
         ],
     }
@@ -691,7 +704,7 @@ pub struct PeerClaimCase {
 pub struct PreparePacketFields {
     pub amount: u64,
     pub expires_at: String,
-    pub execution_condition_hex: String,
+    pub greeting: bool,
     pub destination: String,
     pub data_hex: String,
 }
@@ -828,7 +841,7 @@ fn prepare_fields(prepare: &Prepare) -> PreparePacketFields {
         expires_at: prepare
             .expires_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        execution_condition_hex: hex_of(&prepare.execution_condition),
+        greeting: prepare.greeting,
         destination: prepare.destination.clone(),
         data_hex: hex_of(&prepare.data),
     }
@@ -991,7 +1004,7 @@ fn generate_prepare_pair_cases(evm_claim: &PeerClaimCase) -> (PreparePairCase, P
     let prepare = Prepare {
         amount: 250_000,
         expires_at: "2030-01-01T00:01:00Z".parse().expect("fixed literal"),
-        execution_condition: seq_bytes::<32>(0xf1),
+        greeting: false,
         destination: "g.toon.store-box.settle".to_string(),
         data: b"vector-fixture-prepare-data".to_vec(),
     };
@@ -1471,7 +1484,7 @@ fn generate_forwarded_data_case(giftwrap: &GiftwrapVectors) -> PeerForwardedData
     let prepare = Prepare {
         amount: 250_000,
         expires_at: "2030-01-01T00:01:00Z".parse().expect("fixed literal"),
-        execution_condition: seq_bytes::<32>(0xfa),
+        greeting: false,
         destination: "g.toon.store-box.settle".to_string(),
         data: sealed.clone(),
     };

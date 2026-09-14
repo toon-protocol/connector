@@ -444,7 +444,7 @@ token_network_address = "{token_network}"
     // price, so a fulfilled response proves the claim's cumulative amount
     // advanced by exactly the price, never merely "some amount >= price."
     let (data, shared_secret) = sealed_prepare_data(b"paid write", &connector_identity);
-    let prepare = sample_prepare("g.example.app", data, &shared_secret);
+    let prepare = sample_prepare("g.example.app", data);
     let (claim, claim_signature) = evm_claim_json(
         &buyer_secret,
         &paid_channel.0,
@@ -537,9 +537,9 @@ token_network_address = "{token_network}"
     // AC4: an underpaid packet -- a fresh claim on a channel genuinely
     // funded with less than the route's price -- is refused, and the app
     // records nothing for it.
-    let (underpaid_data, underpaid_secret) =
+    let (underpaid_data, _underpaid_secret) =
         sealed_prepare_data(b"underpaid write attempt", &connector_identity);
-    let underpaid_prepare = sample_prepare("g.example.app", underpaid_data, &underpaid_secret);
+    let underpaid_prepare = sample_prepare("g.example.app", underpaid_data);
     let (underpaid_claim, _) = evm_claim_json(
         &underpaid_buyer_secret,
         &underpaid_channel.0,
@@ -672,8 +672,8 @@ price = {ROUTE_PRICE}
     assert_eq!(state.counterparty_deposited, 10 * ROUTE_PRICE);
 
     let client = reqwest::Client::new();
-    let (data, shared_secret) = sealed_prepare_data(b"unaffiliated write", &connector_identity);
-    let prepare = sample_prepare("g.example.app", data, &shared_secret);
+    let (data, _shared_secret) = sealed_prepare_data(b"unaffiliated write", &connector_identity);
+    let prepare = sample_prepare("g.example.app", data);
     let (claim, _signature) = evm_claim_json(
         &buyer_secret,
         &channel.0,
@@ -707,9 +707,9 @@ price = {ROUTE_PRICE}
     // changed where the counterparty comes from, not whether one is
     // required.
     let forger_secret = SecretKey::parse(&[38u8; 32]).expect("valid secret key");
-    let (forged_data, forged_shared) =
+    let (forged_data, _forged_shared) =
         sealed_prepare_data(b"forged write attempt", &connector_identity);
-    let forged_prepare = sample_prepare("g.example.app", forged_data, &forged_shared);
+    let forged_prepare = sample_prepare("g.example.app", forged_data);
     let (forged_claim, _) = evm_claim_json(
         &forger_secret,
         &channel.0,
@@ -974,9 +974,9 @@ price = {SOLANA_ROUTE_PRICE}
     let connector_identity = identity_from_key_seed(60);
 
     let client = reqwest::Client::new();
-    let (data, shared_secret) =
+    let (data, _shared_secret) =
         sealed_prepare_data(b"unaffiliated solana write", &connector_identity);
-    let prepare = sample_prepare("g.example.app", data, &shared_secret);
+    let prepare = sample_prepare("g.example.app", data);
 
     let channel_bytes = channel_pubkey.to_bytes();
     let genuine_nonce = 1u64;
@@ -1036,9 +1036,9 @@ price = {SOLANA_ROUTE_PRICE}
     // changed where the counterparty comes from, not whether one is
     // required.
     let forger = SolanaSdkKeypair::new();
-    let (forged_data, forged_shared) =
+    let (forged_data, _forged_shared) =
         sealed_prepare_data(b"forged solana write attempt", &connector_identity);
-    let forged_prepare = sample_prepare("g.example.app", forged_data, &forged_shared);
+    let forged_prepare = sample_prepare("g.example.app", forged_data);
     let forged_nonce = 2u64;
     let forged_amount = 2 * SOLANA_ROUTE_PRICE;
     // The REAL program id, deliberately: this claim must be refused because

@@ -1,0 +1,216 @@
+# =============================================================================
+# local/onion -- connector A, the node that DIALS an onion peer.
+#
+# LOCAL / DEV ONLY. `infra/linode-*` owns devnet; nothing here is deployed,
+# published or SSH'd anywhere, and every chain this file names is disposable.
+#
+# A terminates nothing. Its only route to the app is a `peer_id` forward across
+# the peering to B, and B is on a DIFFERENT docker network with no route to
+# this one -- so a packet that comes back FULFILLed can only have crossed the
+# circuit. That is the whole subject of this topology, and it is the reason the
+# networks are split rather than the reason they happen to be: ADR 0070's own
+# Consequences say a fulfilled packet proves nothing about the circuit, so a
+# SOCKS dial that silently fell back to a direct connection would go green.
+# Here there is nothing to fall back to.
+#
+# THE .anyone HOST BELOW IS A PLACEHOLDER (ADR 0070 decision 7). The daemon
+# generates the real address and the operator copies it into the dialing node's
+# peer `endpoint`; `local/keys.sh onion` does that copying and renders the
+# result into `local/.keys/onion/connector-a/connector.toml`, which is what
+# compose mounts. See `connector-b.toml`'s header for the whole of that
+# arrangement.
+#
+# `.anyone` rather than `.onion` because that is what the sidecar this topology
+# runs writes: `anon` renamed its hidden-service TLD, and `local/anon-image`
+# pins the release that did (issue #1284). The connector takes either spelling
+# -- one suffix rule, `is_onion_endpoint` -- so nothing below turns on which.
+# =============================================================================
+
+client_edge_addr = "0.0.0.0:3000"
+
+# Not optional here the way it is for a single node. This is where the peer
+# claim ledger and the outbound client ledger live, and a forwarding hop with
+# no durable ledger re-issues nonce 1 after every restart -- handing the payee
+# a claim it must refuse (issue #605).
+state_dir = "/app/state"
+
+# ── The one SOCKS5 proxy this node dials onion endpoints through ─────────────
+# ADR 0070 decision 3. `anon-a` is the sidecar on this node's network: a C
+# daemon with its own terms-acceptance flag, run in the relationship this
+# repository already has with `anvil` and `solana-test-validator` -- infra the
+# node talks to, never something it contains (decision 8).
+#
+# `socks5h`, and the `h` is not a preference: `socks5://` resolves the host
+# NAME locally before dialing and no resolver on this machine can resolve a
+# hidden-service one, so a node that started with one would come up clean and
+# then fail every onion dial for a reason nothing in its log explains.
+# `Config::load` refuses the other scheme by name.
+#
+# ONE key, and no per-peer twin. Which dials take it is read off each
+# endpoint's own host: `.onion` and `.anyone` go through here, everything else
+# goes direct
+# -- which is why `[settlement.evm] rpc_url` below needs no exemption written
+# anywhere and gets none.
+socks_proxy = "socks5h://anon-a:9050"
+
+# `peer_allow_plaintext_endpoints` is deliberately ABSENT, and its absence is
+# part of what this topology proves. Every plaintext URL below sits at a
+# hidden-service host, and ADR 0070 decision 2 permits the plaintext schemes
+# there independently of that switch -- a v3 onion address IS the ed25519 key the
+# circuit is authenticated to, which is a stronger binding than a CA-issued
+# certificate for a DNS name, so ADR 0004's requirement is satisfied by a
+# different mechanism rather than waived.
+#
+# One rule, asked in three places and never restated: the peering `endpoint`
+# below, the `[[pay_channels]]` row's `client_edge_url`, and the
+# self-description read a runtime peering would establish from. A node that
+# needed the opt-in to run over onion would be a node opening plaintext to
+# every peer in order to get it for one, which is exactly the deployment shape
+# that switch's own documentation refuses.
+
+[signer]
+key_file = "/app/data/signer.key"
+
+# ── The only path to the app ─────────────────────────────────────────────────
+# Nothing on this node terminates `g.local.onion.b`, and nothing on this
+# node's NETWORK could answer for it either.
+#
+# THE ARITHMETIC, WRITTEN OUT, BECAUSE NOTHING IN THE CODE CHECKS IT. ADR 0028:
+# this hop collects `price`, forwards `price - fee`, and so earns exactly
+# `fee`. That composes across a path only while every hop keeps
+#
+#     price - fee >= the next hop's price
+#
+# and no code anywhere enforces it -- a connector cannot know what the next hop
+# charges. Here:
+#
+#     A collects 1200, retains 200, forwards 1000
+#     B terminates at 1000, and 1200 - 200 == 1000 exactly, with no slack
+#
+# The figures deliberately differ from `two-hop`'s (1100/100/1000). A fee is
+# one peering relation's bilateral price for carriage, never a network-wide
+# constant, and equal figures across two topologies would let a config copied
+# from the other one pass unnoticed. `local_topologies_load.rs` holds these two
+# numbers, B's `price` and the rehearsal's `AMOUNT`/`PRICE`/`FEE` to one
+# arithmetic; no container can notice a price or a fee quietly dropped to zero.
+[[routes]]
+prefix = "g.local.onion.b"
+peer_id = "a-b"
+price = 1200
+
+# ── The peering ──────────────────────────────────────────────────────────────
+# `endpoint` selects the carriage by SCHEME and nothing else (§2.1): `ws://` is
+# BTP here exactly as it is at `ws://connector-b:3000/ilp/btp` on
+# `mixed-chain`. THE HOST IS THE ONLY THING THAT CHANGED, which is ADR 0070's
+# entire claim -- no `PeerCarriage` variant was added, `peer_expose` is
+# untouched, and this row would be indistinguishable from a clearnet one if the
+# host were a DNS name.
+#
+# BTP rather than ILP-over-HTTP, and the choice is the point of running this
+# topology at all. The HTTP carriage asks its client for a proxy; the websocket
+# library the BTP carriage speaks has no proxy support whatever, so its onion
+# path establishes a SOCKS5 stream itself and hands the already-established
+# stream to the websocket client (issue #1277). That is the larger of the two
+# carriage changes and the one with the most to get wrong against a real
+# daemon, and it is what a fake SOCKS5 server on loopback can least stand in
+# for. `two-hop` still proves the HTTP carriage's priced termination and
+# `mixed-chain` still carries a packet over BTP on a LAN.
+#
+# NO TIMEOUT OVERRIDES, deliberately. A circuit adds seconds to a round trip,
+# not tens of seconds, and `peer_answer_timeout_ms` and `claim_ack_timeout_ms`
+# both default to 30s while `connector send`'s PREPARE expires in 300 -- so the
+# latency an onion peering costs fits inside the budgets a clearnet one is
+# given. Writing a wider one here would say a circuit needs different terms,
+# which is a claim this topology is not in a position to make.
+#
+# `fee` is what this node retains for carrying ONE packet over this peering
+# (ADR 0010, ADR 0061) -- flat, per packet, never a share of the amount. It is
+# the 200 in the arithmetic above.
+[[peers]]
+id = "a-b"
+endpoint = "ws://placeholderplaceholderplaceholderplaceholderplaceholderb.anyone/ilp/btp"
+fee = 200
+
+# P2 (§1.2): the channel this relation's claims are judged against, and the
+# EIP-712 domain they are signed under (ADR 0024).
+#
+# `counterparty_key` is B's SETTLEMENT address, never its `[signer]` identity:
+# a peer claim is redeemed against the channel participant this node is on
+# chain. `channel_id` is a real channel on the local anvil, opened and funded by
+# `local/keys.sh`, which also refuses to proceed if the chain does not produce
+# exactly this id.
+[[peer_channels]]
+peer_id = "a-b"
+channel_id = "0x339280164c007798a2c4ba9e7752d542dccd586866c53937f41f29702cbae801"
+counterparty_key = "0x71bE63f3384f5fb98995898A86B02Fb2426c5788"
+chain_id = 31337
+token_network = "0xCafac3dD18aC6c6e92c921884f9E4176737C052c"
+
+# ── Paying for the crossing, BEFORE it crosses (ADR 0042 item 2) ─────────────
+# `[[pay_channels]]` makes this node cover a forwarded PREPARE with a
+# client-role claim before it is sent. It is REQUIRED since issue #1145 -- a
+# peering a `[[routes]]` entry forwards to with no row here is refused at load
+# by name -- and it is what lets B price the route it terminates.
+#
+# `client_edge_url` IS AN ONION URL, AND THAT IS THE SECOND DIAL THIS TOPOLOGY
+# EXERCISES. The row asks B, over `POST /ilp/claim-state`, where this node's
+# claims stand on every covered packet (issue #1102): the receiver is the only
+# authority on its own watermark, and nothing local substitutes. So a peering
+# whose far side is reachable only over a circuit is not payable unless that
+# ask goes the same way -- which is why `claim_state_client` applies ADR 0070
+# decision 3's host rule here too, at the one ILP-wire dial that is not a
+# carriage. A packet would otherwise be refused for want of a covering claim
+# long before the carriage was asked to carry it.
+#
+# It is written out rather than derived from the peering's `endpoint` for the
+# usual reason (ADR 0030): this peering is `ws://…/ilp/btp` and this is
+# `http://…/ilp`, and turning one into the other by swapping scheme and path is
+# exactly the class of guess that record refuses. It happens to be the same
+# onion HOST, because it is the same listener behind the same
+# `HiddenServicePort` -- one onion service, both surfaces.
+#
+# ONE CHANNEL, TWO ROLES, WITH ONE HOP: this row names the same `channel_id`
+# the `[[peer_channels]]` row above does, which `Config::load` permits and
+# `pay_channel.rs` calls "the deployed shape" -- the peer role for what
+# arrives, the client role for what this node sends.
+[[pay_channels]]
+peer_id = "a-b"
+channel_id = "0x339280164c007798a2c4ba9e7752d542dccd586866c53937f41f29702cbae801"
+chain_id = 31337
+token_network = "0xCafac3dD18aC6c6e92c921884f9E4176737C052c"
+client_edge_url = "http://placeholderplaceholderplaceholderplaceholderplaceholderb.anyone/ilp"
+
+# ── Operator surface (ADR 0008) ──────────────────────────────────────────────
+# Only this node has one, because only this node is sent to: `connector send`
+# originates the rehearsal's packet through `POST /packets` here, from a
+# container on this node's own network. The packet's PAYLOAD is sealed to B
+# (ADR 0018), which the sender reaches over the circuit with its own
+# `--socks-proxy` -- the operator write and the seal-to fetch are two dials
+# judged independently by host (ADR 0070 decision 5).
+[operator]
+bearer_token_file = "/app/data/operator-bearer-token"
+write_keys_file = "/app/data/operator-write-keys"
+
+# ── Settlement: EVM only ─────────────────────────────────────────────────────
+# DIRECT, and named here rather than exempted: `rpc_url` is not a
+# hidden-service host, so the host-selected rule sends it to the direct client
+# without any key saying so (ADR 0070 decision 4). Routing settlement through
+# a circuit is a separate decision with its own evidence to gather.
+#
+# `contract_address` is the TokenNetworkRegistry, NOT a TokenNetwork:
+# `EvmSettlementBackend::connect` resolves `getTokenNetwork(token_address)`
+# through the registry and refuses to start if that comes back zero (#576).
+#
+# The `[settlement.evm]` key is also this node's peer-claim signing key
+# (ADR 0030 -- "no second key is introduced"), because the channel's on-chain
+# participant IS this node's settlement address. That is why the address it
+# derives to appears in B's `counterparty_key` above, and why `local/keys.sh`
+# derives it deterministically rather than generating it.
+[settlement.evm]
+rpc_url = "http://anvil:8545"
+contract_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+token_address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+decimals = 6
+
+[settlement.evm.key]
+key_file = "/app/data/settlement.key"

@@ -1,0 +1,196 @@
+# =============================================================================
+# local/anyone -- a connector reachable ONLY at a `.anyone` hidden service, and
+# the toon CLIENT paying it over that circuit.
+#
+# Merged ON TOP of the repository-root docker-compose.yml so the chain is the
+# SAME anvil `make anvil-up` brings up:
+#
+#   docker compose -f docker-compose.yml -f local/anyone/compose.yml \
+#     --profile evm --profile anyone up -d
+#
+# `run.sh` does exactly that, in the two phases this topology needs (the address
+# does not exist until the daemon has run once).
+#
+# ── How this differs from local/onion ────────────────────────────────────────
+#
+# `local/onion` proves a PEERING between two connectors. This proves the CLIENT
+# EDGE against the `toon-client` payer: the real payer, a different
+# repository's library rather than `connector send`, discovering and paying
+# this node over a circuit.
+#
+# Both run the SAME daemon, `local/anon-image` (anon v0.4.10.2, TLD `.anyone`).
+# They pinned different ones while issue #1284 was open -- upstream renamed the
+# TLD and this repository was on the older side of the rename -- and that is
+# closed: the connector accepts both spellings and both topologies run the
+# current daemon. See README.md.
+#
+# ── Why there are two networks ───────────────────────────────────────────────
+#
+# ADR 0070's Consequences are explicit that a fulfilled packet proves nothing
+# about the circuit: a SOCKS dial that silently fell back to a direct connection
+# would go green. So a direct dial has to be STRUCTURALLY IMPOSSIBLE, not merely
+# unobserved:
+#
+#   * `connector`, `stub-app` and `anon-b` sit on `anyone-app`; the payer and
+#     its `anon-a` sidecar sit on `anyone-payer`.
+#   * Containers on different user-defined bridges do not route to each other,
+#     and docker's embedded DNS is PER NETWORK -- so the payer cannot resolve
+#     the name `connector` either. Both were verified from inside
+#     `anyone-payer`: the dial times out and the name does not resolve.
+#   * `anvil` joins BOTH, because the payer opens its channel on the same chain
+#     the connector settles on. A container on two bridges is not a router: it
+#     forwards nothing between them.
+#   * Neither network is `internal`, and that is required rather than an
+#     oversight -- the daemons have to reach the real Anyone network. What is
+#     isolated here is the two networks from EACH OTHER.
+#   * `connector` publishes NO host port. Its only door is the circuit.
+# =============================================================================
+
+services:
+  # ── The payer's way onto the network ───────────────────────────────────────
+  # A SOCKS5 proxy and nothing else. This is what `socksProxy` names.
+  anon-a:
+    build:
+      context: ./local/anon-image
+    image: anon-live:v0.4.10.2
+    profiles: [anyone]
+    init: true
+    volumes:
+      # PATHS ARE RELATIVE TO THE REPOSITORY ROOT, not to this file: compose
+      # resolves relative bind mounts against the PROJECT directory, which is
+      # the directory of the FIRST `-f` file -- always ./docker-compose.yml.
+      - ./local/anyone/anonrc-a:/etc/anon/anonrc:ro
+      # A named volume rather than a bind mount, for the same reason /app/state
+      # is one: the image ships this path owned by its own unprivileged user,
+      # and a fresh named volume inherits that ownership.
+      - anyone-a-anon:/var/lib/anon
+    networks: [anyone-payer]
+    ports:
+      # Loopback only. Lets a payer running on the HOST use this proxy too,
+      # which is the shape `docs/hidden-service.md` documents. It is not a route
+      # to the connector: nothing but the daemon can resolve a `.anyone` name.
+      - '127.0.0.1:9050:9050'
+    restart: unless-stopped
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    healthcheck:
+      # A container that is Up is not a container with a circuit. 100% is the
+      # first moment a SOCKS request can be answered.
+      test: ['CMD-SHELL', "grep -q 'Bootstrapped 100%' /var/lib/anon/notice.log"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  # ── The connector's address ────────────────────────────────────────────────
+  anon-b:
+    build:
+      context: ./local/anon-image
+    image: anon-live:v0.4.10.2
+    profiles: [anyone]
+    init: true
+    volumes:
+      - ./local/anyone/anonrc-b:/etc/anon/anonrc:ro
+      - anyone-b-anon:/var/lib/anon
+    networks: [anyone-app]
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      # Both halves. The hostname file appears at key generation, seconds in and
+      # long before the descriptor is published; `Bootstrapped 100%` is what says
+      # the daemon can actually publish it.
+      test:
+        - 'CMD-SHELL'
+        - "test -s /var/lib/anon/hidden_service/hostname && grep -q 'Bootstrapped 100%' /var/lib/anon/notice.log"
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  # ── The payment-oblivious app, behind the connector ────────────────────────
+  stub-app:
+    image: ${ANYONE_CONNECTOR_IMAGE:-ghcr.io/toon-protocol/connector:rust-2026.08.28.1}
+    profiles: [anyone]
+    entrypoint: ['/usr/local/bin/stub-app']
+    # 0.0.0.0, not the default loopback, or no other container can reach it.
+    command: ['0.0.0.0:3100']
+    expose: ['3100']
+    networks: [anyone-app]
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ── The node under test ────────────────────────────────────────────────────
+  connector:
+    # A RELEASED image by default, not `connector-rust:local`. `main` is ahead
+    # of what toon-client has vendored -- `pnpm vectors:check` in that repo
+    # reports the drift, and a packet built against the older vectors is refused
+    # with `invalid packet type byte`, which looks like a transport fault and is
+    # not one. Override with ANYONE_CONNECTOR_IMAGE to test a build of main.
+    image: ${ANYONE_CONNECTOR_IMAGE:-ghcr.io/toon-protocol/connector:rust-2026.08.28.1}
+    profiles: [anyone]
+    command: ['/app/config/connector.toml']
+    volumes:
+      # THE RENDERED CONFIG, not the committed one: `run.sh` writes it into this
+      # node's own key directory with the daemon's real address substituted.
+      - ./local/.keys/anyone/connector/connector.toml:/app/config/connector.toml:ro
+      - ./local/.keys/anyone/connector:/app/data:ro
+      # A NAMED volume: the image creates /app/state owned by uid 10001, so a
+      # fresh named volume inherits that ownership. A host bind mount arrives
+      # root-owned and the connector refuses to start.
+      - anyone-state:/app/state
+    networks:
+      anyone-app:
+        # FIXED, because anon-b's HiddenServicePort names this address and
+        # resolves it when it PARSES its config -- long before this container
+        # exists. See anonrc-b.
+        ipv4_address: 172.30.0.10
+    # NO `ports`. The claim this topology makes is that the circuit is the only
+    # way in, and a published port is not one.
+    depends_on:
+      anvil:
+        condition: service_healthy
+      stub-app:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      # 127.0.0.1, NOT localhost: `client_edge_addr = "0.0.0.0:3000"` binds IPv4
+      # only, while `localhost` resolves `::1` first -- so busybox wget gets
+      # "Connection refused" from a healthy connector.
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:3000/ilp/identity || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── The chain both sides use ───────────────────────────────────────────────
+  # Declared again only to attach it to both networks and to move its host port.
+  # Everything else -- image, uid, the contract deploy, the health gate -- comes
+  # from the repository-root docker-compose.yml this file is merged onto.
+  anvil:
+    ports: !override
+      # 18545, not 8545. The payer reaches this from the HOST, and 8545 is the
+      # port every other local stack on a developer's machine already holds.
+      # Nothing inside the compose network cares: peers reach it as anvil:8545.
+      - '127.0.0.1:18545:8545'
+    networks: [anyone-app, anyone-payer]
+
+networks:
+  anyone-app:
+    ipam:
+      config:
+        # Pinned so anonrc-b's HiddenServicePort can name an address in it.
+        - subnet: 172.30.0.0/16
+  anyone-payer:
+
+volumes:
+  anyone-state:
+  anyone-a-anon:
+  # Holds `hidden_service/hostname` and the private key behind the address.
+  # Neither is ever committed: `tools/ci/check-tracked-secrets.sh` would refuse
+  # the key, and a fixed key in a public repository is an address anyone could
+  # impersonate.
+  anyone-b-anon:

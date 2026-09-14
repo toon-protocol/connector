@@ -108,7 +108,7 @@ use std::process::{Child, Command, Stdio};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use connector_config::{Config, SettlementConfig, TransportPolicy};
-use connector_domain::{agreed_required_transport, derive_condition, EnvelopeRequest, Prepare};
+use connector_domain::{agreed_required_transport, EnvelopeRequest, Prepare};
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
 use connector_settlement_evm::EvmSettlementBackend;
 
@@ -627,7 +627,7 @@ fn unpaid_prepare(destination: &str) -> Prepare {
     Prepare {
         amount: 0,
         expires_at: Utc::now() + ChronoDuration::minutes(5),
-        execution_condition: derive_condition(&[0u8; 32]),
+        greeting: false,
         destination: destination.to_string(),
         data: EnvelopeRequest {
             method: "POST".to_string(),

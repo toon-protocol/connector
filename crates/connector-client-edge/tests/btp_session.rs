@@ -16,9 +16,7 @@ use connector_client_edge::{
     ClientChannelRegistry, ClientClaimGate, DepositFloor, EvmChannel, SESSION_LEASE_BACKSTOP_TTL,
 };
 use connector_config::{StaticRoute, TransportPolicy};
-use connector_domain::{
-    derive_condition, EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject,
-};
+use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject};
 use connector_runtime::{
     AppOutcome, Connector, FakeAppClient, InMemoryJournal, InProcessPeerTransport, TestClock,
 };
@@ -235,9 +233,9 @@ fn test_clock() -> Arc<TestClock> {
     ))
 }
 
-/// A PREPARE whose `data` is sealed to `receiver_public` (ADR 0018) and
-/// whose condition matches the fulfilment that seal derives (ADR 0019) --
-/// a packet the termination genuinely fulfils.
+/// A PREPARE whose `data` is sealed to `receiver_public` (ADR 0018) -- a
+/// packet the termination genuinely fulfils, deriving its fulfilment from
+/// this same sealed secret (ADR 0019).
 fn sealed_prepare(destination: &str, receiver_public: &PublicKeyBytes) -> Prepare {
     sealed_prepare_with_target(destination, "/", receiver_public)
 }
@@ -258,14 +256,12 @@ fn sealed_prepare_with_target(
         body: b"hello app over btp".to_vec(),
     }
     .encode();
-    let (data, shared_secret) =
+    let (data, _shared_secret) =
         connector_signer::giftwrap::seal_request(&envelope, receiver_public).expect("seal");
     Prepare {
         amount: PRICE,
         expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-        execution_condition: derive_condition(&connector_signer::giftwrap::derive_fulfillment(
-            &shared_secret,
-        )),
+        greeting: false,
         destination: destination.to_string(),
         data,
     }
@@ -871,11 +867,10 @@ async fn a_prepare_over_http_addressed_to_a_bound_btp_session_is_delivered_and_f
     // dynamic session address like this is unpriced today (issue #736's
     // charging AC: only a *configured* route is ever priced).
     let fulfillment = [42u8; 32];
-    let condition = derive_condition(&fulfillment);
     let prepare = Prepare {
         amount: 0,
         expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-        execution_condition: condition,
+        greeting: false,
         destination: "g.toon.provider".to_string(),
         data: Vec::new(),
     };
@@ -901,13 +896,12 @@ async fn a_prepare_over_http_addressed_to_a_bound_btp_session_is_delivered_and_f
     // The provider's own socket receives the forwarded PREPARE as a
     // server-originated MESSAGE (issue #697's symmetric grammar) and
     // answers it exactly as it would answer any other PREPARE: a FULFILL
-    // whose fulfilment matches the buyer's own execution condition.
+    // that rides straight home, unchecked (issue #1269 / ADR 0069).
     let forwarded = next_answer(&mut provider).await;
     assert_eq!(forwarded.frame_type, BTP_MESSAGE);
     let forwarded_prepare =
         Prepare::decode(&forwarded.ilp_packet).expect("the connector forwards a real PREPARE");
     assert_eq!(forwarded_prepare.destination, "g.toon.provider");
-    assert_eq!(forwarded_prepare.execution_condition, condition);
 
     send(
         &mut provider,
@@ -950,11 +944,10 @@ async fn a_prepare_over_btp_addressed_to_a_bound_btp_session_is_delivered_and_fu
 
     let mut buyer = connect(addr).await;
     let fulfillment = [43u8; 32];
-    let condition = derive_condition(&fulfillment);
     let prepare = Prepare {
         amount: 0,
         expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-        execution_condition: condition,
+        greeting: false,
         destination: "g.toon.other-provider".to_string(),
         data: Vec::new(),
     };
@@ -994,7 +987,7 @@ async fn a_prepare_to_a_never_bound_destination_still_answers_f02_over_btp() {
     let prepare = Prepare {
         amount: 0,
         expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-        execution_condition: derive_condition(&[1u8; 32]),
+        greeting: false,
         destination: "g.toon.nobody-ever-bound-this".to_string(),
         data: Vec::new(),
     };

@@ -23,6 +23,13 @@ issue #1084 owns the burn-down order.
 condition is refused before any route is selected, any fee taken, or any app touched. There is no
 zero-condition path anywhere in this protocol.
 
+> **Retired by [ADR 0069](../adr/0069-the-execution-condition-leaves-the-wire.md) (issue #1269).**
+> The execution condition is gone from the wire entirely, not merely unchecked: `Prepare` has no
+> such field, so there is nothing left for this rule to refuse the absence of. The bootstrap-probe
+> case this rule's "zero condition" also caught (issue #807) is now the packet's own explicit
+> `greeting` flag, checked at the client edge before routing — never at `reject_ineligible`, which
+> now checks only expiry (PF-02).
+
 **PF-02** `[connector]` — A packet whose expiry has already passed MUST be refused before routing.
 
 > **Amended by [ADR 0064](../adr/0064-a-deadline-bounds-the-wait-for-an-app-not-the-answer.md)

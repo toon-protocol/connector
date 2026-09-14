@@ -28,3 +28,9 @@ devbox.lock
 # whole. `crates/connector-bin/tests/vendored_rfcs_are_unmodified.rs` catches it
 # if this rule is ever lost (it already caught prettier once).
 docs/rfcs
+
+# The toon client's own store, written by `local/anyone/run.sh` inside a
+# container and owned by that container's uid. Gitignored already
+# (local/anyone/.gitignore), but prettier walks the working tree rather than
+# the index and exits non-zero on a file it cannot read.
+local/*/.store

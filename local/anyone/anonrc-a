@@ -1,0 +1,39 @@
+##================= /etc/anon/anonrc -- local/anyone, A's side ===============##
+#
+# The PAYER's way onto the network: a SOCKS5 proxy and nothing else. This opens
+# no ORPort and publishes no service. It is what the toon client's `socksProxy`
+# / `TOON_SOCKS` names, and the only route it has to the connector.
+#
+# Mounted READ-ONLY at /etc/anon/anonrc.
+
+# WITHOUT THIS THE DAEMON DOES NOT START. `anon` refuses to run until its terms
+# are accepted and, in a non-interactive container, FAILS FAST rather than
+# prompting: "User has not agreed to the terms and conditions. Exiting." It is
+# the most common reason a first bring-up leaves a container that exited
+# immediately beside a connector that looks healthy and is unreachable.
+AgreeToTerms 1
+
+User anond
+DataDirectory /var/lib/anon
+
+# EXPLICIT, and it cannot be dropped: the image's entrypoint appends a
+# `Nickname` when it finds none, and this file is mounted read-only, so a
+# missing one is a write failure at boot rather than a default.
+Nickname toonlocalanyoneA
+
+ClientOnly 1
+ORPort 0
+DirPort 0
+ControlSocket 0
+
+# Bound to 0.0.0.0 so the payer's container can reach it; the network it sits on
+# holds nothing else, and the policy below is the belt to that braces.
+SocksPort 0.0.0.0:9050
+SocksPolicy accept 10.0.0.0/8
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy accept 192.168.0.0/16
+SocksPolicy accept 127.0.0.0/8
+SocksPolicy reject *
+
+Log notice stdout
+Log notice file /var/lib/anon/notice.log

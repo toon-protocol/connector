@@ -35,21 +35,19 @@
 //! interval between this check and the send itself -- with `T01`
 //! (`RejectCode::t01_peer_unreachable`), never `F02`.
 //!
-//! **Charging.** Unchanged: both ingresses (`lib.rs`'s `POST /ilp`,
-//! `btp.rs`'s BTP carriage) already compute the `charge` from
-//! `Connector::app_route` -- since ADR 0065 by evaluating that route's price
-//! schedule at this packet's own payload length -- and admit any claim
-//! against it before routing is attempted at all. A destination this arm ever
-//! delivers through has, by construction, no matching app route -- one that
-//! did would already have answered non-`F02` above and never reached here --
-//! so the `charge` is `0` on every real deployment today, and a `T01` this arm answers keeps nothing,
-//! exactly like `Connector::deliver_to_app`'s own `AppOutcome::Unreachable`.
+//! **Charging.** A destination this arm ever delivers through has, by
+//! construction, no matching app route -- one that did would already have
+//! answered non-`F02` above and never reached here -- so nothing here is
+//! ever priced, and a `T01` this arm answers keeps nothing, exactly like
+//! `Connector::deliver_to_app`'s own `AppOutcome::Unreachable`. Before issue
+//! #1269 this module also priced a mismatched fulfilment the same way a
+//! terminated app route's own would (issue #736's charging AC); that check
+//! is retired along with the execution condition it verified against.
 
 use connector_btp::{BtpFrame, BTP_RESPONSE};
-use connector_domain::{
-    fulfillment_matches_condition, Fulfill, PacketResponse, Prepare, Reject, RejectCode,
-};
+use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 use connector_runtime::{ClaimAckOutcome, ClientRouteKind};
+use sha2::{Digest, Sha256};
 
 use crate::btp::payout_claim_protocol_data;
 use crate::ClientEdgeState;
@@ -57,19 +55,17 @@ use crate::ClientEdgeState;
 /// Route `prepare` through `state`: a configured route (app/peer/leased)
 /// first, and -- only if that answers `F02` -- whatever client session
 /// [`crate::session_registry::SessionRegistry`] currently has bound to its
-/// destination. `charge` is the same figure both ingresses already computed
-/// from `Connector::app_route` before admitting any claim -- that route's
-/// price schedule at this packet's own payload length (ADR 0065) -- and it is
-/// only consulted here to price a mismatched fulfilment the same way a
-/// terminated app route's own would be (issue #736's charging AC).
+/// destination.
 ///
-/// **Issue #770.** A genuine fulfilment from a client session means that
-/// client has just earned `prepare`'s own amount: this connector credits
-/// its payout ledger and hands it a fresh signed claim over the same
-/// session, so `credited` (and therefore `available`, `client-edge-spec.md`
-/// §1.10) actually rises instead of staying a figure only a unit test ever
-/// produces. See [`credit_session_earnings`] for both steps and why each is
-/// best-effort past the point the packet's own answer is already decided.
+/// **Issue #770.** A FULFILL from a client session means that client has
+/// just earned `prepare`'s own amount: this connector credits its payout
+/// ledger and hands it a fresh signed claim over the same session, so
+/// `credited` (and therefore `available`, `client-edge-spec.md` §1.10)
+/// actually rises instead of staying a figure only a unit test ever
+/// produces. See [`credit_session_earnings`] for both steps, for the job
+/// identity that keeps a retry from being credited twice, and for why each
+/// step is best-effort past the point the packet's own answer is already
+/// decided.
 ///
 /// `client_channel_id` is the channel a covering claim admitted this
 /// request on (issue #535, ADR 0036) -- `None` for an unclaimed request to
@@ -80,7 +76,6 @@ use crate::ClientEdgeState;
 pub(crate) async fn route_prepare(
     state: &ClientEdgeState,
     prepare: Prepare,
-    charge: u64,
     client_channel_id: Option<&str>,
 ) -> PacketResponse {
     let now = crate::now_unix();
@@ -110,9 +105,20 @@ pub(crate) async fn route_prepare(
     }
 
     let destination = prepare.destination.clone();
-    let condition = prepare.execution_condition;
     let amount = prepare.amount;
     let encoded = prepare.encode();
+    // The payout dedupe key (issue #770 AC3): a hash of the exact PREPARE
+    // bytes this connector is about to hand the session, taken *before* the
+    // session ever answers. That order is the whole property -- a session's
+    // own FULFILL rides home unchecked since ADR 0069, so anything read from
+    // it is payee-forgeable and cannot identify "the same job" against a
+    // retry. `job_id` is fixed by what THIS connector asked for, exactly the
+    // role the sender-minted execution condition played before it left the
+    // wire: a genuine retransmission of one job re-sends byte-identical
+    // `data` (ADR 0018's sealed wrap fixes its own ciphertext at encryption
+    // time), so it hashes to the same `job_id`; a different job's freshly
+    // sealed `data` does not.
+    let job_id: [u8; 32] = Sha256::digest(&encoded).into();
     let response = state
         .connector
         .handle_prepare_with_client_channel(prepare, client_channel_id)
@@ -128,20 +134,12 @@ pub(crate) async fn route_prepare(
         .deliver(&destination, Some(lease.generation), &[], &encoded, now)
         .await
     {
-        Ok(frame) => session_answer(frame, &condition, charge),
+        Ok(frame) => session_answer(frame),
         Err(reject) => return PacketResponse::Reject(reject),
     };
 
     if matches!(response, PacketResponse::Fulfill(_)) {
-        credit_session_earnings(
-            state,
-            &destination,
-            lease.generation,
-            &condition,
-            amount,
-            now,
-        )
-        .await;
+        credit_session_earnings(state, &destination, lease.generation, &job_id, amount, now).await;
     }
 
     response
@@ -166,31 +164,43 @@ pub(crate) async fn route_prepare(
 ///    channel id an earlier inbound claim on this same session taught this
 ///    gate (issue #787), then credits `amount` through
 ///    [`crate::claim_gate::ClientClaimGate::credit_payout`], deduped
-///    against `condition` (AC3) so a duplicate or retransmitted fulfilment
-///    of the same job cannot double-credit -- resolving the channel's
-///    payout domain on demand first if this is a self-opened channel this
+///    against `job_id` (AC3) so a duplicate or retransmitted fulfilment of
+///    the same job cannot double-credit -- resolving the channel's payout
+///    domain on demand first if this is a self-opened channel this
 ///    connector has not seen before (issue #780). A node with no payout
 ///    ledger configured, or a destination with no known channel yet, does
 ///    nothing here.
+///
+///    `job_id` is a hash of the PREPARE this connector sent the session
+///    ([`route_prepare`]'s own doc), never anything read from the session's
+///    answer: before issue #1269 the dedupe key was the packet's own
+///    execution condition, sender-minted and fixed independently of what a
+///    session answered; since ADR 0069 made a session's FULFILL ride home
+///    unchecked, keying on anything the session supplies (its `fulfillment`,
+///    say) would let a dishonest session answer a retried job with fresh
+///    bytes each time and collect a fresh credit on every retry. `job_id`
+///    keeps the property the execution condition used to buy for free: the
+///    identity of "the same job" is decided by what was asked, not by what
+///    was answered.
 /// 2. [`deliver_pending_claim`] flushes whatever `pending_claim` currently
 ///    owes this channel -- called unconditionally, whether or not step 1
 ///    itself produced a fresh claim (issue #779). A deduped retry (the same
-///    execution condition as an earlier delivery) still reaches this line,
-///    and a claim is cumulative (ADR 0024), so the latest pending one
-///    already carries forward anything an earlier delivery on this channel
-///    failed to hand off -- this is how a payout claim whose delivery
-///    failed gets resent rather than stranded forever.
+///    `job_id` as an earlier delivery) still reaches this line, and a
+///    claim is cumulative (ADR 0024), so the latest pending one already
+///    carries forward anything an earlier delivery on this channel failed
+///    to hand off -- this is how a payout claim whose delivery failed gets
+///    resent rather than stranded forever.
 async fn credit_session_earnings(
     state: &ClientEdgeState,
     destination: &str,
     generation: u64,
-    condition: &[u8; 32],
+    job_id: &[u8; 32],
     amount: u64,
     now: u64,
 ) {
     let _ = state
         .claim_gate
-        .credit_session_payout(destination, condition, amount, chrono::Utc::now())
+        .credit_session_payout(destination, job_id, amount, chrono::Utc::now())
         .await;
     deliver_pending_claim(state, destination, Some(generation), now).await;
 }
@@ -270,42 +280,23 @@ fn is_unreachable(response: &PacketResponse) -> bool {
 
 /// Turn a session's own RESPONSE frame into this hop's [`PacketResponse`]:
 /// its `ilp_packet` is a FULFILL or a REJECT, the same as any answer to a
-/// PREPARE this connector originated would be. A candidate FULFILL is
-/// checked against the sender's own execution condition before being
-/// trusted -- the same check `Connector::forward_via_peer_route` runs on a
-/// peer's relayed fulfilment -- since the session on the other end is
-/// exactly as untrusted as a peer is. A REJECT the session raised itself
-/// rides home unchanged. Content this carriage cannot decode as either is
-/// treated as unreachable (`T01`), the same as no answer at all.
-fn session_answer(frame: BtpFrame, condition: &[u8; 32], charge: u64) -> PacketResponse {
+/// PREPARE this connector originated would be. A candidate FULFILL rides
+/// home unchecked (issue #1269 / ADR 0069) -- the same as
+/// `Connector::forward_via_peer_route` now trusts a peer's relayed
+/// fulfilment outright, since a client session is exactly as untrusted as a
+/// peer is and checking it here protected nothing this connector owns: the
+/// sender's own end-to-end check (`connector send` against its own
+/// `derive_fulfillment`) is what a forged fulfilment actually meets. A
+/// REJECT the session raised itself rides home unchanged. Content this
+/// carriage cannot decode as either is treated as unreachable (`T01`), the
+/// same as no answer at all.
+fn session_answer(frame: BtpFrame) -> PacketResponse {
     if let Ok(fulfill) = Fulfill::decode(&frame.ilp_packet) {
-        return accept_if_fulfilled(condition, fulfill, charge);
+        return PacketResponse::Fulfill(fulfill);
     }
     match Reject::decode(&frame.ilp_packet) {
         Ok(reject) => PacketResponse::Reject(reject),
         Err(_) => PacketResponse::Reject(undecodable_session_answer()),
-    }
-}
-
-/// As `Connector::accept_if_fulfilled` (`connector-runtime`, private to that
-/// crate): a candidate FULFILL is trusted only once its fulfilment is
-/// checked against the sender's own execution condition, never on the
-/// remote session's say-so alone.
-fn accept_if_fulfilled(
-    condition: &[u8; 32],
-    candidate: Fulfill,
-    charge_on_reject: u64,
-) -> PacketResponse {
-    if fulfillment_matches_condition(condition, &candidate.fulfillment) {
-        PacketResponse::Fulfill(candidate)
-    } else {
-        PacketResponse::Reject(Reject {
-            code: RejectCode::f99_application_error(),
-            triggered_by: String::new(),
-            message: "fulfillment does not match execution condition".to_string(),
-            data: Vec::new(),
-            accumulated_cost: charge_on_reject,
-        })
     }
 }
 
@@ -355,7 +346,6 @@ mod tests {
         PAYOUT_CLAIM_PROTOCOL,
     };
     use connector_config::StaticRoute;
-    use connector_domain::derive_condition;
     use connector_runtime::{
         ChannelDomain, Connector, FakeAppClient, InMemoryJournal, InProcessPeerTransport, TestClock,
     };
@@ -428,11 +418,11 @@ mod tests {
         ))
     }
 
-    fn sample_prepare(destination: &str, condition: [u8; 32]) -> Prepare {
+    fn sample_prepare(destination: &str) -> Prepare {
         Prepare {
             amount: 0,
             expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-            execution_condition: condition,
+            greeting: false,
             destination: destination.to_string(),
             data: Vec::new(),
         }
@@ -483,9 +473,9 @@ mod tests {
     #[tokio::test]
     async fn a_destination_with_no_session_and_no_route_answers_the_ordinary_f02() {
         let state = test_state(empty_connector(), SessionRegistry::new());
-        let prepare = sample_prepare("g.nowhere", derive_condition(&FULFILLMENT));
+        let prepare = sample_prepare("g.nowhere");
 
-        let response = route_prepare(&state, prepare, 0, None).await;
+        let response = route_prepare(&state, prepare, None).await;
 
         let PacketResponse::Reject(reject) = response else {
             panic!("expected a reject");
@@ -504,8 +494,7 @@ mod tests {
         registry.bind("g.provider.one", handle, crate::now_unix());
         let state = test_state(empty_connector(), registry);
 
-        let condition = derive_condition(&FULFILLMENT);
-        let prepare = sample_prepare("g.provider.one", condition);
+        let prepare = sample_prepare("g.provider.one");
 
         let peer = tokio::spawn(async move {
             answer_next_message(
@@ -520,32 +509,38 @@ mod tests {
             .await;
         });
 
-        let response = route_prepare(&state, prepare, 0, None).await;
+        let response = route_prepare(&state, prepare, None).await;
         peer.await.expect("the peer task");
 
         assert!(
             matches!(response, PacketResponse::Fulfill(fulfill) if fulfill.fulfillment == FULFILLMENT),
-            "a live session's own fulfilment is trusted once it matches the condition"
+            "a live session's own fulfilment rides home"
         );
     }
 
+    /// Issue #1269 / ADR 0069: a client session's FULFILL rides home
+    /// unchecked, exactly like a peer's now does
+    /// (`connector-runtime`'s `a_peers_fulfillment_rides_home_unchecked`) --
+    /// a session is exactly as untrusted as a peer, and verifying its
+    /// fulfilment against the packet's execution condition used to be the
+    /// one thing standing between this hop and trusting its word outright,
+    /// while protecting nothing this hop was paid to check.
     #[tokio::test]
-    async fn a_fulfilment_that_does_not_match_the_condition_is_rejected_and_priced() {
+    async fn a_sessions_fulfillment_rides_home_unchecked() {
         let registry = SessionRegistry::new();
         let (handle, mut reply_rx, outbound) = test_handle();
         registry.bind("g.provider.two", handle, crate::now_unix());
         let state = test_state(empty_connector(), registry);
 
-        let condition = derive_condition(&FULFILLMENT);
-        let prepare = sample_prepare("g.provider.two", condition);
-        let wrong_fulfillment = [9u8; 32];
+        let prepare = sample_prepare("g.provider.two");
+        let bogus_fulfillment = [9u8; 32];
 
         let peer = tokio::spawn(async move {
             answer_next_message(
                 &mut reply_rx,
                 &outbound,
                 Fulfill {
-                    fulfillment: wrong_fulfillment,
+                    fulfillment: bogus_fulfillment,
                     data: Vec::new(),
                 }
                 .encode(),
@@ -553,16 +548,12 @@ mod tests {
             .await;
         });
 
-        let response = route_prepare(&state, prepare, 42, None).await;
+        let response = route_prepare(&state, prepare, None).await;
         peer.await.expect("the peer task");
 
-        let PacketResponse::Reject(reject) = response else {
-            panic!("expected a reject");
-        };
-        assert_eq!(reject.code, RejectCode::f99_application_error());
-        assert_eq!(
-            reject.accumulated_cost, 42,
-            "the session was genuinely reached, so this hop's price is still charged"
+        assert!(
+            matches!(response, PacketResponse::Fulfill(fulfill) if fulfill.fulfillment == bogus_fulfillment),
+            "whatever the session answers with rides home, unchecked"
         );
     }
 
@@ -572,8 +563,8 @@ mod tests {
         registry.bind("g.provider.three", dead_handle(), crate::now_unix());
         let state = test_state(empty_connector(), registry);
 
-        let prepare = sample_prepare("g.provider.three", derive_condition(&FULFILLMENT));
-        let response = route_prepare(&state, prepare, 0, None).await;
+        let prepare = sample_prepare("g.provider.three");
+        let response = route_prepare(&state, prepare, None).await;
 
         let PacketResponse::Reject(reject) = response else {
             panic!("expected a reject");
@@ -607,13 +598,12 @@ mod tests {
         registry.bind("g.provider.silent", handle, crate::now_unix());
         let state = test_state(empty_connector(), registry);
 
-        let condition = derive_condition(&FULFILLMENT);
-        let prepare = sample_prepare("g.provider.silent", condition);
+        let prepare = sample_prepare("g.provider.silent");
 
         // Deliberately no peer task: nothing ever answers the forwarded
         // MESSAGE, the exact shape of a client that is bound but has gone
         // quiet (asleep, network-partitioned, or simply slow).
-        let response = route_prepare(&state, prepare, 0, None).await;
+        let response = route_prepare(&state, prepare, None).await;
 
         assert!(
             reply_rx.try_recv().is_ok(),
@@ -693,18 +683,15 @@ mod tests {
             body: b"hello".to_vec(),
         }
         .encode();
-        let (data, shared_secret) =
+        let (data, _shared_secret) =
             connector_signer::giftwrap::seal_request(&envelope, &signer.public_key().unwrap())
                 .expect("seal");
-        let condition = derive_condition(&connector_signer::giftwrap::derive_fulfillment(
-            &shared_secret,
-        ));
         let prepare = Prepare {
             data,
-            ..sample_prepare("g.example.app", condition)
+            ..sample_prepare("g.example.app")
         };
 
-        let response = route_prepare(&state, prepare, 0, None).await;
+        let response = route_prepare(&state, prepare, None).await;
 
         let PacketResponse::Reject(reject) = response else {
             panic!("expected a reject, not a fulfilment the connector has no right to derive");
@@ -760,10 +747,9 @@ mod tests {
         registry.bind("g.example.peer", handle, crate::now_unix());
         let state = test_state(connector, registry);
 
-        let condition = derive_condition(&FULFILLMENT);
-        let prepare = sample_prepare("g.example.peer", condition);
+        let prepare = sample_prepare("g.example.peer");
 
-        let response = route_prepare(&state, prepare, 0, None).await;
+        let response = route_prepare(&state, prepare, None).await;
 
         // `InProcessPeerTransport` with no peer named "peer-a" registered
         // answers `T01` naming that peer -- which is what makes this
@@ -800,8 +786,7 @@ mod tests {
         registry.bind("g.provider.four", new_handle, crate::now_unix());
 
         let state = test_state(empty_connector(), registry);
-        let condition = derive_condition(&FULFILLMENT);
-        let prepare = sample_prepare("g.provider.four", condition);
+        let prepare = sample_prepare("g.provider.four");
 
         let peer = tokio::spawn(async move {
             answer_next_message(
@@ -816,7 +801,7 @@ mod tests {
             .await;
         });
 
-        let response = route_prepare(&state, prepare, 0, None).await;
+        let response = route_prepare(&state, prepare, None).await;
         peer.await.expect("the peer task");
 
         assert!(matches!(response, PacketResponse::Fulfill(_)));
@@ -874,10 +859,9 @@ mod tests {
         registry.bind(address, handle, crate::now_unix());
         let state = test_state_with_gate(empty_connector(), registry, gate);
 
-        let condition = derive_condition(&FULFILLMENT);
         let prepare = Prepare {
             amount: 42_000,
-            ..sample_prepare(address, condition)
+            ..sample_prepare(address)
         };
 
         let expected_channel_id = channel_id.clone();
@@ -938,7 +922,7 @@ mod tests {
             });
         });
 
-        let response = route_prepare(&state, prepare, 0, None).await;
+        let response = route_prepare(&state, prepare, None).await;
         peer.await.expect("the peer task");
 
         assert!(
@@ -986,8 +970,6 @@ mod tests {
         registry.bind(address, handle, crate::now_unix());
         let state = test_state_with_gate(empty_connector(), registry, gate);
 
-        let condition = derive_condition(&FULFILLMENT);
-
         // The session answers whatever it is sent -- a MESSAGE with a
         // genuine FULFILL, a TRANSFER with an empty ack -- exactly as a
         // real client's BTP session would for a job it has already done
@@ -1017,15 +999,15 @@ mod tests {
 
         let first = Prepare {
             amount: 5_000,
-            ..sample_prepare(address, condition)
+            ..sample_prepare(address)
         };
-        let response_first = route_prepare(&state, first, 0, None).await;
+        let response_first = route_prepare(&state, first, None).await;
 
         let retry = Prepare {
             amount: 5_000,
-            ..sample_prepare(address, condition)
+            ..sample_prepare(address)
         };
-        let response_retry = route_prepare(&state, retry, 0, None).await;
+        let response_retry = route_prepare(&state, retry, None).await;
 
         peer.await.expect("the peer task");
 
@@ -1038,6 +1020,92 @@ mod tests {
             ledger.credited(&channel_id),
             5_000,
             "a retried delivery of the same job must not raise credited a second time"
+        );
+    }
+
+    /// Issue #1269 / ADR 0069's own regression: the dedupe key used to be
+    /// the packet's own execution condition, fixed by the sender and outside
+    /// the session's control. Since a session's FULFILL now rides home
+    /// unchecked, keying on anything the session supplies would let a
+    /// dishonest session defeat the dedupe outright by answering the same
+    /// retried job with a *different* fulfilment each time. This test is
+    /// exactly that attack: the session answers the same job twice with two
+    /// different fulfilments, and `credited` must still rise only once.
+    #[tokio::test]
+    async fn a_session_answering_the_same_job_with_a_different_fulfilment_each_time_is_still_deduped(
+    ) {
+        let address = "g.provider.dishonest";
+        let channel_id = format!("0x{:064x}", 12);
+        let payout_signer = Arc::new(LocalSigner::generate("payout-key"));
+        let domain = ChannelDomain {
+            chain_id: 84_532,
+            token_network_address: [0x66; 20],
+        };
+        let mut ledger = ClientPayoutLedger::new();
+        ledger.set_signer(payout_signer);
+        ledger
+            .set_channel_domain(channel_id.clone(), domain)
+            .expect("valid channel id");
+        let ledger = Arc::new(ledger);
+
+        let gate = ClientClaimGate::restore(Default::default(), Arc::new(InMemoryJournal::new()))
+            .expect("a fresh in-memory journal has nothing to replay")
+            .with_payout_ledger(Arc::clone(&ledger));
+        gate.record_session_channel(address, channel_id.clone());
+
+        let registry = SessionRegistry::new();
+        let (handle, mut reply_rx, outbound) = test_handle();
+        registry.bind(address, handle, crate::now_unix());
+        let state = test_state_with_gate(empty_connector(), registry, gate);
+
+        // Two distinct, arbitrary fulfilments -- neither derived from
+        // anything about the job -- standing in for a session that answers
+        // however it likes since nothing checks it any more.
+        let peer = tokio::spawn(async move {
+            for fulfillment in [[0xaa_u8; 32], [0xbb_u8; 32], [0xcc_u8; 32]] {
+                let sent = reply_rx.recv().await.expect("a frame was written");
+                let decoded = decode_frame(&sent).expect("the connector's own encoder");
+                let ilp_packet = if decoded.frame_type == BTP_TRANSFER {
+                    Vec::new()
+                } else {
+                    Fulfill {
+                        fulfillment,
+                        data: Vec::new(),
+                    }
+                    .encode()
+                };
+                outbound.resolve(BtpFrame {
+                    frame_type: BTP_RESPONSE,
+                    request_id: decoded.request_id,
+                    amount: None,
+                    protocol_data: Vec::new(),
+                    ilp_packet,
+                });
+            }
+        });
+
+        let first = Prepare {
+            amount: 5_000,
+            ..sample_prepare(address)
+        };
+        let response_first = route_prepare(&state, first, None).await;
+
+        let retry = Prepare {
+            amount: 5_000,
+            ..sample_prepare(address)
+        };
+        let response_retry = route_prepare(&state, retry, None).await;
+
+        peer.await.expect("the peer task");
+
+        assert!(matches!(response_first, PacketResponse::Fulfill(_)));
+        assert!(matches!(response_retry, PacketResponse::Fulfill(_)));
+        assert_eq!(
+            ledger.credited(&channel_id),
+            5_000,
+            "a dishonest session answering the same job with a different fulfilment each time \
+             must not be able to collect a fresh credit per answer -- the dedupe key is the job \
+             this connector asked for, never anything the session supplies"
         );
     }
 
@@ -1101,10 +1169,9 @@ mod tests {
         session_registry.bind(address, handle, crate::now_unix());
         let state = test_state_with_gate(empty_connector(), session_registry, gate);
 
-        let condition = derive_condition(&FULFILLMENT);
         let prepare = Prepare {
             amount: 7_000,
-            ..sample_prepare(address, condition)
+            ..sample_prepare(address)
         };
 
         let expected_channel_id = channel_id.clone();
@@ -1162,7 +1229,7 @@ mod tests {
             });
         });
 
-        let response = route_prepare(&state, prepare, 0, None).await;
+        let response = route_prepare(&state, prepare, None).await;
         peer.await.expect("the peer task");
 
         assert!(
@@ -1210,10 +1277,9 @@ mod tests {
         session_registry.bind(address, handle, crate::now_unix());
         let state = test_state_with_gate(empty_connector(), session_registry, gate);
 
-        let condition = derive_condition(&FULFILLMENT);
         let prepare = Prepare {
             amount: 3_000,
-            ..sample_prepare(address, condition)
+            ..sample_prepare(address)
         };
 
         let peer = tokio::spawn(async move {
@@ -1230,7 +1296,7 @@ mod tests {
             reply_rx
         });
 
-        let response = route_prepare(&state, prepare, 0, None).await;
+        let response = route_prepare(&state, prepare, None).await;
         // `route_prepare` only returns once `credit_session_earnings` (and
         // therefore any payout TRANSFER it would send) has already been
         // awaited to completion -- so if nothing was queued by now, nothing
@@ -1285,10 +1351,9 @@ mod tests {
         registry.bind(address, handle, crate::now_unix());
         let state = test_state_with_gate(empty_connector(), registry, gate);
 
-        let condition = derive_condition(&FULFILLMENT);
         let prepare = Prepare {
             amount: 3_000,
-            ..sample_prepare(address, condition)
+            ..sample_prepare(address)
         };
 
         let peer = tokio::spawn(async move {
@@ -1305,7 +1370,7 @@ mod tests {
             reply_rx
         });
 
-        let response = route_prepare(&state, prepare, 0, None).await;
+        let response = route_prepare(&state, prepare, None).await;
         // As `a_channel_that_does_not_resolve_on_chain_is_not_credited`:
         // `route_prepare` only returns once crediting has already been
         // awaited to completion.
@@ -1362,10 +1427,9 @@ mod tests {
         registry.bind(address, handle, crate::now_unix());
         let state = test_state_with_gate(empty_connector(), registry, gate);
 
-        let condition = derive_condition(&FULFILLMENT);
         let first = Prepare {
             amount: 5_000,
-            ..sample_prepare(address, condition)
+            ..sample_prepare(address)
         };
 
         // Answer the FULFILL MESSAGE, then drop the reply channel before
@@ -1385,7 +1449,7 @@ mod tests {
             drop(reply_rx);
         });
 
-        let response_first = route_prepare(&state, first, 0, None).await;
+        let response_first = route_prepare(&state, first, None).await;
         peer.await.expect("the peer task");
 
         assert!(matches!(response_first, PacketResponse::Fulfill(_)));
@@ -1409,7 +1473,7 @@ mod tests {
 
         let retry = Prepare {
             amount: 5_000,
-            ..sample_prepare(address, condition)
+            ..sample_prepare(address)
         };
         let expected_channel_id = channel_id.clone();
         let peer2 = tokio::spawn(async move {
@@ -1449,7 +1513,7 @@ mod tests {
             reply_rx2
         });
 
-        let response_retry = route_prepare(&state, retry, 0, None).await;
+        let response_retry = route_prepare(&state, retry, None).await;
         let mut reply_rx2 = peer2.await.expect("the peer task");
 
         assert!(

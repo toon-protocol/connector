@@ -1,0 +1,342 @@
+# =============================================================================
+# local/dealing -- connector B. THE DENOMINATION BOUNDARY.
+#
+# LOCAL / DEV ONLY. `infra/linode-*` owns devnet; nothing here is deployed,
+# published or SSH'd anywhere, and every chain this file names is disposable.
+#
+# This is the file the topology exists for, and it is the FIRST COMMITTED
+# CONFIG IN THIS REPOSITORY THAT DEALS. B accepts a peering whose channel holds
+# 6-decimal mock USDC on anvil and dials one whose channel holds a 9-decimal
+# mock SPL token on the local validator. Those are two different tokens, so
+# every forward across this node is a CONVERSION (ADR 0071 decision 1): the
+# outgoing amount is `floor(amount * rate) - fee`, the rate is one this file
+# declares, and the fee is subtracted in the OUTGOING leg's unit.
+#
+# WHAT IS DIFFERENT FROM `local/mixed-chain`, WHICH IS THE SAME SHAPE. That
+# topology's B also holds a backend on each of two chains and also forwards
+# between them -- and it is NOT a conversion, because it declares no
+# `[[tokens]]` and ADR 0071 decision 2's absence rule then leaves the ordinary
+# `amount_after_fee` path in place: the arriving integer, minus a flat fee,
+# forwarded onto a channel that happens to be elsewhere. Both legs there hold
+# 6-decimal USDC, so nothing is wrong with that; here the legs are a thousand
+# times apart in scale before any market price is asked about, and forwarding
+# the arriving integer would be wrong by exactly that factor. The whole of the
+# difference between the two directories is the `[[tokens]]`, `[[rates]]` and
+# `[rate_guards]` blocks below.
+#
+# WHAT IS THE SAME: the wire. No packet, header, claim or vector gained an
+# asset field (decision 7). A claim is denominated by the channel it is written
+# against and always was, so the covering claim this node mints for C is an
+# ordinary Solana claim for an ordinary integer -- 4350000 of them -- and the
+# claim A minted for this node is an ordinary EIP-712 balance proof for 1100.
+# Neither says what it is 1100 or 4350000 OF, because neither reader has ever
+# needed telling.
+# =============================================================================
+
+client_edge_addr = "0.0.0.0:3000"
+
+# Two claim ledgers' worth of watermarks -- the EVM peering's inbound and the
+# Solana peering's outbound -- in one journal, keyed by channel. They do not
+# merge: an EVM `channel_id` is `0x` + 64 hex and a Solana `channel_account` is
+# base58, drawn from disjoint spellings, so no name either chain produces can
+# collide with the other's (`Connector::recognizes_solana_channel`).
+state_dir = "/app/state"
+
+# Both axes, because this node is on both ends of a peering: it ACCEPTS from A
+# (`peer_expose`) and DIALS C (`peer_allow_plaintext_endpoints`, since C is a
+# plain container port with no TLS terminator). Expose and dial are separate
+# settings with separate spellings (peer-carriage-spec.md §2.1).
+#
+# `"http"` on both, and that is this topology declining to prove something
+# twice: `local/mixed-chain` is where a shipped image carries a packet over
+# BTP, and a second mixed-carriage stack would add a second place for that one
+# fact to drift rather than a second fact. What is unproven anywhere else is
+# what is below the `[[tokens]]` block.
+peer_expose = "http"
+peer_allow_plaintext_endpoints = true
+
+[signer]
+key_file = "/app/data/signer.key"
+
+# ── Onward to C ──────────────────────────────────────────────────────────────
+# B terminates nothing. `g.local.dealing.b.c` is C's subtree under B's own, so
+# the destination `g.local.dealing.b.c.app` matches here and is forwarded,
+# while A's table matched the shorter `g.local.dealing.b` and forwarded to
+# here.
+#
+# `price` IS IN THE UNIT OF THE LEG IT IS CHARGED ON, which is the incoming
+# one: 1100 µUSDC is what this node charges the packet that arrives from A, and
+# it is exactly what A forwards (1200 less A's own fee of 100). The `fee` on
+# the `b-c` row below is in the OTHER unit, because a fee attaches to the
+# peering it buys carriage over (ADR 0061) and that peering settles in the
+# 9-decimal mock. Two numbers on one hop, in two units, and nothing on the wire
+# says so -- each is in the unit of the leg it sits on, which is the only unit
+# either could be in.
+[[routes]]
+prefix = "g.local.dealing.b.c"
+peer_id = "b-c"
+price = 1100
+
+# ── The EVM peering: A dials in ──────────────────────────────────────────────
+# No `endpoint`: A dials us, which on ILP-over-HTTP makes this node the payee
+# of the peering (peer-semantics-pre-868.md §6.4).
+#
+# `forwarded_claim_enforcement` IS LEFT AT ITS DEFAULT (`observe`) HERE, and
+# that is a decision rather than an omission. `local/mixed-chain`'s `a-b` row
+# is where ADR 0042 item 3's enforcing path is exercised against a running
+# image, and it stays the only one: this topology's subject is the boundary,
+# and turning the setting on here would give one fact two homes to drift
+# between without proving anything new. What rules out a crossing carried for
+# free here is the rehearsal reading C's journal for the CONVERTED figure,
+# which is a stronger check than admission -- a claim can be present and still
+# be for the wrong number.
+[[peers]]
+id = "a-b"
+
+
+# ── The Solana peering: we dial C ────────────────────────────────────────────
+# `max_packet_amount` IS WRITTEN OUT HERE, AND IT HAS TO BE. The cap defaults
+# to 1000000 (ADR 0042, `connector_config::DEFAULT_MAX_PACKET_AMOUNT`), which
+# is 1 USDC at 6 decimals -- and the cap is checked against the amount actually
+# going out, POST-conversion, because it is configured against the outgoing
+# peering and has always been denominated in the outgoing leg's unit. One
+# packet on this path forwards 4350000 base units of a 9-decimal token, which
+# is 0.00435 of one token and four times the default cap, so a node that left
+# this line out would refuse every crossing `T04` naming a ceiling in a unit
+# nobody meant. That is ADR 0071's "an 18-decimal leg has a real ceiling"
+# consequence, met at 9 decimals instead: 1000000000 here is one whole token,
+# the same thing the default means one chain over.
+#
+# `fee = 6000` is in the same unit, for ADR 0061's own reason as amended by ADR
+# 0071 decision 1: a fee is what carrying one packet OVER THIS PEERING costs,
+# and this peering's amounts are 9-decimal ones. It is not 100 scaled -- a fee
+# is bilateral configuration, not a conversion of another peering's fee, and
+# the two hops on this path charge deliberately unrelated figures.
+[[peers]]
+id = "b-c"
+endpoint = "http://connector-c:3000/ilp"
+fee = 6000
+max_packet_amount = 1000000000
+
+
+# The EVM row: A's claims, judged against the anvil channel A opened, under the
+# EIP-712 domain that channel's `TokenNetwork` verifies (ADR 0024).
+# `counterparty_key` is A's EVM SETTLEMENT address -- the channel's on-chain
+# participant -- never the signer address the claim declares about itself
+# (CF-23).
+[[peer_channels]]
+peer_id = "a-b"
+channel_id = "0xaabd147bc75ca72e8deaca1d7994716b6a29cb0ee4e3237ee629b440475e59fc"
+counterparty_key = "0x08135Da0A343E492FA2d4282F2AE34c6c5CC1BbE"
+chain_id = 31337
+token_network = "0xCafac3dD18aC6c6e92c921884f9E4176737C052c"
+
+# The Solana row, and the other side of the boundary. A different SHAPE, not a
+# different spelling: `channel_account` is a program-derived address rather
+# than an EVM-style `channel_id`, there is no `chain_id` because Solana has no
+# numeric chain id, and there is no `token_network` because the channel account
+# IS the whole of a Solana claim's signed message. No `program_id` either: ADR
+# 0053 binds the settlement program into the signed message, so the program a
+# peer claim is verified under is `[settlement.solana] program_id` and nothing
+# else (issue #1128), and writing the key here is refused by name.
+#
+# `channel_account` is `find_program_address(["channel", min, max, mint])` for
+# these two participants under this program -- AND THE MINT IS THE 9-DECIMAL
+# ONE, so this address is not the one the same two keys would derive on the
+# mock USDC mint. `local/keys.sh` recomputes it from the topology's own mint
+# and refuses to provision if this line disagrees.
+[[peer_channels]]
+peer_id = "b-c"
+channel_account = "AiCAdi9xJ5XhJQ3sRkeCYzbWozd7dbS3gwZ9rneJWk8W"
+counterparty_key = "Bg98QFdWCV1fk89UyNFZnHePt7PnjUNh5f8DYbTx4Lzn"
+
+# ── Paying C for the crossing, BEFORE it crosses (ADR 0042 item 2) ───────────
+# Required for this node's reason as much as for the rule's: a peering a
+# `[[routes]]` entry forwards to with no row here is refused at load
+# (`ConfigError::PayChannelUnbound`, issue #1145).
+#
+# THE CLAIM THIS ROW MINTS IS FOR THE CONVERTED FIGURE, and that is ADR 0071
+# decision 1's one sentence about claims: `cover_forward` is handed whatever
+# the forward decided to send, so it signs for 4350000 on the Solana channel
+# rather than for the 1100 that arrived. Nothing in `cover_forward`, in
+# `OutboundClientLedger` or on the claim wire had to change for that, because a
+# claim was already denominated by channel identity alone.
+#
+# IT NAMES THE SAME CHANNEL AS THE `[[peer_channels]]` ROW ABOVE, and on Solana
+# that is required rather than conventional
+# (`ConfigError::PayChannelSolanaWithoutPeerChannel`): `programId` is a
+# REQUIRED field of the Solana claim wire, and both peer carriages render it
+# from that peering's Solana peer row.
+#
+# `client_edge_url` is C's `POST /ilp`, where this node asks where its claims
+# stand on every covered packet (issue #1102). C answers out of its PEER book,
+# because it holds this channel as a `[[peer_channels]]` row.
+[[pay_channels]]
+peer_id = "b-c"
+channel_account = "AiCAdi9xJ5XhJQ3sRkeCYzbWozd7dbS3gwZ9rneJWk8W"
+client_edge_url = "http://connector-c:3000/ilp"
+
+# ── The operator surface, and the two jobs it has here ───────────────────────
+# C has none, deliberately (CF-31): an absent table means the surface is not
+# started at all rather than started unauthenticated. This node has one because
+# it is the ONLY way the Solana channel above gets opened -- `POST /channels`
+# is the only submitter of an `InitializeChannel` in this repository, and
+# `POST /channels/:id/fund` the only submitter of a `Deposit` credited to the
+# depositing signer (issue #1118). `local/keys.sh dealing solana-channels`
+# makes both writes once this node is serving.
+#
+# Its second job is new with ADR 0071 and is a READ: `GET /rates` reports every
+# ordered pair this node deals, live or stale, out of the very table the
+# forwarding path converts against (issue #1297). Nothing in the rehearsal
+# needs it -- the claim journal is the money assertion -- but on a node that
+# deals it is the page an operator looks at first.
+[operator]
+bearer_token_file = "/app/data/operator-bearer-token"
+write_keys_file = "/app/data/operator-write-keys"
+
+# ── What this node deals (ADR 0071 decision 3) ───────────────────────────────
+# One row per token this node holds a channel in, and every `[[peers]]` row
+# resolves to one of them: a peering's token is the `token_address` of the
+# `[settlement.<chain>]` table its channels settle through (issue #1292), so
+# `a-b` holds the EVM row below and `b-c` the Solana one. A peering that
+# resolved to a token no row declares is refused at boot by name
+# (`ConfigError::PeeringTokenNotDeclared`) -- there is no way to deal in a
+# token this file has not named.
+#
+# EXACTLY ONE ROW IS THE NUMERAIRE, and mixing them is refused at boot. The
+# mock USDC is it, which is the ordinary choice: a numeraire is the stable
+# thing every quote is taken against, and this path's only other token is the
+# one being priced.
+#
+# Neither row carries a `quote`. A quote names AMM pools on the token's own
+# settlement chain and is read by TWAP (decision 3); there is no AMM on either
+# of these disposable chains and no Solana-side `RateSource` exists yet, so
+# this pair runs the STATIC ROW below -- the arm decision 3 provides for
+# exactly this case, "a pair that cannot self-source runs a static rate row the
+# operator tends by hand".
+[[tokens]]
+asset = "evm:0x5FbDB2315678afecb367f032d93F642f64180aa3"
+numeraire = true
+
+[[tokens]]
+asset = "solana:5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX"
+
+# ── The rate, and the whole of the arithmetic ────────────────────────────────
+# ORDERED, never sorted. This row prices `evm USDC -> solana mock` and says
+# nothing about the other direction; direction is the trade, and the spread
+# makes the two directions different prices from one mid. The REJECT path needs
+# no second row: a reject crossing back converts the same pair's rate the other
+# way, `ceil((cost + fee) / rate)`, which is the exact inverse of the forward
+# (decision 7) and is read from this one declaration.
+#
+# 4000/1 is a MID over BASE UNITS, and it folds two independent things into one
+# ratio, which is decision 4's whole trick:
+#
+#   * the SCALE. 10^6 base units of a 6-decimal token against 10^9 of a
+#     9-decimal one is a factor of 1000 before any price at all.
+#   * the PRICE. This mock token is worth a quarter of a USDC here, which is
+#     another factor of 4.
+#
+# 1000 * 4 = 4000, and there is nowhere in the connector where those two are
+# separable again -- deliberately. "A rate derived from `decimals()`" was
+# considered and rejected: scale is not price, and `[settlement] decimals`
+# stays a boot-time assertion against the chain rather than an input to value
+# arithmetic. Both halves live in the number an operator wrote down.
+#
+# The row declares no guard overrides, so the pair runs on `[rate_guards]`
+# below. A static row NEVER GOES STALE -- `ttl` governs an observation, and an
+# operator's declaration is not one -- which is why this topology can be
+# rehearsed an hour after it was brought up.
+[[rates]]
+from = "evm:0x5FbDB2315678afecb367f032d93F642f64180aa3"
+to = "solana:5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX"
+rate = { numerator = 4000, denominator = 1 }
+
+# ── The three guards (ADR 0071 decision 5) ───────────────────────────────────
+# Required as a set the moment any `[[rates]]` row or any quote exists, and
+# refused at boot otherwise: a node that deals without saying what it deals at
+# the edges of is a node whose operator has not thought about it.
+#
+# `spread` IS WHAT THIS HOP EARNS FOR DEALING, and it is a separate earnings
+# stream from the flat fee (decision 8). Applied against the sender: a mid of
+# `m` under a spread of `n/d` deals at `m * (d - n) / d`, so 4000/1 at 1/100
+# becomes 3960/1 -- less of the outgoing token leaves per µUSDC that arrives.
+# It is a FRACTION and not a basis point, for the reason ADR 0010 deleted the
+# basis-point fee: there are no floats on this path, and half a basis point is
+# `1/20000` rather than something that rounds to zero.
+#
+# So one packet's arithmetic, end to end, is:
+#
+#     1100 arrive          (1200 sent, A keeps its flat 100)
+#     x 3960/1             (the 4000 mid, less this node's 1% spread)
+#     = 4356000            floor, always the connector's way (decision 4)
+#     - 6000               this node's flat fee on the `b-c` peering
+#     = 4350000            forwarded, and the figure the covering claim names
+#
+# `44000` of that -- 4400000 at the mid less 4356000 at the dealt rate -- is
+# what dealing earned, on top of the 6000 carriage fee. The rehearsal cannot
+# see the two separately and does not try: it reads C's journal for 4350000,
+# which is wrong if either moved.
+#
+# `ttl_secs` and `max_move` govern OBSERVATIONS and bind nothing on a static
+# row. They are written anyway because the guard set is all-or-nothing, and
+# because the figures an operator would want the day this pair gained a quote
+# are the ones to have already thought about: five minutes of life, and a
+# refresh that jumps more than 5% treated as probable manipulation rather than
+# as a market.
+[rate_guards]
+spread = { numerator = 1, denominator = 100 }
+ttl_secs = 300
+max_move = { numerator = 5, denominator = 100 }
+
+# ── Settlement: BOTH chains, and this is not decoration ──────────────────────
+# A `[[peer_channels]]` row can only be signed for if this node holds the
+# matching settlement key: `peer_claim_identity` reads `[settlement.evm]`'s and
+# `peer_claim_identity_solana` reads `[settlement.solana]`'s. So the two tables
+# below are what make the two rows above live rather than inert -- and, since
+# ADR 0071, they are also what each peering's TOKEN is read off.
+#
+# A present-but-unsatisfiable settlement table is a hard startup failure (ADR
+# 0009/CF-25), so this section coming up at all is itself an assertion: the
+# registry resolved a TokenNetwork for the token, the token's own `decimals()`
+# agreed with the 6 written here (issue #564), the Solana program was reachable
+# and proven to behave like the deployed payment-channel program, and the mint
+# was owned by the SPL Token program WITH 9 DECIMALS. That last check is what
+# makes the scale half of the rate above falsifiable against the chain rather
+# than merely typed.
+
+[settlement.evm]
+rpc_url = "http://anvil:8545"
+contract_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+token_address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+decimals = 6
+
+[settlement.evm.key]
+key_file = "/app/data/settlement.key"
+
+# `token_address` is NOT the mock USDC mint every other Solana leg in this
+# directory names. It is a second mock, at NINE decimals, created by
+# `local/keys.sh dealing` from a keypair derived at a fixed index of anvil's
+# own published test mnemonic -- deterministic, so this line can be committed,
+# and never written down, so no key material is. Its authority is the same
+# `infra/solana/usdc-authority.json` the mock USDC mint already uses.
+#
+# It exists because a denomination boundary needs two tokens that are genuinely
+# different. USDC-on-Base and USDC-on-Solana are two `AssetId`s, and a dealing
+# node is held to the absence rule for that pair like any other -- but they are
+# the same asset at the same scale, so the crossing would be at par and the
+# rehearsal could not tell a correct conversion from no conversion at all. A
+# thousandfold scale difference can.
+#
+# `program_id` is the id `infra/solana/entrypoint.sh` loads payment_channel.so
+# under at genesis, and equals
+# `connector_settlement_solana::test_support::LOCAL_TEST_PROGRAM_ID` --
+# `local_program_id_is_shared.rs` fails if those two drift.
+[settlement.solana]
+rpc_url = "http://solana-validator:8899"
+program_id = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR"
+token_address = "5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX"
+decimals = 9
+
+[settlement.solana.key]
+key_file = "/app/data/settlement-solana.key"

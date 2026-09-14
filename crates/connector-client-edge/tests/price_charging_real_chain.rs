@@ -29,15 +29,13 @@ use connector_client_edge::{
     router_with_gate, ClientChannelRegistry, ClientClaimGate, DepositFloor, EvmChannel,
 };
 use connector_config::StaticRoute;
-use connector_domain::{
-    derive_condition, EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject,
-};
+use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject};
 use connector_runtime::{
     AppOutcome, Connector, FakeAppClient, InProcessPeerTransport, TestClock, PAYER_HEADER,
 };
 use connector_settlement::SettlementBackend;
 use connector_settlement_evm::EvmSettlementBackend;
-use connector_signer::giftwrap::{derive_fulfillment, seal_request};
+use connector_signer::giftwrap::seal_request;
 use connector_signer::{
     derive_evm_address, evm_balance_proof_digest, to_hex, EvmBalanceProof, LocalSigner, Signer,
 };
@@ -57,9 +55,9 @@ fn test_clock() -> Arc<TestClock> {
 
 /// Per ADR 0018/issue #524, a `Prepare`'s `data` is a gift wrap sealed to
 /// the terminating connector's identity key, opened above the `AppClient`
-/// boundary (issue #521). `execution_condition` is set to match the
-/// fulfilment this same sealed secret derives (ADR 0019, issue #525) --
-/// what a genuine sender does before ever transmitting a packet.
+/// boundary (issue #521) -- what a genuine sender does before ever
+/// transmitting a packet, the termination deriving its fulfilment from this
+/// same sealed secret (ADR 0019, issue #525).
 fn sealed_sample_prepare(receiver_public: &connector_signer::PublicKeyBytes) -> Prepare {
     let plaintext = EnvelopeRequest {
         method: "POST".to_string(),
@@ -68,11 +66,11 @@ fn sealed_sample_prepare(receiver_public: &connector_signer::PublicKeyBytes) -> 
         body: b"hello app".to_vec(),
     }
     .encode();
-    let (data, shared_secret) = seal_request(&plaintext, receiver_public).expect("seal");
+    let (data, _shared_secret) = seal_request(&plaintext, receiver_public).expect("seal");
     Prepare {
         amount: 0,
         expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-        execution_condition: derive_condition(&derive_fulfillment(&shared_secret)),
+        greeting: false,
         destination: "g.example.app".to_string(),
         data,
     }

@@ -161,14 +161,17 @@ decided _when_ a fulfilled PREPARE should credit a channel, so `credited` — an
 production caller" shape issue #736 already named once for the read side of session routing.
 
 `crate::session_route::route_prepare` is where that decision now lives, alongside the routing
-decision it already owns: once a client session's own answer is a genuine FULFILL (checked against
-`prepare`'s execution condition, same as any other candidate this arm accepts), it calls
-`ClientPayoutLedger::record_payout_once` — a new method, not `record_payout` itself, because
-`record_payout`/`ClaimBook::record_fulfillment` advance their nonce and cumulative amount
-unconditionally on every call and so cannot by themselves tell a genuine second job from a retried
-first one (issue #770's AC3). `record_payout_once` dedupes on `(channel_id, execution_condition)`
-instead: a packet's condition is deterministic per job (RFC-0022), so a retransmitted fulfilment of
-the same job always carries the identical condition, and a genuinely new job never does.
+decision it already owns: once a client session's own answer is a genuine FULFILL — rides home
+unchecked since [ADR 0069](0069-the-execution-condition-leaves-the-wire.md), previously checked
+against `prepare`'s execution condition — it calls `ClientPayoutLedger::record_payout_once` — a new
+method, not `record_payout` itself, because `record_payout`/`ClaimBook::record_fulfillment` advance
+their nonce and cumulative amount unconditionally on every call and so cannot by themselves tell a
+genuine second job from a retried first one (issue #770's AC3). `record_payout_once` dedupes on
+`(channel_id, execution_condition)` at the time this was written; ADR 0069 keys it on `(channel_id,
+fulfillment)` instead, taken from the FULFILL already in hand — the same identity, since RFC-0022's
+relation was `condition = sha256(fulfillment)`: a packet's fulfilment is deterministic per job, so a
+retransmitted fulfilment of the same job always carries the identical value, and a genuinely new job
+never does.
 
 The channel to credit needs no new lookup: `destination` — the address `SessionRegistry::resolve`
 found this session bound at — _is_ the channel id, per this ADR's `outbound_ledger.rs` update
@@ -212,8 +215,9 @@ through `ClientPayoutLedger::ensure_channel_domain` (new, `outbound_ledger.rs`) 
 through to `record_payout_once` exactly as before. A channel that fails to resolve (never opened,
 or the chain endpoint is down) is left unresolved and `record_payout_once` then produces nothing,
 same as it always has — resolution failure never becomes a free credit (issue #780's AC3).
-`record_payout_once`'s own `(channel_id, execution_condition)` dedupe (issue #770's AC3) is
-unaffected: `ensure_channel_domain` only ever adds a domain, it never touches credited state.
+`record_payout_once`'s own dedupe (issue #770's AC3 — `(channel_id, fulfillment)` since ADR 0069,
+`(channel_id, execution_condition)` before it) is unaffected: `ensure_channel_domain` only ever
+adds a domain, it never touches credited state.
 
 `ensure_channel_domain` takes `&self` where `set_channel_domain` takes `&mut self`, because a
 channel discovered at payout time arrives after this ledger is already shared as an `Arc` across

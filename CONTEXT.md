@@ -65,14 +65,17 @@ _Avoid_: speaks ILPv4 (retired — it names the semantics and implies the bytes;
 is "ILPv4 semantics, TOON encoding")
 
 **Condition**:
-A commitment minted by the sender and carried on the packet, naming what will count as proof of
-delivery. Every packet carries a real one; a hop pays out only against something that satisfies it.
-_Avoid_: execution condition (when the layer is already clear), hashlock
+Retired from the wire (issue #1269, ADR 0069). A packet no longer carries one: it was a commitment
+minted by the sender, invariant across every hop and distinctive per packet — exactly the shape of
+a cross-hop join key, and it paid for nothing a hop was actually charged to check. What survives is
+the sender's own end-to-end check, over the fulfilment directly.
+_Avoid_: execution condition (as a thing a current packet carries), hashlock
 
 **Fulfilment**:
-What satisfies a packet's condition, and so the proof that the packet was delivered to its
-intended receiver. It proves delivery; it does not move value — a packet carries its own claim.
-At a route termination the terminating connector produces it; every hop upstream checks it.
+The proof that a packet was delivered to its intended receiver. It proves delivery; it does not
+move value — a packet carries its own claim. At a route termination the terminating connector
+derives it from the request's own sealed secret (ADR 0019); no hop upstream checks it any more
+(ADR 0069) — only the sender does, against that same derivation.
 _Avoid_: receipt, proof of payment, preimage (when the layer is already clear)
 
 **ILP address**:
@@ -199,8 +202,8 @@ _Avoid_: encryption (when the layer is already clear), wrapper, seal
 **Identity key**:
 The key that names a connector to everyone outside it. A sender seals to it, so it is what makes a
 packet deliverable at all; and because a fulfilment derives from what it opens, it is load-bearing
-for payment and not only for confidentiality. Rotating it invalidates conditions already minted
-against the old one.
+for payment and not only for confidentiality. Rotating it invalidates the fulfilment a sender's own
+end-to-end check expects for anything already sealed to the old one.
 
 **Packet plane**:
 The part of a connector on the path of every packet — routing, claim handling, forwarding.
@@ -240,13 +243,32 @@ that is carriage, below.
 _Avoid_: peer wire (it named a deleted transport and this layer at once; see ADR 0027)
 
 **Peer carriage**:
-Where a peer interaction's bytes ride. There are two, and a connector may expose both: **BTP**
-over `wss://`, and **ILP-over-HTTP** over `https://` — the same two the client edge already
-serves. Which one a connector exposes, and which it dials for a given peer, is operator policy,
-never a protocol constant. Below the transport port there is one pipeline: a PREPARE that arrived
+Where a peer interaction's bytes ride. There are two, and a connector may expose both: **BTP** and
+**ILP-over-HTTP** — the same two the client edge already serves. Selected by the endpoint's
+**scheme**, `wss://` and `https://`, which is also why there is no third: a carriage is a protocol,
+and an address is not one (ADR 0070). Which carriage a connector exposes, and which it dials for a
+given peer, is operator policy, never a protocol constant. Below the transport port there is one pipeline: a PREPARE that arrived
 over HTTP is indistinguishable from one that arrived over BTP, and peer behaviour that exists on
 one carriage and not the other is a defect rather than a property of the carriage.
 _Avoid_: peer wire, peer transport (when the layer is already clear)
+
+**Onion endpoint**:
+A published endpoint whose host is a hidden-service address — `.onion` or `.anyone`, the two TLDs
+the `anon` daemon has published — the node reachable over an onion-routing network rather than at a
+DNS name and an IP. Not a third **peer carriage** and not a transport: the
+carriage is still BTP or ILP-over-HTTP, and an onion endpoint is where that carriage's bytes are
+_addressed_. Because a v3 onion address **is** the public key the circuit is authenticated to, such
+an endpoint carries its own authentication and needs no TLS — the one place the plaintext schemes
+select a carriage, and a narrowing of ADR 0004's requirement by satisfying it rather than waiving it.
+Hides where a node is reachable, never who it pays: a claim names an on-chain channel and every
+operator write is signed under a keyid. Dialed through the one `socks_proxy` a node configures,
+selected by the endpoint's host and by nothing else — no per-peer key, no all-outbound mode
+([ADR 0070](docs/adr/0070-an-onion-address-is-a-host-not-a-carriage.md), built, amended by #1284).
+The word names the **mechanism**, never one TLD: `anon` renamed the suffix it publishes between
+releases, both spellings are accepted, and `is_onion_endpoint` is the one place that is decided.
+_Avoid_: hidden service, onion transport, third transport, Anyone transport, `.anyone` endpoint —
+and note that **transport** is already taken: a route's `transport` is the _client_ transport it
+accepts.
 
 **Interaction**:
 The unit a role attaches to: one BTP session, from its websocket upgrade to its close, or one
@@ -268,10 +290,10 @@ machines the operator does not control.
 _Avoid_: client API, ingress
 
 **Vector**:
-A committed input/output pair — an encoded packet, a wrapped packet, an envelope, a condition, the
-fulfilment it derives — that every implementation replays as its own suite. Vectors are generated from the
-properties, never captured from whatever an implementation happened to emit, and reproducing them
-is what conformance means. Prose describing the wire is not normative; these are.
+A committed input/output pair — an encoded packet, a wrapped packet, an envelope, a shared secret,
+the fulfilment it derives — that every implementation replays as its own suite. Vectors are generated
+from the properties, never captured from whatever an implementation happened to emit, and reproducing
+them is what conformance means. Prose describing the wire is not normative; these are.
 _Avoid_: fixture, golden file, test case (when the cross-repo contract is what is meant)
 
 **Peer wire** _(retired term, [ADR 0027](docs/adr/0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md), issue #679)_:
@@ -374,8 +396,12 @@ _Avoid_: payout, redemption (as a synonym for the whole act)
 What a connector charges to carry one packet across one peering relation. Flat per packet,
 not proportional to the amount carried — and not varying with where the packet is headed, because
 it pays for this hop's work and that work is the same whatever the destination. One number per
-peering, held by the peering. What varies by destination is the **price**.
-_Avoid_: spread, commission, rate
+peering, held by the peering, denominated in that peering's unit — which at a hop crossing a
+denomination is the **outgoing** leg's, subtracted after the conversion and not before
+([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). What varies
+by destination is the **price**; what a hop earns for crossing a denomination is the **spread**,
+a separate earning.
+_Avoid_: commission; using fee for the dealing margin — that is the **spread**
 
 **Price**:
 What a terminated route charges for the work the app does. Distinct from a fee — a fee buys
@@ -405,10 +431,51 @@ packet cost.
 What a caller must send for a packet to be delivered: the fees of every hop that carries it, plus
 the **charge** of the route that terminates it. A reject states the cost of the path _that
 packet_ travelled, which is how a probe discovers it. The sum only — never the per-hop breakdown,
-and never the split between fees and price. Because a terminating charge can depend on payload
-length (ADR 0065), a probe's figure is exact for a packet its own size; what answers every size is
+and never the split between fees and price. The sum arrives in the asker's own unit: each
+denomination boundary a reject crosses converts the running figure as it passes
+([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)), so the number
+is always readable where it lands and the wire never needs to name a unit. Because a terminating
+charge can depend on payload length (ADR 0065), a probe's figure is exact for a packet its own
+size; what answers every size is
 the terminating node's published **price**, on its greeting and its self-description.
 _Avoid_: total fee, quote
+
+**Rate**:
+The declared terms on which one connector crosses one denomination boundary: a rational over
+**base units** — so many of the outgoing channel's for so many of the incoming one's — with the
+two tokens' decimals folded into the ratio and direction included
+([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). Declared or
+absent, and absence is the safety rule: a pair this node declared nothing for is refused with a
+final **`F02`** rather than passed through at an implied 1:1, and a rate whose observation has
+aged out past its ttl with a retryable **`T00`** rather than dealt on dead. Nothing ever converts
+silently. A node that declares no tokens resolves no denomination, crosses no boundary and
+forwards unconverted at the flat fee — which is every node this repository ships today; a node
+that declares them is held to the rule on every ordered pair it can resolve, same asset or not,
+because USDC on two chains is two of them. An operator who wants such a pair carried at par says
+so in a row: there is no 1:1 rate to fall back on, deliberately. A rate is one connector's own
+posted term, never a network fact: the network learns it the way it learns every cost, by probing
+the route.
+_Avoid_: exchange rate (a market's number; this is one connector's posted one), conversion factor
+
+**Spread**:
+What a connector earns at a denomination boundary: the part of the **mid** — the unwidened rate
+the node holds for a pair, sourced or hand-tended — that it keeps when it deals, taken against
+the sender in whichever direction the packet runs, and paid for carrying the dealing risk: a
+stale source, a shoved pool, a packet held against a moving price
+([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). Declared as a
+**fraction** strictly below one — as `max_move` and a static rate are, and for the reason ADR 0010
+deleted the basis-point fee: there are no floats on this path, and an operator dealing at half a
+basis point writes `1/20000` rather than watching it round to zero. A separate
+earning from the **fee**, which buys carriage; a hop that crosses no boundary earns no spread.
+_Avoid_: arbitrage (riskless profit between venues — this is priced risk), margin
+
+**Segment**:
+A maximal run of hops sharing one denomination. One segment, one unit: every amount, fee and
+running cost inside a segment is in that segment's unit, and a **path** is its segments joined at
+denomination boundaries
+([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). A
+single-segment path is the only kind that existed before 0071, which is why older prose may use
+"path" where it means this word.
 
 **Minimum delivery** _(retired term, [ADR 0057](docs/adr/0057-minimum-delivery-is-retired-a-claim-bounds-erosion.md), issue #1143)_:
 The amount a packet declared must reach its destination, checked by every hop after its own fee

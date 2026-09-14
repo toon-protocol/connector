@@ -48,11 +48,10 @@ test('encodeGeneralizedTime: pads milliseconds to 3 digits', () => {
 });
 
 test('encodePrepare: leads with the PREPARE type byte and matches the Rust decoder field order', () => {
-  const executionCondition = Buffer.alloc(32, 0);
   const encoded = encodePrepare({
     amount: 100,
     expiresAt: new Date(Date.UTC(2030, 5, 15, 12, 0, 0, 0)),
-    executionCondition,
+    greeting: false,
     destination: 'g.example.app',
     data: Buffer.from('hello app'),
   });
@@ -64,37 +63,35 @@ test('encodePrepare: leads with the PREPARE type byte and matches the Rust decod
   assert.equal(encoded[1], 0x64);
   // expiresAt (19-byte GeneralizedTime) starts at offset 2
   assert.equal(encoded.subarray(2, 21).toString('utf8'), '20300615120000.000Z');
-  // executionCondition: 32 raw bytes at offset 21
-  assert.deepEqual(encoded.subarray(21, 53), executionCondition);
-  // destination: VarOctetString at offset 53 — length byte then the UTF-8 bytes
+  // greeting: 1 byte at offset 21
+  assert.equal(encoded[21], 0x00);
+  // destination: VarOctetString at offset 22 — length byte then the UTF-8 bytes
   const destBytes = Buffer.from('g.example.app', 'utf8');
-  assert.equal(encoded[53], destBytes.length);
-  assert.deepEqual(encoded.subarray(54, 54 + destBytes.length), destBytes);
+  assert.equal(encoded[22], destBytes.length);
+  assert.deepEqual(encoded.subarray(23, 23 + destBytes.length), destBytes);
   // data: VarOctetString right after
-  const dataOffset = 54 + destBytes.length;
+  const dataOffset = 23 + destBytes.length;
   const dataBytes = Buffer.from('hello app');
   assert.equal(encoded[dataOffset], dataBytes.length);
   assert.deepEqual(encoded.subarray(dataOffset + 1), dataBytes);
 });
 
-test('encodePrepare: rejects an execution condition that is not exactly 32 bytes', () => {
-  assert.throws(
-    () =>
-      encodePrepare({
-        amount: 0,
-        expiresAt: new Date(),
-        executionCondition: Buffer.alloc(31),
-        destination: 'g.example',
-      }),
-    RangeError
-  );
+test('encodePrepare: greeting true encodes as 0x01', () => {
+  const encoded = encodePrepare({
+    amount: 0,
+    expiresAt: new Date(Date.UTC(2030, 5, 15, 12, 0, 0, 0)),
+    greeting: true,
+    destination: 'g.example.app',
+  });
+  // type byte (1) + amount (0x00, 1 byte) + expiresAt (19 bytes) => greeting at offset 21
+  assert.equal(encoded[21], 0x01);
 });
 
 test('encodePrepare: defaults data to empty when omitted', () => {
   const encoded = encodePrepare({
     amount: 0,
     expiresAt: new Date(Date.UTC(2030, 0, 1)),
-    executionCondition: Buffer.alloc(32),
+    greeting: true,
     destination: 'g.x',
   });
   // last byte is the (zero) length prefix of the empty data VarOctetString

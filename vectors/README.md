@@ -8,9 +8,9 @@ is evidence of. This file is plain JSON so a client SDK can replay it without im
 from this repository.
 
 Regenerate after any change to the envelope (`connector_domain::envelope`), the gift wrap
-(`connector_signer::giftwrap`), the condition/fulfilment code
-(`connector_domain::condition`/`connector_signer::giftwrap::derive_fulfillment`), or the claim
-signing scheme (`connector_signer::claim_signature`):
+(`connector_signer::giftwrap`), the fulfilment derivation
+(`connector_signer::giftwrap::derive_fulfillment`), or the claim signing scheme
+(`connector_signer::claim_signature`):
 
 ```
 cargo run -p connector-vectors --bin generate-vectors
@@ -26,7 +26,7 @@ wire actually changed.
 semantics are Interledger's; the encoding is TOON's own dialect, ratified by
 [ADR 0063](../docs/adr/0063-the-ilp-packet-is-toons-dialect-not-rfc-0027s.md). An encoder written
 from RFC 0027's §Packet Format will not produce bytes this connector accepts, and a packet this
-connector emits will not decode in a conforming ILPv4 implementation. Three things differ, and
+connector emits will not decode in a conforming ILPv4 implementation. Four things differ, and
 nothing else does:
 
 | RFC 0027 §Packet Format                                 | This connector                                 |
@@ -34,11 +34,15 @@ nothing else does:
 | Outer type-length wrapper: `type` then a VarOctetString | Type byte, then fields inline — no wrapper     |
 | `amount` is a fixed `UInt64` (8 bytes)                  | VarUInt (the `envelope` section defines it)    |
 | `expiresAt` is a 17-byte Interledger Timestamp          | 19-byte GeneralizedTime, `YYYYMMDDHHMMSS.fffZ` |
+| `executionCondition`, a 32-byte `UInt256`               | Gone (issue #1269); a one-byte `greeting` flag |
 
-Everything else is RFC 0027's: the three type bytes, the field order and meanings,
-`condition = sha256(fulfilment)`, and the `F`/`T`/`R` error taxonomy. RFC 0027's reason for those
-two fields being fixed-length is that a forwarding connector can then rewrite them in place; this
-connector forgoes that and re-encodes (ADR 0063 D4).
+The fourth is a semantic departure, not an encoding one: RFC 0027 requires an execution condition
+on every PREPARE, and this connector's PREPARE carries none at all -- see
+[ADR 0069](../docs/adr/0069-the-execution-condition-leaves-the-wire.md). Everything else is RFC
+0027's: the three type bytes, the remaining field order and meanings, `Fulfill.fulfillment` and its
+relation to a request's shared secret (ADR 0019), and the `F`/`T`/`R` error taxonomy. RFC 0027's
+reason for `amount`/`expiresAt` being fixed-length is that a forwarding connector can then rewrite
+them in place; this connector forgoes that and re-encodes (ADR 0063 D4).
 
 ### Where it is pinned
 
@@ -65,7 +69,7 @@ and `VarOctetString` as defined there:
 ```text
 prepare = 0x0c || VarUInt(amount)
              || GeneralizedTime(expires_at)      -- 19 ASCII bytes, no length prefix
-             || execution_condition (32 bytes, no length prefix)
+             || greeting (1 byte: 0x00 or 0x01)
              || VarOctetString(destination)      -- UTF-8 ILP address
              || VarOctetString(data)
 
@@ -86,9 +90,9 @@ as the `TOON-Accumulated-Cost` header or the `toon-accumulated-cost` protocol-da
 
 ### `peer_carriage.prepare.http_body_hex`, byte by byte
 
-108 bytes. The decoded values are `peer_carriage.prepare.prepare` in this file, so a replaying SDK
-can check both directions: that these bytes decode to those values, and that encoding those values
-reproduces these bytes exactly.
+77 bytes (31 fewer than before issue #1269 deleted `executionCondition`). The decoded values are
+`peer_carriage.prepare.prepare` in this file, so a replaying SDK can check both directions: that
+these bytes decode to those values, and that encoding those values reproduces these bytes exactly.
 
 ```text
 0c                                 type 12 = PREPARE
@@ -99,8 +103,9 @@ reproduces these bytes exactly.
                                    expires_at, 19 ASCII bytes = "20300101000100.000Z"
                                      = 2030-01-01T00:01:00.000Z
                                      (RFC 0027 would be 17 bytes: "20300101000100000")
-f1f2f3f4f5f6f7f8f9fafbfcfdfeff00
-0102030405060708090a0b0c0d0e0f10   execution_condition, 32 bytes, no length prefix
+00                                 greeting = false
+                                     (RFC 0027 has no such field, and has a 32-byte
+                                     executionCondition here instead -- issue #1269 / ADR 0069)
 17                                 VarUInt determinant: short form, 23 bytes follow
    672e746f6f6e2e73746f72652d626f782e736574746c65
                                    destination = "g.toon.store-box.settle"
@@ -242,18 +247,20 @@ Each `cases[]` entry pins every input a real seal draws at random (`ephemeral_se
 
 ### `fulfilment`
 
-The fulfilment a terminating connector derives from a request's shared secret (ADR 0019), and the
-condition it satisfies. `fulfilment_hex` is `HKDF-SHA256(salt=none, ikm=shared_secret_hex,
+The fulfilment a terminating connector derives from a request's shared secret (ADR 0019).
+`fulfilment_hex` is `HKDF-SHA256(salt=none, ikm=shared_secret_hex,
 info="toon-giftwrap-fulfillment")`, expanded to 32 bytes -- the same HKDF construction as the
 `giftwrap` section above, domain-separated from both its AEAD keys by this section's own `info`
-string. `condition_hex` is `sha256(fulfilment_hex)`, the standard ILPv4/RFC-0022 condition/
-fulfilment relationship.
+string.
 
-- `cases[]`: `{ name, shared_secret_hex, fulfilment_hex, condition_hex, matches }`.
-  `fulfilment_hex` is what a real connector derives from `shared_secret_hex`; `matches` says
-  whether `fulfilment_hex` satisfies `condition_hex` under the standard
-  `sha256(fulfilment) == condition` check -- both `true` and `false` cases are included, so a
-  replaying SDK exercises rejection as well as acceptance.
+Issue #1269 / ADR 0069 removed the execution condition from the wire (`schema_version` 5): there is
+no condition left to derive a fulfilment from or to check one against, so this section pins only
+`derive_fulfillment`'s own determinism.
+
+- `cases[]`: `{ name, shared_secret_hex, fulfilment_hex }`. `fulfilment_hex` is what a real
+  connector derives from `shared_secret_hex` -- two cases, over two different secrets, so a
+  replaying SDK can check that its own derivation reproduces both rather than one it could get
+  right by accident.
 
 ### `claim`
 
@@ -346,7 +353,7 @@ wire_nonce, wire_cumulative_amount, wire_signature_hex }`: an EVM peer claim, th
 
 - **`prepare`** / **`prepare_no_claim`** (items 5, 6) -- `{ name, prepare, claim_json,
 btp_message_hex, http_headers, http_body_hex }`: a claim-bearing PREPARE.
-  `prepare` is `{ amount, expires_at, execution_condition_hex, destination, data_hex }`, the OER
+  `prepare` is `{ amount, expires_at, greeting, destination, data_hex }`, the OER
   `Prepare` both `btp_message_hex` (a complete BTP MESSAGE frame: type, `requestId`, the
   `payment-channel-claim` protocolData entry, then the OER PREPARE)
   and `http_body_hex` (the same OER bytes as a POST body) carry. `prepare_no_claim` is the same

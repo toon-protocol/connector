@@ -62,9 +62,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::Signer as SolanaSigner;
 use tower::ServiceExt;
 
-use connector_domain::{
-    derive_condition, EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject,
-};
+use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject};
 use connector_operator::test_support::sign_request;
 use connector_runtime::PeerView;
 use connector_settlement::{ChannelId, SettlementBackend};
@@ -72,7 +70,7 @@ use connector_settlement_solana::test_support::{
     fund as fund_sol, require_solana_test_validator, SolanaValidator, LOCAL_TEST_PROGRAM_ID,
 };
 use connector_settlement_solana::SolanaSettlementBackend;
-use connector_signer::giftwrap::{derive_fulfillment, open_response, seal_request};
+use connector_signer::giftwrap::{open_response, seal_request};
 use connector_signer::{verify_solana_balance_proof, LocalSigner, PublicKeyBytes, Signer};
 
 /// What node A's app route charges, and so what every covering claim
@@ -627,7 +625,7 @@ async fn originate_and_expect_fulfil(
     let prepare = Prepare {
         amount: APP_PRICE,
         expires_at: Utc::now() + ChronoDuration::minutes(5),
-        execution_condition: derive_condition(&derive_fulfillment(&shared_secret)),
+        greeting: false,
         destination: A_APP_PREFIX.to_string(),
         data,
     };

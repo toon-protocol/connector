@@ -14,8 +14,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use chrono::{Duration as ChronoDuration, Utc};
-use connector_domain::{derive_condition, EnvelopeRequest, Prepare};
-use connector_signer::giftwrap::{derive_fulfillment, seal_request};
+use connector_domain::{EnvelopeRequest, Prepare};
+use connector_signer::giftwrap::seal_request;
 use connector_signer::{LocalSigner, PublicKeyBytes, Signer};
 
 /// A spawned child process, killed and reaped on drop -- so a test that
@@ -75,15 +75,14 @@ pub fn sealed_prepare_data(body: &[u8], receiver_public: &PublicKeyBytes) -> (Ve
     seal_request(&plaintext, receiver_public).expect("seal")
 }
 
-/// A `Prepare` whose `execution_condition` matches the fulfilment
-/// `shared_secret` derives (ADR 0019, issue #525) -- what a genuine sender
-/// mints its condition from before ever transmitting a packet sealed with
-/// that same secret.
-pub fn sample_prepare(destination: &str, data: Vec<u8>, shared_secret: &[u8; 32]) -> Prepare {
+/// A `Prepare` carrying `data` -- typically already sealed with a secret the
+/// termination will derive its fulfilment from (ADR 0019, issue #525) via
+/// [`sealed_prepare_data`].
+pub fn sample_prepare(destination: &str, data: Vec<u8>) -> Prepare {
     Prepare {
         amount: 0,
         expires_at: Utc::now() + ChronoDuration::minutes(5),
-        execution_condition: derive_condition(&derive_fulfillment(shared_secret)),
+        greeting: false,
         destination: destination.to_string(),
         data,
     }

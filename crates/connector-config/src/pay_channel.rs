@@ -75,6 +75,7 @@ use url::Url;
 
 use crate::client_channel::{is_base58_32_bytes, parse_evm_address, parse_hex_bytes, to_hex};
 use crate::error::ConfigError;
+use crate::peer::plaintext_permitted;
 use crate::settlement::{SettlementChain, SettlementTables};
 
 /// One `[[pay_channels]]` entry as written in the config file, in either
@@ -328,6 +329,23 @@ impl PayChannelConfig {
 /// channel's state -- would otherwise travel in the clear. `false` is the
 /// default and every production config, and then `https://` is the only
 /// scheme this table accepts.
+///
+/// An **onion** URL is the same exception here that it is there (ADR 0070
+/// decision 2), and it has to be, twice over. The reason transfers exactly:
+/// a v3 onion address *is* the ed25519 key the circuit is encrypted and
+/// authenticated to, so the challenge does not travel in the clear and
+/// ADR 0004's requirement is satisfied by a different mechanism rather than
+/// waived. And the alternative is worse than an inconsistency -- a peering
+/// this node forwards to must carry a `[[pay_channels]]` row
+/// (`PayChannelUnbound`), and that row's `client_edge_url` is the *payee's*
+/// client edge, so on an onion-only payee it can only be an onion URL.
+/// Refusing it here would leave an onion peering that loads and can never
+/// cover a forward: every packet refused for want of a covering claim,
+/// before the carriage ADR 0070 built was ever asked to carry one.
+///
+/// Asked through [`is_onion_endpoint`] rather than restated, so this and
+/// `PeerCarriage::for_endpoint` cannot come to different answers about the
+/// same host.
 fn resolve_client_edge_url(
     peer_id: &str,
     written: String,
@@ -341,7 +359,7 @@ fn resolve_client_edge_url(
         })?;
     let scheme_allowed = match url.scheme() {
         "https" => true,
-        "http" => allow_plaintext,
+        "http" => plaintext_permitted(&url, allow_plaintext),
         _ => false,
     };
     if !scheme_allowed {
@@ -776,6 +794,52 @@ mod tests {
             let channels = resolve_pay_channels(vec![row], true, both_chains())
                 .expect("plaintext is opted into");
             assert_eq!(channels[0].client_edge_url().scheme(), "http");
+        }
+    }
+
+    /// ADR 0070 decision 2, on the row that would otherwise make the whole
+    /// feature inert. A peering this node forwards to must carry a
+    /// `[[pay_channels]]` row, and that row names the *payee's* client
+    /// edge -- so on an onion-only payee it can only be an onion URL. If
+    /// this table refused one, an onion peering would load and then refuse
+    /// every packet for want of a covering claim, before the carriage was
+    /// ever asked to carry one.
+    ///
+    /// Read through the same `is_onion_endpoint` the carriage rule reads,
+    /// so the two cannot disagree about a host -- and, as there, the suffix
+    /// is a suffix: a host that only looks onion is still plaintext.
+    /// Both spellings the `anon` daemon has published (issue #1284), for
+    /// the reason the carriage rule takes both: what a payee writes here is
+    /// whatever its own daemon generated, and this node has no say in which
+    /// release that was.
+    #[test]
+    fn an_onion_client_edge_url_needs_no_plaintext_opt_in() {
+        const HIDDEN_SERVICE_URLS: [&str; 2] = [
+            "http://vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion/ilp",
+            "http://vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.anyone/ilp",
+        ];
+
+        for url in HIDDEN_SERVICE_URLS {
+            for row in [evm("relay", CHANNEL), solana("relay", ACCOUNT)] {
+                let row = with_client_edge_url(row, url);
+                let channels = resolve_pay_channels(vec![row], false, both_chains())
+                    .expect("an onion client edge loads on a node that opted into nothing");
+                assert_eq!(channels[0].client_edge_url().as_str(), url);
+            }
+        }
+
+        for url in ["http://onion.example/ilp", "http://anyone.example/ilp"] {
+            for row in [evm("relay", CHANNEL), solana("relay", ACCOUNT)] {
+                let row = with_client_edge_url(row, url);
+                assert!(
+                    matches!(
+                        resolve_pay_channels(vec![row], false, both_chains()),
+                        Err(ConfigError::PayChannelClientEdgeUrlScheme { ref scheme, .. })
+                            if scheme == "http"
+                    ),
+                    "{url}: a host that merely contains the word is an ordinary clearnet host"
+                );
+            }
         }
     }
 

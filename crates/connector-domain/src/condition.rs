@@ -1,37 +1,41 @@
-//! Execution condition, fulfilment and expiry (RFC-0022) -- pure, no I/O.
+//! Fulfilment and expiry (RFC-0022) -- pure, no I/O.
 //!
-//! Trustless forwarding rests on one property: a hop is paid only against a
-//! preimage it cannot forge. That means every packet needs a real,
-//! sender-chosen condition (a missing or all-zero one is invalid, never a
-//! legacy "no condition" case), and a fulfilment is only ever accepted once
-//! its preimage is checked against that condition. There is deliberately no
-//! function anywhere in this module that goes the other way -- from a
-//! condition to a fulfilment -- since that is exactly the derived-preimage
-//! hole issue #417 closes.
+//! Issue #1269 / ADR 0069 removed the execution condition from the wire: it
+//! was invariant across every hop and distinctive per packet -- a perfect
+//! join key for any two hops on a path -- while protecting nothing a hop was
+//! paid to check (a hop is paid on arrival, ADR 0042; a mismatch still
+//! charged; a termination's own check was a tautology against a condition it
+//! minted from the same secret it derives the fulfilment from). No packet
+//! carries a condition any more, and nothing in this crate mints one.
+//! [`fulfillment_matches_condition`] stays exported regardless: RFC-0022's
+//! relation is still real math, useful to a caller that independently holds
+//! a condition to check a fulfilment against (a bridge to a chain that still
+//! uses one, say). It has no production caller in this workspace today --
+//! `connector send`'s own end-to-end check compares two fulfilments
+//! directly (`fulfill.fulfillment == derive_fulfillment(&shared_secret)`)
+//! and needs no intermediate condition to do it. `derive_condition` --
+//! `sha256` of a fulfilment -- stays private as this function's own
+//! arithmetic; nothing here exposes a function that goes the other way,
+//! from a condition to a fulfilment.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use sha2::{Digest, Sha256};
 
-/// RFC-0027's wire format has no separate "absent" representation for
-/// `executionCondition` -- all-zero is the only way "no condition" can be
-/// expressed. This connector treats that state as invalid outright rather
-/// than as a legacy auto-fulfill path, so every packet must carry a real
-/// condition to be eligible for forwarding at all.
-pub fn condition_is_present(condition: &[u8; 32]) -> bool {
-    *condition != [0u8; 32]
-}
-
 /// The condition a `fulfillment` satisfies: `sha256(fulfillment)`. Hashing
 /// only ever runs in this direction -- from a chosen preimage to the
-/// condition it produces -- never reversed.
-pub fn derive_condition(fulfillment: &[u8; 32]) -> [u8; 32] {
+/// condition it produces -- never reversed. Private: nothing in this crate
+/// mints a condition to put anywhere any more (issue #1269), so this is
+/// purely [`fulfillment_matches_condition`]'s own arithmetic.
+fn derive_condition(fulfillment: &[u8; 32]) -> [u8; 32] {
     Sha256::digest(fulfillment).into()
 }
 
-/// Whether `fulfillment` is the real preimage of `condition`:
-/// `sha256(fulfillment) == condition`. This is the one check that gives an
-/// execution condition economic force -- a hop is paid only when it holds a
-/// preimage that verifies, never on a downstream peer's or app's word alone.
+/// Whether `fulfillment` is the real preimage of `condition`, per RFC-0022's
+/// `condition = sha256(fulfillment)`. No packet in this connector carries a
+/// condition any more (issue #1269 / ADR 0069), so nothing here calls this
+/// today -- kept exported as the one piece of that relation this crate
+/// still states plainly, for a caller that holds a condition from elsewhere
+/// and needs to check a fulfilment against it.
 pub fn fulfillment_matches_condition(condition: &[u8; 32], fulfillment: &[u8; 32]) -> bool {
     derive_condition(fulfillment) == *condition
 }
@@ -126,18 +130,6 @@ mod tests {
 
     fn at(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, hh, mm, ss).unwrap()
-    }
-
-    #[test]
-    fn an_all_zero_condition_is_not_present() {
-        assert!(!condition_is_present(&[0u8; 32]));
-    }
-
-    #[test]
-    fn a_single_nonzero_byte_makes_a_condition_present() {
-        let mut condition = [0u8; 32];
-        condition[31] = 1;
-        assert!(condition_is_present(&condition));
     }
 
     #[test]
@@ -334,14 +326,6 @@ mod tests {
             if other != fulfillment {
                 prop_assert!(!fulfillment_matches_condition(&condition, &other));
             }
-        }
-
-        /// Presence is exactly "not all-zero", for every possible condition.
-        #[test]
-        fn presence_matches_the_all_zero_definition(
-            condition in proptest::array::uniform32(any::<u8>())
-        ) {
-            prop_assert_eq!(condition_is_present(&condition), condition != [0u8; 32]);
         }
 
         /// Expiry is a total order on the offset between `now` and

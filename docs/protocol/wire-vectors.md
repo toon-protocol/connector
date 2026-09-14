@@ -80,19 +80,20 @@ arbitrary plaintext (`any_plaintext_round_trips_through_seal_and_open_request`,
 `any_plaintext_round_trips_through_seal_and_open_response`) that generalize them past fixed
 byte strings.
 
-### 4. A derived fulfilment satisfies the condition its sender minted
+### 4. A derived fulfilment is deterministic and secret-specific
 
-For any shared secret, `derive_condition(derive_fulfillment(secret))` — sha256 of the HKDF output
-`connector_signer::giftwrap::derive_fulfillment` produces — equals the condition a sender who
-minted `derive_condition(derive_fulfillment(secret))` before sealing would have attached to the
-same packet, and only that exact fulfilment satisfies it
-(`connector_domain::condition::fulfillment_matches_condition`). This is two already-held
-invariants composed, not a new mechanism: `condition::tests::only_the_derived_preimage_matches_its_condition`
-holds for any 32 bytes, `giftwrap::tests::derive_fulfillment_is_deterministic_for_the_same_secret`
-holds for any secret, and
-`giftwrap::tests::a_terminating_connector_derives_the_same_fulfillment_the_sender_would` ties them
-to a genuine `seal_request`/`open_request` pair rather than to a secret handed to both sides out
-of band.
+For any shared secret, `derive_fulfillment(secret)` — the HKDF output
+`connector_signer::giftwrap::derive_fulfillment` produces — is the same value every time it is
+computed from that secret, and a different secret produces a different fulfilment. A terminating
+connector derives its answer this way (ADR 0019); the sender's own end-to-end check
+(`connector send`) compares a returned fulfilment against this same derivation over its own
+sealed secret, which is what catches a forged delivery now that the packet carries no execution
+condition to check it against instead (issue #1269 / ADR 0069).
+
+Held by `giftwrap::tests::derive_fulfillment_is_deterministic_for_the_same_secret` (any secret) and
+`giftwrap::tests::a_terminating_connector_derives_the_same_fulfillment_the_sender_would`, which ties
+determinism to a genuine `seal_request`/`open_request` pair rather than to a secret handed to both
+sides out of band.
 
 ### 5. A claim's EIP-712 `BalanceProof` digest recovers to its signer, under its own domain
 
@@ -116,7 +117,7 @@ domain's `chain_id`/`token_network_address`), and `the_evm_digest_is_determinist
 keys, secrets, nonces and payloads, not values sampled anew each run — and self-verifies each
 entry against the same functions these invariants name (an envelope vector is decoded back and
 compared before being serialized; a giftwrap vector is opened back with the receiver's own signer;
-a fulfilment vector's condition is checked against `fulfillment_matches_condition`; a claim
+a fulfilment vector's two secrets are checked to derive two different fulfilments; a claim
 vector's signature is checked against `verify_evm_balance_proof`) before writing it out.
 Regenerating (`cargo run -p connector-vectors --bin generate-vectors`) against an
 unchanged implementation is therefore a no-op — same fixtures through the same code always produce

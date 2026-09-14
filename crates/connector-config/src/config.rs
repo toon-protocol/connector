@@ -7,13 +7,20 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::client_channel::{resolve_client_channels, ClientChannelConfig, RawClientChannel};
+use crate::client_channel_asset::{resolve_client_channel_assets, ClientChannelAssets};
+use crate::denomination::{
+    resolve_denomination, DenominationConfig, RawRateGuards, RawRateRow, RawToken,
+};
 use crate::error::ConfigError;
 use crate::identity::{resolve_client_identities, ClientIdentityConfig, RawClientIdentity};
 use crate::node::{resolve_node, NodeConfig, RawNodeConfig};
 use crate::operator::{resolve_operator, OperatorConfig, RawOperatorConfig};
 use crate::pay_channel::{resolve_pay_channels, PayChannelConfig, RawPayChannel};
-use crate::peer::{parse_peer_exposure, resolve_peers, PeerConfig, PeerExposure, RawPeer};
+use crate::peer::{
+    is_onion_endpoint, parse_peer_exposure, resolve_peers, PeerConfig, PeerExposure, RawPeer,
+};
 use crate::peer_channel::{resolve_peer_channels, PeerChannelConfig, RawPeerChannel};
+use crate::peering_asset::{resolve_peering_assets, PeeringAssets};
 use crate::route::{resolve_routes, PeerRouteConfig, RawChild, RawRoute, StaticRoute};
 use crate::secret::{RawSignerConfig, SecretLocation};
 use crate::settlement::{
@@ -92,6 +99,27 @@ struct RawConfig {
     /// node.
     #[serde(default)]
     peer_allow_plaintext_endpoints: Option<bool>,
+    /// The one SOCKS5 proxy this node dials **onion** endpoints through
+    /// (ADR 0070 decision 3). Absent -- the default, and the shape of every
+    /// node that does not run an onion sidecar -- means every dial is
+    /// direct.
+    ///
+    /// The URL must be `socks5h://`, and the `h` is not a preference:
+    /// `socks5://` resolves the hostname locally before dialing, and no
+    /// local resolver resolves a `.onion` name. A node that started with
+    /// one would be a node whose onion peerings fail at dial time for a
+    /// reason nothing in its log explains, which is why the scheme is
+    /// [`ConfigError::SocksProxyScheme`] at load rather than a runtime
+    /// surprise.
+    ///
+    /// One key and one proxy: there is deliberately no per-peer `proxy =`
+    /// on `[[peers]]` and no all-outbound mode. Which dials take the proxy
+    /// is read off the endpoint's own host, so a second place to state it
+    /// would only be a second place to state it wrong. It covers the ILP
+    /// wire only -- settlement RPC and a route's `handler_url` dial direct
+    /// (ADR 0070 decision 4).
+    #[serde(default)]
+    socks_proxy: Option<String>,
     /// The peering relations this node has (issue #488; endpoint and
     /// per-relation terms, issue #677). What used to be a
     /// dialed `SocketAddr` is now an `endpoint` URL whose **scheme**
@@ -227,6 +255,28 @@ struct RawConfig {
     /// `1` is the original lockstep session.
     #[serde(default)]
     btp_session_window: Option<u32>,
+    /// The tokens this node **deals** (ADR 0071 decision 3, issue #1290),
+    /// one row each: the token's chain and contract identity, which of them
+    /// is the node's numeraire, and optionally where its price is read
+    /// from. Absent -- the default, and every config that predates ADR 0071
+    /// -- means this node deals nothing, crosses no denomination boundary,
+    /// and forwards exactly as it did before the table existed.
+    #[serde(default)]
+    tokens: Vec<RawToken>,
+    /// What this node declares about one **ordered** token pair (ADR 0071
+    /// decision 3): a static rate for a pair that cannot self-source, a
+    /// per-pair override of one that can, and per-pair guards over the
+    /// `[rate_guards]` defaults. Ordered, never sorted -- direction is the
+    /// trade, and `X -> Y` and `Y -> X` are different prices from one mid.
+    #[serde(default)]
+    rates: Vec<RawRateRow>,
+    /// This node's dealing policy (ADR 0071 decision 5): the `spread` it
+    /// earns, the `ttl` past which a rate is dead, and the `max_move` a
+    /// single refresh may not jump. Required as soon as anything can
+    /// produce a rate, because none of the three has a safe default; a
+    /// `[[rates]]` row overrides any of them for its own pair.
+    #[serde(default)]
+    rate_guards: Option<RawRateGuards>,
 }
 
 /// The client edge's own defaults for the unresolvable-lookup shaper
@@ -269,6 +319,7 @@ pub struct Config {
     peers: Vec<PeerConfig>,
     peer_expose: PeerExposure,
     peer_allow_plaintext_endpoints: bool,
+    socks_proxy: Option<Url>,
     peer_channels: Vec<PeerChannelConfig>,
     pay_channels: Vec<PayChannelConfig>,
     operator: Option<OperatorConfig>,
@@ -285,6 +336,9 @@ pub struct Config {
     unresolvable_lookup_window: Option<Duration>,
     unresolvable_lookup_max_wait: Option<Duration>,
     btp_session_window: Option<NonZeroU32>,
+    denomination: DenominationConfig,
+    peering_assets: PeeringAssets,
+    client_channel_assets: ClientChannelAssets,
 }
 
 impl Config {
@@ -320,6 +374,7 @@ impl Config {
         let (routes, peer_routes) = resolve_routes(raw.apex.as_deref(), raw.routes, raw.children)?;
         let peer_expose = parse_peer_exposure(raw.peer_expose)?;
         let peer_allow_plaintext_endpoints = raw.peer_allow_plaintext_endpoints.unwrap_or(false);
+        let socks_proxy = resolve_socks_proxy(raw.socks_proxy)?;
         let peers = resolve_peers(raw.peers, peer_expose, peer_allow_plaintext_endpoints)?;
         // Resolved before every channel table rather than beside the other
         // money tables below, for two reasons that are now one rule.
@@ -561,6 +616,42 @@ impl Config {
                 });
             }
         }
+        // ADR 0071 decisions 3 and 5 (issue #1290): the tokens this node
+        // deals, its numeraire, the rates and guards it has declared.
+        // Resolved against `settlement_tables` because a token's quote is
+        // read over its own chain's RPC endpoint, so a quote on a chain
+        // with no `[settlement.<chain>]` table is a poller that could never
+        // take its first reading -- refused here rather than logged
+        // forever. All three keys absent is the default value and checks
+        // nothing, which is what "a node that declares none of it behaves
+        // exactly as it does today" means here.
+        let denomination =
+            resolve_denomination(raw.tokens, raw.rates, raw.rate_guards, settlement_tables)?;
+        // ADR 0071 decision 1 (issue #1292): which of those declared tokens
+        // each peering's channels are denominated in, so that a forward can
+        // ask whether its two legs hold different ones without asking a
+        // chain. Last of the money tables, because it reads all of them --
+        // the peerings, both of their channel tables and the settlement
+        // tables those settle through -- and it holds every one of them to
+        // the declaration resolved immediately above. A node that declared
+        // no tokens resolves nothing here and is held to nothing.
+        let peering_assets = resolve_peering_assets(
+            &peers,
+            &peer_channels,
+            &pay_channels,
+            &settlements,
+            &denomination,
+        )?;
+        // ADR 0071 decision 1 (issue #1301): the same question asked of the
+        // client edge -- which declared token a channel a buyer pays over
+        // holds, so that a forward out of a client arrival crosses a
+        // boundary on the same terms a peer arrival does. After the
+        // peerings, so that a node whose peering already names an
+        // undeclared token is refused by the more specific message.
+        // Resolved from the settlement tables alone and keyed by chain,
+        // because the channel this has to cover is the one no
+        // `[[client_channels]]` row names (ADR 0052, issue #502).
+        let client_channel_assets = resolve_client_channel_assets(&settlements, &denomination)?;
         let state_dir = raw.state_dir.map(PathBuf::from);
         let channel_liveness_ttl = match raw.channel_liveness_ttl_secs {
             Some(0) => return Err(ConfigError::ZeroChannelLivenessTtl),
@@ -750,6 +841,7 @@ impl Config {
             peers,
             peer_expose,
             peer_allow_plaintext_endpoints,
+            socks_proxy,
             peer_channels,
             pay_channels,
             operator,
@@ -766,7 +858,56 @@ impl Config {
             unresolvable_lookup_window,
             unresolvable_lookup_max_wait,
             btp_session_window,
+            denomination,
+            peering_assets,
+            client_channel_assets,
         })
+    }
+
+    /// Everything this node declares about denomination (ADR 0071
+    /// decisions 3 and 5, issue #1290): the tokens it deals, its numeraire,
+    /// the rates and guards it has written down, and its node-wide dealing
+    /// policy.
+    ///
+    /// Always a value, never `None`: a node that declares none of it holds
+    /// the empty declaration, whose
+    /// [`declares_tokens`](DenominationConfig::declares_tokens) is `false`
+    /// and whose every lookup answers nothing. That is deliberately the
+    /// same answer an absent section would give, with one fewer question
+    /// for a caller to ask.
+    pub fn denomination(&self) -> &DenominationConfig {
+        &self.denomination
+    }
+
+    /// Which declared token each peering's channels are denominated in (ADR
+    /// 0071 decision 1, issue #1292) -- and therefore whether a forward
+    /// between two of them crosses a denomination boundary, which is the
+    /// one question a converting forward turns on.
+    ///
+    /// Always a value, and empty for every node that declares no
+    /// `[[tokens]]`: such a node resolves no peering, answers no boundary,
+    /// and forwards exactly as it did before ADR 0071. A node that does
+    /// declare tokens got every one of its peerings resolved here at boot,
+    /// so a reader on the packet path never has a chain to ask or a
+    /// refusal to make.
+    pub fn peering_assets(&self) -> &PeeringAssets {
+        &self.peering_assets
+    }
+
+    /// Which declared token a client channel this node accepts claims on is
+    /// denominated in (ADR 0071 decision 1, issue #1301) -- and therefore
+    /// whether a forward out of a buyer's own packet crosses a denomination
+    /// boundary, which is the same question [`Config::peering_assets`]
+    /// answers for a peer arrival.
+    ///
+    /// Always a value, and empty for every node that declares no
+    /// `[[tokens]]`: such a node resolves no channel, answers no boundary,
+    /// and forwards a client arrival exactly as it did before ADR 0071.
+    /// A node that does declare tokens got every chain it can be paid on
+    /// resolved here at boot -- including the chains whose channels no
+    /// `[[client_channels]]` row names, which is the point.
+    pub fn client_channel_assets(&self) -> &ClientChannelAssets {
+        &self.client_channel_assets
     }
 
     /// How long a chain-resolved client channel's liveness may be believed
@@ -879,15 +1020,36 @@ impl Config {
         self.peer_allow_plaintext_endpoints
     }
 
-    /// Every peering whose endpoint is plaintext, as `(peer id, endpoint)`
-    /// -- what a node with [`Config::peer_allow_plaintext_endpoints`] set
-    /// must name in its startup warning. Always empty when the switch is
-    /// off, because such an endpoint could not have loaded.
+    /// Every peering whose endpoint is plaintext **and unauthenticated**,
+    /// as `(peer id, endpoint)` -- what a node with
+    /// [`Config::peer_allow_plaintext_endpoints`] set must name in its
+    /// startup warning. Always empty when the switch is off, because no
+    /// other endpoint with a plaintext scheme could have loaded.
+    ///
+    /// An **onion endpoint** is excluded (ADR 0070), and its exclusion is
+    /// the difference between a true warning and a false one. A `.onion`
+    /// endpoint loads its plaintext scheme without the switch, so it would
+    /// otherwise be named by a warning whose text says the switch is set;
+    /// and its claims do not "cross the wire in the clear" -- the circuit
+    /// is encrypted and authenticated to the very key the address is.
     pub fn plaintext_peerings(&self) -> impl Iterator<Item = (&str, &Url)> {
         self.peers.iter().filter_map(|peer| {
             let endpoint = peer.endpoint()?;
-            matches!(endpoint.scheme(), "ws" | "http").then_some((peer.id(), endpoint))
+            (matches!(endpoint.scheme(), "ws" | "http") && !is_onion_endpoint(endpoint))
+                .then_some((peer.id(), endpoint))
         })
+    }
+
+    /// The one SOCKS5 proxy this node dials onion endpoints through (ADR
+    /// 0070 decision 3), or `None` -- the default -- when every dial is
+    /// direct.
+    ///
+    /// Always `socks5h://` when present: [`Config::load`] refuses any other
+    /// scheme, so a caller never has to ask whether this proxy resolves
+    /// names for it. Which dials use it is not configured anywhere -- it is
+    /// read off the endpoint's host, and it covers the ILP wire only.
+    pub fn socks_proxy(&self) -> Option<&Url> {
+        self.socks_proxy.as_ref()
     }
 
     /// The payment channels this node judges peer claims against (ADR
@@ -986,13 +1148,64 @@ impl Config {
     }
 }
 
+/// Parse the one `socks_proxy` value, if the file wrote one (ADR 0070
+/// decision 3).
+fn resolve_socks_proxy(raw: Option<String>) -> Result<Option<Url>, ConfigError> {
+    raw.map(|value| parse_socks_proxy(&value)).transpose()
+}
+
+/// **The** `socks_proxy` rule: what a SOCKS5 proxy URL has to be for this
+/// connector to dial an onion endpoint through it (ADR 0070 decision 3).
+///
+/// Three checks, and each is a load-time refusal on purpose, because every
+/// failure it prevents is silent:
+///
+/// * it has to parse as a URL -- the usual mistake is a bare `host:port`,
+///   which is exactly the shape every other SOCKS-taking tool accepts;
+/// * the scheme has to be `socks5h`. A `socks5://` proxy asks the *client*
+///   to resolve the hostname and hands the proxy an address, and nothing on
+///   this machine can resolve a `.onion` name -- so a node that accepted one
+///   would come up clean, serve, and then fail every onion dial with a
+///   resolver error naming a host the operator can see is spelled correctly;
+/// * it has to name a host. `socks5h` is not a *special* scheme in the URL
+///   standard, so -- unlike every `https://` value in a config file --
+///   `socks5h://` parses with an empty host, and `socks5h:9050` parses as a
+///   scheme plus an opaque path rather than as the `host:port` it looks
+///   like. Either would load and then fail every onion dial on a proxy
+///   address that is not one.
+///
+/// **Public because `connector send` takes the same value as a flag.** That
+/// verb loads no config file (ADR 0070 decision 5), so it cannot reach
+/// [`Config::socks_proxy`] -- but it must not reach a *second rule* either.
+/// It calls this and renders the [`ConfigError`] into its own usage error,
+/// so there is one implementation of what a proxy URL is and one set of
+/// reasons an operator is given for a bad one.
+pub fn parse_socks_proxy(value: &str) -> Result<Url, ConfigError> {
+    let url = Url::parse(value).map_err(|source| ConfigError::SocksProxyInvalidUrl {
+        value: value.to_string(),
+        source,
+    })?;
+    if url.scheme() != "socks5h" {
+        return Err(ConfigError::SocksProxyScheme {
+            value: value.to_string(),
+            scheme: url.scheme().to_string(),
+        });
+    }
+    if url.host_str().is_none() {
+        return Err(ConfigError::SocksProxyNoHost {
+            value: value.to_string(),
+        });
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::peer::{PeerCarriage, DEFAULT_MAX_PACKET_AMOUNT};
     use crate::route::TransportPolicy;
     use crate::settlement::SettlementChain;
-    use connector_domain::Price;
+    use connector_domain::{AssetId, Price};
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -1690,6 +1903,117 @@ client_edge_url = "https://store.example/ilp"
         assert_eq!(config.plaintext_peerings().count(), 0);
     }
 
+    /// A minimal config plus whatever lines `extra` adds -- enough to
+    /// exercise a top-level scalar without dragging a peering in, since
+    /// `socks_proxy` is a node-wide value and validating it needs no peer
+    /// at all.
+    fn load_with_extra(extra: &str) -> Result<Config, ConfigError> {
+        with_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+{extra}
+
+[signer]
+key_file = "{}"
+"#,
+                key_path.display()
+            )
+        })
+    }
+
+    /// ADR 0070 decision 3: the one proxy an operator writes down loads and
+    /// reads back off the loaded `Config`, unchanged.
+    #[test]
+    fn loads_a_socks5h_proxy() {
+        let config = load_with_extra(r#"socks_proxy = "socks5h://127.0.0.1:9050""#).expect("load");
+
+        assert_eq!(
+            config.socks_proxy().map(Url::as_str),
+            Some("socks5h://127.0.0.1:9050")
+        );
+    }
+
+    /// Absent is the default and the shape of every node that does not run
+    /// an onion sidecar -- which is every committed config in this
+    /// repository.
+    #[test]
+    fn a_config_with_no_socks_proxy_dials_direct() {
+        let config = load_with_extra("").expect("load");
+
+        assert!(config.socks_proxy().is_none());
+    }
+
+    /// The refusal ADR 0070 decision 3 exists for. `socks5://` is what
+    /// every other SOCKS-taking tool spells, and it is the one value that
+    /// would load and then break exactly the peerings the proxy was
+    /// configured for -- so the message has to carry the reason, not just
+    /// the rule.
+    #[test]
+    fn rejects_a_socks_proxy_whose_scheme_drops_the_h() {
+        for written in ["socks5://127.0.0.1:9050", "http://127.0.0.1:9050"] {
+            let result = load_with_extra(&format!("socks_proxy = \"{written}\""));
+
+            let message = expect_error(
+                result,
+                |error| matches!(error, ConfigError::SocksProxyScheme { value, .. } if value == written),
+            );
+            assert!(
+                message.contains("socks5h")
+                    && message.contains(".onion")
+                    && message.contains("LOCALLY"),
+                "the message must say why the 'h' is not a preference, got: {message}"
+            );
+        }
+    }
+
+    /// A separate variant from the scheme error, for the same reason a peer
+    /// endpoint has two: "you wrote a bare host:port" and "you wrote the
+    /// wrong scheme" are different mistakes with different fixes. This is
+    /// also the verdict `documented_config_keys.rs`'s probe gets when it
+    /// hands the key its dummy value, so it must not read as a key the
+    /// parser does not know.
+    #[test]
+    fn rejects_a_socks_proxy_that_is_not_a_url_at_all() {
+        let result = load_with_extra(r#"socks_proxy = "127.0.0.1:9050""#);
+
+        let message = expect_error(
+            result,
+            |error| matches!(error, ConfigError::SocksProxyInvalidUrl { value, .. } if value == "127.0.0.1:9050"),
+        );
+        let lowered = message.to_lowercase();
+        assert!(
+            !lowered.contains("unknown field") && !lowered.contains("was removed"),
+            "socks_proxy is a key this parser knows; its message must not read as one it \
+             does not, got: {message}"
+        );
+    }
+
+    /// A value that parses but names no proxy is refused too. `socks5h` is
+    /// not a *special* URL scheme, so both of these load as far as `Url` is
+    /// concerned -- and a loaded `Config` is supposed to need no further
+    /// validation anywhere (ADR 0009), so "it parsed" is not the bar.
+    #[test]
+    fn rejects_a_socks_proxy_that_names_no_host() {
+        for written in [
+            // The scheme and nothing else.
+            "socks5h://",
+            // Looks like a `host:port`, and is a scheme plus an opaque
+            // path -- the likelier of the two to be written by hand.
+            "socks5h:9050",
+        ] {
+            let result = load_with_extra(&format!("socks_proxy = \"{written}\""));
+            let message = expect_error(
+                result,
+                |error| matches!(error, ConfigError::SocksProxyNoHost { value } if value == written),
+            );
+            assert!(
+                message.contains("socks5h://<host>:<port>"),
+                "the message has to show the shape that works, got: {message}"
+            );
+        }
+    }
+
     /// The old shape was a `SocketAddr`, so URL parsing is new and its
     /// failures need a name of their own -- separate from the scheme
     /// error, because "you wrote a host:port" and "you wrote the wrong
@@ -1931,6 +2255,422 @@ counterparty_key = "{SOLANA_COUNTERPARTY_KEY}"
             |error| matches!(error, ConfigError::PeerChannelWithoutSolanaSettlement { peer_id } if peer_id == "store"),
         );
         assert!(message.contains("[settlement.solana]"), "got: {message}");
+    }
+
+    // -- a peering resolves to the token its channel holds (ADR 0071
+    // decision 1, issue #1292) --
+    //
+    // File-level proofs, because the rule is cross-table and no part of it
+    // is inside `[[peer_channels]]`: the token comes from the `[settlement]`
+    // table that peering's channels settle through, and whether it is a
+    // token this node deals comes from `[[tokens]]`.
+
+    /// The ERC-20 `evm_settlement` names, spelled as a `[[tokens]]` row
+    /// names one. Checksummed on purpose: a config file is where an
+    /// explorer's spelling gets pasted, and an `AssetId` reads it and the
+    /// lowercase one as a single token.
+    const SETTLEMENT_TOKEN: &str = "evm:0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
+    /// USDC on Base -- some other ERC-20. Declared alone, it makes a node
+    /// that deals a token none of its peerings hold.
+    const OTHER_TOKEN: &str = "evm:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    /// USDC on Solana, the mint `[settlement.solana]` names below.
+    const SOLANA_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+    /// One `[[tokens]]` row per asset, and nothing else: no rate, no quote,
+    /// and therefore no `[rate_guards]` needed (issue #1290). Declaring
+    /// tokens alone is exactly what a node crossing chains in one asset
+    /// writes, and it is the smallest declaration that turns the rule on.
+    fn declaring(assets: &[&str]) -> String {
+        assets
+            .iter()
+            .map(|asset| format!("\n[[tokens]]\nasset = \"{asset}\"\n"))
+            .collect()
+    }
+
+    /// Both settlement tables at once -- `local/solo`'s shape, and what a
+    /// node whose peerings sit on two chains needs before either can be
+    /// read as a token.
+    fn both_settlements(key_path: &Path) -> String {
+        format!(
+            r#"{evm}
+[settlement.solana]
+rpc_url = "https://api.devnet.solana.com"
+program_id = "{SOLANA_PROGRAM_ID}"
+token_address = "{SOLANA_MINT}"
+decimals = 6
+
+[settlement.solana.key]
+key_file = "{key_file}"
+"#,
+            evm = evm_settlement(key_path),
+            key_file = key_path.display(),
+        )
+    }
+
+    /// Two peerings on two chains -- `local/mixed-chain`'s middle node, in
+    /// miniature: one bound to an EVM channel, one to a Solana channel, on
+    /// a node settling on both. The shape a converting forward reads, since
+    /// the two peerings are denominated in two different tokens.
+    fn peerings_on_two_chains(key_path: &Path, state_dir: &Path, declaration: &str) -> String {
+        format!(
+            r#"
+client_edge_addr = "127.0.0.1:3000"
+peer_expose = "btp"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+{settlements}
+[[peers]]
+id = "from-evm"
+endpoint = "wss://evm.example:443/btp"
+
+[[peers]]
+id = "to-solana"
+endpoint = "wss://solana.example:443/btp"
+
+[[peer_channels]]
+peer_id = "from-evm"
+channel_id = "{PEER_CHANNEL}"
+counterparty_key = "{PEER_KEY}"
+chain_id = 31337
+token_network = "{PEER_TOKEN_NETWORK}"
+
+[[peer_channels]]
+peer_id = "to-solana"
+channel_account = "{SOLANA_CHANNEL_ACCOUNT}"
+counterparty_key = "{SOLANA_COUNTERPARTY_KEY}"
+{declaration}
+"#,
+            state_dir = state_dir.display(),
+            key_file = key_path.display(),
+            settlements = both_settlements(key_path),
+        )
+    }
+
+    /// The same two channels bound to **one** peering: an EVM row and a
+    /// Solana row both naming `store`. It loads today, and it is the shape
+    /// that has no single unit.
+    fn one_peering_on_two_chains(key_path: &Path, state_dir: &Path, declaration: &str) -> String {
+        peerings_on_two_chains(key_path, state_dir, declaration)
+            .replace("peer_id = \"to-solana\"", "peer_id = \"from-evm\"")
+            .replace(
+                "\n[[peers]]\nid = \"to-solana\"\nendpoint = \"wss://solana.example:443/btp\"\n",
+                "",
+            )
+    }
+
+    fn load_text(text: &str) -> Result<Config, ConfigError> {
+        Config::from_toml_str(text, Path::new("test.toml"))
+    }
+
+    /// The acceptance criterion itself: a config declaring tokens resolves
+    /// every peering to exactly one of them, from loaded config alone --
+    /// the `TokenNetwork` its `[[peer_channels]]` row names is never read,
+    /// and no chain is asked.
+    #[test]
+    fn a_peering_resolves_to_the_declared_token_its_channels_hold() {
+        let config =
+            load_peering(|text| format!("{text}{}", declaring(&[SETTLEMENT_TOKEN]))).expect("load");
+
+        let resolved = config.peering_assets();
+        assert!(!resolved.is_empty());
+        assert_eq!(
+            resolved.asset("store").map(ToString::to_string),
+            Some(SETTLEMENT_TOKEN.to_ascii_lowercase()),
+            "the peering holds what [settlement.evm] settles in, however the row spelled it"
+        );
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|(peer_id, _)| peer_id)
+                .collect::<Vec<_>>(),
+            vec!["store"]
+        );
+        // A peering with itself is not a boundary, whatever it holds.
+        assert_eq!(resolved.boundary_between("store", "store"), None);
+    }
+
+    /// The rule that protects every node not doing any of this: no
+    /// `[[tokens]]`, nothing resolved, no new required key and no new
+    /// refusal -- the same peering config loads, unchanged, and this is the
+    /// shape every fixture in this repository is committed in.
+    #[test]
+    fn a_node_that_declares_no_tokens_resolves_no_peering() {
+        let config = load_peering(|text| text).expect("load");
+
+        assert!(config.peering_assets().is_empty());
+        assert_eq!(config.peering_assets().asset("store"), None);
+        assert_eq!(
+            config.peering_assets().boundary_between("store", "store"),
+            None
+        );
+    }
+
+    /// A node that deals is held to it: a peering whose token it never
+    /// declared is refused at boot, naming the peering and the token it
+    /// holds, rather than reaching a forward that cannot say what unit it
+    /// is carrying.
+    #[test]
+    fn a_peering_holding_an_undeclared_token_is_refused_by_name() {
+        let result = load_peering(|text| format!("{text}{}", declaring(&[OTHER_TOKEN])));
+
+        let message = expect_error(result, |error| {
+            matches!(
+                error,
+                ConfigError::PeeringTokenNotDeclared { peer_id, asset }
+                    if peer_id == "store"
+                        && asset.to_string() == SETTLEMENT_TOKEN.to_ascii_lowercase()
+            )
+        });
+        assert!(
+            message.contains("'store'")
+                && message.contains(&SETTLEMENT_TOKEN.to_ascii_lowercase())
+                && message.contains("[[tokens]]"),
+            "got: {message}"
+        );
+    }
+
+    /// The ordered pair issue #1295 asks for, on the shape it asks it of:
+    /// two peerings on two chains hold two tokens, and the answer comes
+    /// back in the order asked -- direction is the trade, and the reverse
+    /// pair is a different price.
+    #[test]
+    fn two_peerings_on_two_chains_are_an_ordered_pair_of_tokens() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let solana_token = format!("solana:{SOLANA_MINT}");
+        let config = load_text(&peerings_on_two_chains(
+            key_file.path(),
+            state_dir.path(),
+            &declaring(&[SETTLEMENT_TOKEN, &solana_token]),
+        ))
+        .expect("load");
+
+        let resolved = config.peering_assets();
+        let evm: AssetId = SETTLEMENT_TOKEN.parse().expect("an asset");
+        let solana: AssetId = solana_token.parse().expect("an asset");
+        assert_eq!(resolved.asset("from-evm"), Some(&evm));
+        assert_eq!(resolved.asset("to-solana"), Some(&solana));
+        assert_eq!(
+            resolved.boundary_between("from-evm", "to-solana"),
+            Some((&evm, &solana))
+        );
+        assert_eq!(
+            resolved.boundary_between("to-solana", "from-evm"),
+            Some((&solana, &evm))
+        );
+    }
+
+    /// One peering, two chains, two tokens: refused, because a packet's
+    /// amount is denominated by the channel it rides and this peering rides
+    /// two. Reachable from a file that loads today, which is why it is a
+    /// named refusal rather than an assumption.
+    #[test]
+    fn one_peering_whose_channels_sit_on_two_chains_is_refused_by_name() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let solana_token = format!("solana:{SOLANA_MINT}");
+        let result = load_text(&one_peering_on_two_chains(
+            key_file.path(),
+            state_dir.path(),
+            &declaring(&[SETTLEMENT_TOKEN, &solana_token]),
+        ));
+
+        let message = expect_error(result, |error| {
+            matches!(
+                error,
+                ConfigError::PeeringTokenAmbiguous { peer_id, .. } if peer_id == "from-evm"
+            )
+        });
+        assert!(
+            message.contains("two tokens")
+                && message.contains(&SETTLEMENT_TOKEN.to_ascii_lowercase())
+                && message.contains(SOLANA_MINT),
+            "got: {message}"
+        );
+    }
+
+    /// And the same two-chain file with no `[[tokens]]` at all loads, as it
+    /// always has: the ambiguity is only a problem for a node that has to
+    /// name a unit, and a node that deals nothing never does.
+    #[test]
+    fn one_peering_on_two_chains_still_loads_when_nothing_is_declared() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let config = load_text(&one_peering_on_two_chains(
+            key_file.path(),
+            state_dir.path(),
+            "",
+        ))
+        .expect("a node that declares nothing is held to nothing");
+
+        assert!(config.peering_assets().is_empty());
+    }
+
+    // -- a client channel resolves to the token its chain settles in (ADR
+    // 0071 decision 1, issue #1301) --
+    //
+    // The client edge's half of the rule above, and keyed by CHAIN rather
+    // than by declared row: a `[settlement.<chain>]` table is what lets
+    // this node accept a claim on a channel no `[[client_channels]]` row
+    // names (ADR 0052, issue #502), so every chain with such a table can
+    // carry an arrival a forward has to denominate.
+
+    /// A channel key exactly as
+    /// `connector_domain::client_claim::ClientClaim::channel_key` renders
+    /// one, on a channel this file never mentions. That is the point: the
+    /// id is not read, only the namespace before the colon.
+    const UNDECLARED_EVM_CHANNEL_KEY: &str =
+        "evm:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// [`peering_config`] plus a second settlement table and a
+    /// `[[client_channels]]` row on it -- an EVM peering and a Solana
+    /// client edge, which is the shape that separates the two rules: the
+    /// peering resolves against the EVM token and the client channel
+    /// against the Solana one.
+    fn client_channel_on_a_second_chain(key_path: &Path, declaration: &str) -> String {
+        format!(
+            r#"
+[settlement.solana]
+rpc_url = "https://api.devnet.solana.com"
+program_id = "{SOLANA_PROGRAM_ID}"
+token_address = "{SOLANA_MINT}"
+decimals = 6
+
+[settlement.solana.key]
+key_file = "{key_file}"
+
+[[client_channels]]
+channel_account = "{SOLANA_CHANNEL_ACCOUNT}"
+counterparty = "{SOLANA_COUNTERPARTY_KEY}"
+{declaration}"#,
+            key_file = key_path.display(),
+        )
+    }
+
+    /// The acceptance criterion: a client arrival resolves to the declared
+    /// token its channel holds, read off `[settlement.<chain>] token_address`
+    /// and nothing declared a second time -- the same rule the peering
+    /// table already uses, asked of the client edge.
+    #[test]
+    fn a_client_channel_resolves_to_the_declared_token_its_chain_settles_in() {
+        let config =
+            load_peering(|text| format!("{text}{}", declaring(&[SETTLEMENT_TOKEN]))).expect("load");
+
+        let resolved = config.client_channel_assets();
+        assert!(!resolved.is_empty());
+        assert_eq!(
+            resolved
+                .asset(UNDECLARED_EVM_CHANNEL_KEY)
+                .map(ToString::to_string),
+            Some(SETTLEMENT_TOKEN.to_ascii_lowercase()),
+            "a channel on the EVM chain holds what [settlement.evm] settles in -- including a \
+             channel this file never named, which is the one this rule exists for"
+        );
+        assert_eq!(
+            resolved.asset(&format!("solana:{SOLANA_CHANNEL_ACCOUNT}")),
+            None,
+            "no [settlement.solana] table, so no claim on a Solana channel could be admitted \
+             here and there is nothing to resolve"
+        );
+    }
+
+    /// The rule that protects every node not doing any of this, restated
+    /// for the client edge: no `[[tokens]]`, nothing resolved, and the same
+    /// file loads unchanged. This is the shape every config in this
+    /// repository is committed in.
+    #[test]
+    fn a_node_that_declares_no_tokens_resolves_no_client_channel() {
+        let config = load_peering(|text| text).expect("load");
+
+        assert!(config.client_channel_assets().is_empty());
+        assert_eq!(
+            config
+                .client_channel_assets()
+                .asset(UNDECLARED_EVM_CHANNEL_KEY),
+            None
+        );
+    }
+
+    /// A node that deals is held to it. The peering here resolves fine --
+    /// its EVM token is declared -- and the refusal is about the chain the
+    /// CLIENT EDGE can be paid on, which nothing else in the file would
+    /// have caught. Unresolved, a buyer paying over that chain would have
+    /// forwarded across a real boundary at an implied 1:1.
+    #[test]
+    fn a_client_channel_chain_holding_an_undeclared_token_is_refused_by_name() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let text = peering_config(
+            key_file.path(),
+            state_dir.path(),
+            &client_channel_on_a_second_chain(key_file.path(), &declaring(&[SETTLEMENT_TOKEN])),
+        );
+
+        let message = expect_error(load_text(&text), |error| {
+            matches!(
+                error,
+                ConfigError::ClientChannelTokenNotDeclared { chain, asset }
+                    if *chain == SettlementChain::Solana
+                        && asset.to_string() == format!("solana:{SOLANA_MINT}")
+            )
+        });
+        assert!(
+            message.contains("solana")
+                && message.contains(SOLANA_MINT)
+                && message.contains("[[tokens]]"),
+            "got: {message}"
+        );
+    }
+
+    /// And declaring that chain's token is what makes the same file load --
+    /// both chains resolved, each to its own settlement table's token, so
+    /// every arrival this node can be paid on has a unit.
+    #[test]
+    fn declaring_both_chains_tokens_resolves_both_client_edges() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let solana_token = format!("solana:{SOLANA_MINT}");
+        let text = peering_config(
+            key_file.path(),
+            state_dir.path(),
+            &client_channel_on_a_second_chain(
+                key_file.path(),
+                &declaring(&[SETTLEMENT_TOKEN, &solana_token]),
+            ),
+        );
+
+        let config = load_text(&text).expect("load");
+
+        let resolved = config.client_channel_assets();
+        assert_eq!(
+            resolved
+                .asset(UNDECLARED_EVM_CHANNEL_KEY)
+                .map(ToString::to_string),
+            Some(SETTLEMENT_TOKEN.to_ascii_lowercase())
+        );
+        assert_eq!(
+            resolved
+                .asset(&format!("solana:{SOLANA_CHANNEL_ACCOUNT}"))
+                .map(ToString::to_string),
+            Some(solana_token)
+        );
     }
 
     // -- "the settlement table this channel needs is absent" (issue #1138)

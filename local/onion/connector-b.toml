@@ -1,0 +1,146 @@
+# =============================================================================
+# local/onion -- connector B, the node that is reachable ONLY at a
+# hidden-service address.
+#
+# LOCAL / DEV ONLY. `infra/linode-*` owns devnet; nothing here is deployed,
+# published or SSH'd anywhere, and every chain this file names is disposable.
+#
+# THE .anyone HOST BELOW IS A PLACEHOLDER, and it is committed as one on
+# purpose (ADR 0070 decision 7). The `anon` daemon generates the real address
+# into its `HiddenServiceDir/hostname` the first time it runs, and the OPERATOR
+# copies it into `[node]` and into the dialing node's peer `endpoint`. The
+# connector never reads that file and never speaks the daemon's control
+# protocol. `local/keys.sh onion` plays the operator here: it starts the
+# sidecar, reads the address, and renders this file with the address
+# substituted into `local/.keys/onion/connector-b/connector.toml`, which is
+# what compose actually mounts. A placeholder still ENDS IN `.anyone`, so this
+# committed file loads through the real parser and stays worth committing --
+# `local_topologies_load.rs` reads exactly these bytes.
+#
+# `.anyone` is the TLD the daemon `local/anon-image` pins actually writes:
+# `anon` renamed it, and this repository was on the older side of that rename
+# until issue #1284. The connector accepts `.onion` too -- one suffix rule,
+# `is_onion_endpoint` -- so a node still running the older daemon peers
+# unchanged.
+#
+# WHAT THIS NODE HAS THAT NO OTHER NODE UNDER local/ HAS: no clearnet address
+# at all. It sits on its own docker network with no route to the node that
+# dials it, and nothing publishes a host port for it. The only door is the
+# circuit.
+# =============================================================================
+
+client_edge_addr = "0.0.0.0:3000"
+
+# The peer claim ledger's home. This is the node that RECEIVES claims, so this
+# is the file the rehearsal reads to prove the peering was actually paid rather
+# than merely traversed (`peer-claims.log`, written by `ClaimBook`).
+state_dir = "/app/state"
+
+# CF-17: a peer carriage rides this node's own listener, told apart from a
+# client by authentication rather than by port -- there is no second socket
+# (ADR 0027) and, here, no second onion service either. `HiddenServicePort 80
+# connector-b:3000` publishes ONE port, and both `GET /ilp/btp` (the peering)
+# and `POST /ilp` (the client edge A asks for claim-state on) are behind it.
+# That is ADR 0070's whole claim restated as a deployment: an onion address is
+# a HOST, so it changes where bytes are addressed and nothing about what is
+# listening.
+#
+# `"btp"` rather than `"both"`, and that choice is what makes the rehearsal's
+# journal read evidence of the CARRIAGE as well as of the money: no
+# ILP-over-HTTP peer carriage is mounted on this node at all, so an A that
+# somehow arrived over `POST /ilp` would be admitted as an ordinary client,
+# whose claims never reach the peer book. An accepted peer claim in this node's
+# journal therefore cannot have arrived on anything but a BTP frame -- over the
+# circuit, because there is no other route to this container.
+peer_expose = "btp"
+
+[signer]
+key_file = "/app/data/signer.key"
+
+# ── The terminated route ─────────────────────────────────────────────────────
+# `stub-app` is the connector image's second binary: it answers `POST /`, holds
+# no secret and performs no cryptography, so it supplies nothing toward the
+# packet's fulfilment -- the connector derives that itself from the sealed
+# request (ADR 0019). It sits on THIS node's network, which is the other half
+# of what makes a fulfilled packet evidence: the sender cannot reach it either.
+#
+# `price = 1000`: this node both TERMINATES and PRICES this route, so a peer
+# PREPARE that arrives without a claim covering the price is refused `F06` with
+# the x402 greeting (`peer-carriage-spec.md` §3.1, issue #880). A covers each
+# PREPARE before it is sent (`[[pay_channels]]` on A, ADR 0042 item 2), which
+# is what makes that figure payable rather than a deadlock -- `two-hop`'s two
+# files carry the long version of that argument and nothing about it changes
+# because the wire is a circuit.
+[[routes]]
+prefix = "g.local.onion.b.app"
+handler_url = "http://stub-app:3100/"
+price = 1000
+
+# ── The peering ──────────────────────────────────────────────────────────────
+# No `endpoint`: A dials us, at the address `[node]` publishes below.
+[[peers]]
+id = "a-b"
+
+# The other half of A's row. Same channel, same EIP-712 domain, and the
+# `counterparty_key` pointed the other way: this is A's SETTLEMENT address,
+# whose signature this node accepts on a claim for this channel -- never the
+# signer address the claim declares about itself (CF-23).
+#
+# Note what is NOT here: nothing in this table, or anywhere else on the peer
+# path, mentions the carriage or the circuit. A claim carried over an onion
+# peering is judged by the same claim book under the same domain, which is
+# ADR 0070's "an onion address is a host" measured at the money layer.
+[[peer_channels]]
+peer_id = "a-b"
+channel_id = "0x339280164c007798a2c4ba9e7752d542dccd586866c53937f41f29702cbae801"
+counterparty_key = "0xBcd4042DE499D14e55001CcbB24a551F3b954096"
+chain_id = 31337
+token_network = "0xCafac3dD18aC6c6e92c921884f9E4176737C052c"
+
+# ── What this node cannot introspect about itself (ADR 0050, ADR 0070) ───────
+# The three facts a process cannot discover: the ILP addresses it answers for
+# and the two endpoints it is reachable at. THE ADDRESSES BELOW ARE THE
+# PLACEHOLDER; `local/keys.sh onion` substitutes the daemon's real one.
+#
+# NO NEW KEY (ADR 0070 decision 6): a hidden-service URL is a legal value for
+# the `http_endpoint` and `btp_endpoint` this section already had, and issue
+# #1220's rule holds unmodified -- `btp_endpoint` is required exactly because
+# `peer_expose` opens a BTP peer listener, and `http_endpoint` is required
+# whenever any carriage is exposed, because a peer covering a forward to this
+# node asks its client edge for claim-state over plain HTTP whichever carriage
+# the packet rides (issue #1217).
+#
+# Both are plaintext, and neither needs `peer_allow_plaintext_endpoints`. A v3
+# onion address IS the ed25519 public key the circuit is authenticated to, so a
+# client that reached this host reached the holder of that key or reached
+# nothing -- ADR 0004's wire-authentication requirement satisfied by a
+# different mechanism rather than waived (ADR 0070 decision 2).
+[node]
+addresses = ["g.local.onion.b"]
+http_endpoint = "http://placeholderplaceholderplaceholderplaceholderplaceholderb.anyone/ilp"
+btp_endpoint = "ws://placeholderplaceholderplaceholderplaceholderplaceholderb.anyone/ilp/btp"
+
+# No `[operator]` section, deliberately (CF-31): an absent table means the
+# surface is not started at all. Nothing sends to this node directly -- the
+# rehearsal hands its packet to A -- so an operator surface here would be an
+# unused authenticated endpoint with two more key files behind it.
+
+# ── Settlement: EVM only ─────────────────────────────────────────────────────
+# The same registry, token and decimals A names, and dialed DIRECT. ADR 0070
+# decision 4 is explicit that the proxy covers the ILP wire only: this node
+# reaches `anvil` from its real address, and so would a public RPC provider on
+# a real deployment. An onion endpoint hides where a node is reachable and
+# nothing else.
+#
+# `anvil` is the one service on both docker networks here, and it is not a
+# route between them: a container attached to two bridges forwards nothing
+# between them, and neither of these connectors is configured to reach the
+# other by anything but the address above.
+[settlement.evm]
+rpc_url = "http://anvil:8545"
+contract_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+token_address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+decimals = 6
+
+[settlement.evm.key]
+key_file = "/app/data/settlement.key"

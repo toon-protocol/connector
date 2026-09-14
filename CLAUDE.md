@@ -103,14 +103,27 @@ PRs touching the crates, the Dockerfile, the compose files, the contracts or
 `local/` itself — the path filter is there because a docs-only change elsewhere
 cannot break it and the image build is the expensive part.
 
-There are three topologies, chosen with `LOCAL_TOPOLOGY` (default `solo`), and CI
-runs all three: `solo` (one node, both settlement backends live at once),
-`two-hop` (two nodes peered over ILP-over-HTTP on anvil) and `mixed-chain` (three
+There are five topologies, chosen with `LOCAL_TOPOLOGY` (default `solo`), and CI
+runs four of them: `solo` (one node, both settlement backends live at once),
+`two-hop` (two nodes peered over ILP-over-HTTP on anvil), `mixed-chain` (three
 nodes, EVM on one leg and Solana on the other, with the middle node holding both
-backends). The peered two do not stop at delivery — they cross the peering more
-than once and then read the payee's own claim journal, because a peer claim's
+backends) and `dealing` (ADR 0071 — `mixed-chain`'s shape with the middle node
+**dealing**: 6-decimal mock USDC in, a 9-decimal mock SPL token out, converted at
+a rate it declares, and the only committed config here that declares
+`[[tokens]]`). The fifth is `onion` (ADR 0070): two nodes, each with a real `anon`
+sidecar, on separate docker networks with **no route between them**, so that a
+fulfilled packet is evidence of a circuit rather than of a docker network. It is
+deliberately **off** the CI gate and must stay off it — a gate that goes red when
+a third-party anonymity network has a bad day is this repository's run-or-fail-loudly
+rule inverted rather than honoured — so run it by hand with
+`make local-verify LOCAL_TOPOLOGY=onion`. The peered four do not stop at
+delivery — they cross the peering more than once and then read the payee's own
+claim journal, because a peer claim's
 verdict rides back in `Toon-Claim-Ack` and never gates the packet, so
-`--expect-fulfill` alone would go green over a peering carrying traffic for free.
+`--expect-fulfill` alone would go green over a peering carrying traffic for free
+— and on `dealing` it would go green over a boundary converting at the wrong
+rate, so that one asserts the **converted** figure rather than that a claim
+exists.
 `local/README.md` is the long version, and is worth reading before editing
 anything under `local/`.
 
@@ -132,6 +145,9 @@ operator tool, not a client SDK: it holds no channel and signs no claim.
 `--expect-fulfill` makes a non-fulfilled packet a non-zero exit, which is what makes
 the rehearsal a gate rather than a report. `--print-keyid` answers "what value goes
 in this node's `[operator] write_keys`" from the binary that will do the signing.
+`--socks-proxy <socks5h-url>` is how it probes an onion node: the verb loads no config
+file, so the node's `socks_proxy` key cannot reach it, and the flag applies the same
+host-selected rule to both `--operator` and `--seal-to`.
 
 ## Keys
 
@@ -222,8 +238,22 @@ there is no separate deployer key to lose — which is what happened to the mint
 before 2026-08, killing that leg with no repair path. The faucet is a separate
 service and is not part of the connector.
 
-**Mainnet.** Nothing here funds it and no mainnet deployment exists. The Solana
-mint script and the local topology are devnet-and-below only.
+**Mainnet.** The contracts are live on Base mainnet (2026-09-01,
+`packages/contracts/deployments/base-mainnet.md`) and the payment-channel program on
+Solana mainnet-beta (2026-08-14, `packages/solana-program/deployments/mainnet-beta.md`),
+both against Circle's native USDC and both deployed by hand. One third-party operator's
+node — Drew Pierson's — uses them; this repository's fleet does not. Nothing here funds
+a mainnet node: it funds itself. The Solana mint script and the local topology are
+devnet-and-below only.
+
+**How anyone earns.** There is no protocol fee and no mechanism for one. A
+terminating operator keeps its route's whole `price`; a connector that carries
+someone else's packet keeps a flat per-packet `fee` on the peering it crossed (ADR
+0010, ADR 0061), paid by the caller as part of the path's cost — never deducted from
+the terminating price, which `price − fee ≥ next hop price` protects. Those routing
+fees, earned by the connectors Drew runs, are TOON's business model. A change that
+takes value off a path without a peering's `fee` saying so is a change to that model,
+not a refactor.
 
 ## Environments
 
@@ -231,16 +261,18 @@ mint script and the local topology are devnet-and-below only.
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **local**      | `docker-compose.yml` chain profiles, and the connector image run against them — that is `local/`. Disposable, funded from genesis, no shared state.                                                                                                                                                                                                                                                                                                                     |
 | **devnet**     | Two Linode boxes — relay and store (`ario`) — plus a connector-less faucet box. The relay and store boxes deploy the connector from their OWN repos' `deploy/` bundles (`toon-protocol/relay`, `toon-protocol/store`), each pinning it by release handle in one place (ADR 0068). `infra/linode-relay/` and `infra/linode-store/` are fixtures this repo's tests boot, not what either box runs. The faucet box still deploys from `infra/linode-faucet/` in this repo. |
-| **production** | **Named and empty** (ADR 0056). No machines, no mainnet contracts, no keys, no deploy. Its one artefact is `deploy/connector-rust/connector.production.toml`, a skeleton in which every value is invalid on purpose.                                                                                                                                                                                                                                                    |
+| **production** | The **fleet's** production tier is **named and empty** (ADR 0056): no fleet machine, no fleet key, no deploy. Its one artefact is `deploy/connector-rust/connector.production.toml`, a skeleton in which every value is invalid on purpose. Mainnet contracts exist (see "Where money comes from"), but they are run by a third-party operator, not by this tier.                                                                                                       |
 
-Production is blocked on two deployments, not on configuration: `packages/contracts`
-has never been deployed to an EVM mainnet, so there is no `TokenNetworkRegistry` to
-name, and the Solana payment-channel program is devnet-only — and ADR 0053 binds the
-settlement program into a claim's signed message, so a mainnet node naming the devnet
-program takes money for claims it can never redeem. Do not fill the skeleton in, and
-do not put it under `infra/`: those are gate-checked fixtures, not a place to add a
-file that must never load.
+ADR 0056 was written when no mainnet contract existed and says it is superseded, not
+amended, the moment one is; the mainnet deployments above made its "no mainnet
+contract" half false before any successor record landed. Its fleet half still holds.
+Do not fill the skeleton in, and do not put it under `infra/`: those are gate-checked
+fixtures, not a place to add a file that must never load.
 `crates/connector-bin/tests/production_skeleton_is_inert.rs` fails the build on either.
+A node pointed at mainnet takes its addresses from the deployment records, never from
+the devnet table: ADR 0053 binds the settlement program into a claim's signed message,
+and the mainnet program id (`8e7Bhzyd…`) is unrelated to the devnet one, so a mainnet
+node naming the devnet program takes money for claims it can never redeem.
 
 **Nothing in this repository moves a tag onto the relay or store box (ADR 0068).**
 `:rust-release` used to be a promotion tag, moved only by an explicit
@@ -273,6 +305,43 @@ Because the binary and a box's bind-mounted TOML are a matched pair in both
 directions, adding a required config key is a **breaking deploy** wherever that pair
 lives — for relay and store, that discipline is now each node repo's own to keep.
 
+An **onion endpoint** is a host, not a carriage (ADR 0070, amended by #1284). A peer
+`endpoint` whose host ends in `.onion` **or `.anyone`** selects BTP on `ws://` and
+ILP-over-HTTP on `http://`, needs **no** `peer_allow_plaintext_endpoints` (that switch
+keeps its old meaning and scope), and is dialed through the one root-level `socks_proxy`
+key — `socks5h://` only, refused by name otherwise, because a `socks5://` proxy resolves
+locally and no local resolver resolves a hidden-service name. There are two spellings
+because `anon` renamed the TLD it publishes between v0.4.9.7 and v0.4.10.2 and neither
+release resolves the other's; the connector takes either, since the exemption is earned
+by the address being an ed25519 key rather than by the label after the last dot, and the
+`local/` topologies run the newer daemon — built by `local/anon-image`, because ghcr
+publishes no image for it. Which dials take the proxy is read off the endpoint's host,
+so there is no per-peer proxy key and nothing to keep in sync. The host rule has
+**one** implementation, `connector_config::is_onion_endpoint`; do not write a second.
+`PeerCarriage` stays two-valued — ADR 0070's own falsifier is that no
+`PeerCarriage::Onion` exists. Settlement RPC and a route's `handler_url` are **not**
+proxied, on purpose (decision 4), and the operational half — the daemon's
+terms-acceptance flag, its `HiddenServiceDir` on a persisted volume, and the fact that
+`HiddenServicePort`'s target is resolved when the daemon _parses_ its config, so an
+unresolvable container name crashes it before it runs — is
+`docs/operators/onion-endpoint-bringup.md`, not the connector's.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in this repo's GitHub Issues (`toon-protocol/connector`, via the `gh` CLI).
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage labels, names unchanged — distinct from the `agent:*`
+Sandcastle triggers. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents/domain.md`.
+
 ## Pointers
 
 - `docs/architecture/source-tree.md` — the repository map: every crate, and what is
@@ -287,7 +356,7 @@ lives — for relay and store, that discipline is now each node repo's own to ke
   `cargo run -p connector-vectors --bin generate-vectors` after any change to the
   envelope, gift wrap, fulfilment derivation or claim signing.
 - `docs/operators/` — runbooks for the devnet fleet: box bring-up, key rotation, release
-  and health, peering bring-up.
+  and health, peering bring-up, onion-endpoint bring-up.
 - `docs/agents/` — issue tracker, triage labels, domain docs conventions.
 - `docs/rfcs/` — the ten Interledger RFCs this connector implements, vendored verbatim
   and pinned, each under a **TOON profile** recording where this connector departs and

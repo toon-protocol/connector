@@ -1,0 +1,32 @@
+[package]
+name = "connector-rate-source"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Exposes `contract::assert_upholds_the_contract` outside this crate's own
+# tests, so a real reader -- the Uniswap-v3-compatible `observe()` TWAP
+# reader (issue #1293), a Raydium CLMM one after it -- can hold itself to
+# the same suite from its own dev-dependencies without shipping the
+# assertion helpers in a normal build.
+test-util = []
+
+[dependencies]
+async-trait = "0.1"
+chrono = "0.4"
+# `Rate` and `AssetId` (ADR 0071, issue #1288): the rational this port
+# observes and the token identity it observes it between. The only
+# dependency that carries meaning here -- see this crate's own doc for why
+# there is no chain SDK, RPC client or HTTP client beside it.
+connector-domain = { path = "../connector-domain" }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+# This crate itself, with `test-util` on, so `tests/rate_source_contract.rs`
+# reaches the suite the way a real reader's crate will -- from another
+# crate's `[dev-dependencies]`, through the feature gate, rather than from
+# inside this crate's own test build where `#[cfg(test)]` would have served.
+# Mirrors what `connector-settlement-evm` and `-solana` already do.
+connector-rate-source = { path = ".", features = ["test-util"] }

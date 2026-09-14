@@ -1,7 +1,9 @@
 use std::net::AddrParseError;
 use std::path::PathBuf;
 
-use connector_domain::Price;
+use connector_domain::{AssetChain, AssetId, AssetIdError, GuardError, Price, RateError};
+
+use crate::settlement::SettlementChain;
 
 use thiserror::Error;
 
@@ -290,7 +292,9 @@ pub enum ConfigError {
          carriage: 'wss://' selects BTP and 'https://' selects ILP-over-HTTP, and there is no \
          third one (ADR 0027 deleted the raw-TCP transport). Both are TLS-only because a \
          peering carries signed balance proofs (ADR 0004), so 'ws://' and 'http://' are not \
-         accepted either; see docs/operators/btp-peer-transport-bringup.md"
+         accepted either -- except at a host ending in '.onion' or '.anyone', which \
+         authenticates the circuit with its own key and needs no certificate (ADR 0070), and \
+         this host is not one; see docs/operators/btp-peer-transport-bringup.md"
     )]
     PeerEndpointScheme {
         id: String,
@@ -1112,6 +1116,50 @@ pub enum ConfigError {
     )]
     AnnounceSectionRenamed,
 
+    /// The one `socks_proxy` value is not a URL at all (ADR 0070 decision 3).
+    ///
+    /// Carries the text as written, because the usual cause is a bare
+    /// `host:port` with no scheme -- which is exactly the shape every other
+    /// SOCKS-taking tool accepts -- and an operator reading the message has
+    /// to see that the scheme is what is missing.
+    #[error("socks_proxy '{value}' is not a URL: {source}")]
+    SocksProxyInvalidUrl {
+        value: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    /// The `socks_proxy` URL names no host (ADR 0070 decision 3) --
+    /// `socks5h://` on its own, or a `socks5h:9050` that looks like a
+    /// `host:port` and is not one. `socks5h` is not a *special* scheme in
+    /// the URL standard, so unlike `https://` it parses happily with an
+    /// empty host; without this check such a value would load, the node
+    /// would come up clean, and every onion dial would then fail on a proxy
+    /// address that is not an address. A loaded `Config` needs no further
+    /// validation anywhere downstream (ADR 0009), and that includes this.
+    #[error(
+        "socks_proxy '{value}' names no host to reach the proxy at -- write it as \
+         'socks5h://<host>:<port>', e.g. 'socks5h://127.0.0.1:9050'. ('socks5h' is not a \
+         special URL scheme, so a missing host parses rather than failing, which is why this \
+         is checked by name)"
+    )]
+    SocksProxyNoHost { value: String },
+
+    /// The `socks_proxy` URL names a scheme other than `socks5h` (ADR 0070
+    /// decision 3) -- in practice `socks5`, which every SOCKS-taking tool
+    /// spells that way and which is wrong here for a reason no operator can
+    /// be expected to already know. Hence the length of the message: the
+    /// `h` is the whole point of the key.
+    #[error(
+        "socks_proxy '{value}' has scheme '{scheme}', but it must be 'socks5h'. The 'h' is not \
+         a preference: a 'socks5://' proxy resolves the hostname LOCALLY and dials the address \
+         it gets back, and no local resolver can resolve a '.onion' or '.anyone' name -- so a \
+         node that started with one would come up clean and then fail every onion peering at \
+         dial time, for a reason nothing in its log explains. Resolution has to happen AT the proxy, which \
+         is what 'socks5h://' asks for (ADR 0070)"
+    )]
+    SocksProxyScheme { value: String, scheme: String },
+
     /// The removed-section trap for purchasable peering (ADR 0043), the
     /// same shape [`ConfigError::PeerWireAddrRemoved`] and
     /// [`ConfigError::PeerCeilingRemoved`] already take: the section is
@@ -1131,4 +1179,304 @@ pub enum ConfigError {
          surface (POST /peers, POST /routes/peers) or in the config file"
     )]
     PeerSaleRemoved,
+
+    /// A `[[tokens]]` row whose `asset` is not an asset at all (ADR 0071
+    /// decision 3). Carries the domain's own words, because
+    /// `AssetIdError` already says the three things that can be wrong with
+    /// the text -- an unknown chain, no chain at all, no token -- and
+    /// restating them here would be a second place for them to drift.
+    #[error("invalid [[tokens]] asset '{value}': {source}")]
+    TokenAssetInvalid {
+        value: String,
+        #[source]
+        source: AssetIdError,
+    },
+
+    /// Two `[[tokens]]` rows for one token. Refused rather than merged: a
+    /// rate table is keyed by token, so the second row is either a typo or
+    /// a disagreement, and a disagreement resolved silently is the one a
+    /// packet finds out about.
+    #[error(
+        "[[tokens]] declares '{asset}' more than once -- a token has one row, and two \
+         spellings of one contract address (a checksummed one and a lowercase one) are one \
+         token"
+    )]
+    DuplicateToken { asset: AssetId },
+
+    /// Two `[[tokens]]` rows both set `numeraire = true` (ADR 0071
+    /// decision 3). The boot refusal that keeps peg arithmetic out of the
+    /// node: a cross rate is composed as `X -> Y = (X/numeraire) /
+    /// (Y/numeraire)`, and composing one leg through USDC and the other
+    /// through DAI silently prices the USDC/DAI peg at exactly 1 -- a peg
+    /// nobody declared, which holds right up until it does not.
+    #[error(
+        "[[tokens]] names two numeraires, '{first}' and '{second}': a node declares exactly \
+         one, because every cross rate composes through it. Mixing them would price the peg \
+         between the two at 1 without anyone declaring it -- set 'numeraire = true' on one \
+         row and declare the other pair's rate in [[rates]] if you deal it"
+    )]
+    MixedNumeraire { first: AssetId, second: AssetId },
+
+    /// The numeraire's own row carries a `quote`. The numeraire is what
+    /// every quote path ends at, so a quote on it is a path from a token to
+    /// itself -- there is nothing it could read.
+    #[error(
+        "[[tokens]] gives the numeraire '{asset}' a quote: the numeraire is the token every \
+         other token's quote path ends AT, so it has no price of its own to read. Remove the \
+         'quote' from this row"
+    )]
+    NumeraireQuoted { asset: AssetId },
+
+    /// `quote = []`. An empty path names no pool and is not a declaration
+    /// of anything; a token priced by hand simply has no `quote` key.
+    #[error(
+        "[[tokens]] gives '{asset}' an empty quote: a quote is one or two pools, and a token \
+         with no pool to read is declared without a 'quote' and priced by a [[rates]] row"
+    )]
+    TokenQuoteEmpty { asset: AssetId },
+
+    /// More than two legs (ADR 0071 decision 3). Not a longer path -- a
+    /// path nobody has reasoned about: each leg is an independent
+    /// manipulation surface and the legs' errors compose.
+    #[error(
+        "[[tokens]] gives '{asset}' a quote of {legs} pools: ADR 0071 allows one (a \
+         numeraire-quoted token) or two (a token whose only real venue is quoted in an \
+         intermediate, e.g. ANYONE/WETH then WETH/USDC). Every extra leg is another \
+         manipulation surface and another rounding, so a third is refused rather than \
+         composed"
+    )]
+    TokenQuoteTooLong { asset: AssetId, legs: usize },
+
+    /// A quote leg's `quote_token` is not an asset.
+    #[error("invalid quote_token '{value}' in '{asset}'s quote: {source}")]
+    TokenQuoteTokenInvalid {
+        asset: AssetId,
+        value: String,
+        #[source]
+        source: AssetIdError,
+    },
+
+    /// A quote leg quoting into a token on another chain. There is no
+    /// cross-chain pool: a path that leaves the token's own settlement
+    /// chain names a venue that does not exist.
+    #[error(
+        "'{asset}'s quote names '{quote_token}', which is on another chain: ADR 0071 puts a \
+         token's quote on its OWN settlement chain -- the one chain the peering already \
+         guarantees this node RPC for -- and no pool spans two of them. Price this pair with \
+         a [[rates]] row instead"
+    )]
+    TokenQuoteOffChain {
+        asset: AssetId,
+        quote_token: AssetId,
+    },
+
+    /// A quote leg's pool is not an address on its chain.
+    #[error(
+        "invalid pool '{value}' in '{asset}'s quote: an EVM pool is 40 hex characters \
+         (optionally '0x'-prefixed) and a Solana pool is a base58 32-byte account. A pool \
+         this node cannot address is a rate it can never read"
+    )]
+    TokenQuotePoolInvalid { asset: AssetId, value: String },
+
+    /// A quote leg with `twap_window_secs = 0`. A window of nothing is a
+    /// spot read, and ADR 0071 decision 3 has none: the whole defence
+    /// against a shoved pool is that manipulation has to be sustained for
+    /// the length of the window.
+    #[error(
+        "'{asset}'s quote sets 'twap_window_secs = 0': a window of nothing is a spot read, \
+         and a spot ratio is manipulable inside one block. Set a window long enough that \
+         holding the pool at a false price across it costs an attacker more than the packets \
+         it would misprice"
+    )]
+    TokenQuoteZeroWindow { asset: AssetId },
+
+    /// A quote on a token whose chain this node has no `[settlement]` table
+    /// for (ADR 0071 decision 3).
+    #[error(
+        "'{asset}' has a quote but this node has no [settlement.{chain}] table: a quote is \
+         read over that table's own RPC endpoint, so a pool on a chain this node does not \
+         settle on is one it can never take a reading from. Add the settlement table, or \
+         drop the quote and price this token's pairs with [[rates]] rows"
+    )]
+    TokenQuoteWithoutSettlement { asset: AssetId, chain: AssetChain },
+
+    /// A quote path with no numeraire to end at.
+    #[error(
+        "'{asset}' has a quote but no [[tokens]] row sets 'numeraire = true': a quote path \
+         ends at the numeraire, and a node with none has nowhere for it to end"
+    )]
+    QuoteWithoutNumeraire { asset: AssetId },
+
+    /// The last leg of a quote path lands somewhere other than the
+    /// numeraire (ADR 0071 decision 3). The refusal that makes composition
+    /// sound: every quote answers "how much numeraire is this token worth",
+    /// and one that answers in WETH instead would be composed with the
+    /// others as if it had answered in the numeraire.
+    #[error(
+        "'{asset}'s quote ends at '{ends_at}', not at the numeraire '{numeraire}': every \
+         quote path ends at the numeraire, because a cross rate is composed as (X/numeraire) \
+         / (Y/numeraire) and a leg that answers in a different unit is silently treated as \
+         though it had answered in that one. Add the final leg that reaches the numeraire \
+         (e.g. WETH/USDC after ANYONE/WETH)"
+    )]
+    TokenQuoteDoesNotEndAtNumeraire {
+        asset: AssetId,
+        ends_at: AssetId,
+        numeraire: AssetId,
+    },
+
+    /// A `[[rates]]` row whose `from` or `to` is not an asset.
+    #[error("invalid [[rates]] {field} '{value}': {source}")]
+    RateRowAssetInvalid {
+        field: &'static str,
+        value: String,
+        #[source]
+        source: AssetIdError,
+    },
+
+    /// A `[[rates]]` row whose two sides are one token. A pair with itself
+    /// is not a denomination boundary, so nothing would ever look it up.
+    #[error(
+        "[[rates]] declares '{asset}' against itself: a rate crosses a denomination \
+         boundary, and a token is not a boundary with itself -- a forward whose two legs \
+         hold the same token is not a conversion and takes the flat fee alone"
+    )]
+    RateRowSelfPair { asset: AssetId },
+
+    /// A `[[rates]]` row naming a token no `[[tokens]]` row declares (ADR
+    /// 0071 decision 3).
+    #[error(
+        "[[rates]] declares '{from}' -> '{to}', but '{unknown}' is not a token this node \
+         deals: every side of a rate is a [[tokens]] row, so that a mistyped contract \
+         address is a boot refusal rather than a rate filed under a key no forward ever \
+         looks up"
+    )]
+    RateRowUnknownToken {
+        from: AssetId,
+        to: AssetId,
+        unknown: AssetId,
+    },
+
+    /// Two `[[rates]]` rows for one ordered pair. The reverse pair is a
+    /// different row and is not this: direction is the trade.
+    #[error(
+        "[[rates]] declares '{from}' -> '{to}' more than once: one ordered pair has one row. \
+         (The reverse pair is a DIFFERENT row and may carry a different rate -- direction is \
+         the trade.)"
+    )]
+    DuplicateRateRow { from: AssetId, to: AssetId },
+
+    /// A `[[rates]]` row whose declared rate is not a rate -- a zero
+    /// denominator, or the zero numerator ADR 0071 decision 7 refuses for
+    /// the same reason. The check itself lives in `connector_domain::Rate`,
+    /// which is where a rate is constructed at all; this variant exists so
+    /// that the operator reading the refusal learns which ROW was wrong,
+    /// which the domain's message on its own cannot say.
+    #[error("invalid rate on [[rates]] '{from}' -> '{to}': {source}")]
+    RateRowInvalid {
+        from: AssetId,
+        to: AssetId,
+        #[source]
+        source: RateError,
+    },
+
+    /// A declared guard that is not one (ADR 0071 decision 5): a spread at
+    /// or above the whole mid, a fraction with no whole, a ttl of no time
+    /// at all. The check is each guard's own constructor in
+    /// `connector_domain` -- which is where a guard is made at all -- and
+    /// this variant exists so the operator reading the refusal learns which
+    /// row carried it, which the domain's message cannot say. `row` is
+    /// `[rate_guards]`, or the ordered pair whose `[[rates]]` row overrode
+    /// it.
+    #[error("invalid guard on {row}: {source}")]
+    RateGuardInvalid {
+        row: String,
+        #[source]
+        source: GuardError,
+    },
+
+    /// A node that can produce a rate but declared no `[rate_guards]` (ADR
+    /// 0071 decision 5). Required exactly when something can produce a
+    /// rate, and only then: declaring tokens alone -- which is what a
+    /// same-asset cross-chain hop does -- produces none and needs none.
+    #[error(
+        "this node declares a rate (a [[rates]] row, or a [[tokens]] quote) but no \
+         [rate_guards] table: the three guards have no safe default. A defaulted spread \
+         would be zero -- dealing at mid and donating the risk -- and a defaulted 'ttl' or \
+         'max_move' would be a number nobody wrote being enforced on an operator's book. \
+         Add '[rate_guards]' with 'spread', 'ttl_secs' and 'max_move'; a [[rates]] row may \
+         override any of the three for its own pair"
+    )]
+    RateGuardsMissing,
+
+    /// A peering whose channels hold a token no `[[tokens]]` row declares
+    /// (ADR 0071 decision 1, issue #1292).
+    ///
+    /// Only ever reached on a node that declares tokens: one that declares
+    /// none resolves no peering at all and is not held to this rule, which
+    /// is what makes ADR 0071 free for every operator who deals nothing.
+    /// On a node that does deal, the alternative to this refusal is a
+    /// forward discovering mid-packet that it cannot say what unit it is
+    /// carrying -- and the packet is already paid for by then.
+    #[error(
+        "peering '{peer_id}' is denominated in '{asset}', which is not a token this node \
+         deals: a node that declares [[tokens]] must be able to say which declared token \
+         every peering holds, because a forward between two peerings is a conversion exactly \
+         when their tokens differ. The token comes from the [settlement] table that peering's \
+         channels settle through -- declare it with a [[tokens]] row, or remove the [[tokens]] \
+         table if this node deals nothing"
+    )]
+    PeeringTokenNotDeclared { peer_id: String, asset: AssetId },
+
+    /// One peering whose channel rows sit on two chains, and therefore in
+    /// two tokens (ADR 0071 decision 1, issue #1292). A packet's amount is
+    /// denominated by the channel it rides, so a peering with two units has
+    /// no unit at all: which one a forward was converting into would depend
+    /// on which of the two tables the reader consulted.
+    #[error(
+        "peering '{peer_id}' holds channels in two tokens, '{first}' and '{second}': a \
+         peering is one denomination -- a packet's amount is denominated by the channel it \
+         rides, and a forward out of this one has no single unit to convert into. Give each \
+         chain its own [[peers]] row, so that every peering's [[peer_channels]] and \
+         [[pay_channels]] rows settle through one [settlement] table"
+    )]
+    PeeringTokenAmbiguous {
+        peer_id: String,
+        first: AssetId,
+        second: AssetId,
+    },
+
+    /// A chain whose client-edge channels hold a token no `[[tokens]]` row
+    /// declares (ADR 0071 decision 1, issue #1301) -- the client edge's
+    /// sibling of [`ConfigError::PeeringTokenNotDeclared`], and refused for
+    /// the stronger reason.
+    ///
+    /// Named by CHAIN rather than by channel, because the channel that
+    /// forces this refusal is the one no `[[client_channels]]` row names: a
+    /// settlement table registers the `ClientChannelSource` that admits a
+    /// buyer this operator has never heard of (ADR 0052, issue #502), so
+    /// every chain with a settlement table can carry an arrival whose
+    /// denomination a forward must know. Left unresolved on a dealing node,
+    /// such an arrival would forward across a real boundary at an implied
+    /// 1:1 -- decision 2's failure arriving by the one door the absence rule
+    /// does not cover.
+    ///
+    /// Only ever reached on a node that declares tokens; one that declares
+    /// none resolves no client channel at all and is not held to this rule.
+    #[error(
+        "client-edge channels on the '{chain}' chain are denominated in '{asset}', which is \
+         not a token this node deals: a node that declares [[tokens]] must be able to say \
+         which declared token every channel it accepts a claim on holds, because a forward \
+         out of a client arrival is a conversion exactly when that token and the outgoing \
+         peering's differ. This applies to every channel on the chain and not only to a \
+         declared [[client_channels]] row -- a [settlement.{chain}] table is what lets this \
+         node accept a claim on a channel it has never been configured for (ADR 0052). The \
+         token comes from that table's own 'token_address' -- declare it with a [[tokens]] \
+         row, remove the [settlement.{chain}] table, or remove the [[tokens]] table if this \
+         node deals nothing"
+    )]
+    ClientChannelTokenNotDeclared {
+        chain: SettlementChain,
+        asset: AssetId,
+    },
 }

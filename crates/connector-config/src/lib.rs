@@ -16,7 +16,9 @@
 //! solely to be refused by name ([`ConfigError::PeerCredentialRemoved`]).
 
 mod client_channel;
+mod client_channel_asset;
 mod config;
+mod denomination;
 mod error;
 mod identity;
 mod node;
@@ -24,22 +26,26 @@ mod operator;
 mod pay_channel;
 mod peer;
 mod peer_channel;
+mod peering_asset;
 mod route;
 mod secret;
 mod settlement;
 
 pub use client_channel::{ClientChannelConfig, EvmClientChannelConfig, SolanaClientChannelConfig};
-pub use config::Config;
+pub use client_channel_asset::ClientChannelAssets;
+pub use config::{parse_socks_proxy, Config};
+pub use denomination::{DeclaredToken, DenominationConfig, QuoteLeg, QuotePath, RateRow};
 pub use error::ConfigError;
 pub use identity::ClientIdentityConfig;
 pub use node::NodeConfig;
 pub use operator::OperatorConfig;
 pub use pay_channel::{EvmPayChannelConfig, PayChannelConfig, SolanaPayChannelConfig};
 pub use peer::{
-    ForwardedClaimEnforcement, PeerCarriage, PeerConfig, PeerExposure, DEFAULT_MAX_PACKET_AMOUNT,
-    DEFAULT_PEER_TIMEOUT_MS,
+    is_onion_endpoint, plaintext_permitted, ForwardedClaimEnforcement, PeerCarriage, PeerConfig,
+    PeerExposure, DEFAULT_MAX_PACKET_AMOUNT, DEFAULT_PEER_TIMEOUT_MS,
 };
 pub use peer_channel::{EvmPeerChannelConfig, PeerChannelConfig, SolanaPeerChannelConfig};
+pub use peering_asset::PeeringAssets;
 pub use route::{PeerRouteConfig, StaticRoute, TransportPolicy};
 pub use secret::SecretLocation;
 pub use settlement::{

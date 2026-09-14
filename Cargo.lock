@@ -1101,6 +1101,8 @@ dependencies = [
  "connector-operator",
  "connector-peer-btp",
  "connector-peer-http",
+ "connector-rate-source",
+ "connector-rate-source-evm",
  "connector-runtime",
  "connector-settlement",
  "connector-settlement-evm",
@@ -1124,6 +1126,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1156,6 +1159,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
@@ -1169,6 +1173,7 @@ name = "connector-config"
 version = "0.1.0"
 dependencies = [
  "bs58",
+ "chrono",
  "connector-domain",
  "serde",
  "serde_json",
@@ -1247,6 +1252,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-socks",
  "tokio-tungstenite",
  "tracing",
  "url",
@@ -1277,6 +1283,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-rate-source"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "connector-domain",
+ "connector-rate-source",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "connector-rate-source-evm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "connector-domain",
+ "connector-rate-source",
+ "connector-settlement-evm",
+ "ethers",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "connector-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1288,6 +1321,7 @@ dependencies = [
  "chrono",
  "connector-config",
  "connector-domain",
+ "connector-rate-source",
  "connector-settlement",
  "connector-signer",
  "ed25519-dalek",
@@ -1296,6 +1330,7 @@ dependencies = [
  "percent-encoding",
  "prometheus",
  "proptest",
+ "rand 0.7.3",
  "reqwest",
  "serde",
  "serde_json",
@@ -4927,6 +4962,7 @@ dependencies = [
  "system-configuration",
  "tokio",
  "tokio-rustls",
+ "tokio-socks",
  "tokio-util 0.7.19",
  "tower-service",
  "url",
@@ -8169,6 +8205,18 @@ dependencies = [
  "pin-project",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "tokio-socks"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7e2948f60dbe26b35f2c7fb74ac2854c1fddded0fe9d7548fcc674a246f7615"
+dependencies = [
+ "either",
+ "futures-util",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

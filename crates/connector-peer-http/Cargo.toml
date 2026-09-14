@@ -27,10 +27,14 @@ async-trait = "0.1"
 # claim ack and the credential are the same JSON both carriages carry.
 base64 = "0.22"
 chrono = "0.4"
-# `rustls-tls` only -- a peering carries signed balance proofs, so `https://`
-# is the only scheme that selects this carriage at all. Same 0.11 the
-# runtime and the binary already resolve to.
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+# `rustls-tls` because a peering carries signed balance proofs (ADR 0004),
+# so `https://` is the scheme that selects this carriage for every endpoint
+# whose identity a CA attests. `socks` because ADR 0070 names the one
+# exception: a `.onion` host binds identity to the address itself, cannot
+# hold a web-PKI certificate, and is dialed `http://` through a SOCKS5
+# proxy -- which is a dial reqwest cannot make without this feature. Same
+# 0.11 the runtime and the binary already resolve to.
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "socks"] }
 # `sync` for the per-relation ledgers and §7.2's one-claim-in-flight rule;
 # `time` for §6.3's two deadlines. No runtime is started here -- whoever
 # owns the listener owns the runtime.
@@ -39,8 +43,21 @@ tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
+# `test-support` for the SOCKS5 server fake the onion dial tests dial through
+# (ADR 0070). A dev-dependency, so `cargo build` never carries a listener.
+connector-runtime = { path = "../connector-runtime", features = ["test-support"] }
 connector-signer = { path = "../connector-signer" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+# `net` and `io-util` on top of the library's own features: the onion-dial
+# test stands up a real HTTP listener beside `connector-runtime`'s real
+# SOCKS5 server, because "which socket did that dial reach" is a question
+# no in-process fake can answer (ADR 0070 decision 3).
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "test-util",
+    "net",
+    "io-util",
+] }
 libsecp256k1 = "0.6"
 serde_json = "1"
 tempfile = "3"

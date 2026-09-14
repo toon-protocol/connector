@@ -1,6 +1,6 @@
 # The metrics surface is decided, not accreted, and logs correlate a packet by its condition
 
-**Status:** Accepted, amended by [0033](0033-the-exposure-machinery-is-retired-not-restated.md). Four of the five metrics stand. `toon_exposure` is kept at its decided name for scrape-config stability and is **permanently zero with no producer**, because the projection it was shaped for is retired.
+**Status:** Accepted, amended by [0033](0033-the-exposure-machinery-is-retired-not-restated.md) and [0069](0069-the-execution-condition-leaves-the-wire.md). Four of the five metrics stand. `toon_exposure` is kept at its decided name for scrape-config stability and is **permanently zero with no producer**, because the projection it was shaped for is retired. The log-correlation half is retired outright by 0069: the execution condition it correlated by no longer exists, and cross-hop correlation is not replaced.
 
 **Scope:** connector architecture — internal to this codebase. See the [ADR index](README.md).
 
@@ -8,8 +8,10 @@ The Rust connector exposes exactly five decided metrics — `toon_packets_total`
 `toon_packets_rejected_total`, `toon_fees_earned_total`, `toon_exposure` and
 `toon_settlement_total` — as `GET /metrics` on the operator surface, in Prometheus text
 exposition format, gated by the same bearer token as every other read (ADR 0008). Every log
-line emitted while a packet is being handled carries a `correlation_id`: the packet's own
-execution condition, hex-encoded, requiring no new field and no wire change.
+line emitted while a packet is being handled carries a `correlation_id` — originally the
+packet's own execution condition, hex-encoded, requiring no new field and no wire change; see
+[ADR 0069](0069-the-execution-condition-leaves-the-wire.md) for why that stopped being true and
+what replaced it.
 
 ## Why
 
@@ -54,6 +56,14 @@ carried unchanged. That makes it a correlation id for free: two independent conn
 logging this same value for the same packet, produce structured logs that `jq
 'select(.fields.correlation_id == "...")'` can join across the hop boundary with no addition
 to the peer wire and no new packet field to keep in sync between implementations.
+
+> **This is retired, not replaced.** [ADR 0069](0069-the-execution-condition-leaves-the-wire.md)
+> (issue #1269) names the property this paragraph is proud of as the defect it actually was:
+> invariant and distinctive per packet is exactly what makes a value a cross-hop join key, so
+> "free correlation" was also free deanonymization for anyone forwarding traffic. The condition
+> is gone from the wire entirely, and `correlation_id` is now a random id each hop mints for
+> itself at packet entry and never transmits — logs still correlate perfectly within one node's
+> own handling of one packet, and no longer join across a second one at all.
 
 ## Consequences
 

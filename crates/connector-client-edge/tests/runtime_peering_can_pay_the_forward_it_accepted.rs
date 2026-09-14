@@ -35,8 +35,8 @@ use connector_client_edge::{
 use connector_config::StaticRoute;
 use connector_domain::x402::{X402ChainSettlementTerms, X402SettlementTerms};
 use connector_domain::{
-    derive_condition, EnvelopeRequest, EnvelopeResponse, NodeFacts, NodeSelfDescription,
-    PacketResponse, Prepare, Price,
+    EnvelopeRequest, EnvelopeResponse, NodeFacts, NodeSelfDescription, PacketResponse, Prepare,
+    Price,
 };
 use connector_runtime::{
     AppOutcome, ChannelBranch, ChannelDomain, Connector, FakeAppClient, InMemoryJournal,
@@ -47,7 +47,7 @@ use connector_runtime::{
 use connector_settlement::{
     ChannelId, ChannelState, ChannelStatus, Claim, SettlementBackend, SettlementError,
 };
-use connector_signer::giftwrap::{derive_fulfillment, open_response, seal_request};
+use connector_signer::giftwrap::{open_response, seal_request};
 use connector_signer::{derive_evm_address, to_hex, Address, LocalSigner, PublicKeyBytes, Signer};
 
 const CHAIN_ID: u64 = 31_337;
@@ -154,12 +154,12 @@ fn sample_prepare(
     destination: &str,
     amount: u64,
     data: Vec<u8>,
-    shared_secret: &[u8; 32],
+    _shared_secret: &[u8; 32],
 ) -> Prepare {
     Prepare {
         amount,
         expires_at: Utc::now() + ChronoDuration::minutes(5),
-        execution_condition: derive_condition(&derive_fulfillment(shared_secret)),
+        greeting: false,
         destination: destination.to_string(),
         data,
     }

@@ -47,21 +47,28 @@ use connector_signer::Signer;
 /// new channel.
 pub struct ClientPayoutLedger {
     book: RwLock<ClaimBook>,
-    /// Which `(channel_id, execution_condition)` pairs
-    /// [`Self::record_payout_once`] has already credited (issue #770's
-    /// AC3) -- deliberately not the same mechanism as `book`'s own
-    /// nonce/cumulative-amount tracking, which advances unconditionally on
-    /// every call and so cannot by itself tell a genuine second job from a
-    /// retried first one. A packet's execution condition is deterministic
-    /// per job (RFC-0022: the fulfilment that satisfies it can never
-    /// differ between the original delivery and a retry of the same job),
-    /// so it is the right identity to dedupe a credit against -- unlike an
-    /// amount or a timestamp, which a caller could vary between attempts.
-    /// In-memory only: a restart forgets it, same as every other
+    /// Which `(channel_id, job_id)` pairs [`Self::record_payout_once`] has
+    /// already credited (issue #770's AC3) -- deliberately not the same
+    /// mechanism as `book`'s own nonce/cumulative-amount tracking, which
+    /// advances unconditionally on every call and so cannot by itself tell
+    /// a genuine second job from a retried first one.
+    ///
+    /// `job_id` must be something the **payer** fixes, never something the
+    /// party being paid supplies (issue #1269 / ADR 0069): before that
+    /// change the key was the packet's own execution condition, sender-minted
+    /// and invariant across a retry regardless of what a session answered.
+    /// Once a session's FULFILL started riding home unchecked, keying on
+    /// anything read from that FULFILL (its `fulfillment`, say) would let a
+    /// dishonest or buggy session answer a retried job with different bytes
+    /// each time and collect a fresh credit on every retry -- the dedupe
+    /// would be defeating itself. Every caller of [`Self::record_payout_once`]
+    /// today (`crate::session_route::route_prepare`) derives `job_id` from
+    /// the PREPARE it is about to hand the payee, before the payee ever
+    /// answers. In-memory only: a restart forgets it, same as every other
     /// non-durable memo this crate keeps (e.g. `ClientClaimGate`'s own
     /// `last_claim_seen`) -- the durable, money-bearing fact is `book`'s
     /// watermark, never this set.
-    credited_conditions: Mutex<HashSet<(String, [u8; 32])>>,
+    credited_jobs: Mutex<HashSet<(String, [u8; 32])>>,
 }
 
 impl Default for ClientPayoutLedger {
@@ -94,7 +101,7 @@ impl ClientPayoutLedger {
                 std::collections::HashMap::new(),
                 std::collections::HashMap::new(),
             )),
-            credited_conditions: Mutex::new(HashSet::new()),
+            credited_jobs: Mutex::new(HashSet::new()),
         }
     }
 
@@ -184,11 +191,11 @@ impl ClientPayoutLedger {
     }
 
     /// As [`Self::record_payout`], but a no-op -- credits nothing and
-    /// returns `None` -- if this exact `(channel_id, condition)` pair has
+    /// returns `None` -- if this exact `(channel_id, job_id)` pair has
     /// already been credited (issue #770's AC3: a duplicate or
     /// retransmitted FULFILL for the same job must not raise `credited`
-    /// twice). See the `credited_conditions` field doc for why the
-    /// execution condition is the dedupe key.
+    /// twice). See the `credited_jobs` field doc for what `job_id` must be
+    /// and, critically, must not be derived from.
     ///
     /// The check-and-mark is atomic under one lock, so two concurrent
     /// calls for the same pair can never both pass it. If `record_payout`
@@ -199,20 +206,20 @@ impl ClientPayoutLedger {
     pub fn record_payout_once(
         &self,
         channel_id: &str,
-        condition: &[u8; 32],
+        job_id: &[u8; 32],
         amount: u64,
         now: DateTime<Utc>,
     ) -> Option<WireClaim> {
-        let key = (channel_id.to_string(), *condition);
+        let key = (channel_id.to_string(), *job_id);
         {
-            let mut seen = self.credited_conditions.lock().expect("not poisoned");
+            let mut seen = self.credited_jobs.lock().expect("not poisoned");
             if !seen.insert(key.clone()) {
                 return None;
             }
         }
         let claim = self.record_payout(channel_id, amount, now);
         if claim.is_none() {
-            self.credited_conditions
+            self.credited_jobs
                 .lock()
                 .expect("not poisoned")
                 .remove(&key);
@@ -432,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn record_payout_once_credits_a_fresh_condition() {
+    fn record_payout_once_credits_a_fresh_job() {
         let signer = Arc::new(LocalSigner::generate("payout-key"));
         let ledger = ledger_with_signer(signer);
 
@@ -445,15 +452,15 @@ mod tests {
     }
 
     #[test]
-    fn record_payout_once_refuses_a_second_credit_for_the_same_condition() {
+    fn record_payout_once_refuses_a_second_credit_for_the_same_job() {
         let signer = Arc::new(LocalSigner::generate("payout-key"));
         let ledger = ledger_with_signer(signer);
-        let condition = [7u8; 32];
+        let job_id = [7u8; 32];
 
         ledger
-            .record_payout_once(&channel_id(1), &condition, 500, now())
+            .record_payout_once(&channel_id(1), &job_id, 500, now())
             .expect("first delivery of this job");
-        let retry = ledger.record_payout_once(&channel_id(1), &condition, 500, now());
+        let retry = ledger.record_payout_once(&channel_id(1), &job_id, 500, now());
 
         assert!(
             retry.is_none(),
@@ -467,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn record_payout_once_credits_a_different_condition_on_the_same_channel_independently() {
+    fn record_payout_once_credits_a_different_job_on_the_same_channel_independently() {
         let signer = Arc::new(LocalSigner::generate("payout-key"));
         let ledger = ledger_with_signer(signer);
 
@@ -484,27 +491,27 @@ mod tests {
     #[test]
     fn record_payout_once_releases_its_mark_when_nothing_was_credited() {
         // No signer configured yet, so `record_payout` itself produces
-        // nothing for this channel+condition -- the dedupe mark must not
+        // nothing for this channel+job -- the dedupe mark must not
         // stick around and block a legitimate credit once the ledger is
         // configured.
         let mut ledger = ClientPayoutLedger::new();
         ledger
             .set_channel_domain(channel_id(1), test_domain())
             .expect("valid channel id");
-        let condition = [7u8; 32];
+        let job_id = [7u8; 32];
         assert!(
             ledger
-                .record_payout_once(&channel_id(1), &condition, 100, now())
+                .record_payout_once(&channel_id(1), &job_id, 100, now())
                 .is_none(),
             "no signer configured yet"
         );
 
         ledger.set_signer(Arc::new(LocalSigner::generate("payout-key")));
 
-        let claim = ledger.record_payout_once(&channel_id(1), &condition, 100, now());
+        let claim = ledger.record_payout_once(&channel_id(1), &job_id, 100, now());
         assert!(
             claim.is_some(),
-            "a prior no-op call must not permanently block this condition"
+            "a prior no-op call must not permanently block this job"
         );
     }
 }
