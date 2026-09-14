@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use connector_btp::{BtpFrame, BtpSessionHandle, ProtocolData, BTP_ERROR};
+use connector_btp::{BtpFrame, BtpSessionHandle, OriginateError, ProtocolData, BTP_ERROR};
 use connector_config::{PeerCarriage, PeerChannelConfig, PeerConfig};
 use connector_domain::x402::{GreetingError, X402PaymentRequired};
 use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
@@ -315,7 +315,8 @@ impl BtpPeerTransport {
         }
     }
 
-    /// The session for `peer_id`, dialing one if there is none.
+    /// The session for `peer_id`, dialing one if there is none **or if the
+    /// one held has died** -- which is what a peer's restart leaves behind.
     ///
     /// There is no handshake on it, and there used to be: the session's
     /// first MESSAGE carried a `{peerId, secret}` credential in an `auth`
@@ -326,10 +327,32 @@ impl BtpPeerTransport {
     /// socket that dials and then cannot carry surfaces where every other
     /// carriage failure does: as `T01` on the packet, naming the peer and
     /// the endpoint (§2.2).
+    ///
+    /// What a cached session does owe the packet path is that it still
+    /// exists. Issue #1240: a payee restarting closed the socket, this held
+    /// the handle to it anyway, and the next packet was refused `T01` on a
+    /// session that no dial had been attempted for. A session that reports
+    /// itself gone is therefore replaced here, before anything is written
+    /// into it -- under the same lock that stops eight concurrent forwards
+    /// opening eight sessions, so a herd of packets arriving after a
+    /// restart redials once between them and the rest reuse what the first
+    /// established.
     async fn session(&self, state: &RelationState) -> Result<BtpSessionHandle, DialError> {
         let mut slot = state.session.lock().await;
-        if let Some(handle) = slot.as_ref() {
-            return Ok(handle.clone());
+        match slot.as_ref() {
+            Some(handle) if !handle.is_gone() => return Ok(handle.clone()),
+            Some(_) => {
+                tracing::info!(
+                    peer_id = %state.relation.peer_id,
+                    endpoint = %state.relation.endpoint,
+                    "peer session is gone; redialling"
+                );
+                // Cleared before the dial, not after it: a dial that fails
+                // must not leave the corpse behind for the next packet to
+                // find and mistake for something worth trying.
+                *slot = None;
+            }
+            None => {}
         }
         let handle = self
             .dialer
@@ -337,6 +360,64 @@ impl BtpPeerTransport {
             .await?;
         *slot = Some(handle.clone());
         Ok(handle)
+    }
+
+    /// Send on this relation's session and wait for the frame that answers,
+    /// redialling and sending **once** more if the session turns out to
+    /// have died under the send.
+    ///
+    /// `None` is "no answer": the caller turns that into `T01` for a packet
+    /// and into `NotSent` for a flush.
+    ///
+    /// The retry is deliberately narrow. [`OriginateError::SessionGone`] is
+    /// raised by the writer channel refusing the frame, so the frame was
+    /// **never written** -- sending it again on a fresh session is the same
+    /// packet reaching the peer once, not a second packet. A *timeout* is
+    /// the opposite case: the frame is on the wire and the peer may be
+    /// acting on it, so that one is never retried, only reported. A claim
+    /// riding the retry is byte-identical to the one that did not go, since
+    /// nothing acknowledged it and [`Self::claim_entry`] serves it from
+    /// §6.3's cache.
+    async fn answered<F, Fut>(
+        &self,
+        state: &RelationState,
+        timeout: Duration,
+        send: F,
+    ) -> Option<BtpFrame>
+    where
+        F: Fn(BtpSessionHandle) -> Fut,
+        Fut: std::future::Future<Output = Result<BtpFrame, OriginateError>>,
+    {
+        for attempt in 0..2 {
+            let handle = match self.session(state).await {
+                Ok(handle) => handle,
+                Err(error) => {
+                    tracing::warn!(%error, "peer dial failed");
+                    return None;
+                }
+            };
+            match tokio::time::timeout(timeout, send(handle)).await {
+                Ok(Ok(frame)) => return Some(frame),
+                // Nothing was written. `session` sees the same closed
+                // channel this error was raised from, so the next turn of
+                // the loop dials rather than handing back the corpse.
+                Ok(Err(OriginateError::SessionGone)) if attempt == 0 => {
+                    tracing::info!(
+                        peer_id = %state.relation.peer_id,
+                        "peer session was gone under a send; redialling and sending once more"
+                    );
+                }
+                // §6.3 on expiry: nothing here decides the claim rode or
+                // did not -- the caller does. Forgetting the session is
+                // what stops the next frame being written into a socket
+                // nobody reads.
+                _ => {
+                    self.drop_session(state).await;
+                    return None;
+                }
+            }
+        }
+        None
     }
 
     /// Forget the session after a failure, so the next packet dials a new
@@ -523,13 +604,6 @@ impl PeerTransport for BtpPeerTransport {
             return PeerForward::unreachable(peer_id);
         };
         let state = state.as_ref();
-        let handle = match self.session(state).await {
-            Ok(handle) => handle,
-            Err(error) => {
-                tracing::warn!(%error, "peer dial failed");
-                return unreachable_at(peer_id, &state.relation.endpoint);
-            }
-        };
 
         let mut entries = Vec::new();
         if let Some(claim) = claim.as_ref() {
@@ -539,18 +613,18 @@ impl PeerTransport for BtpPeerTransport {
         // the same OER encoding every other carriage puts on a wire, and
         // nothing here re-wraps, pads or truncates a payload it holds no
         // key for.
-        let answered = tokio::time::timeout(
-            state.relation.peer_answer_timeout,
-            handle.send_message(&entries, &prepare.encode()),
-        )
-        .await;
+        let packet = prepare.encode();
+        let (entries, packet) = (&entries, &packet);
+        let answered = self
+            .answered(
+                state,
+                state.relation.peer_answer_timeout,
+                move |handle| async move { handle.send_message(entries, packet).await },
+            )
+            .await;
 
-        let frame = match answered {
-            Ok(Ok(frame)) => frame,
-            _ => {
-                self.drop_session(state).await;
-                return unreachable_at(peer_id, &state.relation.endpoint);
-            }
+        let Some(frame) = answered else {
+            return unreachable_at(peer_id, &state.relation.endpoint);
         };
         // An ERROR means the peer could not decode our frame: there is no
         // ILP answer at all, so nothing was forwarded and no fee of ours
@@ -610,34 +684,26 @@ impl PeerTransport for BtpPeerTransport {
             return ClaimAckOutcome::NotSent;
         };
         let state = state.as_ref();
-        let handle = match self.session(state).await {
-            Ok(handle) => handle,
-            Err(error) => {
-                tracing::warn!(%error, "peer dial failed");
-                return ClaimAckOutcome::NotSent;
-            }
-        };
 
         // FLUSH (§3): a **TRANSFER (type 7)** whose `amount` is the
         // claim's new cumulative, carrying the claim in
         // `payment-channel-claim` and **no `ilpPacket`**.
-        let entry = self.claim_entry(state, &claim);
-        let answered = tokio::time::timeout(
-            state.relation.claim_ack_timeout,
-            handle.send_transfer(claim.cumulative_amount, &[entry]),
-        )
-        .await;
+        let entries = [self.claim_entry(state, &claim)];
+        let (entries, cumulative) = (&entries, claim.cumulative_amount);
+        let answered = self
+            .answered(
+                state,
+                state.relation.claim_ack_timeout,
+                move |handle| async move { handle.send_transfer(cumulative, entries).await },
+            )
+            .await;
 
-        let frame = match answered {
-            Ok(Ok(frame)) => frame,
-            // §6.3 on expiry: the claim is **not acknowledged**. The
-            // peering is not torn down, no new claim is minted at a higher
-            // nonce for the same cumulative, and the packet's value stays
-            // in this connector's owed projection.
-            _ => {
-                self.drop_session(state).await;
-                return ClaimAckOutcome::NotSent;
-            }
+        // §6.3 on expiry: the claim is **not acknowledged**. The peering is
+        // not torn down, no new claim is minted at a higher nonce for the
+        // same cumulative, and the packet's value stays in this connector's
+        // owed projection.
+        let Some(frame) = answered else {
+            return ClaimAckOutcome::NotSent;
         };
         if frame.frame_type == BTP_ERROR {
             return ClaimAckOutcome::NotSent;
