@@ -40,7 +40,7 @@ use connector_runtime::{
 use connector_signer::{
     derive_evm_address, evm_balance_proof_digest, EvmBalanceProof, LocalSigner, Signature, Signer,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
 // ─── fixtures ───
@@ -431,6 +431,12 @@ struct LoopbackDialer {
     /// else left to count: session reuse used to be provable from the one
     /// `auth` frame a session sent, and ADR 0060 deleted it.
     dials: Arc<AtomicUsize>,
+    /// One session per dial: the switch that kills it, and the signal it
+    /// sends back once it is provably dead. Killing one closes the reply
+    /// channel the dialing side holds -- what `ws`'s real dialer does when
+    /// the socket's read loop stops, and therefore what a payee's restart
+    /// leaves behind.
+    live: Mutex<Vec<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 impl LoopbackDialer {
@@ -439,7 +445,24 @@ impl LoopbackDialer {
             state,
             sent: Arc::new(Mutex::new(Vec::new())),
             dials: Arc::new(AtomicUsize::new(0)),
+            live: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The far side restarts (issue #1240): every session opened so far
+    /// dies where it stands, and this returns only once each one is dead.
+    /// The accepting connector behind it is deliberately the same one --
+    /// what restarted is the socket, not the payee's journal, so a claim's
+    /// watermark survives exactly as a restarted node's durable one does.
+    async fn restart_the_far_side(&self) {
+        let sessions = std::mem::take(&mut *self.live.lock().expect("live sessions lock"));
+        for (kill, dead) in sessions {
+            drop(kill);
+            // Resolves (as an error) when that session drops its end,
+            // which it does only after dropping the receiver whose closure
+            // is what the dialing side reads.
+            let _ = dead.await;
+        }
     }
 }
 
@@ -456,15 +479,35 @@ impl PeerDialer for LoopbackDialer {
         // wrote.
         let (tap, sent) = (mpsc::channel::<Vec<u8>>(32), Arc::clone(&self.sent));
         let (tapped, tapped_rx) = tap;
+        let (kill, mut killed) = oneshot::channel::<()>();
+        let (dead, buried) = oneshot::channel::<()>();
+        self.live
+            .lock()
+            .expect("live sessions lock")
+            .push((kill, buried));
         tokio::spawn(async move {
-            while let Some(bytes) = to_peer_rx.recv().await {
-                sent.lock()
-                    .expect("sent frames lock")
-                    .push(decode_frame(&bytes).expect("our own encoder"));
-                if tapped.send(bytes).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    queued = to_peer_rx.recv() => {
+                        let Some(bytes) = queued else { break };
+                        sent.lock()
+                            .expect("sent frames lock")
+                            .push(decode_frame(&bytes).expect("our own encoder"));
+                        if tapped.send(bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    // The far side went away. Ending here drops
+                    // `to_peer_rx`, so the handle the dialing side still
+                    // holds reports itself gone rather than swallowing a
+                    // frame nobody will ever read.
+                    _ = &mut killed => break,
                 }
             }
+            // Dropped in this order on purpose: the dialing side must find
+            // the channel already closed when the burial is announced.
+            drop(to_peer_rx);
+            drop(dead);
         });
         let session = PeerSession::new(Arc::clone(&self.state), from_peer);
         tokio::spawn(session.run(tapped_rx));
@@ -935,6 +978,107 @@ impl PeerDialer for SilentPayee {
         });
         Ok(handle)
     }
+}
+
+// ─── issue #1240: a peer that restarts under a live peering ───
+
+/// **Issue #1240.** A payee restarts; the socket its peering was carried
+/// on dies with it, and the dialing side is left holding the handle to a
+/// corpse. The next packet must be **redialled and delivered**, not refused
+/// `T01` on a session no dial was ever attempted for.
+///
+/// The assertion is both halves, because "reached the peer" alone would go
+/// green on a peering carrying bytes for free: the peer answered, **and**
+/// the claim that rode the redial was accepted. Nothing is asserted about
+/// the nonce being spent or saved -- the refused packet's claim is never
+/// banked at either end, so the payer's next attempt is free to carry the
+/// same one (§6.3) or a later one, and the transport is not the thing that
+/// decides which.
+#[tokio::test]
+async fn a_packet_after_the_far_side_restarts_is_redialled_rather_than_refused() {
+    let payer_signer = LocalSigner::generate("payer");
+    let state = carriage(payee(&payer_signer), bound_policy());
+    let dialer = LoopbackDialer::new(state);
+    let transport = transport(Arc::clone(&dialer) as Arc<dyn PeerDialer>, &payer_signer);
+
+    let first = transport
+        .forward(
+            PEER_ID,
+            prepare("g.nowhere"),
+            Some(sign_claim(&payer_signer, 1, 500)),
+        )
+        .await;
+    assert!(first.reached_peer, "the peering was carrying before this");
+    assert_eq!(first.ack, ClaimAckOutcome::Accepted);
+    assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
+
+    dialer.restart_the_far_side().await;
+
+    let PeerForward {
+        response,
+        ack,
+        reached_peer: reached,
+        ..
+    } = transport
+        .forward(
+            PEER_ID,
+            prepare("g.nowhere"),
+            Some(sign_claim(&payer_signer, 2, 900)),
+        )
+        .await;
+
+    assert!(
+        reached,
+        "a restarted payee costs a redial, not a packet: {response:?}"
+    );
+    match response {
+        PacketResponse::Reject(reject) => assert_eq!(
+            reject.code.as_str(),
+            "F02",
+            "the answer is the payee's own, not this transport's T01"
+        ),
+        other => panic!("expected the payee's own reject, got {other:?}"),
+    }
+    assert_eq!(
+        ack,
+        ClaimAckOutcome::Accepted,
+        "the claim covering the packet reached the payee and was judged, \
+         so the redial carries value and not merely bytes"
+    );
+    assert_eq!(
+        dialer.dials.load(Ordering::SeqCst),
+        2,
+        "the dead session was replaced, and only once"
+    );
+}
+
+/// The same death, found by [`BtpPeerTransport::flush`] rather than by a
+/// packet: a claim flushed onto a session the far side's restart killed is
+/// sent on a fresh one and acknowledged, not reported `NotSent`.
+#[tokio::test]
+async fn a_flush_after_the_far_side_restarts_is_redialled_rather_than_dropped() {
+    let payer_signer = LocalSigner::generate("payer");
+    let state = carriage(payee(&payer_signer), bound_policy());
+    let dialer = LoopbackDialer::new(state);
+    let transport = transport(Arc::clone(&dialer) as Arc<dyn PeerDialer>, &payer_signer);
+
+    assert_eq!(
+        transport
+            .flush(PEER_ID, sign_claim(&payer_signer, 1, 500))
+            .await,
+        ClaimAckOutcome::Accepted
+    );
+
+    dialer.restart_the_far_side().await;
+
+    assert_eq!(
+        transport
+            .flush(PEER_ID, sign_claim(&payer_signer, 2, 900))
+            .await,
+        ClaimAckOutcome::Accepted,
+        "a flush onto a dead session redials rather than losing the claim"
+    );
+    assert_eq!(dialer.dials.load(Ordering::SeqCst), 2);
 }
 
 // ─── §2.2: a peer that cannot be dialed ───

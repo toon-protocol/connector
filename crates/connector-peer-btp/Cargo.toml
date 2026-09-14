@@ -61,7 +61,10 @@ connector-runtime = { path = "../connector-runtime", features = ["test-support"]
 # `net` and `io-util` on top of the library's own features: the onion-dial
 # test stands up a real websocket server beside `connector-runtime`'s real
 # SOCKS5 server, because "which socket did that dial reach" is a question
-# no in-process fake can answer (ADR 0070 decision 3).
+# no in-process fake can answer (ADR 0070 decision 3). `net` is also what
+# `a_dialed_session_dies_with_its_socket` binds its listener with: `ws`'s
+# dialed session splitting a socket is the half a `PeerDialer` fake cannot
+# stand in for (issue #1240).
 tokio = { version = "1", features = [
     "macros",
     "rt-multi-thread",

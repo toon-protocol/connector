@@ -106,3 +106,8 @@ tempfile = "3"
 # asserts the cadence a `ttl` implies without spending it in real seconds.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 tower = { version = "0.4", features = ["util"] }
+# Reads the WARNs `ConfiguredPeerTransport` emits when a peering registers
+# no carriage (issue #1240). A silence is only fixed if something fails when
+# it comes back, and a `T01` assertion cannot tell the two apart. Already in
+# `Cargo.lock` via `connector-bin`.
+tracing-subscriber = "0.3"
