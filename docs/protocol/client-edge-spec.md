@@ -835,26 +835,49 @@ state, and is never pushed into a network unprompted.
   serves its own bearer-gated `GET /identity` (issue #420) for a different audience — a different
   operator-authenticated caller asking a different question — and the two routers are merged onto
   one port whenever the operator surface is enabled.
-- **`GET /ilp/routes/price?destination=<ILP address>`** — unauthenticated. Returns `200` with the
-  price of the configured route `destination` would match — terminated or forwarded ([ADR
-  0028](../adr/0028-a-forwarded-route-is-priced-at-the-client-edge.md)) — reading the same
+- **`GET /ilp/routes/price?destination=<ILP address>[&size=<bytes>]`** — unauthenticated. Returns
+  `200` with the price of the configured route `destination` would match — terminated or forwarded
+  ([ADR 0028](../adr/0028-a-forwarded-route-is-priced-at-the-client-edge.md)) — reading the same
   longest-prefix lookup the x402 terms (§1.4) and claim value binding (§1.3) charge against, so
   this never states a price a real request wouldn't also be charged:
+
   ```json
   { "destination": "g.example.app", "price": 100 }
   ```
+
   A route priced by payload length ([ADR
   0065](../adr/0065-a-price-is-a-schedule-over-payload-length.md)) answers with its slope beside
   its base, so one read still tells a caller what any packet will cost:
+
   ```json
   { "destination": "g.example.store", "price": 1000, "price_per_kib": 30 }
   ```
+
   `price_per_kib` is **omitted** on a flat route, so this answer is unchanged for every route
   that predates schedules.
   `404` when no route this connector serves matches `destination` — this endpoint never fabricates
   a price for a route it does not serve. It answered `404` for a forwarded destination before ADR
   0028, which was correct only while such a destination was also uncharged; answering it now is
   the same rule applied to a route that is charged for.
+
+  An optional `size` names the length in bytes of a packet's **sealed** payload (§1.8's gift wrap,
+  never the plaintext inside it) and adds a `charge` field: what a packet of exactly that size
+  would be charged, evaluated once by the same `Price::charge` every gate on the value path
+  charges under (issue #1267) — never a second implementation of the ADR 0065 formula at this
+  layer. This matches the semantics the x402 greeting's `accepts[0].amount` already publishes for
+  a request it actually received (§1.4); `size` answers the same question for a size a caller only
+  asks about, before it seals anything:
+
+  ```json
+  { "destination": "g.example.store", "price": 1000, "price_per_kib": 30, "charge": 1030 }
+  ```
+
+  `charge` is **absent**, not `null`, when the request names no `size`, so the answer above is
+  unchanged for a caller that does not ask. A `size` that is not a non-negative integer a `u64` can
+  hold — negative, non-integer, or too many digits — is a `400`, never a silent fall-back to the
+  sizeless answer, since that would hand the caller a number it would mistake for a charge; a
+  destination this connector serves no route for is still a `404` whether or not `size` is present,
+  since the route lookup fails before `size` is ever consulted.
 
 ### 1.8 Sealing (issue #524)
 
