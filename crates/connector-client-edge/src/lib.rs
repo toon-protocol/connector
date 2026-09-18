@@ -622,6 +622,19 @@ const SELF_DESCRIPTION_REQUESTER: &str = "self-description";
 #[derive(Deserialize)]
 struct RoutePriceQuery {
     destination: String,
+    /// The sealed payload's length in bytes (ADR 0018), issue #1267 -- what a
+    /// packet actually carries on the wire, never the plaintext underneath
+    /// it. When present, the answer states the evaluated charge for a packet
+    /// of exactly this size (below).
+    ///
+    /// This type does not `deny_unknown_fields`, so before this field
+    /// existed a caller already sending `size` got today's sizeless body
+    /// with it silently discarded. Naming the field here is a deliberate
+    /// behaviour change for such a caller: a well-formed size now changes
+    /// the body, and a malformed or negative one -- caught by `Query`'s own
+    /// rejection, since a `u64` cannot parse either -- now turns what was a
+    /// silent `200` into a `400` rather than continuing to discard it.
+    size: Option<u64>,
 }
 
 /// What a given destination would cost to deliver to, per ADR 0022's
@@ -642,6 +655,18 @@ struct RoutePriceView {
     /// and is unaffected.
     #[serde(default, skip_serializing_if = "is_zero")]
     price_per_kib: u64,
+    /// What a packet whose sealed payload is the request's `size` bytes
+    /// would be charged (issue #1267) -- [`connector_domain::Price::charge`]
+    /// evaluated once, the same evaluation every gate on the value path
+    /// charges under, never a second implementation of ADR 0065's formula at
+    /// this layer. This is the same semantics the x402 greeting's `amount`
+    /// already publishes for a request it actually received; this field
+    /// answers the same question for a size a caller only asks about.
+    ///
+    /// Absent -- not `null` -- when the request named no `size`, so this
+    /// answer is byte-identical to what it was before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    charge: Option<u64>,
 }
 
 /// `skip_serializing_if` for a slope that is not there. A free function
@@ -655,12 +680,26 @@ async fn route_price(
     Query(query): Query<RoutePriceQuery>,
 ) -> Response {
     match state.connector.client_route_price(&query.destination) {
-        Some(price) => Json(RoutePriceView {
-            destination: query.destination,
-            price: price.base(),
-            price_per_kib: price.per_kib(),
-        })
-        .into_response(),
+        Some(price) => {
+            // `size` is a byte count on the wire (a `u64`), and `charge`
+            // takes `usize`; converting rather than re-deriving the formula
+            // here keeps this a straight pass-through to the one evaluation,
+            // and saturating the conversion itself (mirroring `charge`'s own
+            // `u64::try_from(..).unwrap_or(u64::MAX)`) means a size beyond
+            // this platform's `usize` still reaches the schedule's own
+            // saturating arithmetic rather than being rejected at this
+            // layer.
+            let charge = query
+                .size
+                .map(|size| price.charge(usize::try_from(size).unwrap_or(usize::MAX)));
+            Json(RoutePriceView {
+                destination: query.destination,
+                price: price.base(),
+                price_per_kib: price.per_kib(),
+                charge,
+            })
+            .into_response()
+        }
         None => (
             StatusCode::NOT_FOUND,
             format!(
@@ -2162,6 +2201,214 @@ mod tests {
         let request = Request::builder()
             .method("GET")
             .uri("/ilp/routes/price?destination=g.nowhere")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Issue #1267: a request naming no `size` gets exactly today's body --
+    /// no `charge` field at all, not a null one, so an existing reader
+    /// unmarshalling this into a struct without the field is unaffected and
+    /// a reader inspecting raw JSON never sees the key.
+    #[tokio::test]
+    async fn a_route_price_request_with_no_size_is_unchanged() {
+        let route = StaticRoute::new_priced("g.example.app", "http://localhost:4000", 42).unwrap();
+        let connector = Arc::new(Connector::new(
+            vec![route],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let app = router(connector, test_signer());
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ilp/routes/price?destination=g.example.app.sub")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            raw.get("charge").is_none(),
+            "no size was asked for, so 'charge' must be absent rather than null: {raw}"
+        );
+        assert_eq!(
+            raw,
+            serde_json::json!({"destination": "g.example.app.sub", "price": 42})
+        );
+    }
+
+    /// Issue #1267: a `size` on a route with a slope answers the base, the
+    /// slope and the evaluated charge -- computed by
+    /// [`connector_domain::Price::charge`], never re-derived at this layer --
+    /// and a size that crosses a KiB boundary charges the rounded-up
+    /// kibibyte count (ADR 0065).
+    #[tokio::test]
+    async fn a_route_price_request_with_a_size_answers_the_evaluated_charge() {
+        let route = StaticRoute::new_scheduled(
+            "g.example.store",
+            "http://localhost:4000",
+            Price::scheduled(1000, 30),
+        )
+        .unwrap();
+        let connector = Arc::new(Connector::new(
+            vec![route],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let app = router(connector, test_signer());
+
+        // Exactly one KiB: one started kibibyte.
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ilp/routes/price?destination=g.example.store&size=1024")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let view: RoutePriceView = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(view.price, 1000);
+        assert_eq!(view.price_per_kib, 30);
+        assert_eq!(view.charge, Some(1030));
+
+        // One byte over a KiB boundary: two started kibibytes.
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ilp/routes/price?destination=g.example.store&size=1025")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let view: RoutePriceView = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(view.charge, Some(1060));
+    }
+
+    /// Issue #1267: a flat route (no slope) charges its base for any size --
+    /// the schedule's `per_kib` is zero, so `Price::charge` never adds
+    /// anything to it.
+    #[tokio::test]
+    async fn a_flat_route_charges_its_base_for_any_size() {
+        let route = StaticRoute::new_priced("g.example.app", "http://localhost:4000", 42).unwrap();
+        let connector = Arc::new(Connector::new(
+            vec![route],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let app = router(connector, test_signer());
+
+        for size in [0_u64, 1, 1024, 1_048_576] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/ilp/routes/price?destination=g.example.app&size={size}"
+                ))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            let view: RoutePriceView = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(view.charge, Some(42), "size {size}");
+        }
+    }
+
+    /// Issue #1267: the domain evaluation's saturating arithmetic is
+    /// reachable through this endpoint, not bypassed by it -- a schedule
+    /// whose slope overflows `u64` against a large-but-valid size still
+    /// answers `u64::MAX` rather than panicking or wrapping.
+    #[tokio::test]
+    async fn a_size_that_saturates_the_schedule_answers_u64_max() {
+        let route = StaticRoute::new_scheduled(
+            "g.example.store",
+            "http://localhost:4000",
+            Price::scheduled(0, 2000),
+        )
+        .unwrap();
+        let connector = Arc::new(Connector::new(
+            vec![route],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let app = router(connector, test_signer());
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/ilp/routes/price?destination=g.example.store&size={}",
+                u64::MAX
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let view: RoutePriceView = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(view.charge, Some(u64::MAX));
+    }
+
+    /// Issue #1267: a size that cannot be a byte count at all -- negative,
+    /// non-integer, or too many digits to be a `u64` -- is refused outright
+    /// rather than silently answered with the sizeless body, which would
+    /// hand the caller a number it would mistake for a charge.
+    #[tokio::test]
+    async fn a_malformed_size_is_refused_not_silently_ignored() {
+        let route = StaticRoute::new_priced("g.example.app", "http://localhost:4000", 42).unwrap();
+        let connector = Arc::new(Connector::new(
+            vec![route],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let app = router(connector, test_signer());
+
+        for size in ["-1", "not-a-number", "1.5", "99999999999999999999999999"] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/ilp/routes/price?destination=g.example.app&size={size}"
+                ))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert!(
+                response.status().is_client_error(),
+                "size '{size}' should be a 4xx, got {}",
+                response.status()
+            );
+        }
+    }
+
+    /// Issue #1267: an unrouted destination is a 404 exactly as before,
+    /// whether or not a size was asked for -- the size parameter is never
+    /// consulted before the route lookup fails.
+    #[tokio::test]
+    async fn an_unmatched_destination_with_a_size_is_still_a_404() {
+        let connector = Arc::new(Connector::new(
+            vec![],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let app = router(connector, test_signer());
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ilp/routes/price?destination=g.nowhere&size=1024")
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
@@ -5389,6 +5636,7 @@ mod tests {
                     destination: REMOTE_APP.to_string(),
                     price: FORWARD_PRICE,
                     price_per_kib: 0,
+                    charge: None,
                 }
             );
 

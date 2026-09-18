@@ -34,7 +34,7 @@ use connector_runtime::{
 use connector_settlement::{SettlementBackend, SettlementError};
 use connector_settlement_evm::{
     ChannelIndexLookup, EvmChannelIndex, EvmChannelIndexSyncer, EvmSettlementBackend,
-    DEFAULT_POLL_INTERVAL,
+    IndexedContract, DEFAULT_POLL_INTERVAL,
 };
 use connector_settlement_solana::SolanaSettlementBackend;
 use connector_signer::{
@@ -1105,9 +1105,20 @@ fn open_journal(state_dir: &Path, name: &str) -> Result<Arc<dyn Journal>, Runtim
 /// saves every RPC call the index avoids within a run, it just re-backfills
 /// from `channel_index_from_block` on every restart rather than resuming
 /// from a checkpoint.
-fn open_evm_channel_index(state_dir: Option<&Path>) -> Result<Arc<EvmChannelIndex>, RuntimeError> {
+///
+/// `indexes` and `from_block` are what bind the snapshot to what it indexes
+/// (issue #1282). Both come from facts this node has already established
+/// against the chain itself -- the live chain id and the **resolved**
+/// `TokenNetwork` off the built backend, not anything read out of the URL
+/// or the registry line -- which is why this is called after the backend is
+/// built rather than alongside the other `state_dir` stores.
+fn open_evm_channel_index(
+    state_dir: Option<&Path>,
+    indexes: IndexedContract,
+    from_block: u64,
+) -> Result<Arc<EvmChannelIndex>, RuntimeError> {
     let path = state_dir.map(|state_dir| state_dir.join(EVM_CHANNEL_INDEX));
-    let index = EvmChannelIndex::open(path.as_deref()).map_err(|source| {
+    let index = EvmChannelIndex::open(path.as_deref(), indexes, from_block).map_err(|source| {
         RuntimeError::EvmChannelIndexUnusable {
             path: path.unwrap_or_default(),
             source,
@@ -1792,10 +1803,38 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 // own doc). Opened -- and, on a durable failure, refused --
                 // before any traffic is served, same as every other
                 // `state_dir`-scoped store (ADR 0009).
-                let channel_index = open_evm_channel_index(config.state_dir())?;
+                // Bound to the chain and contract it indexes (issue #1282):
+                // a state volume outlives an `[settlement.evm]` cutover, so
+                // a snapshot that does not say which deployment it is about
+                // is resumed against whichever one the file now names --
+                // which is how a Base Sepolia checkpoint came to be resumed
+                // against Base mainnet, serving five wrong-chain channels
+                // out of the index the whole time. Both facts come off the
+                // backend just built, so they are what the chain answered
+                // rather than what the config claims.
+                //
+                // The same two facts `check_evm_channel_domains` took as an
+                // `EvmDomain` a few lines above, and deliberately a
+                // different type: that one is the EIP-712 domain a peer
+                // claim is signed against (ADR 0024, issue #1136), this one
+                // is the provenance of a cache. They agree here because
+                // both read the same backend, not because either derives
+                // from the other.
+                let indexed_contract = IndexedContract {
+                    chain_id: backend.chain_id(),
+                    token_network: backend.address(),
+                };
+                let channel_index = open_evm_channel_index(
+                    config.state_dir(),
+                    indexed_contract,
+                    evm.channel_index_from_block(),
+                )?;
+                // The syncer queries the contract the index is bound to,
+                // from the one value, so the two cannot drift into
+                // indexing one contract under another's name.
                 let syncer = EvmChannelIndexSyncer::new(
                     evm.rpc_url(),
-                    backend.address(),
+                    indexed_contract.token_network,
                     evm.channel_index_confirmations(),
                     evm.channel_index_from_block(),
                 )
@@ -2543,6 +2582,18 @@ mod tests {
 
     fn load_config(text: &str) -> Config {
         try_load_config(text).expect("load config")
+    }
+
+    /// What a `state_dir`-less, chain-less index is told it indexes. The
+    /// binding (issue #1282) only ever decides whether a snapshot on disk
+    /// is this index's, and these tests have no snapshot on disk at all --
+    /// so any pair does, and naming anvil's chain id says which chain the
+    /// tests around it are written against.
+    fn test_indexed_contract() -> IndexedContract {
+        IndexedContract {
+            chain_id: 31_337,
+            token_network: ethers::types::Address::zero(),
+        }
     }
 
     /// [`load_config`] without the `expect`, for a test whose subject IS
@@ -5443,7 +5494,10 @@ key_file = "{key_path}"
                 .expect("fund the counterparty's side of the channel");
 
             let channel_id = channel_id_bytes(&channel.0);
-            let index = Arc::new(EvmChannelIndex::open(None).expect("open in-memory index"));
+            let index = Arc::new(
+                EvmChannelIndex::open(None, test_indexed_contract(), 0)
+                    .expect("open in-memory index"),
+            );
             index
                 .apply(
                     vec![
@@ -5538,7 +5592,10 @@ key_file = "{key_path}"
             // "confirmed `ChannelOpened`, unconfirmed `ChannelNewDeposit`"
             // window the finding describes.
             let channel_id = channel_id_bytes(&channel.0);
-            let index = Arc::new(EvmChannelIndex::open(None).expect("open in-memory index"));
+            let index = Arc::new(
+                EvmChannelIndex::open(None, test_indexed_contract(), 0)
+                    .expect("open in-memory index"),
+            );
             index
                 .apply(
                     vec![OrderedChannelIndexEvent {
@@ -5669,7 +5726,10 @@ key_file = "{key_path}"
 
             let funded_id = channel_id_bytes(&funded.0);
             let empty_id = channel_id_bytes(&empty.0);
-            let index = Arc::new(EvmChannelIndex::open(None).expect("open in-memory index"));
+            let index = Arc::new(
+                EvmChannelIndex::open(None, test_indexed_contract(), 0)
+                    .expect("open in-memory index"),
+            );
             index
                 .apply(
                     vec![
