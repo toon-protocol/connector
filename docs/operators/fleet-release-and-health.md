@@ -188,6 +188,29 @@ recovery and closes it**, so the issue's open/closed state _is_ the fleet's curr
 never have to work out whether an old alert is still live. One issue, not one per failing run: a
 fleet that stays down for an hour would otherwise open four.
 
+**While it stays red, the alert's body is rewritten on every run and the thread stays quiet.** The
+body always shows the current verdict, plus how long this particular failure has been going and over
+how many consecutive runs. A comment is added only when the failure **changes shape** — a different
+set of jobs failing, a different config-compat detail, or a different set of failing service/check
+rows — or when the fleet recovers.
+
+So read the alert like this:
+
+| What you see                 | What it means                                                             |
+| ---------------------------- | ------------------------------------------------------------------------- |
+| Alert open, no new comments  | The same failure is still failing. The body's "since" line says how long. |
+| A new `🔄` comment           | The failure changed shape; the comment prints the old and new signatures. |
+| A `✅` comment, issue closed | Recovered.                                                                |
+
+This is deliberate. The alert used to comment on every run, and issue #1248 collected 137
+near-identical comments over three weeks — at which point nobody could tell that day's failure from
+the one that opened it, and the alert had stopped being readable. A quiet thread under a red alert
+is now information, not neglect.
+
+One consequence worth knowing: because the signature includes which service/check rows failed, a
+probe whose _detail_ changes but whose failing rows do not — a restart count ticking up, say — will
+not comment. That is intended; the detail is in the body either way.
+
 ### The forwarded route: what container health cannot see
 
 Everything above asks whether a node is up and answering **for itself**. Until 2026-08-28 nothing

@@ -45,6 +45,14 @@
 #     rather than inventing a channel of its own. Opening an issue also emails
 #     everyone watching the repo, which a failed scheduled run does not do
 #     reliably (GitHub mails only the cron's last editor).
+#   * While it stays red the alert's BODY is rewritten on every run -- so the
+#     issue always shows the current verdict -- but the thread gains a comment
+#     only when the failure CHANGES SHAPE. A rolling alert that commented on
+#     every run buried itself: #1248 collected 137 near-identical comments over
+#     three weeks, and nobody could tell that day's failure from the one that
+#     opened it. A quiet thread under a red alert now means "same failure,
+#     still failing", which is information; the body carries how long it has
+#     been that way and over how many runs.
 #   * A subsequent green run COMMENTS the recovery on that issue and CLOSES
 #     it, so the issue's open/closed state is the fleet's current verdict and
 #     a human never has to work out whether an old alert is still live.
@@ -991,13 +999,89 @@ jobs:
             exit 0
           fi
 
+          # --- What this failure IS, as a comparable value -------------------
+          #
+          # A rolling alert that comments on every run is unreadable: #1248
+          # collected 137 near-identical comments over three weeks and nobody
+          # could tell today's failure from August's at a glance. So a comment
+          # is reserved for a CHANGE -- the alert's body is rewritten on every
+          # run and always shows the current verdict, but the thread only gains
+          # an entry when the failure changes shape (or the fleet recovers).
+          #
+          # The signature is the four job verdicts, the config-compat detail,
+          # and the service/check pairs that actually failed -- deliberately
+          # NOT the detail column of each row, which carries restart counts and
+          # timestamps that differ run to run and would make every run a
+          # "change". Two failures with the same signature are the same
+          # outage continuing; a different signature is news.
+          COMPAT_DETAIL='${{ needs.config-compat.outputs.detail }}'
+          # The artifact download is `continue-on-error`, so the reports may be
+          # absent. "I could not see which rows failed" is NOT the same as "no
+          # rows failed" -- treating it as the latter would flip the signature
+          # and comment, which is exactly the noise this exists to stop. So the
+          # two halves stay separable and the failing half is skipped when it
+          # cannot be observed.
+          if ls /tmp/reports/*.md >/dev/null 2>&1; then
+            REPORTS_SEEN=yes
+          else
+            REPORTS_SEEN=no
+          fi
+          FAILING=$(cat /tmp/reports/*.md 2>/dev/null \
+                      | grep '^| ❌ |' \
+                      | awk -F'|' '{ print $3 "/" $4 }' \
+                      | tr -d ' ' | sort -u | paste -sd, - || true)
+          SIG_CORE="probe=$PROBE;compat=$COMPAT;peering=$PEERING;paid=$PAID_VERDICT"
+          SIG_CORE="$SIG_CORE;detail=$(printf '%s' "$COMPAT_DETAIL" | tr -d '\n')"
+          SIG="$SIG_CORE;failing=$FAILING"
+
+          # Carry the previous state forward out of the alert's own body, so
+          # "how long has this been red" survives without any external store.
+          PREV_SIG=""
+          SINCE="$(date -u +%Y-%m-%dT%H:%MZ)"
+          RUNS=1
+          CHANGED=yes
+          if [ -n "$EXISTING" ]; then
+            PREV_STATE=$(gh issue view "$EXISTING" --repo "${{ github.repository }}" \
+                           --json body --jq .body \
+                         | sed -n 's/.*<!-- fleet-health-state: \(.*\) -->.*/\1/p' | head -1)
+            if [ -n "$PREV_STATE" ]; then
+              PREV_SIG=$(printf '%s' "$PREV_STATE" | sed -n 's/.*sig=\(.*\); since=.*/\1/p')
+              PREV_SINCE=$(printf '%s' "$PREV_STATE" | sed -n 's/.*; since=\([^;]*\);.*/\1/p')
+              PREV_RUNS=$(printf '%s' "$PREV_STATE" | sed -n 's/.*; runs=\([0-9]*\).*/\1/p')
+              # An unchanged signature continues the same outage; a changed one
+              # starts a new clock, because the thing being counted is new.
+              if [ "$PREV_SIG" = "$SIG" ]; then
+                CHANGED=no
+              elif [ "$REPORTS_SEEN" = "no" ] \
+                   && [ "${PREV_SIG%%;failing=*}" = "$SIG_CORE" ]; then
+                # Same verdicts, and the rows we cannot see this run are the
+                # only difference. Keep the previous signature so the recorded
+                # failing set is not lost to a flaky artifact download.
+                CHANGED=no
+                SIG="$PREV_SIG"
+              fi
+              if [ "$CHANGED" = "no" ]; then
+                [ -n "$PREV_SINCE" ] && SINCE="$PREV_SINCE"
+                [ -n "$PREV_RUNS" ] && RUNS=$((PREV_RUNS + 1))
+              fi
+            fi
+          fi
+
           BODY=/tmp/alert-body.md
           {
             echo "One or more Watchtower-managed devnet services failed their health probe."
             echo ""
             echo "**Run:** $RUN_URL"
             echo "**Box probes:** \`$PROBE\` · **Config compatibility:** \`$COMPAT\` · **Peering cross-check:** \`$PEERING\` · **Paid probe:** \`$PAID\`"
+            echo "**This failure since:** $SINCE · **consecutive runs:** $RUNS"
             echo ""
+            if [ "$RUNS" -gt 1 ]; then
+              echo "> This body is rewritten on every run and always shows the CURRENT verdict."
+              echo "> The thread gains a comment only when the failure changes shape, or when the"
+              echo "> fleet recovers — so a quiet thread under a red alert means \"still the same"
+              echo "> failure\", not \"nobody looked\"."
+              echo ""
+            fi
             if [ "$PEERING" != "success" ]; then
               echo "> ⚠️ **Two nodes no longer agree about a forwarded route.**"
               echo ">"
@@ -1071,11 +1155,38 @@ jobs:
             echo "Full runbook: \`docs/operators/fleet-release-and-health.md\`."
             echo ""
             echo "<sub>Opened automatically by \`.github/workflows/fleet-health.yml\`. It closes itself when a later run is green.</sub>"
+            echo ""
+            echo "<!-- fleet-health-state: sig=$SIG; since=$SINCE; runs=$RUNS -->"
           } > "$BODY"
 
           if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --repo "${{ github.repository }}" --body-file "$BODY"
-            echo "Updated alert #$EXISTING."
+            # The body is the current verdict, so it is rewritten every run.
+            gh issue edit "$EXISTING" --repo "${{ github.repository }}" --body-file "$BODY"
+
+            if [ "$CHANGED" = "no" ]; then
+              # Same failure, still failing. Rewriting the body already recorded
+              # it; a comment would only add to the pile that made #1248
+              # unreadable. Staying silent here is the whole point of the change.
+              echo "Alert #$EXISTING refreshed; unchanged signature, no comment (run $RUNS since $SINCE)."
+            else
+              {
+                if [ -z "$PREV_SIG" ]; then
+                  echo "🔄 **This alert now reports only changes.** Its body above is rewritten"
+                  echo "every run and always shows the current verdict; this thread will gain a"
+                  echo "comment only when the failure changes shape, or when the fleet recovers."
+                else
+                  echo "🔄 **The failure changed shape.**"
+                  echo ""
+                  echo "\`\`\`"
+                  echo "was: $PREV_SIG"
+                  echo "now: $SIG"
+                  echo "\`\`\`"
+                fi
+                echo ""
+                echo "Current verdict in [this run]($RUN_URL); full detail in the issue body."
+              } | gh issue comment "$EXISTING" --repo "${{ github.repository }}" --body-file -
+              echo "Alert #$EXISTING updated; signature changed, commented."
+            fi
           else
             gh issue create --repo "${{ github.repository }}" \
               --title "$ALERT_TITLE" \
