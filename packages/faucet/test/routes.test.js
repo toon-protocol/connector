@@ -105,4 +105,14 @@ test('the dropped native-token routes 404; the USDC routes and /health survive',
   assert.equal(info.chains.solana.enabled, false);
   assert.equal(info.chains.mina, undefined, '/api/info must not advertise a Mina leg (ADR 0065)');
   assert.ok(info.chains.baseSepolia);
+
+  // The local-anvil EVM leg's vestigial top-level fields must be gone
+  // entirely — they described a leg this service no longer serves.
+  for (const field of ['ethAmount', 'tokenAmount', 'tokenAddress', 'faucetBalances', 'ready']) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(info, field),
+      false,
+      `/api/info must not carry the vestigial EVM field "${field}"`
+    );
+  }
 });
