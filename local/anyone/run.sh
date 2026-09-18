@@ -41,11 +41,11 @@ need() {
 # default mnemonic funds with mock USDC.
 #
 # THAT LITERAL IS PUBLIC and every local chain ships with it -- it is anvil's
-# well-known default mnemonic, the same class of value `docker-compose.yml`
-# already writes in the clear for the faucet's ETH_PRIVATE_KEY and
-# TOKEN_PRIVATE_KEY. It is fine here and nowhere else. The generated files it
-# lands in are written to `local/.keys/`, which is gitignored (ADR 0012), so
-# nothing key-shaped is ever tracked.
+# well-known default mnemonic, the same class of value `packages/contracts/script/DeployLocal.s.sol`
+# already writes in the clear for its deployer key. It is fine here and
+# nowhere else. The generated files it lands in are written to
+# `local/.keys/`, which is gitignored (ADR 0012), so nothing key-shaped is
+# ever tracked.
 #
 # Mode 0644, not 0600: the image runs as uid 10001 and has to read these. They
 # are throwaway local-chain keys and `local/.keys/` is gitignored (ADR 0012).
