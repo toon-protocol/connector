@@ -98,17 +98,43 @@ payment to its Solana peer channel).
 ## Connector config (`[settlement.evm]`)
 
 What the operator's node runs. `contract_address` is the **registry**; the node resolves the
-`TokenNetwork` itself.
+`TokenNetwork` itself. The `rpc_url` line is the one value below this record cannot vouch for —
+what that node runs is that operator's to say, and it ran `https://base-rpc.publicnode.com` when
+this was written. What the deployment _requires_ is the next section, and publicnode does not meet
+it.
 
 ```toml
 [settlement.evm]
-rpc_url          = "https://base-rpc.publicnode.com"
+rpc_url          = "https://mainnet.base.org"  # must serve eth_getLogs — see below
 contract_address = "0x61d31e7Fd9a57A0611e29Bd7eB162f15AC8B3427"  # TokenNetworkRegistry
 token_address    = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # Circle native USDC
 decimals         = 6
 channel_index_from_block = 50745815
 ```
 
-publicnode refuses the channel index's archive `eth_getLogs` backfill ("archive requests require a
-personal token"); the node logs a WARN and falls back to direct chain reads. Cosmetic at the
-current channel count; pick an archive-capable RPC if it matters.
+### The RPC has to serve `eth_getLogs`
+
+**Earlier revisions of this file named `https://base-rpc.publicnode.com` above and called the
+failure cosmetic. The second half was wrong.** publicnode's free tier refuses the channel index's
+`eth_getLogs` backfill outright ("archive requests require a personal token"), which is not an
+archive nicety: the #661 channel index is _built_ out of `eth_getLogs` over
+`ChannelOpened`/`ChannelNewDeposit`/`ChannelSettled`, so an endpoint refusing that call leaves the
+index permanently empty. Every channel lookup then pays a direct chain read, which is exactly the
+cost #661 exists to remove, and an anonymous sender naming channels that do not exist can force
+one read each (#613) with only the client edge's lookup budget rationing it.
+
+`https://mainnet.base.org` serves `eth_getLogs`, at a **10,000-block range cap**. The connector
+asks in 2,000-block ranges, comfortably inside it. Any endpoint that serves `eth_getLogs` over the
+range from `channel_index_from_block` to head will do; one that does not is not usable here,
+whatever else it answers.
+
+### `channel_index_from_block` is load-bearing on a cutover
+
+This node moved `[settlement.evm]` from Base Sepolia to Base mainnet on a state volume that already
+held a channel index. Before #1282 the index resumed that Sepolia checkpoint (block 46,256,398)
+against mainnet, walked ~4.5M blocks of unrelated history to reach 50,745,815, and served five
+wrong-chain channels out of the index while it did. The connector now records the chain id and the
+resolved `TokenNetwork` in the snapshot and refuses to resume one that does not match, or whose
+checkpoint is below `channel_index_from_block`; it logs a WARN naming the mismatch and re-backfills
+from the configured block. Nothing repairs the old file — set `channel_index_from_block` to the
+block the `TokenNetwork` was created in (above) and the discard is automatic.
