@@ -241,7 +241,7 @@ services:
       start_period: 15s
 
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  # Token Faucet - Provides ETH and USDC tokens for testing
+  # Token Faucet - Provides USDC on Solana devnet and Base Sepolia
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   faucet:
     build:
@@ -250,29 +250,17 @@ services:
       # infra/linode-faucet/docker-compose.faucet.yml. See packages/faucet/Dockerfile.
       context: .
       dockerfile: packages/faucet/Dockerfile
-    # Runs under BOTH evm and solana so a single host can drip every chain.
-    # The EVM init polls for the anvil token deploy; the Solana route NO-OPs
-    # with a clear 503 when its env isn't set — so an evm-only `up` still works.
+    # Runs under BOTH evm and solana so it comes up alongside either local
+    # chain tier. It has no local-anvil leg (local EVM is funded from genesis
+    # plus mint-on-demand, never a faucet — see CLAUDE.md); its Solana route
+    # NO-OPs with a clear 503 when its env isn't set, so an evm-only `up`
+    # still works.
     profiles:
       - evm
       - solana
       - app # issue #221 — reused by the app profile
     environment:
       PORT: 3500
-      RPC_URL: http://anvil:8545
-
-      # Account 1 for ETH (has 10k ETH from Anvil)
-      ETH_PRIVATE_KEY: '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d'
-
-      # Account 0 (deployer) for USDC tokens
-      TOKEN_PRIVATE_KEY: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
-
-      # Token address (deterministic from Anvil deployment)
-      TOKEN_ADDRESS: '0x5FbDB2315678afecb367f032d93F642f64180aa3'
-
-      # Amounts to send per request
-      ETH_AMOUNT: '100'
-      TOKEN_AMOUNT: '10000'
 
       # ── Solana (only active under the `solana` profile) ──
       # Mint authority keypair mounted below; deterministic local-validator USDC

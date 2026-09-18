@@ -141,9 +141,9 @@ compile + per-tx proving time; keep Mina settlement **nightly, not per-PR**
   (DONE, updated for the rate-limited redeploy: the token's mint is
   permissionless-but-recipient-signed, so funding is either the
   `tools/mina/self-mint-usdc.mts` self-mint — wrapped by
-  `infra/mina/fund-mina-usdc.sh` — or the faucet's `/api/mina/usdc-request`
-  treasury TRANSFER for zero-MINA recipients; admin-mint is legacy,
-  stock-admin deploys only.)
+  `infra/mina/fund-mina-usdc.sh` — or a treasury TRANSFER for zero-MINA
+  recipients; admin-mint is legacy, stock-admin deploys only. The faucet's
+  Mina route this once named is gone with Mina itself, ADR 0065.)
 
 ## Risks
 
