@@ -1079,11 +1079,61 @@ impl ClientClaimGate {
         ticket.durable().await
     }
 
+    /// Retire the watermark of a channel this node has just settled on
+    /// chain (issue #1283) -- the settle path's half of the same job
+    /// [`Self::reap_unresolvable_channels`] does on a timer.
+    ///
+    /// The sweep alone cannot close this. It resets a watermark only while
+    /// the chain still reports the channel *gone*, and a Solana channel's
+    /// address is `find_program_address` over the sorted participants and
+    /// the mint with no epoch in the seeds
+    /// (`connector_settlement_solana::wire::channel_pda`), so a payer who
+    /// reopens before the next sweep lands is back at the very address
+    /// their settled channel's watermark is filed under and the sweep
+    /// never observes a gap. EVM does not have this shape: its channel id
+    /// hashes in the pair's `channelEpoch`
+    /// (`connector_settlement_evm::channel_id::derive_channel_id`), so a
+    /// reopened pair gets an id nothing is filed under. Retiring here
+    /// closes the window on both, and closes it deterministically rather
+    /// than within an interval.
+    ///
+    /// **The caller must have chain confirmation.** This is called from
+    /// `POST /channels/:id/settle` only after the settle transaction
+    /// itself succeeded -- never from `close`, which merely opens the
+    /// challenge period, and never from `cooperative-close`, which is a
+    /// redeem plus that same close. A channel that is closed but not
+    /// settled still owes its counterparty the replay defence this
+    /// watermark *is*, and its last claim is still what a redemption
+    /// submits ([`Self::latest_inbound_claim`]).
+    ///
+    /// The reset itself is as durable as an acceptance --
+    /// [`Self::reset_watermark`] does not resolve until the committer
+    /// reports it fsync'd -- but its *failure* is deliberately swallowed,
+    /// and this returns `()`. The money-moving half already happened on
+    /// chain and cannot be unwound, so a journal that would not take the
+    /// reset must not turn a successful settle into a failed request an
+    /// operator would retry. The failure is logged at `error` and left to
+    /// the next sweep, which resolves this channel as gone and resets it
+    /// there -- but only while the payer has not yet reopened at the same
+    /// address, so the log line is the operator's cue and not a guarantee.
+    pub async fn retire_settled_channel(&self, channel_key: &str) {
+        if let Err(error) = self.reset_watermark(channel_key).await {
+            tracing::error!(
+                channel = %channel_key,
+                ?error,
+                "settled this channel on chain but could not durably retire its watermark; \
+                 the periodic sweep will retry it"
+            );
+        }
+    }
+
     /// Reset `channel_key`'s watermark, durably (issue #977): the next
     /// claim on this channel is judged as if this gate had never accepted
-    /// one. Only ever called once this gate itself -- never a caller's
-    /// guess -- has confirmed the chain no longer vouches for the channel;
-    /// see [`Self::reap_unresolvable_channels`], its only caller.
+    /// one. Only ever called on a fact a chain has already settled, never
+    /// on a caller's guess -- either this gate's own sweep finding the
+    /// channel gone ([`Self::reap_unresolvable_channels`]) or a settle this
+    /// node itself submitted and the chain accepted
+    /// ([`Self::retire_settled_channel`]).
     ///
     /// A no-op, durably nothing written, when this channel has no
     /// watermark to reset -- most channels, most of the time, and not
@@ -1146,6 +1196,17 @@ impl ClientClaimGate {
     /// like a replay (issue #544's ordering). So nothing on the claim path
     /// can ever observe a reopen; only a check that runs independently of
     /// claim traffic can.
+    ///
+    /// It does not cover the reopen this node settled itself, and is not
+    /// asked to: a settle leaves no gap for a sweep to observe once the
+    /// payer has reopened at the same Solana address, so that case is
+    /// retired synchronously on the settle path instead
+    /// ([`Self::retire_settled_channel`], issue #1283). What stays
+    /// uncovered by both is a settle submitted by somebody *else* -- both
+    /// chains let any caller settle a channel whose window has passed --
+    /// followed by a reopen before the next sweep. Closing that would mean
+    /// resetting a watermark on inference rather than on a chain's own
+    /// answer, which is the one thing nothing here may do.
     ///
     /// Declared channels ([`ClientChannelRegistry::record_evm`]/
     /// [`record_solana`](ClientChannelRegistry::record_solana)) are
@@ -4016,6 +4077,162 @@ mod tests {
                  restart must not resurrect the settled predecessor's watermark"
             );
         }
+
+        // -- Issue #1283: the reopen no sweep ever sees. The sweep above
+        // resets a watermark only while the chain still reports its
+        // channel *gone*, and a Solana channel's address is
+        // `find_program_address` over the sorted participants and the
+        // mint with no epoch in the seeds, so a payer who reopens between
+        // a settle and the next sweep is back at the very address their
+        // settled channel's watermark is filed under, leaving the sweep
+        // no gap to observe. The node's own settle path closes that,
+        // because the node performed the settlement and does not have to
+        // deduce it. --
+
+        /// The settle path's own retirement, at its own seam
+        /// ([`ClientClaimGate::retire_settled_channel`]).
+        ///
+        /// The chain here vouches for the channel throughout and never
+        /// stops -- same address, a deposit still covering the watermark --
+        /// so [`ClientClaimGate::channel_is_gone`] cannot fire, and the
+        /// sweep is asserted to leave the watermark standing first. That is
+        /// precisely the four-minute window the issue reports: settle,
+        /// reopen, and no sweep in between ever sees anything amiss. The
+        /// retirement closes it in the settle's own request.
+        #[tokio::test]
+        async fn a_settle_retires_a_watermark_no_sweep_would_have_touched() {
+            let account = [0x5cu8; 32];
+            let counterparty = solana_signer().public.to_bytes();
+            let (_source, gate) = chain_resolved_solana(account, counterparty, 5_000_000);
+
+            gate.ingest(&genuine_solana_claim_json(&account, 9, 4_000_000), 0)
+                .await
+                .expect("the settled incarnation was paid");
+
+            gate.reap_unresolvable_channels().await;
+            assert_eq!(
+                gate.ingest(&genuine_solana_claim_json(&account, 9, 4_000_000), 0)
+                    .await,
+                Err(ClaimIngestRejection::NonceNotAdvancing),
+                "the sweep has nothing to go on: the chain still answers this channel and its \
+                 deposit still covers the watermark"
+            );
+
+            gate.retire_settled_channel(&format!("solana:{}", base58_encode(&account)))
+                .await;
+
+            assert!(
+                gate.ingest(&genuine_solana_claim_json(&account, 1, 1_000), 0)
+                    .await
+                    .is_ok(),
+                "a channel this node itself settled starts its next incarnation clean, without \
+                 waiting for a sweep to notice"
+            );
+        }
+
+        /// A settle retires one channel, not the book. A second channel's
+        /// watermark is untouched by the first one's retirement, which is
+        /// what keeps `POST /channels/:id/settle` a per-channel write.
+        #[tokio::test]
+        async fn a_settle_retires_only_the_channel_it_names() {
+            let settled = [0x5du8; 32];
+            let bystander = [0x5eu8; 32];
+            let counterparty = solana_signer().public.to_bytes();
+            let source = Arc::new(FakeSolanaChannelSource::knowing(vec![
+                (
+                    settled,
+                    SolanaChannel {
+                        program_id: [7u8; 32],
+                        counterparty,
+                        deposit_floor: DepositFloor::AtLeast(5_000_000),
+                    },
+                ),
+                (
+                    bystander,
+                    SolanaChannel {
+                        program_id: [7u8; 32],
+                        counterparty,
+                        deposit_floor: DepositFloor::AtLeast(5_000_000),
+                    },
+                ),
+            ]));
+            let gate = gate_over(
+                ClientChannelRegistry::new()
+                    .with_solana_source(source)
+                    .with_liveness_policy(unsuppressed()),
+            );
+
+            gate.ingest(&genuine_solana_claim_json(&settled, 4, 4_000), 0)
+                .await
+                .expect("the channel about to be settled accepts its claim");
+            gate.ingest(&genuine_solana_claim_json(&bystander, 4, 4_000), 0)
+                .await
+                .expect("an unrelated channel accepts its claim");
+
+            gate.retire_settled_channel(&format!("solana:{}", base58_encode(&settled)))
+                .await;
+
+            assert_eq!(
+                gate.ingest(&genuine_solana_claim_json(&bystander, 4, 4_000), 0)
+                    .await,
+                Err(ClaimIngestRejection::NonceNotAdvancing),
+                "settling one channel must not hand every other payer a free replay"
+            );
+        }
+
+        /// The settle's retirement is as durable as an acceptance
+        /// (issue #605's discipline, which the sweep's own reset already
+        /// keeps): a restarted process replaying the same journal recovers
+        /// the retirement, not the settled incarnation's watermark.
+        #[tokio::test]
+        async fn the_retirement_a_settle_makes_survives_a_restart() {
+            use connector_runtime::FileJournal;
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("client-edge-claims.log");
+            let account = [0x5fu8; 32];
+            let counterparty = solana_signer().public.to_bytes();
+            let source = Arc::new(FakeSolanaChannelSource::knowing(vec![(
+                account,
+                SolanaChannel {
+                    program_id: [7u8; 32],
+                    counterparty,
+                    deposit_floor: DepositFloor::AtLeast(5_000_000),
+                },
+            )]));
+            let registry = || {
+                ClientChannelRegistry::new()
+                    .with_solana_source(source.clone())
+                    .with_liveness_policy(unsuppressed())
+            };
+
+            {
+                let gate = ClientClaimGate::restore(
+                    registry(),
+                    Arc::new(FileJournal::open(&path).expect("open the journal file")),
+                )
+                .expect("replay the journal");
+                gate.ingest(&genuine_solana_claim_json(&account, 7, 3_000), 0)
+                    .await
+                    .expect("the settled incarnation accepts its claim");
+                gate.retire_settled_channel(&format!("solana:{}", base58_encode(&account)))
+                    .await;
+            }
+
+            let restarted = ClientClaimGate::restore(
+                registry(),
+                Arc::new(FileJournal::open(&path).expect("open the journal file")),
+            )
+            .expect("replay the journal");
+
+            assert!(
+                restarted
+                    .ingest(&genuine_solana_claim_json(&account, 1, 100), 0)
+                    .await
+                    .is_ok(),
+                "a restart must not resurrect the watermark the settle retired"
+            );
+        }
     }
 
     // -- Netting: spendable headroom nets a channel's outbound payout
@@ -4139,7 +4356,6 @@ mod tests {
                 })
             );
         }
-
         /// A gate with no payout ledger configured at all behaves exactly
         /// as it did before issue #700 -- the default every constructor
         /// leaves `payout_ledger` at.

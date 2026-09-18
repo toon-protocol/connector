@@ -991,6 +991,34 @@ async fn close_channel(
 /// `SettlementError::SettlementNotYetDue` named in the body, exactly like
 /// every other settlement refusal on this surface -- a retry-later answer,
 /// not a different status code.
+///
+/// # Retiring the client edge's watermark (issue #1283)
+///
+/// A settle is the one channel write after which the channel can never be
+/// paid on again, so it is also the point at which the client edge's
+/// replay watermark for it stops being a defence and starts being a
+/// liability. On Solana a channel's address is derived from the sorted
+/// participants and the mint with no epoch in the seeds, so the payer's
+/// next channel with this node is *the same address* -- and would inherit
+/// the settled incarnation's watermark, making every fresh claim either a
+/// replay or a demand for money already paid out. `ClientClaimGate`'s
+/// periodic sweep cannot catch that on its own: it resets only while the
+/// chain reports the channel gone, and a payer who reopens between the
+/// settle and the next sweep leaves no gap for it to see.
+///
+/// So this handler retires it directly, and only on the settle's own
+/// success -- never on `close`, which merely starts the challenge period,
+/// and never on `cooperative-close`, which is a redeem plus that same
+/// close. Both leave a channel whose watermark is still owed its job and
+/// whose last claim is still what a redemption would submit.
+///
+/// The retirement is recorded as durably as an acceptance, but it cannot
+/// fail the request. The chain has already moved the money by the time it
+/// runs, and answering `500` would invite an operator to retry a settle
+/// that has already happened; `retire_settled_channel` logs at `error`
+/// instead, and that log line is the operator's cue rather than a
+/// guarantee -- the sweep picks the channel up only while the payer has
+/// not yet reopened at the same address.
 async fn settle_channel(
     State(state): State<OperatorState>,
     Path(channel_id): Path<String>,
@@ -1003,7 +1031,15 @@ async fn settle_channel(
         return error.into_response();
     }
 
-    channel_operation_response(state.connector.settle_channel(&channel_id).await)
+    let settled = state.connector.settle_channel(&channel_id).await;
+    if settled.is_ok() {
+        // `None` for an id in neither chain's shape, which the client edge
+        // could never have journaled a watermark under either.
+        if let Some(key) = client_edge_channel_key(&channel_id) {
+            state.claim_gate.retire_settled_channel(&key).await;
+        }
+    }
+    channel_operation_response(settled)
 }
 
 /// The key `ClientClaimGate` would have journaled `channel_id` under, could
@@ -3248,6 +3284,75 @@ mod tests {
             assert_eq!(no_claim_response.status(), StatusCode::BAD_REQUEST);
         }
 
+        /// The client-edge claim fixtures the two tests below share:
+        /// a genuine, payer-signed claim over a real on-chain channel id,
+        /// and a registry that declares that channel. Module-level rather
+        /// than nested inside one test because issue #1283's settle test
+        /// needs exactly the same pair.
+        fn client_claim_json(
+            signer: &LocalSigner,
+            channel_id_hex: &str,
+            nonce: u64,
+            transferred_amount: u128,
+            chain_id: u64,
+            token_network: [u8; 20],
+        ) -> String {
+            let mut on_chain_id = [0u8; 32];
+            let hex_digits = channel_id_hex.trim_start_matches("0x");
+            for (i, byte) in on_chain_id.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&hex_digits[i * 2..i * 2 + 2], 16)
+                    .expect("channel id is 0x-prefixed 64-hex");
+            }
+            let proof = EvmBalanceProof {
+                channel_id: on_chain_id,
+                nonce,
+                transferred_amount,
+                locked_amount: 0,
+                locks_root: [0u8; 32],
+                chain_id,
+                token_network_address: token_network,
+            };
+            let signature = signer.sign(&evm_balance_proof_digest(&proof)).unwrap();
+            let address = derive_evm_address(&signer.public_key().unwrap());
+            let signature_hex: String = signature
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!(
+                r#"{{
+                    "version": "1.0",
+                    "blockchain": "evm",
+                    "messageId": "msg-{nonce}",
+                    "timestamp": "2026-02-02T12:00:00.000Z",
+                    "senderId": "client-edge-test-payer",
+                    "channelId": "{channel_id_hex}",
+                    "nonce": {nonce},
+                    "transferredAmount": "{transferred_amount}",
+                    "lockedAmount": "0",
+                    "locksRoot": "0x{zeros}",
+                    "signature": "0x{signature_hex}",
+                    "signerAddress": "{address}",
+                    "chainId": {chain_id},
+                    "tokenNetworkAddress": "{token_network_address}"
+                }}"#,
+                zeros = "0".repeat(64),
+                address = to_hex(&address),
+                token_network_address = to_hex(&token_network),
+            )
+        }
+
+        fn channels_recording(
+            channel_id: &str,
+            counterparty: connector_client_edge::EvmChannel,
+        ) -> ClientChannelRegistry {
+            let mut channels = ClientChannelRegistry::new();
+            channels
+                .record_evm(channel_id, counterparty)
+                .expect("a real on-chain channel id is a 32-byte hex identifier");
+            channels
+        }
+
         /// Issue #1218, end to end against a real chain: money accepted at
         /// the client edge -- never `Connector::handle_peer_claim`, which is
         /// the peer-book path the test above already covers -- is what
@@ -3292,70 +3397,6 @@ mod tests {
                 .fund_counterparty(&channel_id, 1_000)
                 .await
                 .expect("fund the payer's own side with real ERC-20 value");
-
-            fn client_claim_json(
-                signer: &LocalSigner,
-                channel_id_hex: &str,
-                nonce: u64,
-                transferred_amount: u128,
-                chain_id: u64,
-                token_network: [u8; 20],
-            ) -> String {
-                let mut on_chain_id = [0u8; 32];
-                let hex_digits = channel_id_hex.trim_start_matches("0x");
-                for (i, byte) in on_chain_id.iter_mut().enumerate() {
-                    *byte = u8::from_str_radix(&hex_digits[i * 2..i * 2 + 2], 16)
-                        .expect("channel id is 0x-prefixed 64-hex");
-                }
-                let proof = EvmBalanceProof {
-                    channel_id: on_chain_id,
-                    nonce,
-                    transferred_amount,
-                    locked_amount: 0,
-                    locks_root: [0u8; 32],
-                    chain_id,
-                    token_network_address: token_network,
-                };
-                let signature = signer.sign(&evm_balance_proof_digest(&proof)).unwrap();
-                let address = derive_evm_address(&signer.public_key().unwrap());
-                let signature_hex: String = signature
-                    .to_bytes()
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect();
-                format!(
-                    r#"{{
-                        "version": "1.0",
-                        "blockchain": "evm",
-                        "messageId": "msg-{nonce}",
-                        "timestamp": "2026-02-02T12:00:00.000Z",
-                        "senderId": "client-edge-test-payer",
-                        "channelId": "{channel_id_hex}",
-                        "nonce": {nonce},
-                        "transferredAmount": "{transferred_amount}",
-                        "lockedAmount": "0",
-                        "locksRoot": "0x{zeros}",
-                        "signature": "0x{signature_hex}",
-                        "signerAddress": "{address}",
-                        "chainId": {chain_id},
-                        "tokenNetworkAddress": "{token_network_address}"
-                    }}"#,
-                    zeros = "0".repeat(64),
-                    address = to_hex(&address),
-                    token_network_address = to_hex(&token_network),
-                )
-            }
-
-            fn channels_recording(
-                channel_id: &str,
-                counterparty: connector_client_edge::EvmChannel,
-            ) -> ClientChannelRegistry {
-                let mut channels = ClientChannelRegistry::new();
-                channels
-                    .record_evm(channel_id, counterparty)
-                    .expect("a real on-chain channel id is a 32-byte hex identifier");
-                channels
-            }
 
             let evm_channel = connector_client_edge::EvmChannel {
                 counterparty: payer_address,
@@ -3523,6 +3564,166 @@ mod tests {
             );
             let redeemed: ChannelView = serde_json::from_slice(&body_bytes).unwrap();
             assert_eq!(redeemed.redeemed, 1_000);
+        }
+
+        /// Issue #1283, against a real chain: settling a channel retires
+        /// the client edge's watermark for it, in the same request.
+        ///
+        /// The bug this closes is a Solana one -- a channel PDA is
+        /// `find_program_address` over the sorted participants and the
+        /// mint with no epoch in the seeds, so a payer who reopens after a
+        /// settle lands back on the very address their settled channel's
+        /// watermark is filed under, and every claim they can sign is then
+        /// either a replay or a demand for money already paid out. But the
+        /// *handler's* half of the fix is chain-agnostic (it retires
+        /// whatever key the settled id maps to), and what has to be proved
+        /// here is the wiring: that a settle which actually succeeded on a
+        /// real chain reaches the gate. `anvil` provides that; the
+        /// chain-specific reasoning about which reopens are detectable at
+        /// all lives in `ClientClaimGate`'s own tests.
+        ///
+        /// The challenge period is waited out by advancing `anvil`'s own
+        /// chain clock rather than by sleeping: `TokenNetwork` refuses any
+        /// `settlementTimeout` below its one-hour `MIN_SETTLEMENT_TIMEOUT`
+        /// (`InvalidSettlementTimeout`), so unlike the Solana leg of
+        /// `connector-cli/tests/settlement_lifecycle.rs` this cannot simply
+        /// open with a zero-length one.
+        #[tokio::test]
+        async fn settling_a_channel_retires_the_client_edges_watermark_for_it() {
+            if !require_anvil() {
+                return;
+            }
+
+            let anvil = Anvil::spawn().await;
+            let token = EvmSettlementBackend::deploy_mock_token(
+                &anvil.rpc_url,
+                DEPLOYER_PRIVATE_KEY,
+                1_000_000,
+            )
+            .await
+            .expect("deploy mock USDC");
+            let settlement = Arc::new(
+                EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
+                    .await
+                    .expect("deploy a TokenNetwork through a fresh registry"),
+            );
+
+            let payer_signer = LocalSigner::generate("client-edge-payer");
+            let payer_address = derive_evm_address(&payer_signer.public_key().unwrap());
+            let channel_id = settlement
+                .open(payer_address.to_vec(), chrono::Duration::seconds(3_600))
+                .await
+                .expect("open a real channel");
+
+            let evm_channel = connector_client_edge::EvmChannel {
+                counterparty: payer_address,
+                chain_id: settlement.chain_id(),
+                token_network_address: settlement.address().to_fixed_bytes(),
+                deposit_floor: connector_client_edge::DepositFloor::Unknown,
+            };
+            let journal_dir = tempfile::tempdir().expect("temp journal dir");
+            let journal_path = journal_dir.path().join("client-edge-claims.log");
+            let gate = Arc::new(
+                ClientClaimGate::restore(
+                    channels_recording(&channel_id.0, evm_channel),
+                    Arc::new(connector_runtime::FileJournal::open(&journal_path).unwrap()),
+                )
+                .expect("a fresh journal has nothing to replay"),
+            );
+            gate.ingest(
+                &client_claim_json(
+                    &payer_signer,
+                    &channel_id.0,
+                    98,
+                    6_028_510,
+                    settlement.chain_id(),
+                    settlement.address().to_fixed_bytes(),
+                ),
+                0,
+            )
+            .await
+            .expect("a genuine payer-signed claim is accepted");
+
+            let watermark_key = format!("evm:{}", channel_id.0);
+            assert!(
+                gate.watermark(&watermark_key).is_some(),
+                "the gate must actually hold a watermark for this channel, or the assertion \
+                 after the settle proves nothing"
+            );
+
+            let connector = Arc::new(
+                Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(TestClock::new(chrono::Utc::now())),
+                )
+                .with_settlement(SettlementChain::Evm, settlement.clone()),
+            );
+            connector.recognize_channel(&channel_id.0);
+            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
+            let keypair = keypair();
+            let app = router(
+                connector,
+                Arc::clone(&gate),
+                signer,
+                "correct-token".to_string(),
+                vec![keypair.public.to_bytes()],
+                None,
+            );
+
+            // Close, which starts the challenge period. The watermark must
+            // survive it: a channel that is merely closed still owes its
+            // counterparty this replay defence, and its last claim is still
+            // what a redemption submits. (Only one settle is attempted
+            // below -- `WriteAuth`'s replay tracking refuses a second,
+            // byte-identical signed request, so a pre-close settle refusal
+            // cannot be asserted here as well; the lifecycle test above
+            // already covers it.)
+            let close_path = format!("/channels/{}/close", channel_id.0);
+            let response = app
+                .clone()
+                .oneshot(signed_post(&keypair, &close_path, Vec::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                gate.watermark(&watermark_key).is_some(),
+                "closing a channel must not retire its watermark -- the challenge period is \
+                 exactly when that claim still matters"
+            );
+
+            // Wait out the challenge period on the chain's own clock.
+            {
+                use ethers::providers::{Http, Provider};
+                let provider =
+                    Provider::<Http>::try_from(anvil.rpc_url.as_str()).expect("build provider");
+                let _: serde_json::Value = provider
+                    .request("evm_increaseTime", [3_601])
+                    .await
+                    .expect("evm_increaseTime");
+                let _: serde_json::Value =
+                    provider.request("evm_mine", ()).await.expect("evm_mine");
+            }
+
+            let settle_path = format!("/channels/{}/settle", channel_id.0);
+            let response = app
+                .oneshot(signed_post(&keypair, &settle_path, Vec::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            let settled: ChannelView = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(settled.status, ChannelViewStatus::Settled);
+
+            assert_eq!(
+                gate.watermark(&watermark_key),
+                None,
+                "the settle retires the watermark in the same request, so a channel reopened \
+                 at this address -- which on Solana is the *same* address -- starts clean \
+                 instead of inheriting a spend the chain has already paid out"
+            );
         }
     }
 }

@@ -555,6 +555,26 @@ cannot decode, stops the connector starting rather than letting it start at no w
 the record lives is a deployment question rather than a wire one: today it is the `state_dir`
 config field, and a config that configures `[[client_channels]]` without one does not load.
 
+**A watermark does not outlive its channel.** The rule above is bounded by the channel it defends.
+Both chains this connector settles on _derive_ a channel's identifier rather than randomising it,
+so a payer's next channel can land on the identifier their settled one used. On EVM it does not:
+`TokenNetwork` hashes the pair's `channelEpoch` into the id, and that epoch advances when a channel
+of theirs settles. On Solana it does: the channel PDA is seeded on the sorted participants and the
+token mint with no epoch, so a reopened pair is back at the identical address. A connector that
+carried the settled incarnation's watermark forward would refuse every claim that payer could
+sign — one continuing the old watermark asks the new channel to honour units the chain has already
+paid out, and one starting fresh reads as a replay — leaving them no way to pay at all
+([issue #1283](https://github.com/toon-protocol/connector/issues/1283)). A connector therefore MUST
+retire a channel's watermark once a chain has told it that channel is finished, and MUST record the
+retirement as durably as it records an acceptance. Two answers count as being told, and only those
+two: a settle this connector itself submitted and the chain accepted, and a later read finding the
+channel gone altogether ([issue #977](https://github.com/toon-protocol/connector/issues/977)). A
+connector MUST NOT retire a watermark on anything weaker — a deposit that merely looks too small for
+it is an inference rather than a chain's answer, and a stale read of one would hand that payer a
+free replay of a claim already honoured. Retirement is not a licence to forget early either: a
+channel that is merely _closed_ is still running its challenge period, still owes its counterparty
+this defence, and its last claim is still what a redemption submits.
+
 **Mina is not a supported chain.** [ADR 0002](../adr/0002-drop-mina-from-the-rust-connector.md)
 drops Mina from the Rust connector: a Mina claim's on-chain lifecycle (open, deposit, close,
 settle) has no Rust implementation and none is planned, so a connector that accepted a Mina claim
