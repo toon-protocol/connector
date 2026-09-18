@@ -5,6 +5,7 @@ import "forge-std/Script.sol";
 import "@openzeppelin/contracts/metatx/ERC2771Forwarder.sol";
 import "../src/TokenNetwork.sol";
 import "../src/TokenNetworkRegistry.sol";
+import "./Erc2771ForwarderDeployment.sol";
 
 /**
  * @title DeployTestnetCutoverScript
@@ -39,16 +40,11 @@ import "../src/TokenNetworkRegistry.sol";
  *                            Defaults to the live Base Sepolia devnet mock USDC recorded in
  *                            packages/contracts/deployments/base-sepolia.md.
  */
-contract DeployTestnetCutoverScript is Script {
+contract DeployTestnetCutoverScript is Script, Erc2771ForwarderDeployment {
     /// @notice The live devnet mock USDC (packages/contracts/deployments/base-sepolia.md).
     ///         Reused, never redeployed -- existing balances and faucet distributions must
     ///         survive the cutover unchanged.
     address public constant DEFAULT_EXISTING_USDC = 0x49beE1Bca5d15Fb0963117923403F9498119a9Ce;
-
-    /// @notice Forwarder name used for its EIP-712 domain, matching
-    ///         test/TokenNetworkERC2771.t.sol's own forwarder so the signing story is identical
-    ///         between the proven test and the real deploy.
-    string public constant FORWARDER_NAME = "TokenNetworkForwarder";
 
     /// @notice Script entrypoint. Broadcasts only if PRIVATE_KEY is set; otherwise runs as a
     ///         keyless simulation so `forge script ... --fork-url` (and fork tests) never need a
@@ -93,10 +89,8 @@ contract DeployTestnetCutoverScript is Script {
         public
         returns (ERC2771Forwarder forwarder, TokenNetworkRegistry registry, TokenNetwork tokenNetwork)
     {
-        forwarder = new ERC2771Forwarder(FORWARDER_NAME);
         registry = new TokenNetworkRegistry();
-        registry.setTrustedForwarder(address(forwarder));
-        tokenNetwork = TokenNetwork(registry.createTokenNetwork(existingUsdc));
+        (forwarder, tokenNetwork) = _createForwarderAwareTokenNetwork(registry, existingUsdc);
     }
 
     function logSummary(ERC2771Forwarder forwarder, TokenNetworkRegistry registry, TokenNetwork tokenNetwork)
