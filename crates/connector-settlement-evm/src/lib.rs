@@ -37,7 +37,7 @@ pub mod test_support;
 pub use channel_id::{derive_channel_id, sort_participants};
 pub use channel_index::{
     ChannelIndexEvent, ChannelIndexLookup, EvmChannelIndex, EvmChannelIndexError,
-    IndexedChannelStatus, OrderedChannelIndexEvent,
+    IndexedChannelStatus, IndexedContract, OrderedChannelIndexEvent, RejectedSnapshot,
 };
 pub use channel_index_sync::{ChannelIndexSyncError, EvmChannelIndexSyncer, DEFAULT_POLL_INTERVAL};
 

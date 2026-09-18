@@ -230,14 +230,16 @@ value merely stale instead of missing.
 
 **On the boxes themselves, at restart.**
 
-- [ ] Delete `evm-channel-index.json` from each box's `state_dir` volume before restarting. The EVM
-      channel index is one file per node and is not keyed by `TokenNetwork` address
-      (`crates/connector-cli/src/runtime.rs`, `open_evm_channel_index`), so a checkpoint built
-      against the old contract survives the repoint and holds channels that do not exist on the
-      contract the node now reads. Deleting it forces a clean backfill.
-- [ ] Optionally set `[settlement.evm] channel_index_from_block` in both configs to the new
-      `TokenNetwork`'s deploy block. It is unset today, which means backfill from genesis — correct,
-      but slow on a public chain.
+- [x] ~~Delete `evm-channel-index.json` from each box's `state_dir` volume before restarting.~~ No
+      longer a manual step, since #1282: the snapshot records the chain id and the resolved
+      `TokenNetwork`, and `EvmChannelIndex::open` refuses to resume one whose identity does not
+      match what this node now indexes. A repoint therefore discards the old index by itself, logs a
+      WARN naming the mismatch, and backfills clean. The old file is ignored, never repaired — so
+      deleting it is still harmless, just unnecessary.
+- [ ] Set `[settlement.evm] channel_index_from_block` in both configs to the new `TokenNetwork`'s
+      deploy block. Unset means backfill from genesis — correct, but slow on a public chain — and
+      since #1282 it is also the second, independent guard: a checkpoint below it is discarded even
+      when the chain id and `TokenNetwork` both match.
 
 ### What NOT to repoint
 

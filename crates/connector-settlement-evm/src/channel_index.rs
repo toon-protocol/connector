@@ -63,6 +63,26 @@
 //! to a temp file beside the target path and is renamed over it, so a crash
 //! mid-write leaves the previous, still-valid snapshot in place.
 //!
+//! # What a snapshot is about
+//!
+//! A snapshot records the chain id and the resolved `TokenNetwork` its rows
+//! came from, and [`EvmChannelIndex::open`] resumes one only when both
+//! still match and its checkpoint is at or above the configured
+//! `channel_index_from_block` (issue #1282). This is not belt-and-braces:
+//! a `state_dir` is a volume that outlives an `[settlement.evm]` edit, so
+//! an unbound snapshot really does get resumed against a chain it says
+//! nothing about -- a Base Sepolia checkpoint at block 46,256,398 resumed
+//! against Base mainnet, ~4.5M blocks of unrelated history walked in
+//! 2,000-block ranges, and five wrong-chain channels served out of this
+//! table the whole time. [`ChannelIndexLookup::Terminal`] is the part that
+//! makes that a wrong answer rather than a slow one, since it is served
+//! with no chain read to correct it.
+//!
+//! A snapshot that fails either test is discarded whole and never
+//! repaired: this index is rebuildable from chain, and rewriting a file
+//! whose provenance is exactly what is in doubt would be inventing a
+//! checkpoint rather than finding one.
+//!
 //! # Reorgs
 //!
 //! This index only ever applies a log once it is
@@ -195,6 +215,58 @@ pub struct OrderedChannelIndexEvent {
     pub event: ChannelIndexEvent,
 }
 
+/// What a channel index's contents are *about*: the chain, and the
+/// `TokenNetwork` on it, whose logs produced every row in the table (issue
+/// #1282).
+///
+/// This travels into the durable snapshot and back out of it, because a
+/// snapshot that does not say what it indexes cannot be told apart from
+/// another deployment's -- and a state volume outlives an
+/// `[settlement.evm]` cutover, so one really does arrive holding the wrong
+/// chain's channels at the wrong chain's block height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedContract {
+    /// The live chain id the settlement backend proved by asking the chain,
+    /// never one inferred from the shape of an RPC URL.
+    pub chain_id: u64,
+    /// The **resolved** `TokenNetwork` -- what the configured registry
+    /// answers for the configured token, not the registry itself. A
+    /// registry that re-points its `TokenNetwork` therefore invalidates
+    /// this index too, which is correct: the old contract's logs describe
+    /// channels the new one has never heard of.
+    pub token_network: Address,
+}
+
+/// Why a snapshot found on disk was not taken as a checkpoint (issue
+/// #1282). `None` from [`EvmChannelIndex::rejected_snapshot`] means either
+/// that the snapshot was taken or that there was no snapshot to take.
+///
+/// Every variant means the same thing operationally -- the index starts
+/// empty, from the configured `channel_index_from_block`, and re-backfills
+/// -- and differs only in what an operator should be told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectedSnapshot {
+    /// Written before issue #1282 and so recording neither chain id nor
+    /// contract. Deliberately not an error: an upgrade must not require an
+    /// operator to hand-edit a state volume, and the index is rebuildable
+    /// from chain anyway.
+    Unbound,
+    /// The snapshot's blocks are numbered in a different chain -- the
+    /// cutover this was found on.
+    ChainId { recorded: u64, configured: u64 },
+    /// Same chain, different contract. Fires on a registry re-pointing its
+    /// `TokenNetwork` as surely as on a cutover, because the address bound
+    /// in is the *resolved* one; the rows are as wrong either way.
+    TokenNetwork {
+        recorded: Address,
+        configured: Address,
+    },
+    /// The operator has asserted, with `channel_index_from_block`, that the
+    /// contract did not exist before that block; a checkpoint below it is
+    /// stale by construction whatever identity it records.
+    BeforeStartBlock { checkpoint: u64, from_block: u64 },
+}
+
 #[derive(Debug, Error)]
 pub enum EvmChannelIndexError {
     #[error("channel index I/O error at {path}: {source}")]
@@ -262,6 +334,17 @@ struct Snapshot {
     /// pins `confirmed_head` at `0`.
     #[serde(default)]
     last_indexed_block: Option<u64>,
+    /// The chain this snapshot's blocks are numbered in (issue #1282).
+    /// `None` on a file written before that change -- read as "this
+    /// snapshot does not say what it indexes", never as a match.
+    #[serde(default)]
+    chain_id: Option<u64>,
+    /// The resolved `TokenNetwork` whose logs produced this table (issue
+    /// #1282), in the same `{:#x}` spelling every other address in this
+    /// file uses. `None` on a pre-#1282 file, read the same way
+    /// `chain_id`'s `None` is.
+    #[serde(default)]
+    token_network: Option<String>,
     #[serde(default)]
     channels: Vec<StoredChannel>,
 }
@@ -326,17 +409,26 @@ struct IndexState {
 #[derive(Debug)]
 pub struct EvmChannelIndex {
     path: Option<PathBuf>,
+    indexed_contract: IndexedContract,
+    rejected: Option<RejectedSnapshot>,
     state: RwLock<IndexState>,
 }
 
 impl EvmChannelIndex {
     /// No checkpoint and no channels, writing through to `path` from the
-    /// first [`Self::apply`] on. The three ways to start from nothing --
-    /// no `state_dir` at all, a snapshot file not written yet, and one
-    /// truncated to empty -- differ only in that `path`.
-    fn empty(path: Option<PathBuf>) -> Self {
+    /// first [`Self::apply`] on. The four ways to start from nothing --
+    /// no `state_dir` at all, a snapshot file not written yet, one
+    /// truncated to empty, and one refused as another deployment's
+    /// (`rejected`) -- differ only in that `path` and that reason.
+    fn empty(
+        path: Option<PathBuf>,
+        indexed_contract: IndexedContract,
+        rejected: Option<RejectedSnapshot>,
+    ) -> Self {
         EvmChannelIndex {
             path,
+            indexed_contract,
+            rejected,
             state: RwLock::new(IndexState {
                 last_indexed_block: None,
                 channels: HashMap::new(),
@@ -346,30 +438,64 @@ impl EvmChannelIndex {
 
     /// Open the durable snapshot at `path` (or start empty if it does not
     /// exist yet), falling back to an in-memory-only index when `path` is
-    /// `None`. No cold-start `from_block` is taken or stored here: that
-    /// floor is the syncer's, consulted only while this index has no
-    /// checkpoint of its own ([`Self::last_indexed_block`] is `None`), since
-    /// the checkpoint -- once it exists -- is always the more accurate
-    /// figure to resume from.
-    pub fn open(path: Option<&Path>) -> Result<Self, EvmChannelIndexError> {
+    /// `None`.
+    ///
+    /// A snapshot is taken as a checkpoint only when it is *this* index's
+    /// (issue #1282). It was not always so: this call used to take the
+    /// checkpoint whenever one existed, on the reasoning that "the
+    /// checkpoint -- once it exists -- is always the more accurate figure
+    /// to resume from". That is false across a cutover. A state volume
+    /// outlives an `[settlement.evm]` edit, so the file can hold another
+    /// chain's channels numbered in another chain's blocks, and this index
+    /// answers a [`ChannelIndexLookup::Terminal`] with no chain read at all
+    /// -- a wrong answer rather than a slow one. So the snapshot must agree
+    /// with `indexed_contract` on both the chain id and the `TokenNetwork`, and its
+    /// checkpoint must be at or above `from_block`, which is the operator's
+    /// own assertion of where that contract begins. A snapshot failing
+    /// either test is discarded whole -- table and checkpoint alike -- and
+    /// this index starts from `from_block` as a cold one would, with the
+    /// reason available from [`Self::rejected_snapshot`]. Nothing is
+    /// repaired or migrated: the rule is "do not trust it", and the index
+    /// is rebuildable from chain.
+    pub fn open(
+        path: Option<&Path>,
+        indexed_contract: IndexedContract,
+        from_block: u64,
+    ) -> Result<Self, EvmChannelIndexError> {
         let Some(path) = path else {
-            return Ok(EvmChannelIndex::empty(None));
+            return Ok(EvmChannelIndex::empty(None, indexed_contract, None));
         };
         if !path.exists() {
-            return Ok(EvmChannelIndex::empty(Some(path.to_path_buf())));
+            return Ok(EvmChannelIndex::empty(
+                Some(path.to_path_buf()),
+                indexed_contract,
+                None,
+            ));
         }
         let text = fs::read_to_string(path).map_err(|source| EvmChannelIndexError::Io {
             path: path.to_path_buf(),
             source,
         })?;
         if text.trim().is_empty() {
-            return Ok(EvmChannelIndex::empty(Some(path.to_path_buf())));
+            return Ok(EvmChannelIndex::empty(
+                Some(path.to_path_buf()),
+                indexed_contract,
+                None,
+            ));
         }
         let snapshot: Snapshot =
             serde_json::from_str(&text).map_err(|source| EvmChannelIndexError::Corrupt {
                 path: path.to_path_buf(),
                 source,
             })?;
+        if let Some(rejected) = reject_snapshot(&snapshot, indexed_contract, from_block, path)? {
+            report_rejected_snapshot(path, rejected, indexed_contract, from_block);
+            return Ok(EvmChannelIndex::empty(
+                Some(path.to_path_buf()),
+                indexed_contract,
+                Some(rejected),
+            ));
+        }
         let mut channels = HashMap::new();
         for stored in snapshot.channels {
             let channel_id = parse_channel_id(&stored.channel_id, path)?;
@@ -401,11 +527,23 @@ impl EvmChannelIndex {
         }
         Ok(EvmChannelIndex {
             path: Some(path.to_path_buf()),
+            indexed_contract,
+            rejected: None,
             state: RwLock::new(IndexState {
                 last_indexed_block: snapshot.last_indexed_block,
                 channels,
             }),
         })
+    }
+
+    /// Why the snapshot on disk was not taken as this index's checkpoint,
+    /// or `None` when it was taken (or there was none to take) -- the same
+    /// verdict [`Self::open`]'s `warn!` renders in prose, kept as a value
+    /// so a test can say *which* rule fired rather than grepping a log
+    /// line. The operator-facing channel is that `warn!`; this is on no
+    /// operator surface.
+    pub fn rejected_snapshot(&self) -> Option<RejectedSnapshot> {
+        self.rejected
     }
 
     /// The last block this index has fully applied. `None` for a fresh
@@ -517,7 +655,7 @@ impl EvmChannelIndex {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let snapshot = snapshot_of(&state);
+        let snapshot = snapshot_of(&state, self.indexed_contract);
         // Dropped before any I/O: persisting must not hold up a lookup
         // racing in on the read side.
         drop(state);
@@ -530,7 +668,7 @@ impl EvmChannelIndex {
 /// same state produce byte-identical files -- a `HashMap`'s iteration order
 /// is not stable across runs, and an operator diffing this file (or reading
 /// it under `jq`) should see the table change only when the table changed.
-fn snapshot_of(state: &IndexState) -> Snapshot {
+fn snapshot_of(state: &IndexState, indexed_contract: IndexedContract) -> Snapshot {
     let mut channels: Vec<StoredChannel> = state
         .channels
         .iter()
@@ -556,8 +694,110 @@ fn snapshot_of(state: &IndexState) -> Snapshot {
     channels.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
     Snapshot {
         last_indexed_block: state.last_indexed_block,
+        chain_id: Some(indexed_contract.chain_id),
+        token_network: Some(format_address(indexed_contract.token_network)),
         channels,
     }
+}
+
+/// Rule 1 of issue #1282, in one place and with no I/O: does this snapshot
+/// say it is about the chain and contract this index is about? A snapshot
+/// that says nothing -- either field absent, which is the pre-#1282 file --
+/// says "no".
+///
+/// A recorded address that does not parse is [`EvmChannelIndexError::Corrupt`]
+/// rather than a mismatch, the same answer this file's channel addresses
+/// have always given: an unreadable snapshot is a different failure from a
+/// readable one belonging to somebody else, and only the second is
+/// something a restart resolves.
+fn reject_snapshot(
+    snapshot: &Snapshot,
+    indexed_contract: IndexedContract,
+    from_block: u64,
+    path: &Path,
+) -> Result<Option<RejectedSnapshot>, EvmChannelIndexError> {
+    let (Some(chain_id), Some(token_network)) =
+        (snapshot.chain_id, snapshot.token_network.as_ref())
+    else {
+        return Ok(Some(RejectedSnapshot::Unbound));
+    };
+    if chain_id != indexed_contract.chain_id {
+        return Ok(Some(RejectedSnapshot::ChainId {
+            recorded: chain_id,
+            configured: indexed_contract.chain_id,
+        }));
+    }
+    let token_network = parse_address(token_network, path)?;
+    if token_network != indexed_contract.token_network {
+        return Ok(Some(RejectedSnapshot::TokenNetwork {
+            recorded: token_network,
+            configured: indexed_contract.token_network,
+        }));
+    }
+    // Rule 2, checked last only because a mismatched identity is the more
+    // useful thing to tell an operator when both are wrong. It stands on
+    // its own: a snapshot can name this very chain and this very contract
+    // and still hold a checkpoint from before the contract existed.
+    if let Some(checkpoint) = snapshot.last_indexed_block {
+        if checkpoint < from_block {
+            return Ok(Some(RejectedSnapshot::BeforeStartBlock {
+                checkpoint,
+                from_block,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// The operator-facing half of a rejection. Deliberately one `warn!` per
+/// node start rather than a silent re-backfill: the symptom an operator
+/// sees otherwise is a syncer walking millions of blocks for no reason,
+/// which looks like a slow RPC rather than a discarded index.
+fn report_rejected_snapshot(
+    path: &Path,
+    rejected: RejectedSnapshot,
+    indexed_contract: IndexedContract,
+    from_block: u64,
+) {
+    let reason = match rejected {
+        RejectedSnapshot::Unbound => "it records no chain id or TokenNetwork at all (it was \
+             written before the connector recorded either), so it cannot be shown to be this \
+             deployment's"
+            .to_string(),
+        RejectedSnapshot::ChainId {
+            recorded,
+            configured,
+        } => format!(
+            "it was written against chain id {recorded} and this node now settles on chain id \
+             {configured}"
+        ),
+        RejectedSnapshot::TokenNetwork {
+            recorded,
+            configured,
+        } => format!(
+            "it was written against TokenNetwork {recorded:#x} and this node's configured \
+             registry now resolves TokenNetwork {configured:#x} -- a registry re-pointing its \
+             TokenNetwork does this as surely as a chain cutover does"
+        ),
+        RejectedSnapshot::BeforeStartBlock {
+            checkpoint,
+            from_block,
+        } => format!(
+            "its checkpoint is block {checkpoint}, below the configured \
+             channel_index_from_block of {from_block}, so it predates the contract this node \
+             indexes"
+        ),
+    };
+    tracing::warn!(
+        path = %path.display(),
+        chain_id = indexed_contract.chain_id,
+        token_network = %format_address(indexed_contract.token_network),
+        channel_index_from_block = from_block,
+        "discarding the local EVM channel index rather than resuming it: {reason}. This node \
+         is re-backfilling from channel_index_from_block; channel lookups fall through to \
+         direct chain reads until it catches up. Nothing is lost -- this index is rebuildable \
+         from chain -- but the old file is not repaired, only ignored (issue #1282)"
+    );
 }
 
 fn persist_snapshot(path: &Path, snapshot: &Snapshot) -> Result<(), EvmChannelIndexError> {
@@ -602,6 +842,13 @@ mod tests {
         [byte; 32]
     }
 
+    fn indexed_contract(chain_id: u64, token_network: Address) -> IndexedContract {
+        IndexedContract {
+            chain_id,
+            token_network,
+        }
+    }
+
     fn opened(block: u64, id: [u8; 32], p1: Address, p2: Address) -> OrderedChannelIndexEvent {
         OrderedChannelIndexEvent {
             block_number: block,
@@ -616,7 +863,8 @@ mod tests {
 
     #[test]
     fn a_channel_this_index_has_never_seen_is_a_miss() {
-        let index = EvmChannelIndex::open(None).expect("open");
+        let index =
+            EvmChannelIndex::open(None, indexed_contract(31_337, address(0xCC)), 0).expect("open");
         assert_eq!(
             index.lookup(&channel_id(1), address(0xAA)),
             ChannelIndexLookup::Miss
@@ -625,7 +873,8 @@ mod tests {
 
     #[test]
     fn an_opened_channel_resolves_active_with_a_zero_deposit_before_any_deposit_event() {
-        let index = EvmChannelIndex::open(None).expect("open");
+        let index =
+            EvmChannelIndex::open(None, indexed_contract(31_337, address(0xCC)), 0).expect("open");
         let own = address(0xAA);
         let counterparty = address(0xBB);
         index
@@ -644,7 +893,8 @@ mod tests {
 
     #[test]
     fn a_channel_not_naming_own_address_is_a_miss_even_though_it_exists() {
-        let index = EvmChannelIndex::open(None).expect("open");
+        let index =
+            EvmChannelIndex::open(None, indexed_contract(31_337, address(0xCC)), 0).expect("open");
         index
             .apply(
                 vec![opened(10, channel_id(1), address(0x01), address(0x02))],
@@ -659,7 +909,8 @@ mod tests {
 
     #[test]
     fn a_new_deposit_raises_the_reported_ceiling_for_the_depositing_participant() {
-        let index = EvmChannelIndex::open(None).expect("open");
+        let index =
+            EvmChannelIndex::open(None, indexed_contract(31_337, address(0xCC)), 0).expect("open");
         let own = address(0xAA);
         let counterparty = address(0xBB);
         index
@@ -691,7 +942,8 @@ mod tests {
 
     #[test]
     fn a_deposit_by_this_node_itself_does_not_change_the_counterpartys_reported_deposit() {
-        let index = EvmChannelIndex::open(None).expect("open");
+        let index =
+            EvmChannelIndex::open(None, indexed_contract(31_337, address(0xCC)), 0).expect("open");
         let own = address(0xAA);
         let counterparty = address(0xBB);
         index
@@ -723,7 +975,8 @@ mod tests {
 
     #[test]
     fn a_settled_channel_is_reported_terminal_not_active_and_not_miss() {
-        let index = EvmChannelIndex::open(None).expect("open");
+        let index =
+            EvmChannelIndex::open(None, indexed_contract(31_337, address(0xCC)), 0).expect("open");
         let own = address(0xAA);
         let counterparty = address(0xBB);
         index
@@ -754,7 +1007,8 @@ mod tests {
     /// active channel that is actually terminal.
     #[test]
     fn events_out_of_order_in_the_batch_are_applied_in_block_order() {
-        let index = EvmChannelIndex::open(None).expect("open");
+        let index =
+            EvmChannelIndex::open(None, indexed_contract(31_337, address(0xCC)), 0).expect("open");
         let own = address(0xAA);
         let counterparty = address(0xBB);
         index
@@ -790,7 +1044,8 @@ mod tests {
 
     #[test]
     fn a_deposit_or_settlement_with_no_prior_opened_event_is_dropped_not_applied() {
-        let index = EvmChannelIndex::open(None).expect("open");
+        let index =
+            EvmChannelIndex::open(None, indexed_contract(31_337, address(0xCC)), 0).expect("open");
         index
             .apply(
                 vec![OrderedChannelIndexEvent {
@@ -816,7 +1071,8 @@ mod tests {
     fn opening_a_path_that_does_not_exist_yet_starts_with_no_checkpoint_and_an_empty_table() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("evm-channel-index.json");
-        let index = EvmChannelIndex::open(Some(&path)).expect("open");
+        let index = EvmChannelIndex::open(Some(&path), indexed_contract(31_337, address(0xCC)), 0)
+            .expect("open");
         assert_eq!(index.last_indexed_block(), None);
         assert_eq!(
             index.lookup(&channel_id(1), address(0xAA)),
@@ -831,7 +1087,9 @@ mod tests {
         let own = address(0xAA);
         let counterparty = address(0xBB);
         {
-            let index = EvmChannelIndex::open(Some(&path)).expect("open");
+            let index =
+                EvmChannelIndex::open(Some(&path), indexed_contract(31_337, address(0xCC)), 0)
+                    .expect("open");
             index
                 .apply(vec![opened(10, channel_id(1), own, counterparty)], 10)
                 .expect("apply");
@@ -851,7 +1109,9 @@ mod tests {
                 .expect("apply");
         }
 
-        let reopened = EvmChannelIndex::open(Some(&path)).expect("re-open");
+        let reopened =
+            EvmChannelIndex::open(Some(&path), indexed_contract(31_337, address(0xCC)), 0)
+                .expect("re-open");
         assert_eq!(reopened.last_indexed_block(), Some(11));
         assert_eq!(
             reopened.lookup(&channel_id(1), own),
@@ -867,7 +1127,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("evm-channel-index.json");
         {
-            let index = EvmChannelIndex::open(Some(&path)).expect("open");
+            let index =
+                EvmChannelIndex::open(Some(&path), indexed_contract(31_337, address(0xCC)), 0)
+                    .expect("open");
             index
                 .apply(
                     vec![opened(500, channel_id(1), address(0xAA), address(0xBB))],
@@ -875,7 +1137,9 @@ mod tests {
                 )
                 .expect("apply");
         }
-        let reopened = EvmChannelIndex::open(Some(&path)).expect("re-open");
+        let reopened =
+            EvmChannelIndex::open(Some(&path), indexed_contract(31_337, address(0xCC)), 0)
+                .expect("re-open");
         assert_eq!(reopened.last_indexed_block(), Some(500));
     }
 
@@ -885,7 +1149,8 @@ mod tests {
         let path = dir.path().join("evm-channel-index.json");
         fs::write(&path, "").expect("write empty file");
 
-        let index = EvmChannelIndex::open(Some(&path)).expect("open");
+        let index = EvmChannelIndex::open(Some(&path), indexed_contract(31_337, address(0xCC)), 0)
+            .expect("open");
         assert_eq!(index.last_indexed_block(), None);
     }
 
@@ -895,7 +1160,8 @@ mod tests {
         let path = dir.path().join("evm-channel-index.json");
         fs::write(&path, "{not json").expect("write garbage");
 
-        let error = EvmChannelIndex::open(Some(&path)).expect_err("garbage must not open");
+        let error = EvmChannelIndex::open(Some(&path), indexed_contract(31_337, address(0xCC)), 0)
+            .expect_err("garbage must not open");
         assert!(matches!(error, EvmChannelIndexError::Corrupt { .. }));
     }
 
@@ -903,7 +1169,8 @@ mod tests {
     fn persisting_again_overwrites_the_snapshot_rather_than_appending() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("evm-channel-index.json");
-        let index = EvmChannelIndex::open(Some(&path)).expect("open");
+        let index = EvmChannelIndex::open(Some(&path), indexed_contract(31_337, address(0xCC)), 0)
+            .expect("open");
         index
             .apply(
                 vec![opened(1, channel_id(1), address(0xAA), address(0xBB))],
@@ -923,7 +1190,9 @@ mod tests {
             )
             .expect("second apply");
 
-        let reopened = EvmChannelIndex::open(Some(&path)).expect("re-open");
+        let reopened =
+            EvmChannelIndex::open(Some(&path), indexed_contract(31_337, address(0xCC)), 0)
+                .expect("re-open");
         assert_eq!(reopened.last_indexed_block(), Some(2));
         assert_eq!(
             reopened.lookup(&channel_id(1), address(0xAA)),
@@ -931,9 +1200,259 @@ mod tests {
         );
     }
 
+    /// Issue #1282: a state volume carried from one chain to another holds a
+    /// snapshot of the old chain's channels at the old chain's block height.
+    /// Resuming it is how a Base Sepolia checkpoint at block 46,256,398 came
+    /// to be resumed against Base mainnet.
+    #[test]
+    fn a_snapshot_recording_a_different_chain_id_is_not_a_checkpoint() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("evm-channel-index.json");
+        let token_network = address(0xCC);
+        {
+            let index =
+                EvmChannelIndex::open(Some(&path), indexed_contract(84_532, token_network), 0)
+                    .expect("open");
+            index
+                .apply(
+                    vec![opened(
+                        46_256_398,
+                        channel_id(1),
+                        address(0xAA),
+                        address(0xBB),
+                    )],
+                    46_256_398,
+                )
+                .expect("apply");
+        }
+
+        let reopened =
+            EvmChannelIndex::open(Some(&path), indexed_contract(8_453, token_network), 0)
+                .expect("re-open");
+
+        assert_eq!(reopened.last_indexed_block(), None);
+        assert_eq!(
+            reopened.lookup(&channel_id(1), address(0xAA)),
+            ChannelIndexLookup::Miss
+        );
+        assert_eq!(
+            reopened.rejected_snapshot(),
+            Some(RejectedSnapshot::ChainId {
+                recorded: 84_532,
+                configured: 8_453,
+            })
+        );
+    }
+
+    /// The same rule on the other half of the identity. The registry is
+    /// what the config names and the `TokenNetwork` is what the registry
+    /// resolves, so this fires on a registry re-pointing its token network
+    /// as well as on a chain cutover -- both leave a table of channels the
+    /// contract now being indexed has never heard of.
+    #[test]
+    fn a_snapshot_recording_a_different_token_network_is_not_a_checkpoint() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("evm-channel-index.json");
+        let was = address(0xC1);
+        let now = address(0xC2);
+        {
+            let index =
+                EvmChannelIndex::open(Some(&path), indexed_contract(8_453, was), 0).expect("open");
+            index
+                .apply(
+                    vec![opened(500, channel_id(1), address(0xAA), address(0xBB))],
+                    500,
+                )
+                .expect("apply");
+        }
+
+        let reopened =
+            EvmChannelIndex::open(Some(&path), indexed_contract(8_453, now), 0).expect("re-open");
+
+        assert_eq!(reopened.last_indexed_block(), None);
+        assert_eq!(
+            reopened.lookup(&channel_id(1), address(0xAA)),
+            ChannelIndexLookup::Miss
+        );
+        assert_eq!(
+            reopened.rejected_snapshot(),
+            Some(RejectedSnapshot::TokenNetwork {
+                recorded: was,
+                configured: now,
+            })
+        );
+    }
+
+    /// The file every node running before issue #1282 left in its state
+    /// volume, written out here in the exact shape that code produced --
+    /// `last_indexed_block` and `channels`, and nothing else. Upgrading must
+    /// not be a manual state-volume edit, so this is unmatched rather than
+    /// corrupt: the node starts, re-backfills, and says why.
+    #[test]
+    fn a_snapshot_written_before_the_identity_was_recorded_is_unmatched_not_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("evm-channel-index.json");
+        fs::write(
+            &path,
+            r#"{
+  "last_indexed_block": 46256398,
+  "channels": [
+    {
+      "channel_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
+      "participant1": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "participant2": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "deposits": [],
+      "status": "settled"
+    }
+  ]
+}"#,
+        )
+        .expect("write a pre-#1282 snapshot");
+
+        let index = EvmChannelIndex::open(
+            Some(&path),
+            indexed_contract(8_453, address(0xCC)),
+            50_745_815,
+        )
+        .expect("a pre-#1282 snapshot must open, not error");
+
+        assert_eq!(index.last_indexed_block(), None);
+        assert_eq!(index.rejected_snapshot(), Some(RejectedSnapshot::Unbound));
+        // And the settled channel it held is gone with it -- a `Terminal`
+        // is answered from this table with no chain read at all, so keeping
+        // the table while dropping the checkpoint would keep exactly the
+        // wrong half.
+        assert_eq!(
+            index.lookup(&channel_id(1), address(0xAA)),
+            ChannelIndexLookup::Miss
+        );
+    }
+
+    /// Rule 2, and it holds independently of rule 1: this snapshot names
+    /// the right chain and the right contract, and is still wrong, because
+    /// `channel_index_from_block` is the operator asserting that the
+    /// contract did not exist before that block.
+    #[test]
+    fn a_checkpoint_below_the_configured_start_block_is_discarded_even_when_the_identity_matches() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("evm-channel-index.json");
+        let token_network = address(0xCC);
+        {
+            let index =
+                EvmChannelIndex::open(Some(&path), indexed_contract(8_453, token_network), 0)
+                    .expect("open");
+            index
+                .apply(
+                    vec![opened(
+                        46_256_398,
+                        channel_id(1),
+                        address(0xAA),
+                        address(0xBB),
+                    )],
+                    46_256_398,
+                )
+                .expect("apply");
+        }
+
+        let reopened = EvmChannelIndex::open(
+            Some(&path),
+            indexed_contract(8_453, token_network),
+            50_745_815,
+        )
+        .expect("re-open");
+
+        assert_eq!(reopened.last_indexed_block(), None);
+        assert_eq!(
+            reopened.rejected_snapshot(),
+            Some(RejectedSnapshot::BeforeStartBlock {
+                checkpoint: 46_256_398,
+                from_block: 50_745_815,
+            })
+        );
+    }
+
+    /// The boundary the rule above is drawn at: the start block itself is
+    /// "at or above", not below, so a node that has indexed exactly its
+    /// configured first block keeps its checkpoint.
+    #[test]
+    fn a_checkpoint_exactly_at_the_configured_start_block_is_still_a_checkpoint() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("evm-channel-index.json");
+        let token_network = address(0xCC);
+        {
+            let index =
+                EvmChannelIndex::open(Some(&path), indexed_contract(8_453, token_network), 0)
+                    .expect("open");
+            index
+                .apply(
+                    vec![opened(
+                        50_745_815,
+                        channel_id(1),
+                        address(0xAA),
+                        address(0xBB),
+                    )],
+                    50_745_815,
+                )
+                .expect("apply");
+        }
+
+        let reopened = EvmChannelIndex::open(
+            Some(&path),
+            indexed_contract(8_453, token_network),
+            50_745_815,
+        )
+        .expect("re-open");
+
+        assert_eq!(reopened.last_indexed_block(), Some(50_745_815));
+        assert_eq!(reopened.rejected_snapshot(), None);
+    }
+
+    /// What every rule above is read back out of. Asserted against the
+    /// file's own JSON rather than only through a re-open, because this
+    /// file is a surface in its own right -- the module doc's operator
+    /// reading it under `jq` should be able to see which deployment it
+    /// belongs to.
+    #[test]
+    fn the_snapshot_written_after_a_sync_records_the_chain_id_and_the_token_network() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("evm-channel-index.json");
+        let index = EvmChannelIndex::open(
+            Some(&path),
+            indexed_contract(
+                8_453,
+                "0xc24a18F19F5c5B2d41B5D1Ecb4B0Ec4C0b5c4B3a"
+                    .parse()
+                    .unwrap(),
+            ),
+            0,
+        )
+        .expect("open");
+        index
+            .apply(
+                vec![opened(
+                    50_745_900,
+                    channel_id(1),
+                    address(0xAA),
+                    address(0xBB),
+                )],
+                50_745_900,
+            )
+            .expect("apply");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read back")).expect("parse");
+        assert_eq!(written["chain_id"], serde_json::json!(8_453));
+        assert_eq!(
+            written["token_network"],
+            serde_json::json!("0xc24a18f19f5c5b2d41b5d1ecb4b0ec4c0b5c4b3a")
+        );
+        assert_eq!(written["last_indexed_block"], serde_json::json!(50_745_900));
+    }
+
     #[test]
     fn a_node_with_no_state_dir_still_indexes_in_memory_for_the_life_of_the_process() {
-        let index = EvmChannelIndex::open(None).expect("open");
+        let index =
+            EvmChannelIndex::open(None, indexed_contract(31_337, address(0xCC)), 0).expect("open");
         let own = address(0xAA);
         let counterparty = address(0xBB);
         index
