@@ -50,7 +50,10 @@ registry itself. State the consequences plainly:
   call, so **nobody holds emergency powers over mainnet channel funds.** On the capped contract
   the owner is the deployer key.
 - The registry's `owner()` is the deployer key. `trustedForwarder()` is the zero address: no
-  ERC-2771 forwarder was deployed on mainnet.
+  ERC-2771 forwarder was deployed on mainnet. `DeployLocal.s.sol` carried the same omission until
+  #1261; this deployment is not changed by that, and cannot be — `TokenNetwork`'s forwarder is an
+  immutable constructor argument, so mainnet gains a meta-transaction leg only through a cutover
+  (`DeployTestnetCutover.s.sol` is the shape of one), never by a call on the live registry.
 
 Verified on-chain 2026-09-03 with `cast call` against `https://base-rpc.publicnode.com`:
 
