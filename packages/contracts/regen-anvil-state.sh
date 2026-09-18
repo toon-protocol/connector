@@ -19,7 +19,14 @@
 #
 #   USDC (MockERC20)      0x5FbDB2315678afecb367f032d93F642f64180aa3
 #   TokenNetworkRegistry  0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512
+#   ERC2771Forwarder      0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0
 #   TokenNetwork (USDC)   0xCafac3dd18aC6c6e92c921884f9E4176737C052c
+#   RollingSwapChannel    0x5FC8d32690cc91D4c39d9d3abcBD16989F875707
+#
+# The forwarder (issue #1261) is deployed AFTER the registry, which is why the
+# three addresses above it are the same as before it existed and only
+# RollingSwapChannel moved. DeployLocal.s.sol's docblock carries why, and
+# test/DeployLocal.t.sol holds the script to it.
 #
 # HOW TO REFRESH AFTER A FOUNDRY BUMP
 # -----------------------------------
