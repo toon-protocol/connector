@@ -4,7 +4,7 @@
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 
-**Falsifier:** `crates/connector-client-edge/src/lib.rs` matching `client_route_prices\(\)` — the document's `routes` come from the same lookup `handle_ilp` refuses a wrong carriage from. A `routes` list built from the route table directly, rather than read back through `Connector::client_route`, would mean the advertisement had acquired a second source and could drift from the enforcement again.
+**Falsifier:** `crates/connector-domain/src/node.rs` matching `^\s*Some\(policy\.to_string\(\)\)\s*$` — the _publish `"both"` rather than omit the field_ option, rejected below. `published_required_transport` answers `None` for the permissive default, which is the whole of what keeps an unpinned node's document byte-for-byte what it was; an unconditional `Some` there is that option having shipped after all.
 
 **A route that requires a client carriage MUST name it on that route's own entry in the node
 self-description**, under `requiredTransport`, in the same two spellings (`"http"`, `"btp"`) the
