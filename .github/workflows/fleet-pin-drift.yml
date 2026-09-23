@@ -24,18 +24,44 @@
 # ── WHAT IT ASSERTS ─────────────────────────────────────────────────────────
 #   1. Each pin is findable. A pin that cannot be parsed means the file moved
 #      or the key was renamed — the bundle changed shape and this check went
-#      blind, which must be loud rather than green.
+#      blind, which must be loud rather than green. (This is what caught
+#      itself out on 2026-09-23, issue #125: relay's pin moved from a
+#      `deploy/Dockerfile` `ARG CONNECTOR_TAG` to `deploy/docker-compose.yml`
+#      — same as store and gas-station always kept it — and the resulting
+#      404 turned into a hard job failure under `set -euo pipefail` instead
+#      of a comparison. The loudness fired exactly as designed; nobody read
+#      it for a month. See "WHERE EACH PIN LIVES" below.)
 #   2. All three name the SAME build. A claim accepted by one box against a
 #      channel another box's binary resolves differently is the shape of an
 #      afternoon lost.
-#   3. Each pin is IMMUTABLE — `rust-sha-<sha>`, never `rust-release`,
-#      `rust-main` or `latest`. ADR 0068 requires the pin be a reviewed commit;
-#      a moving tag makes it a race instead. `:rust-release` specifically is
-#      frozen at `rust-sha-8708caf`, which predates connector#1230 and cannot
-#      pay for a peering it establishes — see ADR 0068's own note on the tag.
+#   3. Each pin is IMMUTABLE. Ruling, 2026-09-23 (issue #125): a RELEASE
+#      HANDLE — `rust-<UTC-date>.<ordinal>`, e.g. `rust-2026.09.11.1`, exactly
+#      as `release-connector.yml` stamps it and `adopt-connector-release.yml`
+#      writes into every node repo's pin — is as legal and immutable a pin as
+#      `rust-sha-<sha>`. `release-connector.yml`'s `version` job refuses to
+#      reuse a handle (`gh rev-parse -q --verify refs/tags/$HANDLE` first) and
+#      nothing anywhere ever retags one, so a handle carries the same
+#      immutability a sha pin does, plus a name a human can read. A MOVING tag
+#      stays illegal regardless of what it's called: `rust-release`,
+#      `rust-main` and `latest` all still fail. `:rust-release` specifically
+#      is frozen at `rust-sha-8708caf`, which predates connector#1230 and
+#      cannot pay for a peering it establishes — see ADR 0068's own note on
+#      the tag.
 #   4. Each pin is PULLABLE from GHCR. A pin to a tag that does not exist is a
 #      box that cannot come back from a restart, and nothing else would say so
 #      until it tried.
+#
+# ── WHERE EACH PIN LIVES ─────────────────────────────────────────────────────
+# As of 2026-09-23 all three node repos keep their pin the same way: a
+# mounted, published `ghcr.io/toon-protocol/connector:<tag>` image line in
+# their own `deploy/docker-compose.yml`, bumped by `adopt-connector-release.yml`
+# in that repo alongside the matching literal in that repo's own guard test
+# (relay: `deploy/bundle.test.ts`; store/gas-station: `src/deploy-bundle-
+# guard.test.ts`). Relay used to bake the connector into its own image via a
+# `deploy/Dockerfile` `ARG CONNECTOR_TAG` default; that file is gone from
+# relay's `main` and hasn't been the pin of record for a while — this
+# workflow just kept reading the old path. If a repo's bundle changes shape
+# again, assertion 1 above is what will say so — read it this time.
 #
 # ── WHAT IT ONLY WARNS ABOUT ────────────────────────────────────────────────
 # How far behind `main` the fleet is. A pin legitimately lags — that is what
@@ -83,23 +109,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The pin of record in each repo, named here exactly as that repo's
-          # own guard test names it. If one of these paths 404s, the bundle
-          # moved and this check has to fail rather than quietly compare two.
+          # The pin of record in each repo. If this path 404s, the bundle
+          # moved and this check has to fail rather than quietly compare two
+          # — see "WHERE EACH PIN LIVES" above.
           fetch() {
             curl -fsSL --retry 3 --retry-delay 2 \
               "https://raw.githubusercontent.com/toon-protocol/$1/main/$2"
           }
 
-          # relay bakes the connector into its own image; the ARG default is
-          # the pin (deploy/bundle.test.ts asserts it is the only place).
-          PIN_RELAY=$(fetch relay deploy/Dockerfile \
-            | sed -n 's/^ARG CONNECTOR_TAG=\([A-Za-z0-9._-]*\).*/\1/p' | head -1)
-          # store and gas mount their config and pin the published image.
-          PIN_STORE=$(fetch store deploy/docker-compose.yml \
-            | sed -n 's|^[[:space:]]*image:[[:space:]]*ghcr\.io/toon-protocol/connector:\([A-Za-z0-9._-]*\).*|\1|p' | head -1)
-          PIN_GAS=$(fetch gas-station deploy/docker-compose.yml \
-            | sed -n 's|^[[:space:]]*image:[[:space:]]*ghcr\.io/toon-protocol/connector:\([A-Za-z0-9._-]*\).*|\1|p' | head -1)
+          # All three mount their config and pin the published image the same
+          # way, in deploy/docker-compose.yml's `connector:` service.
+          pin_from_compose() {
+            fetch "$1" deploy/docker-compose.yml \
+              | sed -n 's|^[[:space:]]*image:[[:space:]]*ghcr\.io/toon-protocol/connector:\([A-Za-z0-9._-]*\).*|\1|p' | head -1
+          }
+
+          PIN_RELAY=$(pin_from_compose relay)
+          PIN_STORE=$(pin_from_compose store)
+          PIN_GAS=$(pin_from_compose gas-station)
 
           echo "relay=${PIN_RELAY:-<unparsed>} store=${PIN_STORE:-<unparsed>} gas=${PIN_GAS:-<unparsed>}"
 
@@ -114,10 +141,15 @@ jobs:
             fi
             case "$pin" in
               rust-release|rust-main|latest)
-                note "**$repo** pins the moving tag \`$pin\`. ADR 0068 requires an immutable \`rust-sha-\` pin bumped by a reviewed commit. \`:rust-release\` in particular is frozen at \`rust-sha-8708caf\`, which predates connector#1230 and cannot pay for a peering it establishes." ;;
+                note "**$repo** pins the moving tag \`$pin\`. ADR 0068 requires an immutable pin — a \`rust-sha-<sha>\` build tag or a \`rust-<release handle>\` (issue #125 ruling) — bumped by a reviewed commit, never a moving tag. \`:rust-release\` in particular is frozen at \`rust-sha-8708caf\`, which predates connector#1230 and cannot pay for a peering it establishes." ;;
               rust-sha-*) ;;
+              # A release handle: rust-<UTC date>.<ordinal>, e.g.
+              # rust-2026.09.11.1, exactly as release-connector.yml stamps it.
+              # Ruling, issue #125: legal and immutable — release-connector.yml
+              # refuses to reuse a handle and nothing ever retags one.
+              rust-[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9].[0-9]*) ;;
               *)
-                note "**$repo** pins \`$pin\`, which is not an immutable \`rust-sha-\` build tag." ;;
+                note "**$repo** pins \`$pin\`, which is neither an immutable \`rust-sha-<sha>\` build tag nor a \`rust-<release handle>\` (\`rust-<UTC-date>.<ordinal>\`, e.g. \`rust-2026.09.11.1\`)." ;;
             esac
           done
 
@@ -142,7 +174,17 @@ jobs:
           # ── Informational: how far behind main, and does it matter ────────
           BEHIND_NOTE=""
           if [ -n "$PIN_RELAY" ] && [ "$PIN_RELAY" = "$PIN_STORE" ] && [ "$PIN_STORE" = "$PIN_GAS" ]; then
-            SHA=${PIN_RELAY#rust-sha-}
+            # A sha pin compares by that sha directly. A release-handle pin
+            # compares by the handle itself: release-connector.yml's `gh
+            # release create "$HANDLE" --target "$SHA"` leaves a git tag
+            # named exactly the handle (no `rust-` prefix) on the released
+            # commit, so `rust-2026.09.11.1` -> tag `2026.09.11.1`, both valid
+            # refs for the compare API.
+            case "$PIN_RELAY" in
+              rust-sha-*) SHA=${PIN_RELAY#rust-sha-} ;;
+              rust-*) SHA=${PIN_RELAY#rust-} ;;
+              *) SHA="" ;;
+            esac
             if CMP=$(gh api "repos/${{ github.repository }}/compare/$SHA...main" 2>/dev/null); then
               BEHIND=$(echo "$CMP" | jq -r '.ahead_by')
               SRC=$(echo "$CMP" | jq -r '[.files[]?.filename | select(test("^crates/[^/]+/src/"))] | length')
@@ -164,7 +206,7 @@ jobs:
             echo ""
             echo "| repo | pin | source of record |"
             echo "| --- | --- | --- |"
-            echo "| relay | \`${PIN_RELAY:-—}\` | \`deploy/Dockerfile\` → \`ARG CONNECTOR_TAG\` |"
+            echo "| relay | \`${PIN_RELAY:-—}\` | \`deploy/docker-compose.yml\` |"
             echo "| store | \`${PIN_STORE:-—}\` | \`deploy/docker-compose.yml\` |"
             echo "| gas-station | \`${PIN_GAS:-—}\` | \`deploy/docker-compose.yml\` |"
             echo ""
@@ -205,15 +247,18 @@ jobs:
             echo ""
             echo "### Fixing it"
             echo ""
-            echo "Each repo owns its own pin (ADR 0068 — nothing in this repository moves a tag onto a box)."
-            echo "Bump each one by a reviewed commit that changes the pin **and** the literal in that repo's"
-            echo "own guard test, then apply on the box:"
+            echo "Each repo owns its own pin (ADR 0068 — nothing in this repository moves a tag onto a box),"
+            echo "at \`deploy/docker-compose.yml\`'s \`connector:\` service. Bump it by a reviewed commit that"
+            echo "changes that image line **and** the matching literal in that repo's own guard test —"
+            echo "\`adopt-connector-release.yml\` does this unattended when the connector cuts a release. The"
+            echo "box applies a merged bump itself, on its own timer (\`deploy/auto-apply.sh\`); nothing here,"
+            echo "and nothing in the node repo's CI, ever pushes to a box:"
             echo ""
             echo '```sh'
-            echo '# relay — deploy/Dockerfile ARG CONNECTOR_TAG, then its publish workflow rebuilds'
-            echo '#          relay-connector:release and Watchtower recreates within ~60s.'
-            echo '# store / gas-station — deploy/docker-compose.yml, then on the box:'
-            echo 'cd /root/<store|gas-station> && git pull && cd deploy && ./render.sh && docker compose up -d'
+            echo '# On the box, applied automatically by deploy/auto-apply.sh — shown here for a manual check:'
+            echo 'cd /root/<relay|store|gas-station> && git pull --ff-only'
+            echo '[ -x deploy/render.sh ] && (cd deploy && ./render.sh)   # store, gas-station only'
+            echo 'cd deploy && docker compose pull && docker compose up -d'
             echo '```'
             echo ""
             echo "Full runbook: \`docs/operators/fleet-release-and-health.md\` § \"Keeping the three pins together\"."
