@@ -421,10 +421,10 @@ pub struct ClientRouteFacts {
 /// One priced prefix, as [`Connector::client_route_prices`] enumerates them
 /// for the node self-description (ADR 0050).
 ///
-/// Prefix, price and `request` only. What else a route has -- where it
-/// terminates, which peer it forwards to, what that peering costs this node
-/// -- is either an app fact or an operator-private one, and neither belongs
-/// in a document a stranger reads.
+/// Prefix, price, `request` and transport policy only. What else a route has
+/// -- where it terminates, which peer it forwards to, what that peering costs
+/// this node -- is either an app fact or an operator-private one, and neither
+/// belongs in a document a stranger reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientRoutePrice {
     pub prefix: String,
@@ -434,6 +434,13 @@ pub struct ClientRoutePrice {
     /// prefix that appears in more than one source is quoted with the
     /// request table a real request to it would resolve.
     pub request: Option<serde_json::Value>,
+    /// Which client carriage a request to this prefix must arrive on
+    /// (TOON_Network issue #111), carried here for exactly the reason
+    /// `price` is: it comes off the same [`Connector::client_route`] lookup,
+    /// and that lookup is the one both client-edge carriages refuse a wrong
+    /// carriage from. There is no second value for the advertisement to
+    /// disagree with the enforcement about.
+    pub transport_policy: TransportPolicy,
 }
 
 /// The connector's packet plane: a fixed set of terminated routes and peer
@@ -3588,21 +3595,27 @@ impl Connector {
     /// costs -- the enumeration behind the node self-description's `routes`
     /// (ADR 0050).
     ///
-    /// Each prefix's price is read back through [`Self::client_route`] rather
-    /// than off the table it was found in, so a prefix that appears in more
-    /// than one source is quoted at the price a real request to it would be
-    /// charged. There is exactly one lookup rule and this uses it.
+    /// Each prefix's price **and its transport policy** are read back through
+    /// [`Self::client_route`] rather than off the table they were found in, so
+    /// a prefix that appears in more than one source is quoted at the price a
+    /// real request to it would be charged and under the carriage a real
+    /// request to it would have to arrive on. There is exactly one lookup rule
+    /// and this uses it.
     ///
     /// Sorted by prefix, which makes the answer stable across restarts and
     /// across a runtime write that happens to land in a different map slot --
     /// a document whose field order wanders is a document nobody can diff.
     ///
-    /// Deliberately carries **prefix, price and the route's `request`
-    /// declaration, and nothing else** (ADR 0067 for the last). A terminated
+    /// Deliberately carries **prefix, price, the route's `request`
+    /// declaration and the carriage it pins, and nothing else** (ADR 0067 for
+    /// the third, TOON_Network issue #111 for the fourth). A terminated
     /// route's `handler_url` describes software behind this connector
     /// (ND-08); a forwarded route's peer id and per-peering fee are
-    /// operator-private (ND-09). Leased routes are absent for the reason
-    /// [`Self::client_route`] gives: a lease carries no price at all.
+    /// operator-private (ND-09). A pin is none of those: it is what a client
+    /// must do to reach the route at all, and withholding it does not keep a
+    /// secret, it only makes the route unusable to anyone who did not guess.
+    /// Leased routes are absent for the reason [`Self::client_route`] gives:
+    /// a lease carries no price at all.
     pub fn client_route_prices(&self) -> Vec<ClientRoutePrice> {
         let mut prefixes: std::collections::BTreeSet<String> = self
             .routes
@@ -3622,6 +3635,7 @@ impl Connector {
                     prefix,
                     price: facts.price,
                     request: facts.request,
+                    transport_policy: facts.transport_policy,
                 })
             })
             .collect()

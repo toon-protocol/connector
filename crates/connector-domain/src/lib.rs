@@ -55,8 +55,8 @@ pub use identity::{
     anonymous_identity, resolve_identity, ConfiguredIdentity, SenderIdentity, UnauthorizedIdentity,
 };
 pub use node::{
-    agreed_required_transport, EdgeIdentity, NodeFacts, NodeSelfDescription, RoutePrice,
-    CLIENT_EDGE_DEFAULT_VERSION, CLIENT_EDGE_SUPPORTED_VERSIONS,
+    agreed_required_transport, published_required_transport, EdgeIdentity, NodeFacts,
+    NodeSelfDescription, RoutePrice, CLIENT_EDGE_DEFAULT_VERSION, CLIENT_EDGE_SUPPORTED_VERSIONS,
 };
 pub use packet::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 pub use price::Price;

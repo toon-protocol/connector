@@ -77,8 +77,8 @@ use connector_config::TransportPolicy;
 use connector_domain::client_claim::ClientClaim;
 use connector_domain::identity::{anonymous_identity, resolve_identity, ConfiguredIdentity};
 use connector_domain::{
-    agreed_required_transport, EdgeIdentity, NodeFacts, NodeSelfDescription, PacketResponse,
-    Prepare, Price, Reject, RejectCode, RoutePrice,
+    agreed_required_transport, published_required_transport, EdgeIdentity, NodeFacts,
+    NodeSelfDescription, PacketResponse, Prepare, Price, Reject, RejectCode, RoutePrice,
 };
 use connector_runtime::{ClientRouteFacts, ClientRouteKind, Connector, ProbeDenied};
 use connector_signer::nip59::{unwrap_claim, WrappedClaim};
@@ -585,6 +585,12 @@ async fn self_description(State(state): State<Arc<ClientEdgeState>>) -> Response
             price: route.price.base().to_string(),
             price_per_kib: (!route.price.is_flat()).then(|| route.price.per_kib().to_string()),
             request: route.request,
+            // The carriage this route pins, off the same `client_route`
+            // lookup the price came from -- and that lookup is the one
+            // `handle_ilp` and `btp.rs` refuse a wrong carriage from
+            // (TOON_Network#111, ND-05a). Advertisement and enforcement read
+            // one value, so there is nothing for them to disagree about.
+            required_transport: published_required_transport(route.transport_policy.name()),
         })
         .collect();
 
@@ -592,6 +598,11 @@ async fn self_description(State(state): State<Arc<ClientEdgeState>>) -> Response
     // is the rule the retired announce used and the one the field means: a
     // per-node scalar can only honestly describe the routes the node is
     // addressed by.
+    //
+    // It is a summary, never the only statement of a pin: a node whose own
+    // addresses disagree -- one pinned, one not, which is the devnet relay --
+    // has no honest scalar to publish, and the per-route field above is what
+    // it says instead (TOON_Network#111).
     let required_transport = agreed_required_transport(
         state
             .node
@@ -637,12 +648,13 @@ struct RoutePriceQuery {
     size: Option<u64>,
 }
 
-/// What a given destination would cost to deliver to, per ADR 0022's
-/// "a sender can ask what a route of its costs" -- reuses
-/// [`Connector::client_route_price`], the same longest-prefix lookup the
-/// x402 greeting and the claim gate's value binding already use, so this
-/// answers with exactly the price a real request to `destination` would be
-/// charged, never a second source of truth. That lookup spans configured
+/// What a given destination would cost to deliver to, and what it takes to
+/// reach it, per ADR 0022's "a sender can ask what a route of its costs" --
+/// reuses [`Connector::client_route`], the same longest-prefix lookup the x402
+/// greeting, the claim gate's value binding and both carriages' transport check
+/// already use, so this answers with exactly the price a real request to
+/// `destination` would be charged **and** exactly the carriage it would have to
+/// arrive on, never a second source of truth. That lookup spans configured
 /// routes of both kinds since ADR 0028, so a destination this connector
 /// forwards over a peering is answered here too -- it is charged here too.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -667,6 +679,21 @@ struct RoutePriceView {
     /// answer is byte-identical to what it was before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     charge: Option<u64>,
+    /// Which client carriage a request to this destination must arrive on
+    /// (TOON_Network#111), in the same two spellings and from the same
+    /// `client_route` lookup the self-description's per-route field and both
+    /// enforcement points use. Absent on an unpinned destination, so this
+    /// answer stays byte-identical to what it was before the field existed.
+    ///
+    /// This endpoint answers "what would a packet to *this* destination
+    /// cost"; a destination whose price is answered and whose carriage is not
+    /// is a destination a caller can pay for and still not reach.
+    #[serde(
+        rename = "requiredTransport",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    required_transport: Option<String>,
 }
 
 /// `skip_serializing_if` for a slope that is not there. A free function
@@ -679,8 +706,9 @@ async fn route_price(
     State(state): State<Arc<ClientEdgeState>>,
     Query(query): Query<RoutePriceQuery>,
 ) -> Response {
-    match state.connector.client_route_price(&query.destination) {
-        Some(price) => {
+    match state.connector.client_route(&query.destination) {
+        Some(facts) => {
+            let price = facts.price;
             // `size` is a byte count on the wire (a `u64`), and `charge`
             // takes `usize`; converting rather than re-deriving the formula
             // here keeps this a straight pass-through to the one evaluation,
@@ -697,6 +725,7 @@ async fn route_price(
                 price: price.base(),
                 price_per_kib: price.per_kib(),
                 charge,
+                required_transport: published_required_transport(facts.transport_policy.name()),
             })
             .into_response()
         }
@@ -2185,6 +2214,58 @@ mod tests {
         assert_eq!(view.price, 42);
     }
 
+    /// TOON_Network#111: the endpoint that answers what a destination costs
+    /// also answers what it takes to reach it, from the same lookup.
+    ///
+    /// A caller told the price of a pinned destination and nothing else can
+    /// pay in full and still be refused; and an unpinned destination's answer
+    /// stays byte-identical to what it was before this field existed, so a
+    /// reader written against that body is untouched.
+    #[tokio::test]
+    async fn the_price_of_a_pinned_destination_names_its_carriage() {
+        let pinned = StaticRoute::new_priced_with_transport(
+            "g.example.app",
+            "http://localhost:4000",
+            42,
+            TransportPolicy::Btp,
+        )
+        .unwrap();
+        let unpinned =
+            StaticRoute::new_priced("g.example.free", "http://localhost:4000", 0).unwrap();
+        let connector = Arc::new(Connector::new(
+            vec![pinned, unpinned],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let app = router(connector, test_signer());
+
+        let ask = |app: Router, destination: &'static str| async move {
+            let request = Request::builder()
+                .method("GET")
+                .uri(format!("/ilp/routes/price?destination={destination}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        assert_eq!(
+            ask(app.clone(), "g.example.app.sub").await["requiredTransport"],
+            serde_json::json!("btp"),
+            "the pin is answered for the destination asked about, under the same \
+             longest-prefix lookup the price came from"
+        );
+        let free = ask(app, "g.example.free").await;
+        assert!(
+            free.get("requiredTransport").is_none(),
+            "an unpinned destination must carry no 'requiredTransport' key at all: {free}"
+        );
+    }
+
     /// Asking about a destination that matches no locally-terminated route
     /// is a 404, not a fabricated price.
     #[tokio::test]
@@ -3145,7 +3226,14 @@ mod tests {
         );
         assert_eq!(
             document["routes"],
-            serde_json::json!([{ "prefix": "g.example.app", "price": "100" }])
+            serde_json::json!([{
+                "prefix": "g.example.app",
+                "price": "100",
+                "requiredTransport": "btp",
+            }]),
+            "a pinned route says so on its own entry, so a client reading this document knows \
+             which carriage to dial for THIS prefix without addressing the node first \
+             (ND-05a, TOON_Network#111)"
         );
         assert_eq!(
             document["requiredTransport"],
@@ -3155,6 +3243,149 @@ mod tests {
         );
         assert_eq!(document["supportedVersions"], serde_json::json!([1]));
         assert_eq!(document["defaultVersion"], serde_json::json!(1));
+    }
+
+    /// The devnet relay, reproduced: a node that answers to **two** of its
+    /// own addresses, one pinned to BTP and one not (TOON_Network#111).
+    ///
+    /// This is the shape that made the pin invisible. `agreed_required_transport`
+    /// has no honest scalar for it -- `g.toon.relay` is `btp`, `g.toon.relay.ephemeral`
+    /// is `both` -- so the per-node field is absent, exactly as the live
+    /// document showed on 2026-09-22 while every paid write to `g.toon.relay`
+    /// was being refused `requiredTransport: btp`. The route entry is what a
+    /// client reads instead, and it names the pin per prefix, which is the
+    /// granularity the refusal is decided at.
+    #[tokio::test]
+    async fn a_node_whose_own_addresses_disagree_still_names_each_routes_pin() {
+        let pinned = StaticRoute::new_priced_with_transport(
+            "g.toon.relay",
+            "http://localhost:4000",
+            1,
+            TransportPolicy::Btp,
+        )
+        .unwrap();
+        let free =
+            StaticRoute::new_priced("g.toon.relay.ephemeral", "http://localhost:4000", 0).unwrap();
+        let connector = Arc::new(Connector::new(
+            vec![pinned, free],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let app = router_with_node_facts(
+            connector,
+            test_signer(),
+            None,
+            Arc::new(test_gate(ClientChannelRegistry::new())),
+            NodeFacts {
+                ilp_addresses: vec![
+                    "g.toon.relay".to_string(),
+                    "g.toon.relay.ephemeral".to_string(),
+                ],
+                http_endpoint: Some("https://proxy.relay.example/ilp".to_string()),
+                btp_endpoint: Some("wss://proxy.relay.example/ilp/btp".to_string()),
+                peer_carriages: Vec::new(),
+                settlements: Vec::new(),
+            },
+            DEFAULT_BTP_SESSION_WINDOW,
+            None,
+            Arc::from([]),
+        );
+
+        let document = self_description_of(app).await;
+
+        assert!(
+            document.get("requiredTransport").is_none(),
+            "a node whose own addresses disagree has no honest per-node answer and must not \
+             invent one: {document}"
+        );
+        assert_eq!(
+            document["routes"],
+            serde_json::json!([
+                { "prefix": "g.toon.relay", "price": "1", "requiredTransport": "btp" },
+                { "prefix": "g.toon.relay.ephemeral", "price": "0" },
+            ]),
+            "the pinned route names its carriage and the unpinned one says nothing, so a \
+             publisher paying `g.toon.relay` dials BTP on its first attempt and one posting \
+             to the free lane is unaffected (TOON_Network#111)"
+        );
+    }
+
+    /// The advertisement cannot disagree with the enforcement, because it is
+    /// the same value (TOON_Network#111).
+    ///
+    /// For every prefix the document publishes, what it says about the
+    /// carriage is compared against what `client_route` -- the one lookup
+    /// `handle_ilp` and `btp.rs` refuse a wrong carriage from -- would answer
+    /// for a real packet to that prefix. A pin that is enforced and not
+    /// published fails here, and so does one published and not enforced.
+    #[tokio::test]
+    async fn every_published_pin_is_the_pin_a_packet_to_that_prefix_meets() {
+        let pinned_btp = StaticRoute::new_priced_with_transport(
+            "g.toon.relay",
+            "http://localhost:4000",
+            1,
+            TransportPolicy::Btp,
+        )
+        .unwrap();
+        let pinned_http = StaticRoute::new_priced_with_transport(
+            "g.toon.relay.oneshot",
+            "http://localhost:4000",
+            2,
+            TransportPolicy::Http,
+        )
+        .unwrap();
+        let unpinned =
+            StaticRoute::new_priced("g.toon.relay.ephemeral", "http://localhost:4000", 0).unwrap();
+        let connector = Arc::new(Connector::new(
+            vec![pinned_btp, pinned_http, unpinned],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let app = router_with_node_facts(
+            connector.clone(),
+            test_signer(),
+            None,
+            Arc::new(test_gate(ClientChannelRegistry::new())),
+            NodeFacts {
+                ilp_addresses: vec!["g.toon.relay".to_string()],
+                http_endpoint: Some("https://proxy.relay.example/ilp".to_string()),
+                btp_endpoint: Some("wss://proxy.relay.example/ilp/btp".to_string()),
+                peer_carriages: Vec::new(),
+                settlements: Vec::new(),
+            },
+            DEFAULT_BTP_SESSION_WINDOW,
+            None,
+            Arc::from([]),
+        );
+
+        let document = self_description_of(app).await;
+        let routes = document["routes"].as_array().expect("routes is an array");
+        assert_eq!(routes.len(), 3, "every priced prefix is published");
+
+        for route in routes {
+            let prefix = route["prefix"].as_str().expect("a prefix");
+            let enforced = connector
+                .client_route(prefix)
+                .expect("a published prefix resolves to a route")
+                .transport_policy;
+            let published = route.get("requiredTransport").and_then(|v| v.as_str());
+
+            match enforced {
+                TransportPolicy::Both => assert_eq!(
+                    published, None,
+                    "'{prefix}' accepts either carriage, so the document must not name one"
+                ),
+                pinned => assert_eq!(
+                    published,
+                    Some(pinned.name()),
+                    "'{prefix}' is enforced as '{pinned}', so that is what the document must say"
+                ),
+            }
+        }
     }
 
     /// Issue #1210: a route's `request` table shows up on its own entry in
@@ -5637,6 +5868,10 @@ mod tests {
                     price: FORWARD_PRICE,
                     price_per_kib: 0,
                     charge: None,
+                    // A forwarded route accepts either carriage -- writing
+                    // `transport` on one is refused at load -- so this answer
+                    // names no pin (TOON_Network#111).
+                    required_transport: None,
                 }
             );
 

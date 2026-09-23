@@ -725,7 +725,13 @@ over a transport its route does not accept is refused with this SAME `402` shape
 is considered at all, and whether or not the request carries a valid claim, since paying over the
 wrong transport does not make the route reachable that way — with one addition: `extra` also
 carries `requiredTransport` (`"http"` or `"btp"`), naming the transport the route actually
-requires. An ordinary unpaid-request greeting (above) never sets this field. The BTP carriage
+requires. An ordinary unpaid-request greeting (above) never sets this field.
+
+**The refusal is the backstop, not the discovery mechanism.** Since
+[ADR 0072](../adr/0072-a-carriage-pin-is-published-on-the-route-that-enforces-it.md) the pin is
+published on the route's own entry in the node self-description, so a client that reads `GET /ilp`
+dials the right carriage on its first attempt and never sees this `402` at all. This shape stays
+exactly as it is for a client that did not read it. The BTP carriage
 answers the mirror case (a route restricted to HTTP, reached over the websocket session) the same
 way; see §1.9 step 3.
 
@@ -891,6 +897,19 @@ state, and is never pushed into a network unprompted.
   ```json
   { "destination": "g.example.store", "price": 1000, "price_per_kib": 30, "charge": 1030 }
   ```
+
+  A destination whose route **pins a client carriage** (§1.4's transport policy) answers with
+  `requiredTransport` beside its price, `"http"` or `"btp"`, off that same lookup — a caller told
+  what a destination costs and not what it takes to reach it can pay in full and still be refused
+  ([ADR 0072](../adr/0072-a-carriage-pin-is-published-on-the-route-that-enforces-it.md),
+  TOON_Network#111):
+
+  ```json
+  { "destination": "g.toon.relay", "price": 1, "requiredTransport": "btp" }
+  ```
+
+  It is **omitted** — never `"both"` — on a destination that accepts either, so an unpinned
+  route's answer is unchanged.
 
   `charge` is **absent**, not `null`, when the request names no `size`, so the answer above is
   unchanged for a caller that does not ask. A `size` that is not a non-negative integer a `u64` can

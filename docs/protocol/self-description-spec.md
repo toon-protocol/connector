@@ -35,6 +35,16 @@ One authoritative document is what makes that class of failure structural rather
 announce is gone ([ADR 0046](../adr/0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md));
 the greeting becomes a projection.
 
+**One document was necessary and was not sufficient, and the same failure came back once more.** The
+field this document replaced the announce's with was a **per-node scalar**, derived only where every
+route covering the node's own addresses agrees. The devnet relay pins `g.toon.relay` to BTP and
+leaves `g.toon.relay.ephemeral` unpinned, so there was no agreement, so the document said nothing —
+correctly, by its own rule — while the connector refused every HTTP-carried write to the first
+prefix before it would even look at the payment. Observed 2026-09-22 (TOON_Network#111): a directory
+publisher reading this document found no pin, dialled HTTP, and a provider that was running fine was
+absent from the directory for hours. The answer is **ND-05a**: a pin is enforced per route, so it is
+published per route, and the scalar is the summary rather than the statement.
+
 ---
 
 ## 1. The document
@@ -76,15 +86,42 @@ The document carries:
 | per chain: chain id, settlement address, token network and its registry, token address, decimals                                                                                                                                                       | what a buyer needs to **open a channel**                                            |
 | route prices — the whole schedule, base and per-KiB slope ([ADR 0065](../adr/0065-a-price-is-a-schedule-over-payload-length.md)) — and their descriptions once [ADR 0044](../adr/0044-a-probe-answers-what-a-route-costs-and-what-it-does.md) is built | what a route costs **at any size**, and what it does                                |
 | a route's declared **request** shape, where the operator wrote one ([ADR 0067](../adr/0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md))                                                                                    | what to **send** to use the route, for a route whose app expects a specific payload |
-| the client transport its routes require, when they agree on one                                                                                                                                                                                        | the `requiredTransport` failure, closed by construction                             |
+| the client transport **each route** requires, where it requires one ([ADR 0072](../adr/0072-a-carriage-pin-is-published-on-the-route-that-enforces-it.md)) — and, as a summary, the one its own addresses require when they agree                      | which carriage to dial **before** sending, rather than by being refused             |
 | supported client-edge versions, and which one unversioned `POST /ilp` resolves to                                                                                                                                                                      | [ADR 0003](../adr/0003-clean-room-peer-wire-versioned-client-edge.md), issue #1054  |
 
 **ND-06** `[connector]` — The **edge identity** MUST be published. A route whose terminating identity
 is unpublished is unreachable: a sender cannot seal to it, so it can never be delivered to.
 
+**ND-05a** `[connector]` — A route that **requires** a client transport MUST name it on that
+route's own entry, as `requiredTransport`, spelled `"http"` or `"btp"` — the same two spellings the
+greeting's `extra.requiredTransport` uses. A route that accepts either MUST carry **no such key at
+all**: not `"both"`, not `null`, so a node that pins nothing publishes byte-for-byte the document it
+published before this field existed.
+([ADR 0072](../adr/0072-a-carriage-pin-is-published-on-the-route-that-enforces-it.md), TOON_Network
+issue #111)
+
+> **Per route, because per node is not where the refusal is decided.** Both client carriages refuse
+> a wrong one from `Connector::client_route(destination).transport_policy` — one longest-prefix
+> lookup, per packet. The node-wide field below is a **summary** of the routes covering this node's
+> own addresses, and it necessarily says nothing when they disagree. They disagree routinely: the
+> devnet relay answers to `g.toon.relay`, pinned to BTP, and `g.toon.relay.ephemeral`, which is not,
+> so it published no pin at all while refusing every HTTP-carried write to the first. TOON_Network's
+> directory publisher reads this field to decide what to dial, found nothing, fell back to HTTP, and
+> a healthy provider went missing from the directory for hours.
+
+**ND-05b** `[client]` — A client resolving which carriage a destination needs MUST read the
+**longest route entry whose prefix covers that destination** — the router's own rule — and MAY fall
+back to the node-wide field only where no entry covers it. A node-wide answer never overrides a
+route's own.
+
 **ND-07** `[connector]` — Per-chain settlement facts MUST be derived from the settlement backend the
 connector verified against a chain at startup, and MUST NOT be separately declared. **Two declarations
 of one fact is how a mainnet node comes to announce itself as devnet.**
+
+> ND-05a is **not** an exception to ND-07: the operator declares `transport` once, on the route, and
+> every surface that mentions it — this document, the greeting, `GET /ilp/routes/price` — is a
+> projection of that one declaration, read back through the lookup the connector enforces from.
+> There is no second value to disagree with.
 
 **ND-07a** `[connector]` — A route's `request` table is the one exception to ND-07's "derived, never
 declared" rule, and deliberately so: there is no backend this connector can ask what an arbitrary
@@ -115,6 +152,12 @@ paid reverse proxy; what runs behind it is the app's business.
 caps. Publishing them discloses who this node peers with and how far it trusts each — an
 operator-private relationship ([ADR 0006](../adr/0006-the-connector-is-mechanism-not-policy.md),
 [ADR 0049](../adr/0049-the-cap-bounds-one-packet-is-discovered-by-t04-and-is-set-from-outside.md)).
+
+> **A route's carriage pin is not one of these, and ND-10 does not reach it either.** A cap is a
+> per-peer trust decision and a moving number; a pin is a fixed property of a published route, at a
+> published price, to a published address. Publishing it discloses nothing a reader of this document
+> does not already have — it only stops the reader having to guess. ND-05a therefore states it, and
+> the refusal stays as the backstop for a client that did not read (ADR 0072).
 
 **ND-10** `[connector]` — A **cap** is discovered by being refused, not by being published. The `T04`
 reject's message states the current cap, which is the whole discovery mechanism.
@@ -185,8 +228,9 @@ money silently.
 Uses exactly the vocabulary of [`CONTEXT.md`](../../CONTEXT.md) and implements
 [ADR 0050](../adr/0050-a-connectors-url-resolves-to-its-self-description.md),
 [ADR 0022](../adr/0022-a-connector-answers-it-does-not-announce.md),
-[ADR 0046](../adr/0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md) and
-[ADR 0054](../adr/0054-an-unsealed-termination-reject-answers-where-to-ask.md).
+[ADR 0046](../adr/0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md),
+[ADR 0054](../adr/0054-an-unsealed-termination-reject-answers-where-to-ask.md) and
+[ADR 0072](../adr/0072-a-carriage-pin-is-published-on-the-route-that-enforces-it.md).
 
 **Built (#1080):** the endpoint. `GET /ilp` answers this document, free and unauthenticated,
 projected from live state on each request; the x402 greeting's `extra` node facts are read off the

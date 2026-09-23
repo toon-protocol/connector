@@ -120,10 +120,11 @@ pub struct EdgeIdentity {
 
 /// One priced route, as the document publishes it.
 ///
-/// Prefix and price and nothing else. A terminated route's `handler_url` is
-/// the operator's business and an app fact besides (ND-08); a forwarded
-/// route's peer id and per-peering fee are operator-private (ND-09). What is
-/// left is exactly what a buyer needs: what to address and what it costs.
+/// Prefix, price, and what it takes to use the route -- and nothing else. A
+/// terminated route's `handler_url` is the operator's business and an app
+/// fact besides (ND-08); a forwarded route's peer id and per-peering fee are
+/// operator-private (ND-09). What is left is exactly what a buyer needs:
+/// what to address, what it costs, and which carriage to arrive on.
 ///
 /// `price` is a decimal **string** in the asset's base units, the same
 /// spelling the greeting's `amount`/`extra.price` already use -- a `u64`
@@ -157,6 +158,31 @@ pub struct RoutePrice {
     /// before this issue.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub request: Option<serde_json::Value>,
+    /// The client transport **this** route requires (ND-05a, TOON_Network
+    /// issue #111) -- `"http"` or `"btp"`, the two spellings
+    /// `TransportPolicy::name` already gives the greeting's
+    /// `extra.requiredTransport`, read off the very lookup both client-edge
+    /// carriages enforce the pin from.
+    ///
+    /// Absent -- not `"both"`, not `null` -- on a route that accepts either
+    /// carriage, which is every route no operator pinned. A node that pins
+    /// nothing therefore publishes exactly the document it published before
+    /// this field existed.
+    ///
+    /// [`NodeSelfDescription::required_transport`] is the same fact
+    /// aggregated over this node's own addresses, and it says nothing the
+    /// moment those addresses disagree. **The devnet relay is exactly such
+    /// a node:** `g.toon.relay` is pinned to BTP, `g.toon.relay.ephemeral`
+    /// is not, so the per-node scalar had no honest answer while the pin was
+    /// fully enforced -- and a publisher reading the document dialled HTTP
+    /// and had every write refused. A pin is enforced per route, so a pin is
+    /// published per route.
+    #[serde(
+        rename = "requiredTransport",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub required_transport: Option<String>,
 }
 
 /// The document itself, as it goes on the wire.
@@ -246,6 +272,27 @@ impl NodeSelfDescription {
     }
 }
 
+/// What one route's transport policy says on the wire: `Some("http")` or
+/// `Some("btp")` for a pinned route, `None` for one that accepts either.
+///
+/// `policy` is the policy's config-file spelling -- the same spelling the
+/// greeting's `extra.requiredTransport` uses, so no two surfaces describe one
+/// policy by two names.
+///
+/// `"both"` becomes `None` rather than `Some("both")` because the field
+/// answers *which carriage must I use*, and "either" is not an answer to
+/// that: it is the absence of a requirement. Omitting it also keeps an
+/// unpinned node's document byte-identical to the one it published before
+/// this field existed (ND-05a).
+///
+/// The one place that knows `"both"` means silence.
+/// [`agreed_required_transport`] defers to it, so a per-route entry and the
+/// per-node scalar cannot come to different conclusions about the same
+/// policy.
+pub fn published_required_transport(policy: &str) -> Option<String> {
+    (policy != "both").then(|| policy.to_string())
+}
+
 /// The one client transport every covered route requires, or `None` when
 /// there is no single honest answer.
 ///
@@ -262,9 +309,15 @@ impl NodeSelfDescription {
 ///   * they agree on `"both"`, the permissive default every route had before
 ///     issue #701. Emitting it would be true and useless.
 ///
-/// This rule is the one that closes the `requiredTransport` defect by
-/// construction: it feeds the *only* description of the node there is, so
-/// there is no second copy for the enforced behaviour to run ahead of.
+/// **The second case is not rare, and it is what TOON_Network issue #111 was
+/// filed about.** A node answering to more than one address usually pins some
+/// of them and not others -- the devnet relay answers to `g.toon.relay`,
+/// pinned to BTP, and `g.toon.relay.ephemeral`, which is not -- so this
+/// returns `None` and the node says nothing about a pin it enforces on every
+/// packet. That is why [`RoutePrice::required_transport`] exists: the pin is
+/// enforced per route, so it is published per route, and this scalar is the
+/// convenience for a node where one answer covers everything rather than the
+/// only place a pin is named.
 pub fn agreed_required_transport<'a>(
     policies: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {
@@ -273,7 +326,7 @@ pub fn agreed_required_transport<'a>(
     if !policies.all(|policy| policy == first) {
         return None;
     }
-    (first != "both").then(|| first.to_string())
+    published_required_transport(first)
 }
 
 #[cfg(test)]
@@ -375,6 +428,7 @@ mod tests {
                 price: "1000".to_string(),
                 price_per_kib: None,
                 request: None,
+                required_transport: None,
             }],
             Some("btp".to_string()),
         );
@@ -404,6 +458,7 @@ mod tests {
                 price: u64::MAX.to_string(),
                 price_per_kib: None,
                 request: None,
+                required_transport: None,
             }],
             None,
         );
@@ -429,12 +484,14 @@ mod tests {
                     price: "1000".to_string(),
                     price_per_kib: None,
                     request: Some(serde_json::json!({"protocol": "nip90", "kinds": [5096, 5098]})),
+                    required_transport: None,
                 },
                 RoutePrice {
                     prefix: "g.toon.ario".to_string(),
                     price: "1000".to_string(),
                     price_per_kib: None,
                     request: None,
+                    required_transport: None,
                 },
             ],
             None,
@@ -449,6 +506,62 @@ mod tests {
             json["routes"][1].get("request").is_none(),
             "a route with no request table must publish no 'request' key at all"
         );
+    }
+
+    /// TOON_Network#111: a pinned route names its carriage on its own entry,
+    /// and an unpinned one carries no such key at all -- not `"both"`, not
+    /// `null`. A node that pins nothing publishes exactly the document it
+    /// published before this field existed (ND-05a).
+    #[test]
+    fn a_pinned_route_names_its_carriage_and_an_unpinned_one_says_nothing() {
+        let document = NodeSelfDescription::describe(
+            &facts(),
+            None,
+            vec![
+                RoutePrice {
+                    prefix: "g.toon.relay".to_string(),
+                    price: "1".to_string(),
+                    price_per_kib: None,
+                    request: None,
+                    required_transport: published_required_transport("btp"),
+                },
+                RoutePrice {
+                    prefix: "g.toon.relay.ephemeral".to_string(),
+                    price: "0".to_string(),
+                    price_per_kib: None,
+                    request: None,
+                    required_transport: published_required_transport("both"),
+                },
+            ],
+            // Those two policies disagree, so the per-node scalar has nothing
+            // honest to say -- which is the devnet relay, and the reason the
+            // per-route field exists.
+            agreed_required_transport(["btp", "both"]),
+        );
+        let json = serde_json::to_value(&document).expect("serializes");
+
+        assert_eq!(json["routes"][0]["requiredTransport"], "btp");
+        assert!(
+            json["routes"][1].get("requiredTransport").is_none(),
+            "a route accepting either carriage must publish no 'requiredTransport' key at all"
+        );
+        assert!(
+            json.get("requiredTransport").is_none(),
+            "and the node-wide scalar stays silent rather than picking one of them"
+        );
+    }
+
+    /// `"both"` is the absence of a requirement, so it is spelled as an
+    /// absence -- one rule, in one place, for the per-route field and the
+    /// per-node scalar alike.
+    #[test]
+    fn the_permissive_default_is_published_as_no_field_at_all() {
+        assert_eq!(published_required_transport("btp"), Some("btp".to_string()));
+        assert_eq!(
+            published_required_transport("http"),
+            Some("http".to_string())
+        );
+        assert_eq!(published_required_transport("both"), None);
     }
 
     #[test]
@@ -481,6 +594,7 @@ mod tests {
                 price: "1000".to_string(),
                 price_per_kib: None,
                 request: None,
+                required_transport: None,
             }],
             Some("btp".to_string()),
         );
