@@ -1,6 +1,6 @@
 # Architecture decision records
 
-71 records. **Every one now carries a `**Status:**` line under its title** — that line, not this
+72 records. **Every one now carries a `**Status:**` line under its title** — that line, not this
 index, is the authority for whether a record is live. This page is the map: what is live, grouped
 by area; what is dead, grouped by what killed it; and what the folder still says that the code no
 longer does.
@@ -17,7 +17,7 @@ The numbers are permanent and are never reused or renumbered — they are cited 
 times across this repo and from `toon-meta`, `relay` and `store`. This index groups them by
 scope; it does not move them.
 
-> **0065 is taken twice, and stays that way.** Seventy-two records, seventy-one numbers.
+> **0065 is taken twice, and stays that way.** Seventy-three records, seventy-two numbers.
 > [_A price is a schedule over payload length_](0065-a-price-is-a-schedule-over-payload-length.md)
 > (#984) and [_Mina leaves the repository_](0065-mina-leaves-the-repository.md) (#1205) were both
 > written on branches cut while 0064 was the folder's highest number, and both landed on `main` on
@@ -179,12 +179,13 @@ This is the group that spells out the nginx sentence at the top of this page.
 
 ### Discovery
 
-| #                                                                                   | Decision                                                             | Status                                                                                |
-| ----------------------------------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| [0022](0022-a-connector-answers-it-does-not-announce.md)                            | A connector answers when asked; it still never announces             | Accepted — one consequence lost to 0027                                               |
-| [0046](0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md)       | The kind:10032 announce is removed; a connector needs no relay       | Accepted — **built** (#1074); **retires 0030**; restores 0022, 0006; extended by 0067 |
-| [0050](0050-a-connectors-url-resolves-to-its-self-description.md)                   | A connector's URL resolves to its self-description                   | Accepted — **built** (#1080); completes 0022; extended by 0067                        |
-| [0067](0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md) | A route declares its request shape, and the connector never reads it | Accepted — **built** (#1210); extends 0050, 0046                                      |
+| #                                                                                   | Decision                                                             | Status                                                                                              |
+| ----------------------------------------------------------------------------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| [0022](0022-a-connector-answers-it-does-not-announce.md)                            | A connector answers when asked; it still never announces             | Accepted — one consequence lost to 0027                                                             |
+| [0046](0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md)       | The kind:10032 announce is removed; a connector needs no relay       | Accepted — **built** (#1074); **retires 0030**; restores 0022, 0006; extended by 0067               |
+| [0050](0050-a-connectors-url-resolves-to-its-self-description.md)                   | A connector's URL resolves to its self-description                   | Accepted — **built** (#1080); completes 0022; extended by 0067                                      |
+| [0067](0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md) | A route declares its request shape, and the connector never reads it | Accepted — **built** (#1210); extends 0050, 0046                                                    |
+| [0072](0072-a-carriage-pin-is-published-on-the-route-that-enforces-it.md)           | A carriage pin is published on the route that enforces it            | Accepted — **built** (TOON_Network#111); extends 0050; completes the half of #701 that 0046 claimed |
 
 ---
 

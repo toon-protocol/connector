@@ -138,8 +138,12 @@ operator declares it, or it is absent.
 schedules: same base and same slope.
 
 **CF-15** `[operator]` — A route MAY require a specific client transport. A connector that pins one
-MUST publish the requirement in its self-description; enforcing a requirement it does not advertise is
-the defect that refused every relay publish on the devnet fleet.
+MUST publish the requirement **on that route's own entry** in its self-description
+([ND-05a](self-description-spec.md), [ADR 0072](../adr/0072-a-carriage-pin-is-published-on-the-route-that-enforces-it.md));
+enforcing a requirement it does not advertise is the defect that refused every relay publish on the
+devnet fleet, twice — once because the announce carried no such key at all, and once because the
+per-node field it was replaced with has nothing honest to say about a node that pins one of its own
+addresses and not the other (TOON_Network#111).
 
 ### 1.5 Peerings
 

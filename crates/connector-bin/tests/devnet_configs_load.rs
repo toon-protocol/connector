@@ -108,7 +108,9 @@ use std::process::{Child, Command, Stdio};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use connector_config::{Config, SettlementConfig, TransportPolicy};
-use connector_domain::{agreed_required_transport, EnvelopeRequest, Prepare};
+use connector_domain::{
+    agreed_required_transport, published_required_transport, EnvelopeRequest, Prepare,
+};
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
 use connector_settlement_evm::EvmSettlementBackend;
 
@@ -1020,6 +1022,15 @@ fn committed_transport_policy(config: &Config, address: &str) -> Option<Transpor
 /// [`connector_domain::agreed_required_transport`] rather than a literal, so
 /// this follows the configs: unpin the relay's route and the relay assertion
 /// below changes with it, pin the store's and the store assertion does.
+///
+/// **This test was green while the live devnet relay published no pin at
+/// all** (TOON_Network#111, observed 2026-09-22). It reads the COMMITTED
+/// file, whose `[node] addresses` holds one entry; the running box answered
+/// to two -- `g.toon.relay`, pinned to BTP, and `g.toon.relay.ephemeral`,
+/// which is not -- and the scalar over two disagreeing policies is `None`.
+/// So what follows is a claim about this file, never about what a second
+/// address does to the scalar. The per-route assertion below is the one that
+/// holds whatever a box adds to `addresses`.
 #[test]
 fn each_boxs_self_description_declares_the_transport_its_own_routes_require() {
     let relay = load_committed_relay_config();
@@ -1057,6 +1068,51 @@ fn each_boxs_self_description_declares_the_transport_its_own_routes_require() {
         "the store's route is left at the permissive default, so its self-description must \
          carry no `requiredTransport` key at all -- naming the default would put a key on the \
          wire to say nothing"
+    );
+}
+
+/// The assertion the scalar above cannot make (TOON_Network#111): every
+/// committed route that pins a carriage says so on **its own** document
+/// entry, whatever else the box answers to.
+///
+/// The relay's `g.toon.relay` is the one that mattered -- a directory
+/// publisher pays that prefix, and an HTTP one-shot there is refused before
+/// payment is even considered. Read through
+/// [`connector_domain::published_required_transport`], the one function that
+/// turns a policy into what the wire says, so this follows the configs
+/// exactly as the assertion above does.
+#[test]
+fn every_committed_route_that_pins_a_carriage_publishes_it_on_its_own_entry() {
+    for (name, config) in [
+        ("relay", load_committed_relay_config()),
+        ("store", load_committed_store_config()),
+    ] {
+        for route in config.routes() {
+            assert_eq!(
+                published_required_transport(route.transport_policy().name()),
+                match route.transport_policy() {
+                    TransportPolicy::Both => None,
+                    pinned => Some(pinned.name().to_string()),
+                },
+                "the {name} box's '{}' route publishes what it enforces",
+                route.prefix()
+            );
+        }
+    }
+
+    let relay = load_committed_relay_config();
+    let pinned: Vec<&str> = relay
+        .routes()
+        .iter()
+        .filter(|route| route.transport_policy() != TransportPolicy::Both)
+        .map(|route| route.prefix())
+        .collect();
+    assert_eq!(
+        pinned,
+        vec!["g.toon.relay"],
+        "the relay pins exactly the prefix a directory publisher pays, and the document names \
+         it per route -- so a publisher dials BTP on its first attempt rather than learning the \
+         pin from a refusal (TOON_Network#111)"
     );
 }
 
