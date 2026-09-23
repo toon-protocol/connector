@@ -1082,18 +1082,44 @@ fn client_edge_claim(state: &OperatorState, channel_id: &str) -> Option<Claim> {
     })
 }
 
-/// The claim this connector holds on `channel_id`, from whichever book is
-/// that channel's actual authority (issue #1218): the peer semantics's own
-/// `ClaimBook`, consulted first exactly as `Connector::peer_channel_watermark`
-/// already does for `POST /ilp/claim-state`, or -- only once that book has
-/// nothing -- the client edge's `ClientClaimGate`. A channel cannot be both
-/// (`ConfigError::ChannelInBothNamespaces`), so this never has two
-/// candidates to choose between.
+/// The claim this connector holds on `channel_id` that supersedes every
+/// other it holds there (issues #1218, #1257): the peer semantics's own
+/// `ClaimBook` and the client edge's `ClientClaimGate` are both read, and
+/// the one with the higher cumulative amount wins -- the nonce breaking a
+/// tie -- which is the claim the chain would actually pay out on.
+///
+/// `ConfigError::ChannelInBothNamespaces` keeps a *configured* channel out
+/// of both books, and #1218 once relied on that to take the peer book's
+/// claim whenever it had one. But a `POST /peers` peering (ADR 0058) binds
+/// a peer channel at runtime with no such check, and an operator who
+/// migrates a config-file peering to a runtime one keeps the old peer-book
+/// journal, as the state-volume doctrine tells them to. Both books then hold
+/// the channel, and the peer book's older, already-redeemed claim shadowed
+/// the client edge's newer one: `redeem-latest` refused with "does not
+/// supersede the channel's already-redeemed" and pointed the operator at
+/// money they already had, not the money they did not (#1257, measured on
+/// a live mainnet node). Where only one book holds the channel -- every
+/// case #1218 was written for -- this answers exactly what it did before.
 fn latest_claim(state: &OperatorState, channel_id: &str) -> Option<Claim> {
-    state
-        .connector
-        .peer_inbound_claim(channel_id)
-        .or_else(|| client_edge_claim(state, channel_id))
+    higher_claim(
+        state.connector.peer_inbound_claim(channel_id),
+        client_edge_claim(state, channel_id),
+    )
+}
+
+/// The claim with the higher `(cumulative_amount, nonce)`, or whichever one
+/// exists. Ties go to `peer`, the book #1218 already preferred, so a channel
+/// the two books agree on keeps its old answer byte for byte.
+fn higher_claim(peer: Option<Claim>, client: Option<Claim>) -> Option<Claim> {
+    match (peer, client) {
+        (Some(peer), Some(client))
+            if (client.cumulative_amount, client.nonce) > (peer.cumulative_amount, peer.nonce) =>
+        {
+            Some(client)
+        }
+        (Some(peer), _) => Some(peer),
+        (None, client) => client,
+    }
 }
 
 /// `POST /channels/:id/redeem-latest`: redeem the latest claim this node
@@ -1128,7 +1154,9 @@ async fn redeem_latest_claim(
 ///
 /// A peer channel delegates entirely to [`Connector::cooperative_close`],
 /// unchanged (issue #1218's peer-book behaviour stays byte for byte the
-/// same). Only once the peer book has no claim on this channel does this
+/// same) -- unless the client edge's book holds a claim on the same channel
+/// that supersedes the peer book's ([`latest_claim`]'s rule, issue #1257).
+/// Only then, or once the peer book has no claim on this channel, does this
 /// handler consult the client edge's own book itself: redeem what it
 /// holds, tolerating an already-redeemed claim exactly as
 /// [`Connector::cooperative_close`] does for its own book, then close --
@@ -1146,11 +1174,23 @@ async fn cooperative_close(
         return error.into_response();
     }
 
-    if state.connector.peer_inbound_claim(&channel_id).is_some() {
+    // Issue #1257: the peer book keeps its whole delegation only while no
+    // client-edge claim supersedes what it holds -- a stale peer-book row
+    // (a migrated peering's old journal) must not close the channel on a
+    // claim older than the one the client edge accepted.
+    let peer = state.connector.peer_inbound_claim(&channel_id);
+    let client = client_edge_claim(&state, &channel_id);
+    let client_supersedes = match (&peer, &client) {
+        (Some(peer), Some(client)) => {
+            (client.cumulative_amount, client.nonce) > (peer.cumulative_amount, peer.nonce)
+        }
+        _ => false,
+    };
+    if peer.is_some() && !client_supersedes {
         return channel_operation_response(state.connector.cooperative_close(&channel_id).await);
     }
 
-    let Some(claim) = client_edge_claim(&state, &channel_id) else {
+    let Some(claim) = client else {
         return channel_operation_response(state.connector.cooperative_close(&channel_id).await);
     };
     match state.connector.redeem_channel(&channel_id, claim).await {
@@ -1238,6 +1278,41 @@ mod tests {
     /// nowhere durable -- the operator-surface tests below that are not
     /// specifically about the client-edge book (most of them) need a
     /// `ClientClaimGate` to satisfy `router`'s signature and nothing more.
+    /// Issue #1257's rule, without a chain: the higher `(cumulative, nonce)`
+    /// wins across the two books, and a tie keeps #1218's peer-book answer.
+    #[test]
+    fn the_superseding_claim_wins_across_both_books() {
+        let claim = |nonce: u64, cumulative_amount: u128, tag: u8| Claim {
+            nonce,
+            cumulative_amount,
+            signature: vec![tag],
+        };
+        assert_eq!(higher_claim(None, None), None);
+        assert_eq!(
+            higher_claim(Some(claim(1, 10, 1)), None),
+            Some(claim(1, 10, 1))
+        );
+        assert_eq!(
+            higher_claim(None, Some(claim(1, 10, 2))),
+            Some(claim(1, 10, 2))
+        );
+        assert_eq!(
+            higher_claim(Some(claim(8, 242_700, 1)), Some(claim(9, 243_600, 2))),
+            Some(claim(9, 243_600, 2)),
+            "#1257: the stale peer-book row must not shadow the newer client-edge claim"
+        );
+        assert_eq!(
+            higher_claim(Some(claim(3, 900, 1)), Some(claim(1, 400, 2))),
+            Some(claim(3, 900, 1)),
+            "the peer book still wins when it is the one that supersedes"
+        );
+        assert_eq!(
+            higher_claim(Some(claim(2, 500, 1)), Some(claim(2, 500, 2))),
+            Some(claim(2, 500, 1)),
+            "a tie keeps the peer book's answer, byte for byte what #1218 returned"
+        );
+    }
+
     fn empty_claim_gate() -> Arc<ClientClaimGate> {
         Arc::new(
             ClientClaimGate::restore(
@@ -3564,6 +3639,196 @@ mod tests {
             );
             let redeemed: ChannelView = serde_json::from_slice(&body_bytes).unwrap();
             assert_eq!(redeemed.redeemed, 1_000);
+        }
+
+        /// Issue #1257, against a real chain: one channel, both books.
+        ///
+        /// The shape a live mainnet node reached by migrating a config-file
+        /// peering to a `POST /peers` one while keeping `state_dir`, as the
+        /// state-volume doctrine requires: the peer book still holds the old
+        /// peering's claim, already redeemed on chain, and the client edge's
+        /// book holds the newer claim the same payer signed after the
+        /// migration. Before this fix `redeem-latest` took the peer book's
+        /// row because it existed, and the chain refused it as not
+        /// superseding what it had already paid -- so the newest accepted
+        /// claim on the node could not be redeemed at all. The claim the
+        /// chain would actually pay out on is the one with the higher
+        /// cumulative amount, whichever book it is in.
+        #[tokio::test]
+        async fn a_client_edge_claim_that_supersedes_a_redeemed_peer_book_claim_is_the_one_redeemed(
+        ) {
+            if !require_anvil() {
+                return;
+            }
+
+            let anvil = Anvil::spawn().await;
+            let token = EvmSettlementBackend::deploy_mock_token(
+                &anvil.rpc_url,
+                DEPLOYER_PRIVATE_KEY,
+                1_000_000,
+            )
+            .await
+            .expect("deploy mock USDC");
+            let settlement = Arc::new(
+                EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
+                    .await
+                    .expect("deploy a TokenNetwork through a fresh registry"),
+            );
+            let domain = ChannelDomain {
+                chain_id: settlement.chain_id(),
+                token_network_address: settlement.address().to_fixed_bytes(),
+            };
+
+            let payer_signer = LocalSigner::generate("migrated-peer-payer");
+            let payer_address = derive_evm_address(&payer_signer.public_key().unwrap());
+            let channel_id = settlement
+                .open(payer_address.to_vec(), chrono::Duration::hours(1))
+                .await
+                .expect("open a real channel");
+            settlement
+                .fund_counterparty(&channel_id, 5_000)
+                .await
+                .expect("fund the payer's own side");
+
+            // The peer binding the old config-file peering left behind.
+            let connector = Arc::new(
+                Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(TestClock::new(chrono::Utc::now())),
+                )
+                .with_settlement(
+                    SettlementChain::Evm,
+                    Arc::clone(&settlement) as Arc<dyn connector_settlement::SettlementBackend>,
+                )
+                .with_channel_verification_key(channel_id.0.clone(), payer_address)
+                .with_channel_domain(channel_id.0.clone(), domain)
+                .unwrap(),
+            );
+
+            // The client edge's book, where the migrated peering's claims
+            // now land.
+            let gate = Arc::new(
+                ClientClaimGate::restore(
+                    channels_recording(
+                        &channel_id.0,
+                        connector_client_edge::EvmChannel {
+                            counterparty: payer_address,
+                            chain_id: domain.chain_id,
+                            token_network_address: domain.token_network_address,
+                            deposit_floor: connector_client_edge::DepositFloor::Unknown,
+                        },
+                    ),
+                    Arc::new(InMemoryJournal::new()),
+                )
+                .expect("a fresh in-memory journal has nothing to replay"),
+            );
+
+            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
+            let keypair = keypair();
+            let app = router(
+                connector.clone(),
+                Arc::clone(&gate),
+                signer,
+                "correct-token".to_string(),
+                vec![keypair.public.to_bytes()],
+                None,
+            );
+            let redeem_latest_path = format!("/channels/{}/redeem-latest", channel_id.0);
+
+            // Before the migration: a peer-book claim, redeemed on chain.
+            let peer_claim_json = client_claim_json(
+                &payer_signer,
+                &channel_id.0,
+                8,
+                2_427,
+                domain.chain_id,
+                domain.token_network_address,
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&peer_claim_json).unwrap();
+            let signature_hex = parsed["signature"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x");
+            let signature_bytes: Vec<u8> = (0..signature_hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&signature_hex[i..i + 2], 16).unwrap())
+                .collect();
+            assert_eq!(
+                connector.handle_peer_claim(WireClaim {
+                    channel_id: channel_id.0.clone(),
+                    nonce: 8,
+                    cumulative_amount: 2_427,
+                    signature: connector_runtime::ClaimSignature::Evm(
+                        connector_signer::Signature::from_bytes(&signature_bytes)
+                            .expect("65 bytes"),
+                    ),
+                }),
+                connector_runtime::ClaimAckOutcome::Accepted
+            );
+            let response = app
+                .clone()
+                .oneshot(signed_post(&keypair, &redeem_latest_path, Vec::new()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            let redeemed: ChannelView = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(redeemed.redeemed, 2_427);
+
+            // After it: the same payer's next claim, accepted at the client
+            // edge. The peer book's row is still there, already redeemed.
+            gate.ingest(
+                &client_claim_json(
+                    &payer_signer,
+                    &channel_id.0,
+                    9,
+                    2_436,
+                    domain.chain_id,
+                    domain.token_network_address,
+                ),
+                0,
+            )
+            .await
+            .expect("the migrated peering's next claim is accepted at the client edge");
+            assert!(
+                connector.peer_inbound_claim(&channel_id.0).is_some(),
+                "the precondition #1257 needs: the stale peer-book row is still present"
+            );
+
+            // A second write to the same path: `signed_post` stamps a fixed
+            // `created`, and the operator surface refuses a replayed
+            // signature, so this one is signed a second later.
+            let (sig_input, sig, digest) = sign_request(
+                &keypair,
+                "POST",
+                &redeem_latest_path,
+                &[],
+                1_001,
+                Some(9_999_999_999),
+            );
+            let second_redeem = Request::builder()
+                .method("POST")
+                .uri(&redeem_latest_path)
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(second_redeem).await.unwrap();
+            let status = response.status();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the client edge's newer claim must be the one redeemed, not the peer book's \
+                 already-redeemed one: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let redeemed: ChannelView = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(redeemed.redeemed, 2_436);
         }
 
         /// Issue #1283, against a real chain: settling a channel retires
