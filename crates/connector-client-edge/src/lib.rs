@@ -648,12 +648,13 @@ struct RoutePriceQuery {
     size: Option<u64>,
 }
 
-/// What a given destination would cost to deliver to, per ADR 0022's
-/// "a sender can ask what a route of its costs" -- reuses
-/// [`Connector::client_route_price`], the same longest-prefix lookup the
-/// x402 greeting and the claim gate's value binding already use, so this
-/// answers with exactly the price a real request to `destination` would be
-/// charged, never a second source of truth. That lookup spans configured
+/// What a given destination would cost to deliver to, and what it takes to
+/// reach it, per ADR 0022's "a sender can ask what a route of its costs" --
+/// reuses [`Connector::client_route`], the same longest-prefix lookup the x402
+/// greeting, the claim gate's value binding and both carriages' transport check
+/// already use, so this answers with exactly the price a real request to
+/// `destination` would be charged **and** exactly the carriage it would have to
+/// arrive on, never a second source of truth. That lookup spans configured
 /// routes of both kinds since ADR 0028, so a destination this connector
 /// forwards over a peering is answered here too -- it is charged here too.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
