@@ -15,6 +15,7 @@
 //! against and none to keep out of a `Debug` rendering. The key is parsed
 //! solely to be refused by name ([`ConfigError::PeerCredentialRemoved`]).
 
+mod batch_settlement;
 mod client_channel;
 mod client_channel_asset;
 mod config;
@@ -31,6 +32,11 @@ mod route;
 mod secret;
 mod settlement;
 
+pub use batch_settlement::{
+    EvmBatchSettlementConfig, SolanaBatchSettlementConfig, BATCH_SETTLEMENT_DELAY_FLOOR_SECS,
+    DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS, DEFAULT_EVM_BATCH_SETTLEMENT_CONTRACT,
+    DEFAULT_SOLANA_BATCH_SETTLEMENT_PROGRAM, EVM_BATCH_SETTLEMENT_MAX_WITHDRAW_DELAY_SECS,
+};
 pub use client_channel::{ClientChannelConfig, EvmClientChannelConfig, SolanaClientChannelConfig};
 pub use client_channel_asset::ClientChannelAssets;
 pub use config::{parse_socks_proxy, Config};

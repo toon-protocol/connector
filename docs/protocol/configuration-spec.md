@@ -417,6 +417,31 @@ repository at all ([ADR 0065](../adr/0065-mina-leaves-the-repository.md)). An ab
 every channel operation then answers `503`; a present but wrong one is a startup failure, because a
 real backend is constructed for every chain configured before the node serves anything (CF-25).
 
+**Accepting x402 batch-settlement channels is opted into per chain** ([ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
+decision 1), by writing a `batch_settlement` sub-table under that chain's keyed settlement table. It is
+**off unless written**: there is no `enabled` key, because the table's presence already says so, and
+the frozen legacy `[settlement]` shape has no such sub-table. Everything decision 2 fixes about an
+admissible channel comes from the enclosing table and is not declared again (CF-26): the receiver (or
+Solana sponsor) is that table's settlement key, and the token or mint is its `token_address`. What the
+sub-table holds is only the terms that are this node's to choose. The first column is the chain whose
+`[settlement.<chain>.batch_settlement]` takes the key — these are not top-level keys, which is why the
+table does not start with one:
+
+| chain  | key                       | default              | refused by name when                                            |
+| ------ | ------------------------- | -------------------- | --------------------------------------------------------------- |
+| EVM    | `min_withdraw_delay_secs` | `86400` (a day)      | below `900`, or above `2592000` (the contract's 30-day maximum) |
+| EVM    | `contract_address`        | x402's `0x4020…0003` | not a 20-byte address                                           |
+| Solana | `min_grace_period_secs`   | `86400` (a day)      | below `900`                                                     |
+| Solana | `min_sponsored_deposit`   | **required**         | `0`; it bounds a public endpoint that spends this node's rent   |
+| Solana | `program_id`              | `CHNLx…yGsX`         | not a base58 32-byte id                                         |
+
+The two minimums are published in the greeting, and a channel whose `withdrawDelay` or `grace_period`
+falls short of them is not admitted. The floor of 900 seconds is x402's own; the day is the window a
+delayed `claim` or `settle_and_seal` still has to land in. `contract_address` and `program_id` default
+to the one address x402 deploys on each chain's test and main networks alike, and are the voucher
+domain the connector reads from its config and never from a voucher (decision 4). The Solana
+`program_id` here is x402's `payment-channels`, not `[settlement.solana] program_id`, which is TOON's.
+
 **`decimals` is a declaration, not a conversion.** Nothing scales by it: every amount on the value path
 — a route's price, a claim's amount, a channel's deposit — is already in the settlement token's base
 units, and stays in the units of the leg it is on. Where a forward's two legs hold different tokens the

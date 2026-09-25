@@ -4,6 +4,10 @@ use connector_domain::{AssetChain, AssetId};
 use serde::Deserialize;
 use url::Url;
 
+use crate::batch_settlement::{
+    resolve_evm_batch_settlement, resolve_solana_batch_settlement, EvmBatchSettlementConfig,
+    RawEvmBatchSettlementTable, RawSolanaBatchSettlementTable, SolanaBatchSettlementConfig,
+};
 use crate::client_channel::to_hex;
 use crate::error::ConfigError;
 use crate::secret::SecretLocation;
@@ -29,11 +33,14 @@ use crate::secret::SecretLocation;
 /// requires `chain` and forbids `evm`/`solana` keys, the keyed shape forbids
 /// `chain` and only recognizes `evm`/`solana` -- mutually exclusive by
 /// construction, so a config can never be read two ways.
+///
+/// The keyed shape is boxed only because it is much the larger of the two,
+/// now that each chain's table can carry a `batch_settlement` sub-table.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum RawSettlementSection {
     Legacy(RawSettlementConfig),
-    Keyed(RawKeyedSettlementConfig),
+    Keyed(Box<RawKeyedSettlementConfig>),
 }
 
 /// The legacy flat `[settlement]` shape (issue #542): one chain, named by
@@ -97,6 +104,10 @@ pub(crate) struct RawEvmSettlementTable {
     /// `socks_proxy`. See [`EvmSettlementConfig::rpc_via_socks_proxy`].
     #[serde(default)]
     rpc_via_socks_proxy: bool,
+    /// ADR 0074: `[settlement.evm.batch_settlement]`, the opt-in to x402
+    /// batch-settlement channels on EVM. Absent is off.
+    #[serde(default)]
+    batch_settlement: Option<RawEvmBatchSettlementTable>,
 }
 
 /// `[settlement.solana]`: `contract_address` (an EVM `TokenNetworkRegistry`)
@@ -117,6 +128,10 @@ pub(crate) struct RawSolanaSettlementTable {
     /// `socks_proxy`. See [`SolanaSettlementConfig::rpc_via_socks_proxy`].
     #[serde(default)]
     rpc_via_socks_proxy: bool,
+    /// ADR 0074: `[settlement.solana.batch_settlement]`, the opt-in to x402
+    /// batch-settlement channels on Solana. Absent is off.
+    #[serde(default)]
+    batch_settlement: Option<RawSolanaBatchSettlementTable>,
 }
 
 /// The `[settlement]`/`[settlement.evm]`/`[settlement.solana]` `key`
@@ -234,6 +249,7 @@ pub struct EvmSettlementConfig {
     channel_index_from_block: u64,
     channel_index_confirmations: u64,
     rpc_via_socks_proxy: bool,
+    batch_settlement: Option<EvmBatchSettlementConfig>,
 }
 
 /// How many blocks behind chain head a `ChannelOpened`/`ChannelNewDeposit`/
@@ -308,6 +324,14 @@ impl EvmSettlementConfig {
     pub fn rpc_via_socks_proxy(&self) -> bool {
         self.rpc_via_socks_proxy
     }
+
+    /// This node's terms for x402 batch-settlement channels on EVM, or
+    /// `None` when it has not opted in (ADR 0074 decision 1). A node that
+    /// has not offers no `batch-settlement` entry on EVM and refuses an EVM
+    /// voucher by name.
+    pub fn batch_settlement(&self) -> Option<&EvmBatchSettlementConfig> {
+        self.batch_settlement.as_ref()
+    }
 }
 
 /// A fully validated `[settlement.solana]` table: which deployed
@@ -323,6 +347,7 @@ pub struct SolanaSettlementConfig {
     token_address: String,
     decimals: u8,
     key: SecretLocation,
+    batch_settlement: Option<SolanaBatchSettlementConfig>,
 }
 
 impl SolanaSettlementConfig {
@@ -381,6 +406,14 @@ impl SolanaSettlementConfig {
     /// [`EvmSettlementConfig::rpc_via_socks_proxy`].
     pub fn rpc_via_socks_proxy(&self) -> bool {
         self.rpc_via_socks_proxy
+    }
+
+    /// This node's terms for x402 batch-settlement channels on Solana, or
+    /// `None` when it has not opted in (ADR 0074 decision 1). A node that
+    /// has not offers no `batch-settlement` entry on Solana, sponsors no
+    /// channel and refuses a Solana voucher by name.
+    pub fn batch_settlement(&self) -> Option<&SolanaBatchSettlementConfig> {
+        self.batch_settlement.as_ref()
     }
 }
 
@@ -570,7 +603,7 @@ impl<'a> SettlementTables<'a> {
 /// `0x`/`0X` prefix accepted since that is how every address in this
 /// workspace's own docs, infra and decision comments is already written
 /// (e.g. `'0x49beE1Bca5d15Fb0963117923403F9498119a9Ce'`).
-fn parse_evm_address(value: &str) -> Option<[u8; 20]> {
+pub(crate) fn parse_evm_address(value: &str) -> Option<[u8; 20]> {
     let hex = value
         .strip_prefix("0x")
         .or_else(|| value.strip_prefix("0X"))
@@ -664,6 +697,10 @@ fn resolve_evm_fields(table: RawEvmSettlementTable) -> Result<EvmSettlementConfi
         channel_index_from_block: table.channel_index_from_block.unwrap_or(0),
         channel_index_confirmations,
         rpc_via_socks_proxy: table.rpc_via_socks_proxy,
+        batch_settlement: table
+            .batch_settlement
+            .map(resolve_evm_batch_settlement)
+            .transpose()?,
     })
 }
 
@@ -692,6 +729,10 @@ fn resolve_solana_fields(
         token_address: table.token_address,
         decimals: table.decimals,
         key,
+        batch_settlement: table
+            .batch_settlement
+            .map(resolve_solana_batch_settlement)
+            .transpose()?,
     })
 }
 
@@ -736,10 +777,14 @@ pub(crate) fn resolve_settlement(
                 // Frozen too: a node that wants its settlement RPC on a
                 // circuit writes the keyed `[settlement.evm]` table.
                 rpc_via_socks_proxy: false,
+                // And for batch settlement (ADR 0074): the opt-in is a
+                // sub-table of the keyed `[settlement.evm]` only.
+                batch_settlement: None,
             })?;
             Ok(vec![SettlementConfig::Evm(evm)])
         }
         RawSettlementSection::Keyed(raw) => {
+            let raw = *raw;
             if raw.evm.is_none() && raw.solana.is_none() {
                 return Err(ConfigError::SettlementSectionEmpty);
             }
@@ -757,6 +802,8 @@ pub(crate) fn resolve_settlement(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     fn raw(
@@ -1100,6 +1147,103 @@ key_file = "{}"
         assert_eq!(resolved[0].chain(), SettlementChain::Solana);
     }
 
+    // -- x402 batch-settlement opt-in (ADR 0074, issue #1340) --
+
+    fn keyed_both(evm_extra: &str, solana_extra: &str, key_file: &Path) -> String {
+        format!(
+            r#"
+[evm]
+rpc_url = "http://127.0.0.1:8545"
+contract_address = "{CONTRACT}"
+token_address = "{TOKEN}"
+decimals = 6
+
+[evm.key]
+key_file = "{key}"
+{evm_extra}
+
+[solana]
+rpc_url = "http://127.0.0.1:8899"
+program_id = "TokenNetworkProgram11111111111111111111111"
+token_address = "SoLMint11111111111111111111111111111111111"
+decimals = 6
+
+[solana.key]
+key_file = "{key}"
+{solana_extra}
+"#,
+            key = key_file.display()
+        )
+    }
+
+    fn both(settlements: &[SettlementConfig]) -> (&EvmSettlementConfig, &SolanaSettlementConfig) {
+        match settlements {
+            [SettlementConfig::Evm(evm), SettlementConfig::Solana(solana)] => (evm, solana),
+            other => panic!("expected an evm and a solana table, got {other:?}"),
+        }
+    }
+
+    /// Decision 1: off unless configured, per chain. A settlement table that
+    /// says nothing about batch settlement has not opted in.
+    #[test]
+    fn batch_settlement_is_off_unless_its_table_is_written() {
+        let key_file = temp_key_file();
+        let resolved = resolve_settlement(Some(keyed_toml(&keyed_both("", "", key_file.path()))))
+            .expect("resolve");
+        let (evm, solana) = both(&resolved);
+
+        assert_eq!(evm.batch_settlement(), None);
+        assert_eq!(solana.batch_settlement(), None);
+    }
+
+    /// Each chain opts in on its own: EVM on, Solana still off.
+    #[test]
+    fn batch_settlement_is_opted_into_per_chain() {
+        let key_file = temp_key_file();
+        let resolved = resolve_settlement(Some(keyed_toml(&keyed_both(
+            "[evm.batch_settlement]\nmin_withdraw_delay_secs = 3600",
+            "",
+            key_file.path(),
+        ))))
+        .expect("resolve");
+        let (evm, solana) = both(&resolved);
+
+        let batch = evm.batch_settlement().expect("EVM opted in");
+        assert_eq!(batch.min_withdraw_delay_secs(), 3600);
+        assert_eq!(solana.batch_settlement(), None);
+
+        let resolved = resolve_settlement(Some(keyed_toml(&keyed_both(
+            "",
+            "[solana.batch_settlement]\nmin_sponsored_deposit = 5",
+            key_file.path(),
+        ))))
+        .expect("resolve");
+        let (evm, solana) = both(&resolved);
+        assert_eq!(evm.batch_settlement(), None);
+        let batch = solana.batch_settlement().expect("Solana opted in");
+        assert_eq!(batch.min_sponsored_deposit(), 5);
+    }
+
+    /// A refusal inside the sub-table surfaces from `resolve_settlement`
+    /// with its own name, not as a generic parse failure.
+    #[test]
+    fn a_below_floor_batch_settlement_delay_fails_the_settlement_section_by_name() {
+        let key_file = temp_key_file();
+        let result = resolve_settlement(Some(keyed_toml(&keyed_both(
+            "",
+            "[solana.batch_settlement]\nmin_sponsored_deposit = 5\nmin_grace_period_secs = 60",
+            key_file.path(),
+        ))));
+        assert!(matches!(
+            result,
+            Err(ConfigError::BatchSettlementDelayBelowFloor {
+                table: "solana",
+                key: "min_grace_period_secs",
+                value: 60,
+            })
+        ));
+    }
+
     #[test]
     fn cluster_hint_recognises_the_canonical_public_solana_rpc_hosts() {
         assert_eq!(
@@ -1342,6 +1486,7 @@ key_file = "{}"
             token_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
             decimals: 6,
             key: SecretLocation::File(key_file.path().to_path_buf()),
+            batch_settlement: None,
         });
         assert_eq!(
             solana.asset(),
