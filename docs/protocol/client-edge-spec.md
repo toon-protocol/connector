@@ -594,8 +594,10 @@ clearly and immediately; it is not owed a code path, only an unambiguous refusal
 > - **Step 2 (freshness):** a voucher has no nonce. It must strictly exceed the amount watermark
 >   for the same (peer, blockchain, channel) tuple. A byte-identical voucher at the watermark is a
 >   retransmission.
-> - **Step 4 (cryptography):** the signer comes from the chain. On EVM it is `payerAuthorizer`, or
->   else `payer`, from the verified `ChannelConfig`; on Solana it is `authorized_signer`.
+> - **Step 4 (cryptography):** the signer comes from the chain. On EVM it is `payerAuthorizer` from
+>   the verified `ChannelConfig` — x402 would fall back to `payer` when it is zero, but this
+>   connector admits no such channel (ADR 0074 decision 2, amended 2026-09-25); on Solana it is
+>   `authorized_signer`.
 > - **Step 5 (collateral):** the licence to cache a deposit as a permanent lower bound does **not**
 >   extend to an EVM batch-settlement channel, whose `balance − totalClaimed − pendingWithdrawal`
 >   can fall.
@@ -715,6 +717,14 @@ configured (below) — and carries nothing else.
 > first. The self-description publishes the same facts under `batchSettlements` (ND-11); this is a
 > projection of that value, never a second assembly of it
 > (`connector_domain::x402::batch_settlement_accept`).
+>
+> **What `extra` cannot say: this connector requires a `payerAuthorizer`.** x402's EVM scheme lets a
+> client leave `ChannelConfig.payerAuthorizer` zero and sign vouchers with `payer`; this connector
+> admits only a channel whose `payerAuthorizer` is nonzero (ADR 0074 decision 2, amended
+> 2026-09-25), because a zero one hands every voucher check to `payer`, which the contract asks
+> ERC-1271 of as soon as it has code — as an EOA does after an EIP-7702 delegation. x402's `extra`
+> has no field for the requirement, so it is stated here. A channel opened without one is refused on
+> its first voucher as a channel this node does not admit.
 
 **`request`** ([issue #1210](https://github.com/toon-protocol/connector/issues/1210), [ADR
 0067](../adr/0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md)) — a

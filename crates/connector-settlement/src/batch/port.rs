@@ -55,11 +55,12 @@ impl BatchChannelStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VoucherSigner {
     /// An ECDSA address: `payerAuthorizer` when it is nonzero, otherwise
-    /// `payer`. A channel whose `payer` is a contract wallet and whose
-    /// `payerAuthorizer` is zero is never admitted
-    /// ([`AdmissionRefusal::ContractWalletPayerWithoutAuthorizer`]), so this
-    /// is always a key a packet's voucher can be checked against with no
-    /// RPC.
+    /// `payer`. A channel whose `payerAuthorizer` is zero is never admitted
+    /// ([`AdmissionRefusal::NoPayerAuthorizer`]), so on an admitted channel
+    /// this is always `payerAuthorizer`: a key a packet's voucher can be
+    /// checked against with no RPC, and one the contract checks by ECDSA
+    /// for the channel's whole life. (A channel only restored may predate
+    /// that rule, and name `payer`.)
     Evm([u8; 20]),
     /// The channel's `authorized_signer`, an Ed25519 public key.
     Solana([u8; 32]),
@@ -203,10 +204,14 @@ pub enum AdmissionRefusal {
     /// Solana: the channel is not Open. A channel already closing or sealed
     /// can back no new voucher.
     NotOpen,
-    /// EVM: `payerAuthorizer` is zero and `payer` is a contract, so every
-    /// voucher would need an ERC-1271 `eth_call` to verify. The client
-    /// names a `payerAuthorizer` instead (ADR 0074 decision 4).
-    ContractWalletPayerWithoutAuthorizer,
+    /// EVM: `payerAuthorizer` is zero, whatever `payer` is (ADR 0074
+    /// decision 2, amended 2026-09-25). With none the contract checks a
+    /// voucher against `payer` through `SignatureChecker`, which asks
+    /// ERC-1271 of a payer with code -- and an EOA payer can gain code at
+    /// any time by an EIP-7702 delegation, stranding the ECDSA vouchers this
+    /// node already accepted. The client names a `payerAuthorizer` instead
+    /// (decision 6).
+    NoPayerAuthorizer,
 }
 
 impl std::fmt::Display for AdmissionRefusal {
@@ -226,10 +231,7 @@ impl std::fmt::Display for AdmissionRefusal {
                 "its delay of {delay_secs}s is below this node's minimum of {minimum_secs}s"
             ),
             AdmissionRefusal::NotOpen => write!(f, "it is not open"),
-            AdmissionRefusal::ContractWalletPayerWithoutAuthorizer => write!(
-                f,
-                "its payer is a contract wallet and it names no payerAuthorizer"
-            ),
+            AdmissionRefusal::NoPayerAuthorizer => write!(f, "it names no payerAuthorizer"),
         }
     }
 }

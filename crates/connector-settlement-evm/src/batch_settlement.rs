@@ -17,11 +17,13 @@
 //!   but not yet claimed, so it is never anyone else's (decision 5);
 //! - `token` is the token this node settles in;
 //! - `withdrawDelay` is at least this node's published minimum;
-//! - `payerAuthorizer` is nonzero, or `payer` has no code. The contract
-//!   checks a zero-`payerAuthorizer` voucher with OpenZeppelin's
-//!   `SignatureChecker`, which asks ERC-1271 of any `payer` with code
-//!   (an EIP-7702-delegated account included), and a packet must never wait
-//!   on that `eth_call` (decision 4).
+//! - `payerAuthorizer` is nonzero, whatever `payer` is (decision 2, amended
+//!   2026-09-25). The contract checks a zero-`payerAuthorizer` voucher with
+//!   OpenZeppelin's `SignatureChecker`, which asks ERC-1271 of any `payer`
+//!   with code -- and an EOA payer can gain code at any time by an EIP-7702
+//!   delegation, after which the ECDSA vouchers this node accepted no
+//!   longer verify the way they did. Asking the chain whether `payer` has
+//!   code today answers nothing about tomorrow, so it is not asked.
 //!
 //! `payer`, `payerAuthorizer` and `salt` are the client's, and a second
 //! channel from one payer is admitted on its own merits (decision 2's
@@ -64,7 +66,6 @@ use connector_signer::{
     BatchSettlementDomain, X402_BATCH_SETTLEMENT_ADDRESS,
 };
 use ethers::abi::{AbiDecode, AbiEncode};
-use ethers::middleware::Middleware;
 use ethers::types::{Address, Bytes};
 
 use crate::bindings::x402_batch_settlement::{
@@ -303,42 +304,32 @@ impl EvmBatchSettlementBackend {
     }
 
     /// The rules of ADR 0074 decision 2 this node fixes, in the order the
-    /// record lists them; the first broken one is the refusal.
-    async fn judge(
-        &self,
-        config: &EvmChannelConfig,
-    ) -> Result<Option<AdmissionRefusal>, BatchSettlementError> {
+    /// record lists them; the first broken one is the refusal. Pure: every
+    /// rule is a field of the presented config against this node's own
+    /// facts, so judging asks the chain nothing.
+    fn judge(&self, config: &EvmChannelConfig) -> Option<AdmissionRefusal> {
         let own = self.own_address.to_fixed_bytes();
         if config.receiver != own {
-            return Ok(Some(AdmissionRefusal::NotPayableToThisNode {
-                field: "receiver",
-            }));
+            return Some(AdmissionRefusal::NotPayableToThisNode { field: "receiver" });
         }
         if config.receiver_authorizer != own {
-            return Ok(Some(AdmissionRefusal::NotPayableToThisNode {
+            return Some(AdmissionRefusal::NotPayableToThisNode {
                 field: "receiverAuthorizer",
-            }));
+            });
         }
         if config.token != self.token.to_fixed_bytes() {
-            return Ok(Some(AdmissionRefusal::TokenNotSettled));
+            return Some(AdmissionRefusal::TokenNotSettled);
         }
         if config.withdraw_delay < self.min_withdraw_delay_secs {
-            return Ok(Some(AdmissionRefusal::DelayBelowMinimum {
+            return Some(AdmissionRefusal::DelayBelowMinimum {
                 delay_secs: config.withdraw_delay,
                 minimum_secs: self.min_withdraw_delay_secs,
-            }));
+            });
         }
         if config.payer_authorizer == [0u8; 20] {
-            let code = self
-                .client
-                .get_code(Address::from(config.payer), None)
-                .await
-                .map_err(backend_error)?;
-            if !code.is_empty() {
-                return Ok(Some(AdmissionRefusal::ContractWalletPayerWithoutAuthorizer));
-            }
+            return Some(AdmissionRefusal::NoPayerAuthorizer);
         }
-        Ok(None)
+        None
     }
 }
 
@@ -349,7 +340,7 @@ impl BatchSettlementBackend for EvmBatchSettlementBackend {
         presentation: ChannelPresentation,
     ) -> Result<BatchChannelState, BatchSettlementError> {
         let (canonical, config, snapshot) = self.locate(presentation).await?;
-        if let Some(refusal) = self.judge(&config).await? {
+        if let Some(refusal) = self.judge(&config) {
             return Err(BatchSettlementError::NotAdmissible {
                 channel: canonical,
                 refusal,

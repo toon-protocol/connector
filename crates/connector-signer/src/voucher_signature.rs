@@ -31,10 +31,11 @@
 //! The signer is `payerAuthorizer` when it is nonzero, otherwise `payer`
 //! ([`evm_voucher_signer`], X402 `x402BatchSettlement.sol#L530-L538`), read
 //! from a `ChannelConfig` whose id has been recomputed -- never from the
-//! claim. **ECDSA only**: a zero `payerAuthorizer` with a contract-wallet
-//! `payer` would need an ERC-1271 `eth_call` per packet, and ADR 0074
-//! refuses that at admission, which is the backend's job (#1342), not this
-//! module's.
+//! claim. **ECDSA only**: a zero `payerAuthorizer` hands the check to
+//! `payer`, which the contract asks ERC-1271 of whenever it has code -- as
+//! an EOA does after an EIP-7702 delegation -- so ADR 0074 (decision 2,
+//! amended 2026-09-25) refuses any channel naming no `payerAuthorizer` at
+//! admission, which is the backend's job (#1342), not this module's.
 //!
 //! The contract recovers with OpenZeppelin's `ECDSA.recoverCalldata`, which
 //! refuses a high-`s` signature and any `v` other than 27 or 28. This

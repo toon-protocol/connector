@@ -241,13 +241,19 @@ async fn evm_batch_settlement_backend_upholds_the_contract() {
     .await;
 }
 
-/// ADR 0074 decision 4: with no `payerAuthorizer` the contract checks a
-/// voucher against `payer` through `SignatureChecker`, which asks ERC-1271
-/// of any payer with code. An EOA payer is admitted and its own voucher
-/// lands; a payer with code -- a contract wallet, or an EIP-7702-delegated
-/// account -- is refused unless it names a `payerAuthorizer`.
+/// ADR 0074 decision 2, as amended on 2026-09-25: a channel must name a
+/// nonzero `payerAuthorizer`, whatever its payer is. With none, the contract
+/// checks a voucher against `payer` through `SignatureChecker`, which asks
+/// ERC-1271 of any payer with code -- and an EOA payer can gain code later,
+/// by an EIP-7702 delegation, turning every ECDSA voucher this node already
+/// accepted into one the contract no longer checks by ECDSA. So an EOA payer
+/// with no `payerAuthorizer` is refused as surely as a contract wallet is,
+/// and a payer with code that names one is admitted.
+///
+/// A channel already held is another matter (ADR 0074 decision 5): one
+/// accepted before the rule is restored for landing, never re-judged.
 #[tokio::test]
-async fn a_payer_with_code_must_name_a_payer_authorizer() {
+async fn a_channel_must_name_a_payer_authorizer() {
     if !require_anvil() {
         return;
     }
@@ -257,10 +263,18 @@ async fn a_payer_with_code_must_name_a_payer_authorizer() {
         ..chain.config()
     };
 
-    // An EOA payer signs for itself.
+    // An EOA payer that would sign for itself is refused by the rule's name.
     let eoa = chain.open(unauthorised(&chain), 1_000).await;
     let channel = eoa.channel().clone();
-    let state = chain.backend.admit(eoa).await.expect("an EOA payer");
+    assert_eq!(
+        refusal(chain.backend.admit(eoa.clone()).await),
+        AdmissionRefusal::NoPayerAuthorizer,
+        "an EOA payer with no payerAuthorizer"
+    );
+
+    // Held from before the rule, it is restored all the same, and the
+    // payer's own voucher still lands.
+    let state = chain.backend.restore(eoa).await.expect("restored");
     assert_eq!(
         state.voucher_signer,
         VoucherSigner::Evm(chain.payer.address().into())
@@ -269,12 +283,13 @@ async fn a_payer_with_code_must_name_a_payer_authorizer() {
         .backend
         .land(&channel, chain.voucher(&chain.payer, &channel, 250))
         .await
-        .expect("the payer's own voucher lands");
+        .expect("a held voucher lands on a restored channel");
     assert_eq!(state.landed, 250);
 
-    // The same payer, now with code: an EIP-7702 delegation designator, then
-    // an ordinary contract. Its channels are opened while it is still an
-    // EOA -- a FiatToken would ask a payer with code for ERC-1271 on the
+    // A payer with code -- an EIP-7702 delegation designator, then an
+    // ordinary contract -- is refused without a payerAuthorizer and
+    // admitted with one. Its channels are opened while it is still an EOA
+    // -- a FiatToken would ask a payer with code for ERC-1271 on the
     // deposit too -- and it gains the code before this node looks.
     for code in [
         format!("0xef0100{}", "11".repeat(20)),
@@ -286,7 +301,7 @@ async fn a_payer_with_code_must_name_a_payer_authorizer() {
         chain.x402.set_code(chain.payer.address(), &code).await;
         assert_eq!(
             refusal(chain.backend.admit(wallet).await),
-            AdmissionRefusal::ContractWalletPayerWithoutAuthorizer,
+            AdmissionRefusal::NoPayerAuthorizer,
             "a payer with code {code} and no payerAuthorizer"
         );
 

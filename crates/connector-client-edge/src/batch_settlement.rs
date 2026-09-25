@@ -32,8 +32,7 @@
 //! Only channels it would **admit** (ADR 0074 decisions 2 and 5): on EVM,
 //! `receiver` and `receiverAuthorizer` both this connector's settlement
 //! address, a token it settles in, a `withdrawDelay` at or above its
-//! published minimum, and no zero `payerAuthorizer` over a contract-wallet
-//! `payer`; on Solana, a channel account whose PDA re-derives from its own
+//! published minimum, and a nonzero `payerAuthorizer`; on Solana, a channel account whose PDA re-derives from its own
 //! seeds, Open, with `payee` and `rent_payer` this connector's sponsor key,
 //! a mint it settles in, a one-recipient `distribution_hash` and a
 //! `grace_period` at or above its minimum. Anything else is `Ok(None)`,
