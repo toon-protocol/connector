@@ -6696,6 +6696,9 @@ key_file = "{solana_key_path}"
             }
 
             let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+            // x402's contracts at their canonical addresses: the EVM batch backend
+            // refuses to bind unless x402BatchSettlement answers there.
+            connector_settlement_evm::test_support::x402::X402Chain::place(&anvil.rpc_url).await;
             let token = EvmSettlementBackend::deploy_mock_token(
                 &anvil.rpc_url,
                 DEPLOYER_PRIVATE_KEY,
