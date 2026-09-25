@@ -1404,6 +1404,7 @@ dependencies = [
  "connector-chain-rpc",
  "connector-settlement",
  "connector-settlement-solana",
+ "connector-signer",
  "serde_json",
  "solana-rpc-client",
  "solana-rpc-client-api",

@@ -402,7 +402,9 @@ local gate on a different one is not the gate.
 chain-backed test forks a **disposable** node of its own on its own port and tears it down on drop
 — `connector_settlement_evm::test_support::Anvil::spawn` for `anvil`, and
 `connector_settlement_solana::test_support::SolanaValidator::spawn` for `solana-test-validator`,
-which also loads `payment_channel.so` into genesis at a fixed program id. Nothing under `crates/`
+which also loads `payment_channel.so` into genesis at a fixed program id, and the committed
+`payment-channels` binary (`crates/connector-settlement-solana/fixtures/`, ADR 0074) at its
+canonical one. Nothing under `crates/`
 dials `localhost:8545` or `localhost:8899`, so running `make anvil-up` or `make solana-up` before
 `cargo test` changes nothing. The Docker chain profiles exist for running a node by hand, and for
 `local/` — not for the test gate.
