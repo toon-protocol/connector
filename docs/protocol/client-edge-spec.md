@@ -586,7 +586,7 @@ part of this connector's claim shape and are not documented here. A Mina client'
 clearly and immediately; it is not owed a code path, only an unambiguous refusal.
 
 > **Amended by [ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
-> (accepted 2026-09-25, not yet built: #1340–#1347).** A claim may also carry the scheme
+> (accepted 2026-09-25, built under epic #1349: #1340–#1347).** A claim may also carry the scheme
 > `batch-settlement`, whose claims are x402 **vouchers** on x402's own channel contracts: EVM
 > `x402BatchSettlement`, and Solana payment-channels. Three steps above read differently for a
 > voucher:
