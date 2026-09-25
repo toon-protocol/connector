@@ -83,7 +83,8 @@
 //! equivalent standing by here: the committed leg names public Solana
 //! devnet (`https://api.devnet.solana.com`) and a program deployed on that
 //! cluster, and `SolanaSettlementBackend::connect` does not merely read --
-//! it fetches the program and mint accounts AND submits a transaction
+//! it fetches the program and mint accounts, refuses a payer with no
+//! lamports, and on a key's first start submits a transaction
 //! (`ensure_own_ata_exists`), so booting it would make this test suite
 //! depend on public-internet reachability, on a third party's rate limits,
 //! and on a FUNDED devnet account whose key this sandbox cannot have. A

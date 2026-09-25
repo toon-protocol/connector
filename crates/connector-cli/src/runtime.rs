@@ -747,7 +747,9 @@ async fn build_solana_settlement_backend(
     let program_id = parse_solana_pubkey("program_id", settlement.program_id())?;
     let token_mint = parse_solana_pubkey("token_address", settlement.token_address())?;
     let backend = SolanaSettlementBackend::connect(
-        settlement.rpc_url(),
+        &connector_settlement_solana::RpcTransport::direct(settlement.rpc_url()).map_err(
+            |error| RuntimeError::Settlement(SettlementError::Backend(error.to_string())),
+        )?,
         &payer_seed,
         program_id,
         token_mint,
@@ -6543,7 +6545,8 @@ key_file = "{key_path}"
             assert_ne!(junk_mint, configured_mint);
             drop(other);
             let node_backend = SolanaSettlementBackend::connect(
-                &validator.rpc_url,
+                &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
+                    .expect("rpc transport"),
                 &opener.test_payer_seed(),
                 program_id,
                 configured_mint,
@@ -6589,7 +6592,8 @@ key_file = "{key_path}"
             // Control: the byte-identical claim is accepted through a
             // backend configured with the channel's own mint.
             let matching_backend = SolanaSettlementBackend::connect(
-                &validator.rpc_url,
+                &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
+                    .expect("rpc transport"),
                 &opener.test_payer_seed(),
                 program_id,
                 junk_mint,
@@ -6857,7 +6861,8 @@ key_file = "{key_path}"
                 .expect("open a channel with no deposit at all");
 
             let node_backend = SolanaSettlementBackend::connect(
-                &validator.rpc_url,
+                &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
+                    .expect("rpc transport"),
                 &opener.test_payer_seed(),
                 program_id,
                 token_mint,
@@ -6957,7 +6962,8 @@ key_file = "{key_path}"
                 .expect("a real on-chain deposit, so the claim below is genuinely collateralized");
 
             let node_backend = SolanaSettlementBackend::connect(
-                &validator.rpc_url,
+                &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
+                    .expect("rpc transport"),
                 &opener.test_payer_seed(),
                 program_id,
                 token_mint,
