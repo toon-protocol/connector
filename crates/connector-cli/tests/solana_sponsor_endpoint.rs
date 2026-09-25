@@ -40,7 +40,7 @@ use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::VersionedTransaction;
 use tower::ServiceExt;
 
-use support::{paid_prepare, post_ilp, spawn_recording_app};
+use support::{paid_prepare, post_ilp, solana_voucher, spawn_recording_app};
 
 const SPONSOR_PATH: &str = "/ilp/batch-settlement/solana/open";
 const ROUTE: &str = "g.toon.sponsored";
@@ -136,22 +136,6 @@ async fn prefund_channel_rent(rpc: &RpcClient, funder: &Keypair, channel: &Pubke
     )
     .await
     .expect("prefund the channel's rent");
-}
-
-fn solana_voucher(channel: &Pubkey, amount: u64, signature: &[u8; 64]) -> String {
-    serde_json::json!({
-        "version": "1.0",
-        "blockchain": "solana",
-        "scheme": "batch-settlement",
-        "messageId": format!("voucher-{amount}"),
-        "timestamp": "2026-09-25T12:00:00Z",
-        "senderId": "x402-client",
-        "channelId": channel.to_string(),
-        "maxClaimableAmount": amount.to_string(),
-        "expiresAt": 0,
-        "signature": bs58::encode(signature).into_string(),
-    })
-    .to_string()
 }
 
 #[tokio::test]
@@ -400,7 +384,7 @@ price = {PRICE}
     let receiver = runtime.signer.public_key().expect("the node's wrap key");
     let response = post_ilp(
         &app,
-        &solana_voucher(&channel, PRICE, &payer.sign(&channel, PRICE)),
+        &solana_voucher(&channel.to_string(), PRICE, &payer.sign(&channel, PRICE)),
         paid_prepare(ROUTE, &receiver),
     )
     .await;
