@@ -600,8 +600,8 @@ clearly and immediately; it is not owed a code path, only an unambiguous refusal
 >   extend to an EVM batch-settlement channel, whose `balance − totalClaimed − pendingWithdrawal`
 >   can fall.
 >
-> A `toon-channel` claim is unchanged. The voucher's own vectors (#1347) will be normative once
-> they land (ADR 0021).
+> A `toon-channel` claim is unchanged. The voucher's own vectors landed with #1347, as
+> `claim_voucher` in `vectors/wire-vectors.json` (`schema_version` 6) -- normative per ADR 0021.
 
 ### 1.4 Answering an unpaid request: x402 v2 terms
 
