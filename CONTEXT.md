@@ -270,6 +270,17 @@ _Avoid_: hidden service, onion transport, third transport, Anyone transport, `.a
 and note that **transport** is already taken: a route's `transport` is the _client_ transport it
 accepts.
 
+**Settlement circuit**:
+The circuit a settlement table's RPC rides when that table sets `rpc_via_socks_proxy = true`: the
+node's one `socks_proxy`, authenticated with a SOCKS username fixed per chain
+(`toon-settlement-evm`, `toon-settlement-solana`), so each chain stays on its own circuit and off the
+ILP wire's. Every client of the table's `rpc_url` rides it (the backend, and on EVM the
+channel-index syncer and the rate source), and none ever falls back to a direct dial. It hides the
+node's address from the RPC provider; it does not hide the node's keys, its transactions or its
+payments, which are on chain either way
+([ADR 0073](docs/adr/0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md)).
+_Avoid_: settlement transport, proxied settlement, hidden settlement.
+
 **Interaction**:
 The unit a role attaches to: one BTP session, from its websocket upgrade to its close, or one
 HTTP request.

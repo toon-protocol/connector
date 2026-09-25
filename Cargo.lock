@@ -1045,6 +1045,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "connector-btp",
+ "connector-chain-rpc",
  "connector-cli",
  "connector-config",
  "connector-domain",
@@ -1075,6 +1076,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

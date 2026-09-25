@@ -400,16 +400,23 @@ impl SolanaSettlementBackend {
             6,
         )
         .map_err(backend_error)?;
-        let recent_blockhash = rpc.get_latest_blockhash().await.map_err(backend_error)?;
+        let (recent_blockhash, last_valid_block_height) = rpc
+            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+            .await
+            .map_err(backend_error)?;
         let transaction = Transaction::new_signed_with_payer(
             &[create_mint_account, initialize_mint],
             Some(&payer.pubkey()),
             &[&payer, &mint],
             recent_blockhash,
         );
-        rpc.send_and_confirm_transaction(&transaction)
-            .await
-            .map_err(backend_error)?;
+        send_and_confirm(
+            &rpc,
+            &transaction,
+            last_valid_block_height,
+            ConfirmPolicy::for_transport(&transport),
+        )
+        .await?;
 
         let backend = Self {
             rpc,
