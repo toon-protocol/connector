@@ -145,7 +145,7 @@ outside this repository.
 | [0049](0049-the-cap-bounds-one-packet-is-discovered-by-t04-and-is-set-from-outside.md) | The cap bounds one packet, is discovered by its `T04`, and is set from outside       | Accepted — **built** (#1160, the runtime cap); corrects CONTEXT.md                                      |
 | [0035](0035-request-request-binding-ships-no-new-mechanism.md)                         | Request-request binding ships no new mechanism                                       | Accepted                                                                                                |
 | [0052](0052-permissionless-payment-is-guaranteed-and-a-claim-is-what-authorises.md)    | Permissionless payment is guaranteed; a claim, never an identity, authorises         | Accepted — the client edge's first record                                                               |
-| [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)                 | A client may pay over an x402 batch-settlement channel, and only a client            | Accepted — **not yet built** (#1340–#1347); amends 0059, 0005; extends 0024, 0053; `schema_version` 6   |
+| [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)                 | A client may pay over an x402 batch-settlement channel, and only a client            | Accepted — **being built** (#1349); amends 0059, 0005; extends 0024, 0053; `schema_version` 6           |
 
 ### The wire and its carriage
 
