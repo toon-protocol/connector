@@ -87,4 +87,4 @@ pub use self_description::{
     UnreachableSelfDescription, FETCH_TIMEOUT, MAX_DOCUMENT_BYTES,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use socks5_test_server::Socks5TestServer;
+pub use socks5_test_server::{Socks5TestServer, SocksConnect};
