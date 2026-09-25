@@ -2,7 +2,7 @@
 
 **Status:** Accepted (owner decision, 2026-09-25, issue #1329) — **being built** under epic #1349; the implementation is tickets #1340–#1347. All three prerequisites were settled before acceptance, the last by a live Base Sepolia deposit on 2026-09-25, and the choices this record makes beyond #1329's seven were accepted with it. It **amends** [0059](0059-a-channel-is-derived-from-its-participants.md) (a client-edge exception to one-live-channel-per-pair), [0005](0005-claims-are-truth-balances-are-a-projection.md) (a second freshness rule for the journal to hold), `client-edge-spec.md` §1.3 (its freshness step, and step 5's rule that a cached deposit is a lower bound, which is false for a channel a payer can withdraw from) and `CONTEXT.md`'s **Claim**, **Nonce** and **Watermark**, plus a new **Voucher** entry (all applied). It **extends** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) with a second claim scheme per chain, and it disturbs [0021](0021-vectors-are-normative-prose-is-not.md): `schema_version` goes to **6** when #1347 lands. It leaves [0022](0022-a-connector-answers-it-does-not-announce.md)'s deferral of paying over HTTP exactly where it is.
 
-**Amended 2026-09-25 (#1349 review):** EVM admission now requires a nonzero `payerAuthorizer` whatever the payer is, where it had refused only a contract-wallet payer without one (decisions 2 and 4, and the last of the choices beyond #1329's seven). An EOA can gain code later by an EIP-7702 delegation, after which the contract checks a voucher by ERC-1271 rather than ECDSA and the vouchers already accepted no longer verify the way they did. Decision 3 also records the journal's second amendment to 0005 (the `BatchChannelAdmitted` entry, which holds an EVM channel's `ChannelConfig` so held vouchers stay claimable after a restart), and its retransmission rule now says what the code always did: a byte-identical voucher buys nothing, so against a nonzero charge it is refused as an underpayment, and the vectors pin that case too.
+**Amended 2026-09-25 (#1349 review):** EVM admission now requires a nonzero `payerAuthorizer` whatever the payer is, where it had refused only a contract-wallet payer without one (decisions 2 and 4, and the last of the choices beyond #1329's seven). An EOA can gain code later by an EIP-7702 delegation, after which the contract checks a voucher by ERC-1271 rather than ECDSA and the vouchers already accepted no longer verify the way they did. Decision 3 also records the journal's second amendment to 0005 (the `BatchChannelAdmitted` entry, which holds an EVM channel's `ChannelConfig` so held vouchers stay claimable after a restart), decision 8 records the greeting's wire names (the EVM asset's EIP-712 `name`/`version`, Solana's `withdrawDelay` for the minimum `grace_period`, and the new `minDeposit`), and decision 3's retransmission rule now says what the code always did: a byte-identical voucher buys nothing, so against a nonzero charge it is refused as an underpayment, and the vectors pin that case too.
 
 **Scope:** protocol law. It binds every implementation, because it adds a claim scheme to the wire and an offer to the greeting. The watchers and sweeps in decision 5 and the port shape in decision 9 are connector architecture. See the [ADR index](README.md).
 
@@ -320,10 +320,19 @@ connector has opted in to. Unlike today's entry, that entry is **x402-valid**:
 - `payTo` is the receiver: the EVM settlement address, or on Solana the owner of the receiving
   account.
 
-Its `extra` carries what a client needs to open a channel this connector will admit:
+Its `extra` carries what a client needs to open a channel this connector will admit. The wire
+names, recorded 2026-09-25, are x402's own wherever x402 has one:
 
-- **EVM:** `receiverAuthorizer` and the minimum `withdrawDelay`.
-- **Solana:** `feePayer`, which is the sponsor key, and the minimum `grace_period`.
+- **EVM:** `receiverAuthorizer`, the minimum `withdrawDelay`, and `name` and `version`: the
+  EIP-712 domain of the deposit's **asset**, which a client signs its ERC-3009 or Permit2
+  authorization under. x402's EVM scheme requires both, and an ERC-20 need not expose either, so
+  the connector does not read them off the chain: they come from the required config keys
+  `asset_eip712_name` and `asset_eip712_version`.
+- **Solana:** `feePayer`, which is the sponsor key; `withdrawDelay`, which carries the minimum
+  `grace_period` under x402's SVM field name (x402 calls the program's `grace_period`
+  `withdrawDelay` on both chains, and a stock client reads that name); and `minDeposit`, the
+  published minimum deposit decision 5 has the sponsor refuse below, as a decimal string of the
+  mint's base units. `minDeposit` is this connector's own addition: x402 has no field for it.
 
 The self-description publishes the same facts. Vouchers still travel inside ILP. Only the one-time
 deposit or open leaves the packet path, which is why [0022](0022-a-connector-answers-it-does-not-announce.md)'s

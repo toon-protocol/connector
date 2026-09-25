@@ -704,20 +704,26 @@ configured (below) — and carries nothing else.
 > has opted into accepting a batch-settlement channel on (`[settlement.<chain>.batch_settlement]`) --
 > unlike a hypothetical `exact` entry, this one names a real scheme this connector's settlement
 > backends actually redeem, x402's own audited contracts, with no TOON contract involved. Its
-> top-level `network`/`asset`/`payTo` and its `extra` are exactly what x402's `batch-settlement`
+> top-level `network`/`asset`/`payTo` and its `extra` carry everything x402's `batch-settlement`
 > scheme spec requires, so a stock client can build a deposit from the greeting alone: `network` is
 > CAIP-2 (`eip155:<chainId>` or `solana:<genesis-hash-prefix>`), `asset` is the token address or
 > mint, and `payTo` is this node's own settlement address (Solana: the owner of its receiving
-> account). `extra` carries `receiverAuthorizer` and the minimum `withdrawDelay`, plus the asset's
-> EIP-712 `name`/`version`, on EVM; `feePayer` (the sponsor key), the minimum `withdrawDelay`
-> (the program's own `grace_period`) and `minDeposit` on Solana. `minDeposit` is this connector's
-> own addition to x402's SVM `extra`: the smallest opening deposit, in the mint's base units and as a
-> decimal string like every amount here, that the sponsor endpoint (§1.11) co-signs an `open` for —
-> the **published** minimum ADR 0074 decision 5 has the sponsor refuse below
-> (`[settlement.solana.batch_settlement] min_sponsored_deposit`). The `toon-channel` entry is unchanged and stays
-> first. The self-description publishes the same facts under `batchSettlements` (ND-11); this is a
-> projection of that value, never a second assembly of it
-> (`connector_domain::x402::batch_settlement_accept`).
+> account). `extra`'s wire names are recorded by ADR 0074 decision 8:
+>
+> - **EVM:** `receiverAuthorizer`, the minimum `withdrawDelay`, and `name`/`version` — the EIP-712
+>   domain of the **asset**, which a client signs its deposit's ERC-3009 or Permit2 authorization
+>   under. x402 requires both and an ERC-20 need not expose either, so they are not read off the
+>   chain: they are the required config keys `asset_eip712_name`/`asset_eip712_version`.
+> - **Solana:** `feePayer` (the sponsor key); `withdrawDelay`, x402's SVM field name, carrying the
+>   minimum `grace_period` (`[settlement.solana.batch_settlement] min_grace_period_secs`); and
+>   `minDeposit`, this connector's own addition to x402's SVM `extra`: the smallest opening deposit,
+>   in the mint's base units and as a decimal string like every amount here, that the sponsor
+>   endpoint (§1.11) co-signs an `open` for — the **published** minimum ADR 0074 decision 5 has the
+>   sponsor refuse below (`min_sponsored_deposit`).
+>
+> The `toon-channel` entry is unchanged and stays first. The self-description publishes the same
+> facts under `batchSettlements` (ND-11); this is a projection of that value, never a second
+> assembly of it (`connector_domain::x402::batch_settlement_accept`).
 >
 > **What `extra` cannot say: this connector requires a `payerAuthorizer`.** x402's EVM scheme lets a
 > client leave `ChannelConfig.payerAuthorizer` zero and sign vouchers with `payer`; this connector
