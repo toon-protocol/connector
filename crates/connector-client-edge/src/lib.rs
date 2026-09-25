@@ -84,6 +84,7 @@ use connector_runtime::{ClientRouteFacts, ClientRouteKind, Connector, ProbeDenie
 use connector_signer::nip59::{unwrap_claim, WrappedClaim};
 use connector_signer::{PublicKeyBytes, Signer};
 
+mod batch_settlement;
 mod btp;
 mod channels;
 mod claim_gate;
@@ -93,6 +94,9 @@ mod outbound_ledger;
 mod peer;
 mod session_registry;
 mod session_route;
+pub use batch_settlement::{
+    AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
+};
 pub use channels::{
     ChannelLivenessPolicy, ChannelLookupFailed, ChannelResolutionError, ClientChannelRegistry,
     ClientChannelSource, DepositFloor, EvmChannel, InvalidChannelIdentifier, SolanaChannel,

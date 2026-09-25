@@ -48,7 +48,7 @@ use connector_btp::{
     BTP_ERROR, BTP_MESSAGE, BTP_RESPONSE, BTP_TRANSFER, CLAIM_PROTOCOL, CONTENT_TYPE_TEXT,
     PAYMENT_REQUIRED_PROTOCOL, PAYOUT_CLAIM_PROTOCOL,
 };
-use connector_domain::client_claim::{ClientClaim, EVM_NAMESPACE};
+use connector_domain::client_claim::{ClaimScheme, ClientClaim, EVM_NAMESPACE};
 use connector_domain::{PacketResponse, Prepare, Price, Reject, RejectCode};
 use connector_signer::{verify_evm_claim_state_challenge, EvmClaimStateChallenge};
 
@@ -249,7 +249,8 @@ async fn window_slot(window: &Arc<Semaphore>) -> OwnedSemaphorePermit {
 /// for (issue #787): the missing join between a session bound under its
 /// ILP address and a payout ledger keyed by channel id. EVM only, matching
 /// [`crate::outbound_ledger::ClientPayoutLedger`]'s own reach -- there is
-/// no Solana payout to resolve towards yet.
+/// no Solana payout to resolve towards yet -- and `toon-channel` only: a
+/// voucher's channel is never paid out on (ADR 0074 decision 1).
 fn record_accepted_claim(
     state: &ClientEdgeState,
     claim: &ClientClaim,
@@ -261,6 +262,11 @@ fn record_accepted_claim(
         .claim_gate
         .note_claim_time(&channel_key, crate::now_unix());
 
+    // A voucher never does (ADR 0074 decision 1): an x402 client is
+    // payer-only, and nothing is ever paid out on a batch-settlement channel.
+    if claim.scheme() != ClaimScheme::ToonChannel {
+        return;
+    }
     if let (Some(address), Some((EVM_NAMESPACE, channel_id))) =
         (session_address, channel_key.split_once(':'))
     {
@@ -1109,6 +1115,56 @@ mod tests {
             .await
             .expect("the session's channel was just taught by the claim above");
         assert_eq!(payout.channel_id, channel_id);
+    }
+
+    /// ADR 0074 decision 1: an x402 client is payer-only, and
+    /// `ClientPayoutLedger` credits nothing to a batch-settlement channel.
+    /// So a voucher -- however verified -- never teaches a session which
+    /// channel to be paid on, even where the ledger could sign for that id.
+    #[tokio::test]
+    async fn an_accepted_voucher_never_teaches_a_payout_association() {
+        use crate::claim_gate::ClientClaimGate;
+        use crate::outbound_ledger::ClientPayoutLedger;
+        use connector_domain::client_claim::{ClientClaimCommon, EvmVoucher};
+        use connector_runtime::{ChannelDomain, InMemoryJournal};
+        use connector_signer::LocalSigner;
+
+        let channel_id = format!("0x{:064x}", 5);
+        let mut ledger = ClientPayoutLedger::new();
+        ledger.set_signer(Arc::new(LocalSigner::generate("payout-key")));
+        ledger
+            .set_channel_domain(
+                channel_id.clone(),
+                ChannelDomain {
+                    chain_id: 84_532,
+                    token_network_address: [0x77; 20],
+                },
+            )
+            .expect("valid channel id");
+        let gate = ClientClaimGate::restore(Default::default(), Arc::new(InMemoryJournal::new()))
+            .expect("a fresh in-memory journal has nothing to replay")
+            .with_payout_ledger(Arc::new(ledger));
+        let state = test_state(gate);
+
+        let voucher = ClientClaim::EvmVoucher(EvmVoucher {
+            common: ClientClaimCommon {
+                message_id: "m1".to_string(),
+                timestamp: "2030-01-01T00:00:00Z".to_string(),
+                sender_id: "sender".to_string(),
+            },
+            channel_id: channel_id.clone(),
+            max_claimable_amount: 500,
+            signature: format!("0x{}", "11".repeat(65)),
+            channel_config: None,
+        });
+
+        record_accepted_claim(&state, &voucher, Some("g.toon.x402"));
+
+        assert!(state
+            .claim_gate
+            .credit_session_payout("g.toon.x402", &[9u8; 32], 500, chrono::Utc::now())
+            .await
+            .is_none());
     }
 
     /// A signed `ClaimStateChallenge` over `channel_id`/`expires`, matching

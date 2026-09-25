@@ -22,6 +22,12 @@
 //! right reason rather than accidentally accepted or misreported as
 //! malformed.
 //!
+//! Since ADR 0074 (issue #1341) a claim also carries a `scheme`
+//! discriminator: absent (or `toon-channel`) is the claim above, unchanged;
+//! `batch-settlement` is an x402 **voucher** ([`EvmVoucher`],
+//! [`SolanaVoucher`]), whose field names follow x402's own voucher payloads.
+//! Those names are provisional until the vectors pin them (#1347, ADR 0021).
+//!
 //! Cryptographic verification (EIP-712 recovery, Ed25519) and value binding
 //! against a route's price are deliberately not this module's concern --
 //! issues #506 and #507 -- so a [`ClientClaim`] carries its signature and
@@ -71,16 +77,115 @@ pub struct SolanaClientClaim {
     pub cluster: Option<String>,
 }
 
+/// The `scheme` discriminator's value for a `toon-channel` claim -- the
+/// scheme a claim that carries no `scheme` field at all is (ADR 0074
+/// decision 4).
+pub const SCHEME_TOON_CHANNEL: &str = "toon-channel";
+
+/// The `scheme` discriminator's value for an x402 `batch-settlement`
+/// voucher (ADR 0074 decision 4).
+pub const SCHEME_BATCH_SETTLEMENT: &str = "batch-settlement";
+
+/// Which claim scheme a claim is under (ADR 0074 decision 4, `CONTEXT.md`
+/// **Claim**). A `toon-channel` claim is ordered by its nonce; a
+/// `batch-settlement` claim is a **voucher**, has no nonce, and is ordered
+/// by its amount alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimScheme {
+    ToonChannel,
+    BatchSettlement,
+}
+
+impl ClaimScheme {
+    /// The discriminator's wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClaimScheme::ToonChannel => SCHEME_TOON_CHANNEL,
+            ClaimScheme::BatchSettlement => SCHEME_BATCH_SETTLEMENT,
+        }
+    }
+}
+
+/// The `ChannelConfig` an EVM voucher's first presentation carries (ADR
+/// 0074 decision 2): the seven immutable fields x402's `getChannelId`
+/// hashes, as they arrived on the wire -- each validated for shape here and
+/// decoded by the caller, which recomputes the channel id from them and
+/// refuses a mismatch. The config is not readable from the chain (the
+/// contract stores channels by id), so a connector learns it only from the
+/// client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvmVoucherChannelConfig {
+    pub payer: String,
+    pub payer_authorizer: String,
+    pub receiver: String,
+    pub receiver_authorizer: String,
+    pub token: String,
+    /// A Solidity `uint40`, in seconds.
+    pub withdraw_delay: u64,
+    pub salt: String,
+}
+
+/// An EVM **voucher**: a claim under x402's `batch-settlement` scheme on
+/// `x402BatchSettlement` (ADR 0074 decision 4). Field names follow x402's
+/// own voucher payload (`channelId`, `maxClaimableAmount`, `signature`,
+/// `channelConfig`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvmVoucher {
+    pub common: ClientClaimCommon,
+    /// The channel the voucher signs, `0x` + 64 hex. Named by the voucher
+    /// and verified on chain, never derived (ADR 0074 decision 2).
+    pub channel_id: String,
+    /// The cumulative amount the voucher authorises. `uint128` on the wire;
+    /// a value this connector's `u64` amounts cannot hold is refused
+    /// ([`ClientClaimError::AmountOutOfRange`]), never truncated.
+    pub max_claimable_amount: u64,
+    /// `r ‖ s ‖ v`, `0x` + 130 hex.
+    pub signature: String,
+    /// Present on a channel's first voucher, and optional after.
+    pub channel_config: Option<EvmVoucherChannelConfig>,
+}
+
+/// A Solana **voucher**: a claim under x402's `batch-settlement` scheme on
+/// payment-channels (ADR 0074 decision 4). Field names follow x402's SVM
+/// `BatchVoucher` (`channelId`, `maxClaimableAmount`, `expiresAt`,
+/// `signature`), whose signature is base58 there and so here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SolanaVoucher {
+    pub common: ClientClaimCommon,
+    /// The channel account, base58. Canonical as it arrives, like a
+    /// `toon-channel` claim's `channelAccount`.
+    pub channel_id: String,
+    pub max_claimable_amount: u64,
+    /// Ed25519, base58 of 64 bytes.
+    pub signature: String,
+}
+
 /// A structurally valid, non-Mina client-edge claim (client-edge-spec.md
 /// §1.3). Discriminated on chain the same way the wire's `blockchain` field
-/// does.
+/// does, and -- since ADR 0074 -- on scheme the way its `scheme` field does:
+/// [`ClientClaim::Evm`]/[`ClientClaim::Solana`] are `toon-channel` claims,
+/// [`ClientClaim::EvmVoucher`]/[`ClientClaim::SolanaVoucher`] are vouchers.
+/// A voucher is client edge only: a peer carriage refuses one
+/// (`connector_peer_btp::claim_json::parse`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientClaim {
     Evm(EvmClientClaim),
     Solana(SolanaClientClaim),
+    EvmVoucher(EvmVoucher),
+    SolanaVoucher(SolanaVoucher),
 }
 
 impl ClientClaim {
+    /// The scheme this claim is under.
+    pub fn scheme(&self) -> ClaimScheme {
+        match self {
+            ClientClaim::Evm(_) | ClientClaim::Solana(_) => ClaimScheme::ToonChannel,
+            ClientClaim::EvmVoucher(_) | ClientClaim::SolanaVoucher(_) => {
+                ClaimScheme::BatchSettlement
+            }
+        }
+    }
+
     /// The channel this claim's freshness/watermark is judged against,
     /// namespaced by chain so an EVM `channelId` and a Solana
     /// `channelAccount` can never collide even in the (practically
@@ -88,6 +193,10 @@ impl ClientClaim {
     /// **canonical** within that namespace (issue #643) -- see
     /// [`canonical_channel_key`] for why the second is a security property
     /// rather than tidiness.
+    ///
+    /// A voucher's key is §1.3's same (blockchain, channel) tuple in the same
+    /// canonical form (ADR 0074 decision 3): only the watermark's
+    /// *comparison* differs by scheme, never its key.
     pub fn channel_key(&self) -> String {
         match self {
             ClientClaim::Evm(claim) => {
@@ -96,20 +205,38 @@ impl ClientClaim {
             ClientClaim::Solana(claim) => {
                 format!("{SOLANA_NAMESPACE}:{}", claim.channel_account)
             }
+            ClientClaim::EvmVoucher(voucher) => {
+                format!("{EVM_NAMESPACE}:{}", canonical_evm_id(&voucher.channel_id))
+            }
+            ClientClaim::SolanaVoucher(voucher) => {
+                format!("{SOLANA_NAMESPACE}:{}", voucher.channel_id)
+            }
         }
     }
 
+    /// The claim's nonce -- for a voucher, which has none,
+    /// [`crate::VOUCHER_WATERMARK_NONCE`], the value its watermark is
+    /// journaled under. A voucher is never judged by this: its freshness is
+    /// [`crate::validate_voucher`], and [`crate::validate_claim`] is for
+    /// `toon-channel` claims alone.
     pub fn nonce(&self) -> u64 {
         match self {
             ClientClaim::Evm(claim) => claim.nonce,
             ClientClaim::Solana(claim) => claim.nonce,
+            ClientClaim::EvmVoucher(_) | ClientClaim::SolanaVoucher(_) => {
+                crate::VOUCHER_WATERMARK_NONCE
+            }
         }
     }
 
+    /// The claim's cumulative amount: `transferredAmount`, or a voucher's
+    /// `maxClaimableAmount`.
     pub fn transferred_amount(&self) -> u64 {
         match self {
             ClientClaim::Evm(claim) => claim.transferred_amount,
             ClientClaim::Solana(claim) => claim.transferred_amount,
+            ClientClaim::EvmVoucher(voucher) => voucher.max_claimable_amount,
+            ClientClaim::SolanaVoucher(voucher) => voucher.max_claimable_amount,
         }
     }
 
@@ -117,6 +244,8 @@ impl ClientClaim {
         match self {
             ClientClaim::Evm(claim) => &claim.common,
             ClientClaim::Solana(claim) => &claim.common,
+            ClientClaim::EvmVoucher(voucher) => &voucher.common,
+            ClientClaim::SolanaVoucher(voucher) => &voucher.common,
         }
     }
 
@@ -140,6 +269,10 @@ impl ClientClaim {
     /// allowance per recasing of their own address. Solana's base58 is
     /// case-*sensitive* and a 32-byte key has one spelling, so it is left
     /// alone for the same reason the Solana channel namespace is.
+    ///
+    /// A voucher declares no signer at all -- its signer is read from the
+    /// chain (ADR 0074 decision 4) -- so its label is its `senderId`, which
+    /// is exactly as self-declared and exactly as authority-free.
     pub fn signer_key(&self) -> String {
         match self {
             ClientClaim::Evm(claim) => format!(
@@ -148,6 +281,13 @@ impl ClientClaim {
             ),
             ClientClaim::Solana(claim) => {
                 format!("{SOLANA_NAMESPACE}:{}", claim.signer_public_key)
+            }
+            ClientClaim::EvmVoucher(voucher) => format!(
+                "{EVM_NAMESPACE}:{}",
+                voucher.common.sender_id.to_ascii_lowercase()
+            ),
+            ClientClaim::SolanaVoucher(voucher) => {
+                format!("{SOLANA_NAMESPACE}:{}", voucher.common.sender_id)
             }
         }
     }
@@ -159,11 +299,14 @@ impl ClientClaim {
     /// derived from whatever this claim already parsed out, not a second
     /// parse of the claim JSON. **This is a self-declared value and it is
     /// not authority for anything** -- the same caveat [`ClientClaim::signer_key`]
-    /// documents applies here unchanged.
+    /// documents applies here unchanged. A voucher's is its `senderId`, for
+    /// the reason [`ClientClaim::signer_key`] gives.
     pub fn signer(&self) -> &str {
         match self {
             ClientClaim::Evm(claim) => &claim.signer_address,
             ClientClaim::Solana(claim) => &claim.signer_public_key,
+            ClientClaim::EvmVoucher(voucher) => &voucher.common.sender_id,
+            ClientClaim::SolanaVoucher(voucher) => &voucher.common.sender_id,
         }
     }
 }
@@ -278,6 +421,24 @@ pub enum ClientClaimError {
          stay on the TypeScript fleet for Mina channels"
     )]
     Mina,
+    /// A voucher's amount is a valid `uint128` that this connector's `u64`
+    /// amount type cannot hold (ADR 0074 decision 3). Refused rather than
+    /// truncated: a truncated amount is a different voucher from the one
+    /// the payer signed, and not one the chain would honour either.
+    #[error(
+        "claim is structurally invalid: 'maxClaimableAmount' {amount} is above the {max} this \
+         connector's amounts can hold -- refused, not truncated",
+        max = u64::MAX
+    )]
+    AmountOutOfRange { amount: u128 },
+    /// A Solana voucher carries a nonzero `expiresAt` (ADR 0074 decision 3):
+    /// value that could lapse before this connector lands it. x402 requires
+    /// zero, so this is refused structurally.
+    #[error(
+        "claim is structurally invalid: a Solana voucher's 'expiresAt' must be 0, got {expires_at} \
+         -- a voucher that can expire is value that can lapse before it is landed"
+    )]
+    VoucherExpires { expires_at: i64 },
 }
 
 fn malformed(msg: impl Into<String>) -> ClientClaimError {
@@ -527,16 +688,161 @@ fn parse_solana(
     })
 }
 
+/// The claim's `scheme` discriminator (ADR 0074 decision 4). Absent -- or
+/// `null` -- is `toon-channel`, so every claim that predates the field
+/// means exactly what it always meant.
+fn parse_scheme(obj: &serde_json::Map<String, Value>) -> Result<ClaimScheme, ClientClaimError> {
+    match optional_str(obj, "scheme")?.as_deref() {
+        None | Some(SCHEME_TOON_CHANNEL) => Ok(ClaimScheme::ToonChannel),
+        Some(SCHEME_BATCH_SETTLEMENT) => Ok(ClaimScheme::BatchSettlement),
+        Some(other) => Err(malformed(format!(
+            "unsupported claim scheme '{other}' (expected '{SCHEME_TOON_CHANNEL}' or \
+             '{SCHEME_BATCH_SETTLEMENT}')"
+        ))),
+    }
+}
+
+/// A voucher's `maxClaimableAmount`: a decimal string holding a `uint128`,
+/// which must also fit this connector's `u64` amounts. Anything wider than
+/// a `uint128` is not an amount any voucher could sign, so malformed; a
+/// valid `uint128` above `u64::MAX` is [`ClientClaimError::AmountOutOfRange`]
+/// -- refused, never truncated (ADR 0074 decision 3).
+fn required_voucher_amount(obj: &serde_json::Map<String, Value>) -> Result<u64, ClientClaimError> {
+    let raw = required_str(obj, "maxClaimableAmount")?;
+    if !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(malformed(
+            "'maxClaimableAmount' must be a non-negative integer string",
+        ));
+    }
+    let amount = raw
+        .parse::<u128>()
+        .map_err(|_| malformed("'maxClaimableAmount' does not fit in a uint128"))?;
+    u64::try_from(amount).map_err(|_| ClientClaimError::AmountOutOfRange { amount })
+}
+
+/// The largest value a Solidity `uint40` -- `ChannelConfig.withdrawDelay`
+/// -- can hold.
+const UINT40_MAX: u64 = (1 << 40) - 1;
+
+fn parse_evm_voucher_channel_config(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<Option<EvmVoucherChannelConfig>, ClientClaimError> {
+    let config = match obj.get("channelConfig") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(config)) => config,
+        Some(_) => return Err(malformed("'channelConfig' must be an object when present")),
+    };
+    let address = |field: &str| -> Result<String, ClientClaimError> {
+        let value = required_str(config, field)
+            .map_err(|_| malformed(format!("'channelConfig.{field}' is missing")))?;
+        if !is_hex_of_len(value, 40) {
+            return Err(malformed(format!(
+                "'channelConfig.{field}' must be 0x-prefixed 40-char hex"
+            )));
+        }
+        Ok(value.to_string())
+    };
+    let withdraw_delay = config
+        .get("withdrawDelay")
+        .and_then(Value::as_u64)
+        .filter(|delay| *delay <= UINT40_MAX)
+        .ok_or_else(|| {
+            malformed("'channelConfig.withdrawDelay' must be an integer that fits a uint40")
+        })?;
+    let salt =
+        required_str(config, "salt").map_err(|_| malformed("'channelConfig.salt' is missing"))?;
+    if !is_hex_of_len(salt, 64) {
+        return Err(malformed(
+            "'channelConfig.salt' must be 0x-prefixed 64-char hex (bytes32)",
+        ));
+    }
+    Ok(Some(EvmVoucherChannelConfig {
+        payer: address("payer")?,
+        payer_authorizer: address("payerAuthorizer")?,
+        receiver: address("receiver")?,
+        receiver_authorizer: address("receiverAuthorizer")?,
+        token: address("token")?,
+        withdraw_delay,
+        salt: salt.to_string(),
+    }))
+}
+
+fn parse_evm_voucher(
+    obj: &serde_json::Map<String, Value>,
+    common: ClientClaimCommon,
+) -> Result<EvmVoucher, ClientClaimError> {
+    let channel_id = required_str(obj, "channelId")?.to_string();
+    if !is_hex_of_len(&channel_id, 64) {
+        return Err(malformed(
+            "'channelId' must be 0x-prefixed 64-char hex (bytes32)",
+        ));
+    }
+    let max_claimable_amount = required_voucher_amount(obj)?;
+    let signature = required_str(obj, "signature")?.to_string();
+    if !is_hex_of_len(&signature, 130) {
+        return Err(malformed(
+            "a voucher's 'signature' must be 0x-prefixed 130-char hex (r ‖ s ‖ v)",
+        ));
+    }
+    let channel_config = parse_evm_voucher_channel_config(obj)?;
+    Ok(EvmVoucher {
+        common,
+        channel_id,
+        max_claimable_amount,
+        signature,
+        channel_config,
+    })
+}
+
+fn parse_solana_voucher(
+    obj: &serde_json::Map<String, Value>,
+    common: ClientClaimCommon,
+) -> Result<SolanaVoucher, ClientClaimError> {
+    let channel_id = required_str(obj, "channelId")?.to_string();
+    if !is_base58(&channel_id, 32, 44) {
+        return Err(malformed(
+            "'channelId' must be a base58-encoded Solana address (32-44 chars)",
+        ));
+    }
+    let max_claimable_amount = required_voucher_amount(obj)?;
+    let expires_at = obj
+        .get("expiresAt")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| malformed("missing or invalid 'expiresAt' (expected an integer)"))?;
+    if expires_at != 0 {
+        return Err(ClientClaimError::VoucherExpires { expires_at });
+    }
+    let signature = required_str(obj, "signature")?.to_string();
+    // Base58 of 64 bytes is at most 88 characters; its exact length is
+    // checked where it is decoded.
+    if !is_base58(&signature, 1, 88) {
+        return Err(malformed(
+            "a Solana voucher's 'signature' must be base58 (an Ed25519 signature)",
+        ));
+    }
+    Ok(SolanaVoucher {
+        common,
+        channel_id,
+        max_claimable_amount,
+        signature,
+    })
+}
+
 /// Parse and structurally validate a client-edge claim's JSON body
-/// (client-edge-spec.md §1.3): required/optional fields per chain and their
-/// formats. Does not check freshness, value or cryptography -- those are
-/// [`crate::validate_claim`] (freshness/watermark, reused unchanged by the
-/// caller) and issues #506/#507 respectively.
+/// (client-edge-spec.md §1.3): required/optional fields per chain and
+/// scheme, and their formats. Does not check freshness, value or
+/// cryptography -- those are [`crate::validate_claim`] (or, for a voucher,
+/// [`crate::validate_voucher`]) and issues #506/#507 respectively.
 ///
 /// `blockchain: "mina"` is refused as [`ClientClaimError::Mina`] before any
 /// Mina-specific field is even inspected -- a well-formed Mina claim is
 /// refused for the deliberate reason ADR 0002 gives, never reported as
-/// malformed.
+/// malformed. That holds whatever `scheme` it declares.
+///
+/// `scheme` (ADR 0074 decision 4) selects the claim's shape: absent or
+/// `toon-channel` is today's claim, `batch-settlement` a voucher. This
+/// function parses both; which carriages *accept* a voucher is theirs to
+/// say, and every peer carriage refuses one.
 pub fn parse_client_claim(json: &str) -> Result<ClientClaim, ClientClaimError> {
     let value: Value =
         serde_json::from_str(json).map_err(|e| ClientClaimError::InvalidJson(e.to_string()))?;
@@ -545,11 +851,19 @@ pub fn parse_client_claim(json: &str) -> Result<ClientClaim, ClientClaimError> {
         .ok_or_else(|| malformed("claim must be a JSON object"))?;
 
     let (blockchain, common) = parse_common(obj)?;
-    match blockchain {
-        "mina" => Err(ClientClaimError::Mina),
-        "evm" => parse_evm(obj, common).map(ClientClaim::Evm),
-        "solana" => parse_solana(obj, common).map(ClientClaim::Solana),
-        other => Err(malformed(format!("unsupported blockchain '{other}'"))),
+    if blockchain == "mina" {
+        return Err(ClientClaimError::Mina);
+    }
+    match (blockchain, parse_scheme(obj)?) {
+        ("evm", ClaimScheme::ToonChannel) => parse_evm(obj, common).map(ClientClaim::Evm),
+        ("solana", ClaimScheme::ToonChannel) => parse_solana(obj, common).map(ClientClaim::Solana),
+        ("evm", ClaimScheme::BatchSettlement) => {
+            parse_evm_voucher(obj, common).map(ClientClaim::EvmVoucher)
+        }
+        ("solana", ClaimScheme::BatchSettlement) => {
+            parse_solana_voucher(obj, common).map(ClientClaim::SolanaVoucher)
+        }
+        (other, _) => Err(malformed(format!("unsupported blockchain '{other}'"))),
     }
 }
 
@@ -610,7 +924,7 @@ mod tests {
                 assert_eq!(evm.transferred_amount, 1_000_000_000_000_000_000);
                 assert_eq!(evm.common.message_id, "claim-1");
             }
-            ClientClaim::Solana(_) => panic!("expected an EVM claim"),
+            other => panic!("expected an EVM claim, got {other:?}"),
         }
     }
 
@@ -622,7 +936,7 @@ mod tests {
                 assert_eq!(solana.nonce, 3);
                 assert_eq!(solana.transferred_amount, 42);
             }
-            ClientClaim::Evm(_) => panic!("expected a Solana claim"),
+            other => panic!("expected a Solana claim, got {other:?}"),
         }
     }
 
@@ -925,6 +1239,255 @@ mod tests {
                 );
             }
             ClientClaim::Solana(_) => panic!("expected an EVM claim"),
+            other => panic!("expected an EVM claim, got {other:?}"),
+        }
+    }
+
+    // -- The scheme discriminator and the voucher shape (ADR 0074, #1341) --
+
+    fn evm_channel_config_json() -> String {
+        format!(
+            r#"{{
+                "payer": "0x{payer}",
+                "payerAuthorizer": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+                "receiver": "0x{receiver}",
+                "receiverAuthorizer": "0x{receiver}",
+                "token": "0x{token}",
+                "withdrawDelay": 86400,
+                "salt": "0x{salt}"
+            }}"#,
+            payer = "11".repeat(20),
+            receiver = "33".repeat(20),
+            token = "55".repeat(20),
+            salt = "66".repeat(32),
+        )
+    }
+
+    fn evm_voucher_json() -> String {
+        evm_voucher_json_with(Some(&evm_channel_config_json()))
+    }
+
+    fn evm_voucher_json_with(channel_config: Option<&str>) -> String {
+        let config = channel_config
+            .map(|config| format!(r#","channelConfig": {config}"#))
+            .unwrap_or_default();
+        format!(
+            r#"{{
+            "version": "1.0",
+            "blockchain": "evm",
+            "scheme": "batch-settlement",
+            "messageId": "voucher-1",
+            "timestamp": "2026-09-25T12:00:00.000Z",
+            "senderId": "client-1",
+            "channelId": "0x{channel}",
+            "maxClaimableAmount": "5000",
+            "signature": "0x{signature}1b"{config}
+        }}"#,
+            channel = "88".repeat(32),
+            signature = "ab".repeat(64),
+        )
+    }
+
+    fn solana_voucher_json() -> String {
+        r#"{
+            "version": "1.0",
+            "blockchain": "solana",
+            "scheme": "batch-settlement",
+            "messageId": "voucher-2",
+            "timestamp": "2026-09-25T12:00:00Z",
+            "senderId": "client-2",
+            "channelId": "So11111111111111111111111111111111111111112",
+            "maxClaimableAmount": "42",
+            "expiresAt": 0,
+            "signature": "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW"
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn a_claim_with_no_scheme_is_a_toon_channel_claim() {
+        let claim = parse_client_claim(&evm_claim_json()).expect("parses");
+        assert_eq!(claim.scheme(), ClaimScheme::ToonChannel);
+        assert!(matches!(claim, ClientClaim::Evm(_)));
+    }
+
+    /// Naming the default scheme explicitly changes nothing: the same bytes
+    /// with `"scheme": "toon-channel"` parse to the same claim.
+    #[test]
+    fn an_explicit_toon_channel_scheme_parses_exactly_as_an_absent_one() {
+        let explicit = evm_claim_json().replace(
+            r#""blockchain": "evm","#,
+            r#""blockchain": "evm", "scheme": "toon-channel","#,
+        );
+        assert_eq!(
+            parse_client_claim(&explicit).expect("parses"),
+            parse_client_claim(&evm_claim_json()).expect("parses")
+        );
+    }
+
+    #[test]
+    fn an_unknown_scheme_is_malformed() {
+        let unknown = evm_claim_json().replace(
+            r#""blockchain": "evm","#,
+            r#""blockchain": "evm", "scheme": "exact","#,
+        );
+        assert!(matches!(
+            parse_client_claim(&unknown),
+            Err(ClientClaimError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_well_formed_evm_voucher_parses() {
+        let claim = parse_client_claim(&evm_voucher_json()).expect("parses");
+        assert_eq!(claim.scheme(), ClaimScheme::BatchSettlement);
+        let ClientClaim::EvmVoucher(voucher) = &claim else {
+            panic!("expected an EVM voucher, got {claim:?}");
+        };
+        assert_eq!(voucher.max_claimable_amount, 5_000);
+        let config = voucher.channel_config.as_ref().expect("config present");
+        assert_eq!(config.withdraw_delay, 86_400);
+        assert_eq!(claim.transferred_amount(), 5_000);
+        assert_eq!(claim.nonce(), crate::VOUCHER_WATERMARK_NONCE);
+    }
+
+    #[test]
+    fn an_evm_voucher_needs_no_channel_config_after_its_first() {
+        let without = parse_client_claim(&evm_voucher_json_with(None));
+        let ClientClaim::EvmVoucher(voucher) = without.expect("parses") else {
+            panic!("expected an EVM voucher");
+        };
+        assert_eq!(voucher.channel_config, None);
+    }
+
+    #[test]
+    fn a_well_formed_solana_voucher_parses() {
+        let claim = parse_client_claim(&solana_voucher_json()).expect("parses");
+        assert_eq!(claim.scheme(), ClaimScheme::BatchSettlement);
+        let ClientClaim::SolanaVoucher(voucher) = &claim else {
+            panic!("expected a Solana voucher, got {claim:?}");
+        };
+        assert_eq!(voucher.max_claimable_amount, 42);
+    }
+
+    /// §1.3's (blockchain, channel) tuple, in its canonical form: a voucher
+    /// is keyed exactly as a claim on the same channel id would be.
+    #[test]
+    fn a_voucher_is_keyed_by_the_same_canonical_tuple_as_a_claim() {
+        let upper = evm_voucher_json().replace(&"88".repeat(32), &"8A".repeat(32));
+        assert_eq!(
+            parse_client_claim(&upper).expect("parses").channel_key(),
+            format!("evm:0x{}", "8a".repeat(32))
+        );
+        assert_eq!(
+            parse_client_claim(&solana_voucher_json())
+                .expect("parses")
+                .channel_key(),
+            "solana:So11111111111111111111111111111111111111112"
+        );
+    }
+
+    #[test]
+    fn a_solana_voucher_with_a_nonzero_expiry_is_refused_structurally() {
+        for expires_at in [1i64, -1, i64::MAX] {
+            let json = solana_voucher_json().replace(
+                r#""expiresAt": 0"#,
+                &format!(r#""expiresAt": {expires_at}"#),
+            );
+            assert_eq!(
+                parse_client_claim(&json),
+                Err(ClientClaimError::VoucherExpires { expires_at })
+            );
+        }
+    }
+
+    #[test]
+    fn a_solana_voucher_with_no_expiry_is_malformed() {
+        let json = solana_voucher_json().replace(r#""expiresAt": 0,"#, "");
+        assert!(matches!(
+            parse_client_claim(&json),
+            Err(ClientClaimError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_voucher_amount_above_u64_is_refused_not_truncated() {
+        let above = u128::from(u64::MAX) + 1;
+        let json = evm_voucher_json().replace(r#""5000""#, &format!(r#""{above}""#));
+        assert_eq!(
+            parse_client_claim(&json),
+            Err(ClientClaimError::AmountOutOfRange { amount: above })
+        );
+    }
+
+    #[test]
+    fn a_voucher_amount_above_u128_is_malformed() {
+        let json =
+            evm_voucher_json().replace(r#""5000""#, r#""340282366920938463463374607431768211456""#);
+        assert!(matches!(
+            parse_client_claim(&json),
+            Err(ClientClaimError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_withdraw_delay_wider_than_a_uint40_is_malformed() {
+        let json = evm_voucher_json().replace("86400", &(UINT40_MAX + 1).to_string());
+        assert!(matches!(
+            parse_client_claim(&json),
+            Err(ClientClaimError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn an_evm_voucher_signature_must_be_65_bytes_of_hex() {
+        let json = evm_voucher_json().replace(&format!("{}1b", "ab".repeat(64)), "abcdef");
+        assert!(matches!(
+            parse_client_claim(&json),
+            Err(ClientClaimError::Malformed(_))
+        ));
+    }
+
+    /// A Mina claim is refused by name whatever scheme it declares -- a
+    /// voucher on a chain this connector cannot settle is still that chain.
+    #[test]
+    fn a_mina_voucher_is_still_refused_as_mina() {
+        let json =
+            solana_voucher_json().replace(r#""blockchain": "solana""#, r#""blockchain": "mina""#);
+        assert_eq!(parse_client_claim(&json), Err(ClientClaimError::Mina));
+    }
+
+    proptest::proptest! {
+        /// ADR 0074 decision 3: a Solana voucher that could expire is
+        /// refused, whatever the expiry -- in the past, the future, or
+        /// negative -- and only `0` parses.
+        #[test]
+        fn a_solana_voucher_parses_only_at_a_zero_expiry(expires_at in proptest::prelude::any::<i64>()) {
+            let json = solana_voucher_json()
+                .replace(r#""expiresAt": 0"#, &format!(r#""expiresAt": {expires_at}"#));
+            let parsed = parse_client_claim(&json);
+            if expires_at == 0 {
+                proptest::prop_assert!(parsed.is_ok());
+            } else {
+                proptest::prop_assert_eq!(parsed, Err(ClientClaimError::VoucherExpires { expires_at }));
+            }
+        }
+
+        /// ADR 0074 decision 3: every `uint128` amount either parses to
+        /// exactly itself or is refused as out of range -- never truncated.
+        #[test]
+        fn a_voucher_amount_is_exact_or_refused(amount in proptest::prelude::any::<u128>()) {
+            let json = evm_voucher_json().replace(r#""5000""#, &format!(r#""{amount}""#));
+            match parse_client_claim(&json) {
+                Ok(claim) => {
+                    proptest::prop_assert!(amount <= u128::from(u64::MAX));
+                    proptest::prop_assert_eq!(u128::from(claim.transferred_amount()), amount);
+                }
+                Err(error) => {
+                    proptest::prop_assert!(amount > u128::from(u64::MAX));
+                    proptest::prop_assert_eq!(error, ClientClaimError::AmountOutOfRange { amount });
+                }
+            }
         }
     }
 }

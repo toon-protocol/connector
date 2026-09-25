@@ -43,7 +43,10 @@ pub mod x402;
 
 pub use address::is_valid_ilp_address;
 pub use asset::{AssetChain, AssetId, AssetIdError};
-pub use claim::{advance_watermark, validate_claim, validate_price, ClaimError, Watermark};
+pub use claim::{
+    advance_voucher_watermark, advance_watermark, validate_claim, validate_price, validate_voucher,
+    ClaimError, VoucherAdmission, VoucherWatermark, Watermark, VOUCHER_WATERMARK_NONCE,
+};
 pub use condition::{
     delivery_budget, forwarded_expiry, fulfillment_matches_condition, is_expired,
     FORWARDING_MESSAGE_WINDOW,
