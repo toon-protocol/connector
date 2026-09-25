@@ -26,7 +26,9 @@
 //!   because a connector picking its own pool picks a dust-liquidity decoy
 //!   sooner or later.
 //! * **No settlement backend.** This crate takes an RPC endpoint and nothing
-//!   else. It holds no key, signs nothing, sends no transaction, and cannot
+//!   else: the settlement table's `RpcTransport` (ADR 0073), which carries
+//!   a URL, a bounded HTTP client and, when the table is proxied, its
+//!   circuit, and no key. It holds no key, signs nothing, sends no transaction, and cannot
 //!   move value if it tried: every call it makes is an `eth_call` at a pinned
 //!   block. ADR 0071 decision 6 keeps the settlement backend out of the value
 //!   path, and `tests/the_reader_holds_no_settlement_backend.rs` asserts the
@@ -55,10 +57,10 @@
 //! use chrono::Duration;
 //! use connector_domain::AssetId;
 //! use connector_rate_source::{PoolId, QuoteLeg, RateSource};
-//! use connector_rate_source_evm::UniswapV3RateSource;
+//! use connector_rate_source_evm::{RpcTransport, UniswapV3RateSource};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let source = UniswapV3RateSource::connect("https://mainnet.base.org")?;
+//! let source = UniswapV3RateSource::connect(&RpcTransport::direct("https://mainnet.base.org")?);
 //! let observation = source
 //!     .observe(&QuoteLeg {
 //!         pool: PoolId("0xd0b53d9277642d899df5c87a3966a349a798f224".to_string()),
@@ -76,15 +78,21 @@ pub mod tick_math;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use connector_chain_rpc::evm::EvmRpc;
 use connector_domain::{AssetChain, AssetId};
 use connector_rate_source::{LegObservation, PoolId, QuoteLeg, RateSource, RateSourceError};
 use ethers::abi::{parse_abi, Abi, Function, ParamType, Token};
-use ethers::providers::{Http, Middleware, Provider, ProviderError, RpcError};
+use ethers::providers::{Middleware, Provider, ProviderError, RpcError};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::types::{Address, BlockNumber, Bytes, TransactionRequest, U256};
 use std::sync::OnceLock;
 
 pub use tick_math::PoolDirection;
+
+/// The endpoint a reader is built over (ADR 0073): the EVM settlement
+/// table's own transport, shared with its backend. Re-exported so a caller
+/// building one does not need a second dependency to name it.
+pub use connector_chain_rpc::RpcTransport;
 
 /// The three functions this reader calls, and the whole of the interface it
 /// requires a pool to have. `slot0` is deliberately absent (ADR 0071's second
@@ -118,27 +126,29 @@ fn pool_function(name: &str) -> &'static Function {
 /// answering with a number that was true once, and ADR 0071 is explicit that
 /// staleness is an outage rather than a fallback.
 pub struct UniswapV3RateSource {
-    provider: Provider<Http>,
+    provider: Provider<EvmRpc>,
     /// Kept for error messages only. An operator debugging a dead pair needs
     /// to know *which* endpoint stopped answering, and a node may hold one
-    /// reader per settlement chain.
+    /// reader per settlement chain. The origin only
+    /// ([`RpcTransport::endpoint`]): a keyed endpoint's path is its API key.
     endpoint: String,
 }
 
 impl UniswapV3RateSource {
-    /// Point a reader at an EVM JSON-RPC endpoint.
+    /// Point a reader at an EVM JSON-RPC endpoint, over its settlement
+    /// table's transport.
     ///
     /// Touches no chain: a reader that probed its endpoint at construction
     /// would be a reader whose *construction* can fail for a reason that has
     /// nothing to do with any pool, and the port already has one honest way to
     /// say an endpoint is unreachable -- saying it when a leg is asked for.
-    pub fn connect(rpc_url: &str) -> Result<Self, RateSourceError> {
-        let provider = Provider::<Http>::try_from(rpc_url)
-            .map_err(|error| RateSourceError::Unreachable(format!("{rpc_url}: {error}")))?;
-        Ok(Self {
-            provider,
-            endpoint: rpc_url.to_string(),
-        })
+    /// Nothing about the endpoint can be wrong here either: the transport
+    /// was built, so its URL already parsed.
+    pub fn connect(transport: &RpcTransport) -> Self {
+        Self {
+            provider: EvmRpc::provider(transport.clone()),
+            endpoint: transport.endpoint(),
+        }
     }
 
     /// The endpoint this reader was built against.

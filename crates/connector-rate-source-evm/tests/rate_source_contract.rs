@@ -34,9 +34,10 @@ async fn the_uniswap_v3_twap_reader_upholds_the_rate_source_contract() {
 
     assert_upholds_the_contract(|| async {
         let venue = support::Venue::stand_up(ANVIL_BASE_PORT).await;
-        let source = Arc::new(
-            UniswapV3RateSource::connect(&venue.rpc_url).expect("a reader for a spawned chain"),
-        );
+        let source = Arc::new(UniswapV3RateSource::connect(
+            &connector_rate_source_evm::RpcTransport::direct(&venue.rpc_url)
+                .expect("rpc transport"),
+        ));
         let window = Duration::seconds(support::WINDOW_SECONDS);
 
         // The chain itself, so the last promise can take it away. Held past

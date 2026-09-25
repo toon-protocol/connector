@@ -198,9 +198,15 @@ fn parse_channel_id(id: &str) -> [u8; 32] {
 /// node's own is: through the registry, with the funded receiver key.
 async fn receiver_backend(rpc: &str) -> EvmSettlementBackend {
     let key = receiver_key().expect("BASE_SEPOLIA_PROOF_KEY");
-    EvmSettlementBackend::connect(rpc, &key, registry(), token(), decimals())
-        .await
-        .expect("connect through the TokenNetworkRegistry")
+    EvmSettlementBackend::connect(
+        &connector_settlement_evm::RpcTransport::direct(rpc).expect("rpc transport"),
+        &key,
+        registry(),
+        token(),
+        decimals(),
+    )
+    .await
+    .expect("connect through the TokenNetworkRegistry")
 }
 
 /// Sign `proof` through the exact production path

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::Router;
 
+use connector_chain_rpc::RpcTransport;
 use connector_client_edge::{
     ChannelLivenessPolicy, ChannelLookupFailed, ClientChannelRegistry, ClientChannelSource,
     ClientClaimGate, ClientPayoutLedger, DepositFloor, EvmChannel, PeerCarriages, SolanaChannel,
@@ -265,16 +266,19 @@ pub enum RuntimeError {
     /// fact about this binary's wiring rather than about the file -- see
     /// `RateSources`.
     QuotePathUnpollable { source: QuotePathUnusable },
-    /// The `[settlement.<chain>]` endpoint a declared quote path would be
-    /// read over is not one a rate source can be pointed at (ADR 0071
-    /// decision 6, issue #1293).
+    /// A `[settlement.<chain>]` table's endpoint cannot be dialed the way
+    /// it is written: its one transport (ADR 0073), which the backend, the
+    /// channel-index syncer and the rate source all share, could not be
+    /// built.
     ///
     /// `Config::load` already refuses an `rpc_url` that is not an `http(s)`
-    /// URL, so this is the second lock on that door too -- and a refusal to
-    /// start, for [`RuntimeError::QuotePathUnpollable`]'s reason: a node
-    /// whose pollers never started reads as priced in the file while every
-    /// forward across those pairs refuses.
-    RateSourceUnusable { endpoint: String, message: String },
+    /// URL and a `socks_proxy` that is not `socks5h://`, so this is the
+    /// second lock on those doors -- and a refusal to start, because a table
+    /// with no transport has no client that could settle on it.
+    SettlementEndpointUnusable {
+        table: &'static str,
+        message: String,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -417,11 +421,11 @@ impl fmt::Display for RuntimeError {
                  node's numeraire (ADR 0071 decision 3); a pair that cannot be sourced that way \
                  runs a [[rates]] row instead"
             ),
-            RuntimeError::RateSourceUnusable { endpoint, message } => write!(
+            RuntimeError::SettlementEndpointUnusable { table, message } => write!(
                 f,
-                "no rate source can be pointed at '{endpoint}': {message}. A declared quote path \
-                 is read over the rpc_url of the settlement table for the token's own chain \
-                 (ADR 0071 decision 6); there is no separate endpoint to configure for it"
+                "[settlement.{table}] rpc_url cannot be dialed as configured: {message}. Every \
+                 client of that endpoint -- the settlement backend, and on EVM the channel-index \
+                 syncer and the rate source -- shares one transport built from it (ADR 0073)"
             ),
         }
     }
@@ -559,12 +563,13 @@ fn parse_solana_pubkey(field: &'static str, value: &str) -> Result<Pubkey, Runti
 /// a startup failure, not a line with no effect (ADR 0009).
 async fn build_evm_settlement_backend(
     settlement: &EvmSettlementConfig,
+    transport: &RpcTransport,
 ) -> Result<Arc<EvmSettlementBackend>, RuntimeError> {
     let private_key = read_settlement_private_key(settlement.key())?;
     let registry_address = ethers::types::Address::from(settlement.contract_address());
     let token_address = ethers::types::Address::from(settlement.token_address());
     let backend = EvmSettlementBackend::connect(
-        settlement.rpc_url(),
+        transport,
         &private_key,
         registry_address,
         token_address,
@@ -742,14 +747,13 @@ fn check_evm_channel_domains(config: &Config, settled: EvmDomain) -> Result<(), 
 /// Solana-flavored, ADR 0009).
 async fn build_solana_settlement_backend(
     settlement: &SolanaSettlementConfig,
+    transport: &RpcTransport,
 ) -> Result<Arc<SolanaSettlementBackend>, RuntimeError> {
     let payer_seed = read_settlement_key_bytes(settlement.key())?;
     let program_id = parse_solana_pubkey("program_id", settlement.program_id())?;
     let token_mint = parse_solana_pubkey("token_address", settlement.token_address())?;
     let backend = SolanaSettlementBackend::connect(
-        &connector_settlement_solana::RpcTransport::direct(settlement.rpc_url()).map_err(
-            |error| RuntimeError::Settlement(SettlementError::Backend(error.to_string())),
-        )?,
+        transport,
         &payer_seed,
         program_id,
         token_mint,
@@ -1760,10 +1764,14 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     let mut client_channel_source_solana: Option<Arc<dyn ClientChannelSource>> = None;
     let mut solana_cluster: Option<&'static str> = None;
     let mut settlements: Vec<connector_client_edge::X402ChainSettlementTerms> = Vec::new();
+    // Each table's one transport, built once and handed to every client of
+    // its `rpc_url` below (ADR 0073 decision 2).
+    let transports = settlement_transports(config)?;
     for settlement in config.settlements() {
         match settlement {
             SettlementConfig::Evm(evm) => {
-                let backend = build_evm_settlement_backend(evm).await?;
+                let transport = transports.for_chain(SettlementChain::Evm)?;
+                let backend = build_evm_settlement_backend(evm, transport).await?;
                 // The file, held against the chain, before a single fact
                 // this backend resolved is used for anything else (issue
                 // #1136). Same posture and same moment as `connect`'s own
@@ -1834,15 +1842,14 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 // The syncer queries the contract the index is bound to,
                 // from the one value, so the two cannot drift into
                 // indexing one contract under another's name.
+                // The same transport as the backend's: a syncer dialing on
+                // its own would be the one client left direct (ADR 0073).
                 let syncer = EvmChannelIndexSyncer::new(
-                    evm.rpc_url(),
+                    transport,
                     indexed_contract.token_network,
                     evm.channel_index_confirmations(),
                     evm.channel_index_from_block(),
-                )
-                .map_err(|source| {
-                    RuntimeError::Settlement(SettlementError::Backend(source.to_string()))
-                })?;
+                );
                 // Backfill-then-poll runs for the life of the process,
                 // never blocking startup (issue #661's own acceptance
                 // criterion) -- a lagging or never-connecting sync logs at
@@ -1870,7 +1877,11 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 // and the greeting's per-chain settlement facts are
                 // composed here as well (issue #632) -- epic #627's
                 // remaining children, together.
-                let backend = build_solana_settlement_backend(solana).await?;
+                let backend = build_solana_settlement_backend(
+                    solana,
+                    transports.for_chain(SettlementChain::Solana)?,
+                )
+                .await?;
                 // Which chain that connection actually reached, from the
                 // chain's own genesis hash rather than from the shape of
                 // the URL used to reach it (issue #1131).
@@ -1943,7 +1954,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         // Every declared quote path, connected to the reader that can
         // actually read it and left polling in the background. A node whose
         // pairs are all static `[[rates]]` rows starts nothing here.
-        spawn_quote_path_pollers(table, config)?;
+        spawn_quote_path_pollers(table, config, &transports)?;
     }
     // ADR 0071 decisions 1 and 2, issues #1295 and #1301: the facts the
     // forwarding path's converting arm reads, and the only ones. Which
@@ -2057,12 +2068,13 @@ pub fn spawn_rate_pollers(
 fn spawn_quote_path_pollers(
     table: &SharedRateTable,
     config: &Config,
+    transports: &SettlementTransports,
 ) -> Result<usize, RuntimeError> {
     let denomination = config.denomination();
     if denomination.quoted_tokens().next().is_none() {
         return Ok(0);
     }
-    let sources = rate_sources(config)?;
+    let sources = rate_sources(transports);
     let started = spawn_rate_pollers(table, &sources, config)?;
     tracing::info!(
         started,
@@ -2099,30 +2111,69 @@ fn spawn_quote_path_pollers(
 /// same endpoint rather than reaching through a `SettlementBackend`, which
 /// decision 6 keeps out of every value path. The two share a URL and
 /// nothing else.
-fn rate_sources(config: &Config) -> Result<RateSources, RuntimeError> {
+fn rate_sources(transports: &SettlementTransports) -> RateSources {
     let mut sources = RateSources::none();
-    if let Some(rpc_url) = config
-        .settlements()
-        .iter()
-        .find_map(|settlement| match settlement {
-            SettlementConfig::Evm(evm) => Some(evm.rpc_url()),
-            SettlementConfig::Solana(_) => None,
+    // The EVM table's own transport, shared with its backend and syncer:
+    // a rate source dialing on its own would be the one client of that
+    // `rpc_url` left direct (ADR 0073 decision 2).
+    if let Some(transport) = &transports.evm {
+        sources = sources.with(
+            AssetChain::Evm,
+            Arc::new(UniswapV3RateSource::connect(transport)),
+        );
+    }
+    sources
+}
+
+/// Each settlement table's one [`RpcTransport`] (ADR 0073 decision 2):
+/// built here, once, and handed to every client of that table's `rpc_url`
+/// -- the backend, and on EVM the channel-index syncer and the rate source.
+/// One of them left on a client of its own would be one client outside the
+/// bounds, the refusal retries and the circuit.
+pub(crate) struct SettlementTransports {
+    evm: Option<RpcTransport>,
+    solana: Option<RpcTransport>,
+}
+
+impl SettlementTransports {
+    /// The transport for a table `config.settlements()` named. The loader
+    /// guarantees one per configured chain, so a miss is a wiring error
+    /// reported rather than a panic.
+    fn for_chain(&self, chain: SettlementChain) -> Result<&RpcTransport, RuntimeError> {
+        let transport = match chain {
+            SettlementChain::Evm => self.evm.as_ref(),
+            SettlementChain::Solana => self.solana.as_ref(),
+        };
+        transport.ok_or(RuntimeError::SettlementEndpointUnusable {
+            table: chain.name(),
+            message: "no transport was built for a table the config names".to_string(),
         })
-    {
-        // Rendered rather than carried: `RateSourceError` is a wide enum
-        // built for a *read* failure -- pool, pair, window -- and only its
-        // one construction-time variant can reach here. Keeping the whole
-        // of it in `RuntimeError` would make every `Result` in this module
-        // pay for a refusal `Config::load` has already made.
-        let source = UniswapV3RateSource::connect(rpc_url).map_err(|source| {
-            RuntimeError::RateSourceUnusable {
-                endpoint: rpc_url.to_string(),
-                message: source.to_string(),
+    }
+}
+
+/// Build [`SettlementTransports`] from `config`'s settlement tables.
+pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTransports, RuntimeError> {
+    let mut transports = SettlementTransports {
+        evm: None,
+        solana: None,
+    };
+    for settlement in config.settlements() {
+        let (chain, rpc_url) = match settlement {
+            SettlementConfig::Evm(evm) => (SettlementChain::Evm, evm.rpc_url()),
+            SettlementConfig::Solana(solana) => (SettlementChain::Solana, solana.rpc_url()),
+        };
+        let transport = RpcTransport::direct(rpc_url).map_err(|error| {
+            RuntimeError::SettlementEndpointUnusable {
+                table: chain.name(),
+                message: error.to_string(),
             }
         })?;
-        sources = sources.with(AssetChain::Evm, Arc::new(source));
+        match chain {
+            SettlementChain::Evm => transports.evm = Some(transport),
+            SettlementChain::Solana => transports.solana = Some(transport),
+        }
     }
-    Ok(sources)
+    Ok(transports)
 }
 
 /// How often [`router`]'s spawned loop sweeps the client edge's channels
@@ -7268,8 +7319,12 @@ max_move = {{ numerator = 5, denominator = 100 }}
             let table = SharedRateTable::from_config(config.denomination())
                 .expect("a node that declares tokens deals");
 
-            let started = spawn_quote_path_pollers(&table, &config)
-                .expect("a quote path on the chain this node settles on");
+            let started = spawn_quote_path_pollers(
+                &table,
+                &config,
+                &settlement_transports(&config).expect("transports"),
+            )
+            .expect("a quote path on the chain this node settles on");
 
             assert_eq!(started, 1, "the one declared quote path is polled");
         }
@@ -7329,8 +7384,12 @@ max_move = {{ numerator = 5, denominator = 100 }}
             let table = SharedRateTable::from_config(config.denomination())
                 .expect("a node that declares tokens deals");
 
-            let refused = spawn_quote_path_pollers(&table, &config)
-                .expect_err("no source reads Solana pools");
+            let refused = spawn_quote_path_pollers(
+                &table,
+                &config,
+                &settlement_transports(&config).expect("transports"),
+            )
+            .expect_err("no source reads Solana pools");
 
             assert!(
                 matches!(
@@ -7391,7 +7450,12 @@ max_move = {{ numerator = 5, denominator = 100 }}
                 .expect("a node that declares tokens deals");
 
             assert_eq!(
-                spawn_quote_path_pollers(&table, &config).expect("nothing to poll is not an error"),
+                spawn_quote_path_pollers(
+                    &table,
+                    &config,
+                    &settlement_transports(&config).expect("transports")
+                )
+                .expect("nothing to poll is not an error"),
                 0
             );
         }

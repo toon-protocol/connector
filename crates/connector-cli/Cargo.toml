@@ -9,6 +9,9 @@ license.workspace = true
 # codec both roles share (ADR 0027, issue #713) and the one
 # `connector-vectors` pins -- never a second implementation of a frame.
 connector-btp = { path = "../connector-btp" }
+# Each settlement table's one transport, built here and handed to every
+# client of its rpc_url (ADR 0073 decision 2).
+connector-chain-rpc = { path = "../connector-chain-rpc" }
 connector-config = { path = "../connector-config" }
 connector-client-edge = { path = "../connector-client-edge" }
 connector-domain = { path = "../connector-domain" }

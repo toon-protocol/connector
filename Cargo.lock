@@ -1114,6 +1114,7 @@ dependencies = [
  "bs58",
  "chrono",
  "connector-btp",
+ "connector-chain-rpc",
  "connector-client-edge",
  "connector-config",
  "connector-domain",
@@ -1320,6 +1321,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "connector-chain-rpc",
  "connector-domain",
  "connector-rate-source",
  "connector-settlement-evm",
@@ -1377,6 +1379,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "connector-chain-rpc",
  "connector-settlement",
  "connector-settlement-evm",
  "connector-signer",

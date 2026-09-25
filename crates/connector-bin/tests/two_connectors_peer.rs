@@ -370,7 +370,7 @@ impl PeerFixture {
         .expect("deployer key is a valid secp256k1 secret");
 
         let payee_backend = EvmSettlementBackend::connect(
-            &anvil.rpc_url,
+            &connector_settlement_evm::RpcTransport::direct(&anvil.rpc_url).expect("rpc transport"),
             PEER_SETTLEMENT_KEY_PLACEHOLDER,
             registry_address,
             token,

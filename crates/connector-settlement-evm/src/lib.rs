@@ -27,6 +27,7 @@ mod bindings;
 mod channel_id;
 mod channel_index;
 pub mod channel_index_sync;
+mod send;
 // Also compiled for this crate's own `#[cfg(test)]` unit tests (none left
 // after issue #576 removed the #568 constructor-guard tests, which were
 // `SettlementChannel`-specific -- kept available the same way regardless,
@@ -40,15 +41,22 @@ pub use channel_index::{
     IndexedChannelStatus, IndexedContract, OrderedChannelIndexEvent, RejectedSnapshot,
 };
 pub use channel_index_sync::{ChannelIndexSyncError, EvmChannelIndexSyncer, DEFAULT_POLL_INTERVAL};
+/// A settlement table's endpoint, which [`EvmSettlementBackend::connect`]
+/// and [`EvmChannelIndexSyncer::new`] take in place of a URL (ADR 0073).
+/// Re-exported so a caller building one does not need a second dependency
+/// to name it.
+pub use connector_chain_rpc::RpcTransport;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Duration;
-use ethers::middleware::nonce_manager::NonceManagerMiddleware;
-use ethers::middleware::{Middleware, SignerMiddleware};
-use ethers::providers::{Http, JsonRpcClient, PendingTransaction, Provider, ProviderError};
+use connector_chain_rpc::evm::EvmRpc;
+use connector_chain_rpc::retry_read;
+use ethers::middleware::Middleware;
+use ethers::providers::Provider;
 use ethers::signers::{LocalWallet, Signer as EvmSigner};
+use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::types::{Address, BlockNumber, Bytes, TransactionReceipt, U256};
 
 use connector_settlement::{
@@ -56,6 +64,7 @@ use connector_settlement::{
 };
 
 use channel_id::{format_channel_id, parse_channel_id};
+use send::{confirm, ConfirmPolicy, Sender};
 
 use bindings::token_network::{
     BalanceProof, ChannelOpenedFilter, TokenNetwork as TokenNetworkContract,
@@ -63,13 +72,12 @@ use bindings::token_network::{
 use bindings::token_network_registry::TokenNetworkRegistry as TokenNetworkRegistryContract;
 use bindings::{Erc20 as Erc20Contract, MockErc20 as MockErc20Contract};
 
-/// The signing client every contract call is made through, wrapped in a
-/// [`NonceManagerMiddleware`] so that concurrent calls against the same
-/// backend (every [`SettlementBackend`] method takes `&self`, so nothing
-/// stops two calls racing) assign themselves distinct, correctly ordered
-/// nonces instead of both reading the same "pending" nonce from the node
-/// and conflicting when both land.
-type EvmClient = NonceManagerMiddleware<SignerMiddleware<Provider<Http>, LocalWallet>>;
+/// The client every contract binding reads through: a plain provider over
+/// the table's transport, holding no key. Writes do not go through it; they
+/// are built by a binding and handed to [`Sender`] (ADR 0073), which owns
+/// the key, the nonce and the one lock concurrent writes (every
+/// [`SettlementBackend`] method takes `&self`) are ordered by.
+type EvmClient = Provider<EvmRpc>;
 
 /// A [`SettlementBackend`] backed by a real `TokenNetwork` contract
 /// instance on an EVM chain, resolved through a `TokenNetworkRegistry`
@@ -91,6 +99,14 @@ pub struct EvmSettlementBackend {
     /// [`read_state`](Self::read_state) can tell which `ParticipantState`
     /// is "self" and which is the counterparty's.
     own_address: Address,
+    /// The read client every binding above shares, and what a write's
+    /// receipt is polled through.
+    client: Arc<EvmClient>,
+    /// Signs and sends every write, with nonces from `pending` that never
+    /// rewind ([`send`], ADR 0073).
+    sender: Sender,
+    /// How long a write's confirmation may take, and how often it polls.
+    confirm: ConfirmPolicy,
     /// Serializes [`fund`](SettlementBackend::fund): `setTotalDeposit`
     /// takes the counterparty's *new total* deposit, not an increment, so
     /// computing that total requires a read-then-write this backend's own
@@ -126,21 +142,24 @@ impl EvmSettlementBackend {
     /// `docs/usdc-cross-chain-settlement.md` asks for, and the check that
     /// turns a stale `decimals = 18` from a line with no effect into a
     /// refusal to start.
+    ///
+    /// Every read here is retried with backoff before it fails the node
+    /// ([`retry_read`], ADR 0073 decision 5), and none of them can hang:
+    /// the transport bounds each one.
     pub async fn connect(
-        rpc_url: &str,
+        transport: &RpcTransport,
         private_key: &str,
         registry_address: Address,
         token_address: Address,
         expected_decimals: u8,
     ) -> Result<Self, SettlementError> {
-        let (client, own_address, chain_id) = build_client(rpc_url, private_key).await?;
-        let client = Arc::new(client);
+        let built = build_client(transport, private_key).await?;
+        let client = built.client.clone();
         let registry = TokenNetworkRegistryContract::new(registry_address, client.clone());
-        let token_network_address = registry
-            .get_token_network(token_address)
-            .call()
-            .await
-            .map_err(backend_error)?;
+        let token_network_address =
+            retry_read(|| async { registry.get_token_network(token_address).call().await })
+                .await
+                .map_err(backend_error)?;
         if token_network_address.is_zero() {
             return Err(SettlementError::Backend(format!(
                 "registry {registry_address:?} has no TokenNetwork registered for token \
@@ -149,7 +168,9 @@ impl EvmSettlementBackend {
         }
         let contract = TokenNetworkContract::new(token_network_address, client.clone());
         let token = Erc20Contract::new(token_address, client);
-        let on_chain_decimals = token.decimals().call().await.map_err(backend_error)?;
+        let on_chain_decimals = retry_read(|| async { token.decimals().call().await })
+            .await
+            .map_err(backend_error)?;
         if on_chain_decimals != expected_decimals {
             return Err(SettlementError::Backend(format!(
                 "[settlement] decimals is {expected_decimals}, but token {token_address:?} \
@@ -160,8 +181,11 @@ impl EvmSettlementBackend {
             contract,
             token,
             registry_address,
-            chain_id,
-            own_address,
+            chain_id: built.chain_id,
+            own_address: built.sender.address(),
+            client: built.client,
+            sender: built.sender,
+            confirm: built.confirm,
             deposit_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -179,18 +203,19 @@ impl EvmSettlementBackend {
         private_key: &str,
         token_address: Address,
     ) -> Result<Self, SettlementError> {
-        let (client, own_address, chain_id) = build_client(rpc_url, private_key).await?;
-        let client = Arc::new(client);
-        let registry = TokenNetworkRegistryContract::deploy(client.clone(), ())
+        let transport = RpcTransport::direct(rpc_url).map_err(backend_error)?;
+        let built = build_client(&transport, private_key).await?;
+        let client = built.client.clone();
+        let deployment = TokenNetworkRegistryContract::deploy(client.clone(), ())
             .map_err(backend_error)?
-            .send()
-            .await
-            .map_err(backend_error)?;
-        let registry_address = registry.address();
+            .deployer
+            .tx;
+        let registry_address = built.deployed_address(deployment).await?;
+        let registry = TokenNetworkRegistryContract::new(registry_address, client.clone());
 
-        let call = registry.create_token_network(token_address);
-        let pending = call.send().await.map_err(backend_error)?;
-        confirm(pending).await?;
+        built
+            .transact(registry.create_token_network(token_address).tx)
+            .await?;
 
         let token_network_address = registry
             .get_token_network(token_address)
@@ -203,8 +228,11 @@ impl EvmSettlementBackend {
             contract,
             token,
             registry_address,
-            chain_id,
-            own_address,
+            chain_id: built.chain_id,
+            own_address: built.sender.address(),
+            client: built.client,
+            sender: built.sender,
+            confirm: built.confirm,
             deposit_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -221,20 +249,25 @@ impl EvmSettlementBackend {
         private_key: &str,
         mint_to_deployer: u128,
     ) -> Result<Address, SettlementError> {
-        let (client, deployer, _chain_id) = build_client(rpc_url, private_key).await?;
-        let client = Arc::new(client);
-        let contract = MockErc20Contract::deploy(
-            client,
+        let transport = RpcTransport::direct(rpc_url).map_err(backend_error)?;
+        let built = build_client(&transport, private_key).await?;
+        let deployment = MockErc20Contract::deploy(
+            built.client.clone(),
             ("USD Coin (mock)".to_string(), "USDC".to_string(), 6u8),
         )
         .map_err(backend_error)?
-        .send()
-        .await
-        .map_err(backend_error)?;
-        let call = contract.mint(deployer, U256::from(mint_to_deployer));
-        let pending = call.send().await.map_err(backend_error)?;
-        confirm(pending).await?;
-        Ok(contract.address())
+        .deployer
+        .tx;
+        let address = built.deployed_address(deployment).await?;
+        let contract = MockErc20Contract::new(address, built.client.clone());
+        built
+            .transact(
+                contract
+                    .mint(built.sender.address(), U256::from(mint_to_deployer))
+                    .tx,
+            )
+            .await?;
+        Ok(address)
     }
 
     /// The address this backend's `TokenNetwork` is deployed at -- the
@@ -516,13 +549,10 @@ impl EvmSettlementBackend {
         participant: Address,
         total: U256,
     ) -> Result<(), SettlementError> {
-        let approve = self.token.approve(self.contract.address(), U256::MAX);
-        let pending = approve.send().await.map_err(backend_error)?;
-        confirm(pending).await?;
-
-        let call = self.contract.set_total_deposit(id, participant, total);
-        let pending = call.send().await.map_err(backend_error)?;
-        confirm(pending).await?;
+        self.transact(self.token.approve(self.contract.address(), U256::MAX).tx)
+            .await?;
+        self.transact(self.contract.set_total_deposit(id, participant, total).tx)
+            .await?;
         Ok(())
     }
 
@@ -543,9 +573,8 @@ impl EvmSettlementBackend {
         amount: u128,
     ) -> Result<(), SettlementError> {
         let token = MockErc20Contract::new(self.token.address(), self.token.client());
-        let call = token.mint(owner, U256::from(amount));
-        let pending = call.send().await.map_err(backend_error)?;
-        confirm(pending).await?;
+        self.transact(token.mint(owner, U256::from(amount)).tx)
+            .await?;
         Ok(())
     }
 
@@ -577,6 +606,16 @@ impl EvmSettlementBackend {
         let new_total = U256::from(state.counterparty_deposited) + U256::from(amount);
         self.set_total_deposit(id, counterparty, new_total).await?;
         self.read_state(channel, id).await
+    }
+
+    /// Send one write and wait for its receipt ([`send`], ADR 0073): the
+    /// only path a transaction leaves this backend by.
+    async fn transact(
+        &self,
+        transaction: TypedTransaction,
+    ) -> Result<TransactionReceipt, SettlementError> {
+        let hash = self.sender.send(transaction).await?;
+        confirm(&self.client, hash, self.confirm).await
     }
 
     /// Derive a single [`ChannelState`] from `TokenNetwork`'s two-sided
@@ -678,34 +717,61 @@ fn status_from_u8(state: u8) -> Result<ChannelStatus, SettlementError> {
     }
 }
 
-/// Builds the signing client every contract call goes through, alongside
-/// the address it signs as -- callers that need to name that address
-/// directly (minting a mock token to it, for instance) would otherwise
-/// have to re-derive it from `private_key` a second time.
+/// What [`build_client`] assembles from a transport and a key.
+struct BuiltClient {
+    client: Arc<EvmClient>,
+    sender: Sender,
+    chain_id: u64,
+    confirm: ConfirmPolicy,
+}
+
+impl BuiltClient {
+    /// [`EvmSettlementBackend::transact`], for the constructors that run
+    /// before there is a backend to call it on.
+    async fn transact(
+        &self,
+        transaction: TypedTransaction,
+    ) -> Result<TransactionReceipt, SettlementError> {
+        let hash = self.sender.send(transaction).await?;
+        confirm(&self.client, hash, self.confirm).await
+    }
+
+    /// Send a contract creation and return the address it deployed to.
+    async fn deployed_address(
+        &self,
+        deployment: TypedTransaction,
+    ) -> Result<Address, SettlementError> {
+        self.transact(deployment)
+            .await?
+            .contract_address
+            .ok_or_else(|| {
+                SettlementError::Backend(
+                    "a contract deployment's receipt names no contract address".to_string(),
+                )
+            })
+    }
+}
+
+/// The read client, the sender and the chain id, from `transport` and
+/// `private_key`. The chain id is read once (retried, since it is boot's
+/// first call) and bound into the key, so every signature carries it.
 async fn build_client(
-    rpc_url: &str,
+    transport: &RpcTransport,
     private_key: &str,
-) -> Result<(EvmClient, Address, u64), SettlementError> {
-    // ethers' default HTTP polling interval (7s) is tuned for mainnet block
-    // times, not a fast-confirming chain -- every open/fund/redeem/close
-    // otherwise pays that whole interval waiting for a receipt Anvil (or
-    // any low-block-time chain) already mined.
-    let provider = Provider::<Http>::try_from(rpc_url)
-        .map_err(backend_error)?
-        .interval(std::time::Duration::from_millis(100));
-    let chain_id = provider
-        .get_chainid()
+) -> Result<BuiltClient, SettlementError> {
+    let client = Arc::new(EvmRpc::provider(transport.clone()));
+    let chain_id = retry_read(|| client.get_chainid())
         .await
         .map_err(backend_error)?
         .as_u64();
     let wallet: LocalWallet = private_key.parse().map_err(backend_error)?;
-    let address = wallet.address();
-    let signer = SignerMiddleware::new(provider, wallet.with_chain_id(chain_id));
-    Ok((
-        NonceManagerMiddleware::new(signer, address),
-        address,
+    let sender = Sender::new(Arc::clone(&client), wallet.with_chain_id(chain_id));
+    Ok(BuiltClient {
+        client,
+        sender,
         chain_id,
-    ))
+        confirm: ConfirmPolicy::for_transport(transport),
+    })
 }
 
 /// A `TokenNetwork` counterparty must be a real 20-byte EVM address: it has
@@ -762,97 +828,6 @@ fn normalize_recovery_id(mut signature: Vec<u8>) -> Result<Vec<u8>, SettlementEr
     Ok(signature)
 }
 
-/// Wait for `pending` to mine and confirm it actually succeeded (issue
-/// #425: "confirmation ... handled explicitly rather than assumed",
-/// "a failed or reverted settlement transaction leaves recoverable
-/// state"). A transaction that reverts on chain is still mined -- it
-/// consumes gas and produces a receipt exactly like a successful one, with
-/// only `status` distinguishing the two -- so a caller that stopped at
-/// "did a receipt come back" would treat a reverted `redeem` or `close` as
-/// success and report whatever state happened to be there already as if
-/// the operation had taken effect. Checking `status` here, in the one
-/// place every channel operation confirms through, means every one of
-/// them fails loudly instead: nothing is ever recorded beyond what the
-/// chain itself did, so a reverted transaction leaves nothing to recover
-/// from beyond retrying with a fresh read of the real state.
-///
-/// `pending`'s own `Ok(None)` (issue #907) means ethers' `PendingTransaction`
-/// gave up polling `eth_getTransactionByHash` for this hash after a handful
-/// of tries -- it is *not* proof the transaction was dropped, only that this
-/// endpoint had not observed it yet. Against a load-balanced RPC (the
-/// devnet repro used `base-sepolia-rpc.publicnode.com`), consecutive polls
-/// can land on different backend nodes, some of which simply have not
-/// caught up to the block the transaction is actually in. Reporting that as
-/// "dropped" told an operator (or an automated caller) that resubmitting
-/// was safe when the transaction went on to mine -- a second `open`/`fund`
-/// call is a real double spend, not a retry. So `Ok(None)` here is not the
-/// end of the story: [`recheck_unobserved`] asks the chain directly, by
-/// hash, before this function concludes anything, and the failure it can
-/// still return says "not observed", carries the hash, and says plainly
-/// that retrying is not known to be safe -- never "dropped".
-async fn confirm<P: JsonRpcClient + Clone>(
-    pending: PendingTransaction<'_, P>,
-) -> Result<TransactionReceipt, SettlementError> {
-    let tx_hash = pending.tx_hash();
-    let provider = pending.provider();
-    let receipt = match pending
-        .await
-        .map_err(|error: ProviderError| backend_error(error))?
-    {
-        Some(receipt) => receipt,
-        None => recheck_unobserved(&provider, tx_hash).await?,
-    };
-    if receipt.status == Some(ethers::types::U64::zero()) {
-        return Err(SettlementError::Backend(format!(
-            "transaction {:#x} reverted on chain",
-            receipt.transaction_hash
-        )));
-    }
-    Ok(receipt)
-}
-
-/// How many direct `eth_getTransactionReceipt` calls [`recheck_unobserved`]
-/// makes, spaced [`UNOBSERVED_RECHECK_INTERVAL`] apart, before concluding a
-/// transaction genuinely cannot be confirmed right now. ethers' own
-/// `PendingTransaction` has already spent its own retry budget (at the
-/// endpoint's polling interval) failing to observe the hash before this
-/// runs at all, so this only needs to cover a load-balanced endpoint
-/// happening to route a further handful of requests to lagging backends.
-const UNOBSERVED_RECHECK_ATTEMPTS: usize = 4;
-
-/// How long [`recheck_unobserved`] waits between those calls -- long enough
-/// for a lagging backend to have caught up on a new block, short enough
-/// that the whole re-check stays within a caller's patience.
-const UNOBSERVED_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// The authoritative re-check `confirm` falls back to once ethers' own
-/// mempool-visibility polling has given up on a hash (issue #907). Unlike
-/// `PendingTransaction`'s `GettingTx` loop -- which asks whether the
-/// endpoint has the transaction *pending* -- this asks for the receipt
-/// directly, which exists the moment the transaction mines regardless of
-/// whether this endpoint's mempool view ever showed it as pending. A few
-/// spaced-out tries give a lagging load-balanced backend a chance to catch
-/// up before this reports anything.
-async fn recheck_unobserved<P: JsonRpcClient>(
-    provider: &Provider<P>,
-    tx_hash: ethers::types::TxHash,
-) -> Result<TransactionReceipt, SettlementError> {
-    for attempt in 0..UNOBSERVED_RECHECK_ATTEMPTS {
-        if attempt > 0 {
-            tokio::time::sleep(UNOBSERVED_RECHECK_INTERVAL).await;
-        }
-        if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
-            return Ok(receipt);
-        }
-    }
-    Err(SettlementError::Backend(format!(
-        "transaction {tx_hash:#x} was not observed within the timeout -- this is not proof it \
-         was dropped, only that this endpoint has not confirmed it yet; check its status by \
-         hash (a block explorer or a fresh eth_getTransactionReceipt call) before resubmitting, \
-         since a transaction that later mines would be double-spent by a retry"
-    )))
-}
-
 #[async_trait]
 impl SettlementBackend for EvmSettlementBackend {
     async fn open(
@@ -863,11 +838,13 @@ impl SettlementBackend for EvmSettlementBackend {
         let participant2 = counterparty_address(&counterparty)?;
         let seconds = settlement_timeout.num_seconds().max(0) as u64;
 
-        let call = self
-            .contract
-            .open_channel(participant2, U256::from(seconds));
-        let pending = call.send().await.map_err(backend_error)?;
-        let receipt = confirm(pending).await?;
+        let receipt = self
+            .transact(
+                self.contract
+                    .open_channel(participant2, U256::from(seconds))
+                    .tx,
+            )
+            .await?;
 
         for log in &receipt.logs {
             if let Ok(decoded) = self.contract.decode_event::<ChannelOpenedFilter>(
@@ -944,11 +921,12 @@ impl SettlementBackend for EvmSettlementBackend {
             locks_root: [0u8; 32],
         };
         let signature = normalize_recovery_id(claim.signature)?;
-        let call = self
-            .contract
-            .claim_from_channel(id, balance_proof, Bytes::from(signature));
-        let pending = call.send().await.map_err(backend_error)?;
-        confirm(pending).await?;
+        self.transact(
+            self.contract
+                .claim_from_channel(id, balance_proof, Bytes::from(signature))
+                .tx,
+        )
+        .await?;
 
         self.read_state(channel, id).await
     }
@@ -956,9 +934,7 @@ impl SettlementBackend for EvmSettlementBackend {
     async fn close(&self, channel: &ChannelId) -> Result<ChannelState, SettlementError> {
         let (id, _state) = self.open_channel(channel).await?;
 
-        let call = self.contract.close_channel(id);
-        let pending = call.send().await.map_err(backend_error)?;
-        confirm(pending).await?;
+        self.transact(self.contract.close_channel(id).tx).await?;
 
         self.read_state(channel, id).await
     }
@@ -982,9 +958,7 @@ impl SettlementBackend for EvmSettlementBackend {
             return Err(SettlementError::SettlementNotYetDue(channel.clone()));
         }
 
-        let call = self.contract.settle_channel(id);
-        let pending = call.send().await.map_err(backend_error)?;
-        confirm(pending).await?;
+        self.transact(self.contract.settle_channel(id).tx).await?;
 
         self.read_state(channel, id).await
     }
@@ -1066,154 +1040,5 @@ mod recovery_id_tests {
     fn an_empty_signature_is_refused_rather_than_panicking() {
         let error = normalize_recovery_id(Vec::new()).unwrap_err();
         assert!(matches!(error, SettlementError::InvalidClaimSignature(_)));
-    }
-}
-
-/// Issue #907: a transaction that mines must never be reported as dropped,
-/// because the obvious response to "dropped" is to retry, and retrying a
-/// transaction that already mined double-spends it.
-///
-/// The repro was a load-balanced RPC endpoint whose `eth_getTransactionByHash`
-/// answers came back empty for several consecutive polls even though the
-/// transaction had already mined -- ethers' own `PendingTransaction` gives up
-/// after exactly that pattern and resolves to `Ok(None)`, which `confirm`
-/// used to report verbatim as "dropped before mining". [`FlakyMempoolClient`]
-/// reproduces the endpoint's half of that behaviour deterministically: every
-/// RPC call reaches the real `anvil` chain except `eth_getTransactionByHash`,
-/// which always answers empty, forcing the exact `Ok(None)` `confirm` must
-/// now treat as "not observed" rather than "dropped".
-#[cfg(test)]
-mod confirm_tests {
-    use std::str::FromStr;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use async_trait::async_trait;
-    use ethers::middleware::SignerMiddleware;
-    use ethers::providers::{Http, JsonRpcClient, Middleware, PendingTransaction, Provider};
-    use ethers::signers::{LocalWallet, Signer};
-    use ethers::types::{TransactionRequest, TxHash};
-    use serde::de::DeserializeOwned;
-    use serde::Serialize;
-
-    use crate::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
-    use connector_settlement::SettlementError;
-
-    /// Forwards every RPC call to a real endpoint except
-    /// `eth_getTransactionByHash`, which always answers "not found" --
-    /// simulating a load-balanced RPC node that has never observed a given
-    /// transaction, regardless of what the chain itself has already done.
-    #[derive(Debug, Clone)]
-    struct FlakyMempoolClient {
-        inner: Http,
-    }
-
-    #[async_trait]
-    impl JsonRpcClient for FlakyMempoolClient {
-        type Error = <Http as JsonRpcClient>::Error;
-
-        async fn request<T, R>(&self, method: &str, params: T) -> Result<R, Self::Error>
-        where
-            T: std::fmt::Debug + Serialize + Send + Sync,
-            R: DeserializeOwned + Send,
-        {
-            if method == "eth_getTransactionByHash" {
-                return Ok(serde_json::from_value(serde_json::Value::Null).expect(
-                    "R is Option<Transaction> for this method, which `null` deserializes into",
-                ));
-            }
-            self.inner.request(method, params).await
-        }
-    }
-
-    fn flaky_provider(rpc_url: &str) -> Provider<FlakyMempoolClient> {
-        let http = Http::from_str(rpc_url).expect("valid anvil url");
-        Provider::new(FlakyMempoolClient { inner: http }).interval(Duration::from_millis(50))
-    }
-
-    #[tokio::test]
-    async fn a_transaction_the_endpoint_never_observed_pending_but_did_mine_still_confirms() {
-        if !require_anvil() {
-            return;
-        }
-        let anvil = Anvil::spawn(19_700).await;
-        let provider = flaky_provider(&anvil.rpc_url);
-        let wallet: LocalWallet = DEPLOYER_PRIVATE_KEY
-            .parse::<LocalWallet>()
-            .expect("valid key")
-            .with_chain_id(31_337u64);
-        let client = Arc::new(SignerMiddleware::new(provider, wallet));
-
-        // A self-transfer: what address it lands on doesn't matter, only
-        // that a real transaction is submitted and mines.
-        let tx = TransactionRequest::new()
-            .to(client.address())
-            .value(1u64)
-            .from(client.address());
-        let pending = client
-            .send_transaction(tx, None)
-            .await
-            .expect("submit to the real chain");
-
-        // The flaky client makes ethers' own polling give up and resolve to
-        // `Ok(None)` -- confirmed separately below so this test does not
-        // silently pass because the transaction never even reached that
-        // state.
-        let tx_hash = pending.tx_hash();
-        let gave_up = PendingTransaction::new(tx_hash, client.provider())
-            .interval(Duration::from_millis(20))
-            .retries(1)
-            .await
-            .expect("no transport error");
-        assert!(
-            gave_up.is_none(),
-            "expected the flaky client to reproduce ethers' own give-up (Ok(None)); the test \
-             setup is not exercising the case this fix addresses"
-        );
-
-        let receipt = super::confirm(
-            PendingTransaction::new(tx_hash, client.provider()).interval(Duration::from_millis(50)),
-        )
-        .await
-        .expect("a transaction that actually mined must confirm, not report as dropped");
-        assert_eq!(receipt.transaction_hash, tx_hash);
-        assert_eq!(receipt.status, Some(1.into()));
-    }
-
-    #[tokio::test]
-    async fn a_transaction_truly_never_observed_is_reported_as_not_observed_not_dropped() {
-        if !require_anvil() {
-            return;
-        }
-        let anvil = Anvil::spawn(19_750).await;
-        let provider = flaky_provider(&anvil.rpc_url);
-
-        // A hash nothing was ever submitted under -- the real chain
-        // genuinely has no receipt for it, so `confirm` must exhaust its
-        // recheck budget and fail, but with wording that does not claim the
-        // (nonexistent) transaction was dropped.
-        let tx_hash: TxHash = TxHash::from_low_u64_be(1);
-        let pending = PendingTransaction::new(tx_hash, &provider)
-            .interval(Duration::from_millis(20))
-            .retries(1);
-
-        let error = super::confirm(pending).await.unwrap_err();
-        let SettlementError::Backend(message) = error else {
-            panic!("expected SettlementError::Backend, got {error:?}");
-        };
-        assert!(
-            !message.contains("dropped before mining"),
-            "message must not assert the transaction was dropped -- that is a stronger claim \
-             than this function can ever verify: {message}"
-        );
-        assert!(
-            message.contains("not observed"),
-            "message should say plainly that it was not observed: {message}"
-        );
-        assert!(
-            message.contains(&format!("{tx_hash:#x}")),
-            "message must carry the transaction hash so a caller is not left to recover it via \
-             a block explorer: {message}"
-        );
     }
 }
