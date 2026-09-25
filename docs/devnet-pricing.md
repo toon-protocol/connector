@@ -39,25 +39,28 @@ appear in **no** committed file in any repository. They are established over the
 why writing them into the config file would take them away from that surface for good. Read them
 back with `GET /peers`; a `"source"` of `"runtime"` is that arrangement working.
 
-## The fleet, and whose repository owns each box
+## The fleet, and whose repository owns each node
 
-Four boxes and no apex — the apex (`toon`) was destroyed 2026-08-14 (#872, toon-meta#313).
-`g.toon` remains the namespace root in the wire protocol, and nothing answers at it.
+One host and no apex — the apex (`toon`) was destroyed 2026-08-14 (#872, toon-meta#313). `g.toon`
+remains the namespace root in the wire protocol, and nothing answers at it. The host is the Linode
+labelled `relay` (infra ADR 0001: the devnet is one host, and every node keeps its own connector):
+every hostname below is served by the one Caddy edge that host runs, not by a separate box per row.
 
-| Box            | Edge                                  | Terminates                               | Authority                                                                                                    |
-| -------------- | ------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| relay          | `proxy.relay.devnet.toonprotocol.dev` | `g.toon.relay`, `g.toon.relay.ephemeral` | [`toon-protocol/relay`](https://github.com/toon-protocol/relay) `deploy/connector.toml`                      |
-| store (`ario`) | `proxy.ario.devnet.toonprotocol.dev`  | `g.toon.store`, `g.toon.relay.store`     | [`toon-protocol/store`](https://github.com/toon-protocol/store) `deploy/connector.toml.template`             |
-| gas            | `proxy.gas.devnet.toonprotocol.dev`   | `g.toon.gas`, `g.toon.relay.gas`         | [`toon-protocol/gas-station`](https://github.com/toon-protocol/gas-station) `deploy/connector.toml.template` |
-| faucet         | `faucet.devnet.toonprotocol.dev`      | — no connector at all                    | `infra/linode-faucet/` in **this** repository                                                                |
+| Node           | Public hostname                         | Terminates                                | Authority                                                                                                    |
+| -------------- | --------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| relay          | `proxy.relay.devnet.toonprotocol.dev`   | `g.toon.relay`, `g.toon.relay.ephemeral`  | [`toon-protocol/relay`](https://github.com/toon-protocol/relay) `deploy/connector.toml`                      |
+| store (`ario`) | `proxy.ario.devnet.toonprotocol.dev`    | `g.toon.store`, `g.toon.relay.store`      | [`toon-protocol/store`](https://github.com/toon-protocol/store) `deploy/connector.toml.template`             |
+| gas-station    | `proxy.gas.devnet.toonprotocol.dev`     | `g.toon.gas`, `g.toon.relay.gas`          | [`toon-protocol/gas-station`](https://github.com/toon-protocol/gas-station) `deploy/connector.toml.template` |
+| gateway        | `proxy.gateway.devnet.toonprotocol.dev` | no priced route — a free Gateway Handover | [`toon-protocol/gateway`](https://github.com/toon-protocol/gateway) `deploy/`                                |
+| faucet         | `faucet.devnet.toonprotocol.dev`        | — no connector at all                     | `infra/linode-faucet/` in **this** repository                                                                |
 
-`ario` is a **box label and a DNS name**, and since store#109 (2026-08-27) it is nothing else:
-that box terminates `g.toon.store`, and a probe for `g.toon.ario` is a `404`. The two are easy to
-conflate precisely because the hostname still carries the older name — the box's own
+`ario` is a **node label and a DNS name**, and since store#109 (2026-08-27) it is nothing else:
+the store node terminates `g.toon.store`, and a probe for `g.toon.ario` is a `404`. The two are
+easy to conflate precisely because the hostname still carries the older name — the node's own
 `[node].http_endpoint` is `https://proxy.ario.devnet.toonprotocol.dev/ilp` while its
 `[node].addresses` are `g.toon.store` and `g.toon.relay.store`. See "Retired names" below.
 
-The faucet box is the one whose deploy this repository still owns, and
+The faucet is the one node whose deploy this repository still owns, and
 [ADR 0068](adr/0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md)
 says why: it has no connector, so it has no route and no price, and `fleet-ops.yml` offers it and
 nothing else.

@@ -71,9 +71,9 @@ treasury, or a chain is ever passed into a container running agent-authored code
 mean the ticket needs a human.** Two reviewed workflows exist to perform exactly this class of
 operation, and your token can dispatch them:
 
-- **`.github/workflows/fleet-ops.yml`** — live faucet-box work: `box-status` (read), and
-  `restart`, `deploy` (writes). It offers no other box: the relay and store boxes deploy from
-  their own repositories now (ADR 0068).
+- **`.github/workflows/fleet-ops.yml`** — live faucet work, on the one devnet host (infra ADR
+  0001): `box-status` (read), and `restart`, `deploy` (writes). It offers nothing else: relay,
+  store, gas-station and gateway each deploy from their own repositories now (ADR 0068).
 - **`.github/workflows/funded-ops.yml`** — EVM channel work needing a key that can sign and pay:
   `whoami`, `channel-status` (reads), and `deposit` (write).
 
