@@ -121,10 +121,15 @@ async fn solana_settlement_backend_upholds_the_contract() {
             .try_into()
             .expect("a Keypair's first 32 bytes are its seed");
         fund(&rpc, &node.pubkey()).await;
-        let backend =
-            SolanaSettlementBackend::connect(&rpc_url, &node_seed, program_id, token_mint, 6)
-                .await
-                .expect("connect to the genesis-loaded payment-channel program");
+        let backend = SolanaSettlementBackend::connect(
+            &connector_settlement_solana::RpcTransport::direct(&rpc_url).expect("rpc transport"),
+            &node_seed,
+            program_id,
+            token_mint,
+            6,
+        )
+        .await
+        .expect("connect to the genesis-loaded payment-channel program");
         // The node's own collateral. `fund` is a self-deposit (issue
         // #1118), so without tokens of its own here there is nothing for
         // it to put behind its own claims -- which is the whole point, and

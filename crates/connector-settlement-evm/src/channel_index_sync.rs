@@ -6,16 +6,21 @@
 //! actually queries and decodes logs, kept separate for exactly that
 //! reason.
 //!
-//! No `eth_subscribe`: this workspace standardizes on `Provider<Http>`
-//! everywhere (`EvmSettlementBackend::build_client`), and this syncer
-//! follows that rather than introducing the only WS-transport consumer in
-//! the codebase for one feature.
+//! No `eth_subscribe`: this workspace standardizes on HTTP JSON-RPC over the
+//! settlement table's one `RpcTransport` (ADR 0073), and this syncer follows
+//! that rather than introducing the only WS-transport consumer in the
+//! codebase for one feature. It takes the **same** transport the backend
+//! does, so it shares the backend's bounds, its refusal retries and, when
+//! the table is proxied, its circuit: a syncer left direct would be the
+//! whole leak ADR 0073 decision 2 exists to close.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use connector_chain_rpc::evm::EvmRpc;
+use connector_chain_rpc::RpcTransport;
 use ethers::contract::{ContractError, EthEvent};
-use ethers::providers::{Http, Middleware, Provider, ProviderError};
+use ethers::providers::{Middleware, Provider, ProviderError};
 use ethers::types::{Address, ValueOrArray};
 
 use crate::bindings::token_network::{
@@ -47,8 +52,6 @@ const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelIndexSyncError {
-    #[error("channel index sync could not build an RPC client for {rpc_url}: {reason}")]
-    Client { rpc_url: String, reason: String },
     #[error("channel index sync could not read the chain: {0}")]
     Provider(#[from] ProviderError),
     #[error("channel index sync could not read a TokenNetwork log: {0}")]
@@ -61,10 +64,11 @@ pub enum ChannelIndexSyncError {
 /// `ChannelSettled` logs (the close events are deliberately not indexed --
 /// see [`crate::channel_index`]'s module doc) and folds them into an
 /// [`EvmChannelIndex`]. Holds no signing key and sends no transaction -- a
-/// plain `Provider<Http>`, never [`crate::EvmSettlementBackend`]'s signing
-/// client, since this syncer only ever reads.
+/// plain provider over the table's transport, never
+/// [`crate::EvmSettlementBackend`]'s sender, since this syncer only ever
+/// reads.
 pub struct EvmChannelIndexSyncer {
-    contract: TokenNetworkContract<Provider<Http>>,
+    contract: TokenNetworkContract<Provider<EvmRpc>>,
     confirmations: u64,
     from_block: u64,
 }
@@ -75,23 +79,18 @@ impl EvmChannelIndexSyncer {
     /// depth of `0` at config load time, so the `max(1)` below is a second,
     /// defensive check rather than the primary one.
     pub fn new(
-        rpc_url: &str,
+        transport: &RpcTransport,
         contract_address: Address,
         confirmations: u64,
         from_block: u64,
-    ) -> Result<Self, ChannelIndexSyncError> {
-        let provider = Provider::<Http>::try_from(rpc_url)
-            .map_err(|source| ChannelIndexSyncError::Client {
-                rpc_url: rpc_url.to_string(),
-                reason: source.to_string(),
-            })?
-            .interval(Duration::from_millis(100));
+    ) -> Self {
+        let provider = EvmRpc::provider(transport.clone());
         let contract = TokenNetworkContract::new(contract_address, Arc::new(provider));
-        Ok(EvmChannelIndexSyncer {
+        EvmChannelIndexSyncer {
             contract,
             confirmations: confirmations.max(1),
             from_block,
-        })
+        }
     }
 
     /// One backfill/poll step: apply everything between this index's

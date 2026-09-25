@@ -29,9 +29,11 @@
 //!
 //! # What is not proxied
 //!
-//! The proxy covers the ILP wire and nothing else (ADR 0070 decision 4).
-//! Settlement RPC and the app's `handler_url` hold their own clients, and
-//! both still dial direct. This file makes no claim about either.
+//! This file is about the ILP wire (ADR 0070 decision 4). Settlement RPC
+//! and the app's `handler_url` hold their own clients; settlement RPC rides
+//! the proxy only when its table opts in (ADR 0073, asserted in
+//! `connector-chain-rpc` and `connector-cli`). This file makes no claim
+//! about either.
 
 use std::collections::HashMap;
 use std::io::Write as _;

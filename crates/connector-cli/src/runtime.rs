@@ -12,6 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::Router;
 
+use connector_chain_rpc::{Circuit, RpcTransport};
 use connector_client_edge::{
     ChannelLivenessPolicy, ChannelLookupFailed, ClientChannelRegistry, ClientChannelSource,
     ClientClaimGate, ClientPayoutLedger, DepositFloor, EvmChannel, PeerCarriages, SolanaChannel,
@@ -265,16 +266,19 @@ pub enum RuntimeError {
     /// fact about this binary's wiring rather than about the file -- see
     /// `RateSources`.
     QuotePathUnpollable { source: QuotePathUnusable },
-    /// The `[settlement.<chain>]` endpoint a declared quote path would be
-    /// read over is not one a rate source can be pointed at (ADR 0071
-    /// decision 6, issue #1293).
+    /// A `[settlement.<chain>]` table's endpoint cannot be dialed the way
+    /// it is written: its one transport (ADR 0073), which the backend, the
+    /// channel-index syncer and the rate source all share, could not be
+    /// built.
     ///
     /// `Config::load` already refuses an `rpc_url` that is not an `http(s)`
-    /// URL, so this is the second lock on that door too -- and a refusal to
-    /// start, for [`RuntimeError::QuotePathUnpollable`]'s reason: a node
-    /// whose pollers never started reads as priced in the file while every
-    /// forward across those pairs refuses.
-    RateSourceUnusable { endpoint: String, message: String },
+    /// URL and a `socks_proxy` that is not `socks5h://`, so this is the
+    /// second lock on those doors -- and a refusal to start, because a table
+    /// with no transport has no client that could settle on it.
+    SettlementEndpointUnusable {
+        table: &'static str,
+        message: String,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -417,11 +421,11 @@ impl fmt::Display for RuntimeError {
                  node's numeraire (ADR 0071 decision 3); a pair that cannot be sourced that way \
                  runs a [[rates]] row instead"
             ),
-            RuntimeError::RateSourceUnusable { endpoint, message } => write!(
+            RuntimeError::SettlementEndpointUnusable { table, message } => write!(
                 f,
-                "no rate source can be pointed at '{endpoint}': {message}. A declared quote path \
-                 is read over the rpc_url of the settlement table for the token's own chain \
-                 (ADR 0071 decision 6); there is no separate endpoint to configure for it"
+                "[settlement.{table}] rpc_url cannot be dialed as configured: {message}. Every \
+                 client of that endpoint -- the settlement backend, and on EVM the channel-index \
+                 syncer and the rate source -- shares one transport built from it (ADR 0073)"
             ),
         }
     }
@@ -559,12 +563,13 @@ fn parse_solana_pubkey(field: &'static str, value: &str) -> Result<Pubkey, Runti
 /// a startup failure, not a line with no effect (ADR 0009).
 async fn build_evm_settlement_backend(
     settlement: &EvmSettlementConfig,
+    transport: &RpcTransport,
 ) -> Result<Arc<EvmSettlementBackend>, RuntimeError> {
     let private_key = read_settlement_private_key(settlement.key())?;
     let registry_address = ethers::types::Address::from(settlement.contract_address());
     let token_address = ethers::types::Address::from(settlement.token_address());
     let backend = EvmSettlementBackend::connect(
-        settlement.rpc_url(),
+        transport,
         &private_key,
         registry_address,
         token_address,
@@ -742,12 +747,13 @@ fn check_evm_channel_domains(config: &Config, settled: EvmDomain) -> Result<(), 
 /// Solana-flavored, ADR 0009).
 async fn build_solana_settlement_backend(
     settlement: &SolanaSettlementConfig,
+    transport: &RpcTransport,
 ) -> Result<Arc<SolanaSettlementBackend>, RuntimeError> {
     let payer_seed = read_settlement_key_bytes(settlement.key())?;
     let program_id = parse_solana_pubkey("program_id", settlement.program_id())?;
     let token_mint = parse_solana_pubkey("token_address", settlement.token_address())?;
     let backend = SolanaSettlementBackend::connect(
-        settlement.rpc_url(),
+        transport,
         &payer_seed,
         program_id,
         token_mint,
@@ -1311,7 +1317,8 @@ const OUTBOUND_CLIENT_LEDGER: &str = "outbound-client.log";
 /// of a covering claim long before the carriage was asked to carry it. It is
 /// the ILP wire by ADR 0070 decision 4's own division: the two things that
 /// decision keeps direct are settlement RPC and the app's `handler_url`, and
-/// both hold their own clients elsewhere.
+/// both hold their own clients elsewhere. (ADR 0073 lets a settlement table
+/// opt its RPC onto the proxy; that is [`settlement_transports`], not this.)
 ///
 /// [`is_onion_endpoint`] is called rather than re-derived, for the reason
 /// that function's own doc gives: the suffix that decides a carriage and the
@@ -1758,10 +1765,14 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     let mut client_channel_source_solana: Option<Arc<dyn ClientChannelSource>> = None;
     let mut solana_cluster: Option<&'static str> = None;
     let mut settlements: Vec<connector_client_edge::X402ChainSettlementTerms> = Vec::new();
+    // Each table's one transport, built once and handed to every client of
+    // its `rpc_url` below (ADR 0073 decision 2).
+    let transports = settlement_transports(config)?;
     for settlement in config.settlements() {
         match settlement {
             SettlementConfig::Evm(evm) => {
-                let backend = build_evm_settlement_backend(evm).await?;
+                let transport = transports.for_chain(SettlementChain::Evm)?;
+                let backend = build_evm_settlement_backend(evm, transport).await?;
                 // The file, held against the chain, before a single fact
                 // this backend resolved is used for anything else (issue
                 // #1136). Same posture and same moment as `connect`'s own
@@ -1832,15 +1843,14 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 // The syncer queries the contract the index is bound to,
                 // from the one value, so the two cannot drift into
                 // indexing one contract under another's name.
+                // The same transport as the backend's: a syncer dialing on
+                // its own would be the one client left direct (ADR 0073).
                 let syncer = EvmChannelIndexSyncer::new(
-                    evm.rpc_url(),
+                    transport,
                     indexed_contract.token_network,
                     evm.channel_index_confirmations(),
                     evm.channel_index_from_block(),
-                )
-                .map_err(|source| {
-                    RuntimeError::Settlement(SettlementError::Backend(source.to_string()))
-                })?;
+                );
                 // Backfill-then-poll runs for the life of the process,
                 // never blocking startup (issue #661's own acceptance
                 // criterion) -- a lagging or never-connecting sync logs at
@@ -1868,7 +1878,11 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 // and the greeting's per-chain settlement facts are
                 // composed here as well (issue #632) -- epic #627's
                 // remaining children, together.
-                let backend = build_solana_settlement_backend(solana).await?;
+                let backend = build_solana_settlement_backend(
+                    solana,
+                    transports.for_chain(SettlementChain::Solana)?,
+                )
+                .await?;
                 // Which chain that connection actually reached, from the
                 // chain's own genesis hash rather than from the shape of
                 // the URL used to reach it (issue #1131).
@@ -1941,7 +1955,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         // Every declared quote path, connected to the reader that can
         // actually read it and left polling in the background. A node whose
         // pairs are all static `[[rates]]` rows starts nothing here.
-        spawn_quote_path_pollers(table, config)?;
+        spawn_quote_path_pollers(table, config, &transports)?;
     }
     // ADR 0071 decisions 1 and 2, issues #1295 and #1301: the facts the
     // forwarding path's converting arm reads, and the only ones. Which
@@ -2055,12 +2069,13 @@ pub fn spawn_rate_pollers(
 fn spawn_quote_path_pollers(
     table: &SharedRateTable,
     config: &Config,
+    transports: &SettlementTransports,
 ) -> Result<usize, RuntimeError> {
     let denomination = config.denomination();
     if denomination.quoted_tokens().next().is_none() {
         return Ok(0);
     }
-    let sources = rate_sources(config)?;
+    let sources = rate_sources(transports);
     let started = spawn_rate_pollers(table, &sources, config)?;
     tracing::info!(
         started,
@@ -2097,30 +2112,93 @@ fn spawn_quote_path_pollers(
 /// same endpoint rather than reaching through a `SettlementBackend`, which
 /// decision 6 keeps out of every value path. The two share a URL and
 /// nothing else.
-fn rate_sources(config: &Config) -> Result<RateSources, RuntimeError> {
+fn rate_sources(transports: &SettlementTransports) -> RateSources {
     let mut sources = RateSources::none();
-    if let Some(rpc_url) = config
-        .settlements()
-        .iter()
-        .find_map(|settlement| match settlement {
-            SettlementConfig::Evm(evm) => Some(evm.rpc_url()),
-            SettlementConfig::Solana(_) => None,
-        })
-    {
-        // Rendered rather than carried: `RateSourceError` is a wide enum
-        // built for a *read* failure -- pool, pair, window -- and only its
-        // one construction-time variant can reach here. Keeping the whole
-        // of it in `RuntimeError` would make every `Result` in this module
-        // pay for a refusal `Config::load` has already made.
-        let source = UniswapV3RateSource::connect(rpc_url).map_err(|source| {
-            RuntimeError::RateSourceUnusable {
-                endpoint: rpc_url.to_string(),
-                message: source.to_string(),
-            }
-        })?;
-        sources = sources.with(AssetChain::Evm, Arc::new(source));
+    // The EVM table's own transport, shared with its backend and syncer:
+    // a rate source dialing on its own would be the one client of that
+    // `rpc_url` left direct (ADR 0073 decision 2).
+    if let Some(transport) = &transports.evm {
+        sources = sources.with(
+            AssetChain::Evm,
+            Arc::new(UniswapV3RateSource::connect(transport)),
+        );
     }
-    Ok(sources)
+    sources
+}
+
+/// Each settlement table's one [`RpcTransport`] (ADR 0073 decision 2):
+/// built here, once, and handed to every client of that table's `rpc_url`
+/// -- the backend, and on EVM the channel-index syncer and the rate source.
+/// One of them left on a client of its own would be one client outside the
+/// bounds, the refusal retries and the circuit.
+///
+/// A table with `rpc_via_socks_proxy = true` gets a transport through the
+/// node's one `socks_proxy`, on its chain's own pinned [`Circuit`]; every
+/// other table dials direct. Which is which is the table's own key, never
+/// inferred from the `rpc_url` (ADR 0073 decision 1).
+pub(crate) struct SettlementTransports {
+    evm: Option<RpcTransport>,
+    solana: Option<RpcTransport>,
+}
+
+impl SettlementTransports {
+    /// The transport for a table `config.settlements()` named. The loader
+    /// guarantees one per configured chain, so a miss is a wiring error
+    /// reported rather than a panic.
+    fn for_chain(&self, chain: SettlementChain) -> Result<&RpcTransport, RuntimeError> {
+        let transport = match chain {
+            SettlementChain::Evm => self.evm.as_ref(),
+            SettlementChain::Solana => self.solana.as_ref(),
+        };
+        transport.ok_or(RuntimeError::SettlementEndpointUnusable {
+            table: chain.name(),
+            message: "no transport was built for a table the config names".to_string(),
+        })
+    }
+}
+
+/// Build [`SettlementTransports`] from `config`'s settlement tables.
+pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTransports, RuntimeError> {
+    let mut transports = SettlementTransports {
+        evm: None,
+        solana: None,
+    };
+    for settlement in config.settlements() {
+        let chain = settlement.chain();
+        let unusable = |message: String| RuntimeError::SettlementEndpointUnusable {
+            table: chain.name(),
+            message,
+        };
+        let transport = if settlement.rpc_via_socks_proxy() {
+            // `Config::load` refuses this key without a `socks_proxy`, so the
+            // miss is reported rather than expected; it is never a reason to
+            // dial direct (ADR 0073 decision 2).
+            let proxy = config.socks_proxy().ok_or_else(|| {
+                unusable("rpc_via_socks_proxy is set and there is no socks_proxy".to_string())
+            })?;
+            let circuit = match chain {
+                SettlementChain::Evm => Circuit::EvmSettlement,
+                SettlementChain::Solana => Circuit::SolanaSettlement,
+            };
+            let transport = RpcTransport::through(settlement.rpc_url(), proxy, circuit)
+                .map_err(|error| unusable(error.to_string()))?;
+            tracing::info!(
+                table = chain.name(),
+                endpoint = %transport.endpoint(),
+                circuit = circuit.socks_username(),
+                "settlement rpc via socks_proxy"
+            );
+            transport
+        } else {
+            RpcTransport::direct(settlement.rpc_url())
+                .map_err(|error| unusable(error.to_string()))?
+        };
+        match chain {
+            SettlementChain::Evm => transports.evm = Some(transport),
+            SettlementChain::Solana => transports.solana = Some(transport),
+        }
+    }
+    Ok(transports)
 }
 
 /// How often [`router`]'s spawned loop sweeps the client edge's channels
@@ -6543,7 +6621,8 @@ key_file = "{key_path}"
             assert_ne!(junk_mint, configured_mint);
             drop(other);
             let node_backend = SolanaSettlementBackend::connect(
-                &validator.rpc_url,
+                &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
+                    .expect("rpc transport"),
                 &opener.test_payer_seed(),
                 program_id,
                 configured_mint,
@@ -6589,7 +6668,8 @@ key_file = "{key_path}"
             // Control: the byte-identical claim is accepted through a
             // backend configured with the channel's own mint.
             let matching_backend = SolanaSettlementBackend::connect(
-                &validator.rpc_url,
+                &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
+                    .expect("rpc transport"),
                 &opener.test_payer_seed(),
                 program_id,
                 junk_mint,
@@ -6857,7 +6937,8 @@ key_file = "{key_path}"
                 .expect("open a channel with no deposit at all");
 
             let node_backend = SolanaSettlementBackend::connect(
-                &validator.rpc_url,
+                &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
+                    .expect("rpc transport"),
                 &opener.test_payer_seed(),
                 program_id,
                 token_mint,
@@ -6957,7 +7038,8 @@ key_file = "{key_path}"
                 .expect("a real on-chain deposit, so the claim below is genuinely collateralized");
 
             let node_backend = SolanaSettlementBackend::connect(
-                &validator.rpc_url,
+                &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
+                    .expect("rpc transport"),
                 &opener.test_payer_seed(),
                 program_id,
                 token_mint,
@@ -7262,8 +7344,12 @@ max_move = {{ numerator = 5, denominator = 100 }}
             let table = SharedRateTable::from_config(config.denomination())
                 .expect("a node that declares tokens deals");
 
-            let started = spawn_quote_path_pollers(&table, &config)
-                .expect("a quote path on the chain this node settles on");
+            let started = spawn_quote_path_pollers(
+                &table,
+                &config,
+                &settlement_transports(&config).expect("transports"),
+            )
+            .expect("a quote path on the chain this node settles on");
 
             assert_eq!(started, 1, "the one declared quote path is polled");
         }
@@ -7323,8 +7409,12 @@ max_move = {{ numerator = 5, denominator = 100 }}
             let table = SharedRateTable::from_config(config.denomination())
                 .expect("a node that declares tokens deals");
 
-            let refused = spawn_quote_path_pollers(&table, &config)
-                .expect_err("no source reads Solana pools");
+            let refused = spawn_quote_path_pollers(
+                &table,
+                &config,
+                &settlement_transports(&config).expect("transports"),
+            )
+            .expect_err("no source reads Solana pools");
 
             assert!(
                 matches!(
@@ -7385,9 +7475,185 @@ max_move = {{ numerator = 5, denominator = 100 }}
                 .expect("a node that declares tokens deals");
 
             assert_eq!(
-                spawn_quote_path_pollers(&table, &config).expect("nothing to poll is not an error"),
+                spawn_quote_path_pollers(
+                    &table,
+                    &config,
+                    &settlement_transports(&config).expect("transports")
+                )
+                .expect("nothing to poll is not an error"),
                 0
             );
+        }
+    }
+
+    /// ADR 0073 decisions 2 and 3 at the seam where the node builds its
+    /// settlement clients: a table with `rpc_via_socks_proxy = true` reaches
+    /// its endpoint through the node's `socks_proxy`, as a name, on its own
+    /// chain's circuit, and every client built from its one transport does.
+    ///
+    /// Both endpoints are onion names, which nothing on this machine
+    /// resolves, and the fake RPCs behind them listen on loopback. So a
+    /// request that reached a fake at all went through the SOCKS5 server's
+    /// route table: the dial was proxied and deferred resolution to the
+    /// proxy. The proxy's own record then says which username each chain
+    /// authenticated with.
+    mod settlement_rpc_route {
+        use super::*;
+        use std::collections::HashMap;
+
+        use connector_chain_rpc::evm::EvmRpc;
+        use connector_chain_rpc::solana::rpc_client;
+        use connector_chain_rpc::{FakeRpc, RpcReply};
+        use connector_rate_source::{PoolId, QuoteLeg, RateSource};
+        use connector_runtime::Socks5TestServer;
+        use ethers::providers::Middleware;
+        use solana_rpc_client::rpc_client::RpcClientConfig;
+        use solana_sdk::commitment_config::CommitmentConfig;
+
+        const EVM_HOST: &str = "evmsettlementrpcevmsettlementrpcevmsettlementrpcevmsett.onion";
+        const SOLANA_HOST: &str = "solanasettlementrpcsolanasettlementrpcsolanasettlementr.anyone";
+
+        fn config(proxy: &url::Url, evm_proxied: bool, key_path: &std::path::Path) -> Config {
+            load_config(&format!(
+                r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "/tmp/connector-settlement-rpc-route"
+socks_proxy = "{proxy}"
+
+[signer]
+key_file = "{key}"
+
+[settlement.evm]
+rpc_url = "http://{EVM_HOST}/"
+contract_address = "0x00000000000000000000000000000000000000aa"
+token_address = "0x00000000000000000000000000000000000000bb"
+decimals = 6
+rpc_via_socks_proxy = {evm_proxied}
+
+[settlement.evm.key]
+key_file = "{key}"
+
+[settlement.solana]
+rpc_url = "http://{SOLANA_HOST}/"
+program_id = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip"
+token_address = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+decimals = 6
+rpc_via_socks_proxy = true
+
+[settlement.solana.key]
+key_file = "{key}"
+"#,
+                key = key_path.display(),
+            ))
+        }
+
+        #[tokio::test]
+        async fn every_client_of_a_proxied_table_rides_the_proxy_on_that_chains_circuit() {
+            let evm_rpc = FakeRpc::spawn(|call| match call.method.as_str() {
+                "eth_blockNumber" => RpcReply::Result(serde_json::json!("0x2a")),
+                _ => RpcReply::Error {
+                    code: -32601,
+                    message: "not served by this fake".to_string(),
+                },
+            })
+            .await;
+            let solana_rpc = FakeRpc::spawn(|_| RpcReply::Result(serde_json::json!(7))).await;
+            let proxy = Socks5TestServer::spawn(HashMap::from([
+                (format!("{EVM_HOST}:80"), evm_rpc.addr()),
+                (format!("{SOLANA_HOST}:80"), solana_rpc.addr()),
+            ]))
+            .await;
+            let key = tempfile::NamedTempFile::new().expect("key file");
+            let config = config(&proxy.proxy_url(), true, key.path());
+
+            let transports = settlement_transports(&config).expect("transports");
+            let evm = transports.for_chain(SettlementChain::Evm).expect("evm");
+            let solana = transports
+                .for_chain(SettlementChain::Solana)
+                .expect("solana");
+            assert!(evm.is_proxied() && solana.is_proxied());
+
+            // The three EVM clients `build` makes from the one transport.
+            assert_eq!(
+                EvmRpc::provider(evm.clone())
+                    .get_block_number()
+                    .await
+                    .expect("the backend's reads, through the proxy")
+                    .as_u64(),
+                42
+            );
+            let index = EvmChannelIndex::open(
+                None,
+                IndexedContract {
+                    chain_id: 84_532,
+                    token_network: ethers::types::Address::zero(),
+                },
+                1_000,
+            )
+            .expect("an in-memory index");
+            EvmChannelIndexSyncer::new(evm, ethers::types::Address::zero(), 1, 1_000)
+                .sync_once(&index)
+                .await
+                .expect("the syncer's head read, through the proxy");
+            let _ = UniswapV3RateSource::connect(evm)
+                .observe(&QuoteLeg {
+                    pool: PoolId("0x00000000000000000000000000000000000000cc".to_string()),
+                    base: connector_domain::AssetId::evm(
+                        "0x00000000000000000000000000000000000000bb",
+                    ),
+                    quote: connector_domain::AssetId::evm(
+                        "0x00000000000000000000000000000000000000dd",
+                    ),
+                    window: chrono::Duration::seconds(60),
+                })
+                .await;
+            assert!(
+                evm_rpc.count("eth_getBlockByNumber") >= 1,
+                "the rate source's read reached the onion-named endpoint, so it was proxied"
+            );
+
+            // The Solana backend's client, on its own circuit.
+            let client = rpc_client(
+                solana,
+                RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+            );
+            assert_eq!(client.get_slot().await.expect("through the proxy"), 7);
+
+            let connects = proxy.connects();
+            assert!(
+                connects.iter().any(|c| c.target == format!("{EVM_HOST}:80")
+                    && c.username.as_deref() == Some(Circuit::EvmSettlement.socks_username())),
+                "{connects:?}"
+            );
+            assert!(
+                connects
+                    .iter()
+                    .any(|c| c.target == format!("{SOLANA_HOST}:80")
+                        && c.username.as_deref()
+                            == Some(Circuit::SolanaSettlement.socks_username())),
+                "{connects:?}"
+            );
+            assert!(
+                connects.iter().all(|c| c.username.is_some()),
+                "no settlement dial went through the proxy unpinned: {connects:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_table_that_does_not_opt_in_dials_direct_beside_one_that_does() {
+            let proxy = Socks5TestServer::spawn_recording_only().await;
+            let key = tempfile::NamedTempFile::new().expect("key file");
+            let config = config(&proxy.proxy_url(), false, key.path());
+
+            let transports = settlement_transports(&config).expect("transports");
+            assert!(!transports
+                .for_chain(SettlementChain::Evm)
+                .expect("evm")
+                .is_proxied());
+            assert!(transports
+                .for_chain(SettlementChain::Solana)
+                .expect("solana")
+                .is_proxied());
         }
     }
 }

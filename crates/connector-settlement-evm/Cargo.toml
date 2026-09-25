@@ -17,8 +17,15 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+# The table's shared transport (ADR 0073): bounds, refusal retries and,
+# when `rpc_via_socks_proxy` is set, the pinned circuit. The backend and the
+# channel-index syncer take one rather than a URL.
+connector-chain-rpc = { path = "../connector-chain-rpc", features = ["evm"] }
 
 [dev-dependencies]
+# `FakeRpc`: confirmation and the lost-send path are tested against an
+# endpoint that drops, refuses or loses an answer on cue, in front of anvil.
+connector-chain-rpc = { path = "../connector-chain-rpc", features = ["evm", "test-support"] }
 # This crate itself, with `test-util` on, so its own integration tests can
 # reach the fixture-only `fund_counterparty` (issue #1118) -- the delegate
 # deposit that is no longer part of the port. Mirrors what

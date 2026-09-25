@@ -557,6 +557,47 @@ token_network_address = "0x00000000000000000000000000000000000000bb"
     );
 }
 
+/// ADR 0073 decision 1, through the real binary: a settlement table that
+/// asks for its RPC to ride the node's `socks_proxy`, on a node that has
+/// none, stops the node by name. It never falls back to dialing direct.
+#[test]
+fn exits_non_zero_when_settlement_rpc_is_routed_through_a_socks_proxy_that_is_not_configured() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let config_file = write_config(&format!(
+        r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement.solana]
+rpc_url = "https://api.devnet.solana.com"
+program_id = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip"
+token_address = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+decimals = 6
+rpc_via_socks_proxy = true
+
+[settlement.solana.key]
+key_file = "{key_file}"
+"#,
+        key_file = key_file.path().display(),
+        state_dir = state_dir.path().display(),
+    ));
+
+    let output = run(Some(config_file.path()));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[settlement.solana]")
+            && stderr.contains("rpc_via_socks_proxy")
+            && stderr.contains("no socks_proxy"),
+        "expected the error to name the table, the key and the missing proxy, got: {stderr}"
+    );
+}
+
 /// A node with nowhere writable fails at startup, naming the path -- not
 /// at the first claim, hours later, on a packet path where the only
 /// honest answer left is to refuse a claim that was perfectly good.
