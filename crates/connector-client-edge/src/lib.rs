@@ -95,12 +95,13 @@ mod peer;
 mod session_registry;
 mod session_route;
 pub use batch_settlement::{
-    AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
+    journaled_batch_channels, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
+    BatchSettlementChannels, JournaledBatchChannel,
 };
 pub use channels::{
-    ChannelLivenessPolicy, ChannelLookupFailed, ChannelResolutionError, ClientChannelRegistry,
-    ClientChannelSource, DepositFloor, EvmChannel, InvalidChannelIdentifier, SolanaChannel,
-    DEFAULT_LIVENESS_TTL, DEFAULT_MIN_REATTEMPT_INTERVAL, DEFAULT_SERVE_STALE_UNTIL,
+    ChannelLivenessPolicy, ChannelLookupFailed, ChannelResolutionError, ChannelTerminal,
+    ClientChannelRegistry, ClientChannelSource, DepositFloor, EvmChannel, InvalidChannelIdentifier,
+    SolanaChannel, DEFAULT_LIVENESS_TTL, DEFAULT_MIN_REATTEMPT_INTERVAL, DEFAULT_SERVE_STALE_UNTIL,
 };
 pub use claim_gate::{ClaimIngestRejection, ClientClaimGate};
 pub use lookup_budget::{

@@ -10,10 +10,22 @@
 //! of these** ([`crate::ClientClaimGate::with_batch_settlement`]). A gate
 //! without one refuses every voucher by name
 //! ([`crate::ClaimIngestRejection::BatchSettlementNotAccepted`]) -- ADR 0074
-//! decision 1's "off unless configured". Nothing in the runtime passes one
-//! yet: the config that opts a chain in and the backends that answer these
-//! questions are #1340/#1342/#1343, and wiring them is a
-//! `with_batch_settlement` call in `connector-cli`'s runtime once they exist.
+//! decision 1's "off unless configured". `connector-cli`'s runtime passes
+//! one exactly when a `[settlement.<chain>.batch_settlement]` table is
+//! written, adapting that chain's receive-only settlement port to this
+//! trait.
+//!
+//! # What the journal remembers
+//!
+//! A voucher signs only its channel's id, and on EVM that id is a hash of a
+//! `ChannelConfig` the contract never gives back -- so a node that forgot the
+//! config could never `claim` a voucher it had already accepted. The gate
+//! therefore journals each channel it accepts a first voucher on as a
+//! [`JournalEntry::BatchChannelAdmitted`], in the same batch as the voucher,
+//! and [`journaled_batch_channels`] reads them back: the gate, to hand a
+//! known channel's config to [`BatchSettlementChannels::evm`] when a later
+//! voucher carries none, and the runtime, to re-admit every such channel to
+//! its backend at boot.
 //!
 //! # What an implementation owes
 //!
@@ -35,6 +47,9 @@
 //! implementation's job.
 
 use async_trait::async_trait;
+use connector_domain::client_claim::{EVM_NAMESPACE, SOLANA_NAMESPACE};
+use connector_domain::JournalEntry;
+use connector_runtime::JournalError;
 use connector_signer::{BatchChannelConfig, BatchSettlementDomain};
 
 use crate::channels::ChannelResolutionError;
@@ -91,4 +106,218 @@ pub trait BatchSettlementChannels: Send + Sync + std::fmt::Debug {
         &self,
         channel_account: &[u8; 32],
     ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError>;
+}
+
+/// A batch-settlement channel the client edge has accepted a voucher on, as
+/// its journal records it: enough to re-admit the channel to its backend
+/// (ADR 0074 decision 2) without the client presenting anything again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournaledBatchChannel {
+    /// The channel's id and the `ChannelConfig` it is the hash of -- the
+    /// config the gate verified hashes to it before the channel's first
+    /// voucher was accepted.
+    Evm {
+        channel_id: [u8; 32],
+        config: BatchChannelConfig,
+    },
+    /// The channel account. Every other field is on chain.
+    Solana { channel_account: [u8; 32] },
+}
+
+/// Bytes in an EVM presentation: five addresses, the `withdrawDelay` as a
+/// big-endian `u64`, and the salt.
+const EVM_PRESENTATION_LEN: usize = 5 * 20 + 8 + 32;
+
+impl JournaledBatchChannel {
+    /// The canonical key this channel's watermark is filed under -- the key
+    /// a voucher on it produces (`ClientClaim::channel_key`).
+    pub fn channel_key(&self) -> String {
+        match self {
+            JournaledBatchChannel::Evm { channel_id, .. } => {
+                format!("{EVM_NAMESPACE}:0x{}", hex::encode(channel_id))
+            }
+            JournaledBatchChannel::Solana { channel_account } => format!(
+                "{SOLANA_NAMESPACE}:{}",
+                bs58::encode(channel_account).into_string()
+            ),
+        }
+    }
+
+    /// The journal entry that records this channel.
+    pub(crate) fn to_entry(self) -> JournalEntry {
+        let presentation = match &self {
+            JournaledBatchChannel::Evm { config, .. } => {
+                let mut bytes = Vec::with_capacity(EVM_PRESENTATION_LEN);
+                for address in [
+                    config.payer,
+                    config.payer_authorizer,
+                    config.receiver,
+                    config.receiver_authorizer,
+                    config.token,
+                ] {
+                    bytes.extend_from_slice(&address);
+                }
+                bytes.extend_from_slice(&config.withdraw_delay.to_be_bytes());
+                bytes.extend_from_slice(&config.salt);
+                bytes
+            }
+            JournaledBatchChannel::Solana { .. } => Vec::new(),
+        };
+        JournalEntry::BatchChannelAdmitted {
+            channel_id: self.channel_key(),
+            presentation,
+        }
+    }
+
+    /// [`Self::to_entry`]'s inverse; `None` for an entry no build of this
+    /// gate writes.
+    fn from_entry(channel_id: &str, presentation: &[u8]) -> Option<JournaledBatchChannel> {
+        match channel_id.split_once(':')? {
+            (EVM_NAMESPACE, id) => {
+                let id = hex::decode(id.strip_prefix("0x")?).ok()?;
+                if presentation.len() != EVM_PRESENTATION_LEN {
+                    return None;
+                }
+                let address = |index: usize| -> [u8; 20] {
+                    presentation[index * 20..(index + 1) * 20]
+                        .try_into()
+                        .expect("a 20-byte slice")
+                };
+                let delay: [u8; 8] = presentation[100..108].try_into().expect("8 bytes");
+                Some(JournaledBatchChannel::Evm {
+                    channel_id: id.try_into().ok()?,
+                    config: BatchChannelConfig {
+                        payer: address(0),
+                        payer_authorizer: address(1),
+                        receiver: address(2),
+                        receiver_authorizer: address(3),
+                        token: address(4),
+                        withdraw_delay: u64::from_be_bytes(delay),
+                        salt: presentation[108..].try_into().expect("32 bytes"),
+                    },
+                })
+            }
+            (SOLANA_NAMESPACE, account) if presentation.is_empty() => {
+                let account = bs58::decode(account).into_vec().ok()?;
+                Some(JournaledBatchChannel::Solana {
+                    channel_account: account.try_into().ok()?,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Every batch-settlement channel `entries` records, once each, in the order
+/// first recorded. A later record of the same channel -- written again after
+/// a rollback or a failed batch left its watermark empty -- is the same
+/// channel and is not repeated.
+///
+/// # Errors
+///
+/// [`JournalError::Corrupt`] for a record no build of the gate writes: the
+/// journal is this node's money state, and a channel it cannot read back is
+/// one whose accepted vouchers it could never land, so the node refuses to
+/// start rather than drop it (ADR 0009).
+pub fn journaled_batch_channels(
+    entries: &[JournalEntry],
+) -> Result<Vec<JournaledBatchChannel>, JournalError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut channels = Vec::new();
+    for entry in entries {
+        let JournalEntry::BatchChannelAdmitted {
+            channel_id,
+            presentation,
+        } = entry
+        else {
+            continue;
+        };
+        let channel =
+            JournaledBatchChannel::from_entry(channel_id, presentation).ok_or_else(|| {
+                JournalError::Corrupt(format!(
+                    "unreadable batch-settlement channel '{channel_id}'"
+                ))
+            })?;
+        if seen.insert(channel.channel_key()) {
+            channels.push(channel);
+        }
+    }
+    Ok(channels)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evm() -> JournaledBatchChannel {
+        JournaledBatchChannel::Evm {
+            channel_id: [0xab; 32],
+            config: BatchChannelConfig {
+                payer: [1; 20],
+                payer_authorizer: [2; 20],
+                receiver: [3; 20],
+                receiver_authorizer: [4; 20],
+                token: [5; 20],
+                withdraw_delay: 86_400,
+                salt: [6; 32],
+            },
+        }
+    }
+
+    fn solana() -> JournaledBatchChannel {
+        JournaledBatchChannel::Solana {
+            channel_account: [0xc3; 32],
+        }
+    }
+
+    #[test]
+    fn a_journaled_channel_reads_back_as_itself_on_either_chain() {
+        let entries = vec![evm().to_entry(), solana().to_entry()];
+        assert_eq!(
+            journaled_batch_channels(&entries).unwrap(),
+            vec![evm(), solana()]
+        );
+    }
+
+    /// The key is the one a voucher on the channel is filed under, so the
+    /// record and the watermark always name the same channel.
+    #[test]
+    fn a_journaled_channel_is_keyed_as_its_vouchers_are() {
+        assert_eq!(evm().channel_key(), format!("evm:0x{}", "ab".repeat(32)));
+        assert_eq!(
+            solana().channel_key(),
+            format!("solana:{}", bs58::encode([0xc3; 32]).into_string())
+        );
+    }
+
+    #[test]
+    fn a_channel_recorded_twice_is_one_channel() {
+        let entries = vec![
+            evm().to_entry(),
+            JournalEntry::InboundClaimWatermarkReset {
+                channel_id: evm().channel_key(),
+            },
+            evm().to_entry(),
+        ];
+        assert_eq!(journaled_batch_channels(&entries).unwrap(), vec![evm()]);
+    }
+
+    #[test]
+    fn a_record_this_gate_never_writes_refuses_the_replay() {
+        for (channel_id, presentation) in [
+            (evm().channel_key(), vec![0u8; 3]),
+            ("evm:not-hex".to_string(), vec![0u8; EVM_PRESENTATION_LEN]),
+            (solana().channel_key(), vec![1u8]),
+            ("mina:whatever".to_string(), Vec::new()),
+        ] {
+            let entries = vec![JournalEntry::BatchChannelAdmitted {
+                channel_id,
+                presentation,
+            }];
+            assert!(matches!(
+                journaled_batch_channels(&entries),
+                Err(JournalError::Corrupt(_))
+            ));
+        }
+    }
 }

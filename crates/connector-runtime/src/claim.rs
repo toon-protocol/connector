@@ -892,6 +892,9 @@ impl ClaimBook {
                 // #1012) -- see the variant's own doc; same reasoning as
                 // `InboundClaimWatermarkReset` above.
                 JournalEntry::InboundClaimRolledBack { .. } => {}
+                // Written only to the client edge's own journal (ADR 0074)
+                // -- same reasoning again.
+                JournalEntry::BatchChannelAdmitted { .. } => {}
             }
         }
         for ledger in outbound.values_mut() {

@@ -35,7 +35,9 @@
 //! [`BatchChannelState`] reports is read from the chain when asked, because
 //! collateral **falls** when a payer initiates a withdrawal (decision 5).
 //! After a restart a channel must be admitted again from its config before
-//! it can be landed on.
+//! it can be landed on: the client edge journals each channel's config with
+//! its first accepted voucher, and the runtime re-admits every journaled
+//! channel at boot.
 //!
 //! # Reads are one snapshot
 //!

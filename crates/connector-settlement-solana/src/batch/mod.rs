@@ -13,8 +13,10 @@
 //!
 //! **What is not here.** Watching for Closing, `distribute`, `reclaim` and
 //! `getProgramAccounts` rediscovery are issue #1344's; the public sponsor
-//! endpoint is issue #1346's, and builds on [`wire::OpenChannel`]. Neither
-//! the runtime nor the client edge is wired to this yet.
+//! endpoint is issue #1346's, and builds on [`wire::OpenChannel`]. The
+//! runtime builds this backend when `[settlement.solana.batch_settlement]`
+//! is written and hands it to the client edge's claim gate
+//! (`connector-cli`'s `batch_settlement` module).
 
 pub mod wire;
 
