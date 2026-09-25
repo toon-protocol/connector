@@ -8,6 +8,8 @@
 //! since that cfg is only active while this crate compiles its own test
 //! binary.
 
+pub mod x402;
+
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -85,6 +87,14 @@ impl Anvil {
     /// for the same port range; the atomic counter means multiple calls
     /// within the same test binary don't collide with each other either.
     pub async fn spawn(base_port: u16) -> Self {
+        Self::spawn_with_chain_id(base_port, 31_337).await
+    }
+
+    /// [`spawn`](Self::spawn), under `chain_id` instead of anvil's default
+    /// 31337: for a test whose subject is bound to a real chain's id, such
+    /// as an EIP-712 digest a deployed contract computes under Base
+    /// Sepolia's 84532.
+    pub async fn spawn_with_chain_id(base_port: u16, chain_id: u64) -> Self {
         let offset = NEXT_PORT_OFFSET.fetch_add(1, Ordering::SeqCst);
         let port = base_port
             .wrapping_add((std::process::id() as u16) % 1_000)
@@ -94,9 +104,9 @@ impl Anvil {
         let child = Command::new("anvil")
             .args(["--host", "127.0.0.1", "--port"])
             .arg(port.to_string())
+            .arg("--chain-id")
+            .arg(chain_id.to_string())
             .args([
-                "--chain-id",
-                "31337",
                 // Two genesis accounts, not one: `DEPLOYER_PRIVATE_KEY` and
                 // `COUNTERPARTY_PRIVATE_KEY`. A channel is two-sided and
                 // `fund` is a self-deposit (issue #1118), so a test that

@@ -63,6 +63,13 @@ pub enum ClaimDecodeError {
     /// (`connector_client_edge::claim_gate`), since I4 means one codec
     /// serves both edges.
     Signature,
+    /// An x402 `batch-settlement` **voucher** (ADR 0074 decision 1). A
+    /// voucher is client edge only: it is never a peer claim and can never
+    /// decide the role `peer`, so every peer carriage refuses one here,
+    /// structurally, before anything about it is judged. It is reported by
+    /// name rather than as [`ClaimDecodeError::Structural`] because nothing
+    /// is wrong with its shape -- it is on the wrong edge.
+    Voucher,
 }
 
 impl std::fmt::Display for ClaimDecodeError {
@@ -79,6 +86,10 @@ impl std::fmt::Display for ClaimDecodeError {
             ClaimDecodeError::Signature => f.write_str(
                 "'signature' must be 0x-prefixed 130-char hex (r ‖ s ‖ v) for an evm claim, \
                  or base64 of 64 ed25519 bytes for a solana one",
+            ),
+            ClaimDecodeError::Voucher => f.write_str(
+                "a 'batch-settlement' voucher is not a peer claim: vouchers are accepted at the \
+                 client edge only (ADR 0074)",
             ),
         }
     }
@@ -373,6 +384,12 @@ pub fn parse(raw: &[u8]) -> Result<WireClaim, ClaimDecodeError> {
             cumulative_amount: claim.transferred_amount,
             signature: ClaimSignature::Solana(parse_solana_signature(&claim.signature)?),
         }),
+        // ADR 0074 decision 1: a voucher is never a peer claim. `WireClaim`
+        // has no voucher shape to put one in -- `ClaimSignature` carries no
+        // voucher variant -- so this is where both carriages refuse it.
+        ClientClaim::EvmVoucher(_) | ClientClaim::SolanaVoucher(_) => {
+            Err(ClaimDecodeError::Voucher)
+        }
     }
 }
 
@@ -462,6 +479,47 @@ mod tests {
             chain_id: 84_532,
             token_network: [0x33; 20],
         }
+    }
+
+    /// ADR 0074 decision 1: a well-formed voucher -- on either chain -- is
+    /// refused by every peer carriage, by name, and so can never become a
+    /// `WireClaim` or decide the role `peer`. Both carriages decode through
+    /// this one function (`accept::decode_claim`, `claim_on`).
+    #[test]
+    fn a_voucher_on_a_peer_carriage_is_refused_by_name() {
+        let evm = serde_json::json!({
+            "version": "1.0",
+            "blockchain": "evm",
+            "scheme": "batch-settlement",
+            "messageId": "m",
+            "timestamp": "2030-01-01T00:00:00Z",
+            "senderId": "s",
+            "channelId": format!("0x{:064x}", 7),
+            "maxClaimableAmount": "12500",
+            "signature": format!("0x{}1b", "ab".repeat(64)),
+        });
+        let solana = serde_json::json!({
+            "version": "1.0",
+            "blockchain": "solana",
+            "scheme": "batch-settlement",
+            "messageId": "m",
+            "timestamp": "2030-01-01T00:00:00Z",
+            "senderId": "s",
+            "channelId": CHANNEL_ACCOUNT,
+            "maxClaimableAmount": "10",
+            "expiresAt": 0,
+            "signature": "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW",
+        });
+        for voucher in [evm, solana] {
+            assert_eq!(
+                parse(voucher.to_string().as_bytes()),
+                Err(ClaimDecodeError::Voucher),
+                "{voucher}"
+            );
+        }
+        assert!(ClaimDecodeError::Voucher
+            .to_string()
+            .contains("client edge only"));
     }
 
     /// I4, mechanically: what the peer carriage emits is what the *client

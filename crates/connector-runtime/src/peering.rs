@@ -517,6 +517,7 @@ mod tests {
                 btp_endpoint: btp.map(str::to_string),
                 peer_carriages: vec!["http".to_string()],
                 settlements,
+                batch_settlements: Vec::new(),
             },
             Some(EdgeIdentity {
                 key_id: "peer-key".to_string(),

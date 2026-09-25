@@ -787,6 +787,52 @@ pub enum ConfigError {
     )]
     SettlementChannelIndexConfirmationsZero,
 
+    /// A `batch_settlement` table published a minimum `withdrawDelay` or
+    /// `grace_period` below x402's 900 seconds (ADR 0074 decision 5).
+    #[error(
+        "[settlement.{table}.batch_settlement] {key} = {value} is below the floor of 900 \
+         seconds. ADR 0074 lets a connector publish its own minimum, but never one below \
+         x402's; omit the key for the default of one day, the window a delayed claim still \
+         has to land in"
+    )]
+    BatchSettlementDelayBelowFloor {
+        table: &'static str,
+        key: &'static str,
+        value: u64,
+    },
+
+    /// `[settlement.evm.batch_settlement] min_withdraw_delay_secs` above the
+    /// contract's own thirty-day `MAX_WITHDRAW_DELAY`: no channel could carry
+    /// a `withdrawDelay` that meets it.
+    #[error(
+        "[settlement.evm.batch_settlement] min_withdraw_delay_secs = {value} exceeds \
+         x402BatchSettlement's MAX_WITHDRAW_DELAY of 2592000 seconds (30 days). No channel \
+         could ever meet it, so the opt-in would admit nothing"
+    )]
+    BatchSettlementWithdrawDelayAboveContractMaximum { value: u64 },
+
+    /// `[settlement.solana.batch_settlement] min_sponsored_deposit = 0`: the
+    /// bound on the public sponsor endpoint would bound nothing (ADR 0074
+    /// decision 5).
+    #[error(
+        "[settlement.solana.batch_settlement] min_sponsored_deposit is 0. It bounds a public \
+         endpoint that spends this node's lamports on rent for every channel it sponsors, so \
+         it must name a real opening deposit in the mint's base units"
+    )]
+    BatchSettlementZeroMinimumSponsoredDeposit,
+
+    /// `[settlement.evm.batch_settlement] asset_eip712_name` or
+    /// `asset_eip712_version` was written empty. Both are required as soon
+    /// as the table exists (ADR 0074 decision 8, issue #1345): the greeting
+    /// publishes them so a payer's deposit can be signed under the asset's
+    /// real EIP-712 domain, and an empty value would be published as one.
+    #[error(
+        "[settlement.evm.batch_settlement] {key} is empty. A client signs its deposit \
+         authorization under this asset's real EIP-712 domain, so the greeting must publish \
+         it -- there is no safe default for an arbitrary settlement token"
+    )]
+    BatchSettlementEmptyAssetEip712Field { key: &'static str },
+
     /// A settlement table asked for its RPC to ride the node's `socks_proxy`
     /// and the node has none (ADR 0073 decision 1). The key selects the one
     /// proxy ADR 0070 gives a node; it never names a second, and a dial that

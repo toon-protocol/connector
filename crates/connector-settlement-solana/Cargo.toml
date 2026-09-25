@@ -9,12 +9,20 @@ test-util = ["dep:tempfile"]
 
 [dependencies]
 connector-settlement = { path = "../connector-settlement" }
+# The batch-settlement voucher's 50-byte message and its Ed25519 check
+# (issue #1341): `batch` lands vouchers and builds their precompile
+# instruction from the one definition, rather than a second copy here.
+connector-signer = { path = "../connector-signer" }
 # The table's shared transport (ADR 0073): the bounds, the refusal retries
 # and, when `rpc_via_socks_proxy` is set, the pinned circuit. The backend
 # takes one rather than a URL, so no client of a settlement `rpc_url` can be
 # built that skips it.
 connector-chain-rpc = { path = "../connector-chain-rpc", features = ["solana"] }
 async-trait = "0.1"
+# The sponsor endpoint (issue #1346) takes a client-built transaction as
+# base64 of its bincode wire form, exactly as a Solana RPC node does.
+base64 = "0.22"
+bincode = "1"
 chrono = "0.4"
 thiserror = "2"
 # solana-rpc-client, NOT the solana-client meta-crate: this backend only does
@@ -29,14 +37,17 @@ solana-rpc-client = "=2.1.0"
 # The send config and the status/encoding types `submit` names; both are
 # already in the tree under solana-rpc-client, at the same pin.
 solana-rpc-client-api = "=2.1.0"
+solana-account-decoder-client-types = "=2.1.0"
 solana-transaction-status-client-types = "=2.1.0"
 solana-sdk = "=2.1.0"
 spl-token = { version = "=6.0.0", features = ["no-entrypoint"] }
 spl-associated-token-account = "=4.0.0"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 tempfile = { version = "3", optional = true }
+tracing = "0.1"
 
 [dev-dependencies]
+proptest = "1"
 # `FakeRpc`: the confirm loop is tested against an endpoint that stalls,
 # refuses and drops, which no local validator can be made to do.
 connector-chain-rpc = { path = "../connector-chain-rpc", features = ["solana", "test-support"] }

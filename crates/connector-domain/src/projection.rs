@@ -97,6 +97,27 @@ pub enum JournalEntry {
         nonce: u64,
         cumulative_amount: u64,
     },
+    /// The client edge accepted its first voucher on the x402
+    /// `batch-settlement` channel `channel_id` (ADR 0074): the canonical
+    /// `evm:0x…` or `solana:…` key its watermark is filed under.
+    /// `presentation` is what restores the channel to its settlement
+    /// backend after a restart, carried opaque as `InboundClaimAccepted`'s
+    /// signature is: on EVM the channel's `ChannelConfig`, which the
+    /// contract stores only as a hash and a voucher signs only as that
+    /// hash, so without it a voucher already accepted could never be
+    /// `claim`ed; on Solana nothing, since the channel account holds every
+    /// field.
+    ///
+    /// Written only by `connector_client_edge::ClientClaimGate`, into the
+    /// client edge's own journal, in the same batch as -- and immediately
+    /// before -- the `InboundClaimAccepted` of the channel's first accepted
+    /// voucher. It also marks the key as a batch-settlement channel's, which
+    /// the gate's `TokenNetwork`-shaped sweep must never judge. Folds into
+    /// nothing here, like the other client-edge-only kinds.
+    BatchChannelAdmitted {
+        channel_id: String,
+        presentation: Vec<u8>,
+    },
 }
 
 /// Balances, derived in memory by folding a journal (ADR 0005). Never a
@@ -159,6 +180,9 @@ impl Projection {
             // Written only to the client edge's own journal, never this
             // one (issue #1012) -- see the variant's own doc.
             JournalEntry::InboundClaimRolledBack { .. } => {}
+            // Written only to the client edge's own journal, never this
+            // one (ADR 0074) -- see the variant's own doc.
+            JournalEntry::BatchChannelAdmitted { .. } => {}
         }
     }
 

@@ -12,7 +12,11 @@
 //! No chain SDK, RPC client or transaction appears in this crate -- that is
 //! deliberately out of scope here (issue #458) and belongs to the two
 //! settlement crates above instead.
+//!
+//! [`batch`] is a second, receive-only port beside it, for x402
+//! `batch-settlement` channels a client opens (ADR 0074 decision 9).
 
+pub mod batch;
 mod in_memory;
 mod port;
 

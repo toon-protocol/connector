@@ -281,6 +281,7 @@ async fn a_runtime_established_peering_can_pay_the_forward_it_accepted() {
                 token_address: to_hex(&[0x77u8; 20]),
                 decimals: 6,
             })],
+            batch_settlements: Vec::new(),
         },
         None,
         Vec::new(),

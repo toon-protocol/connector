@@ -1,10 +1,10 @@
 # A client may pay over an x402 batch-settlement channel, and only a client
 
-**Status:** Accepted (owner decision, 2026-09-25, issue #1329) — **not yet built**; the implementation is tickets #1340–#1347. All three prerequisites were settled before acceptance, the last by a live Base Sepolia deposit on 2026-09-25, and the choices this record makes beyond #1329's seven were accepted with it. It **amends** [0059](0059-a-channel-is-derived-from-its-participants.md) (a client-edge exception to one-live-channel-per-pair), [0005](0005-claims-are-truth-balances-are-a-projection.md) (a second freshness rule for the journal to hold), `client-edge-spec.md` §1.3 (its freshness step, and step 5's rule that a cached deposit is a lower bound, which is false for a channel a payer can withdraw from) and `CONTEXT.md`'s **Claim**, **Nonce** and **Watermark**, plus a new **Voucher** entry (all applied). It **extends** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) with a second claim scheme per chain, and it disturbs [0021](0021-vectors-are-normative-prose-is-not.md): `schema_version` goes to **6** when #1347 lands. It leaves [0022](0022-a-connector-answers-it-does-not-announce.md)'s deferral of paying over HTTP exactly where it is.
+**Status:** Accepted (owner decision, 2026-09-25, issue #1329) — **built** (epic #1349, tickets #1340–#1347). All three prerequisites were settled before acceptance, the last by a live Base Sepolia deposit on 2026-09-25, and the choices this record makes beyond #1329's seven were accepted with it. It **amends** [0059](0059-a-channel-is-derived-from-its-participants.md) (a client-edge exception to one-live-channel-per-pair), [0005](0005-claims-are-truth-balances-are-a-projection.md) (a second freshness rule for the journal to hold), `client-edge-spec.md` §1.3 (its freshness step, and step 5's rule that a cached deposit is a lower bound, which is false for a channel a payer can withdraw from) and `CONTEXT.md`'s **Claim**, **Nonce** and **Watermark**, plus a new **Voucher** entry (all applied). It **extends** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) with a second claim scheme per chain, and it disturbs [0021](0021-vectors-are-normative-prose-is-not.md): `schema_version` goes to **6** when #1347 lands. It leaves [0022](0022-a-connector-answers-it-does-not-announce.md)'s deferral of paying over HTTP exactly where it is.
+
+**Amended 2026-09-25 (#1349 review):** EVM admission now requires a nonzero `payerAuthorizer` whatever the payer is, where it had refused only a contract-wallet payer without one (decisions 2 and 4, and the last of the choices beyond #1329's seven). An EOA can gain code later by an EIP-7702 delegation, after which the contract checks a voucher by ERC-1271 rather than ECDSA and the vouchers already accepted no longer verify the way they did. Decision 3 also records the journal's second amendment to 0005 (the `BatchChannelAdmitted` entry, which holds an EVM channel's `ChannelConfig` so held vouchers stay claimable after a restart), decision 8 records the greeting's wire names (the EVM asset's EIP-712 `name`/`version`, Solana's `withdrawDelay` for the minimum `grace_period`, and the new `minDeposit`), and decision 3's retransmission rule now says what the code always did: a byte-identical voucher buys nothing, so against a nonzero charge it is refused as an underpayment, and the vectors pin that case too.
 
 **Scope:** protocol law. It binds every implementation, because it adds a claim scheme to the wire and an offer to the greeting. The watchers and sweeps in decision 5 and the port shape in decision 9 are connector architecture. See the [ADR index](README.md).
-
-**Falsifier:** `crates/**/*.rs` matching `(?i)batch[-_]?settlement` — this record is accepted but not yet built and claims that nothing under `crates/` speaks the scheme yet, so a non-comment match means implementation (#1340–#1347) has begun and this Status line must move with it.
 
 **A client may pay a connector over an x402 `batch-settlement` channel, on Base and on Solana: the
 audited contract and program x402 already deploys, with no TOON contract involved.** It is a second
@@ -88,13 +88,20 @@ So this is a **client-edge exception to 0059's uniqueness**, not to its reasonin
   config. The connector computes `getChannelId(config)` off chain (an EIP-712 digest, no RPC) and
   refuses a mismatch. It then reads `channels(channelId)` and `pendingWithdrawals(channelId)` for
   collateral.
-- **EVM: the connector fixes three of the seven config fields.** It admits a channel only if:
+- **EVM: the connector fixes three of the seven config fields, and requires a fourth.** It admits
+  a channel only if:
   - `receiver` **and** `receiverAuthorizer` are both this connector's EVM settlement address;
   - `token` is a token it settles in;
-  - `withdrawDelay` is at least its published minimum (decision 5).
+  - `withdrawDelay` is at least its published minimum (decision 5);
+  - `payerAuthorizer` is nonzero, whatever `payer` is (amended 2026-09-25). With a zero one, the
+    contract checks each voucher against `payer` through `SignatureChecker`, which asks ERC-1271 of
+    any payer with code. An EOA payer can gain code at any time by an EIP-7702 delegation, so
+    whether `payer` has code at admission says nothing about whether the vouchers accepted since
+    will still verify by ECDSA when they are claimed. The connector does not ask; it refuses.
 
-  `payer`, `payerAuthorizer` and `salt` are the client's. **`salt` is not fixed.** Fixing it would
-  buy derivability, and nothing at this edge needs that.
+  `payer`, `payerAuthorizer` and `salt` are the client's: `payerAuthorizer` must exist, but which
+  key it names is not fixed. **`salt` is not fixed.** Fixing it would buy derivability, and nothing
+  at this edge needs that.
 
 - **Solana: the connector reads the channel account and checks it.** It re-derives the PDA from the
   account's own seed fields before trusting it (X402 SVM spec `#L1379-L1385`). It then admits the
@@ -129,7 +136,11 @@ and value before cryptography".
   retransmission, not a new claim. It is answered exactly as the same edge answers a
   `toon-channel` claim retransmitted at its watermark today (the `peer_claim_retransmit` vector's
   rule): it buys nothing new, and it is not an error. Byte identity is the test, because an
-  equal amount under a different signature is not the same voucher.
+  equal amount under a different signature is not the same voucher. **Because it buys nothing, it
+  covers no charge** (amended 2026-09-25): against a route whose charge is zero it is accepted
+  again, and against a nonzero charge it advances by `0` and is refused as an underpayment, by the
+  value-binding step like any other voucher that advances too little. The vectors pin both
+  (decision 7).
 - **The width of an amount.** The EVM voucher's amount is `uint128`. A voucher above what the
   connector's amount type holds (`u64` today) is refused, not truncated.
 - **Solana's `expiresAt` must be zero.** x402 already requires this, and servers reject a nonzero
@@ -141,22 +152,33 @@ and value before cryptography".
   voucher exactly as it holds a claim: the signed bytes, and the watermark they set. The
   watermark's _key_ is §1.3's (peer, blockchain, channel) tuple, with the channel in its canonical
   form. Only its _comparison_
-  differs by scheme. This is the one clause of 0005 that is amended.
+  differs by scheme. This is the first clause of 0005 that is amended.
+- **What the journal also holds** (a second amendment to 0005, recorded 2026-09-25). With a
+  channel's first accepted voucher, the journal records the channel itself, as
+  `JournalEntry::BatchChannelAdmitted`: its canonical key and, on EVM, the `ChannelConfig` it was
+  admitted under (on Solana, nothing more, since the channel account holds every field). 0005
+  persists only what is signed or irreversible, and a config is neither. It is journaled anyway
+  because the chain stores an EVM channel by id alone and a voucher signs only that id, so after a
+  restart the config exists nowhere else, and `claim` cannot be sent without it. Without the entry,
+  every voucher accepted before a restart would be unclaimable while the payer withdrew (decision
+  5). The entry is written in the same batch as the voucher it arrives with, and folds into no
+  balance.
 
 ### 4. Two claim schemes: the `toon-channel` claim and the batch-settlement voucher
 
 A client-edge claim gains a **scheme** discriminator. When it is absent, the claim is `toon-channel`
 and means exactly what it means today. When it is `batch-settlement`, the claim is a voucher:
 
-| Chain  | Signed message                                                                                                                                                                          | Signer                                                                                                                                                                                                                                                                   |
-| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| EVM    | The EIP-712 digest of `Voucher(bytes32 channelId,uint128 maxClaimableAmount)` (X402 `#L96`, `#L454-L456`), under the domain `("x402 Batch Settlement", "1", chainId, 0x4020074e…0003)`. | `payerAuthorizer` if it is nonzero, otherwise `payer` (`#L530-L538`). **ECDSA only.** A zero `payerAuthorizer` with a contract-wallet `payer` would need an ERC-1271 `eth_call` per packet, so it is refused at admission. The client names a `payerAuthorizer` instead. |
-| Solana | 50 bytes: `0x56 0x01 ‖ channel_id(32) ‖ u64 cumulative LE ‖ i64 expires_at LE` (PC `instructions/mod.rs#L27-L93`; X402 SVM spec `#L316-L323`). Ed25519.                                 | The channel's `authorized_signer`, which is fixed at open (PC `state/channel.rs#L135-L138`).                                                                                                                                                                             |
+| Chain  | Signed message                                                                                                                                                                          | Signer                                                                                                                                                                                                                                                                                                                                                    |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| EVM    | The EIP-712 digest of `Voucher(bytes32 channelId,uint128 maxClaimableAmount)` (X402 `#L96`, `#L454-L456`), under the domain `("x402 Batch Settlement", "1", chainId, 0x4020074e…0003)`. | `payerAuthorizer` if it is nonzero, otherwise `payer` (`#L530-L538`). **ECDSA only.** A zero `payerAuthorizer` leaves the check to `payer`, which needs an ERC-1271 `eth_call` whenever `payer` has code, as an EOA does after an EIP-7702 delegation; so a zero one is refused at admission (decision 2, amended). The client names a `payerAuthorizer`. |
+| Solana | 50 bytes: `0x56 0x01 ‖ channel_id(32) ‖ u64 cumulative LE ‖ i64 expires_at LE` (PC `instructions/mod.rs#L27-L93`; X402 SVM spec `#L316-L323`). Ed25519.                                 | The channel's `authorized_signer`, which is fixed at open (PC `state/channel.rs#L135-L138`).                                                                                                                                                                                                                                                              |
 
 - **Each voucher's domain is bound as 0024 and 0053 require.** The EVM digest binds the chain and
   the contract through its domain separator. The Solana message binds the channel account, and the
-  account is the program's own PDA. The connector reads the program id from its config, never from
-  the claim, and x402 forbids negotiating it on the wire anyway (X402 SVM spec `#L78-L86`).
+  account is the program's own PDA. The connector takes the program id from its own build (one
+  constant, the same on every cluster; amended by the #1349 review, which removed the config key),
+  never from the claim, and x402 forbids negotiating it on the wire anyway (X402 SVM spec `#L78-L86`).
 - **The signer is taken from the chain, never from the claim.** It comes from the verified
   `ChannelConfig` on EVM and from `authorized_signer` on Solana. This is §1.3 step 4's rule — _"the
   counterparty recorded for the channel"_ — unchanged.
@@ -267,6 +289,8 @@ A signer distinct from the funding key is admitted: `payerAuthorizer` on EVM, an
 - Which key signs is a fact fixed on chain at open. The connector reads it (decision 4).
 - A session key is the ordinary case here. The owner's key funds the channel once, and a hot key
   signs every packet.
+- On EVM it is more than admitted: since the amendment to decision 2 (2026-09-25) a channel must
+  name one. The key may be any the client holds, the payer's own included.
 
 ### 7. Vectors: two voucher cases, and `schema_version` 6
 
@@ -297,10 +321,19 @@ connector has opted in to. Unlike today's entry, that entry is **x402-valid**:
 - `payTo` is the receiver: the EVM settlement address, or on Solana the owner of the receiving
   account.
 
-Its `extra` carries what a client needs to open a channel this connector will admit:
+Its `extra` carries what a client needs to open a channel this connector will admit. The wire
+names, recorded 2026-09-25, are x402's own wherever x402 has one:
 
-- **EVM:** `receiverAuthorizer` and the minimum `withdrawDelay`.
-- **Solana:** `feePayer`, which is the sponsor key, and the minimum `grace_period`.
+- **EVM:** `receiverAuthorizer`, the minimum `withdrawDelay`, and `name` and `version`: the
+  EIP-712 domain of the deposit's **asset**, which a client signs its ERC-3009 or Permit2
+  authorization under. x402's EVM scheme requires both, and an ERC-20 need not expose either, so
+  the connector does not read them off the chain: they come from the required config keys
+  `asset_eip712_name` and `asset_eip712_version`.
+- **Solana:** `feePayer`, which is the sponsor key; `withdrawDelay`, which carries the minimum
+  `grace_period` under x402's SVM field name (x402 calls the program's `grace_period`
+  `withdrawDelay` on both chains, and a stock client reads that name); and `minDeposit`, the
+  published minimum deposit decision 5 has the sponsor refuse below, as a decimal string of the
+  mint's base units. `minDeposit` is this connector's own addition: x402 has no field for it.
 
 The self-description publishes the same facts. Vouchers still travel inside ILP. Only the one-time
 deposit or open leaves the packet path, which is why [0022](0022-a-connector-answers-it-does-not-announce.md)'s
@@ -452,8 +485,9 @@ on 2026-09-25:
   reach it (0052). That is a new unauthenticated surface that makes the node spend lamports.
 - **A minimum sponsored deposit**, as the bound on that surface.
 - **One day** as the default for both the minimum `withdrawDelay` and the minimum `grace_period`.
-- **Refusing an ERC-1271 payer with no `payerAuthorizer`**, so that no packet waits on an
-  `eth_call`.
+- **Refusing a channel with no `payerAuthorizer`**, so that no packet waits on an `eth_call` and
+  no accepted voucher is stranded by a later EIP-7702 delegation. As accepted, this refused only a
+  payer with code; the #1349 review amended it to every payer (2026-09-25).
 
 ## Glossary
 

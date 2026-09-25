@@ -417,6 +417,47 @@ repository at all ([ADR 0065](../adr/0065-mina-leaves-the-repository.md)). An ab
 every channel operation then answers `503`; a present but wrong one is a startup failure, because a
 real backend is constructed for every chain configured before the node serves anything (CF-25).
 
+**Accepting x402 batch-settlement channels is opted into per chain** ([ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
+decision 1), by writing a `batch_settlement` sub-table under that chain's keyed settlement table. It is
+**off unless written**: there is no `enabled` key, because the table's presence already says so, and
+the frozen legacy `[settlement]` shape has no such sub-table. Everything decision 2 fixes about an
+admissible channel comes from the enclosing table and is not declared again (CF-26): the receiver (or
+Solana sponsor) is that table's settlement key, and the token or mint is its `token_address`. What the
+sub-table holds is only the terms that are this node's to choose. The first column is the chain whose
+`[settlement.<chain>.batch_settlement]` takes the key — these are not top-level keys, which is why the
+table does not start with one:
+
+| chain  | key                       | default         | refused by name when                                            |
+| ------ | ------------------------- | --------------- | --------------------------------------------------------------- |
+| EVM    | `min_withdraw_delay_secs` | `86400` (a day) | below `900`, or above `2592000` (the contract's 30-day maximum) |
+| EVM    | `asset_eip712_name`       | **required**    | empty                                                           |
+| EVM    | `asset_eip712_version`    | **required**    | empty                                                           |
+| Solana | `min_grace_period_secs`   | `86400` (a day) | below `900`                                                     |
+| Solana | `min_sponsored_deposit`   | **required**    | `0`; it bounds a public endpoint that spends this node's rent   |
+
+The two minimum delays are published in the greeting, and a channel whose `withdrawDelay` or
+`grace_period` falls short of them is not admitted. `min_sponsored_deposit` is published too, as the
+Solana entry's `extra.minDeposit`: ADR 0074 decision 5 has the sponsor refuse below a _published_
+minimum, so a client reads it before building an `open`. The floor of 900 seconds is x402's own; the day is the window a
+delayed `claim` or `settle_and_seal` still has to land in. Neither sub-table names **where** the
+channels live: the record fixes `x402BatchSettlement` at `0x4020074e…0003` and `payment-channels` at
+`CHNLx…yGsX`, the one address and program id each is deployed under on test and main networks alike
+(ADR 0074, _Sources_ and decision 4), so each is a constant of the connector and never a setting —
+and never read from a voucher. `payment-channels` is unrelated to `[settlement.solana] program_id`,
+which is TOON's own program.
+
+**`asset_eip712_name` and `asset_eip712_version`** are the EIP-712 domain `name` and `version` of
+`[settlement.evm] token_address` -- `"USDC"` and `"2"` for the devnet's Circle FiatToken v2.2 -- and
+are published on the greeting's `batch-settlement` `accepts[].extra` (ADR 0074 decision 8) so a stock
+client can sign its deposit's ERC-3009/permit2 authorization under the asset's real domain. Configured
+rather than read off the chain: an arbitrary ERC-20 need not expose an EIP-712 `version()` the way
+Circle's FiatToken does, and this connector never itself signs or verifies under either value, so
+there is nothing here to prove against a live contract the way `decimals` is (issue #1345). Both are
+required as soon as `[settlement.evm.batch_settlement]` exists -- there is no safe default for an
+arbitrary settlement token, and publishing the wrong domain would build a deposit signature that
+never verifies. Solana carries no equivalent key: the x402 SVM scheme's asset transfer has no EIP-712
+domain of its own to publish.
+
 **`decimals` is a declaration, not a conversion.** Nothing scales by it: every amount on the value path
 — a route's price, a claim's amount, a channel's deposit — is already in the settlement token's base
 units, and stays in the units of the leg it is on. Where a forward's two legs hold different tokens the

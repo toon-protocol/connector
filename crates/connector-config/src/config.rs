@@ -4084,6 +4084,62 @@ key_file = "{}"
         assert_eq!(config.settlements()[0].chain(), crate::SettlementChain::Evm);
     }
 
+    /// ADR 0074 decision 1, through the one loader the binary uses: the
+    /// opt-in to x402 batch settlement is a sub-table of the chain's own
+    /// settlement table, and a below-floor minimum refuses to boot by name.
+    #[test]
+    fn a_batch_settlement_opt_in_loads_under_its_settlement_table() {
+        let load = |batch: &str| {
+            with_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:3000"
+state_dir = "/tmp"
+
+[signer]
+key_file = "{key_path}"
+
+[settlement.evm]
+rpc_url = "http://127.0.0.1:8545"
+contract_address = "0x1234567890123456789012345678901234567890"
+token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
+decimals = 6
+
+[settlement.evm.key]
+key_file = "{key_path}"
+
+[settlement.evm.batch_settlement]
+{batch}
+"#,
+                    key_path = key_path.display()
+                )
+            })
+        };
+
+        let config = load(
+            "min_withdraw_delay_secs = 7200\nasset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"",
+        )
+        .expect("load");
+        let SettlementConfig::Evm(evm) = &config.settlements()[0] else {
+            panic!("expected the EVM table");
+        };
+        assert_eq!(
+            evm.batch_settlement()
+                .expect("opted in")
+                .min_withdraw_delay_secs(),
+            7200
+        );
+
+        let error = load(
+            "min_withdraw_delay_secs = 600\nasset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"",
+        )
+        .expect_err("below the floor");
+        assert!(matches!(
+            error,
+            ConfigError::BatchSettlementDelayBelowFloor { value: 600, .. }
+        ));
+    }
+
     /// AC: "A config declaring both [settlement.evm] and [settlement.solana]
     /// parses into typed per-chain settlement config".
     #[test]

@@ -54,7 +54,8 @@ connector-domain                 pure logic: no async, no I/O, no clock, no keys
   │                               schedule over payload length, flat when its slope
   │                               is zero (ADR 0065)
   ├─ condition.rs                condition / fulfilment / expiry rules
-  ├─ claim.rs, client_claim.rs   nonce, watermark and value rules (ADR 0004, ADR 0005)
+  ├─ claim.rs, client_claim.rs   nonce, watermark and value rules (ADR 0004, ADR 0005),
+  │                               and a voucher's amount-only watermark (ADR 0074)
   ├─ projection.rs               balances folded from journal entries (ADR 0005)
   ├─ envelope.rs                 the request/response envelope a terminated packet
   │                               carries to and from the app (ADR 0018)
@@ -68,6 +69,7 @@ connector-signer                 the only crate that touches key material
   ├─ giftwrap.rs                 seal/open, and the derived fulfilment (ADR 0018, ADR 0019)
   ├─ claim_signature.rs          EIP-712 and Ed25519 balance-proof verification
   │                               (ADR 0024, ADR 0053)
+  ├─ voucher_signature.rs        x402 batch-settlement voucher verification (ADR 0074)
   ├─ claim_state_challenge.rs    "prove you hold this channel", moving no value
   ├─ nip59.rs                    the wrapped-claim transport-privacy envelope
   └─ contract.rs                 the `Signer` contract suite
@@ -83,13 +85,34 @@ connector-chain-rpc              the HTTP transport every settlement table's RPC
 
 connector-settlement             the chain-agnostic settlement port + its contract suite
   ├─ port.rs, contract.rs        the port, and the one suite every backend is run against
-  └─ in_memory.rs                the fake — the first implementation to pass that suite
+  ├─ in_memory.rs                the fake — the first implementation to pass that suite
+  └─ batch/                      a second, receive-only port for x402 batch-settlement
+                                  channels a client opens (ADR 0074 decision 9): admit,
+                                  read collateral and lifecycle, land a voucher. Its own
+                                  port.rs, contract.rs and in_memory.rs, in the same shape,
+                                  and held.rs: where the watchers read the latest voucher
 connector-settlement-evm         real EVM backend: TokenNetworkRegistry → TokenNetwork,
                                   holding no local channel state; every method reads the
                                   chain fresh
+  ├─ batch_settlement.rs         the batch-settlement port over x402's
+  │                               x402BatchSettlement (ADR 0074): admits a presented
+  │                               ChannelConfig, `claim`s from the settlement key.
+  │                               contracts/x402/ holds its ABI and the pinned bytecode
+  │                               the tests place on anvil, with PROVENANCE.md
+  └─ batch_watch.rs              its watcher and sweep (ADR 0074 decision 5): claims at
+                                  once on a WithdrawInitiated, and periodically claims
+                                  every channel in one `claim`, then `settle`s
 connector-settlement-solana      real Solana backend, speaking packages/solana-program's
                                   own wire directly (that crate builds for SBF only and
                                   exports no client SDK)
+  ├─ batch/                      the batch-settlement port on solana-foundation's
+  │                               payment-channels (ADR 0074): admission, settle and
+  │                               settle_and_seal, that program's own wire, and the
+  │                               sponsor that co-signs a client's `open` (sponsor.rs);
+  │                               sweep.rs is its watcher, which rediscovers every
+  │                               sponsored channel and seals, distributes and reclaims it
+  └─ fixtures/payment_channels.so  that program's mainnet-beta binary, which tier-3
+                                  tests load into genesis at its canonical id
 
 connector-rate-source            the chain-agnostic rate-source port + its contract suite
                                   (ADR 0071): what reading a token's price off a market
@@ -143,7 +166,8 @@ connector-operator               axum Router: bearer-gated reads, RFC 9421-signe
                                   dashboard embedded from dashboard.html (ADR 0066)
 connector-cli                    config → runtime → merged routers → bound listeners,
                                   plus the `send` verb; the binary itself branches on
-                                  nothing
+                                  nothing. Mounts POST /ilp/batch-settlement/solana/open,
+                                  the public Solana sponsor endpoint (ADR 0074)
 connector-bin                    bin/connector, bin/stub-app — and the workspace's
                                   cross-cutting integration tests (see below)
 connector-vectors                bin/generate-vectors → vectors/wire-vectors.json

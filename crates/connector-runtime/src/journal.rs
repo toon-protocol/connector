@@ -145,6 +145,13 @@ fn encode_line(entry: &JournalEntry) -> String {
             nonce,
             cumulative_amount,
         } => format!("inbound_claim_rolled_back\t{channel_id}\t{nonce}\t{cumulative_amount}"),
+        JournalEntry::BatchChannelAdmitted {
+            channel_id,
+            presentation,
+        } => format!(
+            "batch_channel_admitted\t{channel_id}\t{}",
+            encode_hex(presentation)
+        ),
     }
 }
 
@@ -185,6 +192,12 @@ fn decode_line(line: &str) -> Result<JournalEntry, JournalError> {
                 channel_id: channel_id.to_string(),
                 nonce: parse_u64(nonce)?,
                 cumulative_amount: parse_u64(cumulative_amount)?,
+            })
+        }
+        ["batch_channel_admitted", channel_id, presentation] => {
+            Ok(JournalEntry::BatchChannelAdmitted {
+                channel_id: channel_id.to_string(),
+                presentation: decode_hex(presentation).ok_or_else(corrupt)?,
             })
         }
         _ => Err(corrupt()),
@@ -283,6 +296,16 @@ mod tests {
                 channel_id: "channel-c".to_string(),
                 nonce: 2,
                 cumulative_amount: 150,
+            },
+            JournalEntry::BatchChannelAdmitted {
+                channel_id: "evm:0xabcd".to_string(),
+                presentation: vec![0x01, 0x02, 0x03],
+            },
+            // A Solana channel's presentation is empty, and must still
+            // round-trip rather than lose its trailing field.
+            JournalEntry::BatchChannelAdmitted {
+                channel_id: "solana:channel-d".to_string(),
+                presentation: Vec::new(),
             },
         ]
     }
