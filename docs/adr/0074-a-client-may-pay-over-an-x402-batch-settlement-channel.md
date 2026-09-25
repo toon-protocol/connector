@@ -176,8 +176,9 @@ and means exactly what it means today. When it is `batch-settlement`, the claim 
 
 - **Each voucher's domain is bound as 0024 and 0053 require.** The EVM digest binds the chain and
   the contract through its domain separator. The Solana message binds the channel account, and the
-  account is the program's own PDA. The connector reads the program id from its config, never from
-  the claim, and x402 forbids negotiating it on the wire anyway (X402 SVM spec `#L78-L86`).
+  account is the program's own PDA. The connector takes the program id from its own build (one
+  constant, the same on every cluster; amended by the #1349 review, which removed the config key),
+  never from the claim, and x402 forbids negotiating it on the wire anyway (X402 SVM spec `#L78-L86`).
 - **The signer is taken from the chain, never from the claim.** It comes from the verified
   `ChannelConfig` on EVM and from `authorized_signer` on Solana. This is §1.3 step 4's rule — _"the
   counterparty recorded for the channel"_ — unchanged.
