@@ -890,6 +890,28 @@ impl SettlementBackend for EvmSettlementBackend {
         self.read_state(channel, id).await
     }
 
+    /// `setTotalDeposit` already takes a total, so the total goes straight
+    /// to the chain: `TokenNetwork` computes the difference itself and
+    /// pulls nothing for a total already reached (`TokenNetwork.sol:276-279`).
+    /// So a duplicate of this call, even one racing it from outside this
+    /// process, cannot deposit twice. The read first only saves the two
+    /// transactions when there is nothing to do.
+    async fn fund_to(
+        &self,
+        channel: &ChannelId,
+        own_total: u128,
+    ) -> Result<ChannelState, SettlementError> {
+        let _guard = self.deposit_lock.lock().await;
+
+        let (id, state) = self.open_channel(channel).await?;
+        if own_total <= state.own_deposited {
+            return Ok(state);
+        }
+        self.set_total_deposit(id, self.own_address, U256::from(own_total))
+            .await?;
+        self.read_state(channel, id).await
+    }
+
     async fn redeem(
         &self,
         channel: &ChannelId,

@@ -169,6 +169,19 @@ impl SettlementBackend for InMemorySettlementBackend {
         })
     }
 
+    /// Atomic under the backend's one lock: the read and the raise are one
+    /// step, so two concurrent calls for the same total deposit once.
+    async fn fund_to(
+        &self,
+        channel: &ChannelId,
+        own_total: u128,
+    ) -> Result<ChannelState, SettlementError> {
+        self.with_open_channel(channel, |c| {
+            c.own_deposited = c.own_deposited.max(own_total);
+            Ok(c.state(channel))
+        })
+    }
+
     async fn redeem(
         &self,
         channel: &ChannelId,

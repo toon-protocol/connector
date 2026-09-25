@@ -109,6 +109,11 @@ pub struct SolanaSettlementBackend {
     /// struct's own top-of-file doc for why the chain alone cannot answer
     /// "was this settled, or did it never exist" once that has happened.
     settled: Mutex<HashSet<Pubkey>>,
+    /// Serializes [`fund`](SettlementBackend::fund) and
+    /// [`fund_to`](SettlementBackend::fund_to): `fund_to` reads the own
+    /// deposit and deposits the difference, and `Deposit` is an increment,
+    /// so two of them interleaving would both deposit it (ADR 0073).
+    deposit_lock: tokio::sync::Mutex<()>,
     /// Which Solana cluster the endpoint this backend connected to is
     /// actually on, read from the chain itself at
     /// [`connect`](Self::connect) -- see [`Self::cluster`] and
@@ -275,6 +280,7 @@ impl SolanaSettlementBackend {
             token_mint,
             counterparty_signers: Vec::new(),
             settled: Mutex::new(HashSet::new()),
+            deposit_lock: tokio::sync::Mutex::new(()),
             cluster,
         };
         // The payer's lamports were read above, so a probe failure below
@@ -413,6 +419,7 @@ impl SolanaSettlementBackend {
             token_mint: mint.pubkey(),
             counterparty_signers: counterparties.into(),
             settled: Mutex::new(HashSet::new()),
+            deposit_lock: tokio::sync::Mutex::new(()),
             // A `deploy`-built backend only ever runs against this
             // workspace's own `solana-test-validator`, whose fresh genesis
             // no published hash can match -- so the read is skipped rather
@@ -805,6 +812,32 @@ impl SolanaSettlementBackend {
         Ok(())
     }
 
+    /// Deposit `amount` of this backend's own tokens into the channel at
+    /// `pubkey`, crediting its own side, and return the state after. The
+    /// caller holds `deposit_lock` and has checked the channel is open.
+    async fn deposit_own(
+        &self,
+        channel: &ChannelId,
+        pubkey: Pubkey,
+        amount: u128,
+    ) -> Result<ChannelState, SettlementError> {
+        let own = self.payer.pubkey();
+        let units = to_units(amount)?;
+        let depositor_token_account =
+            spl_associated_token_account::get_associated_token_address(&own, &self.token_mint);
+        let (vault, _bump) = wire::vault_pda(&pubkey, &self.program_id);
+
+        let instruction = Instruction::new_with_bytes(
+            self.program_id,
+            &wire::pack_deposit(units),
+            wire::Accounts::deposit(&own, &depositor_token_account, &vault, &pubkey),
+        );
+        self.submit(&[instruction], &[]).await?;
+
+        let (_pubkey, account) = self.open_channel(channel).await?;
+        self.to_channel_state(channel, &account)
+    }
+
     /// Fetch and parse the `ChannelState` account at `pubkey`, or `None`
     /// if nothing this program owns lives there.
     async fn fetch_account(
@@ -1079,22 +1112,31 @@ impl SettlementBackend for SolanaSettlementBackend {
         channel: &ChannelId,
         amount: u128,
     ) -> Result<ChannelState, SettlementError> {
+        let _guard = self.deposit_lock.lock().await;
         let (pubkey, _account) = self.open_channel(channel).await?;
-        let own = self.payer.pubkey();
-        let units = to_units(amount)?;
-        let depositor_token_account =
-            spl_associated_token_account::get_associated_token_address(&own, &self.token_mint);
-        let (vault, _bump) = wire::vault_pda(&pubkey, &self.program_id);
+        self.deposit_own(channel, pubkey, amount).await
+    }
 
-        let instruction = Instruction::new_with_bytes(
-            self.program_id,
-            &wire::pack_deposit(units),
-            wire::Accounts::deposit(&own, &depositor_token_account, &vault, &pubkey),
-        );
-        self.submit(&[instruction], &[]).await?;
-
-        let (_pubkey, account) = self.open_channel(channel).await?;
-        self.to_channel_state(channel, &account)
+    /// `Deposit` is an increment, so this reads the own deposit and
+    /// deposits the difference, under the same lock `fund` takes. That
+    /// makes it safe against another call in this process. A duplicate from
+    /// outside the process could still read the same starting deposit; the
+    /// confirm loop leaves one only when a previous attempt's outcome could
+    /// not be read for two minutes (`submit`), and that error names the
+    /// signature to look up first.
+    async fn fund_to(
+        &self,
+        channel: &ChannelId,
+        own_total: u128,
+    ) -> Result<ChannelState, SettlementError> {
+        let _guard = self.deposit_lock.lock().await;
+        let (pubkey, account) = self.open_channel(channel).await?;
+        let state = self.to_channel_state(channel, &account)?;
+        if own_total <= state.own_deposited {
+            return Ok(state);
+        }
+        self.deposit_own(channel, pubkey, own_total - state.own_deposited)
+            .await
     }
 
     async fn redeem(
