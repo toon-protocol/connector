@@ -427,13 +427,13 @@ sub-table holds is only the terms that are this node's to choose. The first colu
 `[settlement.<chain>.batch_settlement]` takes the key — these are not top-level keys, which is why the
 table does not start with one:
 
-| chain  | key                       | default              | refused by name when                                            |
-| ------ | ------------------------- | -------------------- | --------------------------------------------------------------- |
-| EVM    | `min_withdraw_delay_secs` | `86400` (a day)      | below `900`, or above `2592000` (the contract's 30-day maximum) |
-| EVM    | `asset_eip712_name`       | **required**         | empty                                                           |
-| EVM    | `asset_eip712_version`    | **required**         | empty                                                           |
-| Solana | `min_grace_period_secs`   | `86400` (a day)      | below `900`                                                     |
-| Solana | `min_sponsored_deposit`   | **required**         | `0`; it bounds a public endpoint that spends this node's rent   |
+| chain  | key                       | default         | refused by name when                                            |
+| ------ | ------------------------- | --------------- | --------------------------------------------------------------- |
+| EVM    | `min_withdraw_delay_secs` | `86400` (a day) | below `900`, or above `2592000` (the contract's 30-day maximum) |
+| EVM    | `asset_eip712_name`       | **required**    | empty                                                           |
+| EVM    | `asset_eip712_version`    | **required**    | empty                                                           |
+| Solana | `min_grace_period_secs`   | `86400` (a day) | below `900`                                                     |
+| Solana | `min_sponsored_deposit`   | **required**    | `0`; it bounds a public endpoint that spends this node's rent   |
 
 The two minimums are published in the greeting, and a channel whose `withdrawDelay` or `grace_period`
 falls short of them is not admitted. The floor of 900 seconds is x402's own; the day is the window a
