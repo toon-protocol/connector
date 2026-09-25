@@ -120,6 +120,12 @@ pub struct SolanaSettlementBackend {
     /// [`connect`](Self::connect) -- see [`Self::cluster`] and
     /// [`cluster_for_genesis_hash`] (issue #1131).
     cluster: Option<&'static str>,
+    /// The chain's own genesis hash, read at the same moment as
+    /// [`Self::cluster`] -- the raw value CAIP-2 truncates, unlike
+    /// [`Self::cluster`], which names only the three public clusters
+    /// [`cluster_for_genesis_hash`] recognises. See [`Self::caip2_network`]
+    /// (ADR 0074 decision 8, issue #1345).
+    genesis_hash: Hash,
 }
 
 /// The public Solana cluster whose genesis block hashes to `genesis_hash`
@@ -161,6 +167,31 @@ pub fn cluster_for_genesis_hash(genesis_hash: &Hash) -> Option<&'static str> {
     .into_iter()
     .find(|(cluster, _)| cluster.get_genesis_hash().as_ref() == Some(genesis_hash))
     .map(|(_, name)| name)
+}
+
+/// The CAIP-2 network id for `genesis_hash`: `solana:` followed by the
+/// first 32 characters of the chain's own base58-encoded genesis hash (ADR
+/// 0074 decision 8, issue #1345) -- CAIP-2's own truncation rule for the
+/// Solana namespace, e.g. `solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1` for
+/// devnet. Unlike [`cluster_for_genesis_hash`], this never answers `None`:
+/// CAIP-2 is defined over the genesis hash itself, not over whether it
+/// happens to match one of the three public clusters that function
+/// recognises, so a `solana-test-validator`'s fresh genesis gets a network
+/// id too, just not a memorable one.
+///
+/// `.chars().take(32)` rather than byte-slicing: base58 is ASCII, so the two
+/// agree for every real genesis hash, and this reads honestly as "the first
+/// 32 characters" even in the degenerate case CAIP-2's own worked examples
+/// never hit.
+pub fn caip2_solana_network(genesis_hash: &Hash) -> String {
+    format!(
+        "solana:{}",
+        genesis_hash
+            .to_string()
+            .chars()
+            .take(32)
+            .collect::<String>()
+    )
 }
 
 impl SolanaSettlementBackend {
@@ -247,14 +278,14 @@ impl SolanaSettlementBackend {
         // read refuses the connection -- which costs nothing this
         // `connect` did not already cost, since the three reads above have
         // already failed by now if the endpoint is unreachable.
-        let cluster =
-            cluster_for_genesis_hash(&retry_read(|| rpc.get_genesis_hash()).await.map_err(
-                |error| {
-                    SettlementError::Backend(format!(
-                        "could not read the cluster's genesis hash: {error}"
-                    ))
-                },
-            )?);
+        let genesis_hash = retry_read(|| rpc.get_genesis_hash())
+            .await
+            .map_err(|error| {
+                SettlementError::Backend(format!(
+                    "could not read the cluster's genesis hash: {error}"
+                ))
+            })?;
+        let cluster = cluster_for_genesis_hash(&genesis_hash);
 
         // Read rather than inferred from a transaction. Until ADR 0073 the
         // ATA create below ran on every start and doubled as proof that the
@@ -283,6 +314,7 @@ impl SolanaSettlementBackend {
             settled: Mutex::new(HashSet::new()),
             deposit_lock: tokio::sync::Mutex::new(()),
             cluster,
+            genesis_hash,
         };
         // The payer's lamports were read above, so a probe failure below
         // means program identity, never an unfunded payer reported as the
@@ -431,8 +463,12 @@ impl SolanaSettlementBackend {
             // A `deploy`-built backend only ever runs against this
             // workspace's own `solana-test-validator`, whose fresh genesis
             // no published hash can match -- so the read is skipped rather
-            // than spent to learn `None` (issue #1131).
+            // than spent to learn `None` (issue #1131). `genesis_hash` is
+            // never read either, for the same reason: nothing that tests
+            // against a `deploy`-built backend asks this one a CAIP-2
+            // network id (issue #1345).
             cluster: None,
+            genesis_hash: Hash::default(),
         };
         backend.ensure_own_ata_exists().await?;
         backend
@@ -466,6 +502,19 @@ impl SolanaSettlementBackend {
     /// gets nothing.
     pub fn cluster(&self) -> Option<&'static str> {
         self.cluster
+    }
+
+    /// The CAIP-2 network id for the chain this backend actually connected
+    /// to (ADR 0074 decision 8, issue #1345) -- the greeting's own
+    /// batch-settlement `network` field, unlike [`Self::cluster`], which
+    /// names nothing for a chain none of the three public clusters'
+    /// published hashes match. Every `solana-test-validator` is one such
+    /// chain, and still has a genesis hash, and CAIP-2's own Solana
+    /// namespace is defined over that hash directly -- it does not require
+    /// a *named* cluster, only *a* genesis. See
+    /// [`caip2_solana_network`].
+    pub fn caip2_network(&self) -> String {
+        caip2_solana_network(&self.genesis_hash)
     }
 
     /// This backend's own signing address -- the on-chain identity every
@@ -1518,5 +1567,37 @@ mod cluster_identity_tests {
     fn a_genesis_hash_no_public_cluster_published_names_no_cluster() {
         assert_eq!(cluster_for_genesis_hash(&Hash::new_unique()), None);
         assert_eq!(cluster_for_genesis_hash(&Hash::default()), None);
+    }
+
+    /// ADR 0074 decision 8, issue #1345: CAIP-2's Solana namespace is the
+    /// first 32 base58 characters of the genesis hash, checked against the
+    /// same published mainnet and devnet hashes
+    /// [`cluster_names_match_the_published_genesis_hashes`] pins.
+    #[test]
+    fn caip2_network_is_the_first_32_base58_characters_of_the_genesis_hash() {
+        let mainnet = Hash::from_str("5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d").unwrap();
+        assert_eq!(
+            caip2_solana_network(&mainnet),
+            "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+        );
+
+        let devnet = Hash::from_str("EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG").unwrap();
+        assert_eq!(
+            caip2_solana_network(&devnet),
+            "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+        );
+    }
+
+    /// Unlike [`cluster_for_genesis_hash`], a chain no public cluster
+    /// published still gets a real network id -- CAIP-2 is defined over the
+    /// hash itself, and every `solana-test-validator` this workspace's own
+    /// tests and `local/` topologies run on is exactly this case.
+    #[test]
+    fn caip2_network_names_an_unrecognised_chain_too() {
+        let network = caip2_solana_network(&Hash::new_unique());
+        assert!(
+            network.starts_with("solana:") && network.len() > "solana:".len(),
+            "a chain no public cluster published must still get a real network id, got {network}"
+        );
     }
 }

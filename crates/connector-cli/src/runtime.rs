@@ -1565,6 +1565,13 @@ pub struct Runtime {
     /// there was never a second fact there to hold, only a second chance to
     /// disagree.
     pub settlements: Vec<connector_client_edge::X402ChainSettlementTerms>,
+    /// One entry per chain this node has opted into accepting an x402
+    /// `batch-settlement` channel on (ADR 0074 decision 8, issue #1345) --
+    /// composed alongside `settlements` in the same loop, from the same
+    /// backend, so the two can never name a different chain. Empty on a
+    /// node whose settlement tables write no `batch_settlement` sub-table,
+    /// which is every node before this record.
+    pub batch_settlements: Vec<connector_client_edge::X402BatchSettlementTerms>,
     /// The rates this node deals at, or `None` for a node that declares no
     /// token to deal (ADR 0071 decision 6, issue #1294) -- which is every
     /// node that predates the record, and is why this is an `Option` rather
@@ -1765,6 +1772,12 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     let mut client_channel_source_solana: Option<Arc<dyn ClientChannelSource>> = None;
     let mut solana_cluster: Option<&'static str> = None;
     let mut settlements: Vec<connector_client_edge::X402ChainSettlementTerms> = Vec::new();
+    // ADR 0074 decision 8, issue #1345: this node's x402 batch-settlement
+    // facts, one entry per chain whose settlement table opted in. Composed
+    // in the same loop as `settlements`, off the same connected backend, so
+    // the greeting's `batch-settlement` entry and its `toon-channel` entry
+    // can never name two different deployments of "this chain".
+    let mut batch_settlements: Vec<connector_client_edge::X402BatchSettlementTerms> = Vec::new();
     // Each table's one transport, built once and handed to every client of
     // its `rpc_url` below (ADR 0073 decision 2).
     let transports = settlement_transports(config)?;
@@ -1803,6 +1816,25 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                     ),
                     decimals: evm.decimals(),
                 };
+                // ADR 0074 decision 8, issue #1345: this chain's
+                // batch-settlement facts, present only when this table
+                // opted in. `network`, `asset` and `receiverAuthorizer`/
+                // `payTo` are read off `evm_terms` just above rather than
+                // recomputed, so the two entries can never disagree about
+                // which chain or which address this is (CF-26).
+                if let Some(batch) = evm.batch_settlement() {
+                    batch_settlements.push(connector_client_edge::X402BatchSettlementTerms::Evm(
+                        connector_client_edge::X402BatchSettlementEvmTerms {
+                            network: format!("eip155:{}", backend.chain_id()),
+                            asset: evm_terms.token_address.clone(),
+                            pay_to: evm_terms.settlement_address.clone(),
+                            receiver_authorizer: evm_terms.settlement_address.clone(),
+                            min_withdraw_delay_secs: batch.min_withdraw_delay_secs(),
+                            name: batch.asset_eip712_name().to_string(),
+                            version: batch.asset_eip712_version().to_string(),
+                        },
+                    ));
+                }
                 settlements.push(connector_client_edge::X402ChainSettlementTerms::Evm(
                     evm_terms,
                 ));
@@ -1899,6 +1931,25 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                         decimals: solana.decimals(),
                     },
                 ));
+                // ADR 0074 decision 8, issue #1345: this node's Solana
+                // batch-settlement facts, present only when this table
+                // opted in. `payTo` and `feePayer` are both this backend's
+                // own pubkey (decision 5's sponsor-is-the-receiving-operator
+                // rule), and `network` is read off the chain's own genesis
+                // hash (`caip2_network`), never guessed from the RPC URL.
+                if let Some(batch) = solana.batch_settlement() {
+                    batch_settlements.push(
+                        connector_client_edge::X402BatchSettlementTerms::Solana(
+                            connector_client_edge::X402BatchSettlementSolanaTerms {
+                                network: backend.caip2_network(),
+                                asset: backend.token_mint().to_string(),
+                                pay_to: backend.own_pubkey().to_string(),
+                                fee_payer: backend.own_pubkey().to_string(),
+                                min_grace_period_secs: batch.min_grace_period_secs(),
+                            },
+                        ),
+                    );
+                }
                 connector = connector.with_settlement(
                     SettlementChain::Solana,
                     backend as Arc<dyn SettlementBackend>,
@@ -1991,6 +2042,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         client_channel_source_solana,
         solana_cluster,
         settlements,
+        batch_settlements,
         rate_table,
     })
 }
@@ -2540,6 +2592,7 @@ fn node_facts(config: &Config, runtime: &Runtime) -> connector_domain::NodeFacts
             .map(|carriage| carriage.name().to_string())
             .collect(),
         settlements: runtime.settlements.clone(),
+        batch_settlements: runtime.batch_settlements.clone(),
     }
 }
 
@@ -6477,6 +6530,173 @@ key_file = "{solana_key_path}"
             assert_eq!(solana_entry.program_id, program_id.to_string());
             assert_eq!(solana_entry.token_address, token_mint.to_string());
             assert_eq!(solana_entry.decimals, 6);
+        }
+
+        /// ADR 0074 decision 8, issue #1345, end to end: a node that opts
+        /// into `batch_settlement` on both chains composes both chains'
+        /// x402 batch-settlement facts, read off the very backends
+        /// `settlements` is composed from -- so the two lists can never
+        /// name two different deployments of "this chain" (CF-26).
+        #[tokio::test]
+        async fn a_both_chains_config_composes_both_chains_batch_settlement_facts() {
+            if !anvil_available() {
+                eprintln!(
+                    "skipping: `anvil` not found on PATH (install via https://getfoundry.sh)"
+                );
+                return;
+            }
+            if !require_solana_test_validator() {
+                return;
+            }
+
+            let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+            let token = EvmSettlementBackend::deploy_mock_token(
+                &anvil.rpc_url,
+                DEPLOYER_PRIVATE_KEY,
+                1_000_000,
+            )
+            .await
+            .expect("deploy mock USDC");
+            let settlement_backend =
+                EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
+                    .await
+                    .expect("deploy a TokenNetwork through a fresh registry");
+            let registry_address = settlement_backend.registry_address();
+            let evm_settlement_address = settlement_backend.own_address();
+            drop(settlement_backend);
+
+            let validator = SolanaValidator::spawn().await;
+            let program_id =
+                Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
+            let deployed = SolanaSettlementBackend::deploy(&validator.rpc_url, program_id)
+                .await
+                .expect("bind to the genesis-loaded payment-channel program");
+            let token_mint = deployed.token_mint();
+            drop(deployed);
+
+            let seed = [23u8; 32];
+            let payer =
+                solana_sdk::signer::keypair::keypair_from_seed(&seed).expect("derive keypair");
+            let rpc = RpcClient::new_with_commitment(
+                validator.rpc_url.clone(),
+                CommitmentConfig::confirmed(),
+            );
+            fund(&rpc, &payer.pubkey()).await;
+
+            let evm_key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let solana_key_path = raw_key_file(seed);
+            let config = load_config(&format!(
+                r#"
+client_edge_addr = "127.0.0.1:0"
+
+[signer]
+key_file = "{evm_key_path}"
+
+[settlement.evm]
+rpc_url = "{evm_rpc_url}"
+contract_address = "{registry_address:?}"
+token_address = "{token:?}"
+decimals = 6
+
+[settlement.evm.key]
+key_file = "{evm_key_path}"
+
+[settlement.evm.batch_settlement]
+min_withdraw_delay_secs = 3600
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+
+[settlement.solana]
+rpc_url = "{solana_rpc_url}"
+program_id = "{program_id}"
+token_address = "{token_mint}"
+decimals = 6
+
+[settlement.solana.key]
+key_file = "{solana_key_path}"
+
+[settlement.solana.batch_settlement]
+min_sponsored_deposit = 1000000
+min_grace_period_secs = 3600
+"#,
+                evm_key_path = evm_key_path.display(),
+                solana_key_path = solana_key_path.display(),
+                evm_rpc_url = anvil.rpc_url,
+                solana_rpc_url = validator.rpc_url,
+                registry_address = registry_address,
+                token = token,
+            ));
+
+            let runtime = build(&config)
+                .await
+                .expect("both legs opt into batch settlement without either refusing startup");
+
+            assert_eq!(
+                runtime.batch_settlements.len(),
+                2,
+                "both configured chains opted in: {:?}",
+                runtime.batch_settlements
+            );
+
+            let evm_chain_id = runtime
+                .settlements
+                .iter()
+                .find_map(|entry| match entry {
+                    connector_client_edge::X402ChainSettlementTerms::Evm(terms) => {
+                        Some(terms.chain.trim_start_matches("evm:").to_string())
+                    }
+                    _ => None,
+                })
+                .expect("the settlements list carries an EVM entry");
+            let evm_batch = runtime
+                .batch_settlements
+                .iter()
+                .find_map(|entry| match entry {
+                    connector_client_edge::X402BatchSettlementTerms::Evm(terms) => {
+                        Some(terms.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the batch-settlement list carries an EVM entry");
+            assert_eq!(
+                evm_batch.network,
+                format!("eip155:{evm_chain_id}"),
+                "the same chain id `settlements` proved, spelled CAIP-2"
+            );
+            assert_eq!(evm_batch.asset, format!("{token:#x}"));
+            assert_eq!(evm_batch.pay_to, format!("{evm_settlement_address:#x}"));
+            assert_eq!(
+                evm_batch.receiver_authorizer,
+                format!("{evm_settlement_address:#x}"),
+                "receiverAuthorizer is never delegated (ADR 0074 decision 5): it is always this \
+                 node's own settlement address"
+            );
+            assert_eq!(evm_batch.min_withdraw_delay_secs, 3600);
+            assert_eq!(evm_batch.name, "USDC");
+            assert_eq!(evm_batch.version, "2");
+
+            let solana_batch = runtime
+                .batch_settlements
+                .iter()
+                .find_map(|entry| match entry {
+                    connector_client_edge::X402BatchSettlementTerms::Solana(terms) => {
+                        Some(terms.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the batch-settlement list carries a Solana entry");
+            assert!(
+                solana_batch.network.starts_with("solana:"),
+                "got {}",
+                solana_batch.network
+            );
+            assert_eq!(solana_batch.asset, token_mint.to_string());
+            assert_eq!(
+                solana_batch.pay_to, solana_batch.fee_payer,
+                "the sponsor is the receiving operator (ADR 0074 decision 5): one settlement \
+                 key, both roles"
+            );
+            assert_eq!(solana_batch.min_grace_period_secs, 3600);
         }
 
         /// Issue #630's review, finding 2: a `[settlement.solana]`

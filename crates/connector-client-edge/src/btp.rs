@@ -1782,7 +1782,7 @@ mod tests {
             .clone();
         let terms: X402PaymentRequired =
             serde_json::from_slice(&terms_bytes).expect("valid x402 terms JSON");
-        assert_eq!(terms.accepts[0].amount, "0");
+        assert_eq!(terms.offer().unwrap().amount, "0");
     }
 
     /// Issue #1210: a route's `request` table rides the BTP

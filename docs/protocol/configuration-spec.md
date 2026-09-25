@@ -431,6 +431,8 @@ table does not start with one:
 | ------ | ------------------------- | -------------------- | --------------------------------------------------------------- |
 | EVM    | `min_withdraw_delay_secs` | `86400` (a day)      | below `900`, or above `2592000` (the contract's 30-day maximum) |
 | EVM    | `contract_address`        | x402's `0x4020…0003` | not a 20-byte address                                           |
+| EVM    | `asset_eip712_name`       | **required**         | empty                                                           |
+| EVM    | `asset_eip712_version`    | **required**         | empty                                                           |
 | Solana | `min_grace_period_secs`   | `86400` (a day)      | below `900`                                                     |
 | Solana | `min_sponsored_deposit`   | **required**         | `0`; it bounds a public endpoint that spends this node's rent   |
 | Solana | `program_id`              | `CHNLx…yGsX`         | not a base58 32-byte id                                         |
@@ -441,6 +443,18 @@ delayed `claim` or `settle_and_seal` still has to land in. `contract_address` an
 to the one address x402 deploys on each chain's test and main networks alike, and are the voucher
 domain the connector reads from its config and never from a voucher (decision 4). The Solana
 `program_id` here is x402's `payment-channels`, not `[settlement.solana] program_id`, which is TOON's.
+
+**`asset_eip712_name` and `asset_eip712_version`** are the EIP-712 domain `name` and `version` of
+`[settlement.evm] token_address` -- `"USDC"` and `"2"` for the devnet's Circle FiatToken v2.2 -- and
+are published on the greeting's `batch-settlement` `accepts[].extra` (ADR 0074 decision 8) so a stock
+client can sign its deposit's ERC-3009/permit2 authorization under the asset's real domain. Configured
+rather than read off the chain: an arbitrary ERC-20 need not expose an EIP-712 `version()` the way
+Circle's FiatToken does, and this connector never itself signs or verifies under either value, so
+there is nothing here to prove against a live contract the way `decimals` is (issue #1345). Both are
+required as soon as `[settlement.evm.batch_settlement]` exists -- there is no safe default for an
+arbitrary settlement token, and publishing the wrong domain would build a deposit signature that
+never verifies. Solana carries no equivalent key: the x402 SVM scheme's asset transfer has no EIP-712
+domain of its own to publish.
 
 **`decimals` is a declaration, not a conversion.** Nothing scales by it: every amount on the value path
 — a route's price, a claim's amount, a channel's deposit — is already in the settlement token's base

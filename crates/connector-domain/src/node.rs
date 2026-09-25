@@ -34,7 +34,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::x402::{X402ChainSettlementTerms, X402SettlementTerms};
+use crate::x402::{X402BatchSettlementTerms, X402ChainSettlementTerms, X402SettlementTerms};
 
 /// The client-edge versions this connector serves, and the one an
 /// unversioned `POST /ilp` resolves to (issue #1054,
@@ -83,6 +83,15 @@ pub struct NodeFacts {
     pub peer_carriages: Vec<String>,
     /// Every chain this node settles on, as the settlement backend proved it.
     pub settlements: Vec<X402ChainSettlementTerms>,
+    /// One entry per chain this node has opted into accepting an x402
+    /// `batch-settlement` channel on (ADR 0074 decision 8) --
+    /// `[settlement.evm.batch_settlement]` and/or
+    /// `[settlement.solana.batch_settlement]`. Empty on a node that has
+    /// opted into neither, which is every node before this record and every
+    /// node after it that writes neither table. The greeting's own
+    /// `batch-settlement` `accepts[]` entries and the self-description's
+    /// `batchSettlements` are both projections of this one list (ND-11).
+    pub batch_settlements: Vec<X402BatchSettlementTerms>,
 }
 
 impl NodeFacts {
@@ -227,6 +236,16 @@ pub struct NodeSelfDescription {
     pub edge_identity: Option<EdgeIdentity>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub settlements: Vec<X402ChainSettlementTerms>,
+    /// [`NodeFacts::batch_settlements`], published verbatim (ADR 0074
+    /// decision 8, ND-11): the same facts the greeting's own
+    /// `batch-settlement` `accepts[]` entries project. Absent, not an empty
+    /// array, on a node that has opted into neither chain.
+    #[serde(
+        rename = "batchSettlements",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    pub batch_settlements: Vec<X402BatchSettlementTerms>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub routes: Vec<RoutePrice>,
     /// The one client transport the routes covering this node's own
@@ -264,6 +283,7 @@ impl NodeSelfDescription {
             peer_carriages: facts.peer_carriages.clone(),
             edge_identity,
             settlements: facts.settlements.clone(),
+            batch_settlements: facts.batch_settlements.clone(),
             routes,
             required_transport,
             supported_versions: CLIENT_EDGE_SUPPORTED_VERSIONS.to_vec(),
@@ -332,6 +352,7 @@ pub fn agreed_required_transport<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::x402::X402BatchSettlementEvmTerms;
 
     fn evm() -> X402SettlementTerms {
         X402SettlementTerms {
@@ -351,6 +372,7 @@ mod tests {
             btp_endpoint: Some("wss://proxy.example/ilp/btp".to_string()),
             peer_carriages: vec!["btp".to_string()],
             settlements: vec![X402ChainSettlementTerms::Evm(evm())],
+            batch_settlements: Vec::new(),
         }
     }
 
@@ -379,6 +401,7 @@ mod tests {
             "btpEndpoint",
             "edgeIdentity",
             "settlements",
+            "batchSettlements",
             "routes",
             "requiredTransport",
         ] {
@@ -602,5 +625,48 @@ mod tests {
         let back: NodeSelfDescription = serde_json::from_slice(&bytes).expect("round-trips");
 
         assert_eq!(back, document);
+    }
+
+    /// ADR 0074 decision 8 / ND-11: the self-description publishes the same
+    /// batch-settlement facts the greeting projects, under their own
+    /// `batchSettlements` key -- absent, not an empty array, when this node
+    /// has opted into neither chain.
+    #[test]
+    fn the_document_publishes_batch_settlement_facts_when_opted_in() {
+        let evm_batch = X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
+            network: "eip155:84532".to_string(),
+            asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".to_string(),
+            pay_to: "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf".to_string(),
+            receiver_authorizer: "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf".to_string(),
+            min_withdraw_delay_secs: 86_400,
+            name: "USDC".to_string(),
+            version: "2".to_string(),
+        });
+        let opted_in_facts = NodeFacts {
+            batch_settlements: vec![evm_batch.clone()],
+            ..facts()
+        };
+        let document = NodeSelfDescription::describe(&opted_in_facts, None, Vec::new(), None);
+        let json = serde_json::to_value(&document).expect("serializes");
+
+        assert_eq!(
+            json["batchSettlements"],
+            serde_json::json!([{
+                "network": "eip155:84532",
+                "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                "payTo": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
+                "receiverAuthorizer": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
+                "withdrawDelay": 86400,
+                "name": "USDC",
+                "version": "2"
+            }])
+        );
+
+        let opted_out = NodeSelfDescription::describe(&facts(), None, Vec::new(), None);
+        let json = serde_json::to_value(&opted_out).expect("serializes");
+        assert!(
+            json.get("batchSettlements").is_none(),
+            "a node that opted into no chain must not carry a batchSettlements key: {json}"
+        );
     }
 }

@@ -52,9 +52,11 @@ pub const DEFAULT_EVM_BATCH_SETTLEMENT_CONTRACT: [u8; 20] = [
 pub const DEFAULT_SOLANA_BATCH_SETTLEMENT_PROGRAM: &str =
     "CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX";
 
-/// `[settlement.evm.batch_settlement]` as written. Every key is optional:
-/// writing the table is the opt-in (ADR 0074 decision 1), and each value it
-/// omits takes the default the record chose.
+/// `[settlement.evm.batch_settlement]` as written. `asset_eip712_name` and
+/// `asset_eip712_version` are required as soon as the table exists (issue
+/// #1345); every other key is optional -- writing the table is the opt-in
+/// (ADR 0074 decision 1), and each value it omits takes the default the
+/// record chose.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawEvmBatchSettlementTable {
@@ -62,6 +64,8 @@ pub(crate) struct RawEvmBatchSettlementTable {
     min_withdraw_delay_secs: Option<u64>,
     #[serde(default)]
     contract_address: Option<String>,
+    asset_eip712_name: String,
+    asset_eip712_version: String,
 }
 
 /// `[settlement.solana.batch_settlement]` as written. `min_sponsored_deposit`
@@ -88,6 +92,8 @@ pub(crate) struct RawSolanaBatchSettlementTable {
 pub struct EvmBatchSettlementConfig {
     min_withdraw_delay_secs: u64,
     contract_address: [u8; 20],
+    asset_eip712_name: String,
+    asset_eip712_version: String,
 }
 
 impl EvmBatchSettlementConfig {
@@ -104,6 +110,21 @@ impl EvmBatchSettlementConfig {
     /// from here and never from a voucher (ADR 0074 decision 4).
     pub fn contract_address(&self) -> [u8; 20] {
         self.contract_address
+    }
+
+    /// The EIP-712 domain `name` of the asset this node accepts a deposit
+    /// in (`[settlement.evm] token_address`) -- `"USDC"` for the devnet's
+    /// Circle FiatToken v2.2, and the figure the greeting's
+    /// `accepts[].extra.name` publishes (issue #1345). Configured, not read
+    /// off the chain: see this table's own module doc for why.
+    pub fn asset_eip712_name(&self) -> &str {
+        &self.asset_eip712_name
+    }
+
+    /// The EIP-712 domain `version` of the same asset -- `"2"` for the
+    /// devnet's Circle FiatToken v2.2, published as `accepts[].extra.version`.
+    pub fn asset_eip712_version(&self) -> &str {
+        &self.asset_eip712_version
     }
 }
 
@@ -178,9 +199,21 @@ pub(crate) fn resolve_evm_batch_settlement(
             None => return Err(ConfigError::BatchSettlementInvalidContractAddress { value }),
         },
     };
+    if raw.asset_eip712_name.trim().is_empty() {
+        return Err(ConfigError::BatchSettlementEmptyAssetEip712Field {
+            key: "asset_eip712_name",
+        });
+    }
+    if raw.asset_eip712_version.trim().is_empty() {
+        return Err(ConfigError::BatchSettlementEmptyAssetEip712Field {
+            key: "asset_eip712_version",
+        });
+    }
     Ok(EvmBatchSettlementConfig {
         min_withdraw_delay_secs,
         contract_address,
+        asset_eip712_name: raw.asset_eip712_name,
+        asset_eip712_version: raw.asset_eip712_version,
     })
 }
 
@@ -212,8 +245,14 @@ pub(crate) fn resolve_solana_batch_settlement(
 mod tests {
     use super::*;
 
+    /// `asset_eip712_name`/`asset_eip712_version` are required as soon as
+    /// the table exists (issue #1345), so every test below that is not
+    /// itself about those two keys writes a table missing only what it is
+    /// testing -- the two are supplied here once rather than in every
+    /// fixture.
     fn evm(text: &str) -> Result<EvmBatchSettlementConfig, ConfigError> {
-        resolve_evm_batch_settlement(toml::from_str(text).expect("valid TOML"))
+        let text = format!("asset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"\n{text}");
+        resolve_evm_batch_settlement(toml::from_str(&text).expect("valid TOML"))
     }
 
     fn solana(text: &str) -> Result<SolanaBatchSettlementConfig, ConfigError> {
@@ -224,11 +263,12 @@ mod tests {
 
     // -- EVM --
 
-    /// Writing the table is the opt-in, and everything in it has a default
-    /// the record chose: one day, and the contract x402 deploys.
+    /// Writing the table is the opt-in, and everything but the required
+    /// EIP-712 domain fields has a default the record chose: one day, and
+    /// the contract x402 deploys.
     #[test]
     fn an_empty_evm_table_takes_the_recorded_defaults() {
-        let config = evm("").expect("an empty table is a complete opt-in");
+        let config = evm("").expect("the two required keys alone are a complete opt-in");
 
         assert_eq!(config.min_withdraw_delay_secs(), ONE_DAY);
         assert_eq!(
@@ -326,6 +366,56 @@ mod tests {
         assert!(
             toml::from_str::<RawEvmBatchSettlementTable>("min_grace_period_secs = 900").is_err()
         );
+    }
+
+    /// Issue #1345: a table naming neither the EIP-712 name nor version at
+    /// all is refused by `deny_unknown_fields`'s own required-field check,
+    /// naming the missing key.
+    #[test]
+    fn an_evm_table_missing_the_eip712_domain_fields_is_refused_by_name() {
+        let error = toml::from_str::<RawEvmBatchSettlementTable>("min_withdraw_delay_secs = 900")
+            .expect_err("both keys are required as soon as the table exists");
+        let message = error.to_string();
+        assert!(message.contains("asset_eip712_name"), "got: {message}");
+    }
+
+    /// A table that writes the two keys empty is refused by this module's
+    /// own check, not merely accepted with a useless value published.
+    #[test]
+    fn an_evm_table_with_an_empty_eip712_domain_field_is_refused_by_name() {
+        let error = resolve_evm_batch_settlement(
+            toml::from_str("asset_eip712_name = \"\"\nasset_eip712_version = \"2\"")
+                .expect("valid TOML"),
+        )
+        .expect_err("an empty name publishes a useless domain");
+        assert!(matches!(
+            error,
+            ConfigError::BatchSettlementEmptyAssetEip712Field {
+                key: "asset_eip712_name"
+            }
+        ));
+
+        let error = resolve_evm_batch_settlement(
+            toml::from_str("asset_eip712_name = \"USDC\"\nasset_eip712_version = \"\"")
+                .expect("valid TOML"),
+        )
+        .expect_err("an empty version publishes a useless domain");
+        assert!(matches!(
+            error,
+            ConfigError::BatchSettlementEmptyAssetEip712Field {
+                key: "asset_eip712_version"
+            }
+        ));
+    }
+
+    /// The two values ride through verbatim -- the greeting publishes
+    /// exactly what the operator wrote, never a normalized or defaulted
+    /// spelling.
+    #[test]
+    fn the_eip712_domain_fields_are_read_back_verbatim() {
+        let config = evm("").expect("the helper's own USDC/2 fixture");
+        assert_eq!(config.asset_eip712_name(), "USDC");
+        assert_eq!(config.asset_eip712_version(), "2");
     }
 
     // -- Solana --

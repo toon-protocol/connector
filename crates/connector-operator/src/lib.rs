@@ -2446,6 +2446,7 @@ mod tests {
                         token_address: "0x00000000000000000000000000000000000000dd".to_string(),
                         decimals: 6,
                     })],
+                    batch_settlements: Vec::new(),
                 },
                 Some(EdgeIdentity {
                     key_id: "counterparty-key".to_string(),

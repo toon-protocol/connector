@@ -684,9 +684,9 @@ byte-for-byte, base64-encoded, in a `Payment-Required` response header:
 }
 ```
 
-`accepts` is a list — ADR 0022 notes terms are plural — but exactly one entry exists today, for
-the one payment method this client edge's own claim gate (§1.3) actually understands: a TOON
-payment channel claim, presented back over this same `POST /ilp`. There is no per-chain `exact`
+`accepts` is a list — ADR 0022 notes terms are plural — and until ADR 0074 exactly one entry
+existed, for the one payment method this client edge's own claim gate (§1.3) actually understands: a
+TOON payment channel claim, presented back over this same `POST /ilp`. There is no per-chain `exact`
 scheme entry naming a settlement `asset`/`payTo` address, for EVM, Solana or any other chain,
 because this claim gate understands one payment method and an `exact` scheme entry would describe a
 second. **Not** because settlement facts are unavailable — they have been in the greeting's `extra`
@@ -695,6 +695,22 @@ what the code actually sets — `ilpAddress`, `endpoint`, `price` and `sessionLe
 greeting, plus `pricePerKib` where the addressed route prices by size, plus whichever of
 `ilpAddresses`/`btpEndpoint`/`settlement`/`settlements`/`requiredTransport` this node has
 configured (below) — and carries nothing else.
+
+> **Amended by [ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
+> decision 8 (issue #1345).** `accepts` gains one **`batch-settlement`** entry per chain this node
+> has opted into accepting a batch-settlement channel on (`[settlement.<chain>.batch_settlement]`) --
+> unlike a hypothetical `exact` entry, this one names a real scheme this connector's settlement
+> backends actually redeem, x402's own audited contracts, with no TOON contract involved. Its
+> top-level `network`/`asset`/`payTo` and its `extra` are exactly what x402's `batch-settlement`
+> scheme spec requires, so a stock client can build a deposit from the greeting alone: `network` is
+> CAIP-2 (`eip155:<chainId>` or `solana:<genesis-hash-prefix>`), `asset` is the token address or
+> mint, and `payTo` is this node's own settlement address (Solana: the owner of its receiving
+> account). `extra` carries `receiverAuthorizer` and the minimum `withdrawDelay`, plus the asset's
+> EIP-712 `name`/`version`, on EVM; `feePayer` (the sponsor key) and the minimum `withdrawDelay`
+> (the program's own `grace_period`) on Solana. The `toon-channel` entry is unchanged and stays
+> first. The self-description publishes the same facts under `batchSettlements` (ND-11); this is a
+> projection of that value, never a second assembly of it
+> (`connector_domain::x402::batch_settlement_accept`).
 
 **`request`** ([issue #1210](https://github.com/toon-protocol/connector/issues/1210), [ADR
 0067](../adr/0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md)) — a
