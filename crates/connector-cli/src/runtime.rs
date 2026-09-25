@@ -32,19 +32,21 @@ use connector_runtime::{
     PeerRouteStore, PeerRouteStoreError, PeerTransport, QuotePathUnusable, RatePoller, RateSources,
     SharedRateTable, SystemClock,
 };
-use connector_settlement::batch::{BatchSettlementBackend, BatchSettlementError};
+use connector_settlement::batch::{BatchSettlementBackend, BatchSettlementError, HeldVouchers};
 use connector_settlement::{SettlementBackend, SettlementError};
 use connector_settlement_evm::{
-    ChannelIndexLookup, EvmBatchSettlementBackend, EvmChannelIndex, EvmChannelIndexSyncer,
-    EvmSettlementBackend, IndexedContract, DEFAULT_POLL_INTERVAL,
+    ChannelIndexLookup, EvmBatchSettlementBackend, EvmBatchWatcher, EvmChannelIndex,
+    EvmChannelIndexSyncer, EvmSettlementBackend, IndexedContract, DEFAULT_POLL_INTERVAL,
 };
-use connector_settlement_solana::batch::SolanaBatchSettlement;
+use connector_settlement_solana::batch::{SolanaBatchSettlement, SolanaBatchWatcher};
 use connector_settlement_solana::SolanaSettlementBackend;
 use connector_signer::{
     derive_evm_address, Ed25519Signer, LocalEd25519Signer, LocalSigner, Signer, SignerError,
 };
 
-use crate::batch_settlement::{readmit_journaled_channels, BatchSettlementChannelsAdapter};
+use crate::batch_settlement::{
+    readmit_journaled_channels, BatchSettlementChannelsAdapter, ClaimGateVouchers,
+};
 use crate::peer_transport;
 use ethers::types::U256;
 use solana_sdk::pubkey::Pubkey;
@@ -1673,7 +1675,8 @@ pub struct Runtime {
     /// admits vouchers through it; every channel the client-edge journal
     /// holds vouchers on is already re-admitted to it by the time [`build`]
     /// returns, so its `channel_state` and `land` work from the first
-    /// packet. The watchers and sweeps (issue #1344) drive it from here.
+    /// packet. [`router`] also starts its watcher and sweep over it (issue
+    /// #1344, `spawn_batch_settlement_watchers`).
     pub batch_settlement_evm: Option<Arc<EvmBatchSettlementBackend>>,
     /// The Solana twin of [`Self::batch_settlement_evm`], `Some` exactly
     /// when `[settlement.solana.batch_settlement]` is written -- and what
@@ -2427,6 +2430,47 @@ async fn reap_unresolvable_client_channels_periodically(gate: Arc<ClientClaimGat
     }
 }
 
+/// Start the watchers and sweeps over every batch-settlement backend this
+/// node opted in to (ADR 0074 decision 5, issue #1344), reading the vouchers
+/// to land from `gate`, the one place a voucher is accepted. Spawned, never
+/// awaited, for the life of the process, like the reaper beside it: a step
+/// that fails is logged and retried on its next tick. A node that opted in
+/// on neither chain starts nothing.
+///
+/// - EVM: [`EvmBatchWatcher`] reads `WithdrawInitiated` every
+///   [`WITHDRAWAL_WATCH_INTERVAL`] and claims the latest voucher on a
+///   withdrawing channel at once, and every [`BATCH_SWEEP_INTERVAL`] claims
+///   every held voucher in one `claim` and then `settle`s.
+/// - Solana: [`SolanaBatchWatcher`] rediscovers every sponsored channel every
+///   [`CLOSING_WATCH_INTERVAL`] -- sealing a Closing one with its latest
+///   voucher, distributing a Sealed one, reclaiming a Distributed one's rent
+///   -- and settles Open ones every [`OPEN_SETTLE_INTERVAL`].
+///
+/// Both backends read and write through the settlement table's one transport
+/// (ADR 0073): the watchers are built from the backends, never from a URL.
+///
+/// [`WITHDRAWAL_WATCH_INTERVAL`]: connector_settlement_evm::WITHDRAWAL_WATCH_INTERVAL
+/// [`BATCH_SWEEP_INTERVAL`]: connector_settlement_evm::BATCH_SWEEP_INTERVAL
+/// [`CLOSING_WATCH_INTERVAL`]: connector_settlement_solana::batch::CLOSING_WATCH_INTERVAL
+/// [`OPEN_SETTLE_INTERVAL`]: connector_settlement_solana::batch::OPEN_SETTLE_INTERVAL
+fn spawn_batch_settlement_watchers(runtime: &Runtime, gate: &Arc<ClientClaimGate>) {
+    let held: Arc<dyn HeldVouchers> = Arc::new(ClaimGateVouchers(Arc::clone(gate)));
+    if let Some(backend) = &runtime.batch_settlement_evm {
+        let watcher = EvmBatchWatcher::new(Arc::clone(backend), Arc::clone(&held));
+        tokio::spawn(watcher.run(
+            connector_settlement_evm::WITHDRAWAL_WATCH_INTERVAL,
+            connector_settlement_evm::BATCH_SWEEP_INTERVAL,
+        ));
+    }
+    if let Some(backend) = &runtime.batch_settlement_solana {
+        let watcher = SolanaBatchWatcher::new(Arc::clone(backend), held);
+        tokio::spawn(watcher.run(
+            connector_settlement_solana::batch::CLOSING_WATCH_INTERVAL,
+            connector_settlement_solana::batch::OPEN_SETTLE_INTERVAL,
+        ));
+    }
+}
+
 /// The channels this node accepts client-edge claims on, and whose
 /// counterparty each claim's signature must recover to (issues #558,
 /// #556, #631): everything `[[client_channels]]` declares, plus -- when
@@ -2779,6 +2823,7 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     tokio::spawn(reap_unresolvable_client_channels_periodically(Arc::clone(
         &claim_gate,
     )));
+    spawn_batch_settlement_watchers(runtime, &claim_gate);
     let app = connector_client_edge::router_with_node_facts(
         connector.clone(),
         signer.clone(),

@@ -548,6 +548,13 @@ pub struct SolanaValidator {
 
 impl SolanaValidator {
     pub async fn spawn() -> Self {
+        Self::spawn_with_args(&[]).await
+    }
+
+    /// [`spawn`](Self::spawn), with `extra` appended to
+    /// `solana-test-validator`'s arguments: `["--warp-slot", "10000"]`, say,
+    /// for a test that needs a slot a fresh ledger has not reached.
+    pub async fn spawn_with_args(extra: &[&str]) -> Self {
         let offset = NEXT_PORT_OFFSET.fetch_add(1, Ordering::SeqCst);
         let rpc_port = 19_900u16
             .wrapping_add((std::process::id() as u16) % 500)
@@ -580,6 +587,7 @@ impl SolanaValidator {
             ])
             .arg(payment_channels_fixture())
             .args(["--reset", "--quiet"])
+            .args(extra)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

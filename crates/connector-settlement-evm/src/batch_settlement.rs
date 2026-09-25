@@ -80,20 +80,20 @@ use crate::{EvmClient, EvmSettlementBackend};
 /// identity on a batch-settlement channel is its settlement address, and
 /// `claim` is sent from it as the channel's `receiverAuthorizer`.
 pub struct EvmBatchSettlementBackend {
-    contract: X402BatchSettlement<EvmClient>,
+    pub(crate) contract: X402BatchSettlement<EvmClient>,
     /// The EIP-712 domain every channel id and voucher digest is computed
     /// under: this chain, and the configured contract. Never a claim's.
     domain: BatchSettlementDomain,
     /// This node's settlement address: the `receiver` and
     /// `receiverAuthorizer` an admissible channel must name.
-    own_address: Address,
+    pub(crate) own_address: Address,
     /// The token this node settles in: the enclosing `[settlement.evm]`
     /// table's `token_address`, never declared twice (CF-26).
-    token: Address,
+    pub(crate) token: Address,
     min_withdraw_delay_secs: u64,
-    client: Arc<EvmClient>,
-    sender: Arc<Sender>,
-    confirm: ConfirmPolicy,
+    pub(crate) client: Arc<EvmClient>,
+    pub(crate) sender: Arc<Sender>,
+    pub(crate) confirm: ConfirmPolicy,
     /// Every channel admitted, by its canonical id, with the config it was
     /// admitted under. See the module doc for why this is the one thing
     /// kept.
@@ -452,7 +452,7 @@ pub(crate) fn chain_config(config: &EvmChannelConfig) -> ChannelConfig {
 /// A presented channel id's 32 bytes, in any hex case, with or without
 /// `0x`; `None` for anything that is not 32 bytes of hex. A presentation
 /// whose id does not parse cannot match the id its config derives.
-fn parse_id(channel: &ChannelId) -> Option<[u8; 32]> {
+pub(crate) fn parse_id(channel: &ChannelId) -> Option<[u8; 32]> {
     let digits = channel.0.strip_prefix("0x").unwrap_or(&channel.0);
     if digits.len() != 64 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -474,7 +474,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn backend_error<E: std::fmt::Display>(error: E) -> BatchSettlementError {
+pub(crate) fn backend_error<E: std::fmt::Display>(error: E) -> BatchSettlementError {
     BatchSettlementError::Backend(error.to_string())
 }
 

@@ -89,21 +89,27 @@ connector-settlement             the chain-agnostic settlement port + its contra
   └─ batch/                      a second, receive-only port for x402 batch-settlement
                                   channels a client opens (ADR 0074 decision 9): admit,
                                   read collateral and lifecycle, land a voucher. Its own
-                                  port.rs, contract.rs and in_memory.rs, in the same shape
+                                  port.rs, contract.rs and in_memory.rs, in the same shape,
+                                  and held.rs: where the watchers read the latest voucher
 connector-settlement-evm         real EVM backend: TokenNetworkRegistry → TokenNetwork,
                                   holding no local channel state; every method reads the
                                   chain fresh
-  └─ batch_settlement.rs         the batch-settlement port over x402's
-                                  x402BatchSettlement (ADR 0074): admits a presented
-                                  ChannelConfig, `claim`s from the settlement key.
-                                  contracts/x402/ holds its ABI and the pinned bytecode
-                                  the tests place on anvil, with PROVENANCE.md
+  ├─ batch_settlement.rs         the batch-settlement port over x402's
+  │                               x402BatchSettlement (ADR 0074): admits a presented
+  │                               ChannelConfig, `claim`s from the settlement key.
+  │                               contracts/x402/ holds its ABI and the pinned bytecode
+  │                               the tests place on anvil, with PROVENANCE.md
+  └─ batch_watch.rs              its watcher and sweep (ADR 0074 decision 5): claims at
+                                  once on a WithdrawInitiated, and periodically claims
+                                  every channel in one `claim`, then `settle`s
 connector-settlement-solana      real Solana backend, speaking packages/solana-program's
                                   own wire directly (that crate builds for SBF only and
                                   exports no client SDK)
   ├─ batch/                      the batch-settlement port on solana-foundation's
   │                               payment-channels (ADR 0074): admission, settle and
-  │                               settle_and_seal, and that program's own wire
+  │                               settle_and_seal, and that program's own wire; sweep.rs
+  │                               is its watcher, which rediscovers every sponsored
+  │                               channel and seals, distributes and reclaims it
   └─ fixtures/payment_channels.so  that program's mainnet-beta binary, which tier-3
                                   tests load into genesis at its canonical id
 

@@ -29,33 +29,16 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
 
-use support::{paid_prepare, post_ilp, spawn_recording_app, CLIENT_EDGE_JOURNAL};
+use support::{paid_prepare, post_ilp, solana_voucher, spawn_recording_app, CLIENT_EDGE_JOURNAL};
 
 const ROUTE: &str = "g.toon.batch";
 const PRICE: u64 = 100;
 const DEPOSIT: u64 = 1_000;
 const ONE_DAY: u32 = 86_400;
 
-/// A Solana voucher on the wire, as x402's payload names its fields.
-fn solana_voucher(channel: &Pubkey, amount: u64, signature: &[u8; 64]) -> String {
-    serde_json::json!({
-        "version": "1.0",
-        "blockchain": "solana",
-        "scheme": "batch-settlement",
-        "messageId": format!("voucher-{amount}"),
-        "timestamp": "2026-09-25T12:00:00Z",
-        "senderId": "x402-client",
-        "channelId": channel.to_string(),
-        "maxClaimableAmount": amount.to_string(),
-        "expiresAt": 0,
-        "signature": bs58::encode(signature).into_string(),
-    })
-    .to_string()
-}
-
 /// An EVM voucher on the wire, for a node that has not opted in on EVM to
 /// refuse.
-fn evm_voucher() -> String {
+fn unaccepted_evm_voucher() -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
@@ -151,7 +134,7 @@ price = {PRICE}
 
     let response = post_ilp(
         &app,
-        &solana_voucher(&channel, PRICE, &payer.sign(&channel, PRICE)),
+        &solana_voucher(&channel.to_string(), PRICE, &payer.sign(&channel, PRICE)),
         paid_prepare(ROUTE, &receiver),
     )
     .await;
@@ -191,9 +174,15 @@ price = {PRICE}
     assert_eq!(amount, PRICE);
 
     // The node on EVM has not opted in, and says so.
-    let refused =
-        Reject::decode(&post_ilp(&app, &evm_voucher(), paid_prepare(ROUTE, &receiver)).await)
-            .expect("a voucher on a chain this node has not opted in on is refused");
+    let refused = Reject::decode(
+        &post_ilp(
+            &app,
+            &unaccepted_evm_voucher(),
+            paid_prepare(ROUTE, &receiver),
+        )
+        .await,
+    )
+    .expect("a voucher on a chain this node has not opted in on is refused");
     assert!(
         refused.message.contains("batch-settlement"),
         "refused by name: {refused:?}"

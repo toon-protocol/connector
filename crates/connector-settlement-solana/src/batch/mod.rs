@@ -11,14 +11,23 @@
 //! Ed25519 precompile layout in [`crate::wire`] and the voucher message and
 //! verifier in `connector-signer` (issue #1341).
 //!
-//! **What is not here.** Watching for Closing, `distribute`, `reclaim` and
-//! `getProgramAccounts` rediscovery are issue #1344's; the public sponsor
+//! Watching for Closing, `distribute`, `reclaim` and `getProgramAccounts`
+//! rediscovery are [`SolanaBatchWatcher`]'s (issue #1344, the `sweep`
+//! module).
+//!
+//! **What is not here.** The public sponsor
 //! endpoint is issue #1346's, and builds on [`wire::OpenChannel`]. The
 //! runtime builds this backend when `[settlement.solana.batch_settlement]`
 //! is written and hands it to the client edge's claim gate
 //! (`connector-cli`'s `batch_settlement` module).
 
+mod sweep;
 pub mod wire;
+
+pub use sweep::{
+    next_step, SolanaBatchWatcher, SponsoredChannel, Step, CLOSING_WATCH_INTERVAL,
+    OPEN_SETTLE_INTERVAL,
+};
 
 use std::collections::HashSet;
 use std::str::FromStr;

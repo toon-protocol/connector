@@ -1,8 +1,10 @@
 //! Where a node's x402 `batch-settlement` backends meet its client edge
 //! (ADR 0074, epic #1349): the adapter from the receive-only settlement port
 //! ([`BatchSettlementBackend`], #1340) to the claim gate's seam
-//! ([`BatchSettlementChannels`], #1341), and the boot step that re-admits
-//! every channel the client edge's journal holds vouchers on.
+//! ([`BatchSettlementChannels`], #1341), the boot step that re-admits
+//! every channel the client edge's journal holds vouchers on, and the view
+//! of the claim gate the watchers and sweeps (#1344) read the latest voucher
+//! on each channel from ([`ClaimGateVouchers`]).
 //!
 //! Here rather than in either crate it joins, for the reason
 //! `SettlementChannelSource` is: `connector-client-edge` does not depend on
@@ -20,11 +22,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use connector_client_edge::{
     AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
-    ChannelLookupFailed, ChannelResolutionError, ChannelTerminal, JournaledBatchChannel,
+    ChannelLookupFailed, ChannelResolutionError, ChannelTerminal, ClientClaimGate,
+    JournaledBatchChannel,
 };
 use connector_settlement::batch::{
     BatchChannelState, BatchSettlementBackend, BatchSettlementError, ChannelPresentation,
-    EvmChannelConfig, VoucherSigner,
+    EvmChannelConfig, HeldVoucher, HeldVouchers, Voucher, VoucherSigner,
 };
 use connector_settlement::ChannelId;
 use connector_signer::{BatchChannelConfig, BatchSettlementDomain};
@@ -220,6 +223,50 @@ fn port_config(config: &BatchChannelConfig) -> EvmChannelConfig {
     }
 }
 
+/// The claim gate as the watchers and sweeps read it (ADR 0074 decision 5):
+/// every batch-settlement channel it has accepted a voucher on, with that
+/// channel's latest voucher. The gate stays the one place a voucher is
+/// accepted; this only reads what it holds.
+pub(crate) struct ClaimGateVouchers(pub(crate) Arc<ClientClaimGate>);
+
+impl HeldVouchers for ClaimGateVouchers {
+    fn held_vouchers(&self) -> Vec<HeldVoucher> {
+        self.0
+            .batch_channels()
+            .into_iter()
+            .filter_map(|channel| {
+                let (_nonce, amount, signature) =
+                    self.0.latest_inbound_claim(&channel.channel_key())?;
+                Some(held_voucher(channel, amount, signature))
+            })
+            .collect()
+    }
+}
+
+/// A journaled channel and its latest voucher, as the port names them.
+fn held_voucher(channel: JournaledBatchChannel, amount: u64, signature: Vec<u8>) -> HeldVoucher {
+    HeldVoucher {
+        presentation: presentation(channel),
+        voucher: Voucher {
+            cumulative_amount: u128::from(amount),
+            signature,
+        },
+    }
+}
+
+/// A journaled channel as it is presented to the port.
+fn presentation(channel: JournaledBatchChannel) -> ChannelPresentation {
+    match channel {
+        JournaledBatchChannel::Evm { channel_id, config } => ChannelPresentation::Evm {
+            channel: evm_channel(&channel_id),
+            config: port_config(&config),
+        },
+        JournaledBatchChannel::Solana { channel_account } => ChannelPresentation::Solana {
+            channel: solana_channel(&channel_account),
+        },
+    }
+}
+
 /// Re-admit every batch-settlement channel `channels` names to its chain's
 /// backend, so the port's `channel_state` and `land` work on it from the
 /// moment this node serves -- the journal is the only place an EVM
@@ -237,21 +284,11 @@ pub(crate) async fn readmit_journaled_channels(
     solana: Option<&dyn BatchSettlementBackend>,
 ) {
     for channel in channels {
-        let (backend, presentation) = match *channel {
-            JournaledBatchChannel::Evm { channel_id, config } => (
-                evm,
-                ChannelPresentation::Evm {
-                    channel: evm_channel(&channel_id),
-                    config: port_config(&config),
-                },
-            ),
-            JournaledBatchChannel::Solana { channel_account } => (
-                solana,
-                ChannelPresentation::Solana {
-                    channel: solana_channel(&channel_account),
-                },
-            ),
+        let backend = match channel {
+            JournaledBatchChannel::Evm { .. } => evm,
+            JournaledBatchChannel::Solana { .. } => solana,
         };
+        let presentation = presentation(*channel);
         let channel = presentation.channel().clone();
         let Some(backend) = backend else {
             tracing::warn!(
@@ -342,6 +379,54 @@ mod tests {
             resolution(Err(BatchSettlementError::Backend("timed out".to_string()))),
             Err(ChannelResolutionError::LookupFailed(_))
         ));
+    }
+
+    /// A watcher lands what the gate journaled: an EVM channel with the
+    /// config `claim` needs, a Solana one by its account, each carrying its
+    /// latest voucher's amount and signature unchanged.
+    #[test]
+    fn a_journaled_channel_is_held_under_the_ports_presentation() {
+        let config = BatchChannelConfig {
+            payer: [1; 20],
+            payer_authorizer: [2; 20],
+            receiver: [3; 20],
+            receiver_authorizer: [4; 20],
+            token: [5; 20],
+            withdraw_delay: 86_400,
+            salt: [6; 32],
+        };
+        let evm = held_voucher(
+            JournaledBatchChannel::Evm {
+                channel_id: [0xab; 32],
+                config,
+            },
+            300,
+            vec![9; 65],
+        );
+        assert_eq!(
+            evm.presentation,
+            ChannelPresentation::Evm {
+                channel: evm_channel(&[0xab; 32]),
+                config: port_config(&config),
+            }
+        );
+        assert_eq!(evm.voucher.cumulative_amount, 300);
+        assert_eq!(evm.voucher.signature, vec![9; 65]);
+
+        let solana = held_voucher(
+            JournaledBatchChannel::Solana {
+                channel_account: [0x01; 32],
+            },
+            7,
+            vec![8; 64],
+        );
+        assert_eq!(
+            solana.presentation,
+            ChannelPresentation::Solana {
+                channel: solana_channel(&[0x01; 32]),
+            }
+        );
+        assert_eq!(solana.voucher.cumulative_amount, 7);
     }
 
     #[test]
