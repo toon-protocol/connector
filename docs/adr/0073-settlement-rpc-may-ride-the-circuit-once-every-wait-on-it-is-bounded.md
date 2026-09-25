@@ -219,18 +219,27 @@ Built on the branch that accepted this record. Where a number or a mechanism bel
 
 ### Decision 5, item by item
 
-- **Solana confirm.** `submit` sends once with preflight, then polls `getSignatureStatuses` and `getBlockHeight` through any transient error. It stops when the transaction is confirmed, has failed on chain, or the chain's block height has passed the blockhash's `lastValidBlockHeight`, and reports by signature. A preflight refusal is reported as never broadcast. A send whose answer was lost is re-sent as the same signed bytes until acknowledged. The **one addition**: if the endpoint cannot be read at all for 120s (about twice a blockhash's life), the outcome is reported as **unknown**, naming the signature, because nothing else bounds a loop whose only exit is a read. Polls are 500ms direct and 1s over a circuit.
-- **EVM confirm.** The deadline is 180s as written. The recheck window is 30s: a transaction no poll has **observed** (neither a receipt nor `eth_getTransactionByHash`) for 30s is reported as not observed, with its hash. One observed but not mined is waited for until the 180s deadline. Polls are 1s over a circuit and stay 100ms direct, as written.
+- **Solana confirm.** `submit` sends once with preflight, then polls `getSignatureStatuses` and `getBlockHeight` through any transient error, backing off (poll interval doubling, 8s ceiling) while polls fail. It stops when the transaction is confirmed, has failed on chain, or has expired, and reports by signature. A preflight refusal is reported as never broadcast. A send whose answer was lost is re-sent as the same signed bytes until acknowledged. Two **additions**:
+  - **Expired** is judged only once the block height is 20 blocks (about 8s) past `lastValidBlockHeight`, and only on a status read with `searchTransactionHistory`. Otherwise a load-balanced endpoint whose height and status backends disagree could call a landed transaction expired and "safe to retry", the #907 pattern on Solana.
+  - **Unknown**: if no read answers at all for 120s (about twice a blockhash's life), the outcome is reported as unknown, naming the signature. Nothing else bounds a loop whose only exit is a read.
+
+  Polls are 500ms direct and 1s over a circuit.
+
+- **EVM confirm.** The deadline is 180s as written. The recheck window is 30s: a transaction is reported as not observed, with its hash, once the endpoint has **answered** "not found" to both the receipt and `eth_getTransactionByHash` for 30s straight. A failed poll resets that window, so a circuit outage never reads as "not observed". Failed polls back off as on Solana. Polls are 1s over a circuit and stay 100ms direct, as written.
 - **EVM nonces.** `send::Sender` replaces `NonceManagerMiddleware`. It seeds from `pending`, then counts locally under one lock that covers nonce, signing and send. The transaction hash is computed before sending. The outcomes:
   - A JSON-RPC refusal sent nothing.
   - A nonce conflict re-reads `pending` and signs the never-accepted operation once more.
   - A lost answer is looked up by hash, and the only re-send is the identical signed bytes.
-  - Nothing is ever re-signed at a nonce that may be spent.
+  - If neither the lookup nor the re-send settles it, the transaction is remembered as unresolved. The next write reads `pending`, and if `pending` has not moved past the unresolved nonce (a lagging backend), it offers those same bytes again and takes the nonce after. So nothing is ever re-signed at a nonce that may be spent, even when `pending` lags.
 - **Boot reads first, and retries.** `ensure_own_ata_exists` reads the ATA and creates it only when missing. Every boot read on both chains goes through `retry_read`: three retries, 0.5s then 1s then 2s. That applies to every failure, the node's own answers included, since boot only reads. Two things were **added**:
   - The same helper covers the blockhash a Solana write signs over and the `pending` nonce an EVM write starts from. Nothing has been sent at either point.
   - Solana boot now reads the payer's balance and refuses one holding no lamports. The ATA create used to prove that on every start, and a missing proof would otherwise surface as a failed program-identity probe.
 - **403 and 429.** Both are retried with backoff on both chains: four retries, 0.5s doubling (7.5s in all). On EVM a `Retry-After` of up to 8s replaces the computed wait, and a longer one ends the retries. The Solana SDK drops the response before returning a status error, so there the computed wait is always used. A confirmation poll never treats either as an answer.
 - **`fund` is idempotent** by the first of the two routes this record offered: a stated total. `SettlementBackend::fund_to(channel, own_total)` raises the own deposit to a total and no further. On EVM the total goes straight to `setTotalDeposit`, so the chain computes the difference. On Solana the backend reads and deposits the difference under a lock. `POST /channels/:id/fund` takes exactly one of `amount` (the increment, unchanged) or `total`.
+
+### What is not typed
+
+Every outcome above reaches the caller as `SettlementError::Backend` with a message that names the transaction and says whether a retry is safe. The port's error enum was not widened to carry "landed", "expired" and "unknown" as variants. That would change the operator surface's error mapping, and no caller branches on them yet. A caller that needs to retry mechanically should use `fund_to`, which is safe whatever the message says.
 
 ### Tested
 

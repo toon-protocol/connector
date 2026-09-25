@@ -270,3 +270,30 @@ async fn a_proxy_that_is_down_fails_the_request_and_nothing_is_dialed_direct() {
     assert!(!answered(&error));
     assert_eq!(rpc.calls().len(), 0, "nothing reached the endpoint direct");
 }
+
+/// A keyed endpoint carries its API key in the path, and nothing this
+/// transport reports may print it (ADR 0073).
+#[tokio::test]
+async fn a_failed_request_never_prints_the_endpoint_path_where_an_api_key_lives() {
+    let rpc = FakeRpc::spawn(|_| RpcReply::Drop).await;
+    let keyed = format!("{}/v2/SECRETAPIKEY", rpc.url());
+    let transport = RpcTransport::new(&keyed, Route::Direct, SHORT).expect("transport");
+
+    let evm = EvmRpc::provider(transport.clone())
+        .get_block_number()
+        .await
+        .expect_err("dropped");
+    assert!(!format!("{evm} {evm:?}").contains("SECRETAPIKEY"), "{evm}");
+
+    let solana = rpc_client(
+        &transport,
+        RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+    )
+    .get_slot()
+    .await
+    .expect_err("dropped");
+    assert!(
+        !format!("{solana} {solana:?}").contains("SECRETAPIKEY"),
+        "{solana}"
+    );
+}

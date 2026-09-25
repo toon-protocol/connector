@@ -2186,7 +2186,7 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
                 table = chain.name(),
                 endpoint = %transport.endpoint(),
                 circuit = circuit.socks_username(),
-                "settlement RPC rides the socks_proxy on its own pinned circuit (ADR 0073)"
+                "settlement rpc via socks_proxy"
             );
             transport
         } else {

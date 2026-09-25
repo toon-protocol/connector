@@ -64,7 +64,13 @@ impl RpcSender for RefusalRetrying {
         loop {
             let error = match self.inner.send(request, params.clone()).await {
                 Ok(value) => return Ok(value),
-                Err(error) => error,
+                // reqwest prints the full URL, and a keyed endpoint's path is
+                // its API key, so it is dropped from every error this
+                // sender returns.
+                Err(error) => match error.kind {
+                    ErrorKind::Reqwest(source) => ClientError::from(source.without_url()),
+                    kind => ClientError::from(kind),
+                },
             };
             let refused = match error.kind() {
                 ErrorKind::Reqwest(source) => source.status().filter(|status| is_refusal(*status)),

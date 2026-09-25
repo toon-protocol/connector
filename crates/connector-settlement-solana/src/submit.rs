@@ -123,7 +123,10 @@ pub(crate) async fn send_and_confirm(
     last_valid_block_height: u64,
     policy: ConfirmPolicy,
 ) -> Result<Signature, SubmitError> {
-    let signature = transaction.signatures[0];
+    let signature = *transaction
+        .signatures
+        .first()
+        .expect("`submit` signs every transaction with its payer before it gets here");
     // `encoding` is set so the SDK does not first ask the node its version
     // to choose one: one fewer round trip, and one fewer to fail.
     let first_send = RpcSendTransactionConfig {
@@ -150,45 +153,66 @@ pub(crate) async fn send_and_confirm(
         Err(_) => false,
     };
 
-    let started = Instant::now();
+    // The last time any read answered. `Unknown` is measured from here, so
+    // it means what it says: nothing could be read for that long.
+    let mut last_answer = Instant::now();
+    let mut failures = 0u32;
     let mut last_error = String::from("none");
     loop {
-        match poll_status(rpc, &signature).await {
-            Ok(Some(Ok(()))) => return Ok(signature),
-            Ok(Some(Err(error))) => return Err(SubmitError::Failed { signature, error }),
-            Ok(None) => {}
-            Err(error) => last_error = error,
+        let mut failed = false;
+        match poll_status(rpc, &signature, false).await {
+            Ok(PollStatus::Confirmed) => return Ok(signature),
+            Ok(PollStatus::Failed(error)) => return Err(SubmitError::Failed { signature, error }),
+            Ok(PollStatus::Unseen) => last_answer = Instant::now(),
+            Err(error) => {
+                failed = true;
+                last_error = error;
+            }
         }
 
         match rpc
             .get_block_height_with_commitment(CommitmentConfig::confirmed())
             .await
         {
-            Ok(block_height) if block_height > last_valid_block_height => {
-                // Past its deadline. One last look, since it may have landed
-                // in the very block the deadline names; if that look fails,
-                // the loop comes round again rather than guessing.
-                match poll_status(rpc, &signature).await {
-                    Ok(Some(Ok(()))) => return Ok(signature),
-                    Ok(Some(Err(error))) => return Err(SubmitError::Failed { signature, error }),
-                    Ok(None) => {
+            Ok(block_height) if block_height > last_valid_block_height + EXPIRY_MARGIN => {
+                last_answer = Instant::now();
+                // Past its deadline, with a margin for the status and the
+                // height coming from different backends of a load-balanced
+                // endpoint. One last look, searching the ledger's history
+                // rather than a backend's recent-status cache, since it may
+                // have landed in the very block the deadline names; if that
+                // look fails, the loop comes round again rather than
+                // guessing.
+                match poll_status(rpc, &signature, true).await {
+                    Ok(PollStatus::Confirmed) => return Ok(signature),
+                    Ok(PollStatus::Failed(error)) => {
+                        return Err(SubmitError::Failed { signature, error })
+                    }
+                    Ok(PollStatus::Unseen) => {
                         return Err(SubmitError::Expired {
                             signature,
                             block_height,
                             last_valid_block_height,
                         })
                     }
-                    Err(error) => last_error = error,
+                    Err(error) => {
+                        failed = true;
+                        last_error = error;
+                    }
                 }
             }
-            Ok(_) => {}
-            Err(error) => last_error = error.to_string(),
+            Ok(_) => last_answer = Instant::now(),
+            Err(error) => {
+                failed = true;
+                last_error = error.to_string();
+            }
         }
+        failures = if failed { failures + 1 } else { 0 };
 
-        if started.elapsed() >= policy.give_up_after {
+        if last_answer.elapsed() >= policy.give_up_after {
             return Err(SubmitError::Unknown {
                 signature,
-                waited_secs: started.elapsed().as_secs(),
+                waited_secs: last_answer.elapsed().as_secs(),
                 last_error,
             });
         }
@@ -209,30 +233,58 @@ pub(crate) async fn send_and_confirm(
                 acknowledged = true;
             }
         }
-        tokio::time::sleep(policy.poll).await;
+        // Backs off while polls fail, so an endpoint that is refusing or
+        // down is not polled at full speed; the first answer resets it.
+        let backoff = policy
+            .poll
+            .saturating_mul(2u32.saturating_pow(failures.min(4)))
+            .min(Duration::from_secs(8).max(policy.poll));
+        tokio::time::sleep(backoff).await;
     }
+}
+
+/// Blocks past `lastValidBlockHeight` before a transaction is judged
+/// expired. The height and the status can come from different backends of
+/// a load-balanced endpoint, and one lagging behind the other must not turn
+/// a landed transaction into "expired, retry is safe". About 8s of blocks.
+const EXPIRY_MARGIN: u64 = 20;
+
+/// What one status poll said.
+enum PollStatus {
+    /// Landed and succeeded, at `confirmed` or deeper.
+    Confirmed,
+    /// Landed and failed on chain.
+    Failed(TransactionError),
+    /// Not seen, or seen but not yet confirmed.
+    Unseen,
 }
 
 /// `Some(Ok)` confirmed, `Some(Err)` landed and failed, `None` not seen (or
 /// seen but not yet confirmed), `Err` the poll itself failed.
+/// One status read. `search_history` asks the node to look beyond its
+/// recent-status cache, which is what the final expiry check needs. `Err`
+/// is the poll itself failing, never an answer about the transaction.
 async fn poll_status(
     rpc: &RpcClient,
     signature: &Signature,
-) -> Result<Option<Result<(), TransactionError>>, String> {
-    let statuses = rpc
-        .get_signature_statuses(&[*signature])
-        .await
-        .map_err(|error| error.to_string())?;
+    search_history: bool,
+) -> Result<PollStatus, String> {
+    let statuses = if search_history {
+        rpc.get_signature_statuses_with_history(&[*signature]).await
+    } else {
+        rpc.get_signature_statuses(&[*signature]).await
+    }
+    .map_err(|error| error.to_string())?;
     let Some(Some(status)) = statuses.value.into_iter().next() else {
-        return Ok(None);
+        return Ok(PollStatus::Unseen);
     };
     if let Some(error) = status.err.clone() {
-        return Ok(Some(Err(error)));
+        return Ok(PollStatus::Failed(error));
     }
     if status.satisfies_commitment(CommitmentConfig::confirmed()) {
-        return Ok(Some(Ok(())));
+        return Ok(PollStatus::Confirmed);
     }
-    Ok(None)
+    Ok(PollStatus::Unseen)
 }
 
 #[cfg(test)]
@@ -398,7 +450,7 @@ mod tests {
             transaction.signatures[0],
             accepted,
             |_| not_seen(),
-            |call| RpcReply::Result(json!(LAST_VALID - 2 + call.nth as u64)),
+            |call| RpcReply::Result(json!(LAST_VALID - 2 + 10 * call.nth as u64)),
         )
         .await;
 
@@ -409,8 +461,34 @@ mod tests {
         let SubmitError::Expired { block_height, .. } = error else {
             panic!("expected Expired, got {error:?}");
         };
-        assert!(block_height > LAST_VALID);
+        assert!(block_height > LAST_VALID + EXPIRY_MARGIN);
         assert!(text.contains("retrying is safe"), "{text}");
+    }
+
+    /// The #907 pattern on Solana: the height comes from a backend that is
+    /// ahead, and the recent-status cache from one that has not seen the
+    /// transaction. Only the history search, past the margin, decides.
+    #[tokio::test]
+    async fn a_lagging_status_cache_does_not_turn_a_landed_transaction_into_expired() {
+        let transaction = signed_transaction();
+        let rpc = node(
+            transaction.signatures[0],
+            accepted,
+            |call| {
+                let searched = call.params[1]["searchTransactionHistory"] == json!(true);
+                if searched {
+                    status(None, "finalized")
+                } else {
+                    not_seen()
+                }
+            },
+            |_| RpcReply::Result(json!(LAST_VALID + 1_000)),
+        )
+        .await;
+
+        send_and_confirm(&client(&rpc), &transaction, LAST_VALID, FAST)
+            .await
+            .expect("it landed; the history search finds it");
     }
 
     #[tokio::test]

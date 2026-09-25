@@ -162,7 +162,9 @@ impl JsonRpcClient for EvmRpc {
                 .await
                 .map_err(|source| EvmRpcError::Transport {
                     endpoint: endpoint(),
-                    source,
+                    // reqwest prints the full URL, and a keyed endpoint's
+                    // path is its API key; `endpoint` already names where.
+                    source: source.without_url(),
                 })?;
             let status = response.status();
             if is_refusal(status) {
@@ -186,7 +188,9 @@ impl JsonRpcClient for EvmRpc {
                 .await
                 .map_err(|source| EvmRpcError::Transport {
                     endpoint: endpoint(),
-                    source,
+                    // reqwest prints the full URL, and a keyed endpoint's
+                    // path is its API key; `endpoint` already names where.
+                    source: source.without_url(),
                 })?;
             break (status, bytes);
         };

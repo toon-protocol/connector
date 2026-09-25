@@ -100,10 +100,24 @@ impl ConfirmPolicy {
 pub(crate) struct Sender {
     provider: Arc<Provider<EvmRpc>>,
     wallet: LocalWallet,
-    /// The next nonce to use, or `None` when it must be read from
-    /// `pending` first: at start, and after anything that leaves it
-    /// uncertain.
-    next_nonce: tokio::sync::Mutex<Option<U256>>,
+    /// Where the next write's nonce comes from, under the one lock every
+    /// write takes.
+    nonces: tokio::sync::Mutex<NonceState>,
+}
+
+/// The sender's nonce bookkeeping.
+#[derive(Default)]
+struct NonceState {
+    /// The next nonce to use, or `None` when it must be read from `pending`
+    /// first: at start, and after anything that leaves it uncertain.
+    next: Option<U256>,
+    /// A transaction whose send answer was lost and which no lookup found:
+    /// its nonce and its exact signed bytes. It may be in some backend's
+    /// pool, or nowhere. So the next write never signs a different
+    /// operation at that nonce. If `pending` has not moved past it, the
+    /// same bytes are offered again and the next write takes the nonce
+    /// after it.
+    unresolved: Option<(U256, ethers::types::Bytes)>,
 }
 
 impl Sender {
@@ -112,7 +126,7 @@ impl Sender {
         Sender {
             provider,
             wallet,
-            next_nonce: tokio::sync::Mutex::new(None),
+            nonces: tokio::sync::Mutex::new(NonceState::default()),
         }
     }
 
@@ -128,21 +142,12 @@ impl Sender {
         mut transaction: TypedTransaction,
     ) -> Result<TxHash, SettlementError> {
         let own = self.wallet.address();
-        let mut next_nonce = self.next_nonce.lock().await;
+        let mut nonces = self.nonces.lock().await;
         let mut reseeded = false;
         loop {
-            let nonce = match *next_nonce {
+            let nonce = match nonces.next {
                 Some(nonce) => nonce,
-                None => retry_read(|| {
-                    self.provider
-                        .get_transaction_count(own, Some(BlockNumber::Pending.into()))
-                })
-                .await
-                .map_err(|error| {
-                    SettlementError::Backend(format!(
-                        "could not read this account's pending nonce: {error}"
-                    ))
-                })?,
+                None => self.seed_nonce(&mut nonces).await?,
             };
             transaction.set_from(own);
             transaction.set_nonce(nonce);
@@ -163,18 +168,18 @@ impl Sender {
 
             match self.provider.send_raw_transaction(raw.clone()).await {
                 Ok(_) => {
-                    *next_nonce = Some(nonce + 1);
+                    nonces.next = Some(nonce + 1);
                     return Ok(hash);
                 }
                 Err(error) if answered(&error) && already_known(&error) => {
-                    *next_nonce = Some(nonce + 1);
+                    nonces.next = Some(nonce + 1);
                     return Ok(hash);
                 }
                 Err(error) if answered(&error) => {
                     // The node refused it, so this nonce is unspent. Whether
                     // the local count is still right is another matter, so
                     // the next write reads `pending` again.
-                    *next_nonce = None;
+                    nonces.next = None;
                     if nonce_conflict(&error) && !reseeded {
                         // Never accepted, so signing it again at a fresh
                         // `pending` nonce is this operation's first send,
@@ -187,20 +192,62 @@ impl Sender {
                     )));
                 }
                 Err(lost) => {
-                    let seen = self.resolve_lost_send(hash, raw).await;
+                    let seen = self.resolve_lost_send(hash, raw.clone()).await;
                     tracing::warn!(
                         tx_hash = %format!("{hash:#x}"),
                         error = %lost,
                         seen,
-                        "the answer to a transaction send was lost; resolving it by hash"
+                        "send answer lost"
                     );
                     // Seen: the nonce is spent. Not seen: it may or may not
-                    // be, so the next write asks `pending` rather than guess.
-                    *next_nonce = if seen { Some(nonce + 1) } else { None };
+                    // be, so the next write reads `pending` and, if `pending`
+                    // has not moved past this nonce, offers these same bytes
+                    // again rather than signing something else over them.
+                    if seen {
+                        nonces.next = Some(nonce + 1);
+                    } else {
+                        nonces.next = None;
+                        nonces.unresolved = Some((nonce, raw));
+                    }
                     return Ok(hash);
                 }
             }
         }
+    }
+
+    /// Read the next nonce from `pending`, never below a transaction whose
+    /// send is unresolved: if `pending` has not moved past it, its same
+    /// signed bytes are offered again (they cannot run twice) and the next
+    /// write takes the nonce after it. That is what keeps a lagging
+    /// backend's `pending` from rewinding the count onto a nonce that may
+    /// already carry a transaction.
+    async fn seed_nonce(&self, nonces: &mut NonceState) -> Result<U256, SettlementError> {
+        let own = self.wallet.address();
+        let pending = retry_read(|| {
+            self.provider
+                .get_transaction_count(own, Some(BlockNumber::Pending.into()))
+        })
+        .await
+        .map_err(|error| {
+            SettlementError::Backend(format!(
+                "could not read this account's pending nonce: {error}"
+            ))
+        })?;
+        let nonce = match nonces.unresolved.take() {
+            Some((stuck, raw)) if pending <= stuck => {
+                if let Err(error) = self.provider.send_raw_transaction(raw).await {
+                    tracing::warn!(
+                        nonce = %stuck,
+                        error = %error,
+                        "unresolved transaction re-offer failed"
+                    );
+                }
+                stuck + 1
+            }
+            _ => pending,
+        };
+        nonces.next = Some(nonce);
+        Ok(nonce)
     }
 
     /// Whether the node has `hash` after a send whose answer was lost:
@@ -242,8 +289,14 @@ pub(crate) async fn confirm(
 ) -> Result<TransactionReceipt, SettlementError> {
     let started = Instant::now();
     let mut observed = false;
+    // When polls began answering "not found" without a failure in between.
+    // Only answered polls count toward "not observed": a circuit that is
+    // down says nothing about the transaction (ADR 0073 decision 5).
+    let mut unseen_since: Option<Instant> = None;
+    let mut failures = 0u32;
     let mut last_error = String::from("none");
     loop {
+        let mut failed = false;
         match provider.get_transaction_receipt(hash).await {
             Ok(Some(receipt)) => {
                 if receipt.status == Some(U64::zero()) {
@@ -255,7 +308,10 @@ pub(crate) async fn confirm(
                 return Ok(receipt);
             }
             Ok(None) => {}
-            Err(error) => last_error = error.to_string(),
+            Err(error) => {
+                failed = true;
+                last_error = error.to_string();
+            }
         }
 
         // A receipt is the answer. The transaction itself is looked for only
@@ -266,31 +322,60 @@ pub(crate) async fn confirm(
             match provider.get_transaction(hash).await {
                 Ok(Some(_)) => observed = true,
                 Ok(None) => {}
-                Err(error) => last_error = error.to_string(),
+                Err(error) => {
+                    failed = true;
+                    last_error = error.to_string();
+                }
             }
         }
 
-        let waited = started.elapsed();
-        if !observed && waited >= policy.unobserved {
+        if failed {
+            unseen_since = None;
+            failures += 1;
+        } else {
+            failures = 0;
+            if !observed {
+                unseen_since.get_or_insert_with(Instant::now);
+            }
+        }
+
+        let unseen_for = unseen_since.map(|since| since.elapsed());
+        if !observed && unseen_for.is_some_and(|unseen| unseen >= policy.unobserved) {
             return Err(SettlementError::Backend(format!(
-                "transaction {hash:#x} was not observed within {}s (last RPC error: \
-                 {last_error}) -- this is not proof it was dropped, only that this endpoint has \
-                 not confirmed it yet; check its status by hash (a block explorer or a fresh \
+                "transaction {hash:#x} was not observed: this endpoint answered 'not found' for \
+                 {}s -- this is not proof it was dropped, only that this endpoint has not \
+                 confirmed it yet; check its status by hash (a block explorer or a fresh \
                  eth_getTransactionReceipt call) before resubmitting, since a transaction that \
                  later mines would be double-spent by a retry",
-                waited.as_secs()
+                policy.unobserved.as_secs()
             )));
         }
+        let waited = started.elapsed();
         if waited >= policy.deadline {
+            let seen = if observed {
+                "was observed but not mined"
+            } else {
+                "could not be confirmed"
+            };
             return Err(SettlementError::Backend(format!(
-                "transaction {hash:#x} was observed but not mined within {}s (last RPC error: \
-                 {last_error}); it may still mine, so check its status by hash before \
-                 resubmitting, since a retry of a transaction that later mines is a double spend",
+                "transaction {hash:#x} {seen} within {}s (last RPC error: {last_error}); it may \
+                 still mine, so check its status by hash before resubmitting, since a retry of a \
+                 transaction that later mines is a double spend",
                 waited.as_secs()
             )));
         }
-        tokio::time::sleep(policy.poll).await;
+        tokio::time::sleep(failure_backoff(policy.poll, failures)).await;
     }
+}
+
+/// The wait before the next poll: `poll`, doubled for each poll in a row
+/// that failed, up to 8s (ADR 0073 decision 5: "keeps polling after a
+/// transient error, with backoff"). An endpoint that is refusing or down is
+/// not polled at full speed, and the first answered poll resets it.
+pub(crate) fn failure_backoff(poll: Duration, failures: u32) -> Duration {
+    const CEILING: Duration = Duration::from_secs(8);
+    poll.saturating_mul(2u32.saturating_pow(failures.min(8)))
+        .min(CEILING.max(poll))
 }
 
 /// Issue #907 and ADR 0073, against a real chain behind a [`FakeRpc`] that
@@ -480,6 +565,60 @@ mod tests {
             before + 2,
             "two writes, two transactions: the lost answer did not become a third"
         );
+    }
+
+    #[test]
+    fn failed_polls_back_off_doubling_to_a_ceiling_and_answered_ones_do_not() {
+        let poll = Duration::from_millis(100);
+        assert_eq!(failure_backoff(poll, 0), poll);
+        assert_eq!(failure_backoff(poll, 1), Duration::from_millis(200));
+        assert_eq!(failure_backoff(poll, 3), Duration::from_millis(800));
+        assert_eq!(failure_backoff(poll, 30), Duration::from_secs(8));
+    }
+
+    /// The case the lookup cannot settle: the answer to a send is lost and
+    /// no backend will say it has the transaction. The next write must not
+    /// sign a different operation at that nonce (which could replace it).
+    /// It offers the same bytes again and takes the nonce after.
+    #[tokio::test]
+    async fn an_unresolved_lost_send_is_never_overwritten_by_the_next_write() {
+        if !require_anvil() {
+            return;
+        }
+        let anvil = Anvil::spawn(19_950).await;
+        let blind = Arc::new(AtomicBool::new(true));
+        let still_blind = Arc::clone(&blind);
+        let lagging = FakeRpc::spawn_in_front_of(&anvil.rpc_url, move |call| {
+            let blind = still_blind.load(Ordering::SeqCst);
+            match call.method.as_str() {
+                // The first send reaches the chain; its answer is lost, and
+                // the re-offer's answer is lost too.
+                "eth_sendRawTransaction" if blind => RpcReply::ForwardThenDrop,
+                // A lagging backend: it has never seen the transaction.
+                "eth_getTransactionByHash" if blind => RpcReply::Result(serde_json::Value::Null),
+                // Its `pending` never counts the first transaction, for
+                // either write.
+                "eth_getTransactionCount" => RpcReply::Result(serde_json::json!("0x0")),
+                _ => RpcReply::Forward,
+            }
+        })
+        .await;
+        let (provider, sender) = sender(&lagging.url());
+        let first = sender.send(self_transfer(&sender)).await.expect("send");
+
+        // The backend's lookups catch up for the second write; its
+        // `pending` read still says 0, which is the rewind this guards.
+        let second = {
+            blind.store(false, Ordering::SeqCst);
+            sender.send(self_transfer(&sender)).await.expect("send")
+        };
+        confirm(&provider, first, FAST)
+            .await
+            .expect("the first operation still lands, at its own nonce");
+        confirm(&provider, second, FAST)
+            .await
+            .expect("the second lands at the next nonce, not over the first");
+        assert_ne!(first, second);
     }
 
     /// A nonce spent behind this sender's back (another client on the same
