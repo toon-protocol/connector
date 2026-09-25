@@ -338,6 +338,16 @@ _Avoid_: receipt, payment, balance proof; "voucher" for a `toon-channel` claim
 **Voucher**:
 A claim under x402's `batch-settlement` scheme (ADR 0074).
 
+**Sponsor**:
+A connector's Solana settlement key, in the seats it takes on a client's x402 `batch-settlement`
+channel: fee payer and `rent_payer` of the `payment-channels` `open`, which it co-signs through the
+public sponsor endpoint, and the channel's `payee` (ADR 0074 decisions 5 and 9). Always the
+receiving operator itself, never a third party — a third-party sponsor could seal the channel before
+this node lands its latest **voucher**. It pays the fees and floats the rent, which comes home at
+`reclaim`, and only above a published minimum deposit. It controls when a channel closes, never
+where the money goes.
+_Avoid_: facilitator (x402's relayer, which on Solana would take these seats itself)
+
 **Covering claim**:
 The claim that pays for one particular packet, carried **with** it rather than trailing behind it.
 A packet arriving without one is greeted, not carried. This is what removes accumulation from the
