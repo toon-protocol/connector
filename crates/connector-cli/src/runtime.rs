@@ -6752,10 +6752,7 @@ key_file = "{solana_key_path}"
         /// name two different deployments of "this chain" (CF-26).
         #[tokio::test]
         async fn a_both_chains_config_composes_both_chains_batch_settlement_facts() {
-            if !anvil_available() {
-                eprintln!(
-                    "skipping: `anvil` not found on PATH (install via https://getfoundry.sh)"
-                );
+            if !require_anvil() {
                 return;
             }
             if !require_solana_test_validator() {
