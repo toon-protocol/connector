@@ -539,7 +539,11 @@ withdraw_delay, salt_hex }` -- x402's `ChannelConfig`, the seven fields a channe
   `https://sepolia.base.org` at block 47289378 -- the exact `cast call` commands and their output
   are recorded next to where this section is generated
   (`crates/connector-vectors/src/lib.rs`, above `generate_voucher_evm_case`), so this vector cannot
-  silently drift from the chain it names.
+  silently drift from the chain it names. The workspace gate re-checks it on every run:
+  `crates/connector-settlement-evm/tests/x402_voucher_vector.rs` reads this committed case, places
+  Base Sepolia's `x402BatchSettlement` runtime bytecode at that address on an `anvil` running as chain
+  84532, and asserts the contract's own `getChannelId` and `getVoucherDigest` return `channel_id_hex`
+  and `digest_hex`.
 
 - **`solana`** -- `{ name, channel_account_hex, channel_account_base58, signer_public_key_hex,
 signer_public_key_base58, max_claimable_amount, expires_at, signed_message_hex, signature_hex,

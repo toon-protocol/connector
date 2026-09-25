@@ -408,6 +408,31 @@ impl X402Chain {
             .expect("channels")
     }
 
+    /// The deployed contract's own `getChannelId(config)`: what the chain,
+    /// not this workspace, says a config hashes to.
+    pub async fn contract_channel_id(&self, config: &EvmChannelConfig) -> [u8; 32] {
+        X402BatchSettlement::new(batch_settlement_address(), Arc::clone(&self.provider))
+            .get_channel_id(chain_config(config))
+            .call()
+            .await
+            .expect("getChannelId")
+    }
+
+    /// The deployed contract's own `getVoucherDigest(channelId, amount)`:
+    /// the EIP-712 digest a voucher must be signed over, as the chain
+    /// computes it under its own domain.
+    pub async fn contract_voucher_digest(
+        &self,
+        channel_id: [u8; 32],
+        max_claimable_amount: u128,
+    ) -> [u8; 32] {
+        X402BatchSettlement::new(batch_settlement_address(), Arc::clone(&self.provider))
+            .get_voucher_digest(channel_id, max_claimable_amount)
+            .call()
+            .await
+            .expect("getVoucherDigest")
+    }
+
     /// `signer`'s voucher for `cumulative_amount` on `channel`: 65 bytes,
     /// `r ‖ s ‖ v` with `v` of 27 or 28, as a wallet signs one.
     pub fn sign_voucher(
