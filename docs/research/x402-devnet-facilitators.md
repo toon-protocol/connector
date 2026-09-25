@@ -508,3 +508,22 @@ holds Base Sepolia **ETH**, rather than only minting USDC, was not checked.
   server-supplied `receiverAuthorizer`. This is moot for the devnet, since neither offers a testnet
   batch kind.
 - **Whether the faucet box holds Base Sepolia ETH** to fund our own facilitator's gas key.
+
+## Update, 2026-09-25: x402.org's deposit path, run live
+
+The "What is unverified" section above lists whether x402.org's hosted deposit path works as open.
+It has now been run once, and ADR 0074's prerequisite 2 records the details.
+
+**It works for an arbitrary `payTo` and our own token.** A Permit2 deposit of the devnet's mock USDC
+(`0x49beE1Bc…a9Ce`) was relayed by x402.org's signer `0xd407e409…f1bf`. The receiver and
+`receiverAuthorizer` were an address the facilitator had never seen. The result is transaction
+`0x54e792b8…d7a5`, which left 1 mock USDC in channel `0x25712fc6…a8ec`.
+
+**`erc20ApprovalGasSponsoring` does not work there.** x402.org advertises the extension, but the
+first attempt broadcast the payer's signed `approve` without first funding the payer, and failed
+with insufficient funds. The operator is supposed to supply that funding step around the package,
+as x402's own e2e facilitator does with its `sendTransactions` wrapper. x402.org apparently runs
+without it.
+
+This strengthens the recommendation above. The devnet's token has no ERC-3009, so a gasless devnet
+deposit needs a facilitator that performs the funding step, and ours can.
