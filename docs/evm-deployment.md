@@ -9,6 +9,43 @@ Read this before touching any of the files it names; `docs/devnet-pricing.md` ex
 reason on the pricing side (connector#785) -- a hand-edit on one box or one file, unreconciled with
 the rest, is exactly the failure mode both documents exist to prevent.
 
+## Third cutover, BROADCAST 2026-09-25: the token (#1337)
+
+The first two cutovers moved `TokenNetwork` and kept the token. This one moves the **token** and
+keeps the registry. The devnet USDC is now Circle's **FiatToken v2.2**,
+`0x0C996d7c934c79a6255254875607Fe69df25C0E1`, with a fresh `TokenNetwork`,
+`0x1B4606218ceE5Bf02B546e416905F4D3FC8a0249`, created through the live registry `0x0c41D9D4…`.
+
+**Why.** The mock ERC-20 it replaces, `0x49beE1…a9Ce`, had no ERC-3009 and no EIP-2612, and could
+not be upgraded. So an x402 `batch-settlement` deposit of it (ADR 0074) always needed a
+gas-paying Permit2 `approve`, and x402.org's hosted facilitator does not sponsor that step (ADR 0074
+prerequisite 2). With ERC-3009, any stock facilitator makes a deposit gasless. That is proven on
+chain: tx `0xa25e41ae…ce45`, from a wallet holding 0 ETH. FiatToken v2.2 is also the code Base
+mainnet USDC runs, so the devnet now settles in the token production settles in.
+
+**What changed for users.** Minting is **minter-gated**. The faucet key is the one minter, so
+devnet USDC comes from the faucet, or from a key the master minter configures. Channels on the old
+`TokenNetwork` `0xe9E05dfe…` are stranded, as in the second cutover: this is mock money minted on
+demand, so an operational reset, not a loss.
+
+**The record:**
+
+- the deployment: `packages/contracts/deployments/base-sepolia.md`, "Devnet USDC cutover";
+- the repoint checklist: issue #1337;
+- the keys: `/root/keys/devnet-usdc-{owner,proxy-admin}.key` on the devnet box.
+
+This repository's pins moved in the cutover PR:
+
+- `infra/linode/endpoints.json`;
+- the relay and store fixtures, and `swap.config.json`;
+- `devnet_configs_load.rs`'s `EXPECTED_SETTLEMENT_TOKEN_ADDRESS` and `FLEET_LIVE_TOKEN_NETWORK`;
+- the faucet's default;
+- both funded-ops workflows' `TOKEN`;
+- the README.
+
+The live boxes run their own repos' deploy bundles (ADR 0068), so each of those moves in its own
+repo.
+
 ## Status: BOTH cutovers have broadcast; ADR 0059's (2026-08-28) is the live one
 
 This document covers two cutovers of the same shape. The 2026-08-06 ERC-2771 one is recorded

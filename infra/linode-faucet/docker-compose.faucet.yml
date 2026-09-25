@@ -43,7 +43,7 @@ services:
       # faucet key only needs Base Sepolia ETH for gas. Unset key → route 503s.
       BASE_SEPOLIA_FAUCET_KEY: ${BASE_SEPOLIA_FAUCET_KEY:-}
       BASE_SEPOLIA_RPC_URL: ${BASE_SEPOLIA_RPC_URL:-https://sepolia.base.org}
-      BASE_SEPOLIA_USDC: ${BASE_SEPOLIA_USDC:-0x49beE1Bca5d15Fb0963117923403F9498119a9Ce}
+      BASE_SEPOLIA_USDC: ${BASE_SEPOLIA_USDC:-0x0C996d7c934c79a6255254875607Fe69df25C0E1}
       BASE_SEPOLIA_USDC_AMOUNT: ${BASE_SEPOLIA_USDC_AMOUNT:-1000}
       # Pinned to '0', not an overridable default (§4.6's own table entry: the
       # code's own default is already '0' — packages/faucet/src/base-sepolia.js
