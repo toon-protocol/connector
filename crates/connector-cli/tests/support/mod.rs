@@ -20,6 +20,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use connector_config::Config;
 use connector_domain::{EnvelopeRequest, Prepare};
+use connector_settlement::batch::EvmChannelConfig;
+use connector_settlement::ChannelId;
 use connector_signer::giftwrap::seal_request;
 use connector_signer::PublicKeyBytes;
 use tower::ServiceExt;
@@ -94,4 +96,63 @@ pub async fn post_ilp(app: &Router, claim: &str, prepare: Prepare) -> Bytes {
     hyper::body::to_bytes(response.into_body())
         .await
         .expect("the body")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn address(bytes: &[u8; 20]) -> String {
+    format!("0x{}", hex(bytes))
+}
+
+/// An EVM voucher on the wire, as x402's payload names its fields. The
+/// channel's first voucher carries its config; later ones need not.
+pub fn evm_voucher(
+    channel: &ChannelId,
+    amount: u64,
+    signature: &[u8],
+    config: Option<&EvmChannelConfig>,
+) -> String {
+    let mut voucher = serde_json::json!({
+        "version": "1.0",
+        "blockchain": "evm",
+        "scheme": "batch-settlement",
+        "messageId": format!("voucher-{amount}"),
+        "timestamp": "2026-09-25T12:00:00.000Z",
+        "senderId": "x402-client",
+        "channelId": channel.0,
+        "maxClaimableAmount": amount.to_string(),
+        "signature": format!("0x{}", hex(signature)),
+    });
+    if let Some(config) = config {
+        voucher["channelConfig"] = serde_json::json!({
+            "payer": address(&config.payer),
+            "payerAuthorizer": address(&config.payer_authorizer),
+            "receiver": address(&config.receiver),
+            "receiverAuthorizer": address(&config.receiver_authorizer),
+            "token": address(&config.token),
+            "withdrawDelay": config.withdraw_delay,
+            "salt": format!("0x{}", hex(&config.salt)),
+        });
+    }
+    voucher.to_string()
+}
+
+/// A Solana voucher on the wire, as x402's payload names its fields.
+/// `channel` is the channel account, base58.
+pub fn solana_voucher(channel: &str, amount: u64, signature: &[u8; 64]) -> String {
+    serde_json::json!({
+        "version": "1.0",
+        "blockchain": "solana",
+        "scheme": "batch-settlement",
+        "messageId": format!("voucher-{amount}"),
+        "timestamp": "2026-09-25T12:00:00Z",
+        "senderId": "x402-client",
+        "channelId": channel,
+        "maxClaimableAmount": amount.to_string(),
+        "expiresAt": 0,
+        "signature": bs58::encode(signature).into_string(),
+    })
+    .to_string()
 }

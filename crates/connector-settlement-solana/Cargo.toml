@@ -33,14 +33,17 @@ solana-rpc-client = "=2.1.0"
 # The send config and the status/encoding types `submit` names; both are
 # already in the tree under solana-rpc-client, at the same pin.
 solana-rpc-client-api = "=2.1.0"
+solana-account-decoder-client-types = "=2.1.0"
 solana-transaction-status-client-types = "=2.1.0"
 solana-sdk = "=2.1.0"
 spl-token = { version = "=6.0.0", features = ["no-entrypoint"] }
 spl-associated-token-account = "=4.0.0"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 tempfile = { version = "3", optional = true }
+tracing = "0.1"
 
 [dev-dependencies]
+proptest = "1"
 # `FakeRpc`: the confirm loop is tested against an endpoint that stalls,
 # refuses and drops, which no local validator can be made to do.
 connector-chain-rpc = { path = "../connector-chain-rpc", features = ["solana", "test-support"] }

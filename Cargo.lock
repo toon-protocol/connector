@@ -1387,6 +1387,7 @@ dependencies = [
  "connector-signer",
  "ethers",
  "libsecp256k1",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",
@@ -1405,7 +1406,9 @@ dependencies = [
  "connector-settlement",
  "connector-settlement-solana",
  "connector-signer",
+ "proptest",
  "serde_json",
+ "solana-account-decoder-client-types",
  "solana-rpc-client",
  "solana-rpc-client-api",
  "solana-sdk",
@@ -1415,6 +1418,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -24,6 +24,7 @@
 //! shape.
 
 mod batch_settlement;
+mod batch_watch;
 mod bindings;
 mod channel_id;
 mod channel_index;
@@ -37,6 +38,10 @@ mod send;
 pub mod test_support;
 
 pub use batch_settlement::EvmBatchSettlementBackend;
+pub use batch_watch::{
+    claim_target, settle_due, Claimed, EvmBatchWatcher, SweepReport, BATCH_SWEEP_INTERVAL,
+    WITHDRAWAL_WATCH_INTERVAL,
+};
 pub use channel_id::{derive_channel_id, sort_participants};
 pub use channel_index::{
     ChannelIndexEvent, ChannelIndexLookup, EvmChannelIndex, EvmChannelIndexError,

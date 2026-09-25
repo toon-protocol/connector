@@ -20,13 +20,12 @@ use connector_runtime::{FileJournal, Journal};
 use connector_settlement::batch::{
     BatchChannelStatus, BatchSettlementBackend, EvmChannelConfig, Voucher,
 };
-use connector_settlement::ChannelId;
 use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
 use connector_settlement_evm::EvmSettlementBackend;
 use ethers::signers::{LocalWallet, Signer};
 
-use support::{paid_prepare, post_ilp, spawn_recording_app, CLIENT_EDGE_JOURNAL};
+use support::{evm_voucher, paid_prepare, post_ilp, spawn_recording_app, CLIENT_EDGE_JOURNAL};
 
 /// This binary's own base port for [`Anvil::spawn`], clear of every other
 /// anvil binary's range.
@@ -37,50 +36,9 @@ const PRICE: u64 = 100;
 const DEPOSIT: u128 = 1_000;
 const ONE_DAY: u64 = 86_400;
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn address(bytes: &[u8; 20]) -> String {
-    format!("0x{}", hex(bytes))
-}
-
-/// An EVM voucher on the wire, as x402's payload names its fields. The
-/// channel's first voucher carries its config; later ones need not.
-fn evm_voucher(
-    channel: &ChannelId,
-    amount: u64,
-    signature: &[u8],
-    config: Option<&EvmChannelConfig>,
-) -> String {
-    let mut voucher = serde_json::json!({
-        "version": "1.0",
-        "blockchain": "evm",
-        "scheme": "batch-settlement",
-        "messageId": format!("voucher-{amount}"),
-        "timestamp": "2026-09-25T12:00:00.000Z",
-        "senderId": "x402-client",
-        "channelId": channel.0,
-        "maxClaimableAmount": amount.to_string(),
-        "signature": format!("0x{}", hex(signature)),
-    });
-    if let Some(config) = config {
-        voucher["channelConfig"] = serde_json::json!({
-            "payer": address(&config.payer),
-            "payerAuthorizer": address(&config.payer_authorizer),
-            "receiver": address(&config.receiver),
-            "receiverAuthorizer": address(&config.receiver_authorizer),
-            "token": address(&config.token),
-            "withdrawDelay": config.withdraw_delay,
-            "salt": format!("0x{}", hex(&config.salt)),
-        });
-    }
-    voucher.to_string()
-}
-
 /// A Solana voucher on the wire, for a node that has not opted in on
 /// Solana to refuse.
-fn solana_voucher() -> String {
+fn unaccepted_solana_voucher() -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "solana",
@@ -147,6 +105,8 @@ decimals = 6
 key_file = "{settlement_key}"
 
 [settlement.evm.batch_settlement]
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [[routes]]
 prefix = "{ROUTE}"
@@ -233,9 +193,15 @@ price = {PRICE}
     assert_eq!(amount, 2 * PRICE);
 
     // The node on Solana has not opted in, and says so.
-    let refused =
-        Reject::decode(&post_ilp(&app, &solana_voucher(), paid_prepare(ROUTE, &receiver)).await)
-            .expect("a voucher on a chain this node has not opted in on is refused");
+    let refused = Reject::decode(
+        &post_ilp(
+            &app,
+            &unaccepted_solana_voucher(),
+            paid_prepare(ROUTE, &receiver),
+        )
+        .await,
+    )
+    .expect("a voucher on a chain this node has not opted in on is refused");
     assert!(
         refused.message.contains("batch-settlement"),
         "refused by name: {refused:?}"

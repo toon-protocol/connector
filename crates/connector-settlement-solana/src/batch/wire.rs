@@ -30,6 +30,43 @@ pub const SETTLE: u8 = 2;
 pub const TOP_UP: u8 = 3;
 pub const SETTLE_AND_SEAL: u8 = 4;
 pub const REQUEST_CLOSE: u8 = 5;
+pub const SEAL: u8 = 6;
+pub const DISTRIBUTE: u8 = 7;
+pub const RECLAIM: u8 = 9;
+
+/// The slot window `reclaim` waits out: a `Distributed` channel's rent can
+/// come home only once `clock.slot > open_slot + OPEN_SLOT_WINDOW` (PC
+/// `constants.rs`, `OPEN_SLOT_WINDOW`). The program may only ever lower it.
+pub const OPEN_SLOT_WINDOW: u64 = 1_500;
+
+/// The owner of the treasury token account a sealed `distribute` sweeps
+/// rounding residue into, as the mainnet-beta build fixes it (PC
+/// `constants.rs`, `TREASURY_OWNER`, feature `mainnet-beta`). The program
+/// checks the account passed is `ATA(TREASURY_OWNER, mint, token_program)`,
+/// so a caller must name the one its deployment was built with.
+pub const TREASURY_OWNER_MAINNET: &str = "Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP";
+
+/// The placeholder `TREASURY_OWNER` a build without `mainnet-beta` ships
+/// with, `0xBE 0xEF` sixteen times (PC `constants.rs`,
+/// `TREASURY_OWNER_SENTINEL`) -- which the devnet deployment carries (see
+/// `test_support::payment_channels_fixture`).
+pub const TREASURY_OWNER_PLACEHOLDER: [u8; 32] = [
+    0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF,
+    0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF,
+];
+
+/// Every `TREASURY_OWNER` a deployment of the pinned program is known to be
+/// built with, in the order a caller should try them: the program id is the
+/// same on every cluster, so which one a deployment holds is not derivable
+/// from anything a caller has.
+pub fn treasury_owner_candidates() -> [Pubkey; 2] {
+    [
+        TREASURY_OWNER_MAINNET
+            .parse()
+            .expect("a literal base58 address"),
+        Pubkey::new_from_array(TREASURY_OWNER_PLACEHOLDER),
+    ]
+}
 
 /// The channel PDA's seed prefix (PC `state/channel.rs`, `CHANNEL_SEED`).
 pub const CHANNEL_SEED: &[u8] = b"channel";
@@ -485,6 +522,113 @@ pub fn settle_and_seal_instructions(
     ]
 }
 
+/// `settle_and_seal` with no voucher: seal the channel at what is already
+/// settled (PC `instructions/settle_and_seal.rs`, `has_voucher` = 0). Signed
+/// by the payee. From Closing only before `closure_started_at +
+/// grace_period`; what lets a payee with nothing more to land close a
+/// channel its payer asked to close without waiting out the grace period.
+pub fn seal_without_voucher_instruction(
+    program_id: &Pubkey,
+    payee: &Pubkey,
+    channel: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*payee, true),
+            AccountMeta::new(*channel, false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::instructions::id(), false),
+        ],
+        data: vec![SETTLE_AND_SEAL, 0],
+    }
+}
+
+/// `seal`: the permissionless crank that moves a Closing channel to Sealed
+/// once its grace period has elapsed (PC `instructions/seal.rs`). What is
+/// left when no voucher was landed in time.
+pub fn seal_instruction(program_id: &Pubkey, channel: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![AccountMeta::new(*channel, false)],
+        data: vec![SEAL],
+    }
+}
+
+/// `distribute`: the permissionless crank that pays a channel out (PC
+/// `instructions/distribute.rs`). On a Sealed channel it pays every
+/// recipient its share of `settled`, refunds the payer `deposit − settled`,
+/// sweeps the rounding residue to the treasury, closes the escrow and then
+/// either deallocates the channel or marks it Distributed for
+/// [`reclaim_instruction`]; all rent goes to `rent_payer`.
+///
+/// `recipients` must be the preimage `open` committed to -- the program
+/// rehashes it -- and each recipient's canonical ATA is appended, in order,
+/// as a trailing account. `treasury_owner` must be the one the deployment
+/// was built with (see [`treasury_owner_candidates`]).
+pub fn distribute_instruction(
+    program_id: &Pubkey,
+    channel: &Pubkey,
+    account: &ChannelAccount,
+    token_program: &Pubkey,
+    treasury_owner: &Pubkey,
+    recipients: &[DistributionEntry],
+) -> Instruction {
+    let ata = |owner: &Pubkey| {
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            owner,
+            &account.mint,
+            token_program,
+        )
+    };
+    let mut data = vec![DISTRIBUTE];
+    data.extend_from_slice(&distribution_preimage(recipients));
+    let mut accounts = vec![
+        AccountMeta::new(*channel, false),
+        AccountMeta::new(account.payer, false),
+        AccountMeta::new(account.rent_payer, false),
+        AccountMeta::new(
+            escrow_token_account(channel, &account.mint, token_program),
+            false,
+        ),
+        AccountMeta::new(ata(&account.payer), false),
+        AccountMeta::new(ata(&account.payee), false),
+        AccountMeta::new(ata(treasury_owner), false),
+        AccountMeta::new_readonly(account.mint, false),
+        AccountMeta::new_readonly(*token_program, false),
+        AccountMeta::new_readonly(event_authority_pda(program_id), false),
+        AccountMeta::new_readonly(*program_id, false),
+    ];
+    accounts.extend(
+        recipients
+            .iter()
+            .map(|entry| AccountMeta::new(ata(&entry.recipient), false)),
+    );
+    Instruction {
+        program_id: *program_id,
+        accounts,
+        data,
+    }
+}
+
+/// `reclaim`: the permissionless crank that deallocates a Distributed
+/// channel and returns its rent to `rent_payer`, once the clock's slot is
+/// past `open_slot + OPEN_SLOT_WINDOW` (PC `instructions/reclaim.rs`). Two
+/// accounts and no signer, so many fit one transaction.
+pub fn reclaim_instruction(
+    program_id: &Pubkey,
+    channel: &Pubkey,
+    rent_payer: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*channel, false),
+            AccountMeta::new(*rent_payer, false),
+        ],
+        data: vec![RECLAIM],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,5 +846,98 @@ mod tests {
         assert_eq!(seal.data, vec![SETTLE_AND_SEAL, 1]);
         assert_eq!(seal.accounts[0].pubkey, payee);
         assert!(seal.accounts[0].is_signer);
+    }
+
+    #[test]
+    fn the_treasury_owners_are_the_builds_own() {
+        let [mainnet, placeholder] = treasury_owner_candidates();
+        assert_eq!(mainnet.to_string(), TREASURY_OWNER_MAINNET);
+        assert_eq!(&placeholder.to_bytes()[..4], &[0xBE, 0xEF, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn the_seals_carry_their_discriminators_and_the_payee_signs_the_early_one() {
+        let payee = Pubkey::new_unique();
+        let channel = Pubkey::new_unique();
+        let early = seal_without_voucher_instruction(&program_id(), &payee, &channel);
+        assert_eq!(early.data, vec![SETTLE_AND_SEAL, 0]);
+        assert!(early.accounts[0].is_signer);
+        assert_eq!(early.accounts[0].pubkey, payee);
+
+        let crank = seal_instruction(&program_id(), &channel);
+        assert_eq!(crank.data, vec![SEAL]);
+        assert_eq!(crank.accounts.len(), 1);
+        assert!(crank.accounts.iter().all(|meta| !meta.is_signer));
+    }
+
+    /// `distribute`: its eleven fixed accounts in the program's order, then
+    /// one ATA per recipient; the preimage as data; no signer at all.
+    #[test]
+    fn distribute_carries_the_preimage_eleven_accounts_and_the_recipient_tail() {
+        let account = ChannelAccount::parse(&channel_bytes(1)).expect("a channel");
+        let channel = Pubkey::new_unique();
+        let treasury = Pubkey::new_unique();
+        let receiver = Pubkey::new_from_array([0x42; 32]);
+        let recipients = sole_recipient(&receiver);
+        let instruction = distribute_instruction(
+            &program_id(),
+            &channel,
+            &account,
+            &spl_token::id(),
+            &treasury,
+            &recipients,
+        );
+        let mut data = vec![DISTRIBUTE];
+        data.extend_from_slice(&distribution_preimage(&recipients));
+        assert_eq!(instruction.data, data);
+        assert_eq!(instruction.accounts.len(), 12);
+        assert!(instruction.accounts.iter().all(|meta| !meta.is_signer));
+        let ata = |owner: &Pubkey| {
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                owner,
+                &account.mint,
+                &spl_token::id(),
+            )
+        };
+        let keys: Vec<Pubkey> = instruction
+            .accounts
+            .iter()
+            .map(|meta| meta.pubkey)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                channel,
+                account.payer,
+                account.rent_payer,
+                escrow_token_account(&channel, &account.mint, &spl_token::id()),
+                ata(&account.payer),
+                ata(&account.payee),
+                ata(&treasury),
+                account.mint,
+                spl_token::id(),
+                event_authority_pda(&program_id()),
+                program_id(),
+                ata(&receiver),
+            ]
+        );
+    }
+
+    #[test]
+    fn reclaim_names_the_channel_and_its_rent_payer_and_nobody_signs() {
+        let channel = Pubkey::new_unique();
+        let rent_payer = Pubkey::new_unique();
+        let instruction = reclaim_instruction(&program_id(), &channel, &rent_payer);
+        assert_eq!(instruction.data, vec![RECLAIM]);
+        let keys: Vec<Pubkey> = instruction
+            .accounts
+            .iter()
+            .map(|meta| meta.pubkey)
+            .collect();
+        assert_eq!(keys, vec![channel, rent_payer]);
+        assert!(instruction
+            .accounts
+            .iter()
+            .all(|meta| meta.is_writable && !meta.is_signer));
     }
 }

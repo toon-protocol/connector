@@ -41,3 +41,4 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] 
 libsecp256k1 = "0.6"
 serde_json = "1"
 tempfile = "3"
+proptest = "1"
