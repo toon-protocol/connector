@@ -76,6 +76,11 @@ connector-config                 one typed TOML file and every refuse-to-start e
                                   (ADR 0009); a removed key is parsed in order to be
                                   refused by name, never silently ignored
 
+connector-chain-rpc              the HTTP transport every settlement table's RPC clients
+                                  share (ADR 0073): the timeouts, the 403/429 retries, and
+                                  the optional pinned circuit through `socks_proxy`. Holds
+                                  no key and knows no channel
+
 connector-settlement             the chain-agnostic settlement port + its contract suite
   ├─ port.rs, contract.rs        the port, and the one suite every backend is run against
   └─ in_memory.rs                the fake — the first implementation to pass that suite

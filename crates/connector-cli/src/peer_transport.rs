@@ -120,9 +120,10 @@ pub(crate) fn build_peer_transport(
     // endpoint by host. So a peering registered at runtime onto either of
     // these same two transports (ADR 0058, `PeerRegistrar` below) dials
     // through the proxy for free, with no second decision anywhere that
-    // could disagree with this one. Nothing else on this node is proxied:
-    // settlement RPC and the app's `handler_url` hold their own clients
-    // (decision 4).
+    // could disagree with this one. The app's `handler_url` holds its own
+    // client and dials direct (decision 4). Settlement RPC holds its own too:
+    // a table that opts in rides the proxy through its own transport, built
+    // in `runtime::settlement_transports` (ADR 0073), never through this.
     let socks_proxy = config.socks_proxy();
 
     // Ask-only (`TungsteniteDialer::new`) rather than symmetric

@@ -320,8 +320,14 @@ publishes no image for it. Which dials take the proxy is read off the endpoint's
 so there is no per-peer proxy key and nothing to keep in sync. The host rule has
 **one** implementation, `connector_config::is_onion_endpoint`; do not write a second.
 `PeerCarriage` stays two-valued — ADR 0070's own falsifier is that no
-`PeerCarriage::Onion` exists. Settlement RPC and a route's `handler_url` are **not**
-proxied, on purpose (decision 4), and the operational half — the daemon's
+`PeerCarriage::Onion` exists. A route's `handler_url` is **not** proxied, on purpose
+(decision 4). Settlement RPC is not proxied either **unless its table opts in**:
+`rpc_via_socks_proxy = true` in `[settlement.evm]` or `[settlement.solana]` puts every
+client of that `rpc_url` on the one `socks_proxy`, on a circuit pinned per chain by SOCKS
+username, failing closed (ADR 0073, amending decision 4). Every client of a table's
+`rpc_url` is built from one `connector_chain_rpc::RpcTransport` in
+`runtime::settlement_transports` — the backend, and on EVM the channel-index syncer and the
+rate source; do not build a settlement RPC client any other way. The operational half — the daemon's
 terms-acceptance flag, its `HiddenServiceDir` on a persisted volume, and the fact that
 `HiddenServicePort`'s target is resolved when the daemon _parses_ its config, so an
 unresolvable container name crashes it before it runs — is

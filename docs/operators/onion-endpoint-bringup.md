@@ -121,8 +121,9 @@ decision 7), not a gap — see "The operator writes the address down", below.
   works identically: the connector's whole surface is a `socks5h://` URL and a hidden-service
   host, and nothing in it is specific to either. Which `anon` release you run decides the TLD —
   see the section above.
-- A settlement RPC endpoint and an app `handler_url` the node can reach **directly**. Neither is
-  proxied (below), so an onion endpoint does not relieve the box of ordinary outbound network
+- An app `handler_url` the node can reach **directly**, and a settlement RPC endpoint it can reach
+  either directly or, with `rpc_via_socks_proxy = true` on that table, through the same daemon
+  (below). An onion endpoint on its own does not relieve the box of ordinary outbound network
   access.
 
 ## Order — daemon through peering, in order
@@ -325,20 +326,52 @@ the cheapest way to ask "has a rendezvous happened yet" while circuits are still
 
 ## What is not proxied, and what that leaves linkable
 
-**Settlement RPC and the app's `handler_url` dial direct** (ADR 0070 decision 4). This is a named
-limitation of that record, not an oversight: routing settlement through a circuit is a separate
-decision with its own evidence to gather, because circuit latency interacts with confirmation
-semantics and nonce handling on both settlement backends.
+**The app's `handler_url` dials direct** (ADR 0070 decision 4). It is loopback in every provider
+deployment, and nothing about it identifies the operator to a third party.
 
-The consequence, stated plainly so that you can decide about it rather than discover it:
+**Settlement RPC dials direct unless its table opts in** (ADR 0073, amending decision 4). By
+default, the consequence is the one ADR 0070 named:
 
 - A node reaching a public RPC provider does so **from its real address**.
 - That same provider sees **the transactions the node submits**.
 - So an observer positioned there can link the operator's network location to their on-chain
   identity. Running the ILP wire over onion does not prevent it.
 
-If that linkage matters to you, the levers are outside this connector — your own RPC node, or a
-transport for RPC arranged at the host — and none of them is configured here.
+To close that link without running a chain node, set `rpc_via_socks_proxy = true` in
+`[settlement.evm]` and/or `[settlement.solana]`:
+
+```toml
+socks_proxy = "socks5h://anon:9050"   # root level, before any [table]
+
+[settlement.evm]
+rpc_url = "https://sepolia.base.org"
+rpc_via_socks_proxy = true
+# ...
+
+[settlement.solana]
+rpc_url = "https://api.devnet.solana.com"
+rpc_via_socks_proxy = true
+# ...
+```
+
+- Every client of that `rpc_url` then rides the daemon: the backend, the EVM channel-index syncer
+  and the EVM rate source. Each chain gets its own circuit, pinned by a fixed SOCKS username
+  (`toon-settlement-evm`, `toon-settlement-solana`). That needs `IsolateSOCKSAuth` on the
+  `SocksPort`, which is the daemon's default; do not turn it off.
+- It **fails closed**. If the daemon is down, settlement calls fail and nothing dials direct. The
+  node also refuses to start with the key set and no `socks_proxy`.
+- The endpoint must be `https://` (or an onion host). The node refuses plain `http://` to a clearnet
+  host, because the exit relay could rewrite the answers.
+- Use a **keyless** public endpoint. An API-keyed one ties every query to the account that holds
+  the key, which is a stronger link than the IP this setting hides.
+- Expect settlement to be slower: about a quarter of a second more per pooled call, and a
+  multi-step EVM redeem taking several seconds rather than one or two. Nothing on those paths waits
+  on a clock of seconds (ADR 0073, Evidence 1).
+
+What it does **not** hide: the RPC provider still sees every query and transaction, all of which
+name the node's keys, and every payment is on chain. It moves the node's address out of the RPC
+provider's view, and that is all it does. A self-hosted RPC node hides reads completely, but it
+publishes its own IP in the chain's peer-to-peer layer unless that traffic is proxied too.
 
 ## What an onion endpoint hides
 

@@ -1045,6 +1045,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "connector-btp",
+ "connector-chain-rpc",
  "connector-cli",
  "connector-config",
  "connector-domain",
@@ -1075,6 +1076,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -1082,6 +1084,25 @@ name = "connector-btp"
 version = "0.1.0"
 dependencies = [
  "tokio",
+]
+
+[[package]]
+name = "connector-chain-rpc"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "connector-chain-rpc",
+ "connector-runtime",
+ "ethers",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "solana-rpc-client",
+ "solana-rpc-client-api",
+ "solana-sdk",
+ "thiserror 2.0.19",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -1095,6 +1116,7 @@ dependencies = [
  "bs58",
  "chrono",
  "connector-btp",
+ "connector-chain-rpc",
  "connector-client-edge",
  "connector-config",
  "connector-domain",
@@ -1301,6 +1323,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "connector-chain-rpc",
  "connector-domain",
  "connector-rate-source",
  "connector-settlement-evm",
@@ -1358,6 +1381,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "connector-chain-rpc",
  "connector-settlement",
  "connector-settlement-evm",
  "connector-signer",
@@ -1377,10 +1401,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "connector-chain-rpc",
  "connector-settlement",
  "connector-settlement-solana",
+ "serde_json",
  "solana-rpc-client",
+ "solana-rpc-client-api",
  "solana-sdk",
+ "solana-transaction-status-client-types",
  "spl-associated-token-account",
  "spl-token",
  "tempfile",

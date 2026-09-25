@@ -2,6 +2,8 @@
 
 **Status:** Accepted — built (#1273), **amended in place by issue #1284** (the hidden-service TLD
 is a spelling: `.anyone` is a host on the same terms `.onion` is — see the Amendment below).
+**Decision 4's settlement half is amended by [0073](0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md)**:
+a settlement table may opt its RPC onto the proxy (see the note under decision 4).
 Extends
 [0027](0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md) by naming what
 an onion endpoint is _not_: it adds no third carriage and reopens nothing 0027 closed. Narrows
@@ -109,6 +111,16 @@ this record makes no anonymity claim beyond that sentence.
    latency interacts with confirmation semantics and nonce handling on both backends — and is not
    taken here. The consequence is the linkage named above, and it is a limitation of this record
    rather than an oversight.
+
+   _Amended by [0073](0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md)
+   (TOON_Network#167)._ That separate decision has been taken, with its evidence. A
+   `[settlement.evm]` or `[settlement.solana]` table that sets `rpc_via_socks_proxy = true` sends
+   every client of its `rpc_url` through this record's one proxy, on a circuit pinned per chain,
+   never falling back to direct. It does this only together with the backend hardening 0073
+   requires. It is an **opt-in per table**, not host selection, so decision 3's rule and the
+   rejected "proxy every outbound dial" both stand. `handler_url` still dials direct, and so does
+   every settlement table that does not opt in. The linkage named above closes for an operator who
+   opts in, and stands for one who does not.
 
 5. **`connector send` takes a `--socks-proxy <url>` flag.** That verb parses flags and loads no
    config file, so there is nowhere for a config section to reach it. It applies the same

@@ -875,7 +875,8 @@ async fn an_unaffiliated_solana_buyer_pays_for_a_write_with_no_client_channels_c
     // from config, sharing its seed, so the channel proven against here is
     // the one the running node will recognise as its own.
     let production_side = SolanaSettlementBackend::connect(
-        &validator.rpc_url,
+        &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
+            .expect("rpc transport"),
         &production_seed,
         program_id,
         mint.pubkey(),

@@ -17,7 +17,8 @@ use std::collections::BTreeSet;
 
 /// Everything this reader may depend on at build time, and nothing else.
 /// Adding to this list is deliberate by construction -- which is the point.
-const DECLARED: [&str; 6] = [
+const DECLARED: [&str; 7] = [
+    "connector-chain-rpc",
     "connector-domain",
     "connector-rate-source",
     "async-trait",

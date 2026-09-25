@@ -28,10 +28,11 @@ pub const DEPLOYER_PRIVATE_KEY: &str =
 /// #1118): a test that wants collateral on **both** sides of a channel now
 /// needs two identities that can each sign for themselves, and they cannot
 /// be the same address. Two `EvmSettlementBackend`s built for one address
-/// hold two independent `NonceManagerMiddleware`s over one nonce sequence,
-/// so the second one to write gets `nonce too low` -- which is not a
-/// hazard a test should route around, since on a real chain the
-/// counterparty is a different party with a different key anyway.
+/// count two independent local nonces over one nonce sequence, so the
+/// second one to write is refused `nonce too low` and has to re-read
+/// `pending` (ADR 0073) -- which is not a path a test should lean on for its
+/// counterparty, since on a real chain the counterparty is a different
+/// party with a different key anyway.
 pub const COUNTERPARTY_PRIVATE_KEY: &str =
     "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 

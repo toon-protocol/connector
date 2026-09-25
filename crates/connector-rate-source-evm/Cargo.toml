@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The settlement table's transport (ADR 0073): a URL and a bounded HTTP
+# client, optionally on the table's circuit. It holds no key and no channel,
+# which is why it may be here when a settlement crate may not.
+connector-chain-rpc = { path = "../connector-chain-rpc", features = ["evm"] }
 connector-domain = { path = "../connector-domain" }
 connector-rate-source = { path = "../connector-rate-source" }
 async-trait = "0.1"
