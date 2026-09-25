@@ -262,7 +262,7 @@ key_file = "{key_path}"
     // side is calling. Both sides of this channel are now collateralised by
     // the same port method, each for itself.
     let counterparty_backend = EvmSettlementBackend::connect(
-        &anvil.rpc_url,
+        &connector_settlement_evm::RpcTransport::direct(&anvil.rpc_url).expect("rpc transport"),
         COUNTERPARTY_PRIVATE_KEY,
         registry_address,
         token,

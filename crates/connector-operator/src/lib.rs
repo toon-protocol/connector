@@ -781,11 +781,22 @@ struct OpenChannelRequest {
     chain: Option<String>,
 }
 
-/// A `POST /channels/:id/fund` request body: deposit `amount` into the
-/// channel named by the path.
+/// A `POST /channels/:id/fund` request body, in one of two forms:
+///
+/// - `{"amount": n}` deposits `n` more of this node's own collateral. An
+///   increment, so a retry after an ambiguous outcome deposits again.
+/// - `{"total": n}` raises this node's own deposit **to** `n` and no
+///   further, so it can be repeated until it is answered (ADR 0073). A
+///   total already reached deposits nothing and answers the channel as it
+///   stands.
+///
+/// Exactly one of the two.
 #[derive(Debug, Deserialize)]
 struct FundChannelRequest {
-    amount: u128,
+    #[serde(default)]
+    amount: Option<u128>,
+    #[serde(default)]
+    total: Option<u128>,
 }
 
 /// A `POST /channels/:id/redeem` request body: redeem a claim of
@@ -902,12 +913,18 @@ async fn fund_channel(
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
-    channel_operation_response(
-        state
-            .connector
-            .fund_channel(&channel_id, request.amount)
-            .await,
-    )
+    let result =
+        match (request.amount, request.total) {
+            (Some(amount), None) => state.connector.fund_channel(&channel_id, amount).await,
+            (None, Some(total)) => state.connector.fund_channel_to(&channel_id, total).await,
+            _ => return (
+                StatusCode::BAD_REQUEST,
+                "give exactly one of 'amount' (an increment: a retry deposits again) or 'total' \
+                 (this node's own deposit to reach: a retry deposits nothing more)",
+            )
+                .into_response(),
+        };
+    channel_operation_response(result)
 }
 
 /// `POST /channels/:id/redeem`: redeem a claim against an existing channel
@@ -2610,6 +2627,79 @@ mod tests {
                 .uri(path)
                 .body(Body::from(body))
                 .unwrap()
+        }
+
+        /// `POST /channels/:id/fund` with a `total` is the retry-safe form
+        /// (ADR 0073): the same body, re-signed and sent again, deposits
+        /// nothing more. A body naming both forms, or neither, is refused.
+        #[tokio::test]
+        async fn funding_to_a_total_can_be_repeated_without_depositing_twice() {
+            let keypair = keypair();
+            let app = router_with(vec![keypair.public.to_bytes()]);
+            let signed_at = |created: u64, path: &str, body: serde_json::Value| {
+                let body = serde_json::to_vec(&body).unwrap();
+                let (sig_input, sig, digest) =
+                    sign_request(&keypair, "POST", path, &body, created, Some(9_999_999_999));
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("signature-input", sig_input)
+                    .header("signature", sig)
+                    .header("content-digest", digest)
+                    .body(Body::from(body))
+                    .unwrap()
+            };
+
+            let opened = app
+                .clone()
+                .oneshot(signed_at(
+                    1_000,
+                    "/channels",
+                    serde_json::json!({
+                        "counterparty_hex": COUNTERPARTY_SETTLEMENT,
+                        "settlement_timeout_seconds": 3600,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(opened.status(), StatusCode::OK);
+            let opened: ChannelView =
+                serde_json::from_slice(&hyper::body::to_bytes(opened.into_body()).await.unwrap())
+                    .unwrap();
+            let path = format!("/channels/{}/fund", opened.id);
+
+            for created in [1_001, 1_002] {
+                let funded = app
+                    .clone()
+                    .oneshot(signed_at(
+                        created,
+                        &path,
+                        serde_json::json!({ "total": 500 }),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(funded.status(), StatusCode::OK);
+                let funded: ChannelView = serde_json::from_slice(
+                    &hyper::body::to_bytes(funded.into_body()).await.unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    funded.own_deposited, 500,
+                    "the second send deposits nothing"
+                );
+            }
+
+            for (created, body) in [
+                (1_003, serde_json::json!({ "amount": 1, "total": 2 })),
+                (1_004, serde_json::json!({})),
+            ] {
+                let refused = app
+                    .clone()
+                    .oneshot(signed_at(created, &path, body))
+                    .await
+                    .unwrap();
+                assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+            }
         }
 
         #[tokio::test]

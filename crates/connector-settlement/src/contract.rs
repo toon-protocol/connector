@@ -195,16 +195,34 @@ where
     assert_eq!(state.own_deposited, 150);
     assert_eq!(state.counterparty_deposited, 0);
 
+    // `fund_to` is the retry-safe form (ADR 0073 decision 5): it raises the
+    // own deposit TO a total, so repeating it -- the retry of a call whose
+    // answer was lost -- deposits nothing more, and a total already reached
+    // is a no-op rather than an error.
+    let state = backend.fund_to(&channel, 200).await.expect("fund_to");
+    assert_eq!(state.own_deposited, 200);
+    let state = backend
+        .fund_to(&channel, 200)
+        .await
+        .expect("fund_to, repeated");
+    assert_eq!(state.own_deposited, 200, "a repeated fund_to deposits once");
+    let state = backend
+        .fund_to(&channel, 120)
+        .await
+        .expect("fund_to below the current total");
+    assert_eq!(state.own_deposited, 200, "a lower total takes nothing back");
+    assert_eq!(state.counterparty_deposited, 0);
+
     // The counterparty, depositing on their own side, is what puts value
     // behind the claims *this* backend redeems -- and it leaves this
-    // backend's own collateral exactly where `fund` left it.
+    // backend's own collateral exactly where `fund_to` left it.
     fund_counterparty(&channel, 150).await;
     let state = backend
         .channel_state(&channel)
         .await
         .expect("channel_state");
     assert_eq!(state.counterparty_deposited, 150);
-    assert_eq!(state.own_deposited, 150);
+    assert_eq!(state.own_deposited, 200);
 
     // Redeeming a valid claim moves the redeemed total to the claim's
     // cumulative amount. The deposit is untouched -- it is the channel's
@@ -222,7 +240,7 @@ where
         .expect("redeem");
     assert_eq!(state.redeemed, 60);
     assert_eq!(state.counterparty_deposited, 150);
-    assert_eq!(state.own_deposited, 150);
+    assert_eq!(state.own_deposited, 200);
 
     // A later claim supersedes an earlier one: redeeming again for a
     // higher cumulative amount succeeds and moves the total further.
@@ -290,7 +308,7 @@ where
     );
 
     // The bound is the *counterparty's* deposit and nothing else: this
-    // backend's own 150 of collateral is not spare change a claim against
+    // backend's own 200 of collateral is not spare change a claim against
     // it may draw on. Raising only the self-deposit leaves the identical
     // claim refused with the identical number.
     backend.fund(&channel, 900).await.expect("fund");

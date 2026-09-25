@@ -58,10 +58,20 @@ use url::Url;
 /// either.
 const VERSION: u8 = 0x05;
 
-/// "No authentication required" (§3): the method this server offers, and
-/// the one every dial in this repository presents, since a proxy URL here
-/// carries no credentials.
+/// "No authentication required" (§3): the method this server picks when a
+/// client offers nothing else, which is every ILP-wire dial in this
+/// repository, since the `socks_proxy` URL carries no credentials.
 const NO_AUTH: u8 = 0x00;
+
+/// Username/password (§3, RFC 1929): the method this server picks whenever a
+/// client offers it. A settlement circuit is pinned by the username its
+/// client presents (ADR 0073 decision 3), and a real `anon` daemon picks
+/// this method when offered, which is what `IsolateSOCKSAuth` isolates on.
+const USERNAME_PASSWORD: u8 = 0x02;
+
+/// RFC 1929's own version byte, and its "success" status.
+const USERPASS_VERSION: u8 = 0x01;
+const USERPASS_SUCCESS: u8 = 0x00;
 
 /// CONNECT (§4). BIND and UDP ASSOCIATE are not implemented and are
 /// refused with `COMMAND_NOT_SUPPORTED` rather than half-served -- nothing
@@ -86,10 +96,18 @@ const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 /// into a spurious failure.
 pub struct Socks5TestServer {
     addr: SocketAddr,
-    targets: Arc<Mutex<Vec<String>>>,
+    targets: Arc<Mutex<Vec<SocksConnect>>>,
     /// Dropped with the server, which ends the accept loop. Held rather
     /// than read.
     _shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+/// One CONNECT this proxy was asked for: the target as the client wrote it,
+/// and the RFC 1929 username it authenticated with, if it authenticated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocksConnect {
+    pub username: Option<String>,
+    pub target: String,
 }
 
 impl Socks5TestServer {
@@ -168,6 +186,16 @@ impl Socks5TestServer {
     /// both traversed the proxy and deferred resolution to it.
     #[must_use]
     pub fn targets(&self) -> Vec<String> {
+        self.connects()
+            .into_iter()
+            .map(|connect| connect.target)
+            .collect()
+    }
+
+    /// Every CONNECT, with the username it arrived under -- what a test
+    /// reads to prove which circuit a dial was pinned to (ADR 0073).
+    #[must_use]
+    pub fn connects(&self) -> Vec<SocksConnect> {
         self.targets.lock().expect("targets lock").clone()
     }
 
@@ -188,7 +216,7 @@ impl Socks5TestServer {
 async fn serve(
     mut client: TcpStream,
     routes: Arc<HashMap<String, SocketAddr>>,
-    seen: Arc<Mutex<Vec<String>>>,
+    seen: Arc<Mutex<Vec<SocksConnect>>>,
 ) -> std::io::Result<()> {
     // §3: VER, NMETHODS, METHODS...
     let mut greeting = [0u8; 2];
@@ -198,7 +226,26 @@ async fn serve(
     }
     let mut methods = vec![0u8; greeting[1] as usize];
     client.read_exact(&mut methods).await?;
-    client.write_all(&[VERSION, NO_AUTH]).await?;
+    let username = if methods.contains(&USERNAME_PASSWORD) {
+        client.write_all(&[VERSION, USERNAME_PASSWORD]).await?;
+        // RFC 1929: VER, ULEN, UNAME, PLEN, PASSWD. Any credentials are
+        // accepted; the username is what is recorded.
+        let mut header = [0u8; 2];
+        client.read_exact(&mut header).await?;
+        let mut name = vec![0u8; header[1] as usize];
+        client.read_exact(&mut name).await?;
+        let mut password_length = [0u8; 1];
+        client.read_exact(&mut password_length).await?;
+        let mut password = vec![0u8; password_length[0] as usize];
+        client.read_exact(&mut password).await?;
+        client
+            .write_all(&[USERPASS_VERSION, USERPASS_SUCCESS])
+            .await?;
+        Some(String::from_utf8_lossy(&name).into_owned())
+    } else {
+        client.write_all(&[VERSION, NO_AUTH]).await?;
+        None
+    };
 
     // §4: VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT
     let mut request = [0u8; 4];
@@ -235,7 +282,10 @@ async fn serve(
 
     // Recorded before the CONNECT is judged, so a target this server cannot
     // reach is still a target it was asked for.
-    seen.lock().expect("targets lock").push(target.clone());
+    seen.lock().expect("targets lock").push(SocksConnect {
+        username,
+        target: target.clone(),
+    });
 
     if request[1] != CMD_CONNECT {
         reply(&mut client, REP_COMMAND_NOT_SUPPORTED).await?;
@@ -345,6 +395,48 @@ mod tests {
 
         assert_eq!(answer[1], REP_HOST_UNREACHABLE);
         assert_eq!(proxy.targets(), vec!["unrouted.onion:443".to_string()]);
+    }
+
+    /// A client that offers username/password gets it, and the username is
+    /// recorded against its CONNECT -- the fact a pinned settlement circuit
+    /// is asserted by (ADR 0073).
+    #[tokio::test]
+    async fn a_client_offering_credentials_is_authenticated_and_its_username_recorded() {
+        let proxy = Socks5TestServer::spawn_recording_only().await;
+
+        let mut client = TcpStream::connect(proxy.addr()).await.expect("dial proxy");
+        client
+            .write_all(&[VERSION, 2, NO_AUTH, USERNAME_PASSWORD])
+            .await
+            .expect("greet");
+        let mut chosen = [0u8; 2];
+        client.read_exact(&mut chosen).await.expect("method");
+        assert_eq!(chosen, [VERSION, USERNAME_PASSWORD]);
+
+        let mut auth = vec![USERPASS_VERSION, 4];
+        auth.extend_from_slice(b"evm1");
+        auth.push(2);
+        auth.extend_from_slice(b"pw");
+        client.write_all(&auth).await.expect("authenticate");
+        let mut status = [0u8; 2];
+        client.read_exact(&mut status).await.expect("auth status");
+        assert_eq!(status, [USERPASS_VERSION, USERPASS_SUCCESS]);
+
+        let host = b"rpc.onion";
+        let mut connect = vec![VERSION, CMD_CONNECT, 0x00, ATYP_DOMAIN, host.len() as u8];
+        connect.extend_from_slice(host);
+        connect.extend_from_slice(&80u16.to_be_bytes());
+        client.write_all(&connect).await.expect("connect");
+        let mut answer = [0u8; 10];
+        client.read_exact(&mut answer).await.expect("reply");
+
+        assert_eq!(
+            proxy.connects(),
+            vec![SocksConnect {
+                username: Some("evm1".to_string()),
+                target: "rpc.onion:80".to_string(),
+            }]
+        );
     }
 
     /// `proxy_url` is the value an operator writes, and it is `socks5h`.

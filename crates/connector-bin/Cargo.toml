@@ -40,6 +40,10 @@ connector-btp = { path = "../connector-btp" }
 hex = "0.4"
 connector-signer = { path = "../connector-signer" }
 connector-settlement = { path = "../connector-settlement" }
+# `settlement_over_a_circuit.rs` (ADR 0073): the production backends over
+# `RpcTransport::through`, driven only when a SOCKS proxy is named.
+connector-chain-rpc = { path = "../connector-chain-rpc" }
+url = "2"
 connector-settlement-evm = { path = "../connector-settlement-evm", features = ["test-util"] }
 connector-settlement-solana = { path = "../connector-settlement-solana", features = ["test-util"] }
 connector-operator = { path = "../connector-operator", features = ["test-util"] }

@@ -125,8 +125,12 @@ async fn a_channel_opened_and_funded_on_chain_is_indexed_once_confirmed() {
 
     let index = EvmChannelIndex::open(None, indexed_contract_of(&backend), 0)
         .expect("open in-memory index");
-    let syncer =
-        EvmChannelIndexSyncer::new(&rpc_url, backend.address(), 1, 0).expect("build syncer");
+    let syncer = EvmChannelIndexSyncer::new(
+        &connector_settlement_evm::RpcTransport::direct(&rpc_url).expect("rpc transport"),
+        backend.address(),
+        1,
+        0,
+    );
     sync_to_caught_up(&syncer, &index).await;
 
     let channel_id = support::channel_id_bytes(&channel.0);
@@ -173,8 +177,12 @@ async fn a_channel_inside_the_confirmation_window_is_not_yet_indexed() {
     // open is real, but this index must not have caught up to it yet.
     let index = EvmChannelIndex::open(None, indexed_contract_of(&backend), 0)
         .expect("open in-memory index");
-    let syncer =
-        EvmChannelIndexSyncer::new(&rpc_url, backend.address(), 1_000, 0).expect("build syncer");
+    let syncer = EvmChannelIndexSyncer::new(
+        &connector_settlement_evm::RpcTransport::direct(&rpc_url).expect("rpc transport"),
+        backend.address(),
+        1_000,
+        0,
+    );
     sync_to_caught_up(&syncer, &index).await;
 
     let channel_id = support::channel_id_bytes(&channel.0);
@@ -219,8 +227,12 @@ async fn a_settled_channel_is_indexed_as_terminal_without_a_further_chain_read()
 
     let index = EvmChannelIndex::open(None, indexed_contract_of(&backend), 0)
         .expect("open in-memory index");
-    let syncer =
-        EvmChannelIndexSyncer::new(&rpc_url, backend.address(), 1, 0).expect("build syncer");
+    let syncer = EvmChannelIndexSyncer::new(
+        &connector_settlement_evm::RpcTransport::direct(&rpc_url).expect("rpc transport"),
+        backend.address(),
+        1,
+        0,
+    );
     sync_to_caught_up(&syncer, &index).await;
 
     let channel_id = support::channel_id_bytes(&channel.0);
@@ -275,8 +287,12 @@ async fn a_snapshot_from_another_chain_is_not_resumed_against_this_one() {
     let state_dir = tempfile::tempdir().expect("temp state dir");
     let snapshot = state_dir.path().join("evm-channel-index.json");
     let channel_id = support::channel_id_bytes(&channel.0);
-    let syncer =
-        EvmChannelIndexSyncer::new(&rpc_url, backend.address(), 1, 0).expect("build syncer");
+    let syncer = EvmChannelIndexSyncer::new(
+        &connector_settlement_evm::RpcTransport::direct(&rpc_url).expect("rpc transport"),
+        backend.address(),
+        1,
+        0,
+    );
 
     // A node that has caught up on this chain, and stopped.
     let checkpoint = {
@@ -477,7 +493,12 @@ async fn every_log_query_names_the_token_network_so_a_restricted_rpc_serves_it()
 
     let index = EvmChannelIndex::open(None, devnet_indexed_contract(token_network), 0)
         .expect("open in-memory index");
-    let syncer = EvmChannelIndexSyncer::new(&rpc.url, token_network, 1, 0).expect("build syncer");
+    let syncer = EvmChannelIndexSyncer::new(
+        &connector_settlement_evm::RpcTransport::direct(&rpc.url).expect("rpc transport"),
+        token_network,
+        1,
+        0,
+    );
 
     let progressed = syncer
         .sync_once(&index)
@@ -516,7 +537,12 @@ async fn a_served_query_leaves_a_checkpoint_behind() {
         .expect("open in-memory index");
     assert_eq!(index.last_indexed_block(), None);
 
-    let syncer = EvmChannelIndexSyncer::new(&rpc.url, token_network, 1, 0).expect("build syncer");
+    let syncer = EvmChannelIndexSyncer::new(
+        &connector_settlement_evm::RpcTransport::direct(&rpc.url).expect("rpc transport"),
+        token_network,
+        1,
+        0,
+    );
     syncer.sync_once(&index).await.expect("sync_once");
 
     assert_eq!(index.last_indexed_block(), Some(99));

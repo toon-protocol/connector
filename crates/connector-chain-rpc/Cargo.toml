@@ -1,0 +1,44 @@
+[package]
+name = "connector-chain-rpc"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+# The ethers `JsonRpcClient` a settlement table's EVM clients ride: the
+# backend, the channel-index syncer and the rate source (ADR 0073).
+evm = ["dep:ethers"]
+# The `RpcSender` the Solana backend's `RpcClient` rides (ADR 0073).
+solana = ["dep:solana-rpc-client", "dep:solana-rpc-client-api"]
+# `FakeRpc`, a JSON-RPC-over-HTTP server that answers, fails, stalls or
+# drops as a test scripts it. It BINDS A LISTENER, so the shipped binary
+# must not carry it -- the same reason `connector-runtime` gates its SOCKS5
+# fake behind `test-support`.
+test-support = ["tokio/net", "tokio/io-util"]
+
+[dependencies]
+# `socks` for the pinned settlement circuit (ADR 0073 decision 3): the same
+# reqwest line, feature and `tokio-socks` the ILP wire's onion dial already
+# pulls in (ADR 0070), so the lockfile gains nothing. 0.11 because both
+# chain SDKs build their clients on 0.11 and a client handed across that
+# seam has to be the same type.
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "socks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["time"] }
+url = "2"
+async-trait = "0.1"
+ethers = { version = "2", default-features = false, features = ["rustls"], optional = true }
+solana-rpc-client = { version = "=2.1.0", optional = true }
+solana-rpc-client-api = { version = "=2.1.0", optional = true }
+
+[dev-dependencies]
+connector-chain-rpc = { path = ".", features = ["evm", "solana", "test-support"] }
+# The real SOCKS5 server fake ADR 0070 already ships (`Socks5TestServer`):
+# the only way to assert which socket a dial reached, and under which
+# SOCKS username.
+connector-runtime = { path = "../connector-runtime", features = ["test-support"] }
+ethers = { version = "2", default-features = false, features = ["rustls"] }
+solana-sdk = "=2.1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "test-util"] }

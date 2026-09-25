@@ -322,7 +322,7 @@ key_file = "{key_path}"
     // carries both participants, and a channel derived from anything but
     // the settlement addresses would name someone else here.
     let reader = EvmSettlementBackend::connect(
-        &anvil.rpc_url,
+        &connector_settlement_evm::RpcTransport::direct(&anvil.rpc_url).expect("rpc transport"),
         COUNTERPARTY_PRIVATE_KEY,
         registry_address,
         token,
@@ -525,7 +525,7 @@ key_file = "{key_path}"
 
     // The channel really is with the address the document named.
     let reader = EvmSettlementBackend::connect(
-        &anvil.rpc_url,
+        &connector_settlement_evm::RpcTransport::direct(&anvil.rpc_url).expect("rpc transport"),
         DEPLOYER_PRIVATE_KEY,
         registry_address,
         token,

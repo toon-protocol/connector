@@ -131,7 +131,8 @@ pub struct BoundedHttpSelfDescription {
     /// (ADR 0070 decision 3). Two clients selected by host, exactly as the
     /// two peer carriages select: this fetch is the ILP wire's own
     /// bootstrap, not settlement RPC and not a `handler_url`, so decision
-    /// 4 leaves it in scope rather than out.
+    /// 4 leaves it in scope rather than out. (Settlement RPC reaches the
+    /// proxy only by its table's own opt-in, ADR 0073.)
     onion: Result<reqwest::Client, String>,
     allow_plaintext: bool,
 }

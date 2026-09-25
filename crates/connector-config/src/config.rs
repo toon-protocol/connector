@@ -24,7 +24,8 @@ use crate::peering_asset::{resolve_peering_assets, PeeringAssets};
 use crate::route::{resolve_routes, PeerRouteConfig, RawChild, RawRoute, StaticRoute};
 use crate::secret::{RawSignerConfig, SecretLocation};
 use crate::settlement::{
-    resolve_settlement, RawSettlementSection, SettlementConfig, SettlementTables,
+    check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettlementConfig,
+    SettlementTables,
 };
 
 /// The config file's shape exactly as written -- convenience forms
@@ -392,6 +393,7 @@ impl Config {
         // four channel tables -- peer, client, pay, on either chain --
         // answer to it.
         let settlements = resolve_settlement(raw.settlement)?;
+        check_settlement_rpc_routes(&settlements, socks_proxy.as_ref())?;
         let settlement_tables = SettlementTables::of(&settlements);
         let peer_channels = resolve_peer_channels(raw.peer_channels, settlement_tables)?;
         for peer_route in &peer_routes {
@@ -1920,6 +1922,164 @@ key_file = "{}"
                 key_path.display()
             )
         })
+    }
+
+    /// A node with both settlement tables, each routed as `evm_proxied` /
+    /// `solana_proxied` say, under `head` (top-level keys) and at the given
+    /// endpoints.
+    fn load_settlement_routes(
+        head: &str,
+        evm_rpc: &str,
+        evm_proxied: Option<bool>,
+        solana_rpc: &str,
+        solana_proxied: Option<bool>,
+    ) -> Result<Config, ConfigError> {
+        let line = |proxied: Option<bool>| {
+            proxied
+                .map(|value| format!("rpc_via_socks_proxy = {value}"))
+                .unwrap_or_default()
+        };
+        with_key_file(|key_path| {
+            let key = key_path.display();
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+state_dir = "/tmp/connector-rpc-route-test"
+{head}
+
+[signer]
+key_file = "{key}"
+
+[settlement.evm]
+rpc_url = "{evm_rpc}"
+contract_address = "0x00000000000000000000000000000000000000aa"
+token_address = "0x00000000000000000000000000000000000000bb"
+decimals = 6
+{evm_line}
+
+[settlement.evm.key]
+key_file = "{key}"
+
+[settlement.solana]
+rpc_url = "{solana_rpc}"
+program_id = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip"
+token_address = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+decimals = 6
+{solana_line}
+
+[settlement.solana.key]
+key_file = "{key}"
+"#,
+                evm_line = line(evm_proxied),
+                solana_line = line(solana_proxied),
+            )
+        })
+    }
+
+    const PROXY: &str = r#"socks_proxy = "socks5h://127.0.0.1:9050""#;
+
+    /// ADR 0073 decision 1: the key is an opt-in, off unless a table writes
+    /// it, and writing it with the node's one proxy configured loads.
+    #[test]
+    fn settlement_rpc_is_direct_unless_a_table_opts_into_the_proxy() {
+        let config = load_settlement_routes(
+            PROXY,
+            "https://sepolia.base.org",
+            None,
+            "https://api.devnet.solana.com",
+            None,
+        )
+        .expect("load");
+        assert!(config
+            .settlements()
+            .iter()
+            .all(|table| !table.rpc_via_socks_proxy()));
+
+        let config = load_settlement_routes(
+            PROXY,
+            "https://sepolia.base.org",
+            Some(true),
+            "https://api.devnet.solana.com",
+            Some(false),
+        )
+        .expect("load");
+        let routed: Vec<(SettlementChain, bool)> = config
+            .settlements()
+            .iter()
+            .map(|table| (table.chain(), table.rpc_via_socks_proxy()))
+            .collect();
+        assert_eq!(
+            routed,
+            vec![
+                (SettlementChain::Evm, true),
+                (SettlementChain::Solana, false)
+            ],
+            "each table says its own"
+        );
+    }
+
+    /// ADR 0073 decision 1: no proxy, no load. The key never falls back to
+    /// dialing direct, so without a proxy it could only mean "fail every
+    /// settlement call", and that is refused where the operator wrote it.
+    #[test]
+    fn a_table_that_opts_into_the_proxy_on_a_node_with_none_is_refused_by_name() {
+        for (evm, solana, table) in [(Some(true), None, "evm"), (None, Some(true), "solana")] {
+            let error = load_settlement_routes(
+                "",
+                "https://sepolia.base.org",
+                evm,
+                "https://api.devnet.solana.com",
+                solana,
+            )
+            .expect_err("no socks_proxy to ride");
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::SettlementRpcViaSocksProxyWithoutProxy { table: named }
+                        if named == table
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    /// Plain http through an exit relay is refused; https, or an onion host
+    /// (whose address authenticates the service), is accepted.
+    #[test]
+    fn a_proxied_settlement_rpc_is_https_unless_its_host_is_an_onion_address() {
+        let error = load_settlement_routes(
+            PROXY,
+            "http://sepolia.base.org",
+            Some(true),
+            "https://api.devnet.solana.com",
+            None,
+        )
+        .expect_err("plaintext through an exit");
+        assert!(
+            matches!(
+                error,
+                ConfigError::SettlementRpcViaSocksProxyPlaintext { table: "evm", .. }
+            ),
+            "{error}"
+        );
+
+        for onion in [
+            "http://abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion/",
+            "http://abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.anyone:8899/",
+        ] {
+            load_settlement_routes(PROXY, "https://sepolia.base.org", None, onion, Some(true))
+                .unwrap_or_else(|error| panic!("{onion} is an onion host: {error}"));
+        }
+
+        // Direct plaintext is unchanged: a self-hosted node on loopback.
+        load_settlement_routes(
+            "",
+            "http://127.0.0.1:8545",
+            None,
+            "http://127.0.0.1:8899",
+            None,
+        )
+        .expect("a direct loopback endpoint is not this rule's business");
     }
 
     /// ADR 0070 decision 3: the one proxy an operator writes down loads and

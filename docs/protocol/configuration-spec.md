@@ -373,7 +373,8 @@ is reached through ([ADR 0070](../adr/0070-an-onion-address-is-a-host-not-a-carr
 take it is read off the endpoint's own host — a host ending in `.onion` or `.anyone`, the two TLDs
 the `anon` daemon has published (issue #1284) — so there is no per-peer
 `proxy` key and no all-outbound mode, and nothing in this file states it a second time. It covers the
-ILP wire only: settlement RPC and a route's `handler_url` are outside its scope. The value must name a
+ILP wire, and settlement RPC only where a settlement table opts in (below); a route's `handler_url`
+is outside its scope. The value must name a
 host — `socks5h` is not a _special_ URL scheme, so `socks5h://` and `socks5h:9050` both parse and
 neither is a proxy address, and both are refused by name. The scheme must be
 `socks5h://` and every other scheme is refused by name at load, because a `socks5://` proxy resolves
@@ -479,6 +480,30 @@ use and belong in an operator's guide rather than a protocol specification.
 `unresolvable_lookup_budget_per_signer` · `unresolvable_lookup_budget_total` ·
 `unresolvable_lookup_budget_window_secs` · `unresolvable_lookup_budget_max_wait_ms` ·
 `btp_session_window`
+
+**`rpc_via_socks_proxy` sends one settlement table's RPC through `socks_proxy`**
+([ADR 0073](../adr/0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md)). It
+is a boolean on `[settlement.evm]` and on `[settlement.solana]`, `false` when omitted, and not
+accepted by the frozen legacy `[settlement]` shape. When a table sets it:
+
+- every client of that table's `rpc_url` dials through the node's one `socks_proxy` as `socks5h`: the
+  settlement backend, and on EVM the channel-index syncer and the rate source too. None is left
+  direct, and a proxy that is down is a failed call, never a direct dial;
+- each chain rides its own circuit, pinned by a fixed SOCKS username (`toon-settlement-evm`,
+  `toon-settlement-solana`), which relies on the daemon's `IsolateSOCKSAuth` (on by default);
+- a node with no `socks_proxy` is refused at load (`SettlementRpcViaSocksProxyWithoutProxy`), since
+  the key selects the node's one proxy and never names a second;
+- a plain `http://` `rpc_url` is refused at load (`SettlementRpcViaSocksProxyPlaintext`) unless its
+  host is a `.onion` or `.anyone` address, because an exit relay could otherwise read and rewrite
+  every answer, a channel's deposit and a transaction's receipt included.
+
+It is an opt-in and not read off the host, unlike a peer endpoint's proxy, because a public RPC's
+host carries no signal the way an onion host does: a node whose RPC is a self-hosted node on a
+private network must keep dialing it direct. The circuit hides the node's address from the RPC
+provider and nothing else: the provider still sees every query and transaction, and an API-keyed
+endpoint ties them to the account that holds the key. Every settlement client, proxied or not, now
+runs under the same bounds: 20s to connect, 30s per request, idle connections dropped after 30s, and
+a 403 or 429 retried with backoff.
 
 `[settlement.evm]` carries two more of the same kind (issue #661), for the local channel index a node
 builds from its own `TokenNetwork`'s logs so that resolving an unfamiliar channel is a map hit rather
