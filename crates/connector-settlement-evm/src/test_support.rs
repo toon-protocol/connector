@@ -8,6 +8,8 @@
 //! since that cfg is only active while this crate compiles its own test
 //! binary.
 
+pub mod x402;
+
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;

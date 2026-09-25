@@ -77,3 +77,19 @@ pub(crate) mod token_network_registry {
         "./contracts/TokenNetworkRegistry.json"
     );
 }
+
+// x402's `x402BatchSettlement` (ADR 0074, issue #1342): the contract a
+// client's batch-settlement channel lives in, which this crate only reads
+// and `claim`s on. It is not this repository's Solidity, so
+// `regenerate-token-network-abi.sh` does not rebuild it: the ABI is the `abi`
+// field of a `forge build` of x402 at the pinned commit `0cb1a1f0`.
+// `contracts/x402/PROVENANCE.md` records that build and the deployed bytecode
+// it matches, and `tests/x402_provenance.rs` holds the ABI to that bytecode.
+pub(crate) mod x402_batch_settlement {
+    use ethers::contract::abigen;
+
+    abigen!(
+        X402BatchSettlement,
+        "./contracts/x402/x402BatchSettlement.abi.json"
+    );
+}

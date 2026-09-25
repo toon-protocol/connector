@@ -93,6 +93,11 @@ connector-settlement             the chain-agnostic settlement port + its contra
 connector-settlement-evm         real EVM backend: TokenNetworkRegistry → TokenNetwork,
                                   holding no local channel state; every method reads the
                                   chain fresh
+  └─ batch_settlement.rs         the batch-settlement port over x402's
+                                  x402BatchSettlement (ADR 0074): admits a presented
+                                  ChannelConfig, `claim`s from the settlement key.
+                                  contracts/x402/ holds its ABI and the pinned bytecode
+                                  the tests place on anvil, with PROVENANCE.md
 connector-settlement-solana      real Solana backend, speaking packages/solana-program's
                                   own wire directly (that crate builds for SBF only and
                                   exports no client SDK)
