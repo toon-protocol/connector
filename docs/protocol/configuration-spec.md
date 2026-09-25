@@ -435,8 +435,10 @@ table does not start with one:
 | Solana | `min_grace_period_secs`   | `86400` (a day) | below `900`                                                     |
 | Solana | `min_sponsored_deposit`   | **required**    | `0`; it bounds a public endpoint that spends this node's rent   |
 
-The two minimums are published in the greeting, and a channel whose `withdrawDelay` or `grace_period`
-falls short of them is not admitted. The floor of 900 seconds is x402's own; the day is the window a
+The two minimum delays are published in the greeting, and a channel whose `withdrawDelay` or
+`grace_period` falls short of them is not admitted. `min_sponsored_deposit` is published too, as the
+Solana entry's `extra.minDeposit`: ADR 0074 decision 5 has the sponsor refuse below a _published_
+minimum, so a client reads it before building an `open`. The floor of 900 seconds is x402's own; the day is the window a
 delayed `claim` or `settle_and_seal` still has to land in. Neither sub-table names **where** the
 channels live: the record fixes `x402BatchSettlement` at `0x4020074e…0003` and `payment-channels` at
 `CHNLx…yGsX`, the one address and program id each is deployed under on test and main networks alike

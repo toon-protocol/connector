@@ -814,16 +814,16 @@ pub fn token_account_problem(
 }
 
 impl SolanaBatchSettlement {
-    /// The terms this backend's sponsor co-signs under, with the minimum
-    /// sponsored deposit from `[settlement.solana.batch_settlement]`.
-    pub fn sponsor_terms(&self, min_sponsored_deposit: u64) -> SponsorTerms {
+    /// The terms this backend's sponsor co-signs under: its own admission
+    /// facts and its minimum sponsored deposit.
+    pub fn sponsor_terms(&self) -> SponsorTerms {
         SponsorTerms {
             program_id: self.program_id,
             sponsor: self.sponsor(),
             receiver: self.receiver(),
             mint: self.mint,
             min_grace_period_secs: self.min_grace_period_secs,
-            min_sponsored_deposit,
+            min_sponsored_deposit: self.min_sponsored_deposit,
         }
     }
 
@@ -834,12 +834,8 @@ impl SolanaBatchSettlement {
     pub fn vet_sponsored_open(
         &self,
         transaction_base64: &str,
-        min_sponsored_deposit: u64,
     ) -> Result<VettedOpen, SponsorRefusal> {
-        vet_open(
-            transaction_base64,
-            &self.sponsor_terms(min_sponsored_deposit),
-        )
+        vet_open(transaction_base64, &self.sponsor_terms())
     }
 
     /// Co-sign a [`vet_sponsored_open`](Self::vet_sponsored_open)-ed `open` as fee payer and `rent_payer`,

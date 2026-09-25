@@ -95,6 +95,7 @@ async fn world() -> World {
         &seed_of(&sponsor),
         settled_mint,
         ONE_DAY,
+        1,
     )
     .await
     .expect("connect to the genesis-loaded payment-channels program");

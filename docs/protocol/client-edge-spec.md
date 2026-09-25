@@ -706,8 +706,12 @@ configured (below) — and carries nothing else.
 > CAIP-2 (`eip155:<chainId>` or `solana:<genesis-hash-prefix>`), `asset` is the token address or
 > mint, and `payTo` is this node's own settlement address (Solana: the owner of its receiving
 > account). `extra` carries `receiverAuthorizer` and the minimum `withdrawDelay`, plus the asset's
-> EIP-712 `name`/`version`, on EVM; `feePayer` (the sponsor key) and the minimum `withdrawDelay`
-> (the program's own `grace_period`) on Solana. The `toon-channel` entry is unchanged and stays
+> EIP-712 `name`/`version`, on EVM; `feePayer` (the sponsor key), the minimum `withdrawDelay`
+> (the program's own `grace_period`) and `minDeposit` on Solana. `minDeposit` is this connector's
+> own addition to x402's SVM `extra`: the smallest opening deposit, in the mint's base units and as a
+> decimal string like every amount here, that the sponsor endpoint (§1.11) co-signs an `open` for —
+> the **published** minimum ADR 0074 decision 5 has the sponsor refuse below
+> (`[settlement.solana.batch_settlement] min_sponsored_deposit`). The `toon-channel` entry is unchanged and stays
 > first. The self-description publishes the same facts under `batchSettlements` (ND-11); this is a
 > projection of that value, never a second assembly of it
 > (`connector_domain::x402::batch_settlement_accept`).
@@ -1379,7 +1383,8 @@ against `POST /ilp`. Nothing here calls into claim ingestion, and no per-packet 
 [ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 9. A client
 that holds the mint and no SOL opens an x402 `batch-settlement` channel on `payment-channels` with this
 node as fee payer and `rent_payer`: it builds and signs the `open` from the greeting's `batch-settlement`
-entry (`payTo`, `asset`, `extra.feePayer`, the minimum `withdrawDelay`, §1.4), and posts it here. The
+entry (`payTo`, `asset`, `extra.feePayer`, the minimum `withdrawDelay`, a deposit of at least
+`extra.minDeposit`, §1.4), and posts it here. The
 node co-signs, **submits**, waits for the outcome, and admits the channel it made.
 
 **Public, not an operator write.** The channel does not exist yet, so the call cannot be paid for, and a
@@ -1470,7 +1475,7 @@ channel this node admits.
 | `mint_not_settled`                                                                              | 422    | the mint is not `[settlement.solana] token_address`                                                                                 |
 | `distribution_not_sole_receiver`                                                                | 422    | the distribution is not exactly this node's receiver at 10000 bps                                                                   |
 | `grace_period_below_minimum`                                                                    | 422    | `grace_period` is below `min_grace_period_secs`                                                                                     |
-| `deposit_below_minimum`                                                                         | 422    | the deposit is below `min_sponsored_deposit`, which bounds the rent float (Cantina 3.1.9)                                           |
+| `deposit_below_minimum`                                                                         | 422    | the deposit is below `min_sponsored_deposit`, published as `extra.minDeposit`; it bounds the rent float (Cantina 3.1.9)             |
 | `token_program_unsupported`                                                                     | 422    | the token program is not SPL Token; Token-2022's account extensions can fail a payout                                               |
 | `open_account_mismatch`                                                                         | 422    | an account is not the one the canonical `open` names for that role                                                                  |
 | `unexpected_writable_account`                                                                   | 422    | an account the `open` does not write is writable                                                                                    |

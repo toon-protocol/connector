@@ -352,7 +352,7 @@ pub fn agreed_required_transport<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::x402::X402BatchSettlementEvmTerms;
+    use crate::x402::{X402BatchSettlementEvmTerms, X402BatchSettlementSolanaTerms};
 
     fn evm() -> X402SettlementTerms {
         X402SettlementTerms {
@@ -642,8 +642,16 @@ mod tests {
             name: "USDC".to_string(),
             version: "2".to_string(),
         });
+        let solana_batch = X402BatchSettlementTerms::Solana(X402BatchSettlementSolanaTerms {
+            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
+            asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            pay_to: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
+            fee_payer: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
+            min_grace_period_secs: 86_400,
+            min_deposit: "1000000".to_string(),
+        });
         let opted_in_facts = NodeFacts {
-            batch_settlements: vec![evm_batch.clone()],
+            batch_settlements: vec![evm_batch.clone(), solana_batch],
             ..facts()
         };
         let document = NodeSelfDescription::describe(&opted_in_facts, None, Vec::new(), None);
@@ -659,6 +667,13 @@ mod tests {
                 "withdrawDelay": 86400,
                 "name": "USDC",
                 "version": "2"
+            }, {
+                "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                "withdrawDelay": 86400,
+                "minDeposit": "1000000"
             }])
         );
 

@@ -76,6 +76,10 @@ pub struct SolanaBatchSettlement {
     sponsor: Keypair,
     mint: Pubkey,
     min_grace_period_secs: u64,
+    /// The smallest opening deposit the sponsor co-signs an `open` for:
+    /// bounds only the public sponsor endpoint, and is published beside
+    /// `min_grace_period_secs` (ADR 0074 decision 5).
+    min_sponsored_deposit: u64,
     admitted: Mutex<HashSet<Pubkey>>,
 }
 
@@ -85,7 +89,8 @@ impl SolanaBatchSettlement {
     /// `mint` (`[settlement.solana] token_address`) whose `grace_period` is
     /// at least `min_grace_period_secs`, under the sponsor key
     /// `sponsor_seed` derives (the `[settlement.solana]` key file's 32-byte
-    /// ed25519 seed).
+    /// ed25519 seed), sponsoring an `open` only for a deposit of at least
+    /// `min_sponsored_deposit`.
     ///
     /// Refuses, naming it, a chain on which that id is not an executable
     /// account: a node that would otherwise admit nothing and say nothing.
@@ -94,6 +99,7 @@ impl SolanaBatchSettlement {
         sponsor_seed: &[u8; 32],
         mint: Pubkey,
         min_grace_period_secs: u64,
+        min_sponsored_deposit: u64,
     ) -> Result<Self, BatchSettlementError> {
         let program_id = Pubkey::from_str(wire::PAYMENT_CHANNELS_PROGRAM_ID)
             .expect("PAYMENT_CHANNELS_PROGRAM_ID is a base58 program id");
@@ -123,6 +129,7 @@ impl SolanaBatchSettlement {
             sponsor,
             mint,
             min_grace_period_secs,
+            min_sponsored_deposit,
             admitted: Mutex::new(HashSet::new()),
         })
     }
@@ -153,6 +160,12 @@ impl SolanaBatchSettlement {
     /// The shortest `grace_period` admitted, in seconds.
     pub fn min_grace_period_secs(&self) -> u64 {
         self.min_grace_period_secs
+    }
+
+    /// The smallest opening deposit, in the mint's base units, the sponsor
+    /// co-signs an `open` for, and the `minDeposit` the greeting publishes.
+    pub fn min_sponsored_deposit(&self) -> u64 {
+        self.min_sponsored_deposit
     }
 
     fn admitted(&self) -> MutexGuard<'_, HashSet<Pubkey>> {

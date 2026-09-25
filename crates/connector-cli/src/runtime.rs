@@ -826,6 +826,7 @@ async fn build_solana_batch_settlement(
         &sponsor_seed,
         mint,
         batch.min_grace_period_secs(),
+        batch.min_sponsored_deposit(),
     )
     .await
     .map_err(unusable)?;
@@ -2022,7 +2023,10 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 // own pubkey (decision 5's sponsor-is-the-receiving-operator
                 // rule), and `network` is read off the chain's own genesis
                 // hash (`caip2_network`), never guessed from the RPC URL.
-                if let Some(batch) = solana.batch_settlement() {
+                // The two minimums are the batch backend's own: what it
+                // admits by and what its sponsor co-signs above are what is
+                // published, with no second read of the config.
+                if let Some(batch) = &batch_settlement_solana {
                     batch_settlements.push(
                         connector_client_edge::X402BatchSettlementTerms::Solana(
                             connector_client_edge::X402BatchSettlementSolanaTerms {
@@ -2031,6 +2035,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                                 pay_to: backend.own_pubkey().to_string(),
                                 fee_payer: backend.own_pubkey().to_string(),
                                 min_grace_period_secs: batch.min_grace_period_secs(),
+                                min_deposit: batch.min_sponsored_deposit().to_string(),
                             },
                         ),
                     );
@@ -2853,7 +2858,9 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     // ADR 0074 decision 9, issue #1346: the public Solana sponsor endpoint,
     // on the client edge's listener. Mounted whether or not this node opted
     // in, so a node that has not refuses by name.
-    let app = app.merge(crate::sponsor::router(solana_sponsor(runtime, config)));
+    let app = app.merge(crate::sponsor::router(
+        runtime.batch_settlement_solana.clone(),
+    ));
     Ok(match config.operator() {
         Some(operator) => app.merge(connector_operator::router(
             connector,
@@ -2865,22 +2872,6 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
         )),
         None => app,
     })
-}
-
-/// The Solana sponsor this node runs: its batch-settlement backend and the
-/// `min_sponsored_deposit` that bounds the endpoint, or `None` when
-/// `[settlement.solana.batch_settlement]` is not written.
-fn solana_sponsor(runtime: &Runtime, config: &Config) -> Option<(Arc<SolanaBatchSettlement>, u64)> {
-    let backend = runtime.batch_settlement_solana.clone()?;
-    let min_sponsored_deposit = config
-        .settlements()
-        .iter()
-        .find_map(|settlement| match settlement {
-            SettlementConfig::Solana(solana) => solana.batch_settlement(),
-            SettlementConfig::Evm(_) => None,
-        })?
-        .min_sponsored_deposit();
-    Some((backend, min_sponsored_deposit))
 }
 
 /// What `GET /rates` reads on a dealing node, or `None` on one that deals
@@ -6900,6 +6891,10 @@ min_grace_period_secs = 3600
                  key, both roles"
             );
             assert_eq!(solana_batch.min_grace_period_secs, 3600);
+            assert_eq!(
+                solana_batch.min_deposit, "1000000",
+                "the sponsor's minimum deposit is published (ADR 0074 decision 5)"
+            );
         }
 
         /// Issue #630's review, finding 2: a `[settlement.solana]`
