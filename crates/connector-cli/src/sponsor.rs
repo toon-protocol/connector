@@ -10,19 +10,33 @@
 //! must be able to make it (ADR 0052). It is therefore mounted on the client
 //! edge's listener beside `/ilp/claim-state`, with no RFC 9421 signature
 //! (ADR 0008 governs `[operator] write_keys`, which a buyer does not hold).
-//! What bounds it is what it will sign -- every rule is
-//! [`connector_settlement_solana::batch::sponsor`]'s, and this module decides
-//! none of them -- plus two limits of its own: a body no larger than a
-//! transaction needs, and at most [`CONCURRENT_SPONSORSHIPS`] in flight, so
-//! a flood of well-formed opens cannot queue unbounded simulations against
-//! the settlement RPC endpoint.
+//!
+//! **What bounds it.** What it will sign is
+//! [`connector_settlement_solana::batch::sponsor`]'s to decide, and this
+//! module decides none of it. What this module adds is the rate at which a
+//! stranger can make this node spend:
+//!
+//! - a body no larger than a transaction needs;
+//! - at most [`CONCURRENT_SPONSORSHIPS`] in flight, so a flood of
+//!   well-formed opens cannot queue unbounded simulations against the
+//!   settlement RPC endpoint;
+//! - at most one in flight per payer, so one payer's tokens cannot back
+//!   several simultaneous opens that pass simulation and fail on chain;
+//! - a **failure budget**: once [`FAILURE_BUDGET`] co-signed opens have been
+//!   sent and failed within [`FAILURE_WINDOW`], the endpoint refuses every
+//!   request until the oldest leaves the window. A client can make an `open`
+//!   fail after its simulation passed -- move its tokens away first -- and
+//!   this node pays that transaction's fee. The static rules cap one such
+//!   fee; this caps how many, whoever sends them.
 //!
 //! **Off unless configured.** Always mounted, so that a node without
 //! `[settlement.solana.batch_settlement]` refuses by name
 //! (`batch_settlement_not_offered`) rather than with a bare 404 a client
 //! cannot tell from a wrong URL.
 
-use std::sync::Arc;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
@@ -36,6 +50,7 @@ use connector_settlement_solana::batch::sponsor::{
 use connector_settlement_solana::batch::SolanaBatchSettlement;
 use serde::Deserialize;
 use serde_json::json;
+use solana_sdk::pubkey::Pubkey;
 use tokio::sync::Semaphore;
 
 /// Where the endpoint is served.
@@ -46,6 +61,15 @@ pub const SPONSOR_PATH: &str = "/ilp/batch-settlement/solana/open";
 /// -- so this bounds the RPC work the public surface can cause, not the
 /// rate at which channels open.
 pub const CONCURRENT_SPONSORSHIPS: usize = 8;
+
+/// How many sent-and-failed opens the endpoint absorbs per
+/// [`FAILURE_WINDOW`] before it stops sponsoring. At the sponsor's per-open
+/// fee cap (two signatures and at most 40,000 lamports of priority), about
+/// 400,000 lamports an hour at most.
+pub const FAILURE_BUDGET: usize = 8;
+
+/// The window [`FAILURE_BUDGET`] is counted over.
+pub const FAILURE_WINDOW: Duration = Duration::from_secs(3_600);
 
 /// The largest body read: a transaction's base64 (four bytes per three)
 /// plus room for the JSON around it.
@@ -65,6 +89,69 @@ struct Sponsor {
     backend: Arc<SolanaBatchSettlement>,
     min_sponsored_deposit: u64,
     in_flight: Semaphore,
+    payers: Mutex<HashSet<Pubkey>>,
+    failures: Mutex<FailureBudget>,
+}
+
+/// Sent-and-failed opens within a sliding window.
+#[derive(Debug)]
+struct FailureBudget {
+    limit: usize,
+    window: Duration,
+    failures: VecDeque<Instant>,
+}
+
+impl FailureBudget {
+    fn new(limit: usize, window: Duration) -> FailureBudget {
+        FailureBudget {
+            limit,
+            window,
+            failures: VecDeque::new(),
+        }
+    }
+
+    /// Whether the budget is spent at `now`, forgetting failures older than
+    /// the window first.
+    fn exhausted(&mut self, now: Instant) -> bool {
+        while self
+            .failures
+            .front()
+            .is_some_and(|failed| now.saturating_duration_since(*failed) >= self.window)
+        {
+            self.failures.pop_front();
+        }
+        self.failures.len() >= self.limit
+    }
+
+    fn record(&mut self, now: Instant) {
+        self.failures.push_back(now);
+    }
+}
+
+/// A payer's one in-flight sponsorship, released on drop.
+struct PayerSlot<'a> {
+    payers: &'a Mutex<HashSet<Pubkey>>,
+    payer: Pubkey,
+}
+
+impl<'a> PayerSlot<'a> {
+    /// `None` when `payer` already has a sponsorship in flight.
+    fn take(payers: &'a Mutex<HashSet<Pubkey>>, payer: Pubkey) -> Option<PayerSlot<'a>> {
+        let inserted = payers
+            .lock()
+            .expect("sponsor payer set lock poisoned")
+            .insert(payer);
+        inserted.then_some(PayerSlot { payers, payer })
+    }
+}
+
+impl Drop for PayerSlot<'_> {
+    fn drop(&mut self) {
+        self.payers
+            .lock()
+            .expect("sponsor payer set lock poisoned")
+            .remove(&self.payer);
+    }
 }
 
 /// The endpoint's router. `sponsor` is this node's Solana batch-settlement
@@ -75,6 +162,8 @@ pub fn router(sponsor: Option<(Arc<SolanaBatchSettlement>, u64)>) -> Router {
         backend,
         min_sponsored_deposit,
         in_flight: Semaphore::new(CONCURRENT_SPONSORSHIPS),
+        payers: Mutex::new(HashSet::new()),
+        failures: Mutex::new(FailureBudget::new(FAILURE_BUDGET, FAILURE_WINDOW)),
     }));
     Router::new()
         .route(SPONSOR_PATH, post(sponsor_open))
@@ -102,6 +191,34 @@ async fn sponsor_open(State(sponsor): State<Arc<Option<Sponsor>>>, body: Bytes) 
             )
         }
     };
+    if failure_budget(sponsor).exhausted(Instant::now()) {
+        return refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sponsor_paused",
+            format!(
+                "{FAILURE_BUDGET} sponsored opens were sent and failed within the last {}s; \
+                 sponsorship resumes as they age out",
+                FAILURE_WINDOW.as_secs()
+            ),
+        );
+    }
+    let vetted = match sponsor
+        .backend
+        .vet_sponsored_open(&request.transaction, sponsor.min_sponsored_deposit)
+    {
+        Ok(vetted) => vetted,
+        Err(error) => return refused(error),
+    };
+    let Some(_payer_slot) = PayerSlot::take(&sponsor.payers, vetted.open.payer) else {
+        return refusal(
+            StatusCode::CONFLICT,
+            "payer_open_in_flight",
+            format!(
+                "an open for payer {} is already being sponsored; wait for its answer",
+                vetted.open.payer
+            ),
+        );
+    };
     let Ok(_slot) = sponsor.in_flight.try_acquire() else {
         return refusal(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -109,11 +226,7 @@ async fn sponsor_open(State(sponsor): State<Arc<Option<Sponsor>>>, body: Bytes) 
             format!("{CONCURRENT_SPONSORSHIPS} sponsorships are already in flight; retry shortly"),
         );
     };
-    match sponsor
-        .backend
-        .sponsor_open(&request.transaction, sponsor.min_sponsored_deposit)
-        .await
-    {
+    match sponsor.backend.sponsor_vetted(vetted).await {
         Ok(opened) => {
             tracing::info!(
                 channel = %opened.channel,
@@ -134,10 +247,24 @@ async fn sponsor_open(State(sponsor): State<Arc<Option<Sponsor>>>, body: Bytes) 
                 .into_response()
         }
         Err(error) => {
-            tracing::info!(refusal = error.name(), %error, "refused to sponsor an open");
-            refusal(status_of(&error), error.name(), error.to_string())
+            if error.class() == RefusalClass::Failed {
+                failure_budget(sponsor).record(Instant::now());
+            }
+            refused(error)
         }
     }
+}
+
+fn failure_budget(sponsor: &Sponsor) -> std::sync::MutexGuard<'_, FailureBudget> {
+    sponsor
+        .failures
+        .lock()
+        .expect("sponsor failure budget lock poisoned")
+}
+
+fn refused(error: SponsorRefusal) -> Response {
+    tracing::info!(refusal = error.name(), %error, "refused to sponsor an open");
+    refusal(status_of(&error), error.name(), error.to_string())
 }
 
 /// A refusal's HTTP status: its [`RefusalClass`].
@@ -198,6 +325,41 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn the_failure_budget_refuses_once_spent_and_recovers_as_failures_age_out() {
+        let start = Instant::now();
+        let mut budget = FailureBudget::new(2, Duration::from_secs(60));
+        assert!(!budget.exhausted(start));
+        budget.record(start);
+        assert!(!budget.exhausted(start));
+        budget.record(start + Duration::from_secs(30));
+        assert!(budget.exhausted(start + Duration::from_secs(59)));
+        // The first failure leaves the window; one slot is free again.
+        assert!(!budget.exhausted(start + Duration::from_secs(60)));
+        budget.record(start + Duration::from_secs(61));
+        assert!(budget.exhausted(start + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn a_payer_holds_one_sponsorship_at_a_time() {
+        let payers = Mutex::new(HashSet::new());
+        let payer = Pubkey::new_unique();
+        let slot = PayerSlot::take(&payers, payer).expect("free");
+        assert!(
+            PayerSlot::take(&payers, payer).is_none(),
+            "already in flight"
+        );
+        assert!(
+            PayerSlot::take(&payers, Pubkey::new_unique()).is_some(),
+            "another payer is not held up"
+        );
+        drop(slot);
+        assert!(
+            PayerSlot::take(&payers, payer).is_some(),
+            "released on drop"
+        );
     }
 
     #[test]

@@ -336,7 +336,7 @@ pub struct SponsoredOpen {
 /// Judge `transaction_base64` -- a client's payer-signed `open` -- against
 /// every rule the sponsor can check without the chain. Pure: no I/O, no
 /// clock, no key. `Ok` is not permission to sign on its own: the chain
-/// checks in [`SolanaBatchSettlement::sponsor_open`] still follow.
+/// checks in [`SolanaBatchSettlement::sponsor_vetted`] still follow.
 pub fn vet_open(
     transaction_base64: &str,
     terms: &SponsorTerms,
@@ -827,24 +827,46 @@ impl SolanaBatchSettlement {
         }
     }
 
-    /// Co-sign a client's `open` as fee payer and `rent_payer`, submit it,
-    /// and admit the channel it made. See this module's doc for every rule,
-    /// and for why it submits rather than returning the bytes.
-    ///
-    /// The order is cheapest first, and nothing is signed until every static
-    /// rule and both token accounts pass: [`vet_open`], one read of the two
-    /// token accounts, then the co-signed simulation, then the send.
-    pub async fn sponsor_open(
+    /// [`vet_open`] under this backend's [`sponsor_terms`](Self::sponsor_terms):
+    /// the first, pure half of a sponsorship. Split from
+    /// [`sponsor_vetted`](Self::sponsor_vetted) so the endpoint can hold a
+    /// guard on the payer it names before any chain work starts.
+    pub fn vet_sponsored_open(
         &self,
         transaction_base64: &str,
         min_sponsored_deposit: u64,
+    ) -> Result<VettedOpen, SponsorRefusal> {
+        vet_open(
+            transaction_base64,
+            &self.sponsor_terms(min_sponsored_deposit),
+        )
+    }
+
+    /// Co-sign a [`vet_sponsored_open`](Self::vet_sponsored_open)-ed `open` as fee payer and `rent_payer`,
+    /// submit it, and admit the channel it made. See this module's doc for
+    /// every rule, and for why it submits rather than returning the bytes.
+    ///
+    /// Nothing is signed until both token accounts pass; nothing is sent
+    /// until the co-signed bytes simulate cleanly. Both reads are at
+    /// `processed`, the freshest state there is, so a client that has
+    /// already moved its tokens away is caught here rather than on chain,
+    /// where the failure would cost this node the fee. What a client does
+    /// after the simulation is the endpoint's to bound (its failure budget).
+    ///
+    /// The simulation hands the co-signed bytes to the settlement RPC
+    /// endpoint whether or not they are then sent, so that endpoint could
+    /// land them. It can land only this vetted `open`, which is what the
+    /// node was about to send anyway -- the same trust ADR 0073 already
+    /// places in it.
+    pub async fn sponsor_vetted(
+        &self,
+        vetted: VettedOpen,
     ) -> Result<SponsoredOpen, SponsorRefusal> {
-        let terms = self.sponsor_terms(min_sponsored_deposit);
         let VettedOpen {
             mut transaction,
             open,
             channel,
-        } = vet_open(transaction_base64, &terms)?;
+        } = vetted;
 
         self.vet_token_accounts(&open).await?;
 
@@ -855,7 +877,7 @@ impl SolanaBatchSettlement {
                 RpcSimulateTransactionConfig {
                     sig_verify: true,
                     replace_recent_blockhash: false,
-                    commitment: Some(CommitmentConfig::confirmed()),
+                    commitment: Some(CommitmentConfig::processed()),
                     encoding: Some(UiTransactionEncoding::Base64),
                     ..RpcSimulateTransactionConfig::default()
                 },
@@ -915,7 +937,7 @@ impl SolanaBatchSettlement {
         let addresses = [receiving, payer_account];
         let accounts = retry_read(|| {
             self.rpc
-                .get_multiple_accounts_with_commitment(&addresses, CommitmentConfig::confirmed())
+                .get_multiple_accounts_with_commitment(&addresses, CommitmentConfig::processed())
         })
         .await
         .map_err(|error| SponsorRefusal::ChainUnavailable(error.to_string()))?
@@ -1443,9 +1465,10 @@ mod tests {
         }
     }
 
-    /// A `rent_payer` other than the sponsor puts a third signer on the
-    /// transaction, which the signer rule refuses first; with the sponsor
-    /// named nowhere but `payee`, the field rule names it.
+    /// A `rent_payer` other than the sponsor is refused by name. Marked a
+    /// signer, it is a third signer, which the signer rule refuses first;
+    /// left a non-signer, the transaction's signers are right and the field
+    /// rule names it.
     #[test]
     fn a_rent_payer_other_than_the_sponsor_is_refused() {
         let fixture = Fixture::new();
@@ -1457,12 +1480,10 @@ mod tests {
         let transaction = fixture.v0(&[open.instruction(&fixture.terms.program_id)]);
         assert_eq!(fixture.refusal(&transaction), "unexpected_signers");
 
-        // So the field rule is reached only by an `open` the signer rule
-        // already refused; it is pinned directly.
+        let mut instruction = open.instruction(&fixture.terms.program_id);
+        instruction.accounts[RENT_PAYER].is_signer = false;
         assert_eq!(
-            vet_terms(&open, &fixture.terms)
-                .expect_err("refused")
-                .name(),
+            fixture.refusal(&fixture.v0(&[instruction])),
             "rent_payer_not_sponsor"
         );
     }

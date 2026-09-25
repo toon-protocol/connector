@@ -1385,8 +1385,13 @@ node co-signs, **submits**, waits for the outcome, and admits the channel it mad
 **Public, not an operator write.** The channel does not exist yet, so the call cannot be paid for, and a
 buyer this node has never heard of must be able to make it (ADR 0052). It carries no RFC 9421 signature
 and no identity; [ADR 0008](../adr/0008-operator-surface-splits-read-from-write.md)'s write keys are
-the operator's, not a buyer's. What bounds it is what it will sign, below, and two limits: a body no
-larger than a transaction needs, and at most 8 sponsorships in flight (`sponsor_busy` beyond that).
+the operator's, not a buyer's. What bounds it is what it will sign, below, and the rate at which a
+stranger can make the node spend: a body no larger than a transaction needs; at most 8 sponsorships in
+flight (`sponsor_busy`), and at most one per payer (`payer_open_in_flight`); and a **failure budget** —
+once 8 co-signed opens have been sent and failed within an hour, every request is refused
+(`sponsor_paused`) until the oldest ages out. A client can make its `open` fail after the simulation
+passed, by moving its tokens away first, and the node pays that transaction's fee; the fee caps below
+bound one such fee, and the budget bounds how many.
 
 **Off unless configured.** A node without `[settlement.solana.batch_settlement]` answers `404`
 `batch_settlement_not_offered`.
@@ -1440,7 +1445,8 @@ allows:
 Then, from the chain: this node's receiving account (its ATA for the mint) and the payer's canonical ATA
 exist, are SPL Token accounts of the mint owned by the right key, and are not frozen — an unusable one
 forfeits its payout to the program's treasury (Cantina 3.1.4) — and the payer's holds the deposit. Last,
-the exact co-signed transaction is simulated, and only a clean simulation is sent.
+the exact co-signed transaction is simulated, and only a clean simulation is sent. Both reads are at
+`processed`, the freshest state there is.
 
 **Refusals.** `{"error": "<name>", "detail": "<text>"}`. `400` for a request that is not a
 transaction; `422` for one the node will not sign, with nothing signed or sent; `503` when the chain
@@ -1472,6 +1478,8 @@ channel this node admits.
 | `payer_token_account_unusable`                                                                  | 422    | the payer's canonical ATA is missing, frozen, not the mint's for the payer, or short of the deposit                                 |
 | `simulation_failed`                                                                             | 422    | the co-signed transaction fails simulation: an expired blockhash, an `open_slot` out of the program's window, a channel that exists |
 | `sponsor_busy`                                                                                  | 503    | eight sponsorships are already in flight                                                                                            |
+| `payer_open_in_flight`                                                                          | 409    | this payer already has a sponsorship in flight                                                                                      |
+| `sponsor_paused`                                                                                | 503    | the failure budget is spent                                                                                                         |
 | `chain_unavailable`                                                                             | 503    | the settlement RPC endpoint could not be read                                                                                       |
 | `submission_failed`                                                                             | 502    | sent, and did not land                                                                                                              |
 | `not_admitted`                                                                                  | 502    | landed, and the channel is not one this node admits                                                                                 |
