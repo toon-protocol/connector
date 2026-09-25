@@ -137,7 +137,7 @@ real binary and can only assert that far, because a GitHub runner has no chain t
 reach. `local/` has chains, so serving is an assertion — but its configs necessarily
 name local container URLs, so it can never be the fleet check. There is no longer a
 promotion gate that boots a _candidate_ image against the fleet's configs before a
-deploy — ADR 0068 retired `promote-to-fleet.yml`, since neither devnet box deploys
+deploy — ADR 0068 retired `promote-to-fleet.yml`, since no devnet node deploys
 the connector from this repository any more.
 
 `connector send` is the binary's second verb (serving is the other; `announce` was removed by
@@ -233,10 +233,10 @@ keypair and has no mainnet-shaped mode. In tests, funding is
 `test_support::fund()`, a plain `request_airdrop`.
 
 **Devnet** settles on _public_ chains — Base Sepolia and Solana devnet — and is
-funded by the faucet box (`infra/linode-faucet/`), not by any of the above. The
+funded by the faucet (`infra/linode-faucet/`), not by any of the above. The
 faucet **mints** on both legs rather than paying out of a balance: Base Sepolia's
 mock USDC has an ungated `mint()`, and on Solana the faucet's own keypair is the
-mint authority of a mint that box created for itself
+mint authority of a mint it created for itself
 (`infra/linode-faucet/create-devnet-usdc-mint.sh`). So neither leg can run dry, and
 there is no separate deployer key to lose — which is what happened to the mint used
 before 2026-08, killing that leg with no repair path. The faucet is a separate
@@ -261,11 +261,11 @@ not a refactor.
 
 ## Environments
 
-| Tier           | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **local**      | `docker-compose.yml` chain profiles, and the connector image run against them — that is `local/`. Disposable, funded from genesis, no shared state.                                                                                                                                                                                                                                                                                                                     |
-| **devnet**     | Two Linode boxes — relay and store (`ario`) — plus a connector-less faucet box. The relay and store boxes deploy the connector from their OWN repos' `deploy/` bundles (`toon-protocol/relay`, `toon-protocol/store`), each pinning it by release handle in one place (ADR 0068). `infra/linode-relay/` and `infra/linode-store/` are fixtures this repo's tests boot, not what either box runs. The faucet box still deploys from `infra/linode-faucet/` in this repo. |
-| **production** | The **fleet's** production tier is **named and empty** (ADR 0056): no fleet machine, no fleet key, no deploy. Its one artefact is `deploy/connector-rust/connector.production.toml`, a skeleton in which every value is invalid on purpose. Mainnet contracts exist (see "Where money comes from"), but they are run by a third-party operator, not by this tier.                                                                                                       |
+| Tier           | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **local**      | `docker-compose.yml` chain profiles, and the connector image run against them — that is `local/`. Disposable, funded from genesis, no shared state.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **devnet**     | One host — the Linode labelled `relay` (infra ADR 0001) — behind one Caddy edge. It runs the relay, store (`ario`), gas-station and workload-gateway nodes, plus a connector-less faucet. Each of the four connector nodes deploys from its OWN repo's `deploy/` bundle (`toon-protocol/relay`, `toon-protocol/store`, `toon-protocol/gas-station`, `toon-protocol/gateway`), pinning the connector it runs by release handle in one place (ADR 0068), applied by that node's own `toon-auto-apply-<node>.timer` on the host. `infra/linode-relay/` and `infra/linode-store/` are fixtures this repo's tests boot, not what either node runs. The faucet still deploys from `infra/linode-faucet/` in this repo, by hand, through `fleet-ops.yml`. |
+| **production** | The **fleet's** production tier is **named and empty** (ADR 0056): no fleet machine, no fleet key, no deploy. Its one artefact is `deploy/connector-rust/connector.production.toml`, a skeleton in which every value is invalid on purpose. Mainnet contracts exist (see "Where money comes from"), but they are run by a third-party operator, not by this tier.                                                                                                                                                                                                                                                                                                                                                                                  |
 
 ADR 0056 was written when no mainnet contract existed and says it is superseded, not
 amended, the moment one is; the mainnet deployments above made its "no mainnet
@@ -278,14 +278,15 @@ the devnet table: ADR 0053 binds the settlement program into a claim's signed me
 and the mainnet program id (`8e7Bhzyd…`) is unrelated to the devnet one, so a mainnet
 node naming the devnet program takes money for claims it can never redeem.
 
-**Nothing in this repository moves a tag onto the relay or store box (ADR 0068).**
+**Nothing in this repository moves a tag onto any devnet node (ADR 0068).**
 `:rust-release` used to be a promotion tag, moved only by an explicit
-`promote-to-fleet.yml` dispatch after checking the candidate image still booted both
-boxes' committed configs. That mechanism is retired: neither box deploys the
+`promote-to-fleet.yml` dispatch after checking the candidate image still booted the
+fleet's committed configs. That mechanism is retired: no node deploys the
 connector from this repository any more, so there is nothing here left to gate. A
-node repository (`toon-protocol/relay`, `toon-protocol/store`) now pins the connector
-image it runs, by release handle, in exactly one place in its own `deploy/` bundle —
-bumping that pin is that repo's own reviewed change, not a step in this one.
+node repository (`toon-protocol/relay`, `toon-protocol/store`, `toon-protocol/gas-station`,
+`toon-protocol/gateway`) now pins the connector image it runs, by release handle, in
+exactly one place in its own `deploy/` bundle — bumping that pin is that repo's own
+reviewed change, not a step in this one.
 `:rust-release` itself is frozen at whatever digest it last held; do not wire
 anything here to move it — a floating tag moving on green `main` shipped once (#990)
 and was reverted, and there is even less reason to repeat it now that nothing

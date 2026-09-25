@@ -1,37 +1,32 @@
-# Fleet health — the post-redeploy check Watchtower does not do (toon-meta#403).
+# Fleet health — the after-deploy check a node's own apply does not make.
 #
 # ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
-# Every TOON-owned container on both devnet boxes now follows a moving image
-# tag and is recreated by a label-scoped Watchtower within ~60s of that tag
-# moving (infra/linode-relay/docker-compose.relay.watchtower.yml). Watchtower
-# does no health gating whatsoever: it pulls, recreates, and reports success
-# the moment the container is created. Whether the process inside then stayed
-# up, or served anything, is not a question it asks.
+# The devnet is ONE host (infra ADR 0001): the Linode labelled `relay`, a
+# 1 GB nanode, running the relay, store, gas-station and workload-gateway
+# nodes, the faucet, and the edge — one Caddy that terminates TLS for every
+# public hostname. Each node deploys by GitOps (connector ADR 0068): a
+# `toon-auto-apply-<node>.timer` on the host fast-forwards that node's own
+# repository every five minutes, applies its `deploy/` bundle, waits for its
+# connector to go `healthy`, and only then records the commit in
+# `deploy/.applied`. The edge deploys the same way from toon-protocol/infra.
+# The faucet is deployed by hand and has no timer.
 #
-# toon-meta#403 recorded that gap in its own follow-up list and never filed it:
+# That apply gate is real, and it is also all there is. It asks about ONE
+# container, ONCE, at deploy time. Nothing it does notices:
 #
-#   "(recommended) an optional post-redeploy smoke test per box (Watchtower
-#    does no health-gating; a bad image auto-deploys and the container just
-#    crash-loops — a lifecycle hook or external check should alert)."
-#
-# It has since been paid for twice:
-#
-#   * 2026-08-16, swap#134 added a REQUIRED `chainProviders[].tokenNetworkAddress`
-#     to the maker's config schema. It merged green, `swap:release` moved,
-#     Watchtower recreated `swap-node`, and the maker crash-looped on
-#     `[INVALID_CONFIG] chainProviders[0].tokenNetworkAddress MUST be a
-#     non-empty string` — because the box's bind-mounted `swap.config.json`
-#     is not part of the image and nothing had added the key. The maker was
-#     down until a human noticed and hand-edited the file. Nothing alerted.
-#   * connector#993 / connector#972: a recreate changes a container's Docker
-#     network IP, and a long-lived nginx that resolved the OLD one at config-load
-#     answers `502 connect() failed (111: Connection refused)` while the
-#     container itself is perfectly `Up`. "The container being `Up` is not
-#     sufficient evidence" is connector#972's own wording, learned the same way.
-#
-# Those are two DIFFERENT failure shapes and this workflow checks for both:
-# a container that is restarting, and a container that is running but whose
-# door is shut. Neither is visible from `docker ps` alone.
+#   * a container that went down AFTER the apply — a crash-loop presents as
+#     `Up 3 seconds` on any single look, and the apply has long since exited;
+#   * a container that is `Up` but whose door is shut — connector#972's own
+#     wording, "the container being `Up` is not sufficient evidence";
+#   * an apply that keeps FAILING. The timer retries on every tick and
+#     reports it to a journal nobody reads, while the node sits on the last
+#     commit that did apply. A merge that never reaches the host looks, from
+#     GitHub, exactly like a merge that did;
+#   * the edge in front of a healthy node answering 502, or with a bad
+#     certificate — loopback reaches the container directly and never sees it;
+#   * the host itself running out of memory or disk. Every node on it now
+#     shares 961 MB and one root filesystem, so one node's leak takes the
+#     others down with it (ADR 0001, "Consequences").
 #
 # ── WHAT REACHES A HUMAN ────────────────────────────────────────────────────
 # Detection nobody sees is worth nothing, so the alert is an ISSUE, not a red
@@ -39,8 +34,8 @@
 #
 #   * On failure this opens (or updates) a single rolling GitHub issue in this
 #     repo titled `[fleet-health] devnet fleet is unhealthy`, labelled
-#     `needs:human` + `bug`, carrying the full probe table and the exact
-#     rollback command. `needs:human` is the org's existing human-queue label
+#     `needs:human` + `bug`, carrying the full probe table and how to roll
+#     back. `needs:human` is the org's existing human-queue label
 #     (toon-meta#347), so the alert lands in a queue that is already swept
 #     rather than inventing a channel of its own. Opening an issue also emails
 #     everyone watching the repo, which a failed scheduled run does not do
@@ -54,81 +49,72 @@
 #     still failing", which is information; the body carries how long it has
 #     been that way and over how many runs.
 #   * A subsequent green run COMMENTS the recovery on that issue and CLOSES
-#     it, so the issue's open/closed state is the fleet's current verdict and
+#     it, so the issue's open/closed state is the devnet's current verdict and
 #     a human never has to work out whether an old alert is still live.
 #   * The job itself also fails, so a scheduled or dispatched run that finds
-#     the fleet down is visibly red, not a silent probe nobody reads.
+#     the devnet down is visibly red, not a silent probe nobody reads.
 #
-# ── HOW IT REACHES THE BOXES ────────────────────────────────────────────────
+# ── HOW IT REACHES THE HOST ─────────────────────────────────────────────────
 # Same model as fleet-ops.yml and funded-ops.yml, and for the same reason: an
-# SSH key with root on the devnet boxes reaches a GitHub-hosted runner
-# executing THIS reviewed, committed file, and never an agent sandbox. The box
-# IP is resolved from its Linode label per run, never hardcoded. This workflow
-# is strictly READ-ONLY on the box — it runs `docker inspect`, `docker logs`
-# and `curl` against loopback, and nothing else. There is no `apply` input
-# because there is nothing here to apply.
+# SSH key with root on the host reaches a GitHub-hosted runner executing THIS
+# reviewed, committed file, and never an agent sandbox. The host's IP is
+# resolved from its Linode label (`relay`) per run, never hardcoded.
+#
+# This workflow is strictly READ-ONLY on the host. The on-host script runs
+# `docker ps`/`inspect`/`compose port`, `systemctl show`/`is-active`/
+# `list-unit-files`, `journalctl` (read), `git rev-parse`/`log -g`, `cat`,
+# `df`, and `curl` against loopback — and nothing else. It never fetches (it
+# reads what the timer last fetched), never starts, stops or recreates
+# anything, and writes no file, not even to /tmp. There is no `apply` input
+# because there is nothing here to apply; a node applies itself.
 #
 # ── WHAT IT PROBES, AND WHY THAT SET ────────────────────────────────────────
-# The watched set is not a hardcoded service list. It is discovered on the box
-# as "every container carrying the Watchtower enable label" — precisely the
-# set of containers that can change underneath us without a human, which is
-# precisely the set at risk. A labelled service with no probe defined in
-# `PROBES` below is a FAILURE, not a skip: opting a new service into
-# auto-redeploy without saying how to tell whether it is serving is the
+# The watched set is not a hardcoded service list. It is DISCOVERED on the
+# host as every compose project a `toon-auto-apply-*.timer` that is enabled
+# there deploys — the timer's service names the node's `deploy/auto-apply.sh`,
+# and the containers whose `com.docker.compose.project.working_dir` is that
+# directory are the node — plus `linode-faucet`, named explicitly because it
+# is hand-deployed and has no timer to discover it by. That is precisely the
+# set of containers that can change underneath us without a human, plus the
+# one that cannot change without one.
+#
+# Every container in that set needs a serving probe in the `case` below. A
+# container with NO PROBE DEFINED is a FAILURE, not a skip: adding a service
+# to a node's bundle without saying how to tell whether it is serving is the
 # omission this file exists to refuse.
 #
-# Today that discovers five containers: `connector`, `relay` and
-# `swap-node` on the relay box, `connector` and `store` on the store box.
-# (Both boxes' connector service dropped its `-rust` suffix when each moved to
-# its own repo's deploy bundle; the probe matches either name.)
-# It was seven until issue #1074: each box also ran an `announce` loop
-# publisher, and ADR 0046 removed the announce outright.
+# Today that discovers ten containers: `connector` in each of the four node
+# projects, `relay`, `store`, `gas-station`, `gateway`, the edge's `caddy`,
+# and the faucet.
 #
 # Two probe layers, because each catches what the other cannot:
 #
-#   1. ON-BOX. Container state (running, not restarting) sampled TWICE with a
-#      gap, so a crash-loop — which presents as `Up 3 seconds` on any single
-#      look — is caught by a rising `RestartCount`. Then a real serving probe
-#      per service: an HTTP request the process can only answer once it has
-#      booted, read its keys and bound its socket.
-#   2. FROM THE RUNNER, over the public internet. This is the layer that
-#      catches connector#993's stale-nginx-upstream 502: on-box loopback
-#      reaches the container directly and looks perfect while the public edge
-#      in front of it is broken. Only an off-box request crosses nginx.
-#
-# ── PROBE CHOICES (measured live 2026-08-16, both boxes) ────────────────────
-#   * `connector` — `GET /ilp/identity` → 200, at whichever address that box
-#     actually exposes it on. The Rust connector has NO
-#     `/health`: `/health`, `/healthz`, `/status` and `/` all 404, and
-#     `/metrics` is 404 on the relay but 401 on the store, so neither is a
-#     uniform probe. `/ilp/identity` 200s only once the process is serving AND
-#     has read its signer key file, which is why fleet-ops.yml's own post-write
-#     gate already uses exactly it.
-#   * `swap-node` — `GET :8080/health` → 200 (`blsPort`). Loopback-published,
-#     so this is on-box only; there is no public swap health surface.
-#   * `relay` / `store` — these two DEFINE a container HEALTHCHECK, so Docker's
-#     own verdict is read instead of duplicating their probe here. The other
-#     two (`connector-rust`, `swap-node`) define none, which is why they need
-#     explicit probes.
-#   * Public edges — `proxy.relay…/ilp/identity` and `proxy.ario…/ilp/identity`
-#     expect 200; `relay-ws…/` expects **426 Upgrade Required**, which is the
-#     honest liveness signal for a WebSocket-only endpoint (a 200 there would
-#     mean something other than the relay is answering).
-#
-# `dvm.devnet.toonprotocol.dev` (the store app's public name) is deliberately
-# NOT probed: it is currently unreachable for an unrelated reason — the box
-# serves a certificate whose only SAN is `proxy.ario.devnet.toonprotocol.dev`,
-# so every request fails hostname verification. Adding it would make this
-# workflow alert forever on a pre-existing cert gap rather than on a deploy.
-#
-# ADD IT HERE once — and only once — the certificate is fixed on the box.
-# docs/operators/fleet-release-and-health.md, "The store box's `dvm.` name has
-# no certificate", is the runbook (issue #1004): it establishes that the name is
-# NOT vestigial (nginx already routes it to the store app's health server and
-# `curl -k …/health` answers today), so the fix is a `certonly --expand` on the
-# existing lineage, not a hostname retirement. The probe to add is
-# `https://dvm.devnet.toonprotocol.dev/health` expecting 200; delete this whole
-# comment block at the same time.
+#   1. ON THE HOST, per container: state (running, not restarting) sampled
+#      TWICE at least 15s apart, so a crash-loop is caught by a rising
+#      `RestartCount`; Docker's own healthcheck wherever one is defined; and
+#      for each connector a real `GET /ilp/identity` on the loopback port
+#      `docker compose port` reports for it. The Rust connector has NO
+#      `/health` (`/health`, `/healthz`, `/status` and `/` all 404);
+#      `/ilp/identity` 200s only once the process is serving AND has read its
+#      signer key file.
+#      Per auto-apply node: the timer is active and fired recently, the last
+#      apply exited `success`, and the node is not stuck behind `main` — see
+#      "THE STALENESS RULE" on the probe job.
+#      Per host: MemAvailable and root-disk headroom.
+#   2. FROM THE RUNNER, over the public internet, one request per public
+#      hostname. This is the only layer that crosses the edge: a Caddy that
+#      cannot reach its upstream, or serves a certificate that does not cover
+#      the name, looks perfect from loopback. Every hostname has an EXPECTED
+#      answer, not just "not 5xx":
+#        - `proxy.{relay,ario,gas,gateway}.devnet…/ilp/identity` → 200
+#        - `relay-ws.devnet…/` → **426 Upgrade Required**, the honest liveness
+#          signal for a WebSocket-only endpoint (a 200 there would mean
+#          something other than the relay is answering)
+#        - `dvm.devnet…/health`, `gas.devnet…/health`, `faucet.devnet…/health`
+#          → 200 (each is the app behind the node, not its connector)
+#        - `gw.devnet…/` and a fresh random `<label>.gw.devnet…/` → **503**
+#          with `toon-gateway-reason: no_grant`: the gateway answered and
+#          dialled nobody, which is its healthy, empty state.
 #
 # ── WHAT THE PROBES ABOVE CANNOT SEE: A FORWARDED ROUTE ─────────────────────
 # Everything above asks whether a node is up and answering for ITSELF. Nothing
@@ -137,22 +123,23 @@
 # for their whole duration:
 #
 #   * **10:26Z, `T01 peer unreachable`** on `g.toon.relay.store` and
-#     `g.toon.relay.gas`, from a connector restart on the relay box. Every
+#     `g.toon.relay.gas`, from a connector restart on the relay node. Every
 #     container was `running`, every `GET /ilp/identity` was 200, every public
 #     edge answered. Found at 17:20Z, by a human sending a job by hand.
 #   * **01:27Z, `T00 … would not report the claim state of channel FDi2TCT9…`**
 #     on `g.toon.store.relay`, from an SPL mint cutover. On Solana the channel
 #     PDA is seeded with the mint (`["channel", min(p1,p2), max(p1,p2), mint]`),
-#     so changing the mint on one box moves every channel id it shares — and
+#     so changing the mint on one node moves every channel id it shares — and
 #     the far side is then asked about a channel it has never heard of. Found
 #     at 13:45Z, the same way.
 #
-# Both are one hop away from anything this file used to look at, and both are
-# obvious within seconds of asking the right question. Two jobs ask it, and
-# they are deliberately NOT the same question:
+# Co-locating the nodes did not remove this class: a hop between two nodes on
+# the same host is still a real hop — two connectors, two keys, one payment
+# channel (ADR 0001). Two jobs ask about it, and they are deliberately NOT the
+# same question:
 #
 #   `peering-crosscheck` — FREE, and on every run. It reads nothing but each
-#     node's public `GET /ilp` self-description (ADR 0050) and holds the three
+#     node's public `GET /ilp` self-description (ADR 0050) and holds the
 #     documents to each other: does every forwarded prefix land on a node that
 #     actually routes it, at a price the forward covers, over a peering whose
 #     two sides still derive channel ids from the SAME settlement facts. That
@@ -175,26 +162,21 @@ name: fleet-health
 
 on:
   schedule:
-    # Every 15 minutes. Watchtower's own poll is 60s, so this is not a race to
-    # beat a bad deploy — nothing here can prevent one. It bounds how long a
-    # dead service stays unnoticed, which is the thing that actually hurt: the
-    # swap#134 crash-loop was found by a human happening to look.
+    # Every 15 minutes. A node's timer applies a merge within one 5-minute
+    # tick, so this is not a race to beat a bad deploy — nothing here can
+    # prevent one. It bounds how long a dead service stays unnoticed, which is
+    # the thing that actually hurts: the swap#134 crash-loop was found by a
+    # human happening to look.
     - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
-      box:
-        description: 'Which box to probe.'
-        type: choice
-        required: false
-        default: all
-        options: [all, relay, ario]
       settle_seconds:
-        description: 'Seconds to wait before probing (let a just-recreated container land).'
+        description: 'Seconds to wait before probing (let a just-merged commit reach the host: one 5-minute timer tick plus the apply).'
         type: string
         required: false
         default: '0'
       paid_probe:
-        description: 'Cross a paid forwarded route. `send` SPENDS (~2000 base units, ~$0.002) from the relay box own peer channels.'
+        description: 'Cross a paid forwarded route. `send` SPENDS (~2000 base units, ~$0.002) from the relay node own peer channels.'
         type: choice
         required: false
         default: 'off'
@@ -216,11 +198,16 @@ jobs:
   # Does the image the fleet is ABOUT to run (or already runs) still accept
   # the config the fleet actually has?
   #
-  # This is the swap#134 check, and it needs no box and no credential: the
+  # This is the swap#134 check, and it needs no host and no credential: the
   # maker's config is committed here (infra/linode-relay/swap.config.json is
-  # the file bind-mounted at /app/config/swap.config.json), and the image is
-  # public. Booting one against the other reproduces exactly what Watchtower
-  # will do, minutes before or after it does it.
+  # the file the maker bind-mounted at /app/config/swap.config.json), and the
+  # image is public.
+  #
+  # NOTE: no swap maker runs on the one-host devnet (infra ADR 0001 left it
+  # off the host), so today this guards a config nothing deploys. It stays
+  # because crates/connector-bin/tests/fleet_release_gate.rs pins it, and
+  # retiring it is that test's change as much as this file's — a follow-up,
+  # not a side effect of rewriting the host probes.
   #
   # It runs on this cron rather than only in CI on purpose. A connector PR is
   # not what breaks this: swap merging a new REQUIRED config key is, and that
@@ -232,7 +219,7 @@ jobs:
   # lands here instead.
   # ─────────────────────────────────────────────────────────────────────────
   config-compat:
-    name: Committed box config still boots the release image
+    name: Committed maker config still boots the release image
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -263,14 +250,14 @@ jobs:
           # hence the timeout. Surviving the timeout IS the pass condition;
           # we are asking "was this config refused", not "does this node work".
           #
-          # ── The config file alone is NOT what the box runs ────────────────
+          # ── The config file alone is NOT what the maker ran ───────────────
           # Caught by this gate on its own first run (connector#1000): booting
           # the file by itself fails `[INVALID_CONFIG] SwapNodeConfig: one of
-          # mnemonic or secretKey is required`, and the box does not, because
+          # mnemonic or secretKey is required`, and the maker did not, because
           # ./infra/linode-relay/docker-compose.relay.swap.yml supplies
           # `SWAP_AUTOGEN_IDENTITY=1` -- the maker then self-generates a
           # BIP-39 mnemonic on first boot and persists it to its state volume
-          # (swap#127). The file is only half of the box's configuration; the
+          # (swap#127). The file is only half of the maker's configuration; the
           # overlay's `environment:` and its writable `statePath` volume are
           # the other half.
           #
@@ -279,7 +266,7 @@ jobs:
           # crates/connector-bin/tests/fleet_release_gate.rs asserts the
           # overlay still declares exactly this environment -- so adding a
           # variable there without adding it here is a build failure rather
-          # than a gate that quietly validates something the box never runs.
+          # than a gate that quietly validates something the maker never ran.
           #
           # NOT mirrored: the overlay's `working_dir: /app/state`. It pairs with
           # an entrypoint override naming an ABSOLUTE `/app/dist/cli.js`, and
@@ -322,7 +309,7 @@ jobs:
             echo "verdict=incompatible" >> "$GITHUB_OUTPUT"
             echo "detail=$REASON" >> "$GITHUB_OUTPUT"
             echo "::error::$IMAGE REFUSES the committed $CONFIG — $REASON"
-            echo "::error::The relay box's swap-node will crash-loop on its next Watchtower recreate."
+            echo "::error::A swap-node deployed from this config would crash-loop on boot."
             exit 1
           fi
 
@@ -338,10 +325,11 @@ jobs:
   # token, no Linode token, no packet, no money — and holds the three
   # documents to each other.
   #
-  # It covers the GAS box, which no other job here touches: the box probes are
-  # a matrix over `relay` and `ario` only, and the gas node has been invisible
-  # to fleet-health since it moved to its own repo. Every check below applies
-  # to it for free, because a self-description is a self-description.
+  # The three are the relay, store and gas-station nodes: the ones that
+  # forward to one another. They share one host now, and that changes
+  # nothing here — a hop between two nodes on the same host is still two
+  # connectors, two keys and one payment channel (infra ADR 0001). The
+  # workload gateway's node forwards nothing, so it has no row to agree on.
   #
   # WHAT IT CANNOT DO, stated here so nobody reads a green tick as more than
   # it is: it proves the two sides AGREE. It does not prove a packet gets
@@ -406,86 +394,95 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+
   # ─────────────────────────────────────────────────────────────────────────
-  # The box probes.
+  # The host probes.
+  #
+  # ── THE STALENESS RULE ──────────────────────────────────────────────────
+  # "Is this node running what was merged?" is `deploy/.applied` (the commit
+  # the last apply VERIFIED) against `origin/main` in that checkout — read as
+  # the timer last fetched it, because fetching would be a write. Equal is
+  # green. Unequal is not immediately red, because every merge passes through
+  # a window where it is true: the timer fetches, THEN applies, and only
+  # writes `.applied` once the connector is healthy.
+  #
+  # So the clock that matters is how long `origin/main` has pointed at the
+  # commit the node has not applied — which is the reflog time of that
+  # remote-tracking ref (`git log -g -1 --date=unix`), the moment THIS
+  # checkout learned of it. Not `.applied`'s own age: `.applied` is only
+  # rewritten on a successful apply, so on a healthy, quiet node it is
+  # arbitrarily old, and on a stuck one it measures time since the last
+  # success rather than how long the new commit has been waiting.
+  #
+  # The grace is 20 minutes: one tick to fetch plus three more to apply or
+  # retry, which covers the slowest bundle's apply (the gateway builds, with
+  # a 30-minute systemd timeout, so an apply still running is also green).
+  # Past that the node is BEHIND. `.applied`'s own age is the fallback only
+  # where the reflog is missing.
+  #
+  # A failing apply does not wait for the grace at all: the service's last
+  # `Result` goes non-`success` on the first failed tick, and that row fails
+  # on its own, quoting the apply's own FAILED/REFUSING line from the journal.
+  # And a timer that stopped firing — which would freeze `origin/main` too and
+  # make the equality meaningless — fails the "fired recently" row.
   # ─────────────────────────────────────────────────────────────────────────
   probe:
-    name: Probe ${{ matrix.box }}
+    name: Probe the devnet host
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    strategy:
-      # Never fail-fast: if the relay is down we still want the store's
-      # verdict in the same alert, not a cancelled job and half a picture.
-      fail-fast: false
-      matrix:
-        box: [relay, ario]
     env:
-      BOX: ${{ matrix.box }}
+      # The devnet's one host (infra ADR 0001). Resolved to an IP per run.
+      HOST_LABEL: relay
       LINODE_API: https://api.linode.com/v4
     steps:
-      - name: Skip boxes this run did not ask for
-        id: scope
-        run: |
-          set -euo pipefail
-          WANT="${{ inputs.box || 'all' }}"
-          if [ "$WANT" != "all" ] && [ "$WANT" != "$BOX" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Not this run's box (asked for '$WANT')."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Settle
-        if: steps.scope.outputs.skip == 'false' && inputs.settle_seconds != '' && inputs.settle_seconds != '0'
+        if: inputs.settle_seconds != '' && inputs.settle_seconds != '0'
         run: |
           set -euo pipefail
-          # Give Watchtower its 60s poll plus a pull and a boot before asking
-          # whether the new image came up.
-          echo "Waiting ${{ inputs.settle_seconds }}s for the fleet to settle…"
+          # Give the node's timer its 5-minute tick plus an apply before
+          # asking whether the merge came up.
+          echo "Waiting ${{ inputs.settle_seconds }}s for the host to settle…"
           sleep "${{ inputs.settle_seconds }}"
 
       - name: Preconditions
-        if: steps.scope.outputs.skip == 'false'
         env:
           DEVNET_SSH_KEY: ${{ secrets.DEVNET_SSH_KEY }}
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
         run: |
           set -euo pipefail
           fail=0
-          [ -n "${DEVNET_SSH_KEY:-}" ] || { echo "::error::DEVNET_SSH_KEY is not set — cannot reach a box (see fleet-ops.yml)."; fail=1; }
-          [ -n "${LINODE_CLI_TOKEN:-}" ] || { echo "::error::LINODE_CLI_TOKEN is not set — cannot resolve a box label to an IP."; fail=1; }
+          [ -n "${DEVNET_SSH_KEY:-}" ] || { echo "::error::DEVNET_SSH_KEY is not set — cannot reach the host (see fleet-ops.yml)."; fail=1; }
+          [ -n "${LINODE_CLI_TOKEN:-}" ] || { echo "::error::LINODE_CLI_TOKEN is not set — cannot resolve the host's label to an IP."; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
 
-      - name: Resolve box IP from its Linode label
-        if: steps.scope.outputs.skip == 'false'
-        id: box
+      - name: Resolve the host IP from its Linode label
+        id: host
         env:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
         run: |
           set -euo pipefail
           ip=$(curl -sf -H "Authorization: Bearer $LINODE_CLI_TOKEN" \
                  "$LINODE_API/linode/instances" \
-               | jq -r --arg l "$BOX" '.data[] | select(.label==$l) | .ipv4[0]' | head -1)
+               | jq -r --arg l "$HOST_LABEL" '.data[] | select(.label==$l) | .ipv4[0]' | head -1)
           if [ -z "$ip" ] || [ "$ip" = "null" ]; then
-            echo "::error::No Linode labelled '$BOX'."
+            echo "::error::No Linode labelled '$HOST_LABEL'."
             exit 1
           fi
           echo "ip=$ip" >> "$GITHUB_OUTPUT"
 
       - name: Install SSH key
-        if: steps.scope.outputs.skip == 'false'
         env:
           DEVNET_SSH_KEY: ${{ secrets.DEVNET_SSH_KEY }}
-          BOX_IP: ${{ steps.box.outputs.ip }}
+          HOST_IP: ${{ steps.host.outputs.ip }}
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$DEVNET_SSH_KEY" > ~/.ssh/devnet
           chmod 600 ~/.ssh/devnet
           {
-            echo "Host devnet-box"
-            echo "  HostName $BOX_IP"
+            echo "Host devnet-host"
+            echo "  HostName $HOST_IP"
             echo "  User root"
             echo "  IdentityFile ~/.ssh/devnet"
             echo "  IdentitiesOnly yes"
@@ -495,180 +492,338 @@ jobs:
           } > ~/.ssh/config
           chmod 600 ~/.ssh/config
 
-      - name: Probe
-        if: steps.scope.outputs.skip == 'false'
-        id: probe
-        env:
-          BOX_IP: ${{ steps.box.outputs.ip }}
+      - name: Probe on the host (read-only)
         run: |
           set -uo pipefail
-          sshbox() { ssh -F ~/.ssh/config -o LogLevel=ERROR devnet-box "$@"; }
+          sshhost() { ssh -F ~/.ssh/config -o LogLevel=ERROR devnet-host "$@"; }
 
-          # ── On-box probe ────────────────────────────────────────────────
+          # ── On-host probe ───────────────────────────────────────────────
           # One script, one connection, two samples. Emits TSV:
-          #   <OK|FAIL>\t<service>\t<check>\t<detail>
+          #   <OK|FAIL>\t<subject>\t<check>\t<detail>
           # so the reporting below needs no parsing cleverness and a new probe
-          # is one `case` arm.
+          # is one `case` arm. The CHECK column must not vary from run to run
+          # (no ages, counts or ports that move) — the alert's change-detection
+          # signature is built from subject/check, and a moving value there
+          # would make every run a "change". Moving values go in DETAIL.
+          #
+          # The FH_* knobs exist only so a test harness can drive every FAIL
+          # branch against a fabricated host; this workflow never sets them.
           REMOTE=$(cat <<'REMOTE_SCRIPT'
           set -u
-          LABEL=com.centurylinklabs.watchtower.enable
+          export LC_ALL=C
+          APPLY_GRACE=${FH_APPLY_GRACE:-1200}     # 20 min; see THE STALENESS RULE
+          TIMER_MAX_AGE=${FH_TIMER_MAX_AGE:-900}  # the timer fires every 300s
+          MEM_MIN_KB=${FH_MEM_MIN_KB:-102400}     # 100 MB of a 961 MB nanode
+          DISK_MAX_PCT=${FH_DISK_MAX_PCT:-90}
+          SAMPLE_GAP=${FH_SAMPLE_GAP:-15}
+          MEMINFO=${FH_MEMINFO:-/proc/meminfo}
+          # Compose projects watched although no timer deploys them.
+          HAND_DEPLOYED=${FH_HAND_DEPLOYED:-linode-faucet}
+          STARTED=$(date +%s)
 
-          names=$(docker ps -a --filter "label=${LABEL}=true" --format '{{.Names}}')
-          if [ -z "$names" ]; then
-            printf 'FAIL\t(fleet)\twatchtower-labelled containers\tnone found — either Watchtower manages nothing here or docker is unreachable\n'
-            exit 0
-          fi
+          row() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(printf '%s' "$4" | tr '\t\r\n|' '   /')"; }
+          ago() {
+            if [ "$1" -lt 120 ]; then echo "${1}s"
+            elif [ "$1" -lt 7200 ]; then echo "$(( $1 / 60 ))m"
+            else echo "$(( $1 / 3600 ))h"; fi
+          }
 
-          # First sample of the restart counters, then the serving probes,
-          # then a second sample. The probes themselves take long enough that
-          # no extra sleep is needed to give a crash-loop time to show.
-          for n in $names; do
-            printf '%s %s\n' "$n" "$(docker inspect -f '{{.RestartCount}}' "$n" 2>/dev/null || echo -1)"
-          done > /tmp/fleet-health-sample1
+          # ── Discover the watched set ──────────────────────────────────────
+          # Every enabled `toon-auto-apply-<node>.timer`: its service's
+          # ExecStart is `<repo>/<...>/deploy/auto-apply.sh`, and that
+          # directory is both where `.applied` lives and the compose working
+          # dir of every container the node runs.
+          timers=$(systemctl list-unit-files 'toon-auto-apply-*.timer' --state=enabled --no-legend --plain 2>/dev/null | awk '{print $1}')
+          [ -n "$timers" ] || row FAIL '(host)' 'auto-apply timers' 'no enabled toon-auto-apply-*.timer: either no node deploys by GitOps here, or systemd is unreachable'
 
-          for n in $names; do
-            svc=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$n" 2>/dev/null)
-            [ -n "$svc" ] || svc="$n"
-            status=$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo unknown)
-            restarting=$(docker inspect -f '{{.State.Restarting}}' "$n" 2>/dev/null || echo unknown)
-            health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$n" 2>/dev/null || echo none)
-
-            if [ "$status" != "running" ] || [ "$restarting" = "true" ]; then
-              printf 'FAIL\t%s\tcontainer state\tstatus=%s restarting=%s\n' "$svc" "$status" "$restarting"
+          names=""
+          for t in $timers; do
+            node=${t#toon-auto-apply-}; node=${node%.timer}
+            svc="toon-auto-apply-${node}.service"
+            exe=$(systemctl show -p ExecStart --value "$svc" 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -1)
+            if [ -z "$exe" ]; then
+              row FAIL "$node" 'auto-apply service' "$svc names no ExecStart: cannot tell which checkout this node deploys"
               continue
             fi
-            printf 'OK\t%s\tcontainer state\tstatus=running\n' "$svc"
+            dir=$(dirname "$exe")
+
+            # The node's containers.
+            mine=$(docker ps -a --filter "label=com.docker.compose.project.working_dir=$dir" --format '{{.Names}}' 2>/dev/null)
+            if [ -z "$mine" ]; then
+              row FAIL "$node" 'containers' "the timer is enabled but no container runs from $dir: the node is down, or never came up"
+            fi
+            names="$names $mine"
+
+            # The timer is active and has fired recently.
+            tstate=$(systemctl is-active "$t" 2>/dev/null)
+            last=$(systemctl show -p LastTriggerUSec --value "$t" 2>/dev/null)
+            lastsec=$(date -d "$last" +%s 2>/dev/null || echo 0)
+            age=$(( $(date +%s) - lastsec ))
+            if [ "$tstate" != "active" ]; then
+              row FAIL "$node" 'auto-apply timer' "$t is $tstate: nothing merged to this node's repo will reach the host"
+            elif [ "$lastsec" -eq 0 ]; then
+              row FAIL "$node" 'auto-apply timer' "$t is active but has never fired"
+            elif [ "$age" -gt "$TIMER_MAX_AGE" ]; then
+              row FAIL "$node" 'auto-apply timer' "$t is active but last fired $(ago "$age") ago (expected every 5m)"
+            else
+              row OK "$node" 'auto-apply timer' "active, last fired $(ago "$age") ago"
+            fi
+
+            # The last apply succeeded.
+            result=$(systemctl show -p Result --value "$svc" 2>/dev/null)
+            status=$(systemctl show -p ExecMainStatus --value "$svc" 2>/dev/null)
+            running=$(systemctl show -p ActiveState --value "$svc" 2>/dev/null)
+            if [ "$result" = "success" ]; then
+              row OK "$node" 'last apply' "Result=success (exit ${status:-?})"
+            else
+              why=$(journalctl -u "$svc" -n 60 --no-pager -o cat 2>/dev/null | grep -E 'FAILED|REFUSING' | tail -1)
+              row FAIL "$node" 'last apply' "Result=${result:-unknown} (exit ${status:-?}): ${why:-see journalctl -u $svc}"
+            fi
+
+            # The node is running what was merged (THE STALENESS RULE).
+            head=$(git -C "$dir" rev-parse -q --verify origin/main 2>/dev/null)
+            applied=$(cat "$dir/.applied" 2>/dev/null | tr -d '[:space:]')
+            if [ -z "$head" ]; then
+              row FAIL "$node" 'deploy/.applied = origin/main' "$dir has no origin/main: not a checkout the timer can follow"
+            elif [ "$applied" = "$head" ]; then
+              row OK "$node" 'deploy/.applied = origin/main' "${head:0:7} applied and verified"
+            else
+              since=$(git -C "$dir" log -g -1 --date=unix --format=%gd refs/remotes/origin/main 2>/dev/null | sed -n 's/.*@{\([0-9]*\)}.*/\1/p')
+              clock="origin/main moved"
+              if [ -z "$since" ]; then
+                since=$(date -r "$dir/.applied" +%s 2>/dev/null || echo 0)
+                clock="no reflog; .applied written"
+              fi
+              wait=$(( $(date +%s) - since ))
+              if [ "$running" = "activating" ]; then
+                row OK "$node" 'deploy/.applied = origin/main' "applying ${head:0:7} now (.applied is ${applied:0:7})"
+              elif [ "$since" -gt 0 ] && [ "$wait" -le "$APPLY_GRACE" ]; then
+                row OK "$node" 'deploy/.applied = origin/main' "${head:0:7} pending: $clock $(ago "$wait") ago, within the $(( APPLY_GRACE / 60 ))m grace (.applied is ${applied:0:7})"
+              else
+                row FAIL "$node" 'deploy/.applied = origin/main' "BEHIND: main is ${head:0:7} but the last verified apply is $( [ -n "$applied" ] && echo "${applied:0:7}" || echo "<none>" ); $clock $(ago "$wait") ago. The merge is not on the host."
+              fi
+            fi
+          done
+
+          for p in $HAND_DEPLOYED; do
+            mine=$(docker ps -a --filter "label=com.docker.compose.project=$p" --format '{{.Names}}' 2>/dev/null)
+            [ -n "$mine" ] || row FAIL "$p" 'containers' "no container in the hand-deployed compose project $p"
+            names="$names $mine"
+          done
+          names=$(printf '%s' "$names" | tr ' ' '\n' | awk 'NF && !seen[$0]++')
+
+          # ── Per container ─────────────────────────────────────────────────
+          # First restart sample, then the serving probes, then a second
+          # sample at least SAMPLE_GAP seconds after the first.
+          sample1=""
+          for n in $names; do
+            sample1="$sample1$n $(docker inspect -f '{{.RestartCount}}' "$n" 2>/dev/null || echo -1)
+          "
+          done
+
+          for n in $names; do
+            proj=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$n" 2>/dev/null)
+            svc=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$n" 2>/dev/null)
+            [ -n "$svc" ] || svc="$n"
+            who="${proj:-?}/$svc"
+            st=$(docker inspect -f '{{.State.Status}}|{{.State.Restarting}}|{{.State.ExitCode}}|{{.HostConfig.RestartPolicy.Name}}|{{if .State.Health}}{{.State.Health.Status}}|{{.State.Health.FailingStreak}}{{else}}none|0{{end}}' "$n" 2>/dev/null) \
+              || st='unknown|unknown|?|?|none|0'
+            IFS='|' read -r status restarting code policy health streak <<< "$st"
+
+            # A one-shot job that ran to completion is not a dead service.
+            if [ "$status" = "exited" ] && [ "$code" = "0" ] && { [ "$policy" = "no" ] || [ -z "$policy" ]; }; then
+              row OK "$who" 'container state' 'one-shot, exited 0 (restart policy: no)'
+              continue
+            fi
+            if [ "$status" != "running" ] || [ "$restarting" = "true" ]; then
+              row FAIL "$who" 'container state' "status=$status restarting=$restarting exit=$code"
+              continue
+            fi
+            row OK "$who" 'container state' 'status=running'
+
+            # Docker's own verdict, wherever the image or bundle defines one.
+            case "$health" in
+              none) ;;
+              healthy) row OK "$who" 'docker healthcheck' 'healthy' ;;
+              *) row FAIL "$who" 'docker healthcheck' "$health (failing streak $streak)" ;;
+            esac
 
             # Serving probe. An unknown service is a FAILURE by design: a
-            # service opted into auto-redeploy without a probe is the exact
+            # service added to a watched project without a probe is the exact
             # omission this file refuses.
             case "$svc" in
               connector|connector-rust)
-                # Both boxes' connector service is now named `connector`: the
-                # store box's bundle moved to toon-protocol/store (store#103)
-                # and the relay's to its own repo, and both dropped the
-                # `-rust` suffix that distinguished the Rust node from the
-                # retired TypeScript one. `connector-rust` stays matched so a
-                # box that has not been rebuilt is still probed.
-                #
-                # The client edge is NOT at the same address on both. The
-                # store box publishes it on 127.0.0.1:4000; the relay box
-                # publishes no host port at all and is reached over the
-                # compose network by its own reverse proxy. Resolve the
-                # address from the container instead of hardcoding one that
-                # is only right on one box.
-                edge=$(docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{if $b}}{{(index $b 0).HostIp}}:{{(index $b 0).HostPort}}{{end}}{{end}}' "$n" 2>/dev/null | head -1)
-                if [ -z "$edge" ]; then
-                  cip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$n" 2>/dev/null | awk '{print $1}')
-                  cport=$(docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{$p}} {{end}}' "$n" 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
-                  edge="${cip}:${cport}"
-                fi
-                if [ -n "$edge" ] && curl -sf --max-time 10 "http://${edge}/ilp/identity" >/dev/null 2>&1; then
-                  printf 'OK\t%s\tGET %s/ilp/identity\t200\n' "$svc" "$edge"
+                # The client edge is published on loopback at a different port
+                # per node (relay 3000, gateway 4001, gas 4002, store 4003), and
+                # the container port differs too (3000 on the relay, 4000
+                # elsewhere). Read the container port off the container and ask
+                # `docker compose port` where it lands — by project name, which
+                # reads the running containers, not the bundle's files, so a
+                # half-rendered bundle cannot blind this probe.
+                cport=$(docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{if $b}}{{$p}} {{end}}{{end}}' "$n" 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+                addr=""
+                [ -z "$cport" ] || addr=$(docker compose -p "$proj" port "$svc" "$cport" 2>/dev/null | head -1)
+                if [ -z "$addr" ]; then
+                  row FAIL "$who" 'GET /ilp/identity' 'publishes no host port: cannot be reached on loopback'
                 else
-                  printf 'FAIL\t%s\tGET %s/ilp/identity\tno 200 — up but not serving\n' "$svc" "$edge"
+                  got=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$addr/ilp/identity" 2>/dev/null)
+                  if [ "$got" = "200" ]; then
+                    row OK "$who" 'GET /ilp/identity' "200 on $addr"
+                  else
+                    row FAIL "$who" 'GET /ilp/identity' "${got:-000} on $addr: up but not serving"
+                  fi
                 fi
+                ;;
+              relay|store|gas-station|gateway|faucet|caddy)
+                # Each of these defines a container HEALTHCHECK, read above,
+                # rather than having its probe restated here. Without one the
+                # probe is blind, and that is a failure, not a pass.
+                [ "$health" != "none" ] || row FAIL "$who" 'docker healthcheck' 'defines no healthcheck, and this arm relies on one: the probe is blind'
                 ;;
               swap-node)
+                # Not on the devnet since the one-host cutover; kept so a maker
+                # that comes back into a watched project is probed, not reported
+                # as unknown. Loopback-published blsPort.
                 if curl -sf --max-time 10 http://127.0.0.1:8080/health >/dev/null 2>&1; then
-                  printf 'OK\t%s\tGET :8080/health\t200\n' "$svc"
+                  row OK "$who" 'GET :8080/health' '200'
                 else
-                  printf 'FAIL\t%s\tGET :8080/health\tno 200 — up but not serving\n' "$svc"
-                fi
-                ;;
-              relay|store)
-                # These two define a container HEALTHCHECK; read its verdict
-                # rather than restating their probe here.
-                if [ "$health" = "healthy" ]; then
-                  printf 'OK\t%s\tdocker healthcheck\thealthy\n' "$svc"
-                elif [ "$health" = "none" ]; then
-                  printf 'FAIL\t%s\tdocker healthcheck\tthis service used to define one and no longer does — probe is now blind\n' "$svc"
-                else
-                  printf 'FAIL\t%s\tdocker healthcheck\t%s\n' "$svc" "$health"
+                  row FAIL "$who" 'GET :8080/health' 'no 200: up but not serving'
                 fi
                 ;;
               *)
-                printf 'FAIL\t%s\tserving probe\tNO PROBE DEFINED for a Watchtower-managed service — add one to fleet-health.yml before opting a service into auto-redeploy\n' "$svc"
+                row FAIL "$who" 'serving probe' 'NO PROBE DEFINED for a watched service: add one to fleet-health.yml before deploying a service onto the devnet host'
                 ;;
             esac
           done
 
-          # Second restart sample. A rising counter is a crash-loop even
-          # though every single-shot look above said `running`.
+          # ── Host headroom ─────────────────────────────────────────────────
+          # Every node shares one nanode; a leak in one starves the others.
+          memkb=$(awk '/^MemAvailable:/ {print $2}' "$MEMINFO" 2>/dev/null)
+          if [ -z "$memkb" ]; then
+            row FAIL '(host)' 'MemAvailable' "could not read $MEMINFO"
+          elif [ "$memkb" -lt "$MEM_MIN_KB" ]; then
+            row FAIL '(host)' 'MemAvailable' "$(( memkb / 1024 )) MB, under the $(( MEM_MIN_KB / 1024 )) MB floor: the next allocation spike is an OOM kill"
+          else
+            row OK '(host)' 'MemAvailable' "$(( memkb / 1024 )) MB"
+          fi
+          disk=$(df -P / 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}')
+          if [ -z "$disk" ]; then
+            row FAIL '(host)' 'root disk' 'could not read df /'
+          elif [ "$disk" -ge "$DISK_MAX_PCT" ]; then
+            row FAIL '(host)' 'root disk' "${disk}% used, at or over ${DISK_MAX_PCT}%: images, logs and chain state share this filesystem"
+          else
+            row OK '(host)' 'root disk' "${disk}% used"
+          fi
+
+          # ── Second restart sample ─────────────────────────────────────────
+          # A rising counter is a crash-loop even though every single-shot
+          # look above said `running`.
+          elapsed=$(( $(date +%s) - STARTED ))
+          [ "$elapsed" -ge "$SAMPLE_GAP" ] || sleep $(( SAMPLE_GAP - elapsed ))
           for n in $names; do
+            proj=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$n" 2>/dev/null)
             svc=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$n" 2>/dev/null)
             [ -n "$svc" ] || svc="$n"
-            before=$(awk -v k="$n" '$1==k {print $2}' /tmp/fleet-health-sample1)
+            before=$(printf '%s' "$sample1" | awk -v k="$n" '$1==k {print $2}')
             after=$(docker inspect -f '{{.RestartCount}}' "$n" 2>/dev/null || echo -1)
             if [ -n "$before" ] && [ "$after" -gt "$before" ] 2>/dev/null; then
-              printf 'FAIL\t%s\tcrash-loop\tRestartCount rose %s -> %s during this probe\n' "$svc" "$before" "$after"
+              row FAIL "${proj:-?}/$svc" 'crash-loop' "RestartCount rose $before -> $after during this probe"
             else
-              printf 'OK\t%s\tcrash-loop\tRestartCount steady at %s\n' "$svc" "$after"
+              row OK "${proj:-?}/$svc" 'crash-loop' "RestartCount steady at $after"
             fi
           done
-          rm -f /tmp/fleet-health-sample1
           REMOTE_SCRIPT
           )
 
-          sshbox "bash -s" <<< "$REMOTE" > /tmp/onbox.tsv 2>/tmp/onbox.err || true
-          if [ ! -s /tmp/onbox.tsv ]; then
-            printf 'FAIL\t(box)\tssh probe\tproduced no output: %s\n' "$(head -c 300 /tmp/onbox.err)" > /tmp/onbox.tsv
+          sshhost "bash -s" <<< "$REMOTE" > /tmp/onhost.tsv 2>/tmp/onhost.err || true
+          if [ ! -s /tmp/onhost.tsv ]; then
+            printf 'FAIL\t(host)\tssh probe\tproduced no output: %s\n' "$(head -c 300 /tmp/onhost.err | tr '\t\n|' '  /')" > /tmp/onhost.tsv
           fi
+          cat /tmp/onhost.tsv
 
+      # Runs even when the host could not be reached: the edge's answer is
+      # still worth having in the same alert, and a host that is unreachable
+      # over SSH but serving publicly is a different failure from one that
+      # is simply gone.
+      - name: Probe every public hostname, from the runner
+        if: always()
+        run: |
+          set -uo pipefail
           # ── Public-edge probe, FROM THE RUNNER ──────────────────────────
-          # The layer that catches connector#993: loopback reaches the
-          # container directly, so an nginx holding a stale upstream IP looks
-          # perfect from on-box and 502s to the world. Only an off-box request
-          # crosses nginx.
-          case "$BOX" in
-            relay)
-              EDGES="https://proxy.relay.devnet.toonprotocol.dev/ilp/identity=200 https://relay-ws.devnet.toonprotocol.dev/=426"
-              ;;
-            ario)
-              EDGES="https://proxy.ario.devnet.toonprotocol.dev/ilp/identity=200"
-              ;;
-          esac
-          for spec in $EDGES; do
-            url="${spec%=*}"
-            want="${spec##*=}"
-            got=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$url" || echo 000)
-            if [ "$got" = "$want" ]; then
-              printf 'OK\t(public edge)\t%s\t%s\n' "$url" "$got" >> /tmp/onbox.tsv
+          # The only layer that crosses the edge. Loopback reaches a container
+          # directly, so an edge that cannot reach its upstream, or serves a
+          # certificate that does not cover the name (curl verifies it), looks
+          # perfect from on the host.
+          #
+          # <url> <expected status> [<required toon-gateway-reason>]
+          # The random label is fresh every run so no cache can answer for
+          # the gateway; the CHECK column names it `<random>` so the alert's
+          # change signature does not move with it.
+          LABEL="fleet-health-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          D=devnet.toonprotocol.dev
+          while read -r url want reason; do
+            [ -n "$url" ] || continue
+            shown="${url/$LABEL/<random>}"
+            # Up to three tries, so a single dropped connection is not an
+            # outage — and a real one still fails all three.
+            for try in 1 2 3; do
+              got=$(curl -s -o /dev/null -D /tmp/public-headers -w '%{http_code}' --max-time 20 "$url" 2>/dev/null || true)
+              got=${got:-000}
+              seen=$(tr -d '\r' < /tmp/public-headers 2>/dev/null | awk -F': *' 'tolower($1)=="toon-gateway-reason" {print $2}' | tail -1)
+              if [ "$got" = "$want" ] && { [ -z "${reason:-}" ] || [ "$seen" = "$reason" ]; }; then
+                break
+              fi
+              [ "$try" -eq 3 ] || sleep 5
+            done
+            if [ "$got" = "$want" ] && { [ -z "${reason:-}" ] || [ "$seen" = "$reason" ]; }; then
+              printf 'OK\t(edge)\t%s\t%s%s\n' "$shown" "$got" "${reason:+ $reason}"
             else
-              printf 'FAIL\t(public edge)\t%s\texpected %s, got %s\n' "$url" "$want" "$got" >> /tmp/onbox.tsv
+              printf 'FAIL\t(edge)\t%s\texpected %s%s, got %s%s\n' "$shown" "$want" "${reason:+ $reason}" "$got" "${seen:+ $seen}"
             fi
-          done
+          done > /tmp/public.tsv <<EOF
+          https://proxy.relay.$D/ilp/identity 200
+          https://relay-ws.$D/ 426
+          https://proxy.ario.$D/ilp/identity 200
+          https://dvm.$D/health 200
+          https://proxy.gas.$D/ilp/identity 200
+          https://gas.$D/health 200
+          https://proxy.gateway.$D/ilp/identity 200
+          https://gw.$D/ 503 no_grant
+          https://$LABEL.gw.$D/ 503 no_grant
+          https://faucet.$D/health 200
+          EOF
+          cat /tmp/public.tsv
 
-          # ── Verdict + report ────────────────────────────────────────────
-          FAILS=$(grep -c '^FAIL' /tmp/onbox.tsv || true)
+      - name: Verdict
+        if: always()
+        run: |
+          set -uo pipefail
+          [ -s /tmp/onhost.tsv ] || printf 'FAIL\t(host)\tssh probe\tdid not run: the host could not be resolved or reached (see the steps above)\n' > /tmp/onhost.tsv
+          [ -s /tmp/public.tsv ] || printf 'FAIL\t(edge)\tpublic probe\tdid not run\n' > /tmp/public.tsv
+          cat /tmp/onhost.tsv /tmp/public.tsv > /tmp/probe.tsv
+
+          FAILS=$(grep -c '^FAIL' /tmp/probe.tsv || true)
           {
-            echo "### \`$BOX\` — $( [ "$FAILS" -eq 0 ] && echo 'healthy' || echo "**$FAILS failing check(s)**" )"
+            echo "### devnet host — $( [ "$FAILS" -eq 0 ] && echo 'healthy' || echo "**$FAILS failing check(s)**" )"
             echo ""
-            echo "| | service | check | detail |"
+            echo "| | subject | check | detail |"
             echo "|---|---|---|---|"
-            while IFS=$'\t' read -r st svc chk det; do
+            while IFS=$'\t' read -r st subj chk det; do
               icon=$( [ "$st" = "OK" ] && echo '✅' || echo '❌' )
-              echo "| $icon | \`$svc\` | $chk | $det |"
-            done < /tmp/onbox.tsv
+              echo "| $icon | \`$subj\` | $chk | $det |"
+            done < /tmp/probe.tsv
             echo ""
-          } > /tmp/report.md
+          } > /tmp/report-host.md
 
-          cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
-          cat /tmp/onbox.tsv
-
-          # Stash the report for the alert job. Multi-line, so via a file
-          # artifact rather than an output.
-          cp /tmp/report.md "/tmp/report-$BOX.md"
-          echo "fails=$FAILS" >> "$GITHUB_OUTPUT"
-
+          cat /tmp/report-host.md >> "$GITHUB_STEP_SUMMARY"
           [ "$FAILS" -eq 0 ] || exit 1
 
       - name: Upload report
-        if: always() && steps.scope.outputs.skip == 'false'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fleet-health-${{ matrix.box }}
-          path: /tmp/report-${{ matrix.box }}.md
+          name: fleet-health-host
+          path: /tmp/report-host.md
           if-no-files-found: ignore
           retention-days: 7
 
@@ -703,8 +858,8 @@ jobs:
   #
   # So this job adds NO new secret. It needs:
   #   * `DEVNET_SSH_KEY`, which this workflow already holds; and
-  #   * the relay box's own operator write key, which already lives at
-  #     `/root/relay/deploy/operator-write.key` and never leaves the box —
+  #   * the relay node's own operator write key, which already lives at
+  #     `/root/relay/deploy/operator-write.key` and never leaves the host —
   #     it is bind-mounted read-only into a throwaway container and nothing
   #     is copied anywhere.
   #
@@ -738,7 +893,7 @@ jobs:
   #                 names the peer.
   #   REJECT T00    the claim or channel state is broken between the two — the
   #                 01:27Z shape. Read `peering-crosscheck`'s settlement rows
-  #                 in the same run: a mint or token-network change on one box
+  #                 in the same run: a mint or token-network change on one node
   #                 moves every channel id it shares.
   #
   # `dry-run` forms and signs the packet, prints what it would have sent, and
@@ -769,8 +924,8 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          [ -n "${DEVNET_SSH_KEY:-}" ] || { echo "::error::DEVNET_SSH_KEY is not set — cannot reach the relay box (see fleet-ops.yml)."; fail=1; }
-          [ -n "${LINODE_CLI_TOKEN:-}" ] || { echo "::error::LINODE_CLI_TOKEN is not set — cannot resolve a box label to an IP."; fail=1; }
+          [ -n "${DEVNET_SSH_KEY:-}" ] || { echo "::error::DEVNET_SSH_KEY is not set — cannot reach the host (see fleet-ops.yml)."; fail=1; }
+          [ -n "${LINODE_CLI_TOKEN:-}" ] || { echo "::error::LINODE_CLI_TOKEN is not set — cannot resolve the host's label to an IP."; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
 
       # Which legs exist, and what each costs, read off the SAME fleet map the
@@ -785,8 +940,8 @@ jobs:
           echo "the fleet forwards:"
           cat /tmp/legs.tsv
           # Only the relay's own legs are drivable here: this job SSHes to the
-          # relay box, and the relay is the node with a peer-forwarding table
-          # and an operator key on disk. Adding another box means adding it to
+          # host's relay node, and the relay is the node with a peer-forwarding
+          # table and an operator key on disk. Adding another node means adding it to
           # this step, not a new source of truth.
           awk -F'\t' '$1 == "relay"' /tmp/legs.tsv > /tmp/relay-legs.tsv
           if [ ! -s /tmp/relay-legs.tsv ]; then
@@ -794,8 +949,8 @@ jobs:
             exit 1
           fi
 
-      - name: Resolve the relay box IP from its Linode label
-        id: box
+      - name: Resolve the host IP from its Linode label
+        id: host
         env:
           LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
         run: |
@@ -812,15 +967,15 @@ jobs:
       - name: Install SSH key
         env:
           DEVNET_SSH_KEY: ${{ secrets.DEVNET_SSH_KEY }}
-          BOX_IP: ${{ steps.box.outputs.ip }}
+          HOST_IP: ${{ steps.host.outputs.ip }}
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$DEVNET_SSH_KEY" > ~/.ssh/devnet
           chmod 600 ~/.ssh/devnet
           {
-            echo "Host devnet-box"
-            echo "  HostName $BOX_IP"
+            echo "Host devnet-host"
+            echo "  HostName $HOST_IP"
             echo "  User root"
             echo "  IdentityFile ~/.ssh/devnet"
             echo "  IdentitiesOnly yes"
@@ -834,27 +989,34 @@ jobs:
         id: probe
         run: |
           set -uo pipefail
-          sshbox() { ssh -F ~/.ssh/config -o LogLevel=ERROR devnet-box "$@"; }
+          sshhost() { ssh -F ~/.ssh/config -o LogLevel=ERROR devnet-host "$@"; }
 
           # The image the relay is ACTUALLY running, not a pin read from this
           # repo: `connector send` has to be the same build as the node it is
           # driving, and ADR 0068 put that pin in the relay's own repository.
-          IMAGE=$(sshbox 'docker inspect -f "{{.Config.Image}}" "$(docker ps --filter label=com.docker.compose.service=connector --format "{{.Names}}" | head -1)"' | tr -d '\r')
+          # Scoped to the relay's compose project: every node on the host runs
+          # a service called `connector`, each on its own pin.
+          # The single-quoted `$(...)` and `$…` in this step run on the host or
+          # are TSV text; neither is meant to expand here.
+          : > /tmp/paid.tsv
+          # shellcheck disable=SC2016
+          IMAGE=$(sshhost 'docker inspect -f "{{.Config.Image}}" "$(docker ps --filter label=com.docker.compose.project=relay --filter label=com.docker.compose.service=connector --format "{{.Names}}" | head -1)"' | tr -d '\r')
+          # shellcheck disable=SC2016
           if [ -z "$IMAGE" ]; then
-            printf 'FAIL\t(relay)\tconnector container\tno container with compose service `connector` is running — nothing to originate from\n' > /tmp/paid.tsv
+            printf 'FAIL\t(relay)\tconnector container\tno running container with compose project `relay` and service `connector` — nothing to originate from\n' > /tmp/paid.tsv
             IMAGE=""
           fi
 
-          : > /tmp/paid.tsv
           FLAG=$( [ "$MODE" = "dry-run" ] && echo "--dry-run" || echo "" )
 
+          # shellcheck disable=SC2016
           while IFS=$'\t' read -r near prefix far far_url amount; do
             [ -n "$IMAGE" ] || break
             # `--network host`: the relay's client edge and operator surface
-            # share 127.0.0.1:3000 on the box (docker-compose.operator.yml
+            # share 127.0.0.1:3000 on the host (docker-compose.operator.yml
             # mounts the surface onto the port the edge already serves).
             # The key is bind-mounted read only and never copied anywhere.
-            OUT=$(sshbox "docker run --rm --network host \
+            OUT=$(sshhost "docker run --rm --network host \
                     -v /root/relay/deploy/operator-write.key:/k:ro '$IMAGE' \
                     send --operator http://127.0.0.1:3000 --operator-key /k \
                     --to '$prefix' --seal-to '$far_url' --amount '$amount' \
@@ -878,7 +1040,7 @@ jobs:
               "REJECT T01"*)
                 printf 'FAIL\t%s\tpaid probe `%s`\tT01 PEER UNREACHABLE — the peering itself is down; the packet never left this node. %s\n' "$LEG" "$prefix" "$HEAD" ;;
               "REJECT T00"*)
-                printf 'FAIL\t%s\tpaid probe `%s`\tT00 — the two sides disagree about the channel. Read this run cross-check settlement rows: a mint or token-network change on one box moves every channel id it shares. %s\n' "$LEG" "$prefix" "$HEAD" ;;
+                printf 'FAIL\t%s\tpaid probe `%s`\tT00 — the two sides disagree about the channel. Read this run cross-check settlement rows: a mint or token-network change on one node moves every channel id it shares. %s\n' "$LEG" "$prefix" "$HEAD" ;;
               "REJECT F02"*)
                 printf 'FAIL\t%s\tpaid probe `%s`\tF02 — the packet CROSSED the peering, and the far side routes no such name. The cross-check should have caught this first. %s\n' "$LEG" "$prefix" "$HEAD" ;;
               "REJECT F"*)
@@ -924,7 +1086,7 @@ jobs:
     name: Alert a human
     needs: [probe, config-compat, peering-crosscheck, paid-probe]
     # `always()` so this runs on the failure it exists to report. A skipped
-    # `probe` (a PR run, or a dispatch scoped to one box) must not be treated
+    # `probe` (a PR run) must not be treated
     # as a fleet-wide verdict, which the `result` checks below take care of.
     if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -1067,12 +1229,15 @@ jobs:
             fi
           fi
 
+          # The body echoes shell commands verbatim, `$` and trailing `\`
+          # included; none of them is meant to expand here.
           BODY=/tmp/alert-body.md
+          # shellcheck disable=SC2016,SC1003
           {
-            echo "One or more Watchtower-managed devnet services failed their health probe."
+            echo "The devnet host failed one or more health probes."
             echo ""
             echo "**Run:** $RUN_URL"
-            echo "**Box probes:** \`$PROBE\` · **Config compatibility:** \`$COMPAT\` · **Peering cross-check:** \`$PEERING\` · **Paid probe:** \`$PAID\`"
+            echo "**Host probes:** \`$PROBE\` · **Config compatibility:** \`$COMPAT\` · **Peering cross-check:** \`$PEERING\` · **Paid probe:** \`$PAID\`"
             echo "**This failure since:** $SINCE · **consecutive runs:** $RUNS"
             echo ""
             if [ "$RUNS" -gt 1 ]; then
@@ -1087,7 +1252,7 @@ jobs:
               echo ">"
               echo "> This is the class nothing used to check, and both 2026-08-28 outages"
               echo "> were in it. The table below names the disagreement. A settlement-facts"
-              echo "> row means a mint or token-network changed on one box and not the other,"
+              echo "> row means a mint or token-network changed on one node and not the other,"
               echo "> which moves every channel id the two share — the far side is then asked"
               echo "> about a channel it has never heard of (\`T00\`). A DANGLING FORWARD means"
               echo "> a node sells a prefix nobody routes: the payer is charged and refused."
@@ -1098,14 +1263,13 @@ jobs:
               echo ""
             fi
             if [ "$COMPAT" != "success" ]; then
-              echo "> ⚠️ **The committed box config and the current \`:release\` image disagree.**"
+              echo "> ⚠️ **The committed maker config and the current \`:release\` image disagree.**"
               echo "> \`${{ needs.config-compat.outputs.detail }}\`"
               echo ">"
-              echo "> This is the swap#134 shape: an image requiring a config key the box's"
-              echo "> bind-mounted file does not have. The service will crash-loop on its next"
-              echo "> recreate even if it happens to be up right now. Fix the committed config"
-              echo "> in \`infra/\`, then put it on the box — by hand over ssh, or, where the"
-              echo "> service deploys from another repo, in that repo's own \`deploy/\` bundle."
+              echo "> This is the swap#134 shape: an image requiring a config key the committed"
+              echo "> \`infra/linode-relay/swap.config.json\` does not have. No maker runs on the"
+              echo "> devnet host today, so nothing is down — but a maker deployed from this"
+              echo "> config would crash-loop on boot. Fix the committed config in \`infra/\`."
               echo ""
             fi
             for f in /tmp/reports/*.md; do
@@ -1114,16 +1278,36 @@ jobs:
             echo ""
             echo "### Recovering"
             echo ""
-            echo "Every watched service follows a moving tag, so a rollback is a retag, not a rebuild."
-            echo "Immutable \`sha-*\` / \`rust-sha-*\` tags for every previous build stay pullable from GHCR."
+            echo "Every node on the host deploys by GitOps from its own repository: its"
+            echo "\`toon-auto-apply-<node>.timer\` applies whatever that repo's \`main\` says,"
+            echo "every five minutes. So a rollback is a **revert of the merge in the node's"
+            echo "repo** — the timer applies the revert like any other commit. Nothing here, and"
+            echo "nothing on the runner, can make the host deploy."
+            echo ""
+            echo "| subject | repository | on the host |"
+            echo "|---|---|---|"
+            echo "| \`relay\` | toon-protocol/relay | \`/root/relay\` |"
+            echo "| \`store\` | toon-protocol/store | \`/root/store\` |"
+            echo "| \`gas\` | toon-protocol/gas-station | \`/root/gas-station\` |"
+            echo "| \`gateway\` | toon-protocol/gateway | \`/root/gateway\` |"
+            echo "| \`edge\` | toon-protocol/infra (\`edge/deploy\`) | \`/root/infra/edge\` |"
+            echo "| \`linode-faucet\` | toon-protocol/connector (\`infra/linode-faucet\`), **hand-deployed, no timer** | \`/root/faucet-connector\` |"
             echo ""
             echo '```sh'
-            echo '# Roll a service back to a known-good immutable tag (from a machine with docker + ghcr login):'
-            echo 'docker buildx imagetools create -t ghcr.io/toon-protocol/<pkg>:<moving-tag> ghcr.io/toon-protocol/<pkg>:<known-good-sha-tag>'
-            echo '# …then let Watchtower pick it up (~60s). connector-rust on relay/store is no longer'
-            echo '# deployed from here (ADR 0068) -- roll it back via that node repos own deploy/ pin.'
-            echo '# The faucet leg still deploys from this repo:'
-            echo '#   gh workflow run fleet-ops.yml -f operation=deploy -f service=<svc> -f apply=true'
+            echo '# A bad merge in a node repo: revert it there, and let the timer apply the revert.'
+            echo 'gh pr view <pr> --repo toon-protocol/<repo> --json mergeCommit'
+            echo 'git revert <merge-sha> && git push   # or a revert PR, merged'
+            echo ''
+            echo '# A node whose apply keeps failing (`last apply` row): read why, on the host.'
+            echo 'journalctl -u toon-auto-apply-<node>.service -n 50 --no-pager'
+            echo '#   REFUSING: dirty working tree -> a human is mid-edit there; commit/stash/discard it.'
+            echo '#   FAILED: render.sh / pull / up -d / connector not healthy -> fix it in the node repo;'
+            echo '#   deploy/.applied keeps naming the last commit that DID apply until then.'
+            echo ''
+            echo '# The faucet has no timer: roll it back by hand, from the checkout root on the host.'
+            echo 'cd /root/faucet-connector && git checkout <known-good-sha>'
+            echo 'docker compose -f infra/linode-faucet/docker-compose.faucet.yml \'
+            echo '               -f infra/linode-faucet/docker-compose.edge.yml up -d --build'
             echo '```'
             echo ""
             if [ "$PEERING" != "success" ] || [ "$PAID_VERDICT" != "success" ]; then
@@ -1134,10 +1318,11 @@ jobs:
               echo "bearer token; writes are RFC 9421-signed with \`docs/operators/sign-write.sh\`."
               echo ""
               echo '```sh'
-              echo '# On the box, see what that node thinks it forwards and to whom:'
+              echo '# On the host, in that node deploy/ dir, see what it thinks it forwards and to whom:'
               echo 'T=$(cat operator-bearer.token)'
-              echo 'curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<edge>/routes/peers'
-              echo 'curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<edge>/peers'
+              echo '# <port>: relay 3000, gateway 4001, gas 4002, store 4003 (docker compose port connector ...)'
+              echo 'curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<port>/routes/peers'
+              echo 'curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<port>/peers'
               echo ''
               echo '# A DANGLING FORWARD is a runtime row the config no longer owns. Delete it:'
               echo './sign-write.sh -k operator-write.key -X DELETE -p /routes/peers/<prefix>'

@@ -26,6 +26,30 @@ pub struct Watermark {
     pub cumulative_amount: u64,
 }
 
+impl Watermark {
+    /// The higher of two watermarks on the **same** channel, taken field by
+    /// field (issues #1257/#1258): the highest nonce and the highest
+    /// cumulative amount either has seen.
+    ///
+    /// A cumulative amount is a property of the on-chain channel, not of
+    /// the book that happened to journal it -- the chain settles one
+    /// running total per direction, whichever of a node's two books
+    /// accepted each claim. So when both books hold a watermark for one
+    /// channel, the channel stands at the higher of the two, and a claim
+    /// that advances past this answer advances past both. `None` on
+    /// either side is simply the other side's answer.
+    #[must_use]
+    pub fn highest(this: Option<Self>, other: Option<Self>) -> Option<Self> {
+        match (this, other) {
+            (Some(a), Some(b)) => Some(Self {
+                nonce: a.nonce.max(b.nonce),
+                cumulative_amount: a.cumulative_amount.max(b.cumulative_amount),
+            }),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
 /// Why a claim was rejected at the watermark layer -- mirrors
 /// peer-semantics-pre-868.md §3.4's `nonce_not_advancing`/`amount_not_advancing`
 /// CLAIM_ACK rejection reasons (`signature_invalid` and `unknown_channel`
@@ -609,6 +633,27 @@ mod tests {
             let advanced = cumulative_amount.saturating_sub(prior);
             let result = validate_price(watermark, cumulative_amount, price);
             prop_assert_eq!(result.is_ok(), advanced >= price);
+        }
+
+        /// Issues #1257/#1258: a claim that advances past
+        /// [`Watermark::highest`] of two books' watermarks is accepted by
+        /// **both** books -- so a payer seeded from the combined answer can
+        /// never be refused "goes backwards" by whichever book it did not
+        /// read, and a redeem never picks a claim the other book has
+        /// already superseded.
+        #[test]
+        fn a_claim_past_the_highest_of_two_watermarks_passes_both(
+            a in proptest::option::of((any::<u32>(), any::<u32>()).prop_map(|(nonce, cumulative_amount)| Watermark { nonce: nonce.into(), cumulative_amount: cumulative_amount.into() })),
+            b in proptest::option::of((any::<u32>(), any::<u32>()).prop_map(|(nonce, cumulative_amount)| Watermark { nonce: nonce.into(), cumulative_amount: cumulative_amount.into() })),
+            amount in any::<u32>(),
+        ) {
+            let highest = Watermark::highest(a, b);
+            let (nonce, cumulative) = highest.map_or((0, 0), |w| (w.nonce, w.cumulative_amount));
+            let claim_nonce = nonce + 1;
+            let claim_amount = cumulative + u64::from(amount);
+            prop_assert!(validate_claim(a, claim_nonce, claim_amount).is_ok());
+            prop_assert!(validate_claim(b, claim_nonce, claim_amount).is_ok());
+            prop_assert_eq!(Watermark::highest(a, b), Watermark::highest(b, a));
         }
     }
 }

@@ -1,25 +1,28 @@
-# Fleet pin drift — do the three node repos still agree on one connector build?
+# Fleet pin drift — do the four node repos still agree on one connector build?
 #
 # ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
 # ADR 0068 moved the connector pin out of this repository: `toon-protocol/relay`,
-# `toon-protocol/store` and `toon-protocol/gas-station` each name the connector
-# image they run, in one place in their own `deploy/` bundle, guarded there.
-# That decision is right — this repo no longer has a legitimate write path onto
-# those boxes, and the retired promotion workflow was reporting successful
-# config-applies against a path nothing read.
+# `toon-protocol/store`, `toon-protocol/gas-station` and `toon-protocol/gateway`
+# (the workload-gateway node) each name the connector image they run, in one
+# place in their own `deploy/` bundle, guarded there. All four nodes run on the
+# one devnet host (infra ADR 0001), each with its own connector, and a Hop
+# between two of them is still a real hop: two connectors, two binaries, one
+# payment channel. That decision is right — this repo has no legitimate write
+# path onto the host, and the retired promotion workflow was reporting
+# successful config-applies against a path nothing read.
 #
 # But retiring the promotion removed two things, and only one of them was meant.
 # The WRITE PATH went deliberately. The SIGNAL went with it: promotion used to
 # boot one candidate image against the fleet's committed configs, which is the
 # only moment anything ever asked whether the fleet agreed with itself. Since
-# then three repos choose a connector build independently and nothing notices
-# when they diverge — until a box misbehaves in a way that takes a human an
+# then four repos choose a connector build independently and nothing notices
+# when they diverge — until a node misbehaves in a way that takes a human an
 # afternoon to trace back to "these two are not on the same binary".
 #
 # This buys that signal back without buying back the write path. It is strictly
-# READ-ONLY and holds no credential: all four repos are public, so the three
+# READ-ONLY and holds no credential: all five repos are public, so the four
 # pins are read over plain HTTPS, and GHCR is asked with an anonymous pull
-# token. It writes to no box, dispatches no workflow, and moves no tag.
+# token. It writes to no host, dispatches no workflow, and moves no tag.
 #
 # ── WHAT IT ASSERTS ─────────────────────────────────────────────────────────
 #   1. Each pin is findable. A pin that cannot be parsed means the file moved
@@ -31,8 +34,8 @@
 #      404 turned into a hard job failure under `set -euo pipefail` instead
 #      of a comparison. The loudness fired exactly as designed; nobody read
 #      it for a month. See "WHERE EACH PIN LIVES" below.)
-#   2. All three name the SAME build. A claim accepted by one box against a
-#      channel another box's binary resolves differently is the shape of an
+#   2. All four name the SAME build. A claim accepted by one node against a
+#      channel another node's binary resolves differently is the shape of an
 #      afternoon lost.
 #   3. Each pin is IMMUTABLE. Ruling, 2026-09-23 (issue #125): a RELEASE
 #      HANDLE — `rust-<UTC-date>.<ordinal>`, e.g. `rust-2026.09.11.1`, exactly
@@ -48,16 +51,21 @@
 #      cannot pay for a peering it establishes — see ADR 0068's own note on
 #      the tag.
 #   4. Each pin is PULLABLE from GHCR. A pin to a tag that does not exist is a
-#      box that cannot come back from a restart, and nothing else would say so
+#      node that cannot come back from a restart, and nothing else would say so
 #      until it tried.
 #
 # ── WHERE EACH PIN LIVES ─────────────────────────────────────────────────────
-# As of 2026-09-23 all three node repos keep their pin the same way: a
+# As of 2026-09-25 all four node repos keep their pin the same way: a
 # mounted, published `ghcr.io/toon-protocol/connector:<tag>` image line in
-# their own `deploy/docker-compose.yml`, bumped by `adopt-connector-release.yml`
-# in that repo alongside the matching literal in that repo's own guard test
-# (relay: `deploy/bundle.test.ts`; store/gas-station: `src/deploy-bundle-
-# guard.test.ts`). Relay used to bake the connector into its own image via a
+# their own `deploy/docker-compose.yml`, alongside the matching literal in that
+# repo's own guard test (relay: `deploy/bundle.test.ts`; store/gas-station:
+# `src/deploy-bundle-guard.test.ts`; gateway: `deploy/bundle.test.mjs`). Relay,
+# store and gas-station are bumped by their own `adopt-connector-release.yml`;
+# the gateway has no such workflow yet, so its pin is bumped by hand — which is
+# exactly the pin most likely to be left behind, and why it is compared here
+# (toon-protocol/infra#25). The gateway's compose file also names its own app
+# image (`ghcr.io/toon-protocol/gateway:…`); only the `connector:` image line
+# is read. Relay used to bake the connector into its own image via a
 # `deploy/Dockerfile` `ARG CONNECTOR_TAG` default; that file is gone from
 # relay's `main` and hasn't been the pin of record for a while — this
 # workflow just kept reading the old path. If a repo's bundle changes shape
@@ -77,7 +85,7 @@
 # `needs:human` + `bug`, updated while the drift persists and closed by the
 # first green run. Daily, because a pin only moves when somebody merges a
 # deploy PR; this is not a race to beat anything, it bounds how long a split
-# fleet goes unnoticed.
+# devnet goes unnoticed.
 name: Fleet pin drift
 
 on:
@@ -98,7 +106,7 @@ concurrency:
 
 jobs:
   pins-agree:
-    name: The three node repos name one connector build
+    name: The four node repos name one connector build
     runs-on: ubuntu-latest
     steps:
       - name: Read each node repo's pin, and hold them to each other
@@ -110,31 +118,37 @@ jobs:
           set -euo pipefail
 
           # The pin of record in each repo. If this path 404s, the bundle
-          # moved and this check has to fail rather than quietly compare two
-          # — see "WHERE EACH PIN LIVES" above.
+          # moved and this check has to fail rather than quietly compare the
+          # rest — see "WHERE EACH PIN LIVES" above.
           fetch() {
             curl -fsSL --retry 3 --retry-delay 2 \
               "https://raw.githubusercontent.com/toon-protocol/$1/main/$2"
           }
 
-          # All three mount their config and pin the published image the same
-          # way, in deploy/docker-compose.yml's `connector:` service.
+          # All four mount their config and pin the published image the same
+          # way, in deploy/docker-compose.yml's `connector:` service. `|| true`:
+          # a fetch that fails is an unparsed pin, reported below, not a
+          # `set -e` exit before anything is compared (issue #125).
           pin_from_compose() {
-            fetch "$1" deploy/docker-compose.yml \
+            { fetch "$1" deploy/docker-compose.yml || true; } \
               | sed -n 's|^[[:space:]]*image:[[:space:]]*ghcr\.io/toon-protocol/connector:\([A-Za-z0-9._-]*\).*|\1|p' | head -1
           }
 
-          PIN_RELAY=$(pin_from_compose relay)
-          PIN_STORE=$(pin_from_compose store)
-          PIN_GAS=$(pin_from_compose gas-station)
+          # The node repos, in the order the summary lists them. Adding a node
+          # is one entry here.
+          REPOS=(relay store gas-station gateway)
+          declare -A PIN
+          for repo in "${REPOS[@]}"; do
+            PIN[$repo]=$(pin_from_compose "$repo")
+          done
 
-          echo "relay=${PIN_RELAY:-<unparsed>} store=${PIN_STORE:-<unparsed>} gas=${PIN_GAS:-<unparsed>}"
+          for repo in "${REPOS[@]}"; do printf '%s=%s ' "$repo" "${PIN[$repo]:-<unparsed>}"; done; echo
 
           FAILURES=""
           note() { FAILURES="${FAILURES}- $1"$'\n'; }
 
-          for pair in "relay:$PIN_RELAY" "store:$PIN_STORE" "gas-station:$PIN_GAS"; do
-            repo=${pair%%:*}; pin=${pair#*:}
+          for repo in "${REPOS[@]}"; do
+            pin=${PIN[$repo]}
             if [ -z "$pin" ]; then
               note "**$repo**: no connector pin could be parsed — the file moved, or the key was renamed. This check is blind until that is fixed."
               continue
@@ -153,36 +167,49 @@ jobs:
             esac
           done
 
-          if [ -n "$PIN_RELAY" ] && [ -n "$PIN_STORE" ] && [ -n "$PIN_GAS" ] \
-             && { [ "$PIN_RELAY" != "$PIN_STORE" ] || [ "$PIN_STORE" != "$PIN_GAS" ]; }; then
-            note "The three repos name **different** builds — relay \`$PIN_RELAY\`, store \`$PIN_STORE\`, gas-station \`$PIN_GAS\`. If a staged rollout is in progress this is expected and clears when the last repo lands."
+          # Agreement: every pin parsed, and exactly one distinct value.
+          PARSED=0; DISTINCT=""; LISTED=""
+          for repo in "${REPOS[@]}"; do
+            pin=${PIN[$repo]}
+            [ -n "$pin" ] || continue
+            PARSED=$((PARSED + 1))
+            LISTED="${LISTED:+$LISTED, }$repo \`$pin\`"
+            case " $DISTINCT " in *" $pin "*) ;; *) DISTINCT="${DISTINCT:+$DISTINCT }$pin" ;; esac
+          done
+          AGREED=""
+          if [ "$PARSED" -eq "${#REPOS[@]}" ]; then
+            if [ "$DISTINCT" = "${PIN[relay]}" ]; then
+              AGREED=$DISTINCT
+            else
+              note "The ${#REPOS[@]} repos name **different** builds — $LISTED. If a staged rollout is in progress this is expected and clears when the last repo lands."
+            fi
           fi
 
-          # A pin nobody can pull is a box that cannot come back from a
+          # A pin nobody can pull is a node that cannot come back from a
           # restart. Anonymous pull token — the package is public.
-          for pair in "relay:$PIN_RELAY" "store:$PIN_STORE" "gas-station:$PIN_GAS"; do
-            repo=${pair%%:*}; pin=${pair#*:}
+          for repo in "${REPOS[@]}"; do
+            pin=${PIN[$repo]}
             [ -z "$pin" ] && continue
             TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository%3Atoon-protocol%2Fconnector%3Apull" | jq -r .token)
             CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X GET \
               -H "Authorization: Bearer $TOKEN" \
               -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
               "https://ghcr.io/v2/toon-protocol/connector/manifests/$pin" || echo 000)
-            [ "$CODE" = "200" ] || note "**$repo**'s pin \`$pin\` is not pullable from GHCR (HTTP \`$CODE\`). A box on this pin cannot be recreated."
+            [ "$CODE" = "200" ] || note "**$repo**'s pin \`$pin\` is not pullable from GHCR (HTTP \`$CODE\`). A node on this pin cannot be recreated."
           done
 
           # ── Informational: how far behind main, and does it matter ────────
           BEHIND_NOTE=""
-          if [ -n "$PIN_RELAY" ] && [ "$PIN_RELAY" = "$PIN_STORE" ] && [ "$PIN_STORE" = "$PIN_GAS" ]; then
+          if [ -n "$AGREED" ]; then
             # A sha pin compares by that sha directly. A release-handle pin
             # compares by the handle itself: release-connector.yml's `gh
             # release create "$HANDLE" --target "$SHA"` leaves a git tag
             # named exactly the handle (no `rust-` prefix) on the released
             # commit, so `rust-2026.09.11.1` -> tag `2026.09.11.1`, both valid
             # refs for the compare API.
-            case "$PIN_RELAY" in
-              rust-sha-*) SHA=${PIN_RELAY#rust-sha-} ;;
-              rust-*) SHA=${PIN_RELAY#rust-} ;;
+            case "$AGREED" in
+              rust-sha-*) SHA=${AGREED#rust-sha-} ;;
+              rust-*) SHA=${AGREED#rust-} ;;
               *) SHA="" ;;
             esac
             if CMP=$(gh api "repos/${{ github.repository }}/compare/$SHA...main" 2>/dev/null); then
@@ -206,9 +233,9 @@ jobs:
             echo ""
             echo "| repo | pin | source of record |"
             echo "| --- | --- | --- |"
-            echo "| relay | \`${PIN_RELAY:-—}\` | \`deploy/docker-compose.yml\` |"
-            echo "| store | \`${PIN_STORE:-—}\` | \`deploy/docker-compose.yml\` |"
-            echo "| gas-station | \`${PIN_GAS:-—}\` | \`deploy/docker-compose.yml\` |"
+            for repo in "${REPOS[@]}"; do
+              echo "| $repo | \`${PIN[$repo]:-—}\` | \`deploy/docker-compose.yml\` |"
+            done
             echo ""
             [ -n "$BEHIND_NOTE" ] && { echo "$BEHIND_NOTE"; echo ""; }
           } > /tmp/summary.md
@@ -226,17 +253,17 @@ jobs:
           if [ -z "$FAILURES" ]; then
             if [ -n "$EXISTING" ]; then
               gh issue comment "$EXISTING" --repo "${{ github.repository }}" --body \
-                "✅ Recovered — the three repos agree again, on \`$PIN_RELAY\`, in [this run]($RUN_URL). Closing; a later divergence opens a fresh alert."
+                "✅ Recovered — the ${#REPOS[@]} repos agree again, on \`$AGREED\`, in [this run]($RUN_URL). Closing; a later divergence opens a fresh alert."
               gh issue close "$EXISTING" --repo "${{ github.repository }}" --reason completed
               echo "Closed alert #$EXISTING."
             fi
-            echo "Pins agree: ${PIN_RELAY}."
+            echo "Pins agree: ${AGREED}."
             exit 0
           fi
 
           BODY=/tmp/alert-body.md
           {
-            echo "The three node repositories that deploy this connector do not agree on one build."
+            echo "The ${#REPOS[@]} node repositories that deploy this connector do not agree on one build."
             echo ""
             echo "**Run:** $RUN_URL"
             echo ""
@@ -247,17 +274,19 @@ jobs:
             echo ""
             echo "### Fixing it"
             echo ""
-            echo "Each repo owns its own pin (ADR 0068 — nothing in this repository moves a tag onto a box),"
+            echo "Each repo owns its own pin (ADR 0068 — nothing in this repository moves a tag onto a node),"
             echo "at \`deploy/docker-compose.yml\`'s \`connector:\` service. Bump it by a reviewed commit that"
             echo "changes that image line **and** the matching literal in that repo's own guard test —"
-            echo "\`adopt-connector-release.yml\` does this unattended when the connector cuts a release. The"
-            echo "box applies a merged bump itself, on its own timer (\`deploy/auto-apply.sh\`); nothing here,"
-            echo "and nothing in the node repo's CI, ever pushes to a box:"
+            echo "\`adopt-connector-release.yml\` does this unattended when the connector cuts a release, in"
+            echo "relay, store and gas-station; the gateway has no such workflow, so bump"
+            echo "\`toon-protocol/gateway\`'s pin and \`deploy/bundle.test.mjs\` by hand. Each node applies a"
+            echo "merged bump itself, on its own timer on the devnet host (\`deploy/auto-apply.sh\`); nothing"
+            echo "here, and nothing in the node repo's CI, ever pushes to the host:"
             echo ""
             echo '```sh'
-            echo '# On the box, applied automatically by deploy/auto-apply.sh — shown here for a manual check:'
-            echo 'cd /root/<relay|store|gas-station> && git pull --ff-only'
-            echo '[ -x deploy/render.sh ] && (cd deploy && ./render.sh)   # store, gas-station only'
+            echo '# On the host, applied automatically by deploy/auto-apply.sh — shown here for a manual check:'
+            echo 'cd /root/<relay|store|gas-station|gateway> && git pull --ff-only'
+            echo '[ -x deploy/render.sh ] && (cd deploy && ./render.sh)   # store, gas-station, gateway'
             echo 'cd deploy && docker compose pull && docker compose up -d'
             echo '```'
             echo ""
