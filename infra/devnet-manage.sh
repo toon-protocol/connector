@@ -16,6 +16,17 @@
 # public Solana devnet); see infra/linode/endpoints.json's
 # own note. Recreating them here would be a live footgun (issue #819), not a
 # restoration, so they are gone from this file too.
+#
+# STALE AS OF 2026-09-25 (toon-protocol/infra#25): the store box this
+# describes is gone. Store, gas-station and workload-gateway nodes, plus the
+# faucet, were consolidated onto the `relay` box itself — now the devnet's
+# one host, running an edge (toon-protocol/infra `edge/deploy`) in front of
+# all of them. `./devnet-manage.sh store`/`up`/`destroy` below still
+# provision or delete a SEPARATE store Linode; running them now creates or
+# destroys a box that plays no part in the deployed devnet. They are left
+# as-is (not redesigned) for reference and manual disaster recovery; do not
+# run `up`, `store` or `destroy` against the live devnet without checking
+# `toon-protocol/infra`'s `docs/devnet.md` first.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #   ./devnet-manage.sh up        Provision the store/relay boxes + DNS
 #   ./devnet-manage.sh store     Provision + DNS ONLY the store (DVM) box
@@ -102,8 +113,12 @@ declare -A NODE_LABELS=( [store]=ario [relay]=relay [faucet]=faucet )
 # serving two HTTP drip routes, measured the same day at 99MB resident and
 # 6.2GB of disk. It was sized to match the connector boxes only because its
 # Mina leg compiled zk circuits at boot and needed the memory to do it; ADR
-# 0065 deleted that leg, and the plan with it. The relay has NOT been measured
-# and stays on g6-standard-2 until it is.
+# 0065 deleted that leg, and the plan with it. By the time of the infra#25
+# devnet audit (2026-09-25) the relay had also become a g6-nanode-1 — this
+# map's g6-standard-2 was stale — and it stayed one: the relay's box is now
+# the devnet's one host (infra#25), and cutover memory measurements showed
+# the whole fleet (every connector at 2-7MB idle, the apps at 28-92MB apiece)
+# fits in about 600MB of the nanode's 961MB, so it was never resized.
 #
 # NOTE: create_box returns early if a box with the label already exists, so
 # changing a value here does NOT resize a live box. `./devnet-manage.sh
@@ -113,7 +128,7 @@ declare -A NODE_LABELS=( [store]=ario [relay]=relay [faucet]=faucet )
 # generic command to do. Resizing the store is still a hand-made Linode API
 # call (POST /linode/instances/<id>/resize with allow_auto_disk_resize) against
 # a box whose disk usage already fits the smaller plan.
-declare -A NODE_TYPES=(  [store]=g6-nanode-1 [relay]=g6-standard-2 [faucet]=g6-nanode-1 )
+declare -A NODE_TYPES=(  [store]=g6-nanode-1 [relay]=g6-nanode-1 [faucet]=g6-nanode-1 )
 # Root passwords are GENERATED PER CREATE and thrown away — never committed,
 # never printed, never reused. Nothing needs them: every path into a box in this
 # file is `ssh -i "$SSH_KEY"` (see ssh_run below), and infra/harden-ssh.sh turns
