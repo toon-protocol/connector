@@ -1,6 +1,6 @@
 # A client may pay over an x402 batch-settlement channel, and only a client
 
-**Status:** Proposed (issue #1329). Not accepted, not live, and nothing in `crates/` implements it. What would make it true: the owner accepts the decisions below, **and** the one prerequisite still open under "Prerequisites" is settled against a live deposit on Base Sepolia. On acceptance it **amends** [0059](0059-a-channel-is-derived-from-its-participants.md) (a client-edge exception to one-live-channel-per-pair), [0005](0005-claims-are-truth-balances-are-a-projection.md) (a second freshness rule for the journal to hold), `client-edge-spec.md` §1.3 (its freshness step, and step 5's rule that a cached deposit is a lower bound, which is false for a channel a payer can withdraw from) and `CONTEXT.md`'s **Claim**, **Nonce** and **Watermark**, whose new text is under "Glossary on acceptance" below. It **extends** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) with a second claim scheme per chain, and it disturbs [0021](0021-vectors-are-normative-prose-is-not.md), because `schema_version` goes to **6**. It leaves [0022](0022-a-connector-answers-it-does-not-announce.md)'s deferral of paying over HTTP exactly where it is. Until acceptance, the other records' Status lines and the glossary are deliberately left alone: a Proposed record binds nothing, so it amends nothing yet.
+**Status:** Proposed (issue #1329). Not accepted, not live, and nothing in `crates/` implements it. What would make it true: the owner accepts the decisions below. All three prerequisites are now settled; the last was closed by a live deposit on Base Sepolia on 2026-09-25. On acceptance it **amends** [0059](0059-a-channel-is-derived-from-its-participants.md) (a client-edge exception to one-live-channel-per-pair), [0005](0005-claims-are-truth-balances-are-a-projection.md) (a second freshness rule for the journal to hold), `client-edge-spec.md` §1.3 (its freshness step, and step 5's rule that a cached deposit is a lower bound, which is false for a channel a payer can withdraw from) and `CONTEXT.md`'s **Claim**, **Nonce** and **Watermark**, whose new text is under "Glossary on acceptance" below. It **extends** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) with a second claim scheme per chain, and it disturbs [0021](0021-vectors-are-normative-prose-is-not.md), because `schema_version` goes to **6**. It leaves [0022](0022-a-connector-answers-it-does-not-announce.md)'s deferral of paying over HTTP exactly where it is. Until acceptance, the other records' Status lines and the glossary are deliberately left alone: a Proposed record binds nothing, so it amends nothing yet.
 
 **Scope:** protocol law. It binds every implementation, because it adds a claim scheme to the wire and an offer to the greeting. The watchers and sweeps in decision 5 and the port shape in decision 9 are connector architecture. See the [ADR index](README.md).
 
@@ -351,7 +351,7 @@ co-sign as fee payer and `rent_payer`.
      watermark starts at zero whatever the facilitator saw. The facilitator gains no claimable power
      from holding that voucher, because `receiverAuthorizer` is the connector's (decision 5).
 2. **Does a hosted facilitator accept `batch-settlement` deposits on Base Sepolia for an arbitrary
-   `payTo`? Confirmed in part.**
+   `payTo`? Confirmed, by a live deposit.**
    - `GET https://x402.org/facilitator/supported` lists `{"scheme":"batch-settlement","network":"eip155:84532"}`
      (read live, 2026-09-24). It advertises no `receiverAuthorizer`, and it does not list Base
      mainnet.
@@ -359,10 +359,32 @@ co-sign as fee payer and `rent_payer`.
      authentication.
    - The protocol requires only `channel.receiver == payTo` (`scheme_batch_settlement_evm.md#L498`),
      and neither facilitator documents an allowlist.
-   - **Still open, and what keeps this record Proposed:** a live deposit through x402.org's
-     facilitator with `payTo` set to a devnet connector's address. If that is refused, the devnet
-     runs its own facilitator (toon-protocol/infra#23), and nothing in this record changes. The
-     local sandbox already runs one; this question is about the hosted one only.
+   - **Run on 2026-09-25.** A deposit went through x402.org's facilitator on Base Sepolia:
+     - **payer:** a fresh wallet;
+     - **`payTo` and `receiverAuthorizer`:** a second fresh address the facilitator had never seen;
+     - **token:** the devnet's own mock USDC, `0x49beE1Bc…a9Ce`.
+
+     The result:
+     - `/verify` and `/settle` both succeeded.
+     - Transaction `0x54e792b8…d7a5` in block 47284845 was sent **from x402.org's signer**
+       (`0xd407e409…f1bf`) to `x402BatchSettlement`, so the facilitator paid the deposit's gas.
+     - Channel `0x25712fc6…a8ec` holds 1,000,000 base units on chain.
+
+     No allowlist, screening or registration stood in the way of the arbitrary `payTo` or the
+     unfamiliar token.
+
+   - **One caveat, found on the way.** The mock USDC has no ERC-3009 and no EIP-2612, so a
+     deposit takes the Permit2 path, which needs a one-time `approve` from the payer. x402.org
+     advertises `erc20ApprovalGasSponsoring`: fund the payer's gas, then broadcast its signed
+     approval. On the first attempt it broadcast the approval **without funding it**, and `/settle`
+     failed with `invalid_batch_settlement_evm_deposit_transaction_failed` (insufficient funds).
+     The deposit above succeeded only after the payer approved Permit2 itself, for 0.00000028 ETH
+     of Base Sepolia gas.
+
+     So on x402.org, a deposit is fully gasless only for an ERC-3009 token. The devnet runs its
+     own facilitator anyway (toon-protocol/infra#23); that one must fund the approval itself if it
+     is to offer gasless deposits of the devnet's mock USDC.
+
 3. **Every power of the Solana `payee` / sponsor seat. Confirmed from the program.** The full list
    is under decision 5. `payee` signs only `settle_and_seal`. `rent_payer` has no signing power
    after open. Neither can move money anywhere but to addresses fixed at open.
