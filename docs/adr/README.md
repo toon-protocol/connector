@@ -1,6 +1,6 @@
 # Architecture decision records
 
-72 records. **Every one now carries a `**Status:**` line under its title** — that line, not this
+73 records. **Every one now carries a `**Status:**` line under its title** — that line, not this
 index, is the authority for whether a record is live. This page is the map: what is live, grouped
 by area; what is dead, grouped by what killed it; and what the folder still says that the code no
 longer does.
@@ -17,7 +17,7 @@ The numbers are permanent and are never reused or renumbered — they are cited 
 times across this repo and from `toon-meta`, `relay` and `store`. This index groups them by
 scope; it does not move them.
 
-> **0065 is taken twice, and stays that way.** Seventy-three records, seventy-two numbers.
+> **0065 is taken twice, and stays that way.** Seventy-four records, seventy-three numbers.
 > [_A price is a schedule over payload length_](0065-a-price-is-a-schedule-over-payload-length.md)
 > (#984) and [_Mina leaves the repository_](0065-mina-leaves-the-repository.md) (#1205) were both
 > written on branches cut while 0064 was the folder's highest number, and both landed on `main` on
@@ -153,6 +153,7 @@ outside this repository.
 | [0027](0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md) | Connectors peer over BTP or ILP-over-HTTP; the raw-TCP peer wire is deleted | Accepted — supersedes 0003's and 0026's peer halves; extended by 0070                                                      |
 | [0060](0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)             | A claim proves a peering; the shared secret is deleted                      | Accepted — **built** (#1157); finished #868; vectors at schema 4                                                           |
 | [0070](0070-an-onion-address-is-a-host-not-a-carriage.md)                             | An onion address is a host, not a carriage                                  | Accepted — **built** (#1273), amended in place by #1284 (`.anyone` is a host too); extends 0027; narrows 0004 in one place |
+| [0073](0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md)  | Settlement RPC may ride the circuit, once every wait on it is bounded       | **Proposed** — TOON_Network#167, awaiting decision; would amend 0070 decision 4                                            |
 | [0021](0021-vectors-are-normative-prose-is-not.md)                                    | Vectors are normative; prose is not                                         | Accepted — **the tiebreaker for this whole group**                                                                         |
 | [0045](0045-a-behavioural-rule-is-normative-prose-until-its-vector-lands.md)          | A behavioural rule is normative prose until its vector lands                | Accepted — **not yet built**; amends 0021; amended by #1052                                                                |
 | [0023](0023-oer-length-determinants-are-canonical.md)                                 | OER length determinants are canonical, for every consumer                   | Accepted                                                                                                                   |
