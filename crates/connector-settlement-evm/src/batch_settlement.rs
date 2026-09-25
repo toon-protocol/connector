@@ -34,10 +34,12 @@
 //! process lifetime. Nothing else is cached: every figure a
 //! [`BatchChannelState`] reports is read from the chain when asked, because
 //! collateral **falls** when a payer initiates a withdrawal (decision 5).
-//! After a restart a channel must be admitted again from its config before
-//! it can be landed on: the client edge journals each channel's config with
-//! its first accepted voucher, and the runtime re-admits every journaled
-//! channel at boot.
+//! After a restart a channel must be presented again before it can be landed
+//! on: the client edge journals each channel's config with its first
+//! accepted voucher, and the runtime **restores** every journaled channel at
+//! boot -- recomputing its id and reading it, but judging no admission rule,
+//! so a policy tightened across the restart never strands a voucher already
+//! accepted (ADR 0074 decision 5). New vouchers still need `admit`.
 //!
 //! # Reads are one snapshot
 //!
@@ -94,9 +96,9 @@ pub struct EvmBatchSettlementBackend {
     pub(crate) client: Arc<EvmClient>,
     pub(crate) sender: Arc<Sender>,
     pub(crate) confirm: ConfirmPolicy,
-    /// Every channel admitted, by its canonical id, with the config it was
-    /// admitted under. See the module doc for why this is the one thing
-    /// kept.
+    /// Every channel admitted or restored, by its canonical id, with the
+    /// config it was presented under. See the module doc for why this is
+    /// the one thing kept.
     admitted: Mutex<HashMap<ChannelId, EvmChannelConfig>>,
 }
 
@@ -194,8 +196,8 @@ impl EvmBatchSettlementBackend {
         self.min_withdraw_delay_secs
     }
 
-    /// The config `channel` was admitted under, if it has been admitted in
-    /// this process. The voucher signer is
+    /// The config `channel` was admitted or restored under, if it has been
+    /// in this process. The voucher signer is
     /// `connector_signer::evm_voucher_signer` of it.
     pub fn admitted_config(&self, channel: &ChannelId) -> Option<EvmChannelConfig> {
         self.admitted().get(channel).cloned()
@@ -266,6 +268,40 @@ impl EvmBatchSettlementBackend {
         }
     }
 
+    /// The channel `presentation` names, once it is shown to be an EVM
+    /// presentation whose config derives the id it came with, and to exist
+    /// on chain: its canonical id, its config and one reading of it. What
+    /// both `admit` and `restore` check before anything else.
+    async fn locate(
+        &self,
+        presentation: ChannelPresentation,
+    ) -> Result<(ChannelId, EvmChannelConfig, Snapshot), BatchSettlementError> {
+        let ChannelPresentation::Evm { channel, config } = presentation else {
+            return Err(BatchSettlementError::WrongChain {
+                presented: presentation.chain(),
+                backend: "evm",
+            });
+        };
+        let id = evm_batch_channel_id(&self.domain, &signer_config(&config));
+        let canonical = format_channel_id(id);
+        if parse_id(&channel) != Some(id) {
+            return Err(BatchSettlementError::ChannelIdMismatch {
+                presented: channel,
+                derived: canonical,
+            });
+        }
+
+        let snapshot = self.snapshot(id).await?;
+        // A channel is created by its first deposit and holds a balance
+        // until everything unclaimed is withdrawn; one that never held
+        // anything, or was emptied with nothing ever claimed, is nothing
+        // this node could be paid on.
+        if snapshot.balance == 0 && snapshot.total_claimed == 0 {
+            return Err(BatchSettlementError::ChannelNotFound(canonical));
+        }
+        Ok((canonical, config, snapshot))
+    }
+
     /// The rules of ADR 0074 decision 2 this node fixes, in the order the
     /// record lists them; the first broken one is the refusal.
     async fn judge(
@@ -312,35 +348,27 @@ impl BatchSettlementBackend for EvmBatchSettlementBackend {
         &self,
         presentation: ChannelPresentation,
     ) -> Result<BatchChannelState, BatchSettlementError> {
-        let ChannelPresentation::Evm { channel, config } = presentation else {
-            return Err(BatchSettlementError::WrongChain {
-                presented: presentation.chain(),
-                backend: "evm",
-            });
-        };
-        let id = evm_batch_channel_id(&self.domain, &signer_config(&config));
-        let canonical = format_channel_id(id);
-        if parse_id(&channel) != Some(id) {
-            return Err(BatchSettlementError::ChannelIdMismatch {
-                presented: channel,
-                derived: canonical,
-            });
-        }
-
-        let snapshot = self.snapshot(id).await?;
-        // A channel is created by its first deposit and holds a balance
-        // until everything unclaimed is withdrawn; one that never held
-        // anything, or was emptied with nothing ever claimed, is nothing
-        // this node could be paid on.
-        if snapshot.balance == 0 && snapshot.total_claimed == 0 {
-            return Err(BatchSettlementError::ChannelNotFound(canonical));
-        }
+        let (canonical, config, snapshot) = self.locate(presentation).await?;
         if let Some(refusal) = self.judge(&config).await? {
             return Err(BatchSettlementError::NotAdmissible {
                 channel: canonical,
                 refusal,
             });
         }
+        let state = self.state(&canonical, &config, &snapshot);
+        self.admitted().insert(canonical, config);
+        Ok(state)
+    }
+
+    /// [`admit`](Self::admit) without [`judge`](Self::judge): the id is
+    /// still recomputed from the presented config and the channel still read
+    /// from the chain, because `claim` sends that config and a wrong one
+    /// reverts.
+    async fn restore(
+        &self,
+        presentation: ChannelPresentation,
+    ) -> Result<BatchChannelState, BatchSettlementError> {
+        let (canonical, config, snapshot) = self.locate(presentation).await?;
         let state = self.state(&canonical, &config, &snapshot);
         self.admitted().insert(canonical, config);
         Ok(state)

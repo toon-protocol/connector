@@ -167,7 +167,7 @@ price = {PRICE}
         "both writes reached the app"
     );
 
-    // Journaled: the channel, with the config that re-admits it, and each
+    // Journaled: the channel, with the config that restores it, and each
     // voucher's signed bytes and watermark.
     let entries = FileJournal::open(state_dir.path().join(CLIENT_EDGE_JOURNAL))
         .expect("the client-edge journal")
@@ -220,7 +220,7 @@ price = {PRICE}
     let before = backend
         .channel_state(&channel)
         .await
-        .expect("re-admitted at boot, from the journal");
+        .expect("restored at boot, from the journal");
     assert_eq!(before.status, BatchChannelStatus::Open);
     assert_eq!(before.landed, 0);
 

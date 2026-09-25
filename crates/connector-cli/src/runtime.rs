@@ -45,7 +45,7 @@ use connector_signer::{
 };
 
 use crate::batch_settlement::{
-    readmit_journaled_channels, BatchSettlementChannelsAdapter, ClaimGateVouchers,
+    restore_journaled_channels, BatchSettlementChannelsAdapter, ClaimGateVouchers,
 };
 use crate::peer_transport;
 use ethers::types::U256;
@@ -1673,7 +1673,7 @@ pub struct Runtime {
     /// 0074), `Some` exactly when `[settlement.evm.batch_settlement]` is
     /// written. [`router`] hands it to the client edge's claim gate, which
     /// admits vouchers through it; every channel the client-edge journal
-    /// holds vouchers on is already re-admitted to it by the time [`build`]
+    /// holds vouchers on is already restored to it by the time [`build`]
     /// returns, so its `channel_state` and `land` work from the first
     /// packet. [`router`] also starts its watcher and sweep over it (issue
     /// #1344, `spawn_batch_settlement_watchers`).
@@ -2130,9 +2130,11 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         connector = connector.with_rate_table(table.clone());
     }
     // ADR 0074: every batch-settlement channel the client edge's journal
-    // holds vouchers on, admitted again before anything is served, so the
-    // port can land them after a restart. The journal is where an EVM
-    // channel's config survives one; the chain never gives it back.
+    // holds vouchers on, restored before anything is served, so the port
+    // can land them after a restart -- restored, not re-admitted, so a rule
+    // tightened since cannot strand a voucher already accepted (decision 5).
+    // The journal is where an EVM channel's config survives a restart; the
+    // chain never gives it back.
     if batch_settlement_evm.is_some() || batch_settlement_solana.is_some() {
         if let Some(state_dir) = config.state_dir() {
             let path = state_dir.join(CLIENT_EDGE_JOURNAL);
@@ -2145,7 +2147,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 .map_err(unreplayable)?;
             let channels =
                 connector_client_edge::journaled_batch_channels(&entries).map_err(unreplayable)?;
-            readmit_journaled_channels(
+            restore_journaled_channels(
                 &channels,
                 batch_settlement_evm
                     .as_deref()

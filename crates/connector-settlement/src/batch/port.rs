@@ -270,8 +270,9 @@ pub enum BatchSettlementError {
 
     /// [`BatchSettlementBackend::land`] or
     /// [`BatchSettlementBackend::channel_state`] on a channel this backend
-    /// has not admitted. On EVM `claim` needs the full config, which only
-    /// admission supplies, so this is structural rather than a policy.
+    /// has neither admitted nor restored. On EVM `claim` needs the full
+    /// config, which only a presentation supplies, so this is structural
+    /// rather than a policy.
     #[error("batch-settlement channel '{0}' has not been admitted")]
     ChannelNotAdmitted(ChannelId),
 
@@ -350,7 +351,35 @@ pub trait BatchSettlementBackend: Send + Sync {
         presentation: ChannelPresentation,
     ) -> Result<BatchChannelState, BatchSettlementError>;
 
-    /// The admitted channel's state, read from the chain now. Never answered
+    /// Bring back a channel this node **already holds vouchers on** -- one
+    /// admitted before a restart, whose presentation the client edge's
+    /// journal kept -- so [`channel_state`](Self::channel_state) and
+    /// [`land`](Self::land) work on it again, without judging it against
+    /// the admission rules.
+    ///
+    /// Admission policy decides which channels this node takes **new**
+    /// vouchers on. A voucher already accepted was paid for, and landing it
+    /// is what protects that value (ADR 0074 decision 5), so a policy
+    /// tightened across a restart -- a raised minimum delay -- must not
+    /// strand it. What is still checked is what makes landing safe at all:
+    /// the presentation is for this backend's chain
+    /// ([`WrongChain`](BatchSettlementError::WrongChain)), it names itself
+    /// consistently ([`ChannelIdMismatch`](BatchSettlementError::ChannelIdMismatch)),
+    /// and the chain can be read and holds the channel
+    /// ([`ChannelNotFound`](BatchSettlementError::ChannelNotFound)).
+    ///
+    /// Restoring is not admitting. Whether a new voucher may be accepted on
+    /// the channel is still [`admit`](Self::admit)'s to answer, now, under
+    /// this node's current rules; a caller that takes new vouchers asks it.
+    /// Restoring a channel already admitted or restored changes nothing but
+    /// returns its current state.
+    async fn restore(
+        &self,
+        presentation: ChannelPresentation,
+    ) -> Result<BatchChannelState, BatchSettlementError>;
+
+    /// The admitted or restored channel's state, read from the chain now.
+    /// Never answered
     /// from a cache: collateral can fall on EVM, and a watcher that has just
     /// seen `WithdrawInitiated` or a Solana close relies on this to see it.
     async fn channel_state(
@@ -358,7 +387,8 @@ pub trait BatchSettlementBackend: Send + Sync {
         channel: &ChannelId,
     ) -> Result<BatchChannelState, BatchSettlementError>;
 
-    /// Land `voucher` on the admitted `channel`, so its amount is recorded
+    /// Land `voucher` on the admitted or restored `channel`, so its amount
+    /// is recorded
     /// on chain in this node's favour: EVM `claim`; Solana `settle` while
     /// Open and `settle_and_seal` while Closing. Returns the state after.
     ///

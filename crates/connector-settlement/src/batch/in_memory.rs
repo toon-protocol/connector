@@ -288,36 +288,8 @@ impl BatchSettlementBackend for InMemoryBatchSettlement {
         &self,
         presentation: ChannelPresentation,
     ) -> Result<BatchChannelState, BatchSettlementError> {
-        if presentation.chain() != self.chain_name() {
-            return Err(BatchSettlementError::WrongChain {
-                presented: presentation.chain(),
-                backend: self.chain_name(),
-            });
-        }
-        let id = presentation.channel().clone();
+        let id = self.locate(&presentation)?;
         let chain = self.chain();
-        if let ChannelPresentation::Evm { config, .. } = &presentation {
-            // The real backend hashes the config and compares. The fake has
-            // no hash, so a config derives the id of the channel opened
-            // under it, and a config nothing was opened under derives an id
-            // that is not the presented one whenever the presented one
-            // exists (it was opened under a different config).
-            let derived = chain
-                .iter()
-                .find(|(_, stored)| stored.config.as_ref() == Some(config))
-                .map(|(derived, _)| derived.clone());
-            let mismatch = match &derived {
-                Some(derived) => *derived != id,
-                None => chain.contains_key(&id),
-            };
-            if mismatch {
-                return Err(BatchSettlementError::ChannelIdMismatch {
-                    presented: id,
-                    derived: derived
-                        .unwrap_or_else(|| ChannelId("an unopened channel".to_string())),
-                });
-            }
-        }
         let stored = chain
             .get(&id)
             .ok_or_else(|| BatchSettlementError::ChannelNotFound(id.clone()))?;
@@ -327,6 +299,21 @@ impl BatchSettlementBackend for InMemoryBatchSettlement {
                 refusal,
             });
         }
+        let state = self.state(&id, stored);
+        drop(chain);
+        self.admitted().insert(id);
+        Ok(state)
+    }
+
+    async fn restore(
+        &self,
+        presentation: ChannelPresentation,
+    ) -> Result<BatchChannelState, BatchSettlementError> {
+        let id = self.locate(&presentation)?;
+        let chain = self.chain();
+        let stored = chain
+            .get(&id)
+            .ok_or_else(|| BatchSettlementError::ChannelNotFound(id.clone()))?;
         let state = self.state(&id, stored);
         drop(chain);
         self.admitted().insert(id);
@@ -378,6 +365,50 @@ impl BatchSettlementBackend for InMemoryBatchSettlement {
         }
         let stored = &*stored;
         Ok(self.state(channel, stored))
+    }
+}
+
+impl InMemoryBatchSettlement {
+    /// The channel `presentation` names, once it is shown to be for this
+    /// chain and to name itself consistently: what both
+    /// [`admit`](BatchSettlementBackend::admit) and
+    /// [`restore`](BatchSettlementBackend::restore) check before anything
+    /// else.
+    fn locate(
+        &self,
+        presentation: &ChannelPresentation,
+    ) -> Result<ChannelId, BatchSettlementError> {
+        if presentation.chain() != self.chain_name() {
+            return Err(BatchSettlementError::WrongChain {
+                presented: presentation.chain(),
+                backend: self.chain_name(),
+            });
+        }
+        let id = presentation.channel().clone();
+        let chain = self.chain();
+        if let ChannelPresentation::Evm { config, .. } = presentation {
+            // The real backend hashes the config and compares. The fake has
+            // no hash, so a config derives the id of the channel opened
+            // under it, and a config nothing was opened under derives an id
+            // that is not the presented one whenever the presented one
+            // exists (it was opened under a different config).
+            let derived = chain
+                .iter()
+                .find(|(_, stored)| stored.config.as_ref() == Some(config))
+                .map(|(derived, _)| derived.clone());
+            let mismatch = match &derived {
+                Some(derived) => *derived != id,
+                None => chain.contains_key(&id),
+            };
+            if mismatch {
+                return Err(BatchSettlementError::ChannelIdMismatch {
+                    presented: id,
+                    derived: derived
+                        .unwrap_or_else(|| ChannelId("an unopened channel".to_string())),
+                });
+            }
+        }
+        Ok(id)
     }
 }
 

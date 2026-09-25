@@ -166,9 +166,9 @@ impl EvmBatchSettlementBackend {
     /// has, in as few `claim`s as [`MAX_CLAIM_ROWS`] allows. Returns the rows
     /// landed.
     ///
-    /// A voucher is claimed only on a channel this backend admits -- one it
-    /// has not admitted in this process is admitted first, from the
-    /// voucher's own presentation -- and only when its signature is the
+    /// A voucher is claimed only on a channel this backend knows -- one it
+    /// has not admitted or restored in this process is restored first, from
+    /// the voucher's own presentation -- and only when its signature is the
     /// channel's signer's: a bad row would revert every other row with it.
     /// Either failure skips that voucher, logged, and claims the rest.
     pub async fn claim_held(
@@ -285,20 +285,25 @@ impl EvmBatchSettlementBackend {
         Ok(due)
     }
 
-    /// The config `entry`'s channel was admitted under, admitting it now if
-    /// this process has not. `None`, logged, when it cannot be.
+    /// The config `entry`'s channel was presented under, **restoring** it
+    /// now if this process has neither admitted nor restored it. `None`,
+    /// logged, when it cannot be.
+    ///
+    /// Restored, never admitted: the voucher is already accepted, so the
+    /// admission rules -- which may have tightened since it was -- have no
+    /// say in whether it is claimed (ADR 0074 decision 5).
     async fn config_for(&self, entry: &HeldVoucher) -> Option<EvmChannelConfig> {
         let channel = entry.presentation.channel();
         if let Some(config) = self.admitted_config(channel) {
             return Some(config);
         }
-        match self.admit(entry.presentation.clone()).await {
+        match self.restore(entry.presentation.clone()).await {
             Ok(state) => self.admitted_config(&state.id),
             Err(error) => {
                 tracing::warn!(
                     %channel,
                     %error,
-                    "could not admit a batch-settlement channel this node holds a voucher on; \
+                    "could not restore a batch-settlement channel this node holds a voucher on; \
                      not claiming it this time"
                 );
                 None

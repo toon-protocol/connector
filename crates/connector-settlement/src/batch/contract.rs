@@ -175,6 +175,46 @@ where
         BatchSettlementError::ChannelNotAdmitted(unopened.channel().clone())
     );
 
+    // -- Restoring (ADR 0074 decision 5) --
+
+    // A channel this node already holds a voucher on is restored for
+    // landing without being judged: a policy tightened across a restart
+    // must not strand a voucher already accepted. The short-delay channel
+    // stands in for one admitted under a laxer minimum.
+    let held_on = short_delay.presentation.channel().clone();
+    let state = backend
+        .restore(short_delay.presentation.clone())
+        .await
+        .expect("restoring judges no admission rule");
+    assert_eq!(state.id, held_on);
+    assert_eq!(state.landed, 0);
+    let state = backend
+        .land(&held_on, voucher(&sign, &held_on, 100))
+        .await
+        .expect("a voucher held on a restored channel lands");
+    assert_eq!(state.landed, 100);
+    assert_eq!(
+        backend.channel_state(&held_on).await.expect("state").landed,
+        100
+    );
+
+    // Restoring is not admitting: the rules still refuse the channel for
+    // new vouchers.
+    assert_eq!(
+        refusal(backend.admit(short_delay.presentation.clone()).await),
+        AdmissionRefusal::DelayBelowMinimum {
+            delay_secs: minimum_delay_secs - 1,
+            minimum_secs: minimum_delay_secs,
+        }
+    );
+
+    // What makes landing possible at all is still checked: a channel that is
+    // not there is not restored.
+    assert_eq!(
+        backend.restore(unopened.clone()).await.unwrap_err(),
+        BatchSettlementError::ChannelNotFound(unopened.channel().clone())
+    );
+
     // A channel that meets every rule is admitted -- its delay is exactly
     // the minimum, which is "at least", not "more than" -- and reports
     // itself as the chain has it: open, nothing landed, its whole deposit

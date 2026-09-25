@@ -66,8 +66,8 @@ const CHAIN: &str = "solana";
 /// publishes as `payTo` (decision 8).
 ///
 /// Holds no channel ledger. Every answer is read from the chain; the only
-/// local memory is which channels have been admitted, because the port
-/// requires admission before [`channel_state`](BatchSettlementBackend::channel_state)
+/// local memory is which channels have been admitted or restored, because
+/// the port requires one of the two before [`channel_state`](BatchSettlementBackend::channel_state)
 /// and [`land`](BatchSettlementBackend::land).
 pub struct SolanaBatchSettlement {
     rpc: RpcClient,
@@ -255,16 +255,7 @@ fn vet(
     mint: &Pubkey,
     min_grace_period_secs: u64,
 ) -> Result<BatchChannelState, BatchSettlementError> {
-    // The account's bytes are only the channel's word for itself until its
-    // own seeds derive the address it lives at (X402 SVM spec
-    // `#L1379-L1385`).
-    let derived = account.derive_address(program_id);
-    if derived != *address {
-        return Err(BatchSettlementError::ChannelIdMismatch {
-            presented: channel.clone(),
-            derived: ChannelId(derived.to_string()),
-        });
-    }
+    at_its_own_address(channel, address, account, program_id)?;
     if let Some(refusal) = admission_refusal(account, sponsor, mint, min_grace_period_secs) {
         return Err(BatchSettlementError::NotAdmissible {
             channel: channel.clone(),
@@ -272,6 +263,25 @@ fn vet(
         });
     }
     Ok(state_of(channel, account))
+}
+
+/// Refuse `account` unless its own seeds derive `address`: its bytes are
+/// only the channel's word for itself until they do (X402 SVM spec
+/// `#L1379-L1385`). Checked by admission and by restoring alike.
+fn at_its_own_address(
+    channel: &ChannelId,
+    address: &Pubkey,
+    account: &wire::ChannelAccount,
+    program_id: &Pubkey,
+) -> Result<(), BatchSettlementError> {
+    let derived = account.derive_address(program_id);
+    if derived != *address {
+        return Err(BatchSettlementError::ChannelIdMismatch {
+            presented: channel.clone(),
+            derived: ChannelId(derived.to_string()),
+        });
+    }
+    Ok(())
 }
 
 /// The first rule of ADR 0074 decision 2 that `account` breaks, in the
@@ -364,6 +374,27 @@ impl BatchSettlementBackend for SolanaBatchSettlement {
         let state = self.vet(&channel, &address, &account)?;
         self.admitted().insert(address);
         Ok(state)
+    }
+
+    /// [`admit`](BatchSettlementBackend::admit) without the admission rules:
+    /// the account is still read and still trusted only at the address its
+    /// own seeds derive. A Closing channel restores, since landing on it is
+    /// exactly what a held voucher needs.
+    async fn restore(
+        &self,
+        presentation: ChannelPresentation,
+    ) -> Result<BatchChannelState, BatchSettlementError> {
+        let ChannelPresentation::Solana { channel } = presentation else {
+            return Err(BatchSettlementError::WrongChain {
+                presented: presentation.chain(),
+                backend: CHAIN,
+            });
+        };
+        let address = address_of(&channel)?;
+        let account = self.read_existing(&channel, &address).await?;
+        at_its_own_address(&channel, &address, &account, &self.program_id)?;
+        self.admitted().insert(address);
+        Ok(state_of(&channel, &account))
     }
 
     /// Read from the chain now. A channel whose account `distribute` or

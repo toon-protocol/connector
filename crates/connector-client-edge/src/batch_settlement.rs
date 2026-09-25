@@ -24,7 +24,7 @@
 //! [`JournalEntry::BatchChannelAdmitted`], in the same batch as the voucher,
 //! and [`journaled_batch_channels`] reads them back: the gate, to hand a
 //! known channel's config to [`BatchSettlementChannels::evm`] when a later
-//! voucher carries none, and the runtime, to re-admit every such channel to
+//! voucher carries none, and the runtime, to restore every such channel to
 //! its backend at boot.
 //!
 //! # What an implementation owes
@@ -109,7 +109,7 @@ pub trait BatchSettlementChannels: Send + Sync + std::fmt::Debug {
 }
 
 /// A batch-settlement channel the client edge has accepted a voucher on, as
-/// its journal records it: enough to re-admit the channel to its backend
+/// its journal records it: enough to restore the channel to its backend
 /// (ADR 0074 decision 2) without the client presenting anything again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JournaledBatchChannel {

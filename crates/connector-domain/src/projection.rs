@@ -100,7 +100,7 @@ pub enum JournalEntry {
     /// The client edge accepted its first voucher on the x402
     /// `batch-settlement` channel `channel_id` (ADR 0074): the canonical
     /// `evm:0x…` or `solana:…` key its watermark is filed under.
-    /// `presentation` is what re-admits the channel to its settlement
+    /// `presentation` is what restores the channel to its settlement
     /// backend after a restart, carried opaque as `InboundClaimAccepted`'s
     /// signature is: on EVM the channel's `ChannelConfig`, which the
     /// contract stores only as a hash and a voucher signs only as that
