@@ -10,7 +10,10 @@
 //! and a client edge claim's chain-native wallet signature (issue #506) go
 //! through [`verify_evm_balance_proof`]/[`verify_solana_balance_proof`],
 //! neither needing key material of its own, only the public key or address
-//! a channel's counterparty is already known by. [`verify`] is unrelated to
+//! a channel's counterparty is already known by. An x402 `batch-settlement`
+//! voucher (ADR 0074, issue #1341) is verified here too, through its own
+//! [`verify_evm_voucher`]/[`verify_solana_voucher`] and [`VoucherSignature`]
+//! -- a second claim scheme, never a variant of the first. [`verify`] is unrelated to
 //! either: it is the `Signer` contract suite's own "a signature recovers to
 //! its signer's own public key" check (`src/contract.rs`).
 //!
@@ -46,6 +49,7 @@ mod kms;
 mod local;
 pub mod nip59;
 mod signer;
+mod voucher_signature;
 
 pub use address::{derive_evm_address, to_hex, Address};
 pub use claim_signature::{
@@ -63,6 +67,12 @@ pub use kms::{InMemoryKmsBackend, KmsBackend, KmsSigner};
 pub use local::LocalSigner;
 pub use nip59::{unwrap_claim, wrap_claim, Nip59Error, WrappedClaim};
 pub use signer::{verify, PublicKeyBytes, Signature, Signer};
+pub use voucher_signature::{
+    evm_batch_channel_id, evm_voucher_digest, evm_voucher_signer, solana_voucher_message,
+    verify_evm_voucher, verify_solana_voucher, BatchChannelConfig, BatchSettlementDomain,
+    VoucherSignature, SOLANA_VOUCHER_PREFIX, X402_BATCH_SETTLEMENT_ADDRESS,
+    X402_BATCH_SETTLEMENT_EIP712_NAME, X402_BATCH_SETTLEMENT_EIP712_VERSION,
+};
 
 #[cfg(test)]
 mod contract;

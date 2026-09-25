@@ -54,7 +54,8 @@ connector-domain                 pure logic: no async, no I/O, no clock, no keys
   │                               schedule over payload length, flat when its slope
   │                               is zero (ADR 0065)
   ├─ condition.rs                condition / fulfilment / expiry rules
-  ├─ claim.rs, client_claim.rs   nonce, watermark and value rules (ADR 0004, ADR 0005)
+  ├─ claim.rs, client_claim.rs   nonce, watermark and value rules (ADR 0004, ADR 0005),
+  │                               and a voucher's amount-only watermark (ADR 0074)
   ├─ projection.rs               balances folded from journal entries (ADR 0005)
   ├─ envelope.rs                 the request/response envelope a terminated packet
   │                               carries to and from the app (ADR 0018)
@@ -68,6 +69,7 @@ connector-signer                 the only crate that touches key material
   ├─ giftwrap.rs                 seal/open, and the derived fulfilment (ADR 0018, ADR 0019)
   ├─ claim_signature.rs          EIP-712 and Ed25519 balance-proof verification
   │                               (ADR 0024, ADR 0053)
+  ├─ voucher_signature.rs        x402 batch-settlement voucher verification (ADR 0074)
   ├─ claim_state_challenge.rs    "prove you hold this channel", moving no value
   ├─ nip59.rs                    the wrapped-claim transport-privacy envelope
   └─ contract.rs                 the `Signer` contract suite
