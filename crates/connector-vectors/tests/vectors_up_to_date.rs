@@ -288,6 +288,12 @@ fn the_committed_voucher_vectors_replay_against_the_real_implementation() {
                     "case {name}: {result:?}"
                 );
             }
+            "underpayment" => {
+                assert!(
+                    matches!(result, Err(ClaimError::Underpayment { .. })),
+                    "case {name}: {result:?}"
+                );
+            }
             other => panic!("case {name}: unknown outcome tag {other:?}"),
         }
     }

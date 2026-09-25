@@ -555,7 +555,7 @@ signature_base58, json }`. `signed_message_hex` is payment-channels' 50-byte vou
   Solana, unlike EVM's hex -- the same convention `peer_carriage.claim_solana` uses.
 
 - **`amount_only_watermark[]`** -- `{ name, watermark_amount, watermark_signature_hex,
-presented_amount, presented_signature_hex, charge, outcome, advanced }`: the three outcomes of
+presented_amount, presented_signature_hex, charge, outcome, advanced }`: the outcomes of
   [`connector_domain::validate_voucher`], the amount-only rule a voucher's freshness is judged by
   in place of a `toon-channel` claim's nonce (ADR 0074 decision 3). `watermark_amount`/
   `watermark_signature_hex` are `null` for a channel that has never accepted a voucher; otherwise
@@ -571,7 +571,11 @@ presented_amount, presented_signature_hex, charge, outcome, advanced }`: the thr
     voucher at the watermark: a retransmission, not a new claim, answered exactly as
     `peer_carriage.claim_retransmit` answers a `toon-channel` claim retransmitted at its watermark
     today -- accepted again, buying nothing new. Byte identity is the test: an equal amount under a
-    different signature is `"amount_not_advancing"` instead, not a retransmission.
+    different signature is `"amount_not_advancing"` instead, not a retransmission. Pinned at a
+    `charge` of `0`.
+  - `"underpayment"` -- the same byte-identical retransmission against a nonzero `charge`. It buys
+    nothing, so it covers none of the charge: refused as an underpayment, advancing by `0` (ADR
+    0074 decision 3, amended 2026-09-25).
 
 - **`invalid[]`** -- `{ name, claim_json, expected_error }`, the same shape as `envelope`'s
   `invalid[]`: parsing `claim_json` as a client-edge claim must fail with `expected_error`, never

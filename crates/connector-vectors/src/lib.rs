@@ -2255,7 +2255,8 @@ pub struct VoucherWatermarkCase {
     pub presented_amount: u64,
     pub presented_signature_hex: String,
     pub charge: u64,
-    /// `"advances"`, `"retransmission"` or `"amount_not_advancing"`.
+    /// `"advances"`, `"retransmission"`, `"amount_not_advancing"` or
+    /// `"underpayment"`.
     pub outcome: &'static str,
     /// Set only when `outcome` is `"advances"`.
     pub advanced: Option<u64>,
@@ -2296,6 +2297,7 @@ fn voucher_watermark_case(
         }
         ("retransmission", None, Ok(VoucherAdmission::Retransmission)) => {}
         ("amount_not_advancing", None, Err(ClaimError::AmountNotAdvancing { .. })) => {}
+        ("underpayment", None, Err(ClaimError::Underpayment { .. })) => {}
         _ => panic!(
             "vector {name}: validate_voucher returned {result:?}, expected {expected_outcome:?} \
              (advanced {expected_advanced:?})"
@@ -2314,13 +2316,15 @@ fn voucher_watermark_case(
     }
 }
 
-/// The three amount-only-watermark outcomes ADR 0074 decision 7 asks the
+/// The amount-only-watermark outcomes ADR 0074 decision 7 asks the
 /// vectors to pin: an equal amount under a *different* signature is
 /// refused, a strictly higher amount is accepted, and a voucher
 /// byte-identical to the one at the watermark -- same amount, same
 /// signature -- is a retransmission, answered as
 /// `peer_claim_retransmit` answers one today: accepted again, buying
-/// nothing new.
+/// nothing new. Because it buys nothing, the same retransmission against a
+/// nonzero charge covers none of it, and is refused as an underpayment
+/// (decision 3, amended 2026-09-25).
 fn generate_voucher_watermark_cases() -> Vec<VoucherWatermarkCase> {
     let first_signature = seq_bytes::<65>(0xf1);
     let second_signature = seq_bytes::<65>(0xf2);
@@ -2351,6 +2355,15 @@ fn generate_voucher_watermark_cases() -> Vec<VoucherWatermarkCase> {
             &first_signature,
             0,
             "retransmission",
+            None,
+        ),
+        voucher_watermark_case(
+            "byte_identical_voucher_retransmission_against_a_charge_is_underpayment",
+            Some((1_000, &first_signature)),
+            1_000,
+            &first_signature,
+            100,
+            "underpayment",
             None,
         ),
     ]

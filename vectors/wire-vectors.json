@@ -676,6 +676,16 @@
         "charge": 0,
         "outcome": "retransmission",
         "advanced": null
+      },
+      {
+        "name": "byte_identical_voucher_retransmission_against_a_charge_is_underpayment",
+        "watermark_amount": 1000,
+        "watermark_signature_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031",
+        "presented_amount": 1000,
+        "presented_signature_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031",
+        "charge": 100,
+        "outcome": "underpayment",
+        "advanced": null
       }
     ],
     "invalid": [

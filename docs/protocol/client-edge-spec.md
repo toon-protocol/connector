@@ -593,7 +593,8 @@ clearly and immediately; it is not owed a code path, only an unambiguous refusal
 >
 > - **Step 2 (freshness):** a voucher has no nonce. It must strictly exceed the amount watermark
 >   for the same (peer, blockchain, channel) tuple. A byte-identical voucher at the watermark is a
->   retransmission.
+>   retransmission, which buys nothing: it is accepted again where the charge is zero, and refused
+>   as an underpayment (step 3) where it is not.
 > - **Step 4 (cryptography):** the signer comes from the chain. On EVM it is `payerAuthorizer` from
 >   the verified `ChannelConfig` — x402 would fall back to `payer` when it is zero, but this
 >   connector admits no such channel (ADR 0074 decision 2, amended 2026-09-25); on Solana it is

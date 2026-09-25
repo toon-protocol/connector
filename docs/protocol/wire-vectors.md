@@ -145,8 +145,9 @@ arithmetic and asserts it against `Price::charge` before committing it.
 comparison is not [`validate_claim`]'s. An amount **equal** to the channel's watermark is refused
 (`amount_not_advancing`) unless it is byte-identical — same amount, same signature — to the voucher
 that set that watermark, in which case it is a retransmission: accepted again, buying nothing new,
-exactly as a `toon-channel` claim retransmitted at its own watermark is accepted again today. A
-strictly higher amount is accepted, by the difference. Also pinned: a Solana voucher's `expiresAt`
+exactly as a `toon-channel` claim retransmitted at its own watermark is accepted again today —
+and, because it buys nothing, refused as an underpayment where the charge is not zero. A strictly
+higher amount is accepted, by the difference. Also pinned: a Solana voucher's `expiresAt`
 must be `0` — x402 requires it, and the program refuses a nonzero one at `settle` with no state
 change — so the connector refuses it structurally, before any signature check.
 

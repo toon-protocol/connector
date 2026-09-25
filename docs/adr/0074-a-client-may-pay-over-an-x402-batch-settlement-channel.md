@@ -2,7 +2,7 @@
 
 **Status:** Accepted (owner decision, 2026-09-25, issue #1329) — **being built** under epic #1349; the implementation is tickets #1340–#1347. All three prerequisites were settled before acceptance, the last by a live Base Sepolia deposit on 2026-09-25, and the choices this record makes beyond #1329's seven were accepted with it. It **amends** [0059](0059-a-channel-is-derived-from-its-participants.md) (a client-edge exception to one-live-channel-per-pair), [0005](0005-claims-are-truth-balances-are-a-projection.md) (a second freshness rule for the journal to hold), `client-edge-spec.md` §1.3 (its freshness step, and step 5's rule that a cached deposit is a lower bound, which is false for a channel a payer can withdraw from) and `CONTEXT.md`'s **Claim**, **Nonce** and **Watermark**, plus a new **Voucher** entry (all applied). It **extends** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) with a second claim scheme per chain, and it disturbs [0021](0021-vectors-are-normative-prose-is-not.md): `schema_version` goes to **6** when #1347 lands. It leaves [0022](0022-a-connector-answers-it-does-not-announce.md)'s deferral of paying over HTTP exactly where it is.
 
-**Amended 2026-09-25 (#1349 review):** EVM admission now requires a nonzero `payerAuthorizer` whatever the payer is, where it had refused only a contract-wallet payer without one (decisions 2 and 4, and the last of the choices beyond #1329's seven). An EOA can gain code later by an EIP-7702 delegation, after which the contract checks a voucher by ERC-1271 rather than ECDSA and the vouchers already accepted no longer verify the way they did.
+**Amended 2026-09-25 (#1349 review):** EVM admission now requires a nonzero `payerAuthorizer` whatever the payer is, where it had refused only a contract-wallet payer without one (decisions 2 and 4, and the last of the choices beyond #1329's seven). An EOA can gain code later by an EIP-7702 delegation, after which the contract checks a voucher by ERC-1271 rather than ECDSA and the vouchers already accepted no longer verify the way they did. Decision 3's retransmission rule now says what the code always did: a byte-identical voucher buys nothing, so against a nonzero charge it is refused as an underpayment, and the vectors pin that case too.
 
 **Scope:** protocol law. It binds every implementation, because it adds a claim scheme to the wire and an offer to the greeting. The watchers and sweeps in decision 5 and the port shape in decision 9 are connector architecture. See the [ADR index](README.md).
 
@@ -136,7 +136,11 @@ and value before cryptography".
   retransmission, not a new claim. It is answered exactly as the same edge answers a
   `toon-channel` claim retransmitted at its watermark today (the `peer_claim_retransmit` vector's
   rule): it buys nothing new, and it is not an error. Byte identity is the test, because an
-  equal amount under a different signature is not the same voucher.
+  equal amount under a different signature is not the same voucher. **Because it buys nothing, it
+  covers no charge** (amended 2026-09-25): against a route whose charge is zero it is accepted
+  again, and against a nonzero charge it advances by `0` and is refused as an underpayment, by the
+  value-binding step like any other voucher that advances too little. The vectors pin both
+  (decision 7).
 - **The width of an amount.** The EVM voucher's amount is `uint128`. A voucher above what the
   connector's amount type holds (`u64` today) is refused, not truncated.
 - **Solana's `expiresAt` must be zero.** x402 already requires this, and servers reject a nonzero
