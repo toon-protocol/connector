@@ -77,6 +77,72 @@ def price_of(route):
     return int(route.get("price", 0)), int(route.get("pricePerKib") or 0)
 
 
+def roles_of(docs):
+    """Which prefixes each node FORWARDS, which it is the END of, and which
+    no public document can settle. Returns `{(node, prefix): role}`, one of
+    `"terminates"`, `"forwards"` or `"ambiguous"`, for every route row.
+
+    `GET /ilp` says what a node ROUTES (`routes`) and what it CLAIMS as its
+    own names (`ilpAddresses`). It does not say which routes end at this
+    node and which it passes on. So "routed but not claimed" is not proof of
+    a forward, and treating it as one reported a forward that does not exist
+    (connector#1248): the store routes `g.toon.relay.store` because the
+    relay forwards packets to it under that name, but it deliberately does
+    not claim the name, because the name is the relay's (store#121, "routed
+    is not advertised"). The check read that as a store -> relay forward
+    and flagged it as underpriced against the relay's own 1001 row.
+
+    The rule, per prefix P routed by node N:
+
+      1. P is in N's `ilpAddresses`: N terminates P (the gas shape).
+      2. Some OTHER node lists P in its `ilpAddresses`: that node ends the
+         route, so N forwards P (unchanged from before this rule).
+      3. Nobody lists P. Let S be every node routing exactly P. If S is
+         just N, N forwards (a forward to a shorter covering prefix, or a
+         DANGLING one). If S is exactly two nodes and exactly one of them
+         has an own address covering P (the relay's `g.toon.relay` covers
+         `g.toon.relay.store`), that node owns the name and forwards it,
+         and the other ends the route (the store shape).
+      4. Anything else is AMBIGUOUS, and that is a FAILURE, not a guess.
+         Neither covers, both cover, or three or more nodes route P while
+         nobody claims it: the documents cannot say who ends the route.
+         Guessing "forwards" reproduces the false alarm this rule fixes.
+         Guessing "terminates" could hide a real loop or an underpriced
+         forward. The fix on the fleet side is for the node that ends the
+         route to list P in `[node].addresses` (the gas shape), or for the
+         owner to stop routing an exact name nobody claims.
+
+    The sound fix is a fact rather than a heuristic: a `terminated` or
+    `forwarded` field on each `GET /ilp` route row, as an amendment to
+    ADR 0050. The connector knows which one each row is, since a
+    RouteTermination and a peer route are different config. Until that
+    exists, this is the most this script can infer.
+    """
+    claimed = {n: set(d.get("ilpAddresses", [])) for n, d in docs.items()}
+    routed = {n: {r["prefix"] for r in d.get("routes", [])} for n, d in docs.items()}
+    roles = {}
+    for node in docs:
+        for prefix in routed[node]:
+            if prefix in claimed[node]:
+                roles[(node, prefix)] = "terminates"
+                continue
+            if any(prefix in claimed[other] for other in docs if other != node):
+                roles[(node, prefix)] = "forwards"
+                continue
+            sharing = sorted(n for n in docs if prefix in routed[n])
+            if sharing == [node]:
+                roles[(node, prefix)] = "forwards"
+                continue
+            owners = [
+                n for n in sharing if any(covers(a, prefix) for a in claimed[n])
+            ]
+            if len(sharing) == 2 and len(owners) == 1:
+                roles[(node, prefix)] = "forwards" if owners == [node] else "terminates"
+            else:
+                roles[(node, prefix)] = "ambiguous"
+    return roles
+
+
 def crosscheck(nodes, fetch):
     """Hold every node's self-description to every other's.
 
@@ -194,12 +260,43 @@ def crosscheck(nodes, fetch):
                 "one side ever dials, so one of these being empty is normal",
             )
 
-    # For every prefix a node ADVERTISES but does not TERMINATE, it is
-    # forwarding: somebody else has to route that name, at a price this
-    # node's own advertised price can cover, over a peering the two of them
-    # still agree about.
+    # For every prefix a node FORWARDS (see `roles_of` for how that is told
+    # apart from a route it ends without claiming the name), somebody else
+    # has to route that name, at a price this node's own advertised price
+    # can cover, over a peering the two of them still agree about.
+    roles = roles_of(docs)
     for near in sorted(docs):
-        forwards = [p for p in sorted(advertised[near]) if p not in terminated[near]]
+        for prefix in sorted(advertised[near]):
+            role = roles[(near, prefix)]
+            if role == "terminates" and prefix not in terminated[near]:
+                owner = next(
+                    n for n in sorted(docs)
+                    if n != near and roles.get((n, prefix)) == "forwards"
+                )
+                row(
+                    True,
+                    near,
+                    f"`{prefix}` ends here",
+                    f"routed but not advertised: {owner} owns the name and "
+                    f"forwards it here, so this is not a {near} -> {owner} "
+                    "forward (store#121)",
+                )
+            elif role == "ambiguous":
+                sharing = sorted(n for n in docs if prefix in advertised[n])
+                row(
+                    False,
+                    near,
+                    f"`{prefix}` has a known end",
+                    f"AMBIGUOUS ROUTE: {', '.join(sharing)} all route "
+                    f"`{prefix}`, none lists it in `ilpAddresses`, and the "
+                    "documents cannot say which one ends the route -- the "
+                    "node that terminates it should list it in "
+                    "`[node].addresses`",
+                )
+
+        forwards = [
+            p for p in sorted(advertised[near]) if roles[(near, p)] == "forwards"
+        ]
         if not forwards:
             row(
                 True,
@@ -241,7 +338,7 @@ def crosscheck(nodes, fetch):
                 f"{near} -> {far}",
                 f"`{prefix}` lands somewhere",
                 f"{far} "
-                f"{'terminates' if far_prefix in terminated[far] else 'forwards on'}"
+                f"{'terminates' if roles[(far, far_prefix)] == 'terminates' else 'forwards on'}"
                 f" `{far_prefix}`",
             )
 
@@ -304,12 +401,16 @@ def legs(nodes, fetch):
     every fee on the way, and tracks a repricing without an edit here.
     """
     docs = {name: fetch(url) for name, url in sorted(nodes.items())}
+    roles = roles_of(docs)
     out = []
     for near, doc in docs.items():
-        terminates = set(doc.get("ilpAddresses", []))
         for route in doc.get("routes", []):
             prefix = route["prefix"]
-            if prefix in terminates:
+            # The same classification `crosscheck` uses. An ambiguous route
+            # is left out: the cross-check already FAILs it, and a probe
+            # sealed to a guessed far side would fail for this script's
+            # reason rather than the fleet's.
+            if roles[(near, prefix)] != "forwards":
                 continue
             flat, kib = price_of(route)
             # Longest-prefix matching, exactly as `crosscheck` resolves a
@@ -373,8 +474,10 @@ def _fleet(**overrides):
             [dict(_EVM), dict(_SOL)],
             [],
         ),
+        # The store's live shape since store#121: it ROUTES the relay's
+        # name for it but does not CLAIM it -- "routed is not advertised".
         "store": _doc(
-            ["g.toon.store", "g.toon.relay.store"],
+            ["g.toon.store"],
             [("g.toon.store", 1000, 10), ("g.toon.relay.store", 1000, 10)],
             [dict(_EVM), dict(_SOL)],
             ["btp"],
@@ -479,6 +582,112 @@ def _self_test():
         (
             sealed.get("g.toon.relay.store") == "store",
             "--legs seals to the LONGEST match, not the first that covers",
+            found,
+        )
+    )
+
+    # ── routed is not advertised (connector#1248, store#121) ────────────
+    def has(rows, subject, check_part, status="OK"):
+        return any(
+            r[0] == status and r[1] == subject and check_part in r[2] for r in rows
+        )
+
+    # The store shape: routed, not claimed. The relay -> store forward is
+    # still checked, and no store -> relay forward is invented.
+    rows = _run(_fleet())
+    cases.append(
+        (
+            not _fails(rows)
+            and has(rows, "relay -> store", "is priced to cover")
+            and not any(r[1] == "store -> relay" for r in rows)
+            and has(rows, "store", "`g.toon.relay.store` ends here"),
+            "the store shape (routed, not advertised) passes, and only relay -> store is checked",
+            rows,
+        )
+    )
+
+    # The gas shape: the far side DOES list the relay's name for it.
+    def gas_fleet(relay_price=1001):
+        fleet = _fleet()
+        fleet["relay"]["routes"].append(
+            {"prefix": "g.toon.relay.gas", "price": str(relay_price)}
+        )
+        fleet["gas"] = _doc(
+            ["g.toon.gas", "g.toon.relay.gas"],
+            [("g.toon.gas", 1000, 0), ("g.toon.relay", 2, 0), ("g.toon.relay.gas", 1000, 0)],
+            [dict(_EVM), dict(_SOL)],
+            ["btp"],
+        )
+        return fleet
+
+    rows = _run(gas_fleet())
+    cases.append(
+        (
+            not _fails(rows)
+            and has(rows, "relay -> gas", "is priced to cover")
+            and has(rows, "relay -> store", "is priced to cover")
+            and not any(r[1] in ("gas -> relay", "store -> relay") and "g.toon.relay." in r[2] for r in rows),
+            "the gas shape (name in addresses) passes beside the store shape",
+            rows,
+        )
+    )
+
+    # The relay itself underpricing a REAL forward still fails, in both shapes.
+    cheap = _fleet()
+    cheap["relay"]["routes"][1]["price"] = "999"
+    case("an underpriced relay -> store forward fails", _run(cheap), True, "UNDERPRICED FORWARD: relay")
+    case(
+        "an underpriced relay -> gas forward fails",
+        _run(gas_fleet(relay_price=999)),
+        True,
+        "UNDERPRICED FORWARD: relay",
+    )
+
+    # AMBIGUOUS, defined as a FAILURE. Two nodes route the same exact
+    # name, neither claims it, and neither owns a covering address: nothing
+    # public says which one ends the route, and a guess either way is
+    # wrong somewhere (a false forward, or a hidden loop).
+    stray = _fleet()
+    for node in ("relay", "store"):
+        stray[node]["routes"].append({"prefix": "g.toon.other.x", "price": "5"})
+    case("two nodes routing an unowned, unclaimed name fails as ambiguous", _run(stray), True, "AMBIGUOUS ROUTE")
+
+    # Both own a covering address: still no way to tell.
+    both = _fleet()
+    both["store"]["ilpAddresses"].append("g.toon.relay")
+    case("two owners of one unclaimed name fails as ambiguous", _run(both), True, "AMBIGUOUS ROUTE")
+
+    # Three hops under one unclaimed name: the owner forwards, but the
+    # middle hop and the end cannot be told apart.
+    hop = _fleet(
+        mid=_doc(["g.toon.mid"], [("g.toon.mid", 1, 0), ("g.toon.relay.store", 1000, 10)], [dict(_EVM), dict(_SOL)], ["btp"])
+    )
+    case("a three-hop chain under an unclaimed name fails as ambiguous", _run(hop), True, "AMBIGUOUS ROUTE")
+
+    # Three hops where the end CLAIMS the name: every other router of it
+    # is a forwarder, so nothing is ambiguous and the middle hop's price
+    # is held to the end's.
+    claimed = _fleet(
+        mid=_doc(["g.toon.mid"], [("g.toon.mid", 1, 0), ("g.toon.relay.store", 1000, 10)], [dict(_EVM), dict(_SOL)], ["btp"])
+    )
+    claimed["store"]["ilpAddresses"].append("g.toon.relay.store")
+    rows = _run(claimed)
+    cases.append(
+        (
+            not _fails(rows) and has(rows, "mid -> store", "is priced to cover"),
+            "a three-hop chain whose end claims the name resolves every hop",
+            rows,
+        )
+    )
+
+    # The live gas + store fleet's legs: one per real forward, none from
+    # the store, none ambiguous.
+    found = legs({n: n for n in gas_fleet()}, lambda url: gas_fleet()[url])
+    cases.append(
+        (
+            sorted((n, p, f) for n, p, f, _, _ in found)
+            == [("gas", "g.toon.relay", "relay"), ("relay", "g.toon.relay.gas", "gas"), ("relay", "g.toon.relay.store", "store")],
+            "--legs lists exactly the real forwards of the live shape",
             found,
         )
     )
