@@ -331,8 +331,12 @@ _Avoid_: channel (when ambiguous with a route or a stream)
 **Claim**:
 A signed statement of a payment channel's cumulative state, handed from payer to payee.
 Each claim supersedes the last, so a lost claim costs nothing and a replayed claim gains
-nothing.
-_Avoid_: receipt, voucher, payment, balance proof
+nothing. A claim has a **scheme**: `toon-channel`, or — at the client edge only —
+`batch-settlement`, whose claims are **vouchers** (ADR 0074).
+_Avoid_: receipt, payment, balance proof; "voucher" for a `toon-channel` claim
+
+**Voucher**:
+A claim under x402's `batch-settlement` scheme (ADR 0074).
 
 **Covering claim**:
 The claim that pays for one particular packet, carried **with** it rather than trailing behind it.
@@ -345,11 +349,12 @@ the client edge and at a priced termination unconditionally; on a _forwarded_ ar
 per peering, behind `forwarded_claim_enforcement` (issue #1142), which still defaults to observing.
 
 **Nonce**:
-The counter that orders claims within a channel. A payee accepts a claim only if its nonce
-advances.
+The counter that orders `toon-channel` claims within a channel. A payee accepts such a claim only
+if its nonce advances. A voucher has none; its amount orders it.
 
 **Watermark**:
-The highest nonce a payee has accepted on a channel.
+The highest nonce a payee has accepted on a channel — for a voucher, the highest cumulative
+amount, which the next voucher must strictly exceed.
 
 **Exposure** _(retired term, [ADR 0033](docs/adr/0033-the-exposure-machinery-is-retired-not-restated.md), issue #882)_:
 Value a payee had delivered but did not yet hold a claim for, under the pre-#868 credit window.
