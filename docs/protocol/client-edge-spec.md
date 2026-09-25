@@ -585,6 +585,24 @@ zkApp-specific fields the peer semantics's predecessor once carried for it (`zkA
 part of this connector's claim shape and are not documented here. A Mina client's claim is rejected
 clearly and immediately; it is not owed a code path, only an unambiguous refusal.
 
+> **Amended by [ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
+> (accepted 2026-09-25, not yet built: #1340–#1347).** A claim may also carry the scheme
+> `batch-settlement`, whose claims are x402 **vouchers** on x402's own channel contracts: EVM
+> `x402BatchSettlement`, and Solana payment-channels. Three steps above read differently for a
+> voucher:
+>
+> - **Step 2 (freshness):** a voucher has no nonce. It must strictly exceed the amount watermark
+>   for the same (peer, blockchain, channel) tuple. A byte-identical voucher at the watermark is a
+>   retransmission.
+> - **Step 4 (cryptography):** the signer comes from the chain. On EVM it is `payerAuthorizer`, or
+>   else `payer`, from the verified `ChannelConfig`; on Solana it is `authorized_signer`.
+> - **Step 5 (collateral):** the licence to cache a deposit as a permanent lower bound does **not**
+>   extend to an EVM batch-settlement channel, whose `balance − totalClaimed − pendingWithdrawal`
+>   can fall.
+>
+> A `toon-channel` claim is unchanged. The voucher's own vectors (#1347) will be normative once
+> they land (ADR 0021).
+
 ### 1.4 Answering an unpaid request: x402 v2 terms
 
 An unpaid request — no claim header of either kind — addressing a route this connector both

@@ -1,6 +1,6 @@
 # Claims are the source of truth; balances are a projection
 
-**Status:** Accepted, amended by [0033](0033-the-exposure-machinery-is-retired-not-restated.md). Claims-as-truth and the replayed journal stand. The exposure and ceiling arithmetic named under "Consequences" is retired — nothing projects exposure any more. The crate it names, `connector-core`, shipped as `connector-domain`.
+**Status:** Accepted, amended by [0033](0033-the-exposure-machinery-is-retired-not-restated.md). Claims-as-truth and the replayed journal stand. The exposure and ceiling arithmetic named under "Consequences" is retired — nothing projects exposure any more. The crate it names, `connector-core`, shipped as `connector-domain`. **Amended by [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)** in one clause: the journal holds a batch-settlement voucher exactly as it holds a claim, but the voucher's watermark compares amounts, not nonces.
 
 **Scope:** connector architecture — internal to this codebase. See the [ADR index](README.md).
 
