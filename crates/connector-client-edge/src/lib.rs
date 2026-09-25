@@ -757,8 +757,10 @@ async fn route_price(
 /// startup and hands them to [`ClientEdgeState`] -- so the paths its
 /// callers already use keep working.
 pub use connector_domain::x402::{
-    X402ChainSettlementTerms, X402ChannelExtra, X402PaymentOption, X402PaymentRequired,
-    X402Resource, X402SettlementTerms, X402SolanaSettlementTerms, X402_VERSION,
+    X402AcceptOption, X402BatchSettlementEvmTerms, X402BatchSettlementOption,
+    X402BatchSettlementSolanaTerms, X402BatchSettlementTerms, X402ChainSettlementTerms,
+    X402ChannelExtra, X402PaymentOption, X402PaymentRequired, X402Resource, X402SettlementTerms,
+    X402SolanaSettlementTerms, X402_VERSION,
 };
 
 /// Answer an unpaid request to `destination` with terms instead of doing
@@ -2545,7 +2547,7 @@ mod tests {
         assert_eq!(terms.x402_version, 2);
         assert_eq!(terms.resource.url, "g.example.app");
         assert_eq!(terms.accepts.len(), 1, "terms are carried as a list");
-        assert_eq!(terms.accepts[0].amount, "100");
+        assert_eq!(terms.offer().unwrap().amount, "100");
 
         // The header carries the same body the greeting sends over the wire.
         let header_bytes = BASE64.decode(&payment_required_header).unwrap();
@@ -2560,7 +2562,7 @@ mod tests {
         // shape exactly: no `settlement` key at all, not a null one. Issue
         // #632 adds `settlements` beside it on the same terms: absent, not
         // an empty array, on a settlement-less node.
-        let extra = serde_json::to_value(&terms.accepts[0].extra).unwrap();
+        let extra = serde_json::to_value(&terms.offer().unwrap().extra).unwrap();
         assert!(
             extra.get("settlement").is_none(),
             "a settlement-less node's greeting must not carry a settlement key: {extra}"
@@ -2689,7 +2691,7 @@ mod tests {
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            terms.accepts[0].extra.session_lease_ttl_ms,
+            terms.offer().unwrap().extra.session_lease_ttl_ms,
             crate::session_registry::SESSION_LEASE_BACKSTOP_TTL.as_millis() as u64,
             "the advertised lease must be exactly what the session registry enforces"
         );
@@ -2730,7 +2732,7 @@ mod tests {
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            terms.accepts[0].extra.required_transport.as_deref(),
+            terms.offer().unwrap().extra.required_transport.as_deref(),
             Some("btp"),
             "the client should learn this route requires BTP"
         );
@@ -2766,8 +2768,8 @@ mod tests {
 
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(terms.accepts[0].extra.required_transport, None);
-        let extra = serde_json::to_value(&terms.accepts[0].extra).unwrap();
+        assert_eq!(terms.offer().unwrap().extra.required_transport, None);
+        let extra = serde_json::to_value(&terms.offer().unwrap().extra).unwrap();
         assert!(
             extra.get("requiredTransport").is_none(),
             "an unrestricted route's greeting must not carry a requiredTransport key: {extra}"
@@ -2818,7 +2820,7 @@ mod tests {
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let answered: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            answered.accepts[0].extra.settlement.as_ref(),
+            answered.offer().unwrap().extra.settlement.as_ref(),
             Some(&terms),
             "the greeting must carry the node's channel-opening facts verbatim"
         );
@@ -2826,7 +2828,7 @@ mod tests {
         // Issue #632: an EVM-only node's additive `settlements` list is a
         // one-entry list, its entry byte-identical to the legacy object.
         assert_eq!(
-            answered.accepts[0].extra.settlements,
+            answered.offer().unwrap().extra.settlements,
             vec![X402ChainSettlementTerms::Evm(terms)],
             "an EVM-only node's settlements list must carry exactly one entry, matching `settlement` verbatim"
         );
@@ -2890,12 +2892,12 @@ mod tests {
         let answered: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(
-            answered.accepts[0].extra.settlement.as_ref(),
+            answered.offer().unwrap().extra.settlement.as_ref(),
             Some(&evm_terms),
             "the legacy settlement object stays the EVM leg alone, unchanged by the Solana leg"
         );
         assert_eq!(
-            answered.accepts[0].extra.settlements,
+            answered.offer().unwrap().extra.settlements,
             vec![
                 X402ChainSettlementTerms::Evm(evm_terms),
                 X402ChainSettlementTerms::Solana(solana_terms),
@@ -3043,7 +3045,7 @@ mod tests {
 
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(terms.accepts[0].amount, "0");
+        assert_eq!(terms.offer().unwrap().amount, "0");
         assert!(
             app_client.deliveries().is_empty(),
             "a bootstrap probe must never reach an app"
@@ -3175,6 +3177,7 @@ mod tests {
                     token_address: "0x49bee1bca5d15fb0963117923403f9498119a9ce".to_string(),
                     decimals: 6,
                 })],
+                batch_settlements: Vec::new(),
             },
             DEFAULT_BTP_SESSION_WINDOW,
             None,
@@ -3291,6 +3294,7 @@ mod tests {
                 btp_endpoint: Some("wss://proxy.relay.example/ilp/btp".to_string()),
                 peer_carriages: Vec::new(),
                 settlements: Vec::new(),
+                batch_settlements: Vec::new(),
             },
             DEFAULT_BTP_SESSION_WINDOW,
             None,
@@ -3360,6 +3364,7 @@ mod tests {
                 btp_endpoint: Some("wss://proxy.relay.example/ilp/btp".to_string()),
                 peer_carriages: Vec::new(),
                 settlements: Vec::new(),
+                batch_settlements: Vec::new(),
             },
             DEFAULT_BTP_SESSION_WINDOW,
             None,
@@ -3702,7 +3707,7 @@ mod tests {
         let response = described_node().oneshot(request).await.unwrap();
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let greeting: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
-        let extra = &greeting.accepts[0].extra;
+        let extra = &greeting.offer().unwrap().extra;
 
         assert_eq!(
             serde_json::to_value(&extra.ilp_addresses).unwrap(),
@@ -3786,16 +3791,16 @@ mod tests {
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            terms.accepts[0].extra.ilp_addresses,
+            terms.offer().unwrap().extra.ilp_addresses,
             vec!["g.toon.apex".to_string(), "g.toon.apex.alt".to_string()],
             "ilpAddresses must be this node's own configured addresses, not an echo"
         );
         assert_eq!(
-            terms.accepts[0].extra.btp_endpoint.as_deref(),
+            terms.offer().unwrap().extra.btp_endpoint.as_deref(),
             Some("wss://apex.example/ilp/btp")
         );
         // The legacy field is untouched: still an echo of the probed destination.
-        assert_eq!(terms.accepts[0].extra.ilp_address, "g.whatever");
+        assert_eq!(terms.offer().unwrap().extra.ilp_address, "g.whatever");
     }
 
     /// The absence half of the test above: a node with no `[node]` section
@@ -3825,10 +3830,10 @@ mod tests {
 
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
-        assert!(terms.accepts[0].extra.ilp_addresses.is_empty());
-        assert!(terms.accepts[0].extra.btp_endpoint.is_none());
+        assert!(terms.offer().unwrap().extra.ilp_addresses.is_empty());
+        assert!(terms.offer().unwrap().extra.btp_endpoint.is_none());
 
-        let extra = serde_json::to_value(&terms.accepts[0].extra).unwrap();
+        let extra = serde_json::to_value(&terms.offer().unwrap().extra).unwrap();
         assert!(
             extra.get("ilpAddresses").is_none(),
             "a node with no [announce] must not carry an ilpAddresses key: {extra}"
@@ -4402,7 +4407,7 @@ mod tests {
             let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
             let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(
-                terms.accepts[0].extra.required_transport.as_deref(),
+                terms.offer().unwrap().extra.required_transport.as_deref(),
                 Some("btp")
             );
 
@@ -5522,7 +5527,7 @@ mod tests {
             let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(terms.resource.url, REMOTE_APP);
             assert_eq!(
-                terms.accepts[0].amount,
+                terms.offer().unwrap().amount,
                 FORWARD_PRICE.to_string(),
                 "the greeting quotes the forwarded route's `price`, never its `fee`"
             );

@@ -4116,7 +4116,10 @@ key_file = "{key_path}"
             })
         };
 
-        let config = load("min_withdraw_delay_secs = 7200").expect("load");
+        let config = load(
+            "min_withdraw_delay_secs = 7200\nasset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"",
+        )
+        .expect("load");
         let SettlementConfig::Evm(evm) = &config.settlements()[0] else {
             panic!("expected the EVM table");
         };
@@ -4127,7 +4130,10 @@ key_file = "{key_path}"
             7200
         );
 
-        let error = load("min_withdraw_delay_secs = 600").expect_err("below the floor");
+        let error = load(
+            "min_withdraw_delay_secs = 600\nasset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"",
+        )
+        .expect_err("below the floor");
         assert!(matches!(
             error,
             ConfigError::BatchSettlementDelayBelowFloor { value: 600, .. }

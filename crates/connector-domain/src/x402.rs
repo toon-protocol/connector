@@ -62,15 +62,51 @@ pub struct X402PaymentRequired {
     /// was before this issue; a reader that predates the field ignores it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub request: Option<serde_json::Value>,
-    pub accepts: Vec<X402PaymentOption>,
+    /// One `toon-channel` entry (always first, and the only entry before
+    /// ADR 0074) plus one x402-valid `batch-settlement` entry per chain this
+    /// node has opted into accepting a batch-settlement channel on (ADR 0074
+    /// decision 8). [`X402AcceptOption`] is `#[serde(untagged)]` rather than
+    /// this staying `Vec<X402PaymentOption>` so the two shapes can share one
+    /// wire array without either describing the other's fields.
+    pub accepts: Vec<X402AcceptOption>,
 }
 
 impl X402PaymentRequired {
-    /// The offer a payer would satisfy -- the first `accepts` entry, since
-    /// only one payment method exists today and the list is ordered by the
-    /// emitter's own preference.
+    /// The `toon-channel` offer a payer would satisfy -- still the answer
+    /// this method gives even when `accepts` also carries batch-settlement
+    /// entries (ADR 0074 decision 8), because every other reader of this
+    /// greeting (nonce/claim covering, EVM domain recovery, the schedule and
+    /// `payTo` a `connector send` quotes) is about TOON's own claim scheme,
+    /// never about a channel this connector never itself opens.
     pub fn offer(&self) -> Option<&X402PaymentOption> {
-        self.accepts.first()
+        self.accepts.iter().find_map(|option| match option {
+            X402AcceptOption::Channel(channel) => Some(channel.as_ref()),
+            X402AcceptOption::BatchSettlement(_) => None,
+        })
+    }
+
+    /// [`Self::offer`]'s mutable twin, used only where a caller needs to
+    /// adjust the `toon-channel` offer's own `extra` in place (this module's
+    /// own tests, and a covering claim's domain-recovery tests elsewhere) --
+    /// production code only ever builds a greeting fresh, through
+    /// [`terms_body`].
+    pub fn offer_mut(&mut self) -> Option<&mut X402PaymentOption> {
+        self.accepts.iter_mut().find_map(|option| match option {
+            X402AcceptOption::Channel(channel) => Some(channel.as_mut()),
+            X402AcceptOption::BatchSettlement(_) => None,
+        })
+    }
+
+    /// Every `batch-settlement` entry this greeting offers (ADR 0074
+    /// decision 8), in the order the emitting node's own opt-ins were
+    /// walked -- empty on a node that has opted into neither chain, which is
+    /// every node before this record and every node after it that has not
+    /// written a `batch_settlement` table.
+    pub fn batch_settlement_offers(&self) -> impl Iterator<Item = &X402BatchSettlementOption> {
+        self.accepts.iter().filter_map(|option| match option {
+            X402AcceptOption::BatchSettlement(batch) => Some(batch),
+            X402AcceptOption::Channel(_) => None,
+        })
     }
 
     /// What the **greeted packet** costs, in the asset's base units. `None`
@@ -139,6 +175,26 @@ impl X402PaymentRequired {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct X402Resource {
     pub url: String,
+}
+
+/// One entry of [`X402PaymentRequired::accepts`]: either the `toon-channel`
+/// scheme every node has always offered, or an x402-valid `batch-settlement`
+/// entry (ADR 0074 decision 8). `#[serde(untagged)]`, tried in this
+/// declaration order, so the two can share one wire array without either
+/// naming which it is: [`X402BatchSettlementOption`] requires `asset`, which
+/// a `toon-channel` entry never carries, so an object lacking it falls
+/// through to [`X402PaymentOption`] -- the same structural-mismatch
+/// disambiguation [`X402ChainSettlementTerms`] already uses.
+/// `Channel` is boxed only to keep this enum's own size down to its
+/// smaller variant's -- `X402PaymentOption` carries the whole
+/// `X402ChannelExtra` bag, which nothing about a `batch-settlement` entry
+/// needs. Serde boxes and unboxes it transparently, so the wire shape is
+/// unaffected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum X402AcceptOption {
+    BatchSettlement(X402BatchSettlementOption),
+    Channel(Box<X402PaymentOption>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -336,6 +392,200 @@ pub struct X402SolanaSettlementTerms {
     pub decimals: u8,
 }
 
+/// One chain's x402 `batch-settlement` facts (ADR 0074 decision 8): present
+/// only for a chain this node has opted into accepting a batch-settlement
+/// channel on. The greeting's own `batch-settlement` `accepts[]` entry and
+/// the self-description's `batchSettlements` list are both projections of
+/// this one value (ND-11) -- `terms_body` and
+/// [`crate::node::NodeSelfDescription::describe`] each read it off
+/// [`crate::node::NodeFacts::batch_settlements`], and neither assembles a
+/// second copy of it.
+///
+/// `#[serde(untagged)]`: [`X402BatchSettlementEvmTerms`] requires
+/// `receiverAuthorizer`/`name`/`version`, which
+/// [`X402BatchSettlementSolanaTerms`] never carries, so the two disambiguate
+/// structurally, the same way [`X402ChainSettlementTerms`] does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum X402BatchSettlementTerms {
+    Evm(X402BatchSettlementEvmTerms),
+    Solana(X402BatchSettlementSolanaTerms),
+}
+
+/// What a stock `@x402/evm` client needs to build a `ChannelConfig` and
+/// deposit into a channel this connector will admit (ADR 0074 decisions 2
+/// and 8; x402 `specs/schemes/batch-settlement/scheme_batch_settlement_evm.md`
+/// at commit `0cb1a1f0`). `network`, `asset` and `payTo` are this fact's own
+/// copies of the same-named top-level fields the greeting's
+/// [`X402BatchSettlementOption`] carries; `receiver_authorizer` and
+/// `min_withdraw_delay_secs` are `extra.receiverAuthorizer`/
+/// `extra.withdrawDelay` there.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct X402BatchSettlementEvmTerms {
+    /// `eip155:<chainId>` (CAIP-2).
+    pub network: String,
+    /// The ERC-20 this node accepts a deposit in -- `[settlement.evm]
+    /// token_address`, `0x`-prefixed, never declared a second time (CF-26).
+    pub asset: String,
+    /// The receiver a payer's `ChannelConfig.receiver` must name -- this
+    /// node's EVM settlement address.
+    #[serde(rename = "payTo")]
+    pub pay_to: String,
+    /// `ChannelConfig.receiverAuthorizer`. Always the same address as
+    /// `pay_to`: decision 5 never delegates it, so a facilitator can never
+    /// refund a voucher this connector has not yet claimed.
+    #[serde(rename = "receiverAuthorizer")]
+    pub receiver_authorizer: String,
+    /// The shortest `withdrawDelay` a channel may carry and still be
+    /// admitted, in seconds -- `[settlement.evm.batch_settlement]
+    /// min_withdraw_delay_secs`.
+    #[serde(rename = "withdrawDelay")]
+    pub min_withdraw_delay_secs: u64,
+    /// The EIP-712 domain `name` of `asset` -- `"USDC"` for the devnet's
+    /// Circle FiatToken v2.2. Configured (`asset_eip712_name`), not read off
+    /// the chain: an arbitrary ERC-20 need not expose one, and this
+    /// connector never itself signs or verifies under it (only a payer's
+    /// deposit does), so there is nothing here to prove against a live
+    /// contract the way `decimals` is (issue #1345).
+    pub name: String,
+    /// The EIP-712 domain `version` of `asset` -- `"2"` for the devnet's
+    /// Circle FiatToken v2.2. Configured (`asset_eip712_version`), for the
+    /// same reason `name` is.
+    pub version: String,
+}
+
+/// The Solana twin of [`X402BatchSettlementEvmTerms`] (ADR 0074 decisions 2,
+/// 5 and 8; x402 `specs/schemes/batch-settlement/scheme_batch_settlement_svm.md`
+/// at commit `0cb1a1f0`). The SVM spec's wire vocabulary is network-neutral:
+/// its own `extra.withdrawDelay` carries what this connector's config and
+/// the `payment-channels` program itself both call `grace_period`, so
+/// [`Self::min_grace_period_secs`] is exactly that value under the EVM
+/// leg's own wire name -- there is no second key called `gracePeriod`
+/// anywhere on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct X402BatchSettlementSolanaTerms {
+    /// `solana:<genesis-hash-first-32-base58-chars>` (CAIP-2) -- the chain
+    /// this node's settlement RPC actually reached, read at connect time
+    /// (`connector_settlement_solana::SolanaSettlementBackend::caip2_network`,
+    /// issue #1131's own precedent), never guessed from the RPC URL.
+    pub network: String,
+    /// The SPL/Token-2022 mint this node accepts a deposit in, base58 --
+    /// `[settlement.solana] token_address`, never declared a second time
+    /// (CF-26).
+    pub asset: String,
+    /// The owner of this node's receiving token account -- the x402 SVM
+    /// scheme's single 10000bps distribution recipient (decision 2), which
+    /// is this node's Solana settlement pubkey.
+    #[serde(rename = "payTo")]
+    pub pay_to: String,
+    /// The sponsor: `rent_payer` and the zero-share `payee` a payer's
+    /// `open` transaction must name (decision 5) -- this node's Solana
+    /// settlement pubkey, the same key as `pay_to`.
+    #[serde(rename = "feePayer")]
+    pub fee_payer: String,
+    /// The shortest `grace_period` a channel may carry and still be
+    /// admitted, in seconds -- `[settlement.solana.batch_settlement]
+    /// min_grace_period_secs` -- carried on the wire as `withdrawDelay` (see
+    /// this type's own doc).
+    #[serde(rename = "withdrawDelay")]
+    pub min_grace_period_secs: u64,
+}
+
+/// The greeting's own `batch-settlement` `accepts[]` entry (ADR 0074
+/// decision 8): [`X402BatchSettlementTerms`] plus the fields that describe
+/// *this* request rather than this node's standing terms -- `scheme`,
+/// `amount` (the same charge the `toon-channel` entry quotes) and
+/// `maxTimeoutSeconds`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct X402BatchSettlementOption {
+    pub scheme: String,
+    pub network: String,
+    /// The addressed route's charge, in the asset's base units, as a decimal
+    /// string -- identical to the `toon-channel` entry's own `amount`: both
+    /// are alternative ways to pay the same charge.
+    pub amount: String,
+    pub asset: String,
+    #[serde(rename = "payTo")]
+    pub pay_to: String,
+    #[serde(rename = "maxTimeoutSeconds")]
+    pub max_timeout_seconds: u64,
+    pub extra: X402BatchSettlementExtra,
+}
+
+/// [`X402BatchSettlementOption::extra`]: either chain's facts, spelled the
+/// way the corresponding x402 scheme spec names them. Untagged for the same
+/// structural reason [`X402BatchSettlementTerms`] is.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum X402BatchSettlementExtra {
+    Evm(X402BatchSettlementEvmExtra),
+    Solana(X402BatchSettlementSolanaExtra),
+}
+
+/// x402 EVM batch-settlement spec `#L81-L97`: `receiverAuthorizer` and
+/// `withdrawDelay` are required so a client can build a `ChannelConfig`;
+/// `name`/`version` are required so it can build the deposit's own
+/// ERC-3009/permit2 signature under the asset's real EIP-712 domain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct X402BatchSettlementEvmExtra {
+    #[serde(rename = "receiverAuthorizer")]
+    pub receiver_authorizer: String,
+    #[serde(rename = "withdrawDelay")]
+    pub withdraw_delay: u64,
+    pub name: String,
+    pub version: String,
+}
+
+/// x402 SVM batch-settlement spec `#L163-L178`: `feePayer` and
+/// `withdrawDelay` (the program's `grace_period`) are required so a client
+/// can build the channel account `open` names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct X402BatchSettlementSolanaExtra {
+    #[serde(rename = "feePayer")]
+    pub fee_payer: String,
+    #[serde(rename = "withdrawDelay")]
+    pub withdraw_delay: u64,
+}
+
+/// Project [`X402BatchSettlementTerms`] into the greeting's own
+/// `accepts[]` entry shape, quoting `amount` for the request being
+/// answered. The one place that builds an [`X402BatchSettlementOption`], so
+/// the self-description's facts and the greeting's own copy of them can
+/// never drift into two shapes (ND-11).
+fn batch_settlement_accept(
+    fact: &X402BatchSettlementTerms,
+    amount: String,
+) -> X402BatchSettlementOption {
+    match fact {
+        X402BatchSettlementTerms::Evm(evm) => X402BatchSettlementOption {
+            scheme: "batch-settlement".to_string(),
+            network: evm.network.clone(),
+            amount,
+            asset: evm.asset.clone(),
+            pay_to: evm.pay_to.clone(),
+            max_timeout_seconds: X402_MAX_TIMEOUT_SECONDS,
+            extra: X402BatchSettlementExtra::Evm(X402BatchSettlementEvmExtra {
+                receiver_authorizer: evm.receiver_authorizer.clone(),
+                withdraw_delay: evm.min_withdraw_delay_secs,
+                name: evm.name.clone(),
+                version: evm.version.clone(),
+            }),
+        },
+        X402BatchSettlementTerms::Solana(solana) => X402BatchSettlementOption {
+            scheme: "batch-settlement".to_string(),
+            network: solana.network.clone(),
+            amount,
+            asset: solana.asset.clone(),
+            pay_to: solana.pay_to.clone(),
+            max_timeout_seconds: X402_MAX_TIMEOUT_SECONDS,
+            extra: X402BatchSettlementExtra::Solana(X402BatchSettlementSolanaExtra {
+                fee_payer: solana.fee_payer.clone(),
+                withdraw_delay: solana.min_grace_period_secs,
+            }),
+        },
+    }
+}
+
 /// A `payment-required` greeting that was **there and unreadable** (issue
 /// #874).
 ///
@@ -417,32 +667,43 @@ pub fn terms_body(terms: &GreetingTerms<'_>) -> Vec<u8> {
     let settlement: Option<&X402SettlementTerms> = node.and_then(NodeFacts::evm_settlement);
     let settlements: &[X402ChainSettlementTerms] =
         node.map(|node| node.settlements.as_slice()).unwrap_or(&[]);
+    // ADR 0074 decision 8: one `batch-settlement` entry per chain this node
+    // has opted into, read off the same `NodeFacts` the self-description
+    // publishes (ND-11) -- never a second declaration of these facts.
+    let batch_settlements: &[X402BatchSettlementTerms] = node
+        .map(|node| node.batch_settlements.as_slice())
+        .unwrap_or(&[]);
+    let amount = price.charge(payload_len).to_string();
+    let mut accepts = vec![X402AcceptOption::Channel(Box::new(X402PaymentOption {
+        scheme: "toon-channel".to_string(),
+        network: destination.to_string(),
+        amount: amount.clone(),
+        pay_to: destination.to_string(),
+        max_timeout_seconds: X402_MAX_TIMEOUT_SECONDS,
+        http_endpoint: "/ilp".to_string(),
+        extra: X402ChannelExtra {
+            ilp_address: destination.to_string(),
+            endpoint: "/ilp".to_string(),
+            price: price.base().to_string(),
+            price_per_kib: (!price.is_flat()).then(|| price.per_kib().to_string()),
+            ilp_addresses: ilp_addresses.to_vec(),
+            btp_endpoint: btp_endpoint.map(str::to_string),
+            settlement: settlement.cloned(),
+            settlements: settlements.to_vec(),
+            required_transport: required_transport.map(str::to_string),
+            session_lease_ttl_ms,
+        },
+    }))];
+    accepts.extend(batch_settlements.iter().map(|fact| {
+        X402AcceptOption::BatchSettlement(batch_settlement_accept(fact, amount.clone()))
+    }));
     let terms = X402PaymentRequired {
         x402_version: X402_VERSION,
         resource: X402Resource {
             url: destination.to_string(),
         },
         request: request.cloned(),
-        accepts: vec![X402PaymentOption {
-            scheme: "toon-channel".to_string(),
-            network: destination.to_string(),
-            amount: price.charge(payload_len).to_string(),
-            pay_to: destination.to_string(),
-            max_timeout_seconds: X402_MAX_TIMEOUT_SECONDS,
-            http_endpoint: "/ilp".to_string(),
-            extra: X402ChannelExtra {
-                ilp_address: destination.to_string(),
-                endpoint: "/ilp".to_string(),
-                price: price.base().to_string(),
-                price_per_kib: (!price.is_flat()).then(|| price.per_kib().to_string()),
-                ilp_addresses: ilp_addresses.to_vec(),
-                btp_endpoint: btp_endpoint.map(str::to_string),
-                settlement: settlement.cloned(),
-                settlements: settlements.to_vec(),
-                required_transport: required_transport.map(str::to_string),
-                session_lease_ttl_ms,
-            },
-        }],
+        accepts,
     };
     serde_json::to_vec(&terms).expect("x402 terms always serialize")
 }
@@ -758,15 +1019,15 @@ mod tests {
         assert_eq!(terms.evm_settlement(), None);
 
         // The per-chain list alone answers, Solana entry and all...
-        terms.accepts[0].extra.settlements = vec![
+        terms.offer_mut().unwrap().extra.settlements = vec![
             X402ChainSettlementTerms::Solana(solana),
             X402ChainSettlementTerms::Evm(evm.clone()),
         ];
         assert_eq!(terms.evm_settlement(), Some(&evm));
 
         // ...as does the legacy single object on a pre-#632 greeting.
-        terms.accepts[0].extra.settlements.clear();
-        terms.accepts[0].extra.settlement = Some(evm.clone());
+        terms.offer_mut().unwrap().extra.settlements.clear();
+        terms.offer_mut().unwrap().extra.settlement = Some(evm.clone());
         assert_eq!(terms.evm_settlement(), Some(&evm));
     }
 
@@ -777,5 +1038,133 @@ mod tests {
         let terms: X402PaymentRequired = serde_json::from_str(&well_formed()).unwrap();
         let json = serde_json::to_vec(&terms).unwrap();
         assert_eq!(parse_greeting(&json), Ok(terms));
+    }
+
+    // -- ADR 0074 decision 8: the greeting's batch-settlement accepts[] entries --
+
+    fn evm_batch_settlement_fact() -> X402BatchSettlementTerms {
+        X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
+            network: "eip155:84532".to_string(),
+            asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".to_string(),
+            pay_to: "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf".to_string(),
+            receiver_authorizer: "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf".to_string(),
+            min_withdraw_delay_secs: 86_400,
+            name: "USDC".to_string(),
+            version: "2".to_string(),
+        })
+    }
+
+    fn solana_batch_settlement_fact() -> X402BatchSettlementTerms {
+        X402BatchSettlementTerms::Solana(X402BatchSettlementSolanaTerms {
+            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
+            asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            pay_to: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
+            fee_payer: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
+            min_grace_period_secs: 86_400,
+        })
+    }
+
+    /// The greeting keeps its `toon-channel` entry first and unchanged, and
+    /// gains one x402-valid `batch-settlement` entry per opted-in chain --
+    /// the exact shape a stock `@x402/evm` client builds a `ChannelConfig`
+    /// from (issue #1345's "done when").
+    #[test]
+    fn a_node_opted_into_both_chains_greets_with_a_toon_channel_entry_and_two_batch_settlement_entries(
+    ) {
+        let facts = NodeFacts {
+            batch_settlements: vec![evm_batch_settlement_fact(), solana_batch_settlement_fact()],
+            ..Default::default()
+        };
+        let body = terms_body(&GreetingTerms {
+            destination: "g.toon.ario",
+            price: Price::flat(1000),
+            payload_len: 0,
+            node: Some(&facts),
+            ..Default::default()
+        });
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["accepts"].as_array().unwrap().len(), 3);
+        assert_eq!(value["accepts"][0]["scheme"], "toon-channel");
+
+        assert_eq!(
+            value["accepts"][1],
+            serde_json::json!({
+                "scheme": "batch-settlement",
+                "network": "eip155:84532",
+                "amount": "1000",
+                "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                "payTo": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
+                "maxTimeoutSeconds": 60,
+                "extra": {
+                    "receiverAuthorizer": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
+                    "withdrawDelay": 86400,
+                    "name": "USDC",
+                    "version": "2"
+                }
+            }),
+            "a stock @x402/evm client builds its ChannelConfig from payTo and extra alone"
+        );
+        assert_eq!(
+            value["accepts"][2],
+            serde_json::json!({
+                "scheme": "batch-settlement",
+                "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+                "amount": "1000",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                "maxTimeoutSeconds": 60,
+                "extra": {
+                    "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "withdrawDelay": 86400
+                }
+            })
+        );
+
+        // The greeting still reads as ordinary toon-channel terms: `.offer()`
+        // and every accessor built on it see straight through the new
+        // entries to the one they have always described.
+        let terms = parse_greeting(&body).expect("well-formed");
+        assert_eq!(terms.price(), Some(1000));
+        assert_eq!(terms.pay_to(), Some("g.toon.ario"));
+        assert_eq!(terms.batch_settlement_offers().count(), 2);
+    }
+
+    /// A node that has opted into neither chain greets exactly as it did
+    /// before ADR 0074 -- one entry, no `batchSettlements` anywhere. This is
+    /// the compatibility claim every existing greeting test in this
+    /// workspace already relies on.
+    #[test]
+    fn a_node_with_no_batch_settlement_opt_in_greets_with_one_entry_only() {
+        let body = terms_body(&GreetingTerms {
+            destination: "g.toon.relay",
+            price: Price::flat(1000),
+            payload_len: 0,
+            ..Default::default()
+        });
+        let terms = parse_greeting(&body).expect("well-formed");
+        assert_eq!(terms.accepts.len(), 1);
+        assert_eq!(terms.batch_settlement_offers().count(), 0);
+    }
+
+    /// A batch-settlement entry round-trips through JSON byte for byte --
+    /// the untagged enum's disambiguation from a `toon-channel` entry has to
+    /// survive parsing, not merely construction.
+    #[test]
+    fn a_batch_settlement_entry_round_trips_through_json() {
+        let facts = NodeFacts {
+            batch_settlements: vec![evm_batch_settlement_fact()],
+            ..Default::default()
+        };
+        let body = terms_body(&GreetingTerms {
+            destination: "g.toon.ario",
+            price: Price::flat(1000),
+            payload_len: 0,
+            node: Some(&facts),
+            ..Default::default()
+        });
+        let terms = parse_greeting(&body).expect("well-formed");
+        let reserialized = serde_json::to_vec(&terms).unwrap();
+        assert_eq!(parse_greeting(&reserialized), Ok(terms));
     }
 }

@@ -7429,8 +7429,8 @@ mod tests {
             OutboundClientLedger,
         };
         use connector_domain::x402::{
-            X402ChannelExtra, X402PaymentOption, X402PaymentRequired, X402Resource,
-            X402SettlementTerms, X402_VERSION,
+            X402AcceptOption, X402ChannelExtra, X402PaymentOption, X402PaymentRequired,
+            X402Resource, X402SettlementTerms, X402_VERSION,
         };
         use connector_signer::{LocalEd25519Signer, LocalSigner};
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -7453,7 +7453,7 @@ mod tests {
                     url: "g.example.app".to_string(),
                 },
                 request: None,
-                accepts: vec![X402PaymentOption {
+                accepts: vec![X402AcceptOption::Channel(Box::new(X402PaymentOption {
                     scheme: "toon-channel".to_string(),
                     network: "g.example.app".to_string(),
                     amount: PRICE.to_string(),
@@ -7478,7 +7478,7 @@ mod tests {
                         }),
                         ..X402ChannelExtra::default()
                     },
-                }],
+                }))],
             }
         }
 
@@ -8137,7 +8137,7 @@ mod tests {
             );
 
             let mut settlement_less = quoted_terms();
-            settlement_less.accepts[0].extra.settlement = None;
+            settlement_less.offer_mut().unwrap().extra.settlement = None;
             assert_eq!(EvmDomain::from_greeting(&settlement_less), None);
         }
 

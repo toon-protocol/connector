@@ -336,6 +336,7 @@ mod tests {
                 btp_endpoint: None,
                 peer_carriages: vec!["http".to_string()],
                 settlements: Vec::new(),
+                batch_settlements: Vec::new(),
             },
             Some(EdgeIdentity {
                 key_id: "key-1".to_string(),

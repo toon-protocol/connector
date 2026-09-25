@@ -1201,7 +1201,7 @@ key_file = "{key}"
     fn batch_settlement_is_opted_into_per_chain() {
         let key_file = temp_key_file();
         let resolved = resolve_settlement(Some(keyed_toml(&keyed_both(
-            "[evm.batch_settlement]\nmin_withdraw_delay_secs = 3600",
+            "[evm.batch_settlement]\nmin_withdraw_delay_secs = 3600\nasset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"",
             "",
             key_file.path(),
         ))))

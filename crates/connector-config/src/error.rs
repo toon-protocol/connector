@@ -833,6 +833,18 @@ pub enum ConfigError {
     )]
     BatchSettlementInvalidProgramId { value: String },
 
+    /// `[settlement.evm.batch_settlement] asset_eip712_name` or
+    /// `asset_eip712_version` was written empty. Both are required as soon
+    /// as the table exists (ADR 0074 decision 8, issue #1345): the greeting
+    /// publishes them so a payer's deposit can be signed under the asset's
+    /// real EIP-712 domain, and an empty value would be published as one.
+    #[error(
+        "[settlement.evm.batch_settlement] {key} is empty. A client signs its deposit \
+         authorization under this asset's real EIP-712 domain, so the greeting must publish \
+         it -- there is no safe default for an arbitrary settlement token"
+    )]
+    BatchSettlementEmptyAssetEip712Field { key: &'static str },
+
     /// A settlement table asked for its RPC to ride the node's `socks_proxy`
     /// and the node has none (ADR 0073 decision 1). The key selects the one
     /// proxy ADR 0070 gives a node; it never names a second, and a dial that

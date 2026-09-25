@@ -153,6 +153,7 @@ fn serve_self_description(
                 token_address: to_hex(&token),
                 decimals: 6,
             })],
+            batch_settlements: Vec::new(),
         },
         // A secp256k1 edge identity, deliberately a different value from
         // the settlement address above: the two are not interchangeable,
