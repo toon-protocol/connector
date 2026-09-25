@@ -1,10 +1,14 @@
 # Settlement RPC may ride the circuit, once every wait on it is bounded
 
-**Status:** Proposed. It is waiting on the decision asked for in TOON_Network#167, it binds nothing, and it may be rejected. If it is accepted, it amends [0070](0070-an-onion-address-is-a-host-not-a-carriage.md) **decision 4** and nothing else in that record. It **recommends allowing** proxied settlement RPC, but only together with the backend hardening listed in decision 5. The measurements are in this record. The choice is the maintainer's.
+**Status:** Accepted on TOON_Network#167 (2026-09-25), and built together with every item of decision 5's hardening, as this record required. It amends [0070](0070-an-onion-address-is-a-host-not-a-carriage.md) **decision 4**, the settlement half only, and nothing else in that record. Where the build settled a number or a mechanism this record left open, or added a rule, it says so under **Implementation** below. One measurement is still owed: a funded submit and confirm over a circuit (see "What would make this record true").
 
 **Scope:** connector architecture, internal to this codebase. One consequence reaches outside it. TOON Network's spec §10 and its ADR 0008 require a Hidden Provider to "run its own settlement RPC". That rule exists because of decision 4, and accepting this record is what would let TOON Network relax it. This record does not change that repository.
 
-**Falsifier:** `crates/**/*.rs` matching `rpc_via_socks_proxy` — this record proposes that key and says the tree does not have it yet; a match means the key was built while the record still reads Proposed, and its Status line is out of date.
+**Falsifier:** `crates/connector-settlement-*/src/lib.rs` matching `Provider::<Http>|NonceManagerMiddleware|RpcClient::new_with_commitment|send_and_confirm_transaction` — this record says every settlement client is built from its table's one `RpcTransport` and every write confirms through the hardened loops; a match is a client or a confirm loop built around them.
+
+**Falsifier:** `crates/connector-settlement-evm/src/channel_index_sync.rs` matching `Provider::<Http>` — the channel-index syncer rides the table's transport too; a match is the syncer dialing on a client of its own, direct and unbounded.
+
+**Falsifier:** `crates/connector-rate-source-evm/src/lib.rs` matching `Provider::<Http>` — the EVM rate source rides the table's transport too; a match is the rate source dialing on a client of its own.
 
 **A `[settlement.evm]` or `[settlement.solana]` table may set `rpc_via_socks_proxy = true`.** When it does, every client that dials that table's `rpc_url` goes through the node's one `socks_proxy`, as `socks5h`, on one isolated circuit per chain that stays pinned. That covers the settlement backend, the EVM channel-index syncer and the EVM rate source. There is no direct fallback. This comes **with**, not after, the hardening listed in decision 5: bounded request timeouts, confirmation loops that survive a failed poll, a nonce read from `pending`, and a boot that reads before it transacts. Latency is not what makes a circuit unsafe for settlement. The circuit adds about a quarter of a second to a pooled call and about a second to a fresh one, and that is small next to every deadline settlement has. The danger is that the backends today treat one slow or failed round trip as either **forever** (EVM) or **fatal** (Solana).
 
@@ -90,8 +94,8 @@ The keepalive rows mix one new connection per batch of 8 with 7 reused calls. Sp
 
 ### What was not measured
 
-- **Transaction submission and confirmation end to end.** The devnet faucet refused an airdrop (429, daily limit), and this record's author would not spend a fleet key's funds.
-- **What a real `sendTransaction` costs.** A `sendTransaction` or `eth_sendRawTransaction` is one JSON-RPC round trip of the same shape as the reads above, and the RPC node relays it onward from **its own** address. So the circuit adds one round trip to submission, and confirmation time is the chain's, observed through polls that each cost one round trip. That is an inference and is labelled as one. A funded run of `submit`/`confirm` through the circuit is the first thing to do if this record is accepted.
+- **Transaction submission and confirmation end to end.** The devnet faucet refused an airdrop (429, daily limit), and this record's author would not spend a fleet key's funds. It was tried again after acceptance and refused again (below, "After acceptance").
+- **What a real `sendTransaction` costs.** A `sendTransaction` or `eth_sendRawTransaction` is one JSON-RPC round trip of the same shape as the reads above, and the RPC node relays it onward from **its own** address. So the circuit adds one round trip to submission, and confirmation time is the chain's, observed through polls that each cost one round trip. That is an inference and is labelled as one. A funded run of `submit`/`confirm` through the circuit was named as the first thing to do on acceptance, and is still owed (below, "After acceptance").
 - **A circuit dying under a pooled connection mid-request.** Nothing in the sample saw it. By construction it looks like a hung or reset TCP connection, which is why decision 5's timeouts are required rather than nice to have.
 
 ### Reading the numbers against settlement's clocks
@@ -107,7 +111,7 @@ A pinned, pooled circuit costs roughly **+0.22s at p50 and +0.9s at p99** per ca
 
 ## Evidence 2: what the backends do under that latency
 
-Read from `origin/main` at `7f523d23`. Dependency behaviour is from the pinned `solana-rpc-client 2.1.0`, `ethers-providers 2.0.14` and `ethers-middleware 2.0.14` sources.
+Read from `origin/main` at `7f523d23`, the tree **before** this record was built. Every defect below is what decision 5 fixed; **Implementation** says how. Dependency behaviour is from the pinned `solana-rpc-client 2.1.0`, `ethers-providers 2.0.14` and `ethers-middleware 2.0.14` sources.
 
 ### Solana (`crates/connector-settlement-solana/src/lib.rs`)
 
@@ -163,7 +167,7 @@ Payments are public on chain either way. Every channel, deposit, claim redeemed 
 
 **Self-hosting is stronger for reads, and not automatically for writes.** A self-hosted node hides reads completely. It also puts the operator's IP into the chain's peer-to-peer layer: Solana gossip publishes it, and a transaction's first p2p hop is a well-known origin signal. So "run your own node" is the stronger option only if that node's own p2p egress is proxied or otherwise unlinkable, which spec §10 does not say today. This record does not decide that. It flags it for the maintainer, because the recommendation "keep self-hosting as the stronger option" in TOON_Network#167 step 3 depends on it.
 
-## Decision (proposed)
+## Decision
 
 1. **`rpc_via_socks_proxy` per settlement table.**
    - `[settlement.evm]` and `[settlement.solana]` each accept `rpc_via_socks_proxy`, a boolean that defaults to `false`.
@@ -201,6 +205,54 @@ Payments are public on chain either way. Every channel, deposit, claim redeemed 
    - **403 and 429 are retried with backoff on both chains,** within the request budget, and are never treated as a final answer on a confirmation poll. None was seen in 3,200 calls, but exit IPs are shared, and the Solana client today retries only a 429.
    - **`fund` is idempotent under retry.** It is the one operation that can execute twice after an ambiguous outcome on both chains. It needs either a stated target total checked before it sends, or a documented rule that it is never retried without reading the channel first.
 
+## Implementation (TOON_Network#167)
+
+Built on the branch that accepted this record. Where a number or a mechanism below differs from decision 4 or 5 as written, the difference is named and the decision text above is the one it refines.
+
+### The transport, and the key
+
+- **One transport per table.** `connector-chain-rpc` holds `RpcTransport`: the URL, one `reqwest` client under the bounds, and the route. `connector-cli`'s `settlement_transports` builds one per `[settlement.*]` table and hands the same one to every client of that `rpc_url`: the backend, and on EVM `EvmChannelIndexSyncer` and `UniswapV3RateSource`. Each of those now takes an `RpcTransport` instead of a URL, so none can be built around it (the falsifiers above).
+- **The key** is `rpc_via_socks_proxy`, a boolean on `[settlement.evm]` and `[settlement.solana]`, default `false`. The frozen legacy `[settlement]` shape does not accept it. `Config::load` refuses it without a root `socks_proxy` (`SettlementRpcViaSocksProxyWithoutProxy`).
+- **Added: https, unless the host is an onion.** `Config::load` also refuses a proxied table whose `rpc_url` is plain `http://` to a clearnet host (`SettlementRpcViaSocksProxyPlaintext`). This record did not ask for that. It follows from routing through an exit relay: over plaintext the exit could rewrite a channel's deposit or a receipt, and a node believing it would honour claims against collateral that does not exist. An onion host is accepted over `http://` for ADR 0070 decision 2's reason.
+- **Circuits** are pinned by SOCKS username exactly as decision 3 says: `toon-settlement-evm` and `toon-settlement-solana`, password `pinned`, over `Proxy::all`, so a proxied client has no direct path to fall back to.
+- **Bounds** are decision 4's numbers unchanged: 20s connect, 30s request, 30s pool idle, on every settlement client, proxied or not.
+
+### Decision 5, item by item
+
+- **Solana confirm.** `submit` sends once with preflight, then polls `getSignatureStatuses` and `getBlockHeight` through any transient error, backing off (poll interval doubling, 8s ceiling) while polls fail. It stops when the transaction is confirmed, has failed on chain, or has expired, and reports by signature. A preflight refusal is reported as never broadcast. A send whose answer was lost is re-sent as the same signed bytes until acknowledged. Two **additions**:
+  - **Expired** is judged only once the block height is 20 blocks (about 8s) past `lastValidBlockHeight`, and only on a status read with `searchTransactionHistory`. Otherwise a load-balanced endpoint whose height and status backends disagree could call a landed transaction expired and "safe to retry", the #907 pattern on Solana.
+  - **Unknown**: if no read answers at all for 120s (about twice a blockhash's life), the outcome is reported as unknown, naming the signature. Nothing else bounds a loop whose only exit is a read.
+
+  Polls are 500ms direct and 1s over a circuit.
+
+- **EVM confirm.** The deadline is 180s as written. The recheck window is 30s: a transaction is reported as not observed, with its hash, once the endpoint has **answered** "not found" to both the receipt and `eth_getTransactionByHash` for 30s straight. A failed poll resets that window, so a circuit outage never reads as "not observed". Failed polls back off as on Solana. Polls are 1s over a circuit and stay 100ms direct, as written.
+- **EVM nonces.** `send::Sender` replaces `NonceManagerMiddleware`. It seeds from `pending`, then counts locally under one lock that covers nonce, signing and send. The transaction hash is computed before sending. The outcomes:
+  - A JSON-RPC refusal sent nothing.
+  - A nonce conflict re-reads `pending` and signs the never-accepted operation once more.
+  - A lost answer is looked up by hash, and the only re-send is the identical signed bytes.
+  - If neither the lookup nor the re-send settles it, the transaction is remembered as unresolved. The next write reads `pending`, and if `pending` has not moved past the unresolved nonce (a lagging backend), it offers those same bytes again and takes the nonce after. So nothing is ever re-signed at a nonce that may be spent, even when `pending` lags.
+- **Boot reads first, and retries.** `ensure_own_ata_exists` reads the ATA and creates it only when missing. Every boot read on both chains goes through `retry_read`: three retries, 0.5s then 1s then 2s. That applies to every failure, the node's own answers included, since boot only reads. Two things were **added**:
+  - The same helper covers the blockhash a Solana write signs over and the `pending` nonce an EVM write starts from. Nothing has been sent at either point.
+  - Solana boot now reads the payer's balance and refuses one holding no lamports. The ATA create used to prove that on every start, and a missing proof would otherwise surface as a failed program-identity probe.
+- **403 and 429.** Both are retried with backoff on both chains: four retries, 0.5s doubling (7.5s in all). On EVM a `Retry-After` of up to 8s replaces the computed wait, and a longer one ends the retries. The Solana SDK drops the response before returning a status error, so there the computed wait is always used. A confirmation poll never treats either as an answer.
+- **`fund` is idempotent** by the first of the two routes this record offered: a stated total. `SettlementBackend::fund_to(channel, own_total)` raises the own deposit to a total and no further. On EVM the total goes straight to `setTotalDeposit`, so the chain computes the difference. On Solana the backend reads and deposits the difference under a lock. `POST /channels/:id/fund` takes exactly one of `amount` (the increment, unchanged) or `total`.
+
+### What is not typed
+
+Every outcome above reaches the caller as `SettlementError::Backend` with a message that names the transaction and says whether a retry is safe. The port's error enum was not widened to carry "landed", "expired" and "unknown" as variants. That would change the operator surface's error mapping, and no caller branches on them yet. A caller that needs to retry mechanically should use `fund_to`, which is safe whatever the message says.
+
+### Tested
+
+- **Fakes on loopback, in CI.** `FakeRpc` is a scripted JSON-RPC server that answers, refuses, hangs, drops, or forwards to a real chain and loses the answer. It exercises each hardening seam on both chains, alongside `anvil` and `solana-test-validator`.
+- **The SOCKS dial test is ADR 0070's `Socks5TestServer`**, now speaking RFC 1929. It asserts that each chain dials through the proxy, as a name, under its own username, and that a proxy that is down fails the call with nothing reaching the endpoint direct.
+
+### After acceptance: the circuit, measured again (2026-09-25)
+
+- **The daemon.** A local `anon` v0.4.10.2 client, with the Appendix's `anonrc`.
+- **The run.** `settlement_over_a_circuit.rs` drove the production constructors over `RpcTransport::through` against the fleet's public endpoints. EVM boot took 1.50s over the circuit (chain id, `getTokenNetwork`, `decimals`). Solana boot took 1.88s and ended, as it should for an unfunded throwaway key, at the "holds no lamports" refusal.
+- **Pinning, observed.** The daemon's control port showed every EVM stream on one circuit with `SOCKS_USERNAME="toon-settlement-evm"`, and every Solana stream on a different circuit with `SOCKS_USERNAME="toon-settlement-solana"`. Each stream carried the endpoint's hostname, resolved at the exit. That is decisions 2 and 3, observed rather than inferred.
+- **Not measured, still.** A funded submit and confirm. The Solana devnet faucet refused a fresh throwaway address (429, daily limit), and the keyless alternatives need a GitHub login. No public Base Sepolia faucet was found that pays without an account, a captcha or a mainnet balance. This record's rule against spending fleet keys stands.
+
 ## Considered options
 
 - **Reject, and keep "a hidden provider runs its own settlement RPC".** This is the status quo, and it stays available as the stronger option for reads. It is rejected as the _only_ option because it makes "hidden" unavailable to every realistic operator (TOON_Network#167), and because self-hosting leaks the IP at the p2p layer instead (Evidence 3).
@@ -212,7 +264,7 @@ Payments are public on chain either way. Every channel, deposit, claim redeemed 
 
 ## Consequences
 
-- **A hidden provider stops needing a chain node.** Once the key and the hardening land, the #159 bundle's hidden variant can point `[settlement.*]` at public endpoints with `rpc_via_socks_proxy = true`. That depends on TOON Network changing spec §10 and ADR 0008, and the provider's loader, which this record does not do.
+- **A hidden provider stops needing a chain node.** With the key and the hardening built, the #159 bundle's hidden variant can point `[settlement.*]` at public `https://` endpoints with `rpc_via_socks_proxy = true`, once it pins a connector image that has them. That still depends on TOON Network changing spec §10 and ADR 0008, and the provider's loader, which this record does not do.
 - **Settlement gets slower and stays correct.** Pooled calls cost about 0.2–1s more each, so an EVM redeem goes from seconds to several seconds. Nothing on those paths has a deadline measured in seconds.
 - **The hardening helps every node, not just hidden ones.** Bounded requests, confirm loops that survive a failed poll, `pending` nonces and a read-first boot fix defects a direct connection can hit today.
 - **The linkage 0070 left standing closes for the RPC provider and for the node's ISP, and nothing else changes.** The operator's IP stops being joined to its on-chain identity at the RPC. The payments, the addresses and the counterparties are exactly as public as before.
@@ -220,7 +272,7 @@ Payments are public on chain either way. Every channel, deposit, claim redeemed 
 
 ## What would make this record true, or false
 
-- **True:** the maintainer accepts it on TOON_Network#167. Decision 5 lands. A funded run of `submit`/`confirm` over a pinned circuit on both devnets shows confirmation within the budgets in decision 4 (the gap named under "What was not measured").
+- **True:** the maintainer accepts it on TOON_Network#167 (done, 2026-09-25). Decision 5 lands (done, **Implementation**). A funded run of `submit`/`confirm` over a pinned circuit on both devnets shows confirmation within the budgets in decision 4. That run is still owed: both faucets refused, and `crates/connector-bin/tests/settlement_over_a_circuit.rs` is the probe that makes it, given throwaway keys with a little testnet gas.
 - **False:** the maintainer rejects it. Or a longer or differently placed sample shows sustained exit-side refusal (403 or 429) from the public devnet RPCs at a rate the retry budget cannot absorb. That is the one outcome of Evidence 1 that would have changed this recommendation, and a single evening cannot rule it out.
 
 ## Appendix: reproducing the measurement

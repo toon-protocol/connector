@@ -241,7 +241,8 @@ impl Chain {
     /// back with -- never the node under test's own answer.
     async fn reader(&self, keys: &NodeKeys) -> SolanaSettlementBackend {
         SolanaSettlementBackend::connect(
-            &self.validator.rpc_url,
+            &connector_settlement_solana::RpcTransport::direct(&self.validator.rpc_url)
+                .expect("rpc transport"),
             &keys.seed,
             self.program_id,
             self.token_mint,

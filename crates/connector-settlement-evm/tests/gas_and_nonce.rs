@@ -100,9 +100,10 @@ async fn every_channel_operation_estimates_its_own_gas_and_succeeds() {
 /// reads can observe the same pending count before either transaction is
 /// broadcast, so both would submit the same nonce and one would be
 /// rejected or silently replace the other. This only both land, each with
-/// their own funded amount, because `EvmSettlementBackend` wraps its
-/// signer in ethers' `NonceManagerMiddleware`, which allocates nonces
-/// locally rather than re-deriving each one from a racy on-chain read.
+/// their own funded amount, because `EvmSettlementBackend`'s sender holds
+/// one lock across choosing a nonce, signing and sending, and counts nonces
+/// locally from one `pending` read rather than re-deriving each one from a
+/// racy on-chain read (ADR 0073).
 #[tokio::test]
 async fn concurrent_calls_from_the_same_signer_do_not_conflict_on_nonce() {
     if !require_anvil() {

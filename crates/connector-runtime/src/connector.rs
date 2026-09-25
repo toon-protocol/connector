@@ -3926,6 +3926,21 @@ impl Connector {
         Ok(ChannelView::from(state))
     }
 
+    /// Raise this node's own deposit in `channel_id` to `own_total`, on
+    /// whichever chain the id names: the retry-safe form of
+    /// [`Self::fund_channel`] (ADR 0073, `SettlementBackend::fund_to`).
+    pub async fn fund_channel_to(
+        &self,
+        channel_id: &str,
+        own_total: u128,
+    ) -> Result<ChannelView, ChannelOperationError> {
+        let state = self
+            .settlement_for_channel(channel_id)?
+            .fund_to(&ChannelId(channel_id.to_string()), own_total)
+            .await?;
+        Ok(ChannelView::from(state))
+    }
+
     /// Redeem `claim` against `channel_id` (issue #459), on whichever chain
     /// the id itself names ([`Self::settlement_for_channel`]).
     pub async fn redeem_channel(

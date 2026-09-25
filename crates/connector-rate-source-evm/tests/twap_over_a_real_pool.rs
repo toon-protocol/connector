@@ -83,7 +83,9 @@ async fn a_two_leg_quote_composes_to_a_known_good_rate() {
     }
 
     let venue = support::Venue::stand_up(ANVIL_BASE_PORT).await;
-    let source = UniswapV3RateSource::connect(&venue.rpc_url).expect("a reader");
+    let source = UniswapV3RateSource::connect(
+        &connector_rate_source_evm::RpcTransport::direct(&venue.rpc_url).expect("rpc transport"),
+    );
 
     let first = source
         .observe(&anyone_weth_leg(&venue.anyone_weth))
@@ -161,7 +163,9 @@ async fn a_pool_that_cannot_answer_the_question_asked_says_so() {
     }
 
     let venue = support::Venue::stand_up(ANVIL_BASE_PORT + 10).await;
-    let source = UniswapV3RateSource::connect(&venue.rpc_url).expect("a reader");
+    let source = UniswapV3RateSource::connect(
+        &connector_rate_source_evm::RpcTransport::direct(&venue.rpc_url).expect("rpc transport"),
+    );
 
     // A window longer than the pool's whole history. v3's oracle reverts
     // `OLD`; this reader reports the window it could not serve rather than
@@ -235,7 +239,9 @@ async fn growing_observation_cardinality_is_what_makes_a_window_servable() {
     }
 
     let mut pool = support::UngrownPool::stand_up(ANVIL_BASE_PORT + 20).await;
-    let source = UniswapV3RateSource::connect(&pool.rpc_url).expect("a reader");
+    let source = UniswapV3RateSource::connect(
+        &connector_rate_source_evm::RpcTransport::direct(&pool.rpc_url).expect("rpc transport"),
+    );
     let leg = QuoteLeg {
         pool: pool.pool.clone(),
         base: AssetId::evm(support::ANYONE),

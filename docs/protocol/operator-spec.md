@@ -253,6 +253,18 @@ it under `fund`. One asymmetry survives below the port rather than at it: `fund`
 backend adds the increment to the channel's current `own_deposited` before submitting. Solana's
 `Deposit` is already an increment and needs no such conversion.
 
+**`fund` also takes a total, and that form is the one to retry.** An increment runs again when it is
+retried, and `fund` is the one channel write whose repeat the chain accepts rather than refuses (a
+stale claim, a second `open` or `close`, are all refused). So after an outcome the caller did not see
+(a timeout, a lost answer), a retried increment deposits twice. `POST /channels/:id/fund` therefore
+takes exactly one of `amount` (the increment, as before) or `total`: this node's own deposit to
+reach, and no further. A total already reached deposits nothing and answers the channel as it stands,
+which is what the retry of a call that took effect should see. On EVM the total goes straight to
+`setTotalDeposit`, which computes the difference on chain; on Solana the backend reads the deposit
+and deposits the difference under one lock
+([ADR 0073](../adr/0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md)
+decision 5; the port's `fund_to`).
+
 **A runtime row can never take a key the configuration file owns.** A colliding write is refused
 outright, and on the next boot a runtime row whose key the file has since claimed is **deleted**, not
 shadowed — ownership is permanent rather than a precedence that flips back

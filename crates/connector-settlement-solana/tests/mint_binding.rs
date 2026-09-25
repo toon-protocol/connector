@@ -69,7 +69,8 @@ async fn a_funded_channel_on_a_different_mint_resolves_as_unknown() {
     let configured_mint = other.token_mint();
     assert_ne!(junk_mint, configured_mint);
     let node = SolanaSettlementBackend::connect(
-        &validator.rpc_url,
+        &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
+            .expect("rpc transport"),
         &opener.test_payer_seed(),
         program_id,
         configured_mint,
@@ -91,7 +92,8 @@ async fn a_funded_channel_on_a_different_mint_resolves_as_unknown() {
     // configured with its mint -- proving the refusal above was the mint
     // binding and nothing else.
     let same_mint_node = SolanaSettlementBackend::connect(
-        &validator.rpc_url,
+        &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
+            .expect("rpc transport"),
         &opener.test_payer_seed(),
         program_id,
         junk_mint,

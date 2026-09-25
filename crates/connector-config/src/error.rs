@@ -787,6 +787,31 @@ pub enum ConfigError {
     )]
     SettlementChannelIndexConfirmationsZero,
 
+    /// A settlement table asked for its RPC to ride the node's `socks_proxy`
+    /// and the node has none (ADR 0073 decision 1). The key selects the one
+    /// proxy ADR 0070 gives a node; it never names a second, and a dial that
+    /// was meant for a circuit is never made direct instead.
+    #[error(
+        "[settlement.{table}] sets rpc_via_socks_proxy = true, but this node configures no \
+         socks_proxy. The key selects the node's one proxy and never names a second, and a \
+         settlement RPC meant for a circuit is never dialed direct instead (ADR 0073). Set \
+         socks_proxy = \"socks5h://<host>:<port>\" at the top level, or remove \
+         rpc_via_socks_proxy"
+    )]
+    SettlementRpcViaSocksProxyWithoutProxy { table: &'static str },
+
+    /// A settlement table asked for its RPC to ride a circuit to a plain
+    /// `http://` endpoint that is not an onion address (ADR 0073). The exit
+    /// relay would be able to read and rewrite every answer.
+    #[error(
+        "[settlement.{table}] rpc_url '{value}' is plain http, and rpc_via_socks_proxy = true \
+         would send it through an exit relay that can read and rewrite every answer (a \
+         channel's deposit, a transaction's receipt). Use the endpoint's https URL. Plain http \
+         over a circuit is accepted only for a .onion or .anyone host, whose address \
+         authenticates the service itself (ADR 0070, ADR 0073)"
+    )]
+    SettlementRpcViaSocksProxyPlaintext { table: &'static str, value: String },
+
     #[error(
         "invalid [[client_channels]] channel_id '{value}': must be 64 hex characters \
          (an on-chain 32-byte channel identifier), optionally '0x'-prefixed"

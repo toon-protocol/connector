@@ -93,6 +93,10 @@ pub(crate) struct RawEvmSettlementTable {
     channel_index_from_block: Option<u64>,
     #[serde(default)]
     channel_index_confirmations: Option<u64>,
+    /// ADR 0073: dial this table's `rpc_url` through the root
+    /// `socks_proxy`. See [`EvmSettlementConfig::rpc_via_socks_proxy`].
+    #[serde(default)]
+    rpc_via_socks_proxy: bool,
 }
 
 /// `[settlement.solana]`: `contract_address` (an EVM `TokenNetworkRegistry`)
@@ -109,6 +113,10 @@ pub(crate) struct RawSolanaSettlementTable {
     token_address: String,
     decimals: u8,
     key: RawSettlementKeyConfig,
+    /// ADR 0073: dial this table's `rpc_url` through the root
+    /// `socks_proxy`. See [`SolanaSettlementConfig::rpc_via_socks_proxy`].
+    #[serde(default)]
+    rpc_via_socks_proxy: bool,
 }
 
 /// The `[settlement]`/`[settlement.evm]`/`[settlement.solana]` `key`
@@ -225,6 +233,7 @@ pub struct EvmSettlementConfig {
     key: SecretLocation,
     channel_index_from_block: u64,
     channel_index_confirmations: u64,
+    rpc_via_socks_proxy: bool,
 }
 
 /// How many blocks behind chain head a `ChannelOpened`/`ChannelNewDeposit`/
@@ -288,6 +297,17 @@ impl EvmSettlementConfig {
     pub fn channel_index_confirmations(&self) -> u64 {
         self.channel_index_confirmations
     }
+
+    /// Whether every client of this table's `rpc_url` (the backend, the
+    /// channel-index syncer and the rate source) dials through the root
+    /// `socks_proxy`, on this chain's own pinned circuit (ADR 0073). `false`
+    /// unless the table says so. When `true`, `Config::load` has already
+    /// checked that a `socks_proxy` exists, and that the endpoint is
+    /// `https` unless its host is an onion address, since an exit relay
+    /// could otherwise read and rewrite every answer.
+    pub fn rpc_via_socks_proxy(&self) -> bool {
+        self.rpc_via_socks_proxy
+    }
 }
 
 /// A fully validated `[settlement.solana]` table: which deployed
@@ -297,6 +317,7 @@ impl EvmSettlementConfig {
 /// startup (issue #630).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolanaSettlementConfig {
+    rpc_via_socks_proxy: bool,
     rpc_url: String,
     program_id: String,
     token_address: String,
@@ -353,6 +374,14 @@ impl SolanaSettlementConfig {
     pub fn cluster_hint(&self) -> Option<&'static str> {
         cluster_hint_for_rpc_url(&self.rpc_url)
     }
+
+    /// Whether this table's `rpc_url` is dialed through the root
+    /// `socks_proxy`, on the Solana settlement circuit (ADR 0073). The same
+    /// rule and the same load-time checks as
+    /// [`EvmSettlementConfig::rpc_via_socks_proxy`].
+    pub fn rpc_via_socks_proxy(&self) -> bool {
+        self.rpc_via_socks_proxy
+    }
 }
 
 /// [`SolanaSettlementConfig::cluster_hint`]'s free-function half, split out
@@ -404,6 +433,58 @@ impl SettlementConfig {
             SettlementConfig::Solana(solana) => AssetId::solana(&solana.token_address),
         }
     }
+
+    /// This table's RPC endpoint.
+    pub fn rpc_url(&self) -> &str {
+        match self {
+            SettlementConfig::Evm(evm) => evm.rpc_url(),
+            SettlementConfig::Solana(solana) => solana.rpc_url(),
+        }
+    }
+
+    /// Whether this table's RPC rides the root `socks_proxy` (ADR 0073).
+    pub fn rpc_via_socks_proxy(&self) -> bool {
+        match self {
+            SettlementConfig::Evm(evm) => evm.rpc_via_socks_proxy(),
+            SettlementConfig::Solana(solana) => solana.rpc_via_socks_proxy(),
+        }
+    }
+}
+
+/// ADR 0073 decisions 1 and 2, checked at load: a table that sends its RPC
+/// through `socks_proxy` needs a `socks_proxy` to send it through, and an
+/// endpoint an exit relay cannot read or rewrite.
+///
+/// There is no fallback to direct, so without a proxy the key could only
+/// mean "fail every settlement call". Refused here rather than at the first
+/// call.
+///
+/// Plain `http://` is refused unless the host is an onion address. Through
+/// a circuit, the exit relay is a stranger on the path, and over plaintext
+/// it could rewrite a channel's deposit, a transaction's receipt or a
+/// blockhash, and a node that believed it would honour claims against
+/// collateral that does not exist. TLS closes that. An onion host closes it
+/// differently, because its address is the key the circuit authenticates
+/// to, exactly as ADR 0070 decision 2 argues for peer endpoints.
+pub(crate) fn check_settlement_rpc_routes(
+    settlements: &[SettlementConfig],
+    socks_proxy: Option<&Url>,
+) -> Result<(), ConfigError> {
+    for settlement in settlements.iter().filter(|s| s.rpc_via_socks_proxy()) {
+        let table = settlement.chain().name();
+        if socks_proxy.is_none() {
+            return Err(ConfigError::SettlementRpcViaSocksProxyWithoutProxy { table });
+        }
+        let url = Url::parse(settlement.rpc_url())
+            .expect("resolve_rpc_url already parsed every settlement rpc_url");
+        if url.scheme() == "http" && !crate::is_onion_endpoint(&url) {
+            return Err(ConfigError::SettlementRpcViaSocksProxyPlaintext {
+                table,
+                value: settlement.rpc_url().to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Which `[settlement.<chain>]` tables a config declares, and the one
@@ -582,6 +663,7 @@ fn resolve_evm_fields(table: RawEvmSettlementTable) -> Result<EvmSettlementConfi
         key,
         channel_index_from_block: table.channel_index_from_block.unwrap_or(0),
         channel_index_confirmations,
+        rpc_via_socks_proxy: table.rpc_via_socks_proxy,
     })
 }
 
@@ -604,6 +686,7 @@ fn resolve_solana_fields(
     let key = resolve_settlement_key(table.key)?;
 
     Ok(SolanaSettlementConfig {
+        rpc_via_socks_proxy: table.rpc_via_socks_proxy,
         rpc_url,
         program_id: table.program_id,
         token_address: table.token_address,
@@ -650,6 +733,9 @@ pub(crate) fn resolve_settlement(
                 // as an omitted keyed [settlement.evm] table would.
                 channel_index_from_block: None,
                 channel_index_confirmations: None,
+                // Frozen too: a node that wants its settlement RPC on a
+                // circuit writes the keyed `[settlement.evm]` table.
+                rpc_via_socks_proxy: false,
             })?;
             Ok(vec![SettlementConfig::Evm(evm)])
         }
@@ -1250,6 +1336,7 @@ key_file = "{}"
         );
 
         let solana = SettlementConfig::Solana(SolanaSettlementConfig {
+            rpc_via_socks_proxy: false,
             rpc_url: "http://127.0.0.1:8899".to_string(),
             program_id: "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip".to_string(),
             token_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),

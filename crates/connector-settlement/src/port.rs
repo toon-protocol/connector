@@ -241,6 +241,46 @@ pub trait SettlementBackend: Send + Sync {
         amount: u128,
     ) -> Result<ChannelState, SettlementError>;
 
+    /// Raise this node's own deposit in `channel` **to** `own_total`, and
+    /// no further: the retry-safe form of [`fund`](SettlementBackend::fund)
+    /// (ADR 0073 decision 5).
+    ///
+    /// `fund` deposits an increment, so running it twice deposits twice.
+    /// That is harmless only while every outcome is known, and it is the
+    /// one write whose retry after an ambiguous outcome (a timeout, a lost
+    /// answer) executes again on both chains: a stale claim, a second
+    /// `open` or a second `close` is refused by the chain, while a second
+    /// deposit is accepted. A caller that states the total it wants can
+    /// repeat the call until it gets an answer. A total at or below the
+    /// current [`ChannelState::own_deposited`] deposits nothing and returns
+    /// the current state, which is exactly the retry of a call that already
+    /// took effect.
+    ///
+    /// Refuses a channel that is not `Open` exactly as `fund` does.
+    ///
+    /// Provided in terms of [`channel_state`](SettlementBackend::channel_state)
+    /// and `fund`, which is only atomic if nothing else funds the same
+    /// channel between the read and the deposit. Every backend in this
+    /// workspace overrides it with a version that is: the EVM one hands the
+    /// total to `setTotalDeposit` itself, so the chain computes the
+    /// difference.
+    async fn fund_to(
+        &self,
+        channel: &ChannelId,
+        own_total: u128,
+    ) -> Result<ChannelState, SettlementError> {
+        let state = self.channel_state(channel).await?;
+        match state.status {
+            ChannelStatus::Open => {}
+            ChannelStatus::Closed => return Err(SettlementError::ChannelClosed(channel.clone())),
+            ChannelStatus::Settled => return Err(SettlementError::ChannelSettled(channel.clone())),
+        }
+        if own_total <= state.own_deposited {
+            return Ok(state);
+        }
+        self.fund(channel, own_total - state.own_deposited).await
+    }
+
     /// Redeem `claim` against `channel`: the redeemer's honored total
     /// becomes `claim.cumulative_amount`, and no more (ADR 0005) -- a claim
     /// that does not supersede the last one redeemed, or exceeds the

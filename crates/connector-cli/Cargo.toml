@@ -9,6 +9,9 @@ license.workspace = true
 # codec both roles share (ADR 0027, issue #713) and the one
 # `connector-vectors` pins -- never a second implementation of a frame.
 connector-btp = { path = "../connector-btp" }
+# Each settlement table's one transport, built here and handed to every
+# client of its rpc_url (ADR 0073 decision 2).
+connector-chain-rpc = { path = "../connector-chain-rpc" }
 connector-config = { path = "../connector-config" }
 connector-client-edge = { path = "../connector-client-edge" }
 connector-domain = { path = "../connector-domain" }
@@ -70,6 +73,9 @@ tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
+# `FakeRpc` behind the SOCKS5 fake: the proxied settlement route is asserted
+# at the seam where the node builds its settlement clients (ADR 0073).
+connector-chain-rpc = { path = "../connector-chain-rpc", features = ["evm", "solana", "test-support"] }
 # `test-support` for the SOCKS5 server fake the onion dial tests dial through
 # (ADR 0070). A dev-dependency, so `cargo build` never carries a listener.
 connector-runtime = { path = "../connector-runtime", features = ["test-support"] }

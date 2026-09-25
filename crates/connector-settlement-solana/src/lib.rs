@@ -23,9 +23,15 @@
 //! backend has itself driven to `Settled` no longer exists on chain at
 //! all, and is indistinguishable from "never opened" without that memory.
 
+mod submit;
 #[cfg(feature = "test-util")]
 pub mod test_support;
 pub mod wire;
+
+/// A settlement table's endpoint, which [`SolanaSettlementBackend::connect`]
+/// takes in place of a URL (ADR 0073). Re-exported so a caller building one
+/// does not need a second dependency to name it.
+pub use connector_chain_rpc::RpcTransport;
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -35,7 +41,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use chrono::Duration;
 
+use connector_chain_rpc::{retry_read, solana::rpc_client};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use solana_rpc_client::rpc_client::RpcClientConfig;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::genesis_config::ClusterType;
 use solana_sdk::hash::Hash;
@@ -49,10 +57,15 @@ use connector_settlement::{
     ChannelId, ChannelState, ChannelStatus, Claim, SettlementBackend, SettlementError,
 };
 
+use submit::{send_and_confirm, ConfirmPolicy};
+
 /// A [`SettlementBackend`] backed by a real `packages/solana-program`
 /// instance on a Solana chain.
 pub struct SolanaSettlementBackend {
     rpc: RpcClient,
+    /// How [`submit`](Self::submit) paces its confirmation polls: more
+    /// slowly over a circuit (ADR 0073).
+    confirm: ConfirmPolicy,
     program_id: Pubkey,
     /// This backend's own identity -- every channel it opens names this as
     /// one of the two on-chain participants, exactly like
@@ -96,6 +109,11 @@ pub struct SolanaSettlementBackend {
     /// struct's own top-of-file doc for why the chain alone cannot answer
     /// "was this settled, or did it never exist" once that has happened.
     settled: Mutex<HashSet<Pubkey>>,
+    /// Serializes [`fund`](SettlementBackend::fund) and
+    /// [`fund_to`](SettlementBackend::fund_to): `fund_to` reads the own
+    /// deposit and deposits the difference, and `Deposit` is an increment,
+    /// so two of them interleaving would both deposit it (ADR 0073).
+    deposit_lock: tokio::sync::Mutex<()>,
     /// Which Solana cluster the endpoint this backend connected to is
     /// actually on, read from the chain itself at
     /// [`connect`](Self::connect) -- see [`Self::cluster`] and
@@ -179,8 +197,12 @@ impl SolanaSettlementBackend {
     /// refuses: a chain this connector cannot name is recorded as
     /// unnamed, never rejected, because `solana-test-validator` is
     /// unnameable by construction and every `local/` topology runs on one.
+    ///
+    /// Every read here is retried with backoff before it fails the node
+    /// ([`retry_read`], ADR 0073 decision 5): boot is when a circuit is
+    /// youngest, and one lost round trip used to be a failed start.
     pub async fn connect(
-        rpc_url: &str,
+        transport: &RpcTransport,
         payer_seed: &[u8; 32],
         program_id: Pubkey,
         token_mint: Pubkey,
@@ -188,16 +210,22 @@ impl SolanaSettlementBackend {
     ) -> Result<Self, SettlementError> {
         let payer = solana_sdk::signer::keypair::keypair_from_seed(payer_seed)
             .map_err(|error| SettlementError::Backend(error.to_string()))?;
-        let rpc =
-            RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed());
+        let rpc = rpc_client(
+            transport,
+            RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+        );
 
-        let program_account = rpc.get_account(&program_id).await.map_err(backend_error)?;
+        let program_account = retry_read(|| rpc.get_account(&program_id))
+            .await
+            .map_err(backend_error)?;
         if !program_account.executable {
             return Err(SettlementError::Backend(format!(
                 "settlement program_id {program_id} is not an executable program account"
             )));
         }
-        let mint_account = rpc.get_account(&token_mint).await.map_err(backend_error)?;
+        let mint_account = retry_read(|| rpc.get_account(&token_mint))
+            .await
+            .map_err(backend_error)?;
         if mint_account.owner != spl_token::id() {
             return Err(SettlementError::Backend(format!(
                 "settlement token_address {token_mint} is not owned by the SPL Token program"
@@ -218,25 +246,46 @@ impl SolanaSettlementBackend {
         // read refuses the connection -- which costs nothing this
         // `connect` did not already cost, since the three reads above have
         // already failed by now if the endpoint is unreachable.
-        let cluster = cluster_for_genesis_hash(&rpc.get_genesis_hash().await.map_err(|error| {
-            SettlementError::Backend(format!(
-                "could not read the cluster's genesis hash: {error}"
-            ))
-        })?);
+        let cluster =
+            cluster_for_genesis_hash(&retry_read(|| rpc.get_genesis_hash()).await.map_err(
+                |error| {
+                    SettlementError::Backend(format!(
+                        "could not read the cluster's genesis hash: {error}"
+                    ))
+                },
+            )?);
+
+        // Read rather than inferred from a transaction. Until ADR 0073 the
+        // ATA create below ran on every start and doubled as proof that the
+        // payer held lamports; it now runs once in a key's life, so an
+        // unfunded payer is named here instead of surfacing as a failed
+        // program-identity probe.
+        let payer_pubkey = payer.pubkey();
+        let lamports = retry_read(|| rpc.get_balance(&payer_pubkey))
+            .await
+            .map_err(backend_error)?;
+        if lamports == 0 {
+            return Err(SettlementError::Backend(format!(
+                "[settlement.solana] payer {} holds no lamports, so it cannot pay for any \
+                 settlement transaction; fund it before starting the node",
+                payer.pubkey()
+            )));
+        }
 
         let backend = Self {
             rpc,
+            confirm: ConfirmPolicy::for_transport(transport),
             program_id,
             payer,
             token_mint,
             counterparty_signers: Vec::new(),
             settled: Mutex::new(HashSet::new()),
+            deposit_lock: tokio::sync::Mutex::new(()),
             cluster,
         };
-        // Ordered after `ensure_own_ata_exists`, which already proves the
-        // payer holds real lamports by submitting a transaction -- so a
-        // probe failure below means program identity, never an unfunded
-        // payer reported as the wrong program.
+        // The payer's lamports were read above, so a probe failure below
+        // means program identity, never an unfunded payer reported as the
+        // wrong program.
         backend.ensure_own_ata_exists().await?;
         backend.verify_program_identity().await?;
         Ok(backend)
@@ -282,9 +331,7 @@ impl SolanaSettlementBackend {
                 &vault,
             ),
         );
-        let recent_blockhash = self
-            .rpc
-            .get_latest_blockhash()
+        let recent_blockhash = retry_read(|| self.rpc.get_latest_blockhash())
             .await
             .map_err(backend_error)?;
         let transaction = Transaction::new_signed_with_payer(
@@ -293,9 +340,7 @@ impl SolanaSettlementBackend {
             &[&self.payer],
             recent_blockhash,
         );
-        let simulation = self
-            .rpc
-            .simulate_transaction(&transaction)
+        let simulation = retry_read(|| self.rpc.simulate_transaction(&transaction))
             .await
             .map_err(backend_error)?;
         if let Some(error) = simulation.value.err {
@@ -320,8 +365,11 @@ impl SolanaSettlementBackend {
     /// against a real chain, where the mint and every identity already
     /// exist.
     pub async fn deploy(rpc_url: &str, program_id: Pubkey) -> Result<Self, SettlementError> {
-        let rpc =
-            RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed());
+        let transport = RpcTransport::direct(rpc_url).map_err(backend_error)?;
+        let rpc = rpc_client(
+            &transport,
+            RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+        );
         let payer = Keypair::new();
         let counterparties = [Keypair::new(), Keypair::new()];
         for keypair in [&payer, &counterparties[0], &counterparties[1]] {
@@ -352,24 +400,33 @@ impl SolanaSettlementBackend {
             6,
         )
         .map_err(backend_error)?;
-        let recent_blockhash = rpc.get_latest_blockhash().await.map_err(backend_error)?;
+        let (recent_blockhash, last_valid_block_height) = rpc
+            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+            .await
+            .map_err(backend_error)?;
         let transaction = Transaction::new_signed_with_payer(
             &[create_mint_account, initialize_mint],
             Some(&payer.pubkey()),
             &[&payer, &mint],
             recent_blockhash,
         );
-        rpc.send_and_confirm_transaction(&transaction)
-            .await
-            .map_err(backend_error)?;
+        send_and_confirm(
+            &rpc,
+            &transaction,
+            last_valid_block_height,
+            ConfirmPolicy::for_transport(&transport),
+        )
+        .await?;
 
         let backend = Self {
             rpc,
+            confirm: ConfirmPolicy::for_transport(&transport),
             program_id,
             payer,
             token_mint: mint.pubkey(),
             counterparty_signers: counterparties.into(),
             settled: Mutex::new(HashSet::new()),
+            deposit_lock: tokio::sync::Mutex::new(()),
             // A `deploy`-built backend only ever runs against this
             // workspace's own `solana-test-validator`, whose fresh genesis
             // no published hash can match -- so the read is skipped rather
@@ -678,7 +735,27 @@ impl SolanaSettlementBackend {
         self.to_channel_state(channel, &account)
     }
 
+    /// Create this backend's own associated token account if, and only if,
+    /// it does not exist yet (ADR 0073 decision 5).
+    ///
+    /// Read first. The create is idempotent on chain, so this used to submit
+    /// it on every start, which made every boot a real transaction and every
+    /// boot's success depend on confirming one. Now a key's first start
+    /// creates the account and every later start reads it and moves on.
     async fn ensure_own_ata_exists(&self) -> Result<(), SettlementError> {
+        let own_ata = spl_associated_token_account::get_associated_token_address(
+            &self.payer.pubkey(),
+            &self.token_mint,
+        );
+        let existing = retry_read(|| {
+            self.rpc
+                .get_account_with_commitment(&own_ata, CommitmentConfig::confirmed())
+        })
+        .await
+        .map_err(backend_error)?;
+        if existing.value.is_some() {
+            return Ok(());
+        }
         let instruction =
             spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                 &self.payer.pubkey(),
@@ -708,16 +785,22 @@ impl SolanaSettlementBackend {
         self.submit(&[instruction], &[]).await
     }
 
+    /// Sign `instructions` over a fresh blockhash, send them, and wait until
+    /// their outcome is known ([`submit::send_and_confirm`], ADR 0073
+    /// decision 5). An error from here names the transaction's signature
+    /// and says whether it landed, failed, expired or could not be read.
     async fn submit(
         &self,
         instructions: &[Instruction],
         extra_signers: &[&Keypair],
     ) -> Result<(), SettlementError> {
-        let recent_blockhash = self
-            .rpc
-            .get_latest_blockhash()
-            .await
-            .map_err(backend_error)?;
+        // Nothing has been sent yet, so a failed read is simply retried.
+        let (recent_blockhash, last_valid_block_height) = retry_read(|| {
+            self.rpc
+                .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+        })
+        .await
+        .map_err(backend_error)?;
         let mut signers: Vec<&Keypair> = vec![&self.payer];
         signers.extend_from_slice(extra_signers);
         let transaction = Transaction::new_signed_with_payer(
@@ -726,11 +809,40 @@ impl SolanaSettlementBackend {
             &signers,
             recent_blockhash,
         );
-        self.rpc
-            .send_and_confirm_transaction(&transaction)
-            .await
-            .map_err(backend_error)?;
+        send_and_confirm(
+            &self.rpc,
+            &transaction,
+            last_valid_block_height,
+            self.confirm,
+        )
+        .await?;
         Ok(())
+    }
+
+    /// Deposit `amount` of this backend's own tokens into the channel at
+    /// `pubkey`, crediting its own side, and return the state after. The
+    /// caller holds `deposit_lock` and has checked the channel is open.
+    async fn deposit_own(
+        &self,
+        channel: &ChannelId,
+        pubkey: Pubkey,
+        amount: u128,
+    ) -> Result<ChannelState, SettlementError> {
+        let own = self.payer.pubkey();
+        let units = to_units(amount)?;
+        let depositor_token_account =
+            spl_associated_token_account::get_associated_token_address(&own, &self.token_mint);
+        let (vault, _bump) = wire::vault_pda(&pubkey, &self.program_id);
+
+        let instruction = Instruction::new_with_bytes(
+            self.program_id,
+            &wire::pack_deposit(units),
+            wire::Accounts::deposit(&own, &depositor_token_account, &vault, &pubkey),
+        );
+        self.submit(&[instruction], &[]).await?;
+
+        let (_pubkey, account) = self.open_channel(channel).await?;
+        self.to_channel_state(channel, &account)
     }
 
     /// Fetch and parse the `ChannelState` account at `pubkey`, or `None`
@@ -1007,22 +1119,31 @@ impl SettlementBackend for SolanaSettlementBackend {
         channel: &ChannelId,
         amount: u128,
     ) -> Result<ChannelState, SettlementError> {
+        let _guard = self.deposit_lock.lock().await;
         let (pubkey, _account) = self.open_channel(channel).await?;
-        let own = self.payer.pubkey();
-        let units = to_units(amount)?;
-        let depositor_token_account =
-            spl_associated_token_account::get_associated_token_address(&own, &self.token_mint);
-        let (vault, _bump) = wire::vault_pda(&pubkey, &self.program_id);
+        self.deposit_own(channel, pubkey, amount).await
+    }
 
-        let instruction = Instruction::new_with_bytes(
-            self.program_id,
-            &wire::pack_deposit(units),
-            wire::Accounts::deposit(&own, &depositor_token_account, &vault, &pubkey),
-        );
-        self.submit(&[instruction], &[]).await?;
-
-        let (_pubkey, account) = self.open_channel(channel).await?;
-        self.to_channel_state(channel, &account)
+    /// `Deposit` is an increment, so this reads the own deposit and
+    /// deposits the difference, under the same lock `fund` takes. That
+    /// makes it safe against another call in this process. A duplicate from
+    /// outside the process could still read the same starting deposit; the
+    /// confirm loop leaves one only when a previous attempt's outcome could
+    /// not be read for two minutes (`submit`), and that error names the
+    /// signature to look up first.
+    async fn fund_to(
+        &self,
+        channel: &ChannelId,
+        own_total: u128,
+    ) -> Result<ChannelState, SettlementError> {
+        let _guard = self.deposit_lock.lock().await;
+        let (pubkey, account) = self.open_channel(channel).await?;
+        let state = self.to_channel_state(channel, &account)?;
+        if own_total <= state.own_deposited {
+            return Ok(state);
+        }
+        self.deposit_own(channel, pubkey, own_total - state.own_deposited)
+            .await
     }
 
     async fn redeem(
