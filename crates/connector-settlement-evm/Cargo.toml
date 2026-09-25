@@ -9,6 +9,10 @@ test-util = []
 
 [dependencies]
 connector-settlement = { path = "../connector-settlement" }
+# ADR 0074 (#1342): the batch-settlement backend recomputes a presented
+# channel's id and checks a voucher's signature with the one implementation
+# of each (`evm_batch_channel_id`, `verify_evm_voucher`), never a second.
+connector-signer = { path = "../connector-signer" }
 async-trait = "0.1"
 chrono = "0.4"
 thiserror = "2"
