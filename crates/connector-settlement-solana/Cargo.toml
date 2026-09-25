@@ -9,6 +9,10 @@ test-util = ["dep:tempfile"]
 
 [dependencies]
 connector-settlement = { path = "../connector-settlement" }
+# The batch-settlement voucher's 50-byte message and its Ed25519 check
+# (issue #1341): `batch` lands vouchers and builds their precompile
+# instruction from the one definition, rather than a second copy here.
+connector-signer = { path = "../connector-signer" }
 # The table's shared transport (ADR 0073): the bounds, the refusal retries
 # and, when `rpc_via_socks_proxy` is set, the pinned circuit. The backend
 # takes one rather than a URL, so no client of a settlement `rpc_url` can be

@@ -23,6 +23,7 @@
 //! backend has itself driven to `Settled` no longer exists on chain at
 //! all, and is indistinguishable from "never opened" without that memory.
 
+pub mod batch;
 mod submit;
 #[cfg(feature = "test-util")]
 pub mod test_support;

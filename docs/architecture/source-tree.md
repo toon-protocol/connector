@@ -96,6 +96,11 @@ connector-settlement-evm         real EVM backend: TokenNetworkRegistry → Toke
 connector-settlement-solana      real Solana backend, speaking packages/solana-program's
                                   own wire directly (that crate builds for SBF only and
                                   exports no client SDK)
+  ├─ batch/                      the batch-settlement port on solana-foundation's
+  │                               payment-channels (ADR 0074): admission, settle and
+  │                               settle_and_seal, and that program's own wire
+  └─ fixtures/payment_channels.so  that program's mainnet-beta binary, which tier-3
+                                  tests load into genesis at its canonical id
 
 connector-rate-source            the chain-agnostic rate-source port + its contract suite
                                   (ADR 0071): what reading a token's price off a market
