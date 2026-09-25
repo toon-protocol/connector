@@ -66,8 +66,8 @@ const CHAIN: &str = "solana";
 /// publishes as `payTo` (decision 8).
 ///
 /// Holds no channel ledger. Every answer is read from the chain; the only
-/// local memory is which channels have been admitted, because the port
-/// requires admission before [`channel_state`](BatchSettlementBackend::channel_state)
+/// local memory is which channels have been admitted or restored, because
+/// the port requires one of the two before [`channel_state`](BatchSettlementBackend::channel_state)
 /// and [`land`](BatchSettlementBackend::land).
 pub struct SolanaBatchSettlement {
     rpc: RpcClient,
@@ -76,26 +76,33 @@ pub struct SolanaBatchSettlement {
     sponsor: Keypair,
     mint: Pubkey,
     min_grace_period_secs: u64,
+    /// The smallest opening deposit the sponsor co-signs an `open` for:
+    /// bounds only the public sponsor endpoint, and is published beside
+    /// `min_grace_period_secs` (ADR 0074 decision 5).
+    min_sponsored_deposit: u64,
     admitted: Mutex<HashSet<Pubkey>>,
 }
 
 impl SolanaBatchSettlement {
-    /// Bind to the `payment-channels` program at `program_id`
-    /// (`[settlement.solana.batch_settlement] program_id`), admitting
-    /// channels in `mint` (`[settlement.solana] token_address`) whose
-    /// `grace_period` is at least `min_grace_period_secs`, under the sponsor
-    /// key `sponsor_seed` derives (the `[settlement.solana]` key file's
-    /// 32-byte ed25519 seed).
+    /// Bind to the `payment-channels` program at the one id the record
+    /// fixes ([`wire::PAYMENT_CHANNELS_PROGRAM_ID`]), admitting channels in
+    /// `mint` (`[settlement.solana] token_address`) whose `grace_period` is
+    /// at least `min_grace_period_secs`, under the sponsor key
+    /// `sponsor_seed` derives (the `[settlement.solana]` key file's 32-byte
+    /// ed25519 seed), sponsoring an `open` only for a deposit of at least
+    /// `min_sponsored_deposit`.
     ///
-    /// Refuses, naming it, a `program_id` that is not an executable account:
-    /// a node that would otherwise admit nothing and say nothing.
+    /// Refuses, naming it, a chain on which that id is not an executable
+    /// account: a node that would otherwise admit nothing and say nothing.
     pub async fn connect(
         transport: &RpcTransport,
         sponsor_seed: &[u8; 32],
-        program_id: Pubkey,
         mint: Pubkey,
         min_grace_period_secs: u64,
+        min_sponsored_deposit: u64,
     ) -> Result<Self, BatchSettlementError> {
+        let program_id = Pubkey::from_str(wire::PAYMENT_CHANNELS_PROGRAM_ID)
+            .expect("PAYMENT_CHANNELS_PROGRAM_ID is a base58 program id");
         let sponsor =
             solana_sdk::signer::keypair::keypair_from_seed(sponsor_seed).map_err(backend_error)?;
         let rpc = rpc_client(
@@ -106,14 +113,13 @@ impl SolanaBatchSettlement {
             .await
             .map_err(|error| {
                 BatchSettlementError::Backend(format!(
-                    "[settlement.solana.batch_settlement] program_id {program_id} could not be \
-                     read: {error}"
+                    "payment-channels ({program_id}) could not be read: {error}"
                 ))
             })?;
         if !program.executable {
             return Err(BatchSettlementError::Backend(format!(
-                "[settlement.solana.batch_settlement] program_id {program_id} is not an \
-                 executable program account"
+                "payment-channels ({program_id}) is not an executable program account on this \
+                 chain"
             )));
         }
         Ok(SolanaBatchSettlement {
@@ -123,6 +129,7 @@ impl SolanaBatchSettlement {
             sponsor,
             mint,
             min_grace_period_secs,
+            min_sponsored_deposit,
             admitted: Mutex::new(HashSet::new()),
         })
     }
@@ -153,6 +160,12 @@ impl SolanaBatchSettlement {
     /// The shortest `grace_period` admitted, in seconds.
     pub fn min_grace_period_secs(&self) -> u64 {
         self.min_grace_period_secs
+    }
+
+    /// The smallest opening deposit, in the mint's base units, the sponsor
+    /// co-signs an `open` for, and the `minDeposit` the greeting publishes.
+    pub fn min_sponsored_deposit(&self) -> u64 {
+        self.min_sponsored_deposit
     }
 
     fn admitted(&self) -> MutexGuard<'_, HashSet<Pubkey>> {
@@ -255,16 +268,7 @@ fn vet(
     mint: &Pubkey,
     min_grace_period_secs: u64,
 ) -> Result<BatchChannelState, BatchSettlementError> {
-    // The account's bytes are only the channel's word for itself until its
-    // own seeds derive the address it lives at (X402 SVM spec
-    // `#L1379-L1385`).
-    let derived = account.derive_address(program_id);
-    if derived != *address {
-        return Err(BatchSettlementError::ChannelIdMismatch {
-            presented: channel.clone(),
-            derived: ChannelId(derived.to_string()),
-        });
-    }
+    at_its_own_address(channel, address, account, program_id)?;
     if let Some(refusal) = admission_refusal(account, sponsor, mint, min_grace_period_secs) {
         return Err(BatchSettlementError::NotAdmissible {
             channel: channel.clone(),
@@ -272,6 +276,25 @@ fn vet(
         });
     }
     Ok(state_of(channel, account))
+}
+
+/// Refuse `account` unless its own seeds derive `address`: its bytes are
+/// only the channel's word for itself until they do (X402 SVM spec
+/// `#L1379-L1385`). Checked by admission and by restoring alike.
+fn at_its_own_address(
+    channel: &ChannelId,
+    address: &Pubkey,
+    account: &wire::ChannelAccount,
+    program_id: &Pubkey,
+) -> Result<(), BatchSettlementError> {
+    let derived = account.derive_address(program_id);
+    if derived != *address {
+        return Err(BatchSettlementError::ChannelIdMismatch {
+            presented: channel.clone(),
+            derived: ChannelId(derived.to_string()),
+        });
+    }
+    Ok(())
 }
 
 /// The first rule of ADR 0074 decision 2 that `account` breaks, in the
@@ -366,6 +389,27 @@ impl BatchSettlementBackend for SolanaBatchSettlement {
         Ok(state)
     }
 
+    /// [`admit`](BatchSettlementBackend::admit) without the admission rules:
+    /// the account is still read and still trusted only at the address its
+    /// own seeds derive. A Closing channel restores, since landing on it is
+    /// exactly what a held voucher needs.
+    async fn restore(
+        &self,
+        presentation: ChannelPresentation,
+    ) -> Result<BatchChannelState, BatchSettlementError> {
+        let ChannelPresentation::Solana { channel } = presentation else {
+            return Err(BatchSettlementError::WrongChain {
+                presented: presentation.chain(),
+                backend: CHAIN,
+            });
+        };
+        let address = address_of(&channel)?;
+        let account = self.read_existing(&channel, &address).await?;
+        at_its_own_address(&channel, &address, &account, &self.program_id)?;
+        self.admitted().insert(address);
+        Ok(state_of(&channel, &account))
+    }
+
     /// Read from the chain now. A channel whose account `distribute` or
     /// `reclaim` has since deallocated reports
     /// [`ChannelNotFound`](BatchSettlementError::ChannelNotFound): the chain
@@ -418,9 +462,14 @@ impl BatchSettlementBackend for SolanaBatchSettlement {
                 deposited,
             });
         }
-        // At most the deposit, which is a u64.
-        let amount = u64::try_from(voucher.cumulative_amount)
-            .expect("a voucher no larger than a u64 deposit fits a u64");
+        // At most the deposit, which is a u64, so this cannot fail; if it
+        // ever did it is refused by name rather than panicking the caller.
+        let amount = u64::try_from(voucher.cumulative_amount).map_err(|_| {
+            BatchSettlementError::VoucherExceedsDeposit {
+                amount: voucher.cumulative_amount,
+                deposited,
+            }
+        })?;
         let signature: [u8; 64] = voucher.signature.as_slice().try_into().map_err(|_| {
             BatchSettlementError::InvalidVoucherSignature(format!(
                 "a payment-channels voucher signature is 64 bytes of Ed25519, got {}",

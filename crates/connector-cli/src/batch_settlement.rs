@@ -1,7 +1,7 @@
 //! Where a node's x402 `batch-settlement` backends meet its client edge
 //! (ADR 0074, epic #1349): the adapter from the receive-only settlement port
 //! ([`BatchSettlementBackend`], #1340) to the claim gate's seam
-//! ([`BatchSettlementChannels`], #1341), the boot step that re-admits
+//! ([`BatchSettlementChannels`], #1341), the boot step that restores
 //! every channel the client edge's journal holds vouchers on, and the view
 //! of the claim gate the watchers and sweeps (#1344) read the latest voucher
 //! on each channel from ([`ClaimGateVouchers`]).
@@ -16,8 +16,9 @@
 //! translates one vocabulary into the other and decides nothing but how a
 //! port error reads to the gate.
 
+use std::collections::HashSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use connector_client_edge::{
@@ -39,6 +40,13 @@ use connector_signer::{BatchChannelConfig, BatchSettlementDomain};
 pub(crate) struct BatchSettlementChannelsAdapter {
     evm: Option<EvmLeg>,
     solana: Option<Arc<dyn BatchSettlementBackend>>,
+    /// Every channel this adapter has seen `admit` accept in this process.
+    /// A backend also answers for channels it only **restored** -- ones the
+    /// journal holds vouchers on, brought back at boot without judging them
+    /// (ADR 0074 decision 5) -- so "the backend can read it" is not "a new
+    /// voucher may be accepted on it". A channel absent here is admitted,
+    /// under this node's current rules, before its first new voucher.
+    admitted: Mutex<HashSet<ChannelId>>,
 }
 
 struct EvmLeg {
@@ -62,6 +70,7 @@ impl BatchSettlementChannelsAdapter {
         Some(BatchSettlementChannelsAdapter {
             evm: evm.map(|(backend, domain)| EvmLeg { backend, domain }),
             solana,
+            admitted: Mutex::new(HashSet::new()),
         })
     }
 }
@@ -100,7 +109,7 @@ impl BatchSettlementChannels for BatchSettlementChannelsAdapter {
             channel: evm_channel(channel_id),
             config: port_config(config),
         };
-        let state = state_of(leg.backend.as_ref(), presentation).await;
+        let state = self.state_of(leg.backend.as_ref(), presentation).await;
         Ok(resolution(state)?.map(|state| AdmittedEvmVoucherChannel {
             config: *config,
             max_cumulative: max_cumulative(&state),
@@ -117,7 +126,7 @@ impl BatchSettlementChannels for BatchSettlementChannelsAdapter {
         let presentation = ChannelPresentation::Solana {
             channel: solana_channel(channel_account),
         };
-        let state = state_of(backend.as_ref(), presentation).await;
+        let state = self.state_of(backend.as_ref(), presentation).await;
         Ok(
             resolution(state)?.and_then(|state| match state.voucher_signer {
                 VoucherSigner::Solana(authorized_signer) => Some(AdmittedSolanaVoucherChannel {
@@ -132,15 +141,33 @@ impl BatchSettlementChannels for BatchSettlementChannelsAdapter {
     }
 }
 
-/// The channel's state now: one read for a channel the backend has already
-/// admitted, and admission -- which reads it too -- for one it has not.
-async fn state_of(
-    backend: &dyn BatchSettlementBackend,
-    presentation: ChannelPresentation,
-) -> Result<BatchChannelState, BatchSettlementError> {
-    match backend.channel_state(presentation.channel()).await {
-        Err(BatchSettlementError::ChannelNotAdmitted(_)) => backend.admit(presentation).await,
-        read => read,
+impl BatchSettlementChannelsAdapter {
+    /// The channel's state now, for a voucher the gate is about to accept:
+    /// one read for a channel admitted in this process, and admission --
+    /// which reads it too -- for one that was not. A channel the backend
+    /// only restored is admitted here like any other, so a rule tightened
+    /// since its vouchers were accepted refuses its new ones.
+    async fn state_of(
+        &self,
+        backend: &dyn BatchSettlementBackend,
+        presentation: ChannelPresentation,
+    ) -> Result<BatchChannelState, BatchSettlementError> {
+        let channel = presentation.channel().clone();
+        if self.admitted().contains(&channel) {
+            match backend.channel_state(&channel).await {
+                Err(BatchSettlementError::ChannelNotAdmitted(_)) => {}
+                read => return read,
+            }
+        }
+        let state = backend.admit(presentation).await?;
+        self.admitted().insert(channel);
+        Ok(state)
+    }
+
+    fn admitted(&self) -> MutexGuard<'_, HashSet<ChannelId>> {
+        self.admitted
+            .lock()
+            .expect("batch-settlement adapter lock poisoned")
     }
 }
 
@@ -190,6 +217,11 @@ fn resolution(
 
 /// The port's voucher ceiling, in the gate's `u64` amounts. A ceiling wider
 /// than any `u64` bounds nothing a voucher here can name, so it saturates.
+///
+/// Saturating is right here and nowhere else a `u128` narrows: this is a
+/// bound, and clamping a bound down loses no value, where a voucher amount
+/// narrowed must never be dropped or truncated (ADR 0074 decision 3; the
+/// watchers log an out-of-range held amount as an error).
 fn max_cumulative(state: &BatchChannelState) -> u64 {
     u64::try_from(state.voucher_ceiling()).unwrap_or(u64::MAX)
 }
@@ -267,18 +299,26 @@ fn presentation(channel: JournaledBatchChannel) -> ChannelPresentation {
     }
 }
 
-/// Re-admit every batch-settlement channel `channels` names to its chain's
+/// Restore every batch-settlement channel `channels` names to its chain's
 /// backend, so the port's `channel_state` and `land` work on it from the
 /// moment this node serves -- the journal is the only place an EVM
 /// channel's config survives a restart (ADR 0074 decision 2).
 ///
+/// **Restored, not re-admitted.** These channels hold vouchers this node
+/// already accepted, and landing them is what protects that value (ADR 0074
+/// decision 5). Re-running admission here would strand them whenever a rule
+/// had tightened since -- a raised minimum delay -- while the payer walks
+/// off with what it paid. So only what landing needs is checked: the
+/// channel still exists on chain under the id its presentation derives. The
+/// rules still gate **new** vouchers: the claim gate admits each channel
+/// afresh, under this node's current terms, before it accepts one.
+///
 /// Best effort, channel by channel, and never a refusal to start: a channel
-/// that cannot be re-admitted now is logged and left, and the gate still
-/// admits it again from the same record on its next voucher. A channel whose
-/// chain has since been opted out of is logged too: its vouchers can no
-/// longer be accepted here, and whatever it still holds unlanded is the
-/// operator's to collect.
-pub(crate) async fn readmit_journaled_channels(
+/// that cannot be restored now is logged and left, and the watchers try
+/// again from the same record. A channel whose chain has since been opted
+/// out of is logged too: its vouchers can no longer be accepted here, and
+/// whatever it still holds unlanded is the operator's to collect.
+pub(crate) async fn restore_journaled_channels(
     channels: &[JournaledBatchChannel],
     evm: Option<&dyn BatchSettlementBackend>,
     solana: Option<&dyn BatchSettlementBackend>,
@@ -299,12 +339,12 @@ pub(crate) async fn readmit_journaled_channels(
             );
             continue;
         };
-        if let Err(error) = backend.admit(presentation).await {
+        if let Err(error) = backend.restore(presentation).await {
             tracing::warn!(
                 %channel,
                 %error,
-                "could not re-admit a batch-settlement channel the client-edge journal holds \
-                 vouchers on; its next voucher admits it again"
+                "could not restore a batch-settlement channel the client-edge journal holds \
+                 vouchers on; the watchers try again"
             );
         }
     }

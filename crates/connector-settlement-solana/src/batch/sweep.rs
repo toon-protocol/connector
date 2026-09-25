@@ -505,6 +505,13 @@ impl SolanaBatchWatcher {
     }
 
     /// The held vouchers on Solana channels, by channel account.
+    ///
+    /// A held voucher that cannot be put in the program's terms is an
+    /// invariant breach, never a quiet skip: the claim gate accepts only
+    /// a `u64` amount (`connector-domain`'s voucher parser refuses a wider
+    /// one) and a 64-byte signature, so either failing here means a voucher
+    /// this node was paid with cannot be landed. It is logged as an error,
+    /// naming the channel, and left out.
     fn held(&self) -> HashMap<Pubkey, Held> {
         self.held
             .held_vouchers()
@@ -513,13 +520,23 @@ impl SolanaBatchWatcher {
                 let ChannelPresentation::Solana { channel } = &entry.presentation else {
                     return None;
                 };
-                Some((
-                    Pubkey::from_str(&channel.0).ok()?,
-                    Held {
-                        amount: u64::try_from(entry.voucher.cumulative_amount).ok()?,
-                        signature: entry.voucher.signature.as_slice().try_into().ok()?,
-                    },
-                ))
+                let amount = entry.voucher.cumulative_amount;
+                let landable = Pubkey::from_str(&channel.0).ok().zip(
+                    u64::try_from(amount)
+                        .ok()
+                        .zip(<[u8; 64]>::try_from(entry.voucher.signature.as_slice()).ok()),
+                );
+                let Some((address, (amount, signature))) = landable else {
+                    tracing::error!(
+                        %channel,
+                        amount,
+                        signature_len = entry.voucher.signature.len(),
+                        "a held batch-settlement voucher is not in payment-channels' terms (a \
+                         base58 channel, a u64 amount, a 64-byte signature); it cannot be landed"
+                    );
+                    return None;
+                };
+                Some((address, Held { amount, signature }))
             })
             .collect()
     }

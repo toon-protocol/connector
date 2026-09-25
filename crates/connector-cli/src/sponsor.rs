@@ -87,7 +87,6 @@ struct SponsorRequest {
 /// The sponsor this node runs, if any.
 struct Sponsor {
     backend: Arc<SolanaBatchSettlement>,
-    min_sponsored_deposit: u64,
     in_flight: Semaphore,
     payers: Mutex<HashSet<Pubkey>>,
     failures: Mutex<FailureBudget>,
@@ -155,12 +154,11 @@ impl Drop for PayerSlot<'_> {
 }
 
 /// The endpoint's router. `sponsor` is this node's Solana batch-settlement
-/// backend and its `min_sponsored_deposit`, or `None` for a node that has
-/// not opted in on Solana.
-pub fn router(sponsor: Option<(Arc<SolanaBatchSettlement>, u64)>) -> Router {
-    let state = Arc::new(sponsor.map(|(backend, min_sponsored_deposit)| Sponsor {
+/// backend, which carries the minimum sponsored deposit it co-signs above,
+/// or `None` for a node that has not opted in on Solana.
+pub fn router(sponsor: Option<Arc<SolanaBatchSettlement>>) -> Router {
+    let state = Arc::new(sponsor.map(|backend| Sponsor {
         backend,
-        min_sponsored_deposit,
         in_flight: Semaphore::new(CONCURRENT_SPONSORSHIPS),
         payers: Mutex::new(HashSet::new()),
         failures: Mutex::new(FailureBudget::new(FAILURE_BUDGET, FAILURE_WINDOW)),
@@ -202,10 +200,7 @@ async fn sponsor_open(State(sponsor): State<Arc<Option<Sponsor>>>, body: Bytes) 
             ),
         );
     }
-    let vetted = match sponsor
-        .backend
-        .vet_sponsored_open(&request.transaction, sponsor.min_sponsored_deposit)
-    {
+    let vetted = match sponsor.backend.vet_sponsored_open(&request.transaction) {
         Ok(vetted) => vetted,
         Err(error) => return refused(error),
     };

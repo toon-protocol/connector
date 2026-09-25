@@ -17,11 +17,13 @@
 //!   but not yet claimed, so it is never anyone else's (decision 5);
 //! - `token` is the token this node settles in;
 //! - `withdrawDelay` is at least this node's published minimum;
-//! - `payerAuthorizer` is nonzero, or `payer` has no code. The contract
-//!   checks a zero-`payerAuthorizer` voucher with OpenZeppelin's
-//!   `SignatureChecker`, which asks ERC-1271 of any `payer` with code
-//!   (an EIP-7702-delegated account included), and a packet must never wait
-//!   on that `eth_call` (decision 4).
+//! - `payerAuthorizer` is nonzero, whatever `payer` is (decision 2, amended
+//!   2026-09-25). The contract checks a zero-`payerAuthorizer` voucher with
+//!   OpenZeppelin's `SignatureChecker`, which asks ERC-1271 of any `payer`
+//!   with code -- and an EOA payer can gain code at any time by an EIP-7702
+//!   delegation, after which the ECDSA vouchers this node accepted no
+//!   longer verify the way they did. Asking the chain whether `payer` has
+//!   code today answers nothing about tomorrow, so it is not asked.
 //!
 //! `payer`, `payerAuthorizer` and `salt` are the client's, and a second
 //! channel from one payer is admitted on its own merits (decision 2's
@@ -34,10 +36,12 @@
 //! process lifetime. Nothing else is cached: every figure a
 //! [`BatchChannelState`] reports is read from the chain when asked, because
 //! collateral **falls** when a payer initiates a withdrawal (decision 5).
-//! After a restart a channel must be admitted again from its config before
-//! it can be landed on: the client edge journals each channel's config with
-//! its first accepted voucher, and the runtime re-admits every journaled
-//! channel at boot.
+//! After a restart a channel must be presented again before it can be landed
+//! on: the client edge journals each channel's config with its first
+//! accepted voucher, and the runtime **restores** every journaled channel at
+//! boot -- recomputing its id and reading it, but judging no admission rule,
+//! so a policy tightened across the restart never strands a voucher already
+//! accepted (ADR 0074 decision 5). New vouchers still need `admit`.
 //!
 //! # Reads are one snapshot
 //!
@@ -59,10 +63,9 @@ use connector_settlement::batch::{
 use connector_settlement::ChannelId;
 use connector_signer::{
     evm_batch_channel_id, evm_voucher_signer, verify_evm_voucher, BatchChannelConfig,
-    BatchSettlementDomain,
+    BatchSettlementDomain, X402_BATCH_SETTLEMENT_ADDRESS,
 };
 use ethers::abi::{AbiDecode, AbiEncode};
-use ethers::middleware::Middleware;
 use ethers::types::{Address, Bytes};
 
 use crate::bindings::x402_batch_settlement::{
@@ -82,7 +85,7 @@ use crate::{EvmClient, EvmSettlementBackend};
 pub struct EvmBatchSettlementBackend {
     pub(crate) contract: X402BatchSettlement<EvmClient>,
     /// The EIP-712 domain every channel id and voucher digest is computed
-    /// under: this chain, and the configured contract. Never a claim's.
+    /// under: this chain, and `x402BatchSettlement`. Never a claim's.
     domain: BatchSettlementDomain,
     /// This node's settlement address: the `receiver` and
     /// `receiverAuthorizer` an admissible channel must name.
@@ -94,22 +97,22 @@ pub struct EvmBatchSettlementBackend {
     pub(crate) client: Arc<EvmClient>,
     pub(crate) sender: Arc<Sender>,
     pub(crate) confirm: ConfirmPolicy,
-    /// Every channel admitted, by its canonical id, with the config it was
-    /// admitted under. See the module doc for why this is the one thing
-    /// kept.
+    /// Every channel admitted or restored, by its canonical id, with the
+    /// config it was presented under. See the module doc for why this is
+    /// the one thing kept.
     admitted: Mutex<HashMap<ChannelId, EvmChannelConfig>>,
 }
 
 impl EvmSettlementBackend {
     /// This node's receive-only backend for x402 `batch-settlement`
-    /// channels (ADR 0074), over the `x402BatchSettlement` at
-    /// `contract_address`, admitting channels whose `withdrawDelay` is at
-    /// least `min_withdraw_delay_secs`: what `[settlement.evm.batch_settlement]`
-    /// holds. Everything else a channel must name is this backend's: its
-    /// settlement address as `receiver` and `receiverAuthorizer`, and its
-    /// token.
+    /// channels (ADR 0074), over `x402BatchSettlement` at the one address
+    /// the record fixes ([`X402_BATCH_SETTLEMENT_ADDRESS`]), admitting
+    /// channels whose `withdrawDelay` is at least `min_withdraw_delay_secs`:
+    /// what `[settlement.evm.batch_settlement]` holds. Everything else a
+    /// channel must name is this backend's: its settlement address as
+    /// `receiver` and `receiverAuthorizer`, and its token.
     ///
-    /// Refuses unless the contract at `contract_address` computes the same
+    /// Refuses unless the contract at that address computes the same
     /// channel id for a probe config as this node does, which checks in one
     /// `eth_call` that something is deployed there and that it is
     /// `x402BatchSettlement` under the domain vouchers will be checked
@@ -117,9 +120,9 @@ impl EvmSettlementBackend {
     /// the `ChannelConfig` type hash.
     pub async fn batch_settlement(
         &self,
-        contract_address: Address,
         min_withdraw_delay_secs: u64,
     ) -> Result<EvmBatchSettlementBackend, BatchSettlementError> {
+        let contract_address = Address::from(X402_BATCH_SETTLEMENT_ADDRESS);
         let contract = X402BatchSettlement::new(contract_address, Arc::clone(&self.client));
         let domain = BatchSettlementDomain {
             chain_id: self.chain_id,
@@ -177,7 +180,7 @@ struct Snapshot {
 
 impl EvmBatchSettlementBackend {
     /// The EIP-712 domain vouchers on this backend's channels are signed
-    /// under: this chain and the configured `x402BatchSettlement`.
+    /// under: this chain and `x402BatchSettlement`.
     pub fn domain(&self) -> BatchSettlementDomain {
         self.domain
     }
@@ -194,8 +197,8 @@ impl EvmBatchSettlementBackend {
         self.min_withdraw_delay_secs
     }
 
-    /// The config `channel` was admitted under, if it has been admitted in
-    /// this process. The voucher signer is
+    /// The config `channel` was admitted or restored under, if it has been
+    /// in this process. The voucher signer is
     /// `connector_signer::evm_voucher_signer` of it.
     pub fn admitted_config(&self, channel: &ChannelId) -> Option<EvmChannelConfig> {
         self.admitted().get(channel).cloned()
@@ -266,52 +269,14 @@ impl EvmBatchSettlementBackend {
         }
     }
 
-    /// The rules of ADR 0074 decision 2 this node fixes, in the order the
-    /// record lists them; the first broken one is the refusal.
-    async fn judge(
-        &self,
-        config: &EvmChannelConfig,
-    ) -> Result<Option<AdmissionRefusal>, BatchSettlementError> {
-        let own = self.own_address.to_fixed_bytes();
-        if config.receiver != own {
-            return Ok(Some(AdmissionRefusal::NotPayableToThisNode {
-                field: "receiver",
-            }));
-        }
-        if config.receiver_authorizer != own {
-            return Ok(Some(AdmissionRefusal::NotPayableToThisNode {
-                field: "receiverAuthorizer",
-            }));
-        }
-        if config.token != self.token.to_fixed_bytes() {
-            return Ok(Some(AdmissionRefusal::TokenNotSettled));
-        }
-        if config.withdraw_delay < self.min_withdraw_delay_secs {
-            return Ok(Some(AdmissionRefusal::DelayBelowMinimum {
-                delay_secs: config.withdraw_delay,
-                minimum_secs: self.min_withdraw_delay_secs,
-            }));
-        }
-        if config.payer_authorizer == [0u8; 20] {
-            let code = self
-                .client
-                .get_code(Address::from(config.payer), None)
-                .await
-                .map_err(backend_error)?;
-            if !code.is_empty() {
-                return Ok(Some(AdmissionRefusal::ContractWalletPayerWithoutAuthorizer));
-            }
-        }
-        Ok(None)
-    }
-}
-
-#[async_trait]
-impl BatchSettlementBackend for EvmBatchSettlementBackend {
-    async fn admit(
+    /// The channel `presentation` names, once it is shown to be an EVM
+    /// presentation whose config derives the id it came with, and to exist
+    /// on chain: its canonical id, its config and one reading of it. What
+    /// both `admit` and `restore` check before anything else.
+    async fn locate(
         &self,
         presentation: ChannelPresentation,
-    ) -> Result<BatchChannelState, BatchSettlementError> {
+    ) -> Result<(ChannelId, EvmChannelConfig, Snapshot), BatchSettlementError> {
         let ChannelPresentation::Evm { channel, config } = presentation else {
             return Err(BatchSettlementError::WrongChain {
                 presented: presentation.chain(),
@@ -335,12 +300,66 @@ impl BatchSettlementBackend for EvmBatchSettlementBackend {
         if snapshot.balance == 0 && snapshot.total_claimed == 0 {
             return Err(BatchSettlementError::ChannelNotFound(canonical));
         }
-        if let Some(refusal) = self.judge(&config).await? {
+        Ok((canonical, config, snapshot))
+    }
+
+    /// The rules of ADR 0074 decision 2 this node fixes, in the order the
+    /// record lists them; the first broken one is the refusal. Pure: every
+    /// rule is a field of the presented config against this node's own
+    /// facts, so judging asks the chain nothing.
+    fn judge(&self, config: &EvmChannelConfig) -> Option<AdmissionRefusal> {
+        let own = self.own_address.to_fixed_bytes();
+        if config.receiver != own {
+            return Some(AdmissionRefusal::NotPayableToThisNode { field: "receiver" });
+        }
+        if config.receiver_authorizer != own {
+            return Some(AdmissionRefusal::NotPayableToThisNode {
+                field: "receiverAuthorizer",
+            });
+        }
+        if config.token != self.token.to_fixed_bytes() {
+            return Some(AdmissionRefusal::TokenNotSettled);
+        }
+        if config.withdraw_delay < self.min_withdraw_delay_secs {
+            return Some(AdmissionRefusal::DelayBelowMinimum {
+                delay_secs: config.withdraw_delay,
+                minimum_secs: self.min_withdraw_delay_secs,
+            });
+        }
+        if config.payer_authorizer == [0u8; 20] {
+            return Some(AdmissionRefusal::NoPayerAuthorizer);
+        }
+        None
+    }
+}
+
+#[async_trait]
+impl BatchSettlementBackend for EvmBatchSettlementBackend {
+    async fn admit(
+        &self,
+        presentation: ChannelPresentation,
+    ) -> Result<BatchChannelState, BatchSettlementError> {
+        let (canonical, config, snapshot) = self.locate(presentation).await?;
+        if let Some(refusal) = self.judge(&config) {
             return Err(BatchSettlementError::NotAdmissible {
                 channel: canonical,
                 refusal,
             });
         }
+        let state = self.state(&canonical, &config, &snapshot);
+        self.admitted().insert(canonical, config);
+        Ok(state)
+    }
+
+    /// [`admit`](Self::admit) without [`judge`](Self::judge): the id is
+    /// still recomputed from the presented config and the channel still read
+    /// from the chain, because `claim` sends that config and a wrong one
+    /// reverts.
+    async fn restore(
+        &self,
+        presentation: ChannelPresentation,
+    ) -> Result<BatchChannelState, BatchSettlementError> {
+        let (canonical, config, snapshot) = self.locate(presentation).await?;
         let state = self.state(&canonical, &config, &snapshot);
         self.admitted().insert(canonical, config);
         Ok(state)

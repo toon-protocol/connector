@@ -45,7 +45,7 @@ use connector_signer::{
 };
 
 use crate::batch_settlement::{
-    readmit_journaled_channels, BatchSettlementChannelsAdapter, ClaimGateVouchers,
+    restore_journaled_channels, BatchSettlementChannelsAdapter, ClaimGateVouchers,
 };
 use crate::peer_transport;
 use ethers::types::U256;
@@ -796,10 +796,7 @@ async fn build_evm_batch_settlement(
         return Ok(None);
     };
     let backend = backend
-        .batch_settlement(
-            ethers::types::Address::from(batch.contract_address()),
-            batch.min_withdraw_delay_secs(),
-        )
+        .batch_settlement(batch.min_withdraw_delay_secs())
         .await
         .map_err(|source| RuntimeError::BatchSettlementUnusable {
             table: SettlementChain::Evm.name(),
@@ -823,19 +820,13 @@ async fn build_solana_batch_settlement(
         source,
     };
     let sponsor_seed = read_settlement_key_bytes(settlement.key())?;
-    let program_id = Pubkey::from_str(batch.program_id()).map_err(|error| {
-        unusable(BatchSettlementError::Backend(format!(
-            "program_id '{}' is not a base58 Solana pubkey: {error}",
-            batch.program_id()
-        )))
-    })?;
     let mint = parse_solana_pubkey("token_address", settlement.token_address())?;
     let backend = SolanaBatchSettlement::connect(
         transport,
         &sponsor_seed,
-        program_id,
         mint,
         batch.min_grace_period_secs(),
+        batch.min_sponsored_deposit(),
     )
     .await
     .map_err(unusable)?;
@@ -1673,7 +1664,7 @@ pub struct Runtime {
     /// 0074), `Some` exactly when `[settlement.evm.batch_settlement]` is
     /// written. [`router`] hands it to the client edge's claim gate, which
     /// admits vouchers through it; every channel the client-edge journal
-    /// holds vouchers on is already re-admitted to it by the time [`build`]
+    /// holds vouchers on is already restored to it by the time [`build`]
     /// returns, so its `channel_state` and `land` work from the first
     /// packet. [`router`] also starts its watcher and sweep over it (issue
     /// #1344, `spawn_batch_settlement_watchers`).
@@ -2032,7 +2023,10 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 // own pubkey (decision 5's sponsor-is-the-receiving-operator
                 // rule), and `network` is read off the chain's own genesis
                 // hash (`caip2_network`), never guessed from the RPC URL.
-                if let Some(batch) = solana.batch_settlement() {
+                // The two minimums are the batch backend's own: what it
+                // admits by and what its sponsor co-signs above are what is
+                // published, with no second read of the config.
+                if let Some(batch) = &batch_settlement_solana {
                     batch_settlements.push(
                         connector_client_edge::X402BatchSettlementTerms::Solana(
                             connector_client_edge::X402BatchSettlementSolanaTerms {
@@ -2041,6 +2035,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                                 pay_to: backend.own_pubkey().to_string(),
                                 fee_payer: backend.own_pubkey().to_string(),
                                 min_grace_period_secs: batch.min_grace_period_secs(),
+                                min_deposit: batch.min_sponsored_deposit().to_string(),
                             },
                         ),
                     );
@@ -2130,9 +2125,11 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         connector = connector.with_rate_table(table.clone());
     }
     // ADR 0074: every batch-settlement channel the client edge's journal
-    // holds vouchers on, admitted again before anything is served, so the
-    // port can land them after a restart. The journal is where an EVM
-    // channel's config survives one; the chain never gives it back.
+    // holds vouchers on, restored before anything is served, so the port
+    // can land them after a restart -- restored, not re-admitted, so a rule
+    // tightened since cannot strand a voucher already accepted (decision 5).
+    // The journal is where an EVM channel's config survives a restart; the
+    // chain never gives it back.
     if batch_settlement_evm.is_some() || batch_settlement_solana.is_some() {
         if let Some(state_dir) = config.state_dir() {
             let path = state_dir.join(CLIENT_EDGE_JOURNAL);
@@ -2145,7 +2142,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 .map_err(unreplayable)?;
             let channels =
                 connector_client_edge::journaled_batch_channels(&entries).map_err(unreplayable)?;
-            readmit_journaled_channels(
+            restore_journaled_channels(
                 &channels,
                 batch_settlement_evm
                     .as_deref()
@@ -2861,7 +2858,9 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     // ADR 0074 decision 9, issue #1346: the public Solana sponsor endpoint,
     // on the client edge's listener. Mounted whether or not this node opted
     // in, so a node that has not refuses by name.
-    let app = app.merge(crate::sponsor::router(solana_sponsor(runtime, config)));
+    let app = app.merge(crate::sponsor::router(
+        runtime.batch_settlement_solana.clone(),
+    ));
     Ok(match config.operator() {
         Some(operator) => app.merge(connector_operator::router(
             connector,
@@ -2873,22 +2872,6 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
         )),
         None => app,
     })
-}
-
-/// The Solana sponsor this node runs: its batch-settlement backend and the
-/// `min_sponsored_deposit` that bounds the endpoint, or `None` when
-/// `[settlement.solana.batch_settlement]` is not written.
-fn solana_sponsor(runtime: &Runtime, config: &Config) -> Option<(Arc<SolanaBatchSettlement>, u64)> {
-    let backend = runtime.batch_settlement_solana.clone()?;
-    let min_sponsored_deposit = config
-        .settlements()
-        .iter()
-        .find_map(|settlement| match settlement {
-            SettlementConfig::Solana(solana) => solana.batch_settlement(),
-            SettlementConfig::Evm(_) => None,
-        })?
-        .min_sponsored_deposit();
-    Some((backend, min_sponsored_deposit))
 }
 
 /// What `GET /rates` reads on a dealing node, or `None` on one that deals
@@ -6750,10 +6733,7 @@ key_file = "{solana_key_path}"
         /// name two different deployments of "this chain" (CF-26).
         #[tokio::test]
         async fn a_both_chains_config_composes_both_chains_batch_settlement_facts() {
-            if !anvil_available() {
-                eprintln!(
-                    "skipping: `anvil` not found on PATH (install via https://getfoundry.sh)"
-                );
+            if !require_anvil() {
                 return;
             }
             if !require_solana_test_validator() {
@@ -6911,6 +6891,10 @@ min_grace_period_secs = 3600
                  key, both roles"
             );
             assert_eq!(solana_batch.min_grace_period_secs, 3600);
+            assert_eq!(
+                solana_batch.min_deposit, "1000000",
+                "the sponsor's minimum deposit is published (ADR 0074 decision 5)"
+            );
         }
 
         /// Issue #630's review, finding 2: a `[settlement.solana]`

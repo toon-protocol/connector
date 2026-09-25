@@ -586,16 +586,19 @@ part of this connector's claim shape and are not documented here. A Mina client'
 clearly and immediately; it is not owed a code path, only an unambiguous refusal.
 
 > **Amended by [ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
-> (accepted 2026-09-25, not yet built: #1340–#1347).** A claim may also carry the scheme
+> (accepted 2026-09-25, built under epic #1349: #1340–#1347).** A claim may also carry the scheme
 > `batch-settlement`, whose claims are x402 **vouchers** on x402's own channel contracts: EVM
 > `x402BatchSettlement`, and Solana payment-channels. Three steps above read differently for a
 > voucher:
 >
 > - **Step 2 (freshness):** a voucher has no nonce. It must strictly exceed the amount watermark
 >   for the same (peer, blockchain, channel) tuple. A byte-identical voucher at the watermark is a
->   retransmission.
-> - **Step 4 (cryptography):** the signer comes from the chain. On EVM it is `payerAuthorizer`, or
->   else `payer`, from the verified `ChannelConfig`; on Solana it is `authorized_signer`.
+>   retransmission, which buys nothing: it is accepted again where the charge is zero, and refused
+>   as an underpayment (step 3) where it is not.
+> - **Step 4 (cryptography):** the signer comes from the chain. On EVM it is `payerAuthorizer` from
+>   the verified `ChannelConfig` — x402 would fall back to `payer` when it is zero, but this
+>   connector admits no such channel (ADR 0074 decision 2, amended 2026-09-25); on Solana it is
+>   `authorized_signer`.
 > - **Step 5 (collateral):** the licence to cache a deposit as a permanent lower bound does **not**
 >   extend to an EVM batch-settlement channel, whose `balance − totalClaimed − pendingWithdrawal`
 >   can fall.
@@ -701,16 +704,34 @@ configured (below) — and carries nothing else.
 > has opted into accepting a batch-settlement channel on (`[settlement.<chain>.batch_settlement]`) --
 > unlike a hypothetical `exact` entry, this one names a real scheme this connector's settlement
 > backends actually redeem, x402's own audited contracts, with no TOON contract involved. Its
-> top-level `network`/`asset`/`payTo` and its `extra` are exactly what x402's `batch-settlement`
+> top-level `network`/`asset`/`payTo` and its `extra` carry everything x402's `batch-settlement`
 > scheme spec requires, so a stock client can build a deposit from the greeting alone: `network` is
 > CAIP-2 (`eip155:<chainId>` or `solana:<genesis-hash-prefix>`), `asset` is the token address or
 > mint, and `payTo` is this node's own settlement address (Solana: the owner of its receiving
-> account). `extra` carries `receiverAuthorizer` and the minimum `withdrawDelay`, plus the asset's
-> EIP-712 `name`/`version`, on EVM; `feePayer` (the sponsor key) and the minimum `withdrawDelay`
-> (the program's own `grace_period`) on Solana. The `toon-channel` entry is unchanged and stays
-> first. The self-description publishes the same facts under `batchSettlements` (ND-11); this is a
-> projection of that value, never a second assembly of it
-> (`connector_domain::x402::batch_settlement_accept`).
+> account). `extra`'s wire names are recorded by ADR 0074 decision 8:
+>
+> - **EVM:** `receiverAuthorizer`, the minimum `withdrawDelay`, and `name`/`version` — the EIP-712
+>   domain of the **asset**, which a client signs its deposit's ERC-3009 or Permit2 authorization
+>   under. x402 requires both and an ERC-20 need not expose either, so they are not read off the
+>   chain: they are the required config keys `asset_eip712_name`/`asset_eip712_version`.
+> - **Solana:** `feePayer` (the sponsor key); `withdrawDelay`, x402's SVM field name, carrying the
+>   minimum `grace_period` (`[settlement.solana.batch_settlement] min_grace_period_secs`); and
+>   `minDeposit`, this connector's own addition to x402's SVM `extra`: the smallest opening deposit,
+>   in the mint's base units and as a decimal string like every amount here, that the sponsor
+>   endpoint (§1.11) co-signs an `open` for — the **published** minimum ADR 0074 decision 5 has the
+>   sponsor refuse below (`min_sponsored_deposit`).
+>
+> The `toon-channel` entry is unchanged and stays first. The self-description publishes the same
+> facts under `batchSettlements` (ND-11); this is a projection of that value, never a second
+> assembly of it (`connector_domain::x402::batch_settlement_accept`).
+>
+> **What `extra` cannot say: this connector requires a `payerAuthorizer`.** x402's EVM scheme lets a
+> client leave `ChannelConfig.payerAuthorizer` zero and sign vouchers with `payer`; this connector
+> admits only a channel whose `payerAuthorizer` is nonzero (ADR 0074 decision 2, amended
+> 2026-09-25), because a zero one hands every voucher check to `payer`, which the contract asks
+> ERC-1271 of as soon as it has code — as an EOA does after an EIP-7702 delegation. x402's `extra`
+> has no field for the requirement, so it is stated here. A channel opened without one is refused on
+> its first voucher as a channel this node does not admit.
 
 **`request`** ([issue #1210](https://github.com/toon-protocol/connector/issues/1210), [ADR
 0067](../adr/0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md)) — a
@@ -1379,7 +1400,8 @@ against `POST /ilp`. Nothing here calls into claim ingestion, and no per-packet 
 [ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 9. A client
 that holds the mint and no SOL opens an x402 `batch-settlement` channel on `payment-channels` with this
 node as fee payer and `rent_payer`: it builds and signs the `open` from the greeting's `batch-settlement`
-entry (`payTo`, `asset`, `extra.feePayer`, the minimum `withdrawDelay`, §1.4), and posts it here. The
+entry (`payTo`, `asset`, `extra.feePayer`, the minimum `withdrawDelay`, a deposit of at least
+`extra.minDeposit`, §1.4), and posts it here. The
 node co-signs, **submits**, waits for the outcome, and admits the channel it made.
 
 **Public, not an operator write.** The channel does not exist yet, so the call cannot be paid for, and a
@@ -1470,7 +1492,7 @@ channel this node admits.
 | `mint_not_settled`                                                                              | 422    | the mint is not `[settlement.solana] token_address`                                                                                 |
 | `distribution_not_sole_receiver`                                                                | 422    | the distribution is not exactly this node's receiver at 10000 bps                                                                   |
 | `grace_period_below_minimum`                                                                    | 422    | `grace_period` is below `min_grace_period_secs`                                                                                     |
-| `deposit_below_minimum`                                                                         | 422    | the deposit is below `min_sponsored_deposit`, which bounds the rent float (Cantina 3.1.9)                                           |
+| `deposit_below_minimum`                                                                         | 422    | the deposit is below `min_sponsored_deposit`, published as `extra.minDeposit`; it bounds the rent float (Cantina 3.1.9)             |
 | `token_program_unsupported`                                                                     | 422    | the token program is not SPL Token; Token-2022's account extensions can fail a payout                                               |
 | `open_account_mismatch`                                                                         | 422    | an account is not the one the canonical `open` names for that role                                                                  |
 | `unexpected_writable_account`                                                                   | 422    | an account the `open` does not write is writable                                                                                    |

@@ -55,11 +55,12 @@ impl BatchChannelStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VoucherSigner {
     /// An ECDSA address: `payerAuthorizer` when it is nonzero, otherwise
-    /// `payer`. A channel whose `payer` is a contract wallet and whose
-    /// `payerAuthorizer` is zero is never admitted
-    /// ([`AdmissionRefusal::ContractWalletPayerWithoutAuthorizer`]), so this
-    /// is always a key a packet's voucher can be checked against with no
-    /// RPC.
+    /// `payer`. A channel whose `payerAuthorizer` is zero is never admitted
+    /// ([`AdmissionRefusal::NoPayerAuthorizer`]), so on an admitted channel
+    /// this is always `payerAuthorizer`: a key a packet's voucher can be
+    /// checked against with no RPC, and one the contract checks by ECDSA
+    /// for the channel's whole life. (A channel only restored may predate
+    /// that rule, and name `payer`.)
     Evm([u8; 20]),
     /// The channel's `authorized_signer`, an Ed25519 public key.
     Solana([u8; 32]),
@@ -203,10 +204,14 @@ pub enum AdmissionRefusal {
     /// Solana: the channel is not Open. A channel already closing or sealed
     /// can back no new voucher.
     NotOpen,
-    /// EVM: `payerAuthorizer` is zero and `payer` is a contract, so every
-    /// voucher would need an ERC-1271 `eth_call` to verify. The client
-    /// names a `payerAuthorizer` instead (ADR 0074 decision 4).
-    ContractWalletPayerWithoutAuthorizer,
+    /// EVM: `payerAuthorizer` is zero, whatever `payer` is (ADR 0074
+    /// decision 2, amended 2026-09-25). With none the contract checks a
+    /// voucher against `payer` through `SignatureChecker`, which asks
+    /// ERC-1271 of a payer with code -- and an EOA payer can gain code at
+    /// any time by an EIP-7702 delegation, stranding the ECDSA vouchers this
+    /// node already accepted. The client names a `payerAuthorizer` instead
+    /// (decision 6).
+    NoPayerAuthorizer,
 }
 
 impl std::fmt::Display for AdmissionRefusal {
@@ -226,10 +231,7 @@ impl std::fmt::Display for AdmissionRefusal {
                 "its delay of {delay_secs}s is below this node's minimum of {minimum_secs}s"
             ),
             AdmissionRefusal::NotOpen => write!(f, "it is not open"),
-            AdmissionRefusal::ContractWalletPayerWithoutAuthorizer => write!(
-                f,
-                "its payer is a contract wallet and it names no payerAuthorizer"
-            ),
+            AdmissionRefusal::NoPayerAuthorizer => write!(f, "it names no payerAuthorizer"),
         }
     }
 }
@@ -270,8 +272,9 @@ pub enum BatchSettlementError {
 
     /// [`BatchSettlementBackend::land`] or
     /// [`BatchSettlementBackend::channel_state`] on a channel this backend
-    /// has not admitted. On EVM `claim` needs the full config, which only
-    /// admission supplies, so this is structural rather than a policy.
+    /// has neither admitted nor restored. On EVM `claim` needs the full
+    /// config, which only a presentation supplies, so this is structural
+    /// rather than a policy.
     #[error("batch-settlement channel '{0}' has not been admitted")]
     ChannelNotAdmitted(ChannelId),
 
@@ -350,7 +353,35 @@ pub trait BatchSettlementBackend: Send + Sync {
         presentation: ChannelPresentation,
     ) -> Result<BatchChannelState, BatchSettlementError>;
 
-    /// The admitted channel's state, read from the chain now. Never answered
+    /// Bring back a channel this node **already holds vouchers on** -- one
+    /// admitted before a restart, whose presentation the client edge's
+    /// journal kept -- so [`channel_state`](Self::channel_state) and
+    /// [`land`](Self::land) work on it again, without judging it against
+    /// the admission rules.
+    ///
+    /// Admission policy decides which channels this node takes **new**
+    /// vouchers on. A voucher already accepted was paid for, and landing it
+    /// is what protects that value (ADR 0074 decision 5), so a policy
+    /// tightened across a restart -- a raised minimum delay -- must not
+    /// strand it. What is still checked is what makes landing safe at all:
+    /// the presentation is for this backend's chain
+    /// ([`WrongChain`](BatchSettlementError::WrongChain)), it names itself
+    /// consistently ([`ChannelIdMismatch`](BatchSettlementError::ChannelIdMismatch)),
+    /// and the chain can be read and holds the channel
+    /// ([`ChannelNotFound`](BatchSettlementError::ChannelNotFound)).
+    ///
+    /// Restoring is not admitting. Whether a new voucher may be accepted on
+    /// the channel is still [`admit`](Self::admit)'s to answer, now, under
+    /// this node's current rules; a caller that takes new vouchers asks it.
+    /// Restoring a channel already admitted or restored changes nothing but
+    /// returns its current state.
+    async fn restore(
+        &self,
+        presentation: ChannelPresentation,
+    ) -> Result<BatchChannelState, BatchSettlementError>;
+
+    /// The admitted or restored channel's state, read from the chain now.
+    /// Never answered
     /// from a cache: collateral can fall on EVM, and a watcher that has just
     /// seen `WithdrawInitiated` or a Solana close relies on this to see it.
     async fn channel_state(
@@ -358,7 +389,8 @@ pub trait BatchSettlementBackend: Send + Sync {
         channel: &ChannelId,
     ) -> Result<BatchChannelState, BatchSettlementError>;
 
-    /// Land `voucher` on the admitted `channel`, so its amount is recorded
+    /// Land `voucher` on the admitted or restored `channel`, so its amount
+    /// is recorded
     /// on chain in this node's favour: EVM `claim`; Solana `settle` while
     /// Open and `settle_and_seal` while Closing. Returns the state after.
     ///

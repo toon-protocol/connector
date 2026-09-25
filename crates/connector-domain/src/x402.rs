@@ -489,6 +489,15 @@ pub struct X402BatchSettlementSolanaTerms {
     /// this type's own doc).
     #[serde(rename = "withdrawDelay")]
     pub min_grace_period_secs: u64,
+    /// The smallest opening deposit, in the mint's base units, this node's
+    /// sponsor will co-sign an `open` for -- `[settlement.solana.batch_settlement]
+    /// min_sponsored_deposit`. Published because ADR 0074 decision 5 has
+    /// the sponsor refuse "below a *published* minimum deposit": a client
+    /// must be able to read the bound before it builds an `open` the public
+    /// sponsor endpoint would refuse. A decimal string, as every token
+    /// amount on this greeting is.
+    #[serde(rename = "minDeposit")]
+    pub min_deposit: String,
 }
 
 /// The greeting's own `batch-settlement` `accepts[]` entry (ADR 0074
@@ -538,13 +547,17 @@ pub struct X402BatchSettlementEvmExtra {
 
 /// x402 SVM batch-settlement spec `#L163-L178`: `feePayer` and
 /// `withdrawDelay` (the program's `grace_period`) are required so a client
-/// can build the channel account `open` names.
+/// can build the channel account `open` names. `minDeposit` is this
+/// connector's own addition: the published minimum its sponsor co-signs an
+/// `open` for (ADR 0074 decision 5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct X402BatchSettlementSolanaExtra {
     #[serde(rename = "feePayer")]
     pub fee_payer: String,
     #[serde(rename = "withdrawDelay")]
     pub withdraw_delay: u64,
+    #[serde(rename = "minDeposit")]
+    pub min_deposit: String,
 }
 
 /// Project [`X402BatchSettlementTerms`] into the greeting's own
@@ -581,6 +594,7 @@ fn batch_settlement_accept(
             extra: X402BatchSettlementExtra::Solana(X402BatchSettlementSolanaExtra {
                 fee_payer: solana.fee_payer.clone(),
                 withdraw_delay: solana.min_grace_period_secs,
+                min_deposit: solana.min_deposit.clone(),
             }),
         },
     }
@@ -1061,6 +1075,7 @@ mod tests {
             pay_to: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
             fee_payer: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
             min_grace_period_secs: 86_400,
+            min_deposit: "1000000".to_string(),
         })
     }
 
@@ -1116,9 +1131,11 @@ mod tests {
                 "maxTimeoutSeconds": 60,
                 "extra": {
                     "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
-                    "withdrawDelay": 86400
+                    "withdrawDelay": 86400,
+                    "minDeposit": "1000000"
                 }
-            })
+            }),
+            "the sponsor's minimum deposit is published, not only enforced (ADR 0074 decision 5)"
         );
 
         // The greeting still reads as ordinary toon-channel terms: `.offer()`

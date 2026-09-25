@@ -199,7 +199,7 @@ price = {PRICE}
     let before = backend
         .channel_state(&channel_id)
         .await
-        .expect("re-admitted at boot, from the journal");
+        .expect("restored at boot, from the journal");
     assert_eq!(before.status, BatchChannelStatus::Open);
     assert_eq!(before.landed, 0);
 

@@ -145,8 +145,9 @@ arithmetic and asserts it against `Price::charge` before committing it.
 comparison is not [`validate_claim`]'s. An amount **equal** to the channel's watermark is refused
 (`amount_not_advancing`) unless it is byte-identical — same amount, same signature — to the voucher
 that set that watermark, in which case it is a retransmission: accepted again, buying nothing new,
-exactly as a `toon-channel` claim retransmitted at its own watermark is accepted again today. A
-strictly higher amount is accepted, by the difference. Also pinned: a Solana voucher's `expiresAt`
+exactly as a `toon-channel` claim retransmitted at its own watermark is accepted again today —
+and, because it buys nothing, refused as an underpayment where the charge is not zero. A strictly
+higher amount is accepted, by the difference. Also pinned: a Solana voucher's `expiresAt`
 must be `0` — x402 requires it, and the program refuses a nonzero one at `settle` with no state
 change — so the connector refuses it structurally, before any signature check.
 
@@ -155,7 +156,9 @@ tests over `validate_voucher`) and by `connector-signer`'s `voucher_signature::t
 digest and Ed25519 message each voucher scheme signs, checked against the deployed
 `x402BatchSettlement` contract and against `payment-channels`' own message layout) — and pinned
 cross-repo by the `claim_voucher` section, whose `evm`/`solana` cases are checked against
-`x402BatchSettlement.getChannelId`/`.getVoucherDigest` on Base Sepolia and whose
+`x402BatchSettlement.getChannelId`/`.getVoucherDigest` on Base Sepolia — and again on every
+workspace run, by `connector-settlement-evm`'s `x402_voucher_vector.rs`, against the deployed
+bytecode on an `anvil` at chain 84532 — and whose
 `amount_only_watermark`/`invalid` cases are checked against the real `validate_voucher` and claim
 parser before being committed.
 

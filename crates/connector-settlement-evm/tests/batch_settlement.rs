@@ -20,7 +20,7 @@ use connector_settlement::batch::{
     ChannelPresentation, EvmChannelConfig, Voucher, VoucherSigner,
 };
 use connector_settlement::ChannelId;
-use connector_settlement_evm::test_support::x402::{batch_settlement_address, X402Chain};
+use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
 use connector_settlement_evm::{EvmBatchSettlementBackend, EvmSettlementBackend};
 use ethers::signers::{LocalWallet, Signer};
@@ -42,7 +42,6 @@ struct Chain {
     /// Held so the chain outlives every closure the suite runs.
     _anvil: Anvil,
     x402: Arc<X402Chain>,
-    settlement: EvmSettlementBackend,
     backend: Arc<EvmBatchSettlementBackend>,
     /// The token this node settles in.
     token: Address,
@@ -67,7 +66,7 @@ impl Chain {
             .await
             .expect("this node's settlement backend, over the FiatToken");
         let backend = settlement
-            .batch_settlement(batch_settlement_address(), ONE_DAY)
+            .batch_settlement(ONE_DAY)
             .await
             .expect("the batch-settlement backend binds to x402BatchSettlement");
 
@@ -82,7 +81,6 @@ impl Chain {
         Chain {
             _anvil: anvil,
             x402: Arc::new(x402),
-            settlement,
             backend: Arc::new(backend),
             token,
             other_token,
@@ -243,13 +241,19 @@ async fn evm_batch_settlement_backend_upholds_the_contract() {
     .await;
 }
 
-/// ADR 0074 decision 4: with no `payerAuthorizer` the contract checks a
-/// voucher against `payer` through `SignatureChecker`, which asks ERC-1271
-/// of any payer with code. An EOA payer is admitted and its own voucher
-/// lands; a payer with code -- a contract wallet, or an EIP-7702-delegated
-/// account -- is refused unless it names a `payerAuthorizer`.
+/// ADR 0074 decision 2, as amended on 2026-09-25: a channel must name a
+/// nonzero `payerAuthorizer`, whatever its payer is. With none, the contract
+/// checks a voucher against `payer` through `SignatureChecker`, which asks
+/// ERC-1271 of any payer with code -- and an EOA payer can gain code later,
+/// by an EIP-7702 delegation, turning every ECDSA voucher this node already
+/// accepted into one the contract no longer checks by ECDSA. So an EOA payer
+/// with no `payerAuthorizer` is refused as surely as a contract wallet is,
+/// and a payer with code that names one is admitted.
+///
+/// A channel already held is another matter (ADR 0074 decision 5): one
+/// accepted before the rule is restored for landing, never re-judged.
 #[tokio::test]
-async fn a_payer_with_code_must_name_a_payer_authorizer() {
+async fn a_channel_must_name_a_payer_authorizer() {
     if !require_anvil() {
         return;
     }
@@ -259,10 +263,18 @@ async fn a_payer_with_code_must_name_a_payer_authorizer() {
         ..chain.config()
     };
 
-    // An EOA payer signs for itself.
+    // An EOA payer that would sign for itself is refused by the rule's name.
     let eoa = chain.open(unauthorised(&chain), 1_000).await;
     let channel = eoa.channel().clone();
-    let state = chain.backend.admit(eoa).await.expect("an EOA payer");
+    assert_eq!(
+        refusal(chain.backend.admit(eoa.clone()).await),
+        AdmissionRefusal::NoPayerAuthorizer,
+        "an EOA payer with no payerAuthorizer"
+    );
+
+    // Held from before the rule, it is restored all the same, and the
+    // payer's own voucher still lands.
+    let state = chain.backend.restore(eoa).await.expect("restored");
     assert_eq!(
         state.voucher_signer,
         VoucherSigner::Evm(chain.payer.address().into())
@@ -271,12 +283,13 @@ async fn a_payer_with_code_must_name_a_payer_authorizer() {
         .backend
         .land(&channel, chain.voucher(&chain.payer, &channel, 250))
         .await
-        .expect("the payer's own voucher lands");
+        .expect("a held voucher lands on a restored channel");
     assert_eq!(state.landed, 250);
 
-    // The same payer, now with code: an EIP-7702 delegation designator, then
-    // an ordinary contract. Its channels are opened while it is still an
-    // EOA -- a FiatToken would ask a payer with code for ERC-1271 on the
+    // A payer with code -- an EIP-7702 delegation designator, then an
+    // ordinary contract -- is refused without a payerAuthorizer and
+    // admitted with one. Its channels are opened while it is still an EOA
+    // -- a FiatToken would ask a payer with code for ERC-1271 on the
     // deposit too -- and it gains the code before this node looks.
     for code in [
         format!("0xef0100{}", "11".repeat(20)),
@@ -288,7 +301,7 @@ async fn a_payer_with_code_must_name_a_payer_authorizer() {
         chain.x402.set_code(chain.payer.address(), &code).await;
         assert_eq!(
             refusal(chain.backend.admit(wallet).await),
-            AdmissionRefusal::ContractWalletPayerWithoutAuthorizer,
+            AdmissionRefusal::NoPayerAuthorizer,
             "a payer with code {code} and no payerAuthorizer"
         );
 
@@ -474,17 +487,22 @@ async fn a_finalised_withdrawal_leaves_an_open_channel_backing_nothing_new() {
     );
 }
 
-/// The backend refuses to bind to an address where no `x402BatchSettlement`
-/// computes this node's channel ids: here, one with nothing deployed.
+/// The backend refuses to bind on a chain where no `x402BatchSettlement`
+/// answers at its fixed address: here, one x402 was never placed on.
 #[tokio::test]
-async fn binding_to_an_address_that_is_not_x402_batch_settlement_is_refused() {
+async fn binding_where_x402_batch_settlement_is_not_deployed_is_refused() {
     if !require_anvil() {
         return;
     }
-    let chain = Chain::spawn().await;
-    let nowhere = Address::repeat_byte(0x77);
-    let Err(err) = chain.settlement.batch_settlement(nowhere, ONE_DAY).await else {
-        panic!("bound to an address with no contract");
+    let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+    let token = EvmSettlementBackend::deploy_mock_token(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, 0)
+        .await
+        .expect("a token");
+    let settlement = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
+        .await
+        .expect("this node's settlement backend");
+    let Err(err) = settlement.batch_settlement(ONE_DAY).await else {
+        panic!("bound where no x402BatchSettlement is deployed");
     };
     assert!(
         matches!(&err, BatchSettlementError::Backend(message) if message.contains("no x402BatchSettlement")),

@@ -93,9 +93,9 @@ async fn world() -> World {
     let backend = SolanaBatchSettlement::connect(
         &RpcTransport::direct(&validator.rpc_url).expect("rpc transport"),
         &seed_of(&sponsor),
-        program_id(),
         settled_mint,
         ONE_DAY,
+        1,
     )
     .await
     .expect("connect to the genesis-loaded payment-channels program");
