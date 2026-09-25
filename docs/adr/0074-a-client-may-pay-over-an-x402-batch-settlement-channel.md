@@ -2,7 +2,7 @@
 
 **Status:** Accepted (owner decision, 2026-09-25, issue #1329) — **being built** under epic #1349; the implementation is tickets #1340–#1347. All three prerequisites were settled before acceptance, the last by a live Base Sepolia deposit on 2026-09-25, and the choices this record makes beyond #1329's seven were accepted with it. It **amends** [0059](0059-a-channel-is-derived-from-its-participants.md) (a client-edge exception to one-live-channel-per-pair), [0005](0005-claims-are-truth-balances-are-a-projection.md) (a second freshness rule for the journal to hold), `client-edge-spec.md` §1.3 (its freshness step, and step 5's rule that a cached deposit is a lower bound, which is false for a channel a payer can withdraw from) and `CONTEXT.md`'s **Claim**, **Nonce** and **Watermark**, plus a new **Voucher** entry (all applied). It **extends** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) with a second claim scheme per chain, and it disturbs [0021](0021-vectors-are-normative-prose-is-not.md): `schema_version` goes to **6** when #1347 lands. It leaves [0022](0022-a-connector-answers-it-does-not-announce.md)'s deferral of paying over HTTP exactly where it is.
 
-**Amended 2026-09-25 (#1349 review):** EVM admission now requires a nonzero `payerAuthorizer` whatever the payer is, where it had refused only a contract-wallet payer without one (decisions 2 and 4, and the last of the choices beyond #1329's seven). An EOA can gain code later by an EIP-7702 delegation, after which the contract checks a voucher by ERC-1271 rather than ECDSA and the vouchers already accepted no longer verify the way they did. Decision 3's retransmission rule now says what the code always did: a byte-identical voucher buys nothing, so against a nonzero charge it is refused as an underpayment, and the vectors pin that case too.
+**Amended 2026-09-25 (#1349 review):** EVM admission now requires a nonzero `payerAuthorizer` whatever the payer is, where it had refused only a contract-wallet payer without one (decisions 2 and 4, and the last of the choices beyond #1329's seven). An EOA can gain code later by an EIP-7702 delegation, after which the contract checks a voucher by ERC-1271 rather than ECDSA and the vouchers already accepted no longer verify the way they did. Decision 3 also records the journal's second amendment to 0005 (the `BatchChannelAdmitted` entry, which holds an EVM channel's `ChannelConfig` so held vouchers stay claimable after a restart), and its retransmission rule now says what the code always did: a byte-identical voucher buys nothing, so against a nonzero charge it is refused as an underpayment, and the vectors pin that case too.
 
 **Scope:** protocol law. It binds every implementation, because it adds a claim scheme to the wire and an offer to the greeting. The watchers and sweeps in decision 5 and the port shape in decision 9 are connector architecture. See the [ADR index](README.md).
 
@@ -152,7 +152,17 @@ and value before cryptography".
   voucher exactly as it holds a claim: the signed bytes, and the watermark they set. The
   watermark's _key_ is §1.3's (peer, blockchain, channel) tuple, with the channel in its canonical
   form. Only its _comparison_
-  differs by scheme. This is the one clause of 0005 that is amended.
+  differs by scheme. This is the first clause of 0005 that is amended.
+- **What the journal also holds** (a second amendment to 0005, recorded 2026-09-25). With a
+  channel's first accepted voucher, the journal records the channel itself, as
+  `JournalEntry::BatchChannelAdmitted`: its canonical key and, on EVM, the `ChannelConfig` it was
+  admitted under (on Solana, nothing more, since the channel account holds every field). 0005
+  persists only what is signed or irreversible, and a config is neither. It is journaled anyway
+  because the chain stores an EVM channel by id alone and a voucher signs only that id, so after a
+  restart the config exists nowhere else, and `claim` cannot be sent without it. Without the entry,
+  every voucher accepted before a restart would be unclaimable while the payer withdrew (decision
+  5). The entry is written in the same batch as the voucher it arrives with, and folds into no
+  balance.
 
 ### 4. Two claim schemes: the `toon-channel` claim and the batch-settlement voucher
 
