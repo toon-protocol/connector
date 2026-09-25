@@ -1,12 +1,15 @@
 // ---------------------------------------------------------------------------
-// Base Sepolia faucet — mock-USDC mint drip (+ best-effort ETH gas)
+// Base Sepolia faucet — devnet-USDC mint drip (+ best-effort ETH gas)
 // ---------------------------------------------------------------------------
-// The PUBLIC Base Sepolia testnet (chainId 84532) hosts a mock USDC (6dp) whose
-// `mint(address,uint256)` is UNGATED — anyone can create fresh USDC to any
-// address. So, unlike the anvil EVM leg (which TRANSFERS pre-minted tokens from
-// the deployer), this leg does NOT need the faucet key to hold any USDC: it just
-// calls `mint(recipient, amount)`, coining new tokens on demand. The faucet key
-// only needs Base Sepolia ETH to pay gas for the mint tx.
+// The PUBLIC Base Sepolia testnet (chainId 84532) hosts the devnet USDC: Circle's
+// FiatToken v2.2, the same code as Base mainnet USDC, deployed 2026-09-25 (#1337)
+// so a client can deposit without gas through ERC-3009. Its
+// `mint(address,uint256)` is MINTER-GATED, and the faucet key is a minter with an
+// unlimited allowance. So, unlike the anvil EVM leg (which TRANSFERS pre-minted
+// tokens from the deployer), this leg does NOT need the faucet key to hold any
+// USDC: it just calls `mint(recipient, amount)`, coining new tokens on demand.
+// The faucet key only needs Base Sepolia ETH to pay gas for the mint tx. (The
+// mock ERC-20 it replaced, 0x49beE1…a9Ce, had an ungated mint and no ERC-3009.)
 //
 // It ALSO best-effort drips a little Base Sepolia ETH for gas (mirroring the
 // anvil EVM leg, which drips ETH too) — but only when the faucet key holds a
@@ -23,11 +26,11 @@ import { createDripLimiter } from './drip-limiter.js';
 
 const BASE_SEPOLIA_RPC_URL = process.env.BASE_SEPOLIA_RPC_URL || 'https://sepolia.base.org';
 const BASE_SEPOLIA_CHAIN_ID = Number(process.env.BASE_SEPOLIA_CHAIN_ID || '84532');
-// Mock USDC (6dp, ungated public mint) deployed on Base Sepolia 2026-07-18.
+// Devnet USDC: Circle FiatToken v2.2 on Base Sepolia, 2026-09-25 (#1337).
 const BASE_SEPOLIA_USDC =
-  process.env.BASE_SEPOLIA_USDC || '0x49beE1Bca5d15Fb0963117923403F9498119a9Ce';
+  process.env.BASE_SEPOLIA_USDC || '0x0C996d7c934c79a6255254875607Fe69df25C0E1';
 const BASE_SEPOLIA_FAUCET_KEY = process.env.BASE_SEPOLIA_FAUCET_KEY || '';
-// 6 decimals — real-USDC standard, matches the deployed mock USDC.
+// 6 decimals — real-USDC standard, matches the deployed FiatToken.
 const BASE_SEPOLIA_USDC_DECIMALS = Number(process.env.BASE_SEPOLIA_USDC_DECIMALS || '6');
 // USDC per drip (whole tokens; default 1,000 USDC = 1000_000000 base units).
 const BASE_SEPOLIA_USDC_AMOUNT = process.env.BASE_SEPOLIA_USDC_AMOUNT || '1000';
