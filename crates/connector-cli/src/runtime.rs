@@ -2858,6 +2858,10 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
             })
             .collect(),
     );
+    // ADR 0074 decision 9, issue #1346: the public Solana sponsor endpoint,
+    // on the client edge's listener. Mounted whether or not this node opted
+    // in, so a node that has not refuses by name.
+    let app = app.merge(crate::sponsor::router(solana_sponsor(runtime, config)));
     Ok(match config.operator() {
         Some(operator) => app.merge(connector_operator::router(
             connector,
@@ -2869,6 +2873,22 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
         )),
         None => app,
     })
+}
+
+/// The Solana sponsor this node runs: its batch-settlement backend and the
+/// `min_sponsored_deposit` that bounds the endpoint, or `None` when
+/// `[settlement.solana.batch_settlement]` is not written.
+fn solana_sponsor(runtime: &Runtime, config: &Config) -> Option<(Arc<SolanaBatchSettlement>, u64)> {
+    let backend = runtime.batch_settlement_solana.clone()?;
+    let min_sponsored_deposit = config
+        .settlements()
+        .iter()
+        .find_map(|settlement| match settlement {
+            SettlementConfig::Solana(solana) => solana.batch_settlement(),
+            SettlementConfig::Evm(_) => None,
+        })?
+        .min_sponsored_deposit();
+    Some((backend, min_sponsored_deposit))
 }
 
 /// What `GET /rates` reads on a dealing node, or `None` on one that deals

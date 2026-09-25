@@ -27,6 +27,7 @@ mod batch_settlement;
 mod peer_transport;
 mod runtime;
 mod send;
+mod sponsor;
 
 use std::fmt;
 use std::net::SocketAddr;
