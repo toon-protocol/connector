@@ -1,5 +1,5 @@
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "envelope": {
     "valid": [
       {
@@ -609,6 +609,80 @@
         "kib": 3,
         "charge": "18446744073709551615",
         "saturated": true
+      }
+    ]
+  },
+  "claim_voucher": {
+    "evm": {
+      "name": "claim_voucher_evm",
+      "chain_id": 84532,
+      "verifying_contract_hex": "4020074e9df2ce1dee5a9c1b5c3f541d02a10003",
+      "channel_config": {
+        "payer_hex": "1111111111111111111111111111111111111111",
+        "payer_authorizer_hex": "70997970c51812dc3a010c7d01b50e0d17dc79c8",
+        "receiver_hex": "3333333333333333333333333333333333333333",
+        "receiver_authorizer_hex": "4444444444444444444444444444444444444444",
+        "token_hex": "5555555555555555555555555555555555555555",
+        "withdraw_delay": 86400,
+        "salt_hex": "6666666666666666666666666666666666666666666666666666666666666666"
+      },
+      "channel_id_hex": "88d37e9be679d5e46c7c1d073e6f41b5ec07cc5099319a49b80ba460f0d8055d",
+      "max_claimable_amount": 5000,
+      "digest_hex": "0485b41befd093f42efa53a626e86749b97998f0243e2c7f74b179851d880a8a",
+      "signer_address_hex": "70997970c51812dc3a010c7d01b50e0d17dc79c8",
+      "signature_hex": "6be416a12f0d5af512c04435315cc4235e915536d73175e05b08b597c160f0ac463b79066298bea17a15716eedbf07231ffbc514295c9057d8c195bebc8566241b",
+      "json": "{\"blockchain\":\"evm\",\"channelConfig\":{\"payer\":\"0x1111111111111111111111111111111111111111\",\"payerAuthorizer\":\"0x70997970c51812dc3a010c7d01b50e0d17dc79c8\",\"receiver\":\"0x3333333333333333333333333333333333333333\",\"receiverAuthorizer\":\"0x4444444444444444444444444444444444444444\",\"salt\":\"0x6666666666666666666666666666666666666666666666666666666666666666\",\"token\":\"0x5555555555555555555555555555555555555555\",\"withdrawDelay\":86400},\"channelId\":\"0x88d37e9be679d5e46c7c1d073e6f41b5ec07cc5099319a49b80ba460f0d8055d\",\"maxClaimableAmount\":\"5000\",\"messageId\":\"vector-fixture:voucher:evm:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"0x70997970c51812dc3a010c7d01b50e0d17dc79c8\",\"signature\":\"0x6be416a12f0d5af512c04435315cc4235e915536d73175e05b08b597c160f0ac463b79066298bea17a15716eedbf07231ffbc514295c9057d8c195bebc8566241b\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}"
+    },
+    "solana": {
+      "name": "claim_voucher_solana",
+      "channel_account_hex": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+      "channel_account_base58": "EBBduiozK9vBCemy4FcAjhVkby2FLPstxZxxN7jpgxtr",
+      "signer_public_key_hex": "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b",
+      "signer_public_key_base58": "AB3FQHskSYuWVw4M9EpGdxNzrAjBNiYGpbH4CVzLFene",
+      "max_claimable_amount": 5000,
+      "expires_at": 0,
+      "signed_message_hex": "5601c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c388130000000000000000000000000000",
+      "signature_hex": "347482945bb1d06372454c0f88c48934e7a0ab8042553132d4abb9937125281154f3bf945db285c9dd5bf1e252592b2d8122aa4ad357675f08a3590f0fa9a405",
+      "signature_base58": "23pytmL2R4RcZukDPv27ejMwhsJ1uay5CDmNVxdwnFnRTdn5RDgnPZygbVAGesBSKeyoqUbeNCnMwn1si7sy3wsA",
+      "json": "{\"blockchain\":\"solana\",\"channelId\":\"EBBduiozK9vBCemy4FcAjhVkby2FLPstxZxxN7jpgxtr\",\"expiresAt\":0,\"maxClaimableAmount\":\"5000\",\"messageId\":\"vector-fixture:voucher:solana:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"AB3FQHskSYuWVw4M9EpGdxNzrAjBNiYGpbH4CVzLFene\",\"signature\":\"23pytmL2R4RcZukDPv27ejMwhsJ1uay5CDmNVxdwnFnRTdn5RDgnPZygbVAGesBSKeyoqUbeNCnMwn1si7sy3wsA\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}"
+    },
+    "amount_only_watermark": [
+      {
+        "name": "voucher_amount_equal_to_watermark_is_refused",
+        "watermark_amount": 1000,
+        "watermark_signature_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031",
+        "presented_amount": 1000,
+        "presented_signature_hex": "f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132",
+        "charge": 0,
+        "outcome": "amount_not_advancing",
+        "advanced": null
+      },
+      {
+        "name": "voucher_amount_above_watermark_is_accepted",
+        "watermark_amount": 1000,
+        "watermark_signature_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031",
+        "presented_amount": 1500,
+        "presented_signature_hex": "f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132",
+        "charge": 500,
+        "outcome": "advances",
+        "advanced": 500
+      },
+      {
+        "name": "byte_identical_voucher_retransmission_is_accepted_again",
+        "watermark_amount": 1000,
+        "watermark_signature_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031",
+        "presented_amount": 1000,
+        "presented_signature_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031",
+        "charge": 0,
+        "outcome": "retransmission",
+        "advanced": null
+      }
+    ],
+    "invalid": [
+      {
+        "name": "claim_voucher_solana_expires_at_nonzero",
+        "claim_json": "{\"blockchain\":\"solana\",\"channelId\":\"EBBduiozK9vBCemy4FcAjhVkby2FLPstxZxxN7jpgxtr\",\"expiresAt\":1,\"maxClaimableAmount\":\"5000\",\"messageId\":\"vector-fixture:voucher:solana:expires\",\"scheme\":\"batch-settlement\",\"senderId\":\"AB3FQHskSYuWVw4M9EpGdxNzrAjBNiYGpbH4CVzLFene\",\"signature\":\"23pytmL2R4RcZukDPv27ejMwhsJ1uay5CDmNVxdwnFnRTdn5RDgnPZygbVAGesBSKeyoqUbeNCnMwn1si7sy3wsA\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}",
+        "expected_error": "voucher_expires"
       }
     ]
   }

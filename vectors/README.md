@@ -505,4 +505,77 @@ connector accepts in silence, so there was no reject to read.
   confirmed against that live node, whose x402 greeting quotes `price.charge(prepare.data.len())`
   for the packet it was handed.
 
+### `claim_voucher`
+
+[ADR 0074](../docs/adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 7,
+issue #1347: `schema_version` **6**. A client-edge claim gains a `scheme` discriminator (issue
+#1341); absent, or `"toon-channel"`, is the `claim`/`peer_carriage` claim above, unchanged. Under
+`scheme: "batch-settlement"` a claim is a **voucher** -- x402's own claim, on a channel this
+connector never opens, verified against a different signature scheme per chain and freed of the
+nonce every claim above uses: its freshness is an amount-only watermark
+(`connector_domain::validate_voucher`). **Client edge only** -- no peer carriage ever accepts one
+(`connector_peer_btp::claim_json::parse` has no voucher arm) -- so unlike `peer_carriage`'s claim
+cases there is no BTP/HTTP framing pair here: a voucher rides the same
+`ILP-Payment-Channel-Claim` header/protocolData entry a `toon-channel` claim already does, and only
+its JSON shape differs.
+
+- **`evm`** -- `{ name, chain_id, verifying_contract_hex, channel_config, channel_id_hex,
+max_claimable_amount, digest_hex, signer_address_hex, signature_hex, json }`. `channel_config` is
+  `{ payer_hex, payer_authorizer_hex, receiver_hex, receiver_authorizer_hex, token_hex,
+withdraw_delay, salt_hex }` -- x402's `ChannelConfig`, the seven fields a channel's id is the
+  EIP-712 hash of. `channel_id_hex` is `getChannelId(channel_config)` under the domain
+  `("x402 Batch Settlement", "1", chain_id, verifying_contract_hex)`; `digest_hex` is
+  `getVoucherDigest(channel_id_hex, max_claimable_amount)` -- what `signature_hex` (`r ‖ s ‖ v`, 65
+  bytes) actually signs, recovering to `signer_address_hex` (`payerAuthorizer`, since this
+  fixture's is nonzero -- ADR 0074 decision 4). `json` is the full claim, exactly as it rides the
+  claim header/protocolData entry -- note its wire field names are camelCase
+  (`channelId`, `maxClaimableAmount`, `channelConfig.payerAuthorizer`, ...) where this file's own
+  `_hex` fields are snake_case, the same convention `peer_carriage.claim_evm.json` uses.
+
+  **Independently confirmed against the deployed contract.** `channel_id_hex` and `digest_hex` are
+  not only this repository's own arithmetic: they equal `x402BatchSettlement.getChannelId` and
+  `.getVoucherDigest` called live against the contract's one deployed address
+  (`0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003`) on Base Sepolia (chain 84532), over
+  `https://sepolia.base.org` at block 47289378 -- the exact `cast call` commands and their output
+  are recorded next to where this section is generated
+  (`crates/connector-vectors/src/lib.rs`, above `generate_voucher_evm_case`), so this vector cannot
+  silently drift from the chain it names.
+
+- **`solana`** -- `{ name, channel_account_hex, channel_account_base58, signer_public_key_hex,
+signer_public_key_base58, max_claimable_amount, expires_at, signed_message_hex, signature_hex,
+signature_base58, json }`. `signed_message_hex` is payment-channels' 50-byte voucher message --
+  `0x5601 ‖ channel_account ‖ cumulative_amount (u64 LE) ‖ expires_at (i64 LE)` -- what
+  `signature_hex`/`signature_base58` (the same 64 bytes, Ed25519) covers, verifying against
+  `signer_public_key_hex`, the channel's `authorized_signer`. `expires_at` is `0`: see `invalid[]`
+  for what a nonzero one costs. `json`'s wire fields (`channelId`, `signature`) are base58 on
+  Solana, unlike EVM's hex -- the same convention `peer_carriage.claim_solana` uses.
+
+- **`amount_only_watermark[]`** -- `{ name, watermark_amount, watermark_signature_hex,
+presented_amount, presented_signature_hex, charge, outcome, advanced }`: the three outcomes of
+  [`connector_domain::validate_voucher`], the amount-only rule a voucher's freshness is judged by
+  in place of a `toon-channel` claim's nonce (ADR 0074 decision 3). `watermark_amount`/
+  `watermark_signature_hex` are `null` for a channel that has never accepted a voucher; otherwise
+  they are the amount and signature of the voucher that set the watermark, and
+  `presented_amount`/`presented_signature_hex` are the voucher now being judged against it.
+  `outcome` is one of:
+  - `"amount_not_advancing"` -- the presented amount equals the watermark's under a **different**
+    signature. Refused, and for a voucher this means _not strictly greater_ (`claim`'s nonce rule
+    means _less than_ -- ADR 0074 decision 3 pins the difference deliberately).
+  - `"advances"` -- the presented amount is strictly above the watermark's, `advanced` (the
+    difference) covers `charge`, and the voucher is accepted; `advanced` carries the figure.
+  - `"retransmission"` -- the presented amount **and** signature are byte-identical to the
+    voucher at the watermark: a retransmission, not a new claim, answered exactly as
+    `peer_carriage.claim_retransmit` answers a `toon-channel` claim retransmitted at its watermark
+    today -- accepted again, buying nothing new. Byte identity is the test: an equal amount under a
+    different signature is `"amount_not_advancing"` instead, not a retransmission.
+
+- **`invalid[]`** -- `{ name, claim_json, expected_error }`, the same shape as `envelope`'s
+  `invalid[]`: parsing `claim_json` as a client-edge claim must fail with `expected_error`, never
+  succeed. Today's one entry, `claim_voucher_solana_expires_at_nonzero`
+  (`expected_error: "voucher_expires"`), is ADR 0074 decision 3's Solana rule: `expiresAt` must be
+  `0`. x402 itself requires this and the program refuses a nonzero one at `settle` with no state
+  change, so the connector refuses it structurally, **before any signature check** -- `claim_json`
+  here carries `solana`'s own genuine channel, signer and signature bytes with only `expiresAt`
+  changed, which is what makes this a structural refusal rather than a signature failure.
+
 [ADR 0018]: ../docs/adr/0018-a-payload-is-sealed-to-the-terminating-connector.md
