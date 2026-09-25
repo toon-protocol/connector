@@ -1241,15 +1241,16 @@ const FLEET_SOLANA_USDC_MINT: &str = "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6Ttxf
 /// would be a box that cannot boot.
 const EXPECTED_SETTLEMENT_DECIMALS: u8 = 6;
 
-/// The mock USDC ERC-20 every fleet config's `[settlement.evm]` leg settles
-/// in. Unchanged by the #695/#811 ERC-2771 registry cutover -- only the
-/// `TokenNetworkRegistry` moved (see [`FLEET_LIVE_REGISTRY`]); the token being
-/// registered through it did not (`docs/evm-deployment.md`: "never a new
-/// token, so no existing balance or faucet distribution is disturbed").
+/// The devnet USDC every fleet config's `[settlement.evm]` leg settles in:
+/// Circle's FiatToken v2.2 on Base Sepolia, which replaced the ungated mock
+/// ERC-20 `0x49beE1…a9Ce` on 2026-09-25 so a client can deposit without gas
+/// through ERC-3009 (#1337, `docs/evm-deployment.md`). The registry did not
+/// move (see [`FLEET_LIVE_REGISTRY`]); the token registered through it did,
+/// and with it the `TokenNetwork` ([`FLEET_LIVE_TOKEN_NETWORK`]).
 /// [`with_anvil_settlement`] looks for this same literal before retargeting a
 /// leg at a freshly deployed mock, so the substitution and this identity
 /// check read one constant instead of two copies that could drift apart.
-const EXPECTED_SETTLEMENT_TOKEN_ADDRESS: &str = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
+const EXPECTED_SETTLEMENT_TOKEN_ADDRESS: &str = "0x0C996d7c934c79a6255254875607Fe69df25C0E1";
 
 /// Lowercase hex, for comparing a parsed 20-byte EVM address back against
 /// the committed literal.
@@ -1795,7 +1796,7 @@ const RELAY_SWAP_CONFIG: &str = include_str!("../../../infra/linode-relay/swap.c
 /// (`packages/contracts/deployments.json`, docs/evm-deployment.md), resolved
 /// from [`FLEET_LIVE_REGISTRY`]. A literal here for the same reason every
 /// other `FLEET_*` address is one.
-const FLEET_LIVE_TOKEN_NETWORK: &str = "0xe9E05dfecfe165266C88d73e61D483612651952a";
+const FLEET_LIVE_TOKEN_NETWORK: &str = "0x1B4606218ceE5Bf02B546e416905F4D3FC8a0249";
 
 /// The maker holds TWO EVM contract addresses that are easy to read as one
 /// thing and are not:

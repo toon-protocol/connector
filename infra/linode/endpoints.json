@@ -3,13 +3,13 @@
   "evm": {
     "rpcUrl": "https://sepolia.base.org",
     "chainId": 84532,
-    "tokenAddress": "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce",
+    "tokenAddress": "0x0C996d7c934c79a6255254875607Fe69df25C0E1",
     "tokenDecimals": 6,
     "registryAddress": "0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5",
-    "tokenNetworkUsdc": "0xe9E05dfecfe165266C88d73e61D483612651952a",
+    "tokenNetworkUsdc": "0x1B4606218ceE5Bf02B546e416905F4D3FC8a0249",
     "faucetUrl": "https://faucet.devnet.toonprotocol.dev",
-    "_fund": "curl -X POST https://faucet.devnet.toonprotocol.dev/api/base-sepolia/request -d '{\"address\":\"0x…\"}' → mints 1000 USDC. The mock USDC mint(address,uint256) is UNGATED (anyone can coin fresh tokens to any address). Per-address 24h cooldown. Basescan: https://sepolia.basescan.org/address/0x49beE1Bca5d15Fb0963117923403F9498119a9Ce",
-    "_tokenNetworkNote": "DERIVED, not independent: tokenNetworkUsdc is whatever registryAddress.getTokenNetwork(tokenAddress) answers on chain, so the two move TOGETHER or this file is lying. The 2026-08-06 ERC-2771 cutover (#695/#811, docs/evm-deployment.md) repointed registryAddress here and left tokenNetworkUsdc on the retired 2026-07-18 contract 0x1E95493f… for three weeks; the connector never noticed because it is configured with the REGISTRY ([settlement.evm] contract_address) and resolves the TokenNetwork at boot, so only a direct reader of this key was pointed at a dead contract. Both moved again on 2026-08-28 with the ADR 0059 cutover (docs/evm-deployment.md). Re-derive it with: cast call --rpc-url https://base-sepolia-rpc.publicnode.com 0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5 \"getTokenNetwork(address)(address)\" 0x49beE1Bca5d15Fb0963117923403F9498119a9Ce",
+    "_fund": "curl -X POST https://faucet.devnet.toonprotocol.dev/api/base-sepolia/request -d '{\"address\":\"0x…\"}' → mints 1000 USDC. The devnet USDC is Circle's FiatToken v2.2 (ERC-3009 + EIP-2612, the code Base mainnet USDC runs), deployed 2026-09-25 (#1337); its mint(address,uint256) is MINTER-GATED and the faucet key is the minter, so fund through the faucet. Per-address 24h cooldown. Basescan: https://sepolia.basescan.org/address/0x0C996d7c934c79a6255254875607Fe69df25C0E1",
+    "_tokenNetworkNote": "DERIVED, not independent: tokenNetworkUsdc is whatever registryAddress.getTokenNetwork(tokenAddress) answers on chain, so the two move TOGETHER or this file is lying. The 2026-08-06 ERC-2771 cutover (#695/#811, docs/evm-deployment.md) repointed registryAddress here and left tokenNetworkUsdc on the retired 2026-07-18 contract 0x1E95493f… for three weeks; the connector never noticed because it is configured with the REGISTRY ([settlement.evm] contract_address) and resolves the TokenNetwork at boot, so only a direct reader of this key was pointed at a dead contract. Both moved again on 2026-08-28 with the ADR 0059 cutover, and tokenNetworkUsdc and tokenAddress together on 2026-09-25 with the FiatToken cutover (#1337, docs/evm-deployment.md). Re-derive it with: cast call --rpc-url https://base-sepolia-rpc.publicnode.com 0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5 \"getTokenNetwork(address)(address)\" 0x0C996d7c934c79a6255254875607Fe69df25C0E1",
     "_chainNote": "PUBLIC Base Sepolia testnet (chainId 84532) — no self-hosted node. The anvil chain evm:31337 (token 0x5FbDB2…, registry 0xe7f1725E…) is deleted."
   },
   "solana": {
@@ -24,10 +24,10 @@
   "baseSepolia": {
     "rpcUrl": "https://sepolia.base.org",
     "chainId": 84532,
-    "tokenAddress": "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce",
+    "tokenAddress": "0x0C996d7c934c79a6255254875607Fe69df25C0E1",
     "tokenDecimals": 6,
     "registryAddress": "0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5",
-    "tokenNetworkUsdc": "0xe9E05dfecfe165266C88d73e61D483612651952a",
+    "tokenNetworkUsdc": "0x1B4606218ceE5Bf02B546e416905F4D3FC8a0249",
     "faucetUrl": "https://faucet.devnet.toonprotocol.dev",
     "_note": "Mirror of the evm block — since the 2026-07-19 cutover the devnet's EVM chain IS Base Sepolia. Kept for consumers that read this key. Every address here MUST equal the evm block's, tokenNetworkUsdc included: see that block's _tokenNetworkNote, and note that the miss it records was a miss in BOTH copies at once — a mirror check would not have caught it, which is why crates/connector-bin/tests/devnet_configs_load.rs pins both copies to FLEET_LIVE_REGISTRY and FLEET_LIVE_TOKEN_NETWORK rather than to each other."
   },

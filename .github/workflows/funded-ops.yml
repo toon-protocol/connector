@@ -218,7 +218,7 @@ jobs:
       # is what `[settlement.evm] contract_address` means — the registry, not
       # whichever TokenNetwork it currently resolves to.
       REGISTRY: '0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5'
-      TOKEN: '0x49beE1Bca5d15Fb0963117923403F9498119a9Ce'
+      TOKEN: '0x0C996d7c934c79a6255254875607Fe69df25C0E1'
       DECIMALS: '6'
 
     steps:

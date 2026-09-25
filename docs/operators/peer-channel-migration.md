@@ -83,15 +83,16 @@ rollback means reverting the edit, not the on-chain state.
 ## Order
 
 1. **Fund the new channel's collateral.** Mint or acquire devnet USDC for both participant
-   addresses on the new `TokenNetwork`'s token (`0x49beE1Bca5d15Fb0963117923403F9498119a9Ce` — the
-   cutover reused the same mock USDC, `docs/evm-deployment.md`). The faucet
+   addresses on the live `TokenNetwork`'s token (`0x0C996d7c934c79a6255254875607Fe69df25C0E1`, Circle's FiatToken v2.2 since the
+   2026-09-25 token cutover, #1337, `docs/evm-deployment.md`). The faucet
    (`https://faucet.devnet.toonprotocol.dev/api/base-sepolia/request`) is rate-limited per address
-   (24h cooldown) and may not cover a realistic channel deposit; the mock USDC's
-   `mint(address,uint256)` is ungated (`infra/linode/endpoints.json`'s own note), so a funded
-   deployer key can mint directly instead.
+   (24h cooldown) and may not cover a realistic channel deposit. Minting is **minter-gated** now,
+   unlike the mock it replaced: for a larger amount, mint from the faucet key on the devnet box
+   (the token's one minter), or have the token's master minter
+   (`/root/keys/devnet-usdc-owner.key`) `configureMinter` a key for the job.
 2. **Open the new channel.** Either participant calls
    `openChannel(address participant2, uint256 settlementTimeout)` on the live `TokenNetwork`
-   (`0xe9E05dfecfe165266C88d73e61D483612651952a` since the 2026-08-28 ADR 0059 cutover; `docs/evm-deployment.md`) naming the _other_ participant's settlement
+   (`0x1B4606218ceE5Bf02B546e416905F4D3FC8a0249` since the 2026-09-25 token cutover, #1337; `docs/evm-deployment.md`) naming the _other_ participant's settlement
    address, with a `settlementTimeout` at least as long as the retired channel's — read that value
    off the OLD `TokenNetwork`'s `channels(bytes32)` rather than assuming the 1-hour contract
    minimum. Record the returned `channelId`: it is emitted in `ChannelOpened` and is the value both

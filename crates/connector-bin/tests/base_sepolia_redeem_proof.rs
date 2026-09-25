@@ -133,7 +133,7 @@ const DEFAULT_RPC: &str = "https://base-sepolia-rpc.publicnode.com";
 /// a factory, resolved to a `TokenNetwork` at connect time, never pinned
 /// directly (issue #566).
 const DEFAULT_REGISTRY: &str = "0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5";
-const DEFAULT_TOKEN: &str = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
+const DEFAULT_TOKEN: &str = "0x0C996d7c934c79a6255254875607Fe69df25C0E1";
 const DEFAULT_DECIMALS: u8 = 6;
 
 /// 0.001 USDC -- enough for `InsufficientChannelBalance` to never be the
