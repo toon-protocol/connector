@@ -1,6 +1,6 @@
 # Architecture decision records
 
-72 records. **Every one now carries a `**Status:**` line under its title** — that line, not this
+73 records. **Every one now carries a `**Status:**` line under its title** — that line, not this
 index, is the authority for whether a record is live. This page is the map: what is live, grouped
 by area; what is dead, grouped by what killed it; and what the folder still says that the code no
 longer does.
@@ -17,7 +17,7 @@ The numbers are permanent and are never reused or renumbered — they are cited 
 times across this repo and from `toon-meta`, `relay` and `store`. This index groups them by
 scope; it does not move them.
 
-> **0065 is taken twice, and stays that way.** Seventy-three records, seventy-two numbers.
+> **0065 is taken twice, and stays that way.** Seventy-four records, seventy-three numbers.
 > [_A price is a schedule over payload length_](0065-a-price-is-a-schedule-over-payload-length.md)
 > (#984) and [_Mina leaves the repository_](0065-mina-leaves-the-repository.md) (#1205) were both
 > written on branches cut while 0064 was the folder's highest number, and both landed on `main` on
@@ -145,6 +145,7 @@ outside this repository.
 | [0049](0049-the-cap-bounds-one-packet-is-discovered-by-t04-and-is-set-from-outside.md) | The cap bounds one packet, is discovered by its `T04`, and is set from outside       | Accepted — **built** (#1160, the runtime cap); corrects CONTEXT.md                                      |
 | [0035](0035-request-request-binding-ships-no-new-mechanism.md)                         | Request-request binding ships no new mechanism                                       | Accepted                                                                                                |
 | [0052](0052-permissionless-payment-is-guaranteed-and-a-claim-is-what-authorises.md)    | Permissionless payment is guaranteed; a claim, never an identity, authorises         | Accepted — the client edge's first record                                                               |
+| [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)                 | A client may pay over an x402 batch-settlement channel, and only a client            | **Proposed** (#1329) — would amend 0059, 0005; extend 0024, 0053; `schema_version` 6                    |
 
 ### The wire and its carriage
 
