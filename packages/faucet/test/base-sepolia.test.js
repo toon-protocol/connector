@@ -17,7 +17,7 @@ import { executeBaseSepoliaDrip, baseSepoliaInfo } from '../src/base-sepolia.js'
 import { createDripLimiter } from '../src/drip-limiter.js';
 
 const RECIPIENT = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8';
-const TOKEN = '0x49beE1Bca5d15Fb0963117923403F9498119a9Ce';
+const TOKEN = '0x0C996d7c934c79a6255254875607Fe69df25C0E1';
 const FAUCET = '0x6bafedaF18FF62f0a63dd0148bafa163204627F6';
 const USDC_AMOUNT = ethers.parseUnits('1000', 6); // 1000_000000 base units
 
