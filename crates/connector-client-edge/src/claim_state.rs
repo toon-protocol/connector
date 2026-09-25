@@ -59,12 +59,16 @@
 //! `[[peer_channels]]` row is judged by `ClaimBook`, and `Config::load`
 //! refuses a channel that is also a `[[client_channels]]` row
 //! (`ConfigError::ChannelInBothNamespaces`), so at most one book can ever
-//! be the authority for one channel. So this endpoint asks
-//! [`connector_runtime::Connector::peer_channel_watermark`] first and
-//! falls back to the client edge's book, which is what lets a
-//! `[[pay_channels]]` payer -- who holds one channel with its next hop in
-//! both roles -- be told where its claims actually stand. See
-//! [`verified_state`] for what went wrong when it did not.
+//! be the authority for one channel. That guard is config-load only: a
+//! `POST /peers` peering (ADR 0058) binds a peer channel at runtime with
+//! no such check, so both books CAN hold the same channel (issues
+//! #1257/#1258). This endpoint therefore answers the higher of
+//! [`connector_runtime::Connector::peer_channel_watermark`] and the client
+//! edge's book ([`connector_domain::Watermark::highest`]), which is what
+//! lets a `[[pay_channels]]` payer -- who holds one channel with its next
+//! hop in both roles -- be told where its claims actually stand, whichever
+//! book they landed in. See [`verified_state`] for what went wrong each
+//! time it did not.
 //!
 //! **The admission path is untouched.** This handler only reads --
 //! [`crate::ClientClaimGate::watermark`], [`crate::ClientClaimGate::channels`],
@@ -423,6 +427,23 @@ async fn resolve_solana(
 /// termination refuses every packet after the first with `F06`,
 /// `advanced = 0`.
 ///
+/// **Both books, not the first one (issues #1257/#1258).** The answer is
+/// [`Watermark::highest`] of the peer book's and the client edge's, not
+/// the peer book's with the client edge's as a fallback. `Config::load`'s
+/// `ChannelInBothNamespaces` keeps a *configured* channel out of both
+/// books, but a `POST /peers` peering (ADR 0058) binds a peer channel at
+/// runtime with no such check, and the payer's claims on it can still
+/// arrive through the client edge. Then the peer book answers the
+/// "configured, nothing claimed yet" `Some(0/0)` above forever while every
+/// real claim lands in the client edge's book: a payer that restarts
+/// re-seeds at zero, signs `0 + amount`, and the client edge refuses it as
+/// going backwards, on every retry, until an operator deletes the peering.
+/// Measured on a live two-connector mainnet node (#1258). A cumulative
+/// amount is a property of the on-chain channel, not of the book that
+/// journaled it, so the channel stands at the higher of the two -- which
+/// is still exactly the peer book's answer in the `[[pay_channels]]` case
+/// above, where the client edge's book never holds anything.
+///
 /// `last_claim_time` stays the client edge's. The peer book journals no
 /// timestamp on `InboundClaimAccepted`, so a peer channel reports `null`
 /// there -- which that field's own doc already admits as a best-effort,
@@ -436,7 +457,7 @@ fn verified_state(
     deposit_floor: DepositFloor,
     credited: u64,
 ) -> VerifiedChannelState {
-    let watermark = peer_watermark.or_else(|| state.claim_gate.watermark(channel_key));
+    let watermark = Watermark::highest(peer_watermark, state.claim_gate.watermark(channel_key));
     let cumulative_claimed = watermark.map(|w| w.cumulative_amount).unwrap_or(0);
     let nonce = watermark.map(|w| w.nonce).unwrap_or(0);
     let deposit_total = deposit_floor.deposit();
@@ -1387,6 +1408,103 @@ mod tests {
         let entry = ask(app).await;
         assert_eq!(entry["nonce"], 2);
         assert_eq!(entry["cumulativeClaimed"], "2000");
+    }
+
+    /// **Issue #1258.** A channel bound as a PEER channel -- as a
+    /// `POST /peers` peering binds one, with no `ChannelInBothNamespaces`
+    /// check -- whose claims nonetheless arrive through the client edge.
+    /// The peer book holds the binding and nothing else, so it answers the
+    /// "configured, nothing claimed yet" zero; every real claim is in the
+    /// client edge's book. Answering the peer book's zero here is the
+    /// measured defect: a payer re-seeding from it after a restart signs
+    /// `0 + amount`, and the client edge refuses that as going backwards on
+    /// every retry. The channel stands where the client edge's book says.
+    #[tokio::test]
+    async fn a_peer_bound_channel_paid_through_the_client_edge_answers_the_client_book() {
+        let (secret, address) = evm_signer();
+        let connector = connector_with_peer_channel(address);
+        let app = router_with_gate(connector.clone(), test_signer(), None, test_gate());
+
+        let balance_proof = connector_signer::EvmBalanceProof {
+            channel_id: EVM_CHANNEL_ID,
+            nonce: 9,
+            transferred_amount: 243_600,
+            locked_amount: 0,
+            locks_root: [0u8; 32],
+            chain_id: EVM_CHAIN_ID,
+            token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
+        };
+        let digest = connector_signer::evm_balance_proof_digest(&balance_proof);
+        let claim_json = serde_json::json!({
+            "version": "1.0",
+            "blockchain": "evm",
+            "messageId": "m1",
+            "timestamp": "2030-01-01T00:00:00Z",
+            "senderId": "sender",
+            "channelId": evm_channel_id_hex(),
+            "nonce": 9,
+            "transferredAmount": "243600",
+            "lockedAmount": "0",
+            "locksRoot": format!("0x{}", "0".repeat(64)),
+            "signature": format!("0x{}", hex_encode(&sign_evm(&secret, &digest))),
+            "signerAddress": format!("0x{}", hex_encode(&address)),
+            "chainId": EVM_CHAIN_ID,
+            "tokenNetworkAddress": format!("0x{}", hex_encode(&EVM_TOKEN_NETWORK_ADDRESS)),
+        })
+        .to_string();
+        let prepare = Prepare {
+            amount: 0,
+            expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
+            greeting: false,
+            destination: "g.nowhere".to_string(),
+            data: Vec::new(),
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ilp")
+            .header(crate::CLAIM_HEADER, BASE64.encode(claim_json))
+            .body(Body::from(prepare.encode()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            connector
+                .peer_channel_watermark(&evm_channel_id_hex())
+                .map(|w| (w.nonce, w.cumulative_amount)),
+            Some((0, 0)),
+            "the precondition #1258 needs: a peer binding whose book has never held a claim"
+        );
+
+        let expires = far_future_expiry();
+        let body = serde_json::json!({
+            "channels": [{
+                "blockchain": "evm",
+                "channelId": evm_channel_id_hex(),
+                "expires": expires,
+                "signature": evm_challenge_signature(&secret, EVM_CHANNEL_ID, expires),
+            }]
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ilp/claim-state")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let entry =
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["channels"][0].clone();
+
+        assert_eq!(entry["ok"], true);
+        assert_eq!(
+            entry["nonce"], 9,
+            "the client edge's nonce, not the empty peer book's zero"
+        );
+        assert_eq!(
+            entry["cumulativeClaimed"], "243600",
+            "the client edge's cumulative amount, not the empty peer book's zero"
+        );
     }
 
     /// The other half of the rule: a channel this node holds no
