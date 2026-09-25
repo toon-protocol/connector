@@ -1,6 +1,6 @@
 # Fleet release and health
 
-How a merge becomes a running devnet box, what stops a bad one, and how you find out when
+How a merge becomes a running devnet node, what stops a bad one, and how you find out when
 something is down.
 
 Decision records: [ADR 0041](../adr/0041-a-moving-tag-carries-the-fleets-committed-config-or-it-does-not-move.md),
@@ -11,20 +11,24 @@ Epic: toon-meta#403.
 
 ## The shape of it
 
-The three boxes are no longer one shape. The **faucet** box still deploys from this repo
-(`infra/linode-faucet/`, built on-box) and this document's release/rollback sections apply to it
-only where noted. The **relay** and **store** (`ario`) boxes each deploy the connector from their
-own repository's `deploy/` bundle — `toon-protocol/relay`, `toon-protocol/store` — pinning it by
-release handle in exactly one place there. **Nothing in this repository moves a tag onto either
-box any more** (ADR 0068): `fleet-ops.yml` no longer offers `box=relay`/`box=ario`, and
+The devnet is one host (infra [ADR 0001](../adr/0001-devnet-is-one-host-every-node-keeps-its-connector.md)):
+the Linode labelled `relay`, a nanode. Behind one Caddy edge that owns ports 80 and 443, it runs the
+relay, store, gas-station and workload-gateway nodes, plus the faucet. Each node deploys by GitOps
+(ADR 0068) from its own repository — `toon-protocol/relay`, `toon-protocol/store`,
+`toon-protocol/gas-station`, `toon-protocol/gateway` — pinning the connector it runs in one place
+in its own `deploy/` bundle, applied every five minutes by that node's own
+`toon-auto-apply-<node>.timer` on the host. **Nothing outside a node's own repository can make it
+deploy**: there is no promotion, `fleet-ops.yml` offers no per-node deploy, and
 `promote-to-fleet.yml` is deleted.
 
-`swap`, `store` and `relay` (the apps, not the connector boxes) keep the auto-on-green regime
-toon-meta#403 accepted for devnet — a green merge in their own repos reaches the live box within
-about a minute, under a label-scoped `containrrr/watchtower:1.7.1` (`--label-enable --interval 60
---cleanup`) each box runs. Watchtower does **no** health gating: it pulls, recreates, and
-considers itself done. Whether the process then stayed up, or served anything, is not a question
-it asks — which is why the health section below exists and is unaffected by any of this.
+The faucet has no connector and no timer. It is the one node this repository still deploys
+directly, by hand, through `fleet-ops.yml`, from this repo's own `infra/linode-faucet/` in a
+detached checkout at `/root/faucet-connector` on the host.
+
+There is **no Watchtower** anywhere on the host, and **no compute provider** on the devnet (ADR
+0001's "Consequences"). Every node's deploy is gated on its own connector going healthy before the
+timer records the commit as applied — the closest thing to Watchtower's auto-pull, but health-gated
+where Watchtower was not.
 
 ## Cutting a connector release
 
@@ -40,49 +44,54 @@ gh workflow run release-connector.yml \
 
 Run it **on the commit you want released** — `gh workflow run --ref <branch-or-sha>` — and it must
 be on `main`. It is `workflow_dispatch`-only, and stays that way: adding an automatic trigger would
-reverse ADR 0041 Decision 3, which is still binding — `connector-rust` is the client edge on both
-boxes, so an unreviewed digest reaching either is still a real risk even with no promotion left
+reverse ADR 0041 Decision 3, which is still binding — `connector-rust` is the client edge on every
+node, so an unreviewed digest reaching any of them is still a real risk even with no promotion left
 here to guard against it.
 
 **Adopting the build is a node repository's own change, not a step here.** Open a PR in
-`toon-protocol/relay` or `toon-protocol/store` bumping its pinned connector tag to the `rust-sha-`
-tag (or the release's `rust-<handle>` alias) the release names. That repo's own guard — a test that
-fails if a second copy of the pin appears anywhere — is what keeps the pin singular; there is no
-config-compatibility boot gate here to run first, because the config that pin boots against no
-longer lives in this repository.
+`toon-protocol/relay`, `toon-protocol/store`, `toon-protocol/gas-station` or `toon-protocol/gateway`
+bumping its pinned connector tag to the `rust-sha-` tag (or the release's `rust-<handle>` alias) the
+release names. That repo's own guard — a test that fails if a second copy of the pin appears
+anywhere — is what keeps the pin singular; there is no config-compatibility boot gate here to run
+first, because the config that pin boots against no longer lives in this repository.
 
 `:rust-release` is **frozen**. It used to be a promotion tag moved only by an explicit
-`promote-to-fleet.yml` dispatch after booting the candidate against both boxes' committed
+`promote-to-fleet.yml` dispatch after booting the candidate against the fleet's committed
 `connector-rust.toml`; ADR 0068 retired that mechanism because there is nothing left in this repo
 for it to check. Do not wire anything to move it — a floating tag moving unsupervised shipped once
 (#990) and was reverted, and there is even less reason to repeat it now.
 
-## Keeping the three pins together
+## Keeping the four pins together
 
 Since [ADR 0068](../adr/0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md)
-this repository does not deploy the connector. Three node repositories each pin the build they run,
-in one place, guarded by that repo's own bundle test:
+this repository does not deploy the connector. Four node repositories each pin the build they run,
+in `deploy/docker-compose.yml`'s `connector:` image line, guarded by that repo's own bundle test
+(relay: `deploy/bundle.test.ts`; store and gas-station: `src/deploy-bundle-guard.test.ts`; gateway:
+`deploy/bundle.test.mjs`):
 
-| repo          | the pin of record                                    | how a bump reaches the box                                                                   |
+| repo          | the pin of record                                    | how a bump reaches the host                                                                  |
 | ------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `relay`       | `deploy/Dockerfile` → `ARG CONNECTOR_TAG`            | the publish workflow rebuilds `relay-connector:release` and Watchtower recreates within ~60s |
-| `store`       | `deploy/docker-compose.yml` → `connector:rust-sha-…` | on the box: `git pull && ./render.sh && docker compose up -d`                                |
-| `gas-station` | `deploy/docker-compose.yml` → `connector:rust-sha-…` | same                                                                                         |
+| `relay`       | `deploy/docker-compose.yml` → `connector:rust-sha-…` | its own `adopt-connector-release.yml`, then `toon-auto-apply-relay.timer`                    |
+| `store`       | `deploy/docker-compose.yml` → `connector:rust-sha-…` | its own `adopt-connector-release.yml`, then `toon-auto-apply-store.timer`                    |
+| `gas-station` | `deploy/docker-compose.yml` → `connector:rust-sha-…` | its own `adopt-connector-release.yml`, then `toon-auto-apply-gas-station.timer`              |
+| `gateway`     | `deploy/docker-compose.yml` → `connector:rust-sha-…` | bumped by hand — no `adopt-connector-release.yml` yet — then `toon-auto-apply-gateway.timer` |
 
 Bump the pin **and** the literal in that repo's guard test in one reviewed commit — the guards exist
-so the two cannot disagree. The pin must be an immutable `rust-sha-` tag: `:rust-release` is retired
-and frozen at `rust-sha-8708caf`, a build on which a runtime peering cannot pay (ADR 0068's update).
+so the two cannot disagree. The pin must be immutable: a `rust-sha-<sha>` build tag or a
+`rust-<UTC-date>.<ordinal>` release handle (e.g. `rust-2026.09.11.1`) are both legal (issue #125's
+ruling). `:rust-release` is retired and frozen at `rust-sha-8708caf`, a build that predates
+connector#1230 and cannot pay for a peering it establishes.
 
 Land a config change **before** the build that requires it. The parser is `deny_unknown_fields` and
-startup is fail-closed, so a schema drift under a box is a refuse-to-start rather than a degraded
+startup is fail-closed, so a schema drift under a node is a refuse-to-start rather than a degraded
 run — which is the behaviour you want, and the reason ordering matters.
 
 ### The drift check
 
 `.github/workflows/fleet-pin-drift.yml` runs daily and on dispatch. It is read-only, holds no
-credential, and reaches no box: it reads the three pins over plain HTTPS and asks GHCR anonymously
+credential, and reaches no host: it reads the four pins over plain HTTPS and asks GHCR anonymously
 whether each is pullable. It **fails**, and opens a rolling `needs:human` issue, when a pin cannot
-be parsed, when the three name different builds, when one is a moving tag, or when one cannot be
+be parsed, when the four name different builds, when one is a moving tag, or when one cannot be
 pulled. The first green run closes the issue.
 
 Being **behind `main` is only reported, never failed** — a pin lagging is what pinning is. The run
@@ -94,43 +103,47 @@ last repo lands.
 
 ## Rolling the faucet back
 
-The faucet is the one box this repo still redeploys directly:
+The faucet is the one node this repo still redeploys directly. `fleet-ops.yml`'s `deploy` operation
+moves its checkout to a commit of `main`, so a rollback is simply an older one:
 
 ```sh
-gh workflow run fleet-ops.yml -f operation=deploy -f service=faucet -f apply=true
+gh workflow run fleet-ops.yml -f operation=deploy -f ref=<older main commit> -f apply=true
 ```
 
-For relay, store, and the auto-on-green apps (`swap`, `store`, `relay`), a rollback is that repo's
-own concern: for an auto-on-green app, retag its own `:release` onto a known-good `sha-*` build and
-let that box's Watchtower pick it up; for the connector on relay/store, bump the pin in
-`toon-protocol/relay` / `toon-protocol/store` to an earlier `rust-sha-` build.
+For relay, store, gas-station and the gateway there is no separate rollback mechanism: **revert the
+merge in the node's own repository, and its `toon-auto-apply-<node>.timer` applies the revert like
+any other commit** on its next tick. Nothing in this repository, and nothing on any runner, can
+make a node deploy.
 
 ---
 
 ## What stops a config-breaking change
 
 This is the failure that motivated the connector's promotion regime in the first place, and it is
-still worth knowing even though the mechanism it produced is retired. On 2026-08-16 swap#134 added
-a **required** `chainProviders[].tokenNetworkAddress`. It merged green, `swap:release` moved,
-Watchtower recreated `swap-node`, and the maker crash-looped on `INVALID_CONFIG` — because the
-box's bind-mounted `swap.config.json` is not in the image and nobody had added the key. It was down
-until a human happened to look.
+still worth knowing even though both the mechanism it produced and the auto-on-green Watchtower
+regime it describes are retired. On 2026-08-16 swap#134 added a **required**
+`chainProviders[].tokenNetworkAddress`. It merged green, `swap:release` moved, Watchtower recreated
+`swap-node`, and the maker crash-looped on `INVALID_CONFIG` — because the box's bind-mounted
+`swap.config.json` is not in the image and nobody had added the key. It was down until a human
+happened to look.
 
-For `swap` (still auto-on-green, still deployed via a config this repo commits), the rule (ADR 0041) is unchanged:
+No swap maker runs on the one-host devnet today (ADR 0001 left it off the host), so this is
+history rather than a live risk — but the `config-compat` job below still boots the committed
+`infra/linode-relay/swap.config.json` against `ghcr.io/toon-protocol/swap:release` on every run, as
+the backstop, in case a maker returns to a watched project without this discipline coming back with
+it:
 
-| Where                                                      | Catches                                                              | When          |
-| ---------------------------------------------------------- | -------------------------------------------------------------------- | ------------- |
-| `swap`'s `publish-swap-image.yml`, before `:release` moves | a new required key, **in the PR that adds it** — the tag stays put   | pre-deploy    |
-| `fleet-health.yml`'s `config-compat` job                   | a mismatch that got in anyway, or a bad edit to the committed config | ≤15 min, cron |
+| Where                                    | Catches                                                 | When          |
+| ---------------------------------------- | ------------------------------------------------------- | ------------- |
+| `fleet-health.yml`'s `config-compat` job | a config the current `:release` image no longer accepts | ≤15 min, cron |
 
-**If you are adding a config key to an app that still deploys against a config this repo commits
-(today, only `swap`):** give it a default. If it genuinely has no safe default (swap#134's did not
-— defaulting it would have made the maker announce a contract that reverts for every client), then
-it is a **breaking deploy**: land the key in the committed config here first, apply it, and only
-then merge the app change.
+**If a maker is ever redeployed against a config this repo commits:** give any new required key a
+default. If it genuinely has no safe default (swap#134's did not — defaulting it would have made
+the maker announce a contract that reverts for every client), land the key in the committed config
+here first, apply it, and only then merge the app change.
 
-For the connector on relay and store, this discipline is now each node repository's own to keep —
-the config a build must boot against lives there, not here.
+For the connector on every node, this discipline is each node repository's own to keep — the config
+a build must boot against lives there, not here.
 
 ---
 
@@ -138,22 +151,23 @@ the config a build must boot against lives there, not here.
 
 `.github/workflows/fleet-health.yml` runs every 15 minutes and on demand — schedule or dispatch
 only (ADR 0068 removed the `workflow_call` trigger it used to fire after a promotion, along with
-the promotion itself). It is strictly read-only on the boxes.
+the promotion itself). It is strictly read-only on the host.
 
-It does **not** take a hardcoded service list. It discovers "every container carrying the Watchtower
-enable label" — precisely the set that can change without a human. A labelled service with no probe
-defined is a **failure**, not a skip: opting a service into auto-redeploy without saying how to tell
-whether it is serving is the omission the file exists to refuse.
+It does **not** take a hardcoded service list. It discovers every compose project a
+`toon-auto-apply-*.timer` enabled on the host deploys, plus the hand-deployed faucet named
+explicitly (it has no timer to discover it by) — precisely the set that can change without a human,
+plus the one that cannot change without one. A discovered service with no probe defined is a
+**failure**, not a skip: adding a service to a node's bundle without saying how to tell whether it
+is serving is the omission the file exists to refuse.
 
 Five things are checked, because each catches what the others cannot:
 
 1. **Container state, sampled twice.** A crash-loop shows as `Up 3 seconds` on any single look; a
    rising `RestartCount` across the probe is the giveaway.
 2. **A real serving probe.** `Up` is not evidence.
-3. **The public edge, from the runner.** This is the one that catches connector#993's stale-nginx
-   upstream: a recreate changes the container's Docker network IP, and an nginx that resolved the
-   old one 502s to the world while loopback on the box looks perfect. Only an off-box request
-   crosses nginx.
+3. **The public edge, from the runner.** Loopback reaches a container directly, so a Caddy that
+   cannot reach its upstream, or serves a certificate that does not cover the name, looks perfect
+   from on the host. Only an off-host request crosses the edge.
 4. **A forwarded route, cross-checked.** Every check above asks whether a node is up **for itself**;
    this one asks whether two nodes still agree about the route and the peering between them. Free.
    See "The forwarded route" below.
@@ -162,15 +176,31 @@ Five things are checked, because each catches what the others cannot:
 
 ### The probes, and why these
 
-| Service           | Probe                                      | Why                                                                                                                                                                                                                                                           |
-| ----------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `connector-rust`  | `GET 127.0.0.1:4000/ilp/identity` → 200    | The Rust connector has no `/health` — `/health`, `/healthz`, `/status`, `/` all 404, and `/metrics` is 404 on relay but 401 on store. `/ilp/identity` 200s only once the process is serving **and** has read its signer key. `fleet-ops.yml` already uses it. |
-| `swap-node`       | `GET 127.0.0.1:8080/health` → 200          | `blsPort`, loopback-published. No public swap health surface exists.                                                                                                                                                                                          |
-| `relay`, `store`  | container `HEALTHCHECK` verdict            | These two define one; reading Docker's verdict beats restating their probe here.                                                                                                                                                                              |
-| `announce`        | `[announce] OK` in the last 15 min of logs | A loop publisher: no port, no healthcheck. Its printed verdict is the only honest signal. 15 min covers ~3 of its 240s iterations, so one slow publish is not an alert.                                                                                       |
-| relay public edge | `proxy.relay…/ilp/identity` → 200          | crosses nginx                                                                                                                                                                                                                                                 |
-| relay public edge | `relay-ws…/` → **426**                     | 426 Upgrade Required is the honest liveness signal for a WebSocket-only endpoint. A 200 there would mean something _other_ than the relay is answering.                                                                                                       |
-| store public edge | `proxy.ario…/ilp/identity` → 200           | crosses nginx                                                                                                                                                                                                                                                 |
+On the host, per container in the discovered set:
+
+| Service                                                       | Probe                                                                                                    | Why                                                                                                                                                                         |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `connector` (in every node's project)                         | `GET 127.0.0.1:<port>/ilp/identity` → 200, port read off the running container via `docker compose port` | The Rust connector has no `/health` — `/health`, `/healthz`, `/status`, `/` all 404. `/ilp/identity` 200s only once the process is serving **and** has read its signer key. |
+| `relay`, `store`, `gas-station`, `gateway`, `faucet`, `caddy` | container `HEALTHCHECK` verdict                                                                          | Each defines one; reading Docker's own verdict beats restating the probe here. A container with none defined fails this row outright — the probe is blind.                  |
+
+Per node with a `toon-auto-apply-<node>.timer`: the timer is active and fired within the last 15
+minutes, its last apply's `Result` is `success`, and `deploy/.applied` matches `origin/main` — or,
+short of that, the merge is within a 20-minute grace (one tick to fetch, plus three more to apply or
+retry). Past the grace, or on a failing apply, the node is reported **BEHIND**, quoting the apply's
+own `FAILED`/`REFUSING` line.
+
+Per host: `MemAvailable` above 100 MB (of the nanode's ~961 MB — one node's leak now takes the
+others down with it, ADR 0001) and root-disk usage under 90%.
+
+From the runner, over the public internet, one request per public hostname, with an **expected**
+answer rather than just "not 5xx":
+
+| Hostname                                                            | Expected                                     | Why                                                                                                                        |
+| ------------------------------------------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `proxy.{relay,ario,gas,gateway}.devnet…/ilp/identity`               | 200                                          | crosses the edge                                                                                                           |
+| `relay-ws.devnet…/`                                                 | **426** Upgrade Required                     | the honest liveness signal for a WebSocket-only endpoint; a 200 there would mean something _other_ than the relay answered |
+| `dvm.devnet…/health`, `gas.devnet…/health`, `faucet.devnet…/health` | 200                                          | the app behind the node, not its connector                                                                                 |
+| `gw.devnet…/` and a fresh random `<label>.gw.devnet…/`              | **503** with `toon-gateway-reason: no_grant` | the gateway's healthy, empty state — it answered and dialled nobody                                                        |
 
 ### How you find out
 
@@ -231,17 +261,31 @@ Two jobs close this, and they are deliberately different questions.
 
 #### `peering-crosscheck` — free, every run
 
-Reads each node's public `GET /ilp` self-description (ADR 0050) and holds the three documents to each
-other. No ssh key, no bearer token, no packet, **no money**. It also covers the **gas box**, which
-nothing else in `fleet-health.yml` touches — the box probes are a matrix over `relay` and `ario`
-only.
+Reads each node's public `GET /ilp` self-description (ADR 0050) and holds the documents to each
+other. No ssh key, no bearer token, no packet, **no money**. It covers the relay, store and
+gas-station nodes — the three that forward to one another. The workload gateway forwards nothing,
+so it has no row here.
 
-| Assertion                                                               | What it catches                                                                                                                 |
-| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Every forwarded prefix lands on a node that actually routes it          | a **dangling forward** — a node sells a name nobody routes, and the payer is charged and then refused `F02`                     |
-| A forward's price covers the far side's price                           | an **underpriced forward** — one side is repriced, the packet arrives short, and it is refused after the payer has been charged |
-| Both sides derive channel ids from the same settlement facts, per chain | the **01:27Z outage**: a mint or token-network change on one box only                                                           |
-| At least one side advertises a `peerCarriage`                           | a peering nothing can re-establish after a restart                                                                              |
+Which prefixes a node **forwards** and which it **ends** is not read straight off `routes`: a node
+can route a prefix for a peer without claiming the name as its own (store#121, "routed is not
+advertised" — the store routes `g.toon.relay.store` because the relay forwards to it under that
+name, but the name is the relay's to claim, not the store's). The cross-check works this out with
+`roles_of`:
+
+- a node that lists the prefix in its own `ilpAddresses` **ends** the route there;
+- otherwise, if exactly two nodes route an unclaimed prefix and exactly one of them owns a covering
+  address, that one **forwards** it and the other **ends** it (the store's shape above);
+- anything else — nobody claims it, more than two nodes route it, or ownership doesn't pick out
+  exactly one — is an **AMBIGUOUS ROUTE**, reported as a failure rather than a guess.
+
+| Assertion                                                               | What it catches                                                                                                                           |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| A prefix routed but not claimed resolves to a single owner              | `g.toon.relay.store` **ends here**, at the store, without being misread as a store → relay forward (store#121)                            |
+| Every forwarded prefix lands on a node that actually routes it          | a **dangling forward** — a node sells a name nobody routes, and the payer is charged and then refused `F02`                               |
+| A forward's price covers the far side's price                           | an **underpriced forward** — one side is repriced, the packet arrives short, and it is refused after the payer has been charged           |
+| Both sides derive channel ids from the same settlement facts, per chain | the **01:27Z outage**: a mint or token-network change on one node only                                                                    |
+| At least one side advertises a `peerCarriage`                           | a peering nothing can re-establish after a restart                                                                                        |
+| Two or more nodes route an unclaimed prefix with no single owner        | **AMBIGUOUS ROUTE** — the documents cannot say who ends it; the fix is for the terminating node to list the prefix in its own `addresses` |
 
 Exactly one side of a peering dials and the other only accepts, so one side advertising no carriage
 is normal and is reported as such. Both advertising none is not.
@@ -275,9 +319,9 @@ channel opened from CI, a client SDK, a channel-watermark file to reconcile ever
 unnecessary, because the connector can originate a packet through its own routing: `POST /packets`
 (ADR 0008), which `connector send` forms and signs. Driven that way the money comes from **the relay's
 own peer channel, the very channel being tested**, and the packet takes exactly the path a client's
-would. The job needs only `DEVNET_SSH_KEY`, which this workflow already holds, and the relay box's
+would. The job needs only `DEVNET_SSH_KEY`, which this workflow already holds, and the relay node's
 own operator write key, which already lives at `/root/relay/deploy/operator-write.key` and never
-leaves the box — it is bind-mounted read-only into a throwaway container.
+leaves the host — it is bind-mounted read-only into a throwaway container.
 
 **What it costs, and why arming it is your call.** ~1011 base units for the store leg and ~1001 for
 the gas leg: about **$0.002 per run**, out of the relay's peer channels. On the 15-minute cron that
@@ -305,16 +349,16 @@ expected healthy answer is a _final error from the far end_, not a fulfilment:
 
 A peering is not rolled back — it is re-established, or re-priced, from the operator surface of the
 node that owns the row (ADR 0058). Reads need only the bearer token; writes are RFC 9421-signed with
-`docs/operators/sign-write.sh`. The relay box ships a copy at `deploy/sign-write.sh` alongside the
-private half of its write key; the store and gas boxes hold only the public allowlist
-(`operator-write.keys`), so a write to those two is signed from wherever the operator keeps the
-private half — which is where it belongs.
+`docs/operators/sign-write.sh`. The relay node ships a copy at `deploy/sign-write.sh` alongside the
+private half of its write key; the store, gas-station and gateway nodes hold only the public
+allowlist (`operator-write.keys`), so a write to those is signed from wherever the operator keeps
+the private half — which is where it belongs.
 
 ```sh
-# On the box: what does this node think it forwards, and to whom?
+# On the host: what does this node think it forwards, and to whom?
 T=$(cat operator-bearer.token)
-curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<edge>/routes/peers
-curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<edge>/peers
+curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<port>/routes/peers
+curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<port>/peers
 
 # A DANGLING FORWARD is usually a runtime row the config file no longer owns.
 ./sign-write.sh -k operator-write.key -X DELETE -p /routes/peers/<prefix>
@@ -328,19 +372,16 @@ curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<edge>/peers
 gh workflow run fleet-health.yml -f paid_probe=send
 ```
 
-The client edge is `127.0.0.1:4000` on the store and gas boxes and **`127.0.0.1:3000`** on the relay;
-the operator surface rides the same port on all three.
+Each node publishes its client edge and operator surface on the same port, on loopback: relay 3000,
+gateway 4001, gas-station 4002, store 4003 (`docker compose port connector <container-port>` on the
+host confirms it for a given node).
 
-### Known gap, not alerted on
+### Known gap, resolved
 
-`dvm.devnet.toonprotocol.dev` — the store app's public name — currently fails hostname verification.
-DNS resolves to the store box and nginx routes the name correctly, but the box serves a certificate
-whose only `subjectAltName` is `proxy.ario.devnet.toonprotocol.dev`; it was never reissued to cover
-`dvm`. The store app therefore has no working public URL, and its health is observable only on-box.
-
-It is deliberately **not** a fleet-health probe: it would alert forever on a pre-existing certificate
-gap rather than on a deploy, which is how a monitor gets ignored. The runbook below closes the gap;
-**add the probe only once it is applied**, not before.
+`dvm.devnet.toonprotocol.dev` — the store app's public name — used to fail hostname verification:
+the certificate it served covered only `proxy.ario.devnet.toonprotocol.dev`. That gap was closed
+(see the runbook below, kept for the record) and `https://dvm.devnet…/health` is now one of
+`fleet-health.yml`'s public-edge probes, expected to answer 200.
 
 ## The store box's `dvm.` name has no certificate
 
