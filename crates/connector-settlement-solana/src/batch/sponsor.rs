@@ -1595,12 +1595,16 @@ mod tests {
             let mut instruction = fixture.open().instruction(&program);
             let meta = &mut instruction.accounts[slot];
             meta.pubkey = Pubkey::new_unique();
-            match fixture.vet(&fixture.v0(&[instruction])) {
-                Err(SponsorRefusal::OpenAccountMismatch { role, .. }) => {
-                    assert_eq!(role, OPEN_ROLES[slot])
-                }
-                other => panic!("slot {slot}: {other:?}"),
-            }
+            // Named by slot only: the refusal carries account keys, which a
+            // failure message has no business printing (rust/cleartext-logging).
+            let role = match fixture.vet(&fixture.v0(&[instruction])) {
+                Err(SponsorRefusal::OpenAccountMismatch { role, .. }) => role,
+                _ => panic!("slot {slot}: not refused as an open-account mismatch"),
+            };
+            assert!(
+                role == OPEN_ROLES[slot],
+                "slot {slot}: refused under the wrong role"
+            );
         }
     }
 

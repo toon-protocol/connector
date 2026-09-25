@@ -6825,11 +6825,12 @@ min_grace_period_secs = 3600
                 .await
                 .expect("both legs opt into batch settlement without either refusing startup");
 
+            // No `{:?}` of the facts: they carry keys derived from the
+            // settlement key files (rust/cleartext-logging).
             assert_eq!(
                 runtime.batch_settlements.len(),
                 2,
-                "both configured chains opted in: {:?}",
-                runtime.batch_settlements
+                "both configured chains opted in"
             );
 
             let evm_chain_id = runtime
