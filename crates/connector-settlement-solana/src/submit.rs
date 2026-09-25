@@ -35,10 +35,11 @@ use std::time::{Duration, Instant};
 use connector_chain_rpc::solana::answered;
 use connector_chain_rpc::RpcTransport;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use solana_rpc_client::rpc_client::SerializableTransaction;
 use solana_rpc_client_api::config::RpcSendTransactionConfig;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::signature::Signature;
-use solana_sdk::transaction::{Transaction, TransactionError};
+use solana_sdk::transaction::TransactionError;
 use solana_transaction_status_client_types::UiTransactionEncoding;
 
 use connector_settlement::SettlementError;
@@ -117,16 +118,18 @@ impl From<SubmitError> for SettlementError {
 /// Send `transaction` (already signed over a blockhash whose
 /// `lastValidBlockHeight` is `last_valid_block_height`) and wait until its
 /// outcome is known. See the module doc for the outcomes.
+///
+/// Legacy and versioned transactions alike: the sponsor endpoint (issue
+/// #1346) submits a client-built version-0 `open` exactly as it was signed.
 pub(crate) async fn send_and_confirm(
     rpc: &RpcClient,
-    transaction: &Transaction,
+    transaction: &impl SerializableTransaction,
     last_valid_block_height: u64,
     policy: ConfirmPolicy,
 ) -> Result<Signature, SubmitError> {
-    let signature = *transaction
-        .signatures
-        .first()
-        .expect("`submit` signs every transaction with its payer before it gets here");
+    // The fee payer's signature: every caller has signed as fee payer
+    // before it gets here.
+    let signature = *transaction.get_signature();
     // `encoding` is set so the SDK does not first ask the node its version
     // to choose one: one fewer round trip, and one fewer to fail.
     let first_send = RpcSendTransactionConfig {
@@ -299,6 +302,7 @@ mod tests {
     use solana_sdk::hash::Hash;
     use solana_sdk::signature::{Keypair, Signer};
     use solana_sdk::system_instruction;
+    use solana_sdk::transaction::Transaction;
 
     use super::*;
 

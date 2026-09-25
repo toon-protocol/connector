@@ -103,7 +103,8 @@ connector-settlement-solana      real Solana backend, speaking packages/solana-p
                                   exports no client SDK)
   ├─ batch/                      the batch-settlement port on solana-foundation's
   │                               payment-channels (ADR 0074): admission, settle and
-  │                               settle_and_seal, and that program's own wire
+  │                               settle_and_seal, that program's own wire, and the
+  │                               sponsor that co-signs a client's `open` (sponsor.rs)
   └─ fixtures/payment_channels.so  that program's mainnet-beta binary, which tier-3
                                   tests load into genesis at its canonical id
 
@@ -159,7 +160,8 @@ connector-operator               axum Router: bearer-gated reads, RFC 9421-signe
                                   dashboard embedded from dashboard.html (ADR 0066)
 connector-cli                    config → runtime → merged routers → bound listeners,
                                   plus the `send` verb; the binary itself branches on
-                                  nothing
+                                  nothing. Mounts POST /ilp/batch-settlement/solana/open,
+                                  the public Solana sponsor endpoint (ADR 0074)
 connector-bin                    bin/connector, bin/stub-app — and the workspace's
                                   cross-cutting integration tests (see below)
 connector-vectors                bin/generate-vectors → vectors/wire-vectors.json

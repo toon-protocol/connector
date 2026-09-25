@@ -19,6 +19,10 @@ connector-signer = { path = "../connector-signer" }
 # built that skips it.
 connector-chain-rpc = { path = "../connector-chain-rpc", features = ["solana"] }
 async-trait = "0.1"
+# The sponsor endpoint (issue #1346) takes a client-built transaction as
+# base64 of its bincode wire form, exactly as a Solana RPC node does.
+base64 = "0.22"
+bincode = "1"
 chrono = "0.4"
 thiserror = "2"
 # solana-rpc-client, NOT the solana-client meta-crate: this backend only does

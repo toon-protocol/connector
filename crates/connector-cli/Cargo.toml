@@ -60,7 +60,8 @@ reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 solana-sdk = "=2.1.0"
-tokio = { version = "1", features = ["net", "time"] }
+# `sync` for the sponsor endpoint's in-flight bound (issue #1346).
+tokio = { version = "1", features = ["net", "sync", "time"] }
 # The websocket under the announce's BTP carriage -- the same 0.20 the peer
 # carriage and the client edge's own BTP integration test already speak.
 tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
@@ -80,6 +81,9 @@ connector-chain-rpc = { path = "../connector-chain-rpc", features = ["evm", "sol
 # (ADR 0070). A dev-dependency, so `cargo build` never carries a listener.
 connector-runtime = { path = "../connector-runtime", features = ["test-support"] }
 base64 = "0.22"
+# Serializes a client-built, payer-signed transaction to its wire bytes, as
+# a stock x402 client posts it to the sponsor endpoint (issue #1346).
+bincode = "1"
 # Reads a Solana channel account and program id back off a rendered claim
 # and a rendered claim-state ask (issue #1146's `[[pay_channels]]` wiring
 # test), so the assertions are against the base58 the far side decodes
@@ -107,6 +111,9 @@ solana-rpc-client = "=2.1.0"
 # a `ChannelView`. Pinned to the same version `connector-settlement-solana`
 # builds its instructions with.
 spl-associated-token-account = "=4.0.0"
+# The token program id the sponsor endpoint's test names its receiving
+# account under; the same pin `connector-settlement-solana` builds with.
+spl-token = { version = "=6.0.0", features = ["no-entrypoint"] }
 tempfile = "3"
 # `test-util` for the rate poller's spawn test (issue #1294): a paused clock
 # asserts the cadence a `ttl` implies without spending it in real seconds.

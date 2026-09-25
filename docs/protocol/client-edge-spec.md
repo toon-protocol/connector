@@ -1374,6 +1374,115 @@ flood of fabricated channel ids against this endpoint costs no more than the sam
 against `POST /ilp`. Nothing here calls into claim ingestion, and no per-packet work was added to
 `handle_prepare` to build it.
 
+### 1.11 Sponsoring a Solana batch-settlement open: `POST /ilp/batch-settlement/solana/open` (issue #1346)
+
+[ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 9. A client
+that holds the mint and no SOL opens an x402 `batch-settlement` channel on `payment-channels` with this
+node as fee payer and `rent_payer`: it builds and signs the `open` from the greeting's `batch-settlement`
+entry (`payTo`, `asset`, `extra.feePayer`, the minimum `withdrawDelay`, §1.4), and posts it here. The
+node co-signs, **submits**, waits for the outcome, and admits the channel it made.
+
+**Public, not an operator write.** The channel does not exist yet, so the call cannot be paid for, and a
+buyer this node has never heard of must be able to make it (ADR 0052). It carries no RFC 9421 signature
+and no identity; [ADR 0008](../adr/0008-operator-surface-splits-read-from-write.md)'s write keys are
+the operator's, not a buyer's. What bounds it is what it will sign, below, and two limits: a body no
+larger than a transaction needs, and at most 8 sponsorships in flight (`sponsor_busy` beyond that).
+
+**Off unless configured.** A node without `[settlement.solana.batch_settlement]` answers `404`
+`batch_settlement_not_offered`.
+
+**Request.** Base64 of the transaction's wire bytes, legacy or version 0, signed by the payer alone with
+the fee payer's signature slot left empty — exactly what a stock x402 client's
+`buildOpenPaymentChannelTransaction` returns, and what x402 carries as `deposit.transaction`. Other
+members are ignored.
+
+```json
+POST /ilp/batch-settlement/solana/open
+Content-Type: application/json
+
+{ "transaction": "<base64>" }
+```
+
+**Response.** `200` once the `open` has confirmed and the channel has been re-read and admitted:
+
+```json
+{
+  "channelId": "<base58 channel PDA>",
+  "transaction": "<base58 signature>",
+  "payer": "<base58>",
+  "deposit": "1000000"
+}
+```
+
+**Submitted, not returned.** x402's facilitator validates, co-signs and broadcasts a client's `open`
+(X402 SVM spec `#L379`, `#L1008`), and a stock client expects exactly that of the `feePayer`. Returning
+the co-signed bytes would instead let the client choose when, and whether, this node's rent is spent,
+and leave the node unable to re-read the channel it paid for, which x402 requires before reporting
+success (`#L1143-L1146`).
+
+**What it signs.** x402's acceptance policy for a client-supplied `open` (X402 SVM spec
+`#L1017-L1150`), checked on the compiled message before any signature, and stricter where the spec
+allows:
+
+- the top level is an optional Compute Budget prefix — at most one `SetComputeUnitLimit` (≤ 400,000),
+  then at most one `SetComputeUnitPrice` (≤ 100,000 microlamports, a fiftieth of x402's cap, because the priority fee is the node's even when an `open` a client has sabotaged fails on chain) — exactly
+  one `open` of the configured `program_id`, then at most one account-less, UTF-8 Memo of ≤ 256 bytes.
+  Nothing else: no other program, no Lighthouse assertion, no address lookup table;
+- the required signers are exactly the fee payer and the `open`'s `payer`, both writable, and the
+  payer's signature already verifies;
+- the sponsor key is the fee payer, the `open`'s `rent_payer` and its `payee`, and appears nowhere else —
+  not as `payer`, not as `authorized_signer`, not in any other slot or instruction, never as a program;
+- no account is writable but the five an `open` writes;
+- every field decision 2 fixes, and every account the canonical `open` names for those fields — the
+  channel PDA, both canonical ATAs, the token, system and ATA programs, the rent sysvar, the event
+  authority and the program itself.
+
+Then, from the chain: this node's receiving account (its ATA for the mint) and the payer's canonical ATA
+exist, are SPL Token accounts of the mint owned by the right key, and are not frozen — an unusable one
+forfeits its payout to the program's treasury (Cantina 3.1.4) — and the payer's holds the deposit. Last,
+the exact co-signed transaction is simulated, and only a clean simulation is sent.
+
+**Refusals.** `{"error": "<name>", "detail": "<text>"}`. `400` for a request that is not a
+transaction; `422` for one the node will not sign, with nothing signed or sent; `503` when the chain
+could not be read, with nothing sent; `502` when the co-signed `open` was sent and did not produce a
+channel this node admits.
+
+| Name                                                                                            | Status | When                                                                                                                                |
+| ----------------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `batch_settlement_not_offered`                                                                  | 404    | the Solana `batch_settlement` table is not configured                                                                               |
+| `request_malformed`, `transaction_not_base64`, `transaction_too_large`, `transaction_malformed` | 400    | not `{"transaction": base64}` of one Solana transaction of at most 1,232 bytes, decoded exactly                                     |
+| `address_lookup_tables_refused`                                                                 | 422    | the message uses an address lookup table                                                                                            |
+| `fee_payer_not_sponsor`                                                                         | 422    | the fee payer is not this node's sponsor key                                                                                        |
+| `unexpected_instruction`                                                                        | 422    | any instruction outside the layout above, or no `open`                                                                              |
+| `compute_budget_refused`                                                                        | 422    | a Compute Budget instruction outside the bounds above                                                                               |
+| `memo_refused`                                                                                  | 422    | a second Memo, or one with accounts, over 256 bytes, or not UTF-8                                                                   |
+| `open_malformed`                                                                                | 422    | the `open`'s data or account list is not exactly what its fields imply                                                              |
+| `sponsor_misused`                                                                               | 422    | the sponsor key appears anywhere but its three seats                                                                                |
+| `unexpected_signers`                                                                            | 422    | the signers are not exactly the sponsor and the payer, both writable                                                                |
+| `payer_signature_invalid`                                                                       | 422    | the payer's signature is missing or does not verify                                                                                 |
+| `payee_not_sponsor`, `rent_payer_not_sponsor`                                                   | 422    | that seat is not this node's sponsor key (decision 5)                                                                               |
+| `mint_not_settled`                                                                              | 422    | the mint is not `[settlement.solana] token_address`                                                                                 |
+| `distribution_not_sole_receiver`                                                                | 422    | the distribution is not exactly this node's receiver at 10000 bps                                                                   |
+| `grace_period_below_minimum`                                                                    | 422    | `grace_period` is below `min_grace_period_secs`                                                                                     |
+| `deposit_below_minimum`                                                                         | 422    | the deposit is below `min_sponsored_deposit`, which bounds the rent float (Cantina 3.1.9)                                           |
+| `token_program_unsupported`                                                                     | 422    | the token program is not SPL Token; Token-2022's account extensions can fail a payout                                               |
+| `open_account_mismatch`                                                                         | 422    | an account is not the one the canonical `open` names for that role                                                                  |
+| `unexpected_writable_account`                                                                   | 422    | an account the `open` does not write is writable                                                                                    |
+| `receiving_account_unusable`                                                                    | 422    | this node's receiving account is missing, frozen, or not the mint's for this node                                                   |
+| `payer_token_account_unusable`                                                                  | 422    | the payer's canonical ATA is missing, frozen, not the mint's for the payer, or short of the deposit                                 |
+| `simulation_failed`                                                                             | 422    | the co-signed transaction fails simulation: an expired blockhash, an `open_slot` out of the program's window, a channel that exists |
+| `sponsor_busy`                                                                                  | 503    | eight sponsorships are already in flight                                                                                            |
+| `chain_unavailable`                                                                             | 503    | the settlement RPC endpoint could not be read                                                                                       |
+| `submission_failed`                                                                             | 502    | sent, and did not land                                                                                                              |
+| `not_admitted`                                                                                  | 502    | landed, and the channel is not one this node admits                                                                                 |
+
+**No rent prefund.** `payment-channels` computes a channel's rent without the cluster's
+`exemption_threshold`, which is correct everywhere SIMD-0194 has set it to 1 and half the real figure on
+an older cluster. There the `open` fails simulation. The node does not top the channel up in a
+transaction of its own first: that transaction would not be atomic with the client's `open`, so a client
+could have the node prefund an address and then make its `open` fail, stranding the lamports where
+nobody can sign for them.
+
 ## 2. What version 1 does not do
 
 Version 1 has no field or header identifying its own version. That is the gap §3 closes: version

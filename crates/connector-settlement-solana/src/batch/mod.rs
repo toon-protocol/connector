@@ -18,6 +18,7 @@
 //! is written and hands it to the client edge's claim gate
 //! (`connector-cli`'s `batch_settlement` module).
 
+pub mod sponsor;
 pub mod wire;
 
 use std::collections::HashSet;

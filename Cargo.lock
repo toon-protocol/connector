@@ -1113,6 +1113,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bincode",
  "bs58",
  "chrono",
  "connector-btp",
@@ -1143,6 +1144,7 @@ dependencies = [
  "solana-rpc-client",
  "solana-sdk",
  "spl-associated-token-account",
+ "spl-token",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
@@ -1400,6 +1402,8 @@ name = "connector-settlement-solana"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
+ "bincode",
  "chrono",
  "connector-chain-rpc",
  "connector-settlement",
