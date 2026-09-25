@@ -23,6 +23,7 @@
 //! calls [`run`] and gets back a [`Command`] telling it either to serve a
 //! bound socket or that the work is already done.
 
+mod batch_settlement;
 mod peer_transport;
 mod runtime;
 mod send;

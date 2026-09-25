@@ -26,6 +26,13 @@
 //! watermark is answered without advancing or journaling anything; its
 //! signer is read from the backend's verified channel; and its acceptance is
 //! journaled exactly as a claim's is. See `ClientClaimGate::admit_voucher`.
+//! A channel's first accepted voucher also journals the channel itself
+//! ([`JournalEntry::BatchChannelAdmitted`]), because on EVM the config it
+//! carries is the only way to land any voucher on it after a restart; that
+//! record is also what keeps the `TokenNetwork`-shaped sweep
+//! ([`ClientClaimGate::reap_unresolvable_channels`]) off its watermark. A
+//! voucher lookup for a channel with no record is metered by issue #613's
+//! unresolvable-lookup budget, as a claim's is.
 //!
 //! Reuses `connector_domain`'s pure nonce/watermark/value rules
 //! ([`connector_domain::validate_claim`], [`connector_domain::validate_price`],
@@ -150,12 +157,14 @@ use connector_signer::{
     VoucherSignature,
 };
 
-use crate::batch_settlement::BatchSettlementChannels;
+use crate::batch_settlement::{
+    journaled_batch_channels, BatchSettlementChannels, JournaledBatchChannel,
+};
 use crate::channels::{
     decode_base58_bytes, decode_hex_bytes, ChannelResolutionError, ClientChannelRegistry,
     DepositFloor,
 };
-use crate::lookup_budget::LookupBudgetBound;
+use crate::lookup_budget::{LookupBudgetBound, LookupReservation, UnresolvableLookupBudget};
 use crate::outbound_ledger::ClientPayoutLedger;
 
 /// Why the gate refused a claim. [`ClaimIngestRejection::Mina`] and
@@ -502,6 +511,20 @@ pub struct ClientClaimGate {
     /// every voucher is refused by name. **This is the seam** where a node
     /// opts in: see [`crate::batch_settlement`].
     batch_settlement: Option<Arc<dyn BatchSettlementChannels>>,
+    /// Every batch-settlement channel this gate has accepted a voucher on,
+    /// by canonical key (ADR 0074): replayed from the journal's
+    /// [`JournalEntry::BatchChannelAdmitted`] records, and added to under
+    /// the watermark write lock as a channel's first voucher is enqueued.
+    /// It is what makes a key a voucher channel's rather than a
+    /// `TokenNetwork` one's -- the watermark itself does not say -- and it
+    /// holds the EVM config a voucher without one is admitted from.
+    ///
+    /// Never shrinks: a record outlives a failed batch or a rollback, which
+    /// costs nothing, because the next first voucher on the channel records
+    /// it again and the config never changes.
+    ///
+    /// Wherever both are held, this lock is taken after [`Self::watermarks`].
+    batch_channels: RwLock<HashMap<String, JournaledBatchChannel>>,
 }
 
 impl ClientClaimGate {
@@ -529,7 +552,12 @@ impl ClientClaimGate {
         channels: ClientChannelRegistry,
         journal: Arc<dyn Journal>,
     ) -> Result<ClientClaimGate, JournalError> {
-        let watermarks = Arc::new(RwLock::new(replay_watermarks(&journal.read_all()?)));
+        let entries = journal.read_all()?;
+        let watermarks = Arc::new(RwLock::new(replay_watermarks(&entries)));
+        let batch_channels = journaled_batch_channels(&entries)?
+            .into_iter()
+            .map(|channel| (channel.channel_key(), channel))
+            .collect();
         let committer = GroupCommitter::spawn(journal, Arc::clone(&watermarks));
         Ok(ClientClaimGate {
             channels,
@@ -540,15 +568,15 @@ impl ClientClaimGate {
             payout_ledger: None,
             session_channels: RwLock::new(HashMap::new()),
             batch_settlement: None,
+            batch_channels: RwLock::new(batch_channels),
         })
     }
 
     /// Accept x402 `batch-settlement` vouchers through `backend` (ADR 0074
     /// decision 1: off unless configured). Without this, a voucher is
-    /// refused as [`ClaimIngestRejection::BatchSettlementNotAccepted`]. The
-    /// runtime does not call it yet: the config that opts a chain in and the
-    /// backends behind [`BatchSettlementChannels`] are #1340, #1342 and
-    /// #1343.
+    /// refused as [`ClaimIngestRejection::BatchSettlementNotAccepted`].
+    /// `connector-cli`'s runtime calls it exactly when a
+    /// `[settlement.<chain>.batch_settlement]` table is written.
     pub fn with_batch_settlement(
         mut self,
         backend: Arc<dyn BatchSettlementChannels>,
@@ -755,6 +783,21 @@ impl ClientClaimGate {
                     record.signature.clone(),
                 )
             })
+    }
+
+    /// Every x402 `batch-settlement` channel this gate has accepted a
+    /// voucher on (ADR 0074), as the journal records it. With
+    /// [`Self::latest_inbound_claim`] under each one's
+    /// [`channel_key`](JournaledBatchChannel::channel_key), this is what a
+    /// watcher or sweep (issue #1344) lands: the channel, and the latest
+    /// voucher's amount and signature.
+    pub fn batch_channels(&self) -> Vec<JournaledBatchChannel> {
+        self.batch_channels
+            .read()
+            .expect("batch channels lock poisoned")
+            .values()
+            .copied()
+            .collect()
     }
 
     /// Every channel this gate has ever accepted a claim on, and that
@@ -995,6 +1038,7 @@ impl ClientClaimGate {
             &key,
             advance_watermark(claim.nonce(), claim.transferred_amount()),
             verified.signature,
+            None,
         )?;
         drop(watermarks);
 
@@ -1007,12 +1051,17 @@ impl ClientClaimGate {
     /// under (ADR 0005, issue #605, #686). The one place an acceptance is
     /// made, for a `toon-channel` claim and a voucher alike: ADR 0074
     /// decision 3 journals a voucher exactly as it journals a claim.
+    ///
+    /// `channel_record`, when given, is journaled in the same batch and
+    /// immediately before the acceptance: a batch-settlement channel's
+    /// [`JournalEntry::BatchChannelAdmitted`], on its first voucher.
     fn advance_and_enqueue(
         &self,
         watermarks: &mut HashMap<String, LiveClaim>,
         key: &str,
         watermark: Watermark,
         signature: Vec<u8>,
+        channel_record: Option<JournalEntry>,
     ) -> Result<DurabilityTicket, ClaimIngestRejection> {
         let previous = watermarks.get(key).cloned();
         watermarks.insert(
@@ -1023,6 +1072,7 @@ impl ClientClaimGate {
             },
         );
         match self.committer.enqueue(PendingAcceptance {
+            channel_record,
             entry: JournalEntry::InboundClaimAccepted {
                 channel_id: key.to_string(),
                 nonce: watermark.nonce,
@@ -1119,14 +1169,31 @@ impl ClientClaimGate {
         }
 
         let requester = claim.signer_key();
-        let max_cumulative = verify_voucher(backend, &claim, signature, &requester).await?;
+        // A channel this gate has accepted a voucher on before: its record
+        // supplies the EVM config a voucher may omit, and its lookup is not
+        // a discovery the unresolvable-lookup budget meters.
+        let known = self
+            .batch_channels
+            .read()
+            .expect("batch channels lock poisoned")
+            .get(&key)
+            .copied();
+        let verified = verify_voucher(
+            backend,
+            &claim,
+            signature,
+            &requester,
+            known,
+            self.lookup_budget(),
+        )
+        .await?;
         // client-edge-spec.md §1.3 step 5, against the backend's current
         // reading rather than a cached floor: on EVM the figure can fall
         // (ADR 0074 decision 5), so there is no lower bound to cache.
-        if amount > max_cumulative {
+        if amount > verified.max_cumulative {
             return Err(ClaimIngestRejection::Undercollateralized {
                 claimed: amount,
-                deposited: max_cumulative,
+                deposited: verified.max_cumulative,
             });
         }
 
@@ -1146,12 +1213,21 @@ impl ClientClaimGate {
             drop(watermarks);
             return Ok((claim, self.retransmission(&key)));
         }
+        // The channel's first voucher -- or its first since a rollback or a
+        // failed batch emptied the watermark -- records the channel with it,
+        // so it can still be landed on after a restart.
+        let channel_record = (!watermarks.contains_key(&key)).then(|| verified.channel.to_entry());
         let ticket = self.advance_and_enqueue(
             &mut watermarks,
             &key,
             advance_voucher_watermark(amount),
             signature_bytes,
+            channel_record,
         )?;
+        self.batch_channels
+            .write()
+            .expect("batch channels lock poisoned")
+            .insert(key, verified.channel);
         drop(watermarks);
         Ok((claim, ticket))
     }
@@ -1255,6 +1331,7 @@ impl ClientClaimGate {
             };
             restore_watermark(&mut watermarks, &key, previous.clone());
             match self.committer.enqueue(PendingAcceptance {
+                channel_record: None,
                 entry,
                 channel_key: key.clone(),
                 previous: current.clone(),
@@ -1359,6 +1436,7 @@ impl ClientClaimGate {
                 return Ok(());
             };
             match self.committer.enqueue(PendingAcceptance {
+                channel_record: None,
                 entry: JournalEntry::InboundClaimWatermarkReset {
                     channel_id: key.clone(),
                 },
@@ -1428,13 +1506,30 @@ impl ClientClaimGate {
     /// not stall every other channel's sweep or crash the loop that calls
     /// this repeatedly.
     pub async fn reap_unresolvable_channels(&self) {
-        let keys: Vec<String> = self
-            .watermarks
-            .read()
-            .expect("client claim watermarks lock poisoned")
-            .keys()
-            .cloned()
-            .collect();
+        let keys: Vec<String> = {
+            // A batch-settlement channel is never swept (ADR 0074): the
+            // registry this sweep asks resolves `TokenNetwork` channels and
+            // the TOON program's, so it never finds one, and a reset on
+            // that answer would make every voucher already spent on it good
+            // again. Its lifecycle is its own backend's.
+            //
+            // The watermark lock first, then the record's: the order
+            // `admit_voucher` takes them in, so the two can never wait on
+            // each other.
+            let watermarks = self
+                .watermarks
+                .read()
+                .expect("client claim watermarks lock poisoned");
+            let batch_channels = self
+                .batch_channels
+                .read()
+                .expect("batch channels lock poisoned");
+            watermarks
+                .keys()
+                .filter(|key| !batch_channels.contains_key(*key))
+                .cloned()
+                .collect()
+        };
         for key in keys {
             if self.channel_is_gone(&key).await {
                 tracing::warn!(
@@ -1508,6 +1603,11 @@ const GROUP_COMMIT_MAX_BATCH: usize = 4096;
 /// acceptance -- the channel it advanced and the watermark that channel
 /// held before it -- should the batch fail.
 struct PendingAcceptance {
+    /// Written first, in the same batch: a batch-settlement channel's
+    /// record, enqueued with its first voucher (ADR 0074). Undone by
+    /// nothing -- see `ClientClaimGate::batch_channels` for why an orphaned
+    /// record is harmless.
+    channel_record: Option<JournalEntry>,
     entry: JournalEntry,
     channel_key: String,
     previous: Option<LiveClaim>,
@@ -1635,7 +1735,13 @@ fn group_commit_loop(
         }
         let entries: Vec<JournalEntry> = batch
             .iter()
-            .map(|(pending, _)| pending.entry.clone())
+            .flat_map(|(pending, _)| {
+                pending
+                    .channel_record
+                    .iter()
+                    .chain(std::iter::once(&pending.entry))
+                    .cloned()
+            })
             .collect();
         match journal.append_batch(&entries) {
             Ok(()) => {
@@ -1958,16 +2064,31 @@ fn decode_evm_channel_config(
     })
 }
 
+/// What survives [`verify_voucher`]: the channel's collateral bound for
+/// step 5, and the channel as the journal records it.
+struct VerifiedVoucher {
+    max_cumulative: u64,
+    channel: JournaledBatchChannel,
+}
+
 /// client-edge-spec.md §1.3 step 4 for a voucher (ADR 0074 decision 4):
 /// resolve its channel through `backend`, take the signer from what the
 /// backend verified -- never from the voucher -- and check the signature.
-/// Returns the channel's collateral bound for step 5.
+///
+/// `known` is this gate's record of the channel, if it has accepted a
+/// voucher on it before: on EVM its config is presented for a voucher that
+/// carries none. A channel with no record is a discovery, and its lookup is
+/// metered against `budget` exactly as a `toon-channel` claim's is (issue
+/// #613): charged before the backend is asked, and given back if the
+/// backend found a channel.
 async fn verify_voucher(
     backend: &dyn BatchSettlementChannels,
     claim: &ClientClaim,
     signature: VoucherSignature,
     requester: &str,
-) -> Result<u64, ClaimIngestRejection> {
+    known: Option<JournaledBatchChannel>,
+    budget: &UnresolvableLookupBudget,
+) -> Result<VerifiedVoucher, ClaimIngestRejection> {
     let refuse_resolution = |error: ChannelResolutionError| {
         if let ChannelResolutionError::LookupFailed(failure) = &error {
             tracing::warn!(
@@ -1986,22 +2107,29 @@ async fn verify_voucher(
             let Some(channel_id) = decode_hex_bytes::<32>(&voucher.channel_id) else {
                 return Err(ClaimIngestRejection::UnknownChannel);
             };
+            let recorded = match known {
+                Some(JournaledBatchChannel::Evm { config, .. }) => Some(config),
+                _ => None,
+            };
             let presented = voucher
                 .channel_config
                 .as_ref()
                 .map(decode_evm_channel_config)
-                .transpose()?;
+                .transpose()?
+                .or(recorded);
             // ADR 0074 decision 2: recompute `getChannelId` and refuse a
             // mismatch -- before asking the backend anything about it.
             if presented.is_some_and(|config| evm_batch_channel_id(&domain, &config) != channel_id)
             {
                 return Err(ClaimIngestRejection::VoucherChannelConfigMismatch);
             }
-            let channel = backend
+            let reservation = reserve_voucher_lookup(budget, known.is_none(), requester).await?;
+            let found = backend
                 .evm(&channel_id, presented.as_ref())
                 .await
-                .map_err(refuse_resolution)?
-                .ok_or(ClaimIngestRejection::UnknownChannel)?;
+                .map_err(refuse_resolution)?;
+            refund_if_found(budget, reservation, found.is_some());
+            let channel = found.ok_or(ClaimIngestRejection::UnknownChannel)?;
             // The backend's config is re-hashed too: the signer is read from
             // it, so it has to be this channel's, whoever supplied it.
             if evm_batch_channel_id(&domain, &channel.config) != channel_id {
@@ -2015,7 +2143,13 @@ async fn verify_voucher(
                 &signature,
                 &signer,
             ) {
-                Ok(channel.max_cumulative)
+                Ok(VerifiedVoucher {
+                    max_cumulative: channel.max_cumulative,
+                    channel: JournaledBatchChannel::Evm {
+                        channel_id,
+                        config: channel.config,
+                    },
+                })
             } else {
                 Err(ClaimIngestRejection::SignatureInvalid)
             }
@@ -2024,11 +2158,13 @@ async fn verify_voucher(
             let Some(channel_account) = decode_base58_bytes::<32>(&voucher.channel_id) else {
                 return Err(ClaimIngestRejection::UnknownChannel);
             };
-            let channel = backend
+            let reservation = reserve_voucher_lookup(budget, known.is_none(), requester).await?;
+            let found = backend
                 .solana(&channel_account)
                 .await
-                .map_err(refuse_resolution)?
-                .ok_or(ClaimIngestRejection::UnknownChannel)?;
+                .map_err(refuse_resolution)?;
+            refund_if_found(budget, reservation, found.is_some());
+            let channel = found.ok_or(ClaimIngestRejection::UnknownChannel)?;
             // `expiresAt` is zero: the parser refused anything else (ADR
             // 0074 decision 3), and it is still part of the signed bytes.
             if verify_solana_voucher(
@@ -2038,12 +2174,56 @@ async fn verify_voucher(
                 &signature,
                 &channel.authorized_signer,
             ) {
-                Ok(channel.max_cumulative)
+                Ok(VerifiedVoucher {
+                    max_cumulative: channel.max_cumulative,
+                    channel: JournaledBatchChannel::Solana { channel_account },
+                })
             } else {
                 Err(ClaimIngestRejection::SignatureInvalid)
             }
         }
         _ => Err(ClaimIngestRejection::BatchSettlementNotAccepted),
+    }
+}
+
+/// Charge a voucher lookup for a channel this gate has no record of against
+/// the unresolvable-lookup budget (issue #613), waiting for its slot if the
+/// drain is in arrears. `Ok(None)` for a lookup on a known channel, which is
+/// not a discovery and is never charged.
+async fn reserve_voucher_lookup(
+    budget: &UnresolvableLookupBudget,
+    unseen: bool,
+    requester: &str,
+) -> Result<Option<LookupReservation>, ClaimIngestRejection> {
+    if !unseen {
+        return Ok(None);
+    }
+    match budget.reserve(requester).await {
+        Ok(reservation) => Ok(Some(reservation)),
+        Err(exhausted) => {
+            tracing::warn!(
+                bound = exhausted.bound.as_str(),
+                allowance = exhausted.allowance,
+                signer = %requester,
+                "declining to look up an unknown batch-settlement channel: this node's \
+                 discovery drain is saturated and its queue is full"
+            );
+            Err(resolution_refusal(ChannelResolutionError::Budgeted(
+                exhausted,
+            )))
+        }
+    }
+}
+
+/// Give a voucher lookup's slot back if it found a channel: only lookups
+/// that found nothing, or failed, leave a mark (issue #613).
+fn refund_if_found(
+    budget: &UnresolvableLookupBudget,
+    reservation: Option<LookupReservation>,
+    found: bool,
+) {
+    if let (Some(reservation), true) = (reservation, found) {
+        budget.refund(reservation);
     }
 }
 

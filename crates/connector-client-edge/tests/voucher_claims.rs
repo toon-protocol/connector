@@ -11,13 +11,15 @@
 //! (a replay, an underpayment, a config that hashes wrong) really asked the
 //! backend nothing.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use connector_client_edge::{
-    AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
-    ChannelResolutionError, ClaimIngestRejection, ClientChannelRegistry, ClientClaimGate,
+    journaled_batch_channels, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
+    BatchSettlementChannels, ChannelResolutionError, ClaimIngestRejection, ClientChannelRegistry,
+    ClientClaimGate, JournaledBatchChannel, UnresolvableLookupBudgetPolicy,
 };
 use connector_domain::{JournalEntry, Watermark, VOUCHER_WATERMARK_NONCE};
 use connector_runtime::{FileJournal, InMemoryJournal, Journal};
@@ -134,20 +136,31 @@ fn solana_voucher(amount: u64, signer: &ed25519_dalek::Keypair, expires_at: i64)
     .to_string()
 }
 
-/// A backend holding one EVM and one Solana channel, both admitted.
+/// A backend holding one EVM and one Solana channel, both admissible.
+///
+/// It keeps the seam's one EVM rule a real backend cannot escape: an EVM
+/// channel is found only from its config, so an instance that has never
+/// been shown the config -- a fresh process, after a restart -- admits
+/// nothing when handed `None`.
 #[derive(Debug)]
 struct FakeBatchSettlement {
     evm_config: BatchChannelConfig,
     max_cumulative: u64,
     lookups: AtomicUsize,
+    admitted: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl FakeBatchSettlement {
     fn new(max_cumulative: u64) -> FakeBatchSettlement {
+        FakeBatchSettlement::holding(config(), max_cumulative)
+    }
+
+    fn holding(evm_config: BatchChannelConfig, max_cumulative: u64) -> FakeBatchSettlement {
         FakeBatchSettlement {
-            evm_config: config(),
+            evm_config,
             max_cumulative,
             lookups: AtomicUsize::new(0),
+            admitted: Mutex::new(HashSet::new()),
         }
     }
 
@@ -169,17 +182,21 @@ impl BatchSettlementChannels for FakeBatchSettlement {
     async fn evm(
         &self,
         channel_id: &[u8; 32],
-        _presented_config: Option<&BatchChannelConfig>,
+        presented_config: Option<&BatchChannelConfig>,
     ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
         self.lookups.fetch_add(1, Ordering::SeqCst);
-        Ok(
-            (*channel_id == evm_batch_channel_id(&domain(), &self.evm_config)).then_some(
-                AdmittedEvmVoucherChannel {
-                    config: self.evm_config,
-                    max_cumulative: self.max_cumulative,
-                },
-            ),
-        )
+        if *channel_id != evm_batch_channel_id(&domain(), &self.evm_config) {
+            return Ok(None);
+        }
+        let mut admitted = self.admitted.lock().unwrap();
+        if presented_config.is_none() && !admitted.contains(channel_id) {
+            return Ok(None);
+        }
+        admitted.insert(*channel_id);
+        Ok(Some(AdmittedEvmVoucherChannel {
+            config: self.evm_config,
+            max_cumulative: self.max_cumulative,
+        }))
     }
 
     async fn solana(
@@ -252,17 +269,26 @@ async fn a_genuine_evm_voucher_is_accepted_and_journaled_like_a_claim() {
         })
     );
     // ADR 0005, as amended by ADR 0074 decision 3: the signed bytes and the
-    // watermark they set, in the same entry a claim is journaled in.
+    // watermark they set, in the same entry a claim is journaled in -- after
+    // the record of the channel itself, which a first voucher adds so the
+    // channel can be landed on after a restart.
     let entries = journal.read_all().expect("readable");
-    let [JournalEntry::InboundClaimAccepted {
+    let [JournalEntry::BatchChannelAdmitted { .. }, JournalEntry::InboundClaimAccepted {
         channel_id,
         nonce,
         cumulative_amount,
         signature,
     }] = entries.as_slice()
     else {
-        panic!("expected exactly one acceptance, got {entries:?}");
+        panic!("expected the channel's record and one acceptance, got {entries:?}");
     };
+    assert_eq!(
+        journaled_batch_channels(&entries).expect("readable"),
+        vec![JournaledBatchChannel::Evm {
+            channel_id: crate::channel_id(),
+            config: config(),
+        }]
+    );
     assert_eq!(channel_id, &channel_key());
     assert_eq!((*nonce, *cumulative_amount), (VOUCHER_WATERMARK_NONCE, 100));
     assert_eq!(
@@ -346,12 +372,13 @@ async fn a_byte_identical_resend_is_accepted_again_and_records_nothing() {
     let voucher = signed_evm_voucher(100);
     gate.ingest(&voucher, 100).await.expect("first");
     let lookups = backend.lookups();
+    let journaled = journal.read_all().expect("readable").len();
 
     gate.ingest(&voucher, 0)
         .await
         .expect("a resend at no charge is not an error");
 
-    assert_eq!(journal.read_all().expect("readable").len(), 1);
+    assert_eq!(journal.read_all().expect("readable").len(), journaled);
     assert_eq!(backend.lookups(), lookups, "nothing new to verify");
     assert_eq!(
         gate.watermark(&channel_key()).map(|w| w.cumulative_amount),
@@ -453,14 +480,13 @@ async fn a_voucher_above_the_channels_collateral_is_refused() {
 
 #[tokio::test]
 async fn a_voucher_on_a_channel_the_backend_does_not_admit_is_unknown() {
-    let backend = Arc::new(FakeBatchSettlement {
-        evm_config: BatchChannelConfig {
+    let backend = Arc::new(FakeBatchSettlement::holding(
+        BatchChannelConfig {
             salt: [0x01; 32],
             ..config()
         },
-        max_cumulative: 1_000,
-        lookups: AtomicUsize::new(0),
-    });
+        1_000,
+    ));
     let (gate, _journal) = gate_with(&backend);
     assert_eq!(
         gate.ingest(&signed_evm_voucher(100), 0).await.unwrap_err(),
@@ -562,4 +588,148 @@ async fn after_a_restart_a_resend_is_still_a_resend_and_a_replay_still_stale() {
         },
         "and still buying nothing"
     );
+}
+
+/// A voucher signs only its channel's id, and a fresh process's backend has
+/// never been shown the config that id hashes. The journal has: the gate
+/// hands the recorded config over, so a client whose later vouchers carry no
+/// `channelConfig` -- as x402 lets them -- is still paid after a restart.
+#[tokio::test]
+async fn after_a_restart_a_voucher_without_its_config_is_still_admitted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("client-claims.journal");
+    {
+        let gate = gate_over(
+            Arc::new(FileJournal::open(&path).expect("opens")),
+            &Arc::new(FakeBatchSettlement::new(1_000)),
+        );
+        gate.ingest(&signed_evm_voucher(100), 100)
+            .await
+            .expect("the channel's first voucher, carrying its config");
+    }
+
+    // A new process: a backend that has admitted nothing yet.
+    let restarted = Arc::new(FakeBatchSettlement::new(1_000));
+    let gate = gate_over(
+        Arc::new(FileJournal::open(&path).expect("reopens")),
+        &restarted,
+    );
+    gate.ingest(
+        &evm_voucher(250, &sign_voucher(&authorizer(), 250), None),
+        150,
+    )
+    .await
+    .expect("the journal remembers the channel's config");
+    assert_eq!(
+        gate.watermark(&channel_key()).map(|w| w.cumulative_amount),
+        Some(250)
+    );
+}
+
+/// The gate's periodic sweep resets the watermark of a `toon-channel`
+/// channel its registry no longer finds (issue #977). A batch-settlement
+/// channel is not the registry's to find: it lives in another contract, so
+/// the registry never has it, and a sweep that judged it would reset its
+/// watermark and make every voucher already spent on it good again.
+#[tokio::test]
+async fn a_sweep_never_resets_a_voucher_channels_watermark() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("client-claims.journal");
+    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let solana_key = format!("solana:{}", bs58::encode(SOLANA_CHANNEL).into_string());
+    {
+        let gate = gate_over(Arc::new(FileJournal::open(&path).expect("opens")), &backend);
+        gate.ingest(&signed_evm_voucher(100), 100)
+            .await
+            .expect("accepted");
+        gate.ingest(&solana_voucher(100, &solana_signer(), 0), 100)
+            .await
+            .expect("accepted");
+        gate.reap_unresolvable_channels().await;
+        assert!(gate.watermark(&channel_key()).is_some());
+        assert!(gate.watermark(&solana_key).is_some());
+    }
+
+    // And after a restart, when only the journal says which channels these
+    // are.
+    let gate = gate_over(
+        Arc::new(FileJournal::open(&path).expect("reopens")),
+        &backend,
+    );
+    gate.reap_unresolvable_channels().await;
+    assert_eq!(
+        gate.watermark(&channel_key()).map(|w| w.cumulative_amount),
+        Some(100),
+        "a voucher already spent stays spent"
+    );
+    assert!(gate.watermark(&solana_key).is_some());
+}
+
+/// Issue #613's bound, applied to vouchers: a lookup for a channel this gate
+/// has never accepted a voucher on costs a slot of the unresolvable-lookup
+/// budget unless it finds a channel, so naming fresh channel ids cannot make
+/// this node read its chain without limit -- and a client paying on a real
+/// channel spends none of it.
+#[tokio::test]
+async fn a_voucher_lookup_that_finds_nothing_is_metered() {
+    // One lookup per hour, and no waiting for the next.
+    let registry =
+        ClientChannelRegistry::new().with_lookup_budget(UnresolvableLookupBudgetPolicy {
+            per_signer: 1,
+            total: 1,
+            window: std::time::Duration::from_secs(3_600),
+            max_wait: std::time::Duration::ZERO,
+        });
+    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let gate = ClientClaimGate::restore(registry, Arc::new(InMemoryJournal::new()))
+        .expect("an empty journal")
+        .with_batch_settlement(Arc::clone(&backend) as Arc<dyn BatchSettlementChannels>);
+
+    // Real channels resolve, so they give their slot back: any number of
+    // first vouchers on them costs the budget nothing.
+    gate.ingest(&signed_evm_voucher(100), 100)
+        .await
+        .expect("a real EVM channel");
+    gate.ingest(&solana_voucher(100, &solana_signer(), 0), 100)
+        .await
+        .expect("a real Solana channel");
+
+    // A channel that does not exist spends the one slot...
+    let stranger = BatchChannelConfig {
+        salt: [0x99; 32],
+        ..config()
+    };
+    let stranger_id = evm_batch_channel_id(&domain(), &stranger);
+    let unknown = |amount: u64| {
+        let digest = evm_voucher_digest(&domain(), &stranger_id, u128::from(amount));
+        let (signature, recovery) = libsecp256k1::sign(&Message::parse(&digest), &authorizer());
+        let mut bytes = signature.serialize().to_vec();
+        bytes.push(recovery.serialize() + 27);
+        evm_voucher(
+            amount,
+            &format!("0x{}", hex::encode(bytes)),
+            Some(&stranger),
+        )
+        .replace(&hex::encode(channel_id()), &hex::encode(stranger_id))
+    };
+    assert_eq!(
+        gate.ingest(&unknown(100), 0).await.unwrap_err(),
+        ClaimIngestRejection::UnknownChannel
+    );
+    let lookups = backend.lookups();
+
+    // ...and the next is refused without asking the chain at all.
+    assert!(matches!(
+        gate.ingest(&unknown(200), 0).await.unwrap_err(),
+        ClaimIngestRejection::LookupBudgetExhausted { .. }
+    ));
+    assert_eq!(backend.lookups(), lookups);
+
+    // A channel already paid on is not a discovery, and is never budgeted.
+    gate.ingest(
+        &evm_voucher(250, &sign_voucher(&authorizer(), 250), None),
+        150,
+    )
+    .await
+    .expect("a known channel is looked up whatever the budget says");
 }
