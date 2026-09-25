@@ -430,19 +430,19 @@ table does not start with one:
 | chain  | key                       | default              | refused by name when                                            |
 | ------ | ------------------------- | -------------------- | --------------------------------------------------------------- |
 | EVM    | `min_withdraw_delay_secs` | `86400` (a day)      | below `900`, or above `2592000` (the contract's 30-day maximum) |
-| EVM    | `contract_address`        | x402's `0x4020…0003` | not a 20-byte address                                           |
 | EVM    | `asset_eip712_name`       | **required**         | empty                                                           |
 | EVM    | `asset_eip712_version`    | **required**         | empty                                                           |
 | Solana | `min_grace_period_secs`   | `86400` (a day)      | below `900`                                                     |
 | Solana | `min_sponsored_deposit`   | **required**         | `0`; it bounds a public endpoint that spends this node's rent   |
-| Solana | `program_id`              | `CHNLx…yGsX`         | not a base58 32-byte id                                         |
 
 The two minimums are published in the greeting, and a channel whose `withdrawDelay` or `grace_period`
 falls short of them is not admitted. The floor of 900 seconds is x402's own; the day is the window a
-delayed `claim` or `settle_and_seal` still has to land in. `contract_address` and `program_id` default
-to the one address x402 deploys on each chain's test and main networks alike, and are the voucher
-domain the connector reads from its config and never from a voucher (decision 4). The Solana
-`program_id` here is x402's `payment-channels`, not `[settlement.solana] program_id`, which is TOON's.
+delayed `claim` or `settle_and_seal` still has to land in. Neither sub-table names **where** the
+channels live: the record fixes `x402BatchSettlement` at `0x4020074e…0003` and `payment-channels` at
+`CHNLx…yGsX`, the one address and program id each is deployed under on test and main networks alike
+(ADR 0074, _Sources_ and decision 4), so each is a constant of the connector and never a setting —
+and never read from a voucher. `payment-channels` is unrelated to `[settlement.solana] program_id`,
+which is TOON's own program.
 
 **`asset_eip712_name` and `asset_eip712_version`** are the EIP-712 domain `name` and `version` of
 `[settlement.evm] token_address` -- `"USDC"` and `"2"` for the devnet's Circle FiatToken v2.2 -- and

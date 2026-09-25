@@ -796,10 +796,7 @@ async fn build_evm_batch_settlement(
         return Ok(None);
     };
     let backend = backend
-        .batch_settlement(
-            ethers::types::Address::from(batch.contract_address()),
-            batch.min_withdraw_delay_secs(),
-        )
+        .batch_settlement(batch.min_withdraw_delay_secs())
         .await
         .map_err(|source| RuntimeError::BatchSettlementUnusable {
             table: SettlementChain::Evm.name(),
@@ -823,17 +820,10 @@ async fn build_solana_batch_settlement(
         source,
     };
     let sponsor_seed = read_settlement_key_bytes(settlement.key())?;
-    let program_id = Pubkey::from_str(batch.program_id()).map_err(|error| {
-        unusable(BatchSettlementError::Backend(format!(
-            "program_id '{}' is not a base58 Solana pubkey: {error}",
-            batch.program_id()
-        )))
-    })?;
     let mint = parse_solana_pubkey("token_address", settlement.token_address())?;
     let backend = SolanaBatchSettlement::connect(
         transport,
         &sponsor_seed,
-        program_id,
         mint,
         batch.min_grace_period_secs(),
     )

@@ -80,22 +80,23 @@ pub struct SolanaBatchSettlement {
 }
 
 impl SolanaBatchSettlement {
-    /// Bind to the `payment-channels` program at `program_id`
-    /// (`[settlement.solana.batch_settlement] program_id`), admitting
-    /// channels in `mint` (`[settlement.solana] token_address`) whose
-    /// `grace_period` is at least `min_grace_period_secs`, under the sponsor
-    /// key `sponsor_seed` derives (the `[settlement.solana]` key file's
-    /// 32-byte ed25519 seed).
+    /// Bind to the `payment-channels` program at the one id the record
+    /// fixes ([`wire::PAYMENT_CHANNELS_PROGRAM_ID`]), admitting channels in
+    /// `mint` (`[settlement.solana] token_address`) whose `grace_period` is
+    /// at least `min_grace_period_secs`, under the sponsor key
+    /// `sponsor_seed` derives (the `[settlement.solana]` key file's 32-byte
+    /// ed25519 seed).
     ///
-    /// Refuses, naming it, a `program_id` that is not an executable account:
-    /// a node that would otherwise admit nothing and say nothing.
+    /// Refuses, naming it, a chain on which that id is not an executable
+    /// account: a node that would otherwise admit nothing and say nothing.
     pub async fn connect(
         transport: &RpcTransport,
         sponsor_seed: &[u8; 32],
-        program_id: Pubkey,
         mint: Pubkey,
         min_grace_period_secs: u64,
     ) -> Result<Self, BatchSettlementError> {
+        let program_id = Pubkey::from_str(wire::PAYMENT_CHANNELS_PROGRAM_ID)
+            .expect("PAYMENT_CHANNELS_PROGRAM_ID is a base58 program id");
         let sponsor =
             solana_sdk::signer::keypair::keypair_from_seed(sponsor_seed).map_err(backend_error)?;
         let rpc = rpc_client(
@@ -106,14 +107,13 @@ impl SolanaBatchSettlement {
             .await
             .map_err(|error| {
                 BatchSettlementError::Backend(format!(
-                    "[settlement.solana.batch_settlement] program_id {program_id} could not be \
-                     read: {error}"
+                    "payment-channels ({program_id}) could not be read: {error}"
                 ))
             })?;
         if !program.executable {
             return Err(BatchSettlementError::Backend(format!(
-                "[settlement.solana.batch_settlement] program_id {program_id} is not an \
-                 executable program account"
+                "payment-channels ({program_id}) is not an executable program account on this \
+                 chain"
             )));
         }
         Ok(SolanaBatchSettlement {

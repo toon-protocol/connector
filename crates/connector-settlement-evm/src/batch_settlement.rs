@@ -61,7 +61,7 @@ use connector_settlement::batch::{
 use connector_settlement::ChannelId;
 use connector_signer::{
     evm_batch_channel_id, evm_voucher_signer, verify_evm_voucher, BatchChannelConfig,
-    BatchSettlementDomain,
+    BatchSettlementDomain, X402_BATCH_SETTLEMENT_ADDRESS,
 };
 use ethers::abi::{AbiDecode, AbiEncode};
 use ethers::middleware::Middleware;
@@ -84,7 +84,7 @@ use crate::{EvmClient, EvmSettlementBackend};
 pub struct EvmBatchSettlementBackend {
     pub(crate) contract: X402BatchSettlement<EvmClient>,
     /// The EIP-712 domain every channel id and voucher digest is computed
-    /// under: this chain, and the configured contract. Never a claim's.
+    /// under: this chain, and `x402BatchSettlement`. Never a claim's.
     domain: BatchSettlementDomain,
     /// This node's settlement address: the `receiver` and
     /// `receiverAuthorizer` an admissible channel must name.
@@ -104,14 +104,14 @@ pub struct EvmBatchSettlementBackend {
 
 impl EvmSettlementBackend {
     /// This node's receive-only backend for x402 `batch-settlement`
-    /// channels (ADR 0074), over the `x402BatchSettlement` at
-    /// `contract_address`, admitting channels whose `withdrawDelay` is at
-    /// least `min_withdraw_delay_secs`: what `[settlement.evm.batch_settlement]`
-    /// holds. Everything else a channel must name is this backend's: its
-    /// settlement address as `receiver` and `receiverAuthorizer`, and its
-    /// token.
+    /// channels (ADR 0074), over `x402BatchSettlement` at the one address
+    /// the record fixes ([`X402_BATCH_SETTLEMENT_ADDRESS`]), admitting
+    /// channels whose `withdrawDelay` is at least `min_withdraw_delay_secs`:
+    /// what `[settlement.evm.batch_settlement]` holds. Everything else a
+    /// channel must name is this backend's: its settlement address as
+    /// `receiver` and `receiverAuthorizer`, and its token.
     ///
-    /// Refuses unless the contract at `contract_address` computes the same
+    /// Refuses unless the contract at that address computes the same
     /// channel id for a probe config as this node does, which checks in one
     /// `eth_call` that something is deployed there and that it is
     /// `x402BatchSettlement` under the domain vouchers will be checked
@@ -119,9 +119,9 @@ impl EvmSettlementBackend {
     /// the `ChannelConfig` type hash.
     pub async fn batch_settlement(
         &self,
-        contract_address: Address,
         min_withdraw_delay_secs: u64,
     ) -> Result<EvmBatchSettlementBackend, BatchSettlementError> {
+        let contract_address = Address::from(X402_BATCH_SETTLEMENT_ADDRESS);
         let contract = X402BatchSettlement::new(contract_address, Arc::clone(&self.client));
         let domain = BatchSettlementDomain {
             chain_id: self.chain_id,
@@ -179,7 +179,7 @@ struct Snapshot {
 
 impl EvmBatchSettlementBackend {
     /// The EIP-712 domain vouchers on this backend's channels are signed
-    /// under: this chain and the configured `x402BatchSettlement`.
+    /// under: this chain and `x402BatchSettlement`.
     pub fn domain(&self) -> BatchSettlementDomain {
         self.domain
     }

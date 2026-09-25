@@ -13,7 +13,7 @@ use connector_settlement::batch::{
     BatchChannelStatus, BatchSettlementBackend, ChannelPresentation, EvmChannelConfig, HeldVoucher,
     HeldVouchers, Voucher,
 };
-use connector_settlement_evm::test_support::x402::{batch_settlement_address, X402Chain};
+use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
 use connector_settlement_evm::{
     Claimed, EvmBatchSettlementBackend, EvmBatchWatcher, EvmSettlementBackend,
@@ -47,7 +47,7 @@ impl Chain {
             .await
             .expect("this node's settlement backend");
         let backend = settlement
-            .batch_settlement(batch_settlement_address(), ONE_DAY)
+            .batch_settlement(ONE_DAY)
             .await
             .expect("bound to x402BatchSettlement");
         let payer = LocalWallet::from_bytes(&[0x71; 32]).expect("key");

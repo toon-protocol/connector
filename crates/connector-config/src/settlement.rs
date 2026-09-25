@@ -603,7 +603,7 @@ impl<'a> SettlementTables<'a> {
 /// `0x`/`0X` prefix accepted since that is how every address in this
 /// workspace's own docs, infra and decision comments is already written
 /// (e.g. `'0x49beE1Bca5d15Fb0963117923403F9498119a9Ce'`).
-pub(crate) fn parse_evm_address(value: &str) -> Option<[u8; 20]> {
+fn parse_evm_address(value: &str) -> Option<[u8; 20]> {
     let hex = value
         .strip_prefix("0x")
         .or_else(|| value.strip_prefix("0X"))

@@ -20,7 +20,7 @@ use connector_settlement::batch::{
     ChannelPresentation, EvmChannelConfig, Voucher, VoucherSigner,
 };
 use connector_settlement::ChannelId;
-use connector_settlement_evm::test_support::x402::{batch_settlement_address, X402Chain};
+use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
 use connector_settlement_evm::{EvmBatchSettlementBackend, EvmSettlementBackend};
 use ethers::signers::{LocalWallet, Signer};
@@ -42,7 +42,6 @@ struct Chain {
     /// Held so the chain outlives every closure the suite runs.
     _anvil: Anvil,
     x402: Arc<X402Chain>,
-    settlement: EvmSettlementBackend,
     backend: Arc<EvmBatchSettlementBackend>,
     /// The token this node settles in.
     token: Address,
@@ -67,7 +66,7 @@ impl Chain {
             .await
             .expect("this node's settlement backend, over the FiatToken");
         let backend = settlement
-            .batch_settlement(batch_settlement_address(), ONE_DAY)
+            .batch_settlement(ONE_DAY)
             .await
             .expect("the batch-settlement backend binds to x402BatchSettlement");
 
@@ -82,7 +81,6 @@ impl Chain {
         Chain {
             _anvil: anvil,
             x402: Arc::new(x402),
-            settlement,
             backend: Arc::new(backend),
             token,
             other_token,
@@ -474,17 +472,22 @@ async fn a_finalised_withdrawal_leaves_an_open_channel_backing_nothing_new() {
     );
 }
 
-/// The backend refuses to bind to an address where no `x402BatchSettlement`
-/// computes this node's channel ids: here, one with nothing deployed.
+/// The backend refuses to bind on a chain where no `x402BatchSettlement`
+/// answers at its fixed address: here, one x402 was never placed on.
 #[tokio::test]
-async fn binding_to_an_address_that_is_not_x402_batch_settlement_is_refused() {
+async fn binding_where_x402_batch_settlement_is_not_deployed_is_refused() {
     if !require_anvil() {
         return;
     }
-    let chain = Chain::spawn().await;
-    let nowhere = Address::repeat_byte(0x77);
-    let Err(err) = chain.settlement.batch_settlement(nowhere, ONE_DAY).await else {
-        panic!("bound to an address with no contract");
+    let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+    let token = EvmSettlementBackend::deploy_mock_token(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, 0)
+        .await
+        .expect("a token");
+    let settlement = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
+        .await
+        .expect("this node's settlement backend");
+    let Err(err) = settlement.batch_settlement(ONE_DAY).await else {
+        panic!("bound where no x402BatchSettlement is deployed");
     };
     assert!(
         matches!(&err, BatchSettlementError::Backend(message) if message.contains("no x402BatchSettlement")),

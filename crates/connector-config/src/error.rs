@@ -821,18 +821,6 @@ pub enum ConfigError {
     )]
     BatchSettlementZeroMinimumSponsoredDeposit,
 
-    #[error(
-        "invalid [settlement.evm.batch_settlement] contract_address '{value}': must be 40 hex \
-         characters (a 20-byte EVM address), optionally '0x'-prefixed"
-    )]
-    BatchSettlementInvalidContractAddress { value: String },
-
-    #[error(
-        "invalid [settlement.solana.batch_settlement] program_id '{value}': must be a base58 \
-         32-byte program id"
-    )]
-    BatchSettlementInvalidProgramId { value: String },
-
     /// `[settlement.evm.batch_settlement] asset_eip712_name` or
     /// `asset_eip712_version` was written empty. Both are required as soon
     /// as the table exists (ADR 0074 decision 8, issue #1345): the greeting

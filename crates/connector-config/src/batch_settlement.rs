@@ -12,14 +12,18 @@
 //! **What is not here.** Everything ADR 0074 decision 2 _fixes_ about an
 //! admissible channel is read from the enclosing settlement table and never
 //! declared again (CF-26): the receiver is that table's settlement key, and
-//! the token or mint is its `token_address`. These tables hold only the
-//! terms that are this node's to choose.
+//! the token or mint is its `token_address`. Nor is where the channels live:
+//! the record fixes `x402BatchSettlement` at one address and
+//! `payment-channels` at one program id (its _Sources_, and decision 4's EVM
+//! domain), so each is a single constant in the crate that binds to it --
+//! `connector_signer::X402_BATCH_SETTLEMENT_ADDRESS` and
+//! `connector_settlement_solana::batch::wire::PAYMENT_CHANNELS_PROGRAM_ID`
+//! -- and no key here can name another. These tables hold only the terms
+//! that are this node's to choose.
 
 use serde::Deserialize;
 
-use crate::client_channel::is_base58_32_bytes;
 use crate::error::ConfigError;
-use crate::settlement::parse_evm_address;
 
 /// The floor under both published minimums, in seconds: x402's own 900
 /// (ADR 0074 decision 5). On EVM it is the contract's `MIN_WITHDRAW_DELAY`,
@@ -37,21 +41,6 @@ pub const DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS: u64 = 86_400;
 /// published minimum above it would admit no channel at all.
 pub const EVM_BATCH_SETTLEMENT_MAX_WITHDRAW_DELAY_SECS: u64 = 30 * 86_400;
 
-/// `x402BatchSettlement`, at the one address x402 deploys it on both Base
-/// Sepolia and Base mainnet: `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003`
-/// (ADR 0074, _Sources_).
-pub const DEFAULT_EVM_BATCH_SETTLEMENT_CONTRACT: [u8; 20] = [
-    0x40, 0x20, 0x07, 0x4e, 0x9d, 0xf2, 0xce, 0x1d, 0xee, 0x5a, 0x9c, 0x1b, 0x5c, 0x3f, 0x54, 0x1d,
-    0x02, 0xa1, 0x00, 0x03,
-];
-
-/// solana-foundation's `payment-channels` program, at the one id it is
-/// deployed under on both devnet and mainnet-beta (ADR 0074, _Sources_).
-/// Unrelated to `[settlement.solana] program_id`, which is TOON's own
-/// payment-channel program.
-pub const DEFAULT_SOLANA_BATCH_SETTLEMENT_PROGRAM: &str =
-    "CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX";
-
 /// `[settlement.evm.batch_settlement]` as written. `asset_eip712_name` and
 /// `asset_eip712_version` are required as soon as the table exists (issue
 /// #1345); every other key is optional -- writing the table is the opt-in
@@ -62,8 +51,6 @@ pub const DEFAULT_SOLANA_BATCH_SETTLEMENT_PROGRAM: &str =
 pub(crate) struct RawEvmBatchSettlementTable {
     #[serde(default)]
     min_withdraw_delay_secs: Option<u64>,
-    #[serde(default)]
-    contract_address: Option<String>,
     asset_eip712_name: String,
     asset_eip712_version: String,
 }
@@ -77,8 +64,6 @@ pub(crate) struct RawSolanaBatchSettlementTable {
     #[serde(default)]
     min_grace_period_secs: Option<u64>,
     min_sponsored_deposit: u64,
-    #[serde(default)]
-    program_id: Option<String>,
 }
 
 /// A validated `[settlement.evm.batch_settlement]`: this node accepts x402
@@ -91,7 +76,6 @@ pub(crate) struct RawSolanaBatchSettlementTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvmBatchSettlementConfig {
     min_withdraw_delay_secs: u64,
-    contract_address: [u8; 20],
     asset_eip712_name: String,
     asset_eip712_version: String,
 }
@@ -103,13 +87,6 @@ impl EvmBatchSettlementConfig {
     /// the table says otherwise.
     pub fn min_withdraw_delay_secs(&self) -> u64 {
         self.min_withdraw_delay_secs
-    }
-
-    /// The `x402BatchSettlement` contract: the verifying contract of every
-    /// voucher's EIP-712 domain, and the contract `claim` is sent to. Read
-    /// from here and never from a voucher (ADR 0074 decision 4).
-    pub fn contract_address(&self) -> [u8; 20] {
-        self.contract_address
     }
 
     /// The EIP-712 domain `name` of the asset this node accepts a deposit
@@ -139,7 +116,6 @@ impl EvmBatchSettlementConfig {
 pub struct SolanaBatchSettlementConfig {
     min_grace_period_secs: u64,
     min_sponsored_deposit: u64,
-    program_id: String,
 }
 
 impl SolanaBatchSettlementConfig {
@@ -155,13 +131,6 @@ impl SolanaBatchSettlementConfig {
     /// zero.
     pub fn min_sponsored_deposit(&self) -> u64 {
         self.min_sponsored_deposit
-    }
-
-    /// The `payment-channels` program, base58: the program every voucher's
-    /// channel account must belong to, read from here and never from a
-    /// voucher (ADR 0074 decision 4).
-    pub fn program_id(&self) -> &str {
-        &self.program_id
     }
 }
 
@@ -192,13 +161,6 @@ pub(crate) fn resolve_evm_batch_settlement(
             },
         );
     }
-    let contract_address = match raw.contract_address {
-        None => DEFAULT_EVM_BATCH_SETTLEMENT_CONTRACT,
-        Some(value) => match parse_evm_address(&value) {
-            Some(address) => address,
-            None => return Err(ConfigError::BatchSettlementInvalidContractAddress { value }),
-        },
-    };
     if raw.asset_eip712_name.trim().is_empty() {
         return Err(ConfigError::BatchSettlementEmptyAssetEip712Field {
             key: "asset_eip712_name",
@@ -211,7 +173,6 @@ pub(crate) fn resolve_evm_batch_settlement(
     }
     Ok(EvmBatchSettlementConfig {
         min_withdraw_delay_secs,
-        contract_address,
         asset_eip712_name: raw.asset_eip712_name,
         asset_eip712_version: raw.asset_eip712_version,
     })
@@ -229,15 +190,9 @@ pub(crate) fn resolve_solana_batch_settlement(
     if raw.min_sponsored_deposit == 0 {
         return Err(ConfigError::BatchSettlementZeroMinimumSponsoredDeposit);
     }
-    let program_id = match raw.program_id {
-        None => DEFAULT_SOLANA_BATCH_SETTLEMENT_PROGRAM.to_string(),
-        Some(value) if is_base58_32_bytes(&value) => value,
-        Some(value) => return Err(ConfigError::BatchSettlementInvalidProgramId { value }),
-    };
     Ok(SolanaBatchSettlementConfig {
         min_grace_period_secs,
         min_sponsored_deposit: raw.min_sponsored_deposit,
-        program_id,
     })
 }
 
@@ -264,28 +219,12 @@ mod tests {
     // -- EVM --
 
     /// Writing the table is the opt-in, and everything but the required
-    /// EIP-712 domain fields has a default the record chose: one day, and
-    /// the contract x402 deploys.
+    /// EIP-712 domain fields has a default the record chose: one day.
     #[test]
     fn an_empty_evm_table_takes_the_recorded_defaults() {
         let config = evm("").expect("the two required keys alone are a complete opt-in");
 
         assert_eq!(config.min_withdraw_delay_secs(), ONE_DAY);
-        assert_eq!(
-            config.contract_address(),
-            DEFAULT_EVM_BATCH_SETTLEMENT_CONTRACT
-        );
-    }
-
-    /// The default is the address the record cites, spelled the way it
-    /// cites it -- not a byte array nobody can check by eye.
-    #[test]
-    fn the_default_evm_contract_is_the_deployed_x402_batch_settlement() {
-        assert_eq!(
-            parse_evm_address("0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003"),
-            Some(DEFAULT_EVM_BATCH_SETTLEMENT_CONTRACT)
-        );
-        assert!(is_base58_32_bytes(DEFAULT_SOLANA_BATCH_SETTLEMENT_PROGRAM));
     }
 
     #[test]
@@ -330,26 +269,15 @@ mod tests {
         evm("min_withdraw_delay_secs = 2592000").expect("thirty days exactly is the maximum");
     }
 
+    /// ADR 0074 fixes `x402BatchSettlement` at one address, so the table
+    /// has no key to name another: it is not a setting.
     #[test]
-    fn an_evm_contract_address_may_be_named() {
-        let config = evm(r#"contract_address = "0x1234567890123456789012345678901234567890""#)
-            .expect("an explicit contract");
-        assert_eq!(
-            config.contract_address(),
-            [
-                0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78,
-                0x90, 0x12, 0x34, 0x56, 0x78, 0x90
-            ]
-        );
-    }
-
-    #[test]
-    fn a_malformed_evm_contract_address_is_refused_by_name() {
-        let error = evm(r#"contract_address = "0x1234""#).expect_err("not an address");
-        assert!(matches!(
-            error,
-            ConfigError::BatchSettlementInvalidContractAddress { ref value } if value == "0x1234"
-        ));
+    fn the_evm_table_names_no_contract() {
+        assert!(toml::from_str::<RawEvmBatchSettlementTable>(
+            "asset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"\n\
+             contract_address = \"0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003\""
+        )
+        .is_err());
     }
 
     #[test]
@@ -426,7 +354,6 @@ mod tests {
 
         assert_eq!(config.min_grace_period_secs(), ONE_DAY);
         assert_eq!(config.min_sponsored_deposit(), 1_000_000);
-        assert_eq!(config.program_id(), DEFAULT_SOLANA_BATCH_SETTLEMENT_PROGRAM);
     }
 
     /// Decision 5: the sponsor endpoint is public and spends lamports, so
@@ -479,14 +406,14 @@ mod tests {
         assert_eq!(config.min_grace_period_secs(), 31_536_000);
     }
 
+    /// ADR 0074 fixes `payment-channels` at one program id, so the table
+    /// has no key to name another.
     #[test]
-    fn a_malformed_solana_program_id_is_refused_by_name() {
-        let error = solana("min_sponsored_deposit = 1\nprogram_id = \"not-base58-0OIl\"")
-            .expect_err("not a program id");
-        assert!(matches!(
-            error,
-            ConfigError::BatchSettlementInvalidProgramId { ref value } if value == "not-base58-0OIl"
-        ));
+    fn the_solana_table_names_no_program() {
+        assert!(toml::from_str::<RawSolanaBatchSettlementTable>(
+            "min_sponsored_deposit = 1\nprogram_id = \"CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX\""
+        )
+        .is_err());
     }
 
     #[test]

@@ -34,8 +34,7 @@ mod settlement;
 
 pub use batch_settlement::{
     EvmBatchSettlementConfig, SolanaBatchSettlementConfig, BATCH_SETTLEMENT_DELAY_FLOOR_SECS,
-    DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS, DEFAULT_EVM_BATCH_SETTLEMENT_CONTRACT,
-    DEFAULT_SOLANA_BATCH_SETTLEMENT_PROGRAM, EVM_BATCH_SETTLEMENT_MAX_WITHDRAW_DELAY_SECS,
+    DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS, EVM_BATCH_SETTLEMENT_MAX_WITHDRAW_DELAY_SECS,
 };
 pub use client_channel::{ClientChannelConfig, EvmClientChannelConfig, SolanaClientChannelConfig};
 pub use client_channel_asset::ClientChannelAssets;

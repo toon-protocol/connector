@@ -109,7 +109,6 @@ async fn a_close_is_answered_by_sealing_the_latest_voucher_and_the_rent_comes_ho
         SolanaBatchSettlement::connect(
             &RpcTransport::direct(&validator.rpc_url).expect("transport"),
             &seed,
-            program_id(),
             mint,
             u64::from(GRACE),
         )
