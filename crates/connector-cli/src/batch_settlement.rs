@@ -217,6 +217,11 @@ fn resolution(
 
 /// The port's voucher ceiling, in the gate's `u64` amounts. A ceiling wider
 /// than any `u64` bounds nothing a voucher here can name, so it saturates.
+///
+/// Saturating is right here and nowhere else a `u128` narrows: this is a
+/// bound, and clamping a bound down loses no value, where a voucher amount
+/// narrowed must never be dropped or truncated (ADR 0074 decision 3; the
+/// watchers log an out-of-range held amount as an error).
 fn max_cumulative(state: &BatchChannelState) -> u64 {
     u64::try_from(state.voucher_ceiling()).unwrap_or(u64::MAX)
 }

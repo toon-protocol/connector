@@ -449,9 +449,14 @@ impl BatchSettlementBackend for SolanaBatchSettlement {
                 deposited,
             });
         }
-        // At most the deposit, which is a u64.
-        let amount = u64::try_from(voucher.cumulative_amount)
-            .expect("a voucher no larger than a u64 deposit fits a u64");
+        // At most the deposit, which is a u64, so this cannot fail; if it
+        // ever did it is refused by name rather than panicking the caller.
+        let amount = u64::try_from(voucher.cumulative_amount).map_err(|_| {
+            BatchSettlementError::VoucherExceedsDeposit {
+                amount: voucher.cumulative_amount,
+                deposited,
+            }
+        })?;
         let signature: [u8; 64] = voucher.signature.as_slice().try_into().map_err(|_| {
             BatchSettlementError::InvalidVoucherSignature(format!(
                 "a payment-channels voucher signature is 64 bytes of Ed25519, got {}",
