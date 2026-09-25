@@ -1,6 +1,6 @@
 # Vectors are normative; prose is not
 
-**Status:** Accepted, **amended by [0045](0045-a-behavioural-rule-is-normative-prose-until-its-vector-lands.md)**, and still the tiebreaker for every protocol record: `crates/connector-vectors` is the contract for a fact a vector covers. 0045 adds a bounded prose tier for behavioural rules a vector does **not** yet cover, and corrects this record's claim that vectors are generated from property tests — they are generated from fixed literal fixtures (`connector-vectors/src/lib.rs`; the crate has no `proptest` dependency).
+**Status:** Accepted, **amended by [0045](0045-a-behavioural-rule-is-normative-prose-until-its-vector-lands.md)**, and still the tiebreaker for every protocol record: `crates/connector-vectors` is the contract for a fact a vector covers. 0045 adds a bounded prose tier for behavioural rules a vector does **not** yet cover, and corrects this record's claim that vectors are generated from property tests — they are generated from fixed literal fixtures (`connector-vectors/src/lib.rs`; the crate has no `proptest` dependency). **Disturbed by [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)**: its voucher cases take `schema_version` to 6 (#1347).
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 

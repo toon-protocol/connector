@@ -1,10 +1,10 @@
 # A client may pay over an x402 batch-settlement channel, and only a client
 
-**Status:** Proposed (issue #1329). Not accepted, not live, and nothing in `crates/` implements it. What would make it true: the owner accepts the decisions below. All three prerequisites are now settled; the last was closed by a live deposit on Base Sepolia on 2026-09-25. On acceptance it **amends** [0059](0059-a-channel-is-derived-from-its-participants.md) (a client-edge exception to one-live-channel-per-pair), [0005](0005-claims-are-truth-balances-are-a-projection.md) (a second freshness rule for the journal to hold), `client-edge-spec.md` §1.3 (its freshness step, and step 5's rule that a cached deposit is a lower bound, which is false for a channel a payer can withdraw from) and `CONTEXT.md`'s **Claim**, **Nonce** and **Watermark**, whose new text is under "Glossary on acceptance" below. It **extends** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) with a second claim scheme per chain, and it disturbs [0021](0021-vectors-are-normative-prose-is-not.md), because `schema_version` goes to **6**. It leaves [0022](0022-a-connector-answers-it-does-not-announce.md)'s deferral of paying over HTTP exactly where it is. Until acceptance, the other records' Status lines and the glossary are deliberately left alone: a Proposed record binds nothing, so it amends nothing yet.
+**Status:** Accepted (owner decision, 2026-09-25, issue #1329) — **not yet built**; the implementation is tickets #1340–#1347. All three prerequisites were settled before acceptance, the last by a live Base Sepolia deposit on 2026-09-25, and the choices this record makes beyond #1329's seven were accepted with it. It **amends** [0059](0059-a-channel-is-derived-from-its-participants.md) (a client-edge exception to one-live-channel-per-pair), [0005](0005-claims-are-truth-balances-are-a-projection.md) (a second freshness rule for the journal to hold), `client-edge-spec.md` §1.3 (its freshness step, and step 5's rule that a cached deposit is a lower bound, which is false for a channel a payer can withdraw from) and `CONTEXT.md`'s **Claim**, **Nonce** and **Watermark**, plus a new **Voucher** entry (all applied). It **extends** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) with a second claim scheme per chain, and it disturbs [0021](0021-vectors-are-normative-prose-is-not.md): `schema_version` goes to **6** when #1347 lands. It leaves [0022](0022-a-connector-answers-it-does-not-announce.md)'s deferral of paying over HTTP exactly where it is.
 
 **Scope:** protocol law. It binds every implementation, because it adds a claim scheme to the wire and an offer to the greeting. The watchers and sweeps in decision 5 and the port shape in decision 9 are connector architecture. See the [ADR index](README.md).
 
-**Falsifier:** `crates/**/*.rs` matching `(?i)batch[-_]?settlement` — this record is Proposed and claims that nothing under `crates/` speaks the scheme yet, so a non-comment match means code was written against an unaccepted record.
+**Falsifier:** `crates/**/*.rs` matching `(?i)batch[-_]?settlement` — this record is accepted but not yet built and claims that nothing under `crates/` speaks the scheme yet, so a non-comment match means implementation (#1340–#1347) has begun and this Status line must move with it.
 
 **A client may pay a connector over an x402 `batch-settlement` channel, on Base and on Solana: the
 audited contract and program x402 already deploys, with no TOON contract involved.** It is a second
@@ -442,8 +442,8 @@ nothing here changes it. This record takes the other road, using a channel that 
 
 ## Choices this record makes beyond #1329's seven
 
-#1329 asked for decisions 1–7. These go further, and acceptance should confirm them one by one
-rather than inherit them:
+#1329 asked for decisions 1–7. These go further. The owner accepted each of them with the record,
+on 2026-09-25:
 
 - **Decisions 8 and 9 whole**: the greeting's shape, a separate receive-only port, and modules
   rather than crates.
@@ -455,9 +455,9 @@ rather than inherit them:
 - **Refusing an ERC-1271 payer with no `payerAuthorizer`**, so that no packet waits on an
   `eth_call`.
 
-## Glossary on acceptance
+## Glossary
 
-`CONTEXT.md` is not edited while this record is Proposed. On acceptance, its three entries become:
+Applied to `CONTEXT.md` on acceptance (2026-09-25). Its three entries now read:
 
 > **Claim**: A signed statement of a payment channel's cumulative state, handed from payer to
 > payee. Each claim supersedes the last, so a lost claim costs nothing and a replayed claim gains
@@ -471,27 +471,27 @@ rather than inherit them:
 > **Watermark**: The highest nonce a payee has accepted on a channel — for a voucher, the highest
 > cumulative amount, which the next voucher must strictly exceed.
 
-It also gains a **Voucher** entry: _A claim under x402's `batch-settlement` scheme (ADR 0074)._
+It also gained a **Voucher** entry: _A claim under x402's `batch-settlement` scheme (ADR 0074)._
 
-## Follow-up tickets (to file on acceptance, each `ready-for-agent`)
+## Implementation tickets
 
-In the order #1329 lists them:
+Filed on acceptance, each `ready-for-agent`, in the order #1329 lists them:
 
-1. **Port.** The receive-only settlement port, and its contract suite.
-2. **EVM backend.** Config admission (decision 2) and `claim`, against `test_support::Anvil` with
+1. **#1340 Port.** The receive-only settlement port, and its contract suite.
+2. **#1342 EVM backend.** Config admission (decision 2) and `claim`, against `test_support::Anvil` with
    the x402 contracts deployed.
-3. **Solana backend.** Account admission (decision 2) and `settle`, against `SolanaValidator` with
+3. **#1343 Solana backend.** Account admission (decision 2) and `settle`, against `SolanaValidator` with
    `CHNLx…` loaded into genesis.
-4. **Claim schemes and the watermark.** The `scheme` discriminator; both voucher verifications in
+4. **#1341 Claim schemes and the watermark.** The `scheme` discriminator; both voucher verifications in
    `connector-signer`; and the amount-only watermark and retransmission rule in
    `connector-domain`, with property tests.
-5. **Greeting and self-description.** The `batch-settlement` `accepts[]` entries and published
+5. **#1345 Greeting and self-description.** The `batch-settlement` `accepts[]` entries and published
    minimums (decision 8).
-6. **Watchers and sweeps.**
+6. **#1344 Watchers and sweeps.**
    - EVM: the `WithdrawInitiated` watcher, dropping the collateral cache, and batched `claim` then
      `settle`.
    - Solana: the Closing watcher with `settle_and_seal`, then `distribute`, and `reclaim` through
      `getProgramAccounts` rediscovery.
-7. **Solana sponsor endpoint** (decision 9).
-8. **Vectors.** `schema_version` 6, the four cases of decision 7, and a cross-check against the
+7. **#1346 Solana sponsor endpoint** (decision 9).
+8. **#1347 Vectors.** `schema_version` 6, the four cases of decision 7, and a cross-check against the
    deployed `getVoucherDigest`.

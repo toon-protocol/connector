@@ -1,6 +1,6 @@
 # Peer-wire claims sign the EIP-712 balance-proof digest, not a connector-internal SHA-256 tuple
 
-**Status:** Accepted. Its own inline note already records that `SettlementChannel.sol` was deleted (#578, #589) and `connector-settlement-evm` retargeted at the deployed `TokenNetwork`. `connector_domain::claim_digest` is gone from `crates/`, as this record required. **Disturbed by [0059](0059-a-channel-is-derived-from-its-participants.md)** — the channel identifier a claim binds becomes derivable from the participants; what a claim signs is unchanged, but the vectors move.
+**Status:** Accepted. Its own inline note already records that `SettlementChannel.sol` was deleted (#578, #589) and `connector-settlement-evm` retargeted at the deployed `TokenNetwork`. `connector_domain::claim_digest` is gone from `crates/`, as this record required. **Disturbed by [0059](0059-a-channel-is-derived-from-its-participants.md)** — the channel identifier a claim binds becomes derivable from the participants; what a claim signs is unchanged, but the vectors move. **Extended by [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)**: the client edge gains a second EVM claim scheme, x402's EIP-712 `Voucher(channelId, maxClaimableAmount)`. The peer wire is untouched.
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 
