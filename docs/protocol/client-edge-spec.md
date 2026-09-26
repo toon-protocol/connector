@@ -1466,9 +1466,11 @@ allows:
 
 Then, from the chain: this node's receiving account (its ATA for the mint) and the payer's canonical ATA
 exist, are SPL Token accounts of the mint owned by the right key, and are not frozen — an unusable one
-forfeits its payout to the program's treasury (Cantina 3.1.4) — and the payer's holds the deposit. Last,
-the exact co-signed transaction is simulated, and only a clean simulation is sent. Both reads are at
-`processed`, the freshest state there is.
+forfeits its payout to the program's treasury (Cantina 3.1.4) — and the payer's holds the deposit. Where
+the cluster's rent `exemption_threshold` is not 1, the channel already holds the cluster's real
+rent-exempt minimum (see "No rent prefund" below). Last, the exact co-signed transaction is simulated,
+and only a clean simulation is sent. The account reads and the simulation are at `processed`, the
+freshest state there is; the Rent sysvar is read once per process.
 
 **Refusals.** `{"error": "<name>", "detail": "<text>"}`. `400` for a request that is not a
 transaction; `422` for one the node will not sign, with nothing signed or sent; `503` when the chain
@@ -1498,6 +1500,7 @@ channel this node admits.
 | `unexpected_writable_account`                                                                   | 422    | an account the `open` does not write is writable                                                                                    |
 | `receiving_account_unusable`                                                                    | 422    | this node's receiving account is missing, frozen, or not the mint's for this node                                                   |
 | `payer_token_account_unusable`                                                                  | 422    | the payer's canonical ATA is missing, frozen, not the mint's for the payer, or short of the deposit                                 |
+| `cluster_rent_threshold_unsupported`                                                            | 422    | the cluster's rent `exemption_threshold` is not 1 and the channel holds less than the cluster's real rent-exempt minimum (below)    |
 | `simulation_failed`                                                                             | 422    | the co-signed transaction fails simulation: an expired blockhash, an `open_slot` out of the program's window, a channel that exists |
 | `sponsor_busy`                                                                                  | 503    | eight sponsorships are already in flight                                                                                            |
 | `payer_open_in_flight`                                                                          | 409    | this payer already has a sponsorship in flight                                                                                      |
@@ -1508,10 +1511,17 @@ channel this node admits.
 
 **No rent prefund.** `payment-channels` computes a channel's rent without the cluster's
 `exemption_threshold`, which is correct everywhere SIMD-0194 has set it to 1 and half the real figure on
-an older cluster. There the `open` fails simulation. The node does not top the channel up in a
-transaction of its own first: that transaction would not be atomic with the client's `open`, so a client
-could have the node prefund an address and then make its `open` fail, stranding the lamports where
-nobody can sign for them.
+an older cluster. **Sponsored opens are supported on clusters whose threshold is 1: mainnet-beta, devnet
+and v3+ validators.** Elsewhere — any validator before v3 — the node reads the cluster's Rent sysvar
+before signing and refuses an `open` whose channel holds less than the cluster's real rent-exempt
+minimum as `cluster_rent_threshold_unsupported`, naming the threshold, the channel's balance and the
+minimum, with nothing signed or sent. A channel that already holds that minimum opens there too, since
+the program tops up only a shortfall. The node does not top the channel up itself, either way. In a
+transaction of its own first, that would not be atomic with the client's `open`, so a client could have
+the node prefund an address and then make its `open` fail, stranding the lamports where nobody can sign
+for them. Inside the client's transaction, it would void the payer's signature, which covers the whole
+message before the node sees it, and would put the sponsor key in a second instruction, which
+`sponsor_misused` exists to refuse.
 
 ## 2. What version 1 does not do
 
