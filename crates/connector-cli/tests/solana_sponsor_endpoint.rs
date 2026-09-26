@@ -7,6 +7,15 @@
 //! needs the chain to decide it is shown here by name, and each leaves the
 //! sponsor's balance exactly where it was: nothing was signed and sent.
 //!
+//! The channel it admits is built **from the greeting alone** (issue
+//! #1357): the client greets the node with an unpaid request, takes the
+//! greeting's Solana `batch-settlement` entry, and derives every account and
+//! field of its `open` -- and where to post it -- from `payTo`, `asset` and
+//! `extra`, as x402's SVM scheme has a stock client do, then posts x402's
+//! own `deposit` object there. Nothing about the node is passed to that
+//! client from the test's own setup; the one step no real client takes is
+//! the rent prefund the pinned test validator needs (`prefund_channel_rent`).
+//!
 //! The refusals decided from the transaction alone are pinned, one by one,
 //! beside the rules in `connector_settlement_solana::batch::sponsor`.
 //!
@@ -22,15 +31,19 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use base64::Engine as _;
+use connector_domain::x402::{parse_greeting, X402BatchSettlementExtra, X402PaymentRequired};
 use connector_domain::{Fulfill, Reject};
 use connector_settlement::batch::{BatchChannelStatus, BatchSettlementBackend};
 use connector_settlement::ChannelId;
 use connector_settlement_solana::batch::sponsor::MEMO_PROGRAM_ID;
-use connector_settlement_solana::batch::wire::{self, OpenChannel, PAYMENT_CHANNELS_PROGRAM_ID};
+use connector_settlement_solana::batch::wire::{
+    self, sole_recipient, OpenChannel, PAYMENT_CHANNELS_PROGRAM_ID,
+};
 use connector_settlement_solana::test_support::{
     create_mint, fund, mint_to, require_solana_test_validator, send, BatchPayer, SolanaValidator,
     LOCAL_TEST_PROGRAM_ID,
 };
+use connector_signer::PublicKeyBytes;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::instruction::Instruction;
@@ -89,14 +102,27 @@ async fn client_built(
 
 /// POST `transaction` to the sponsor endpoint.
 async fn sponsor(app: &Router, transaction: &str) -> (StatusCode, serde_json::Value) {
+    sponsor_at(
+        app,
+        SPONSOR_PATH,
+        serde_json::json!({ "transaction": transaction }),
+    )
+    .await
+}
+
+/// POST `body` to `path`, as a client that read the path off the greeting
+/// does.
+async fn sponsor_at(
+    app: &Router,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
     let response = app
         .clone()
         .oneshot(
-            Request::post(SPONSOR_PATH)
+            Request::post(path)
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "transaction": transaction }).to_string(),
-                ))
+                .body(Body::from(body.to_string()))
                 .expect("request"),
         )
         .await
@@ -109,6 +135,20 @@ async fn sponsor(app: &Router, transaction: &str) -> (StatusCode, serde_json::Va
         status,
         serde_json::from_slice(&bytes).expect("a JSON answer"),
     )
+}
+
+/// What a client that holds nothing yet is told: an unpaid `POST /ilp` to
+/// `route`, answered `402` with the x402 greeting (client-edge-spec §1.4).
+async fn greeting(app: &Router, route: &str, receiver: &PublicKeyBytes) -> X402PaymentRequired {
+    let request = Request::post("/ilp")
+        .body(Body::from(paid_prepare(route, receiver).encode()))
+        .expect("a request");
+    let response = app.clone().oneshot(request).await.expect("an answer");
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    let bytes = hyper::body::to_bytes(response.into_body())
+        .await
+        .expect("body");
+    parse_greeting(&bytes).expect("an x402 greeting")
 }
 
 /// Prefund `channel` with its full rent from `funder`, so the `open` runs
@@ -342,14 +382,62 @@ price = {PRICE}
         "no refusal cost the sponsor a lamport: nothing was signed and sent"
     );
 
-    // And one it co-signs, submits and admits.
-    let open = payer
-        .admissible_open(&sponsor_pubkey, &mint, MIN_SPONSORED_DEPOSIT, ONE_DAY)
-        .await;
+    // And one it co-signs, submits and admits -- built from the greeting
+    // alone, the way x402's SVM scheme has a stock client build it (SVM
+    // spec `#L193-L201`, `#L294-L305`, `#L1003-L1006`). The client holds
+    // only its own keys, a salt, and the chain; everything about the node
+    // comes off the Solana `batch-settlement` entry.
+    let receiver = runtime.signer.public_key().expect("the node's wrap key");
+    let terms = greeting(&app, ROUTE, &receiver).await;
+    let (offer, extra) = terms
+        .batch_settlement_offers()
+        .find_map(|offer| match &offer.extra {
+            X402BatchSettlementExtra::Solana(extra) => Some((offer, extra)),
+            X402BatchSettlementExtra::Evm(_) => None,
+        })
+        .expect("a node opted in on Solana offers a Solana batch-settlement entry");
+    assert_eq!(offer.scheme, "batch-settlement");
+    assert!(offer.network.starts_with("solana:"), "{}", offer.network);
+    let key = |text: &str| Pubkey::from_str(text).expect("a base58 key");
+    let fee_payer = key(&extra.fee_payer);
+    let asset = key(&offer.asset);
+    let token_program = key(&extra.token_program);
+    // x402 has the client check `tokenProgram` against the mint's on-chain
+    // owner rather than trust it (SVM spec `#L273-L275`).
+    assert_eq!(
+        rpc.get_account(&asset).await.expect("the mint").owner,
+        token_program,
+        "extra.tokenProgram is the program that owns asset"
+    );
+    let open = OpenChannel {
+        payer: payer.payer.pubkey(),
+        rent_payer: fee_payer,
+        payee: fee_payer,
+        mint: asset,
+        token_program,
+        authorized_signer: payer.session.pubkey(),
+        // The client's own choice; any salt no earlier `open` of this payer
+        // used. `BatchPayer`'s counter above has only reached single digits.
+        salt: 0x1357,
+        deposit: extra
+            .min_deposit
+            .parse()
+            .expect("minDeposit is a decimal u64"),
+        grace_period: u32::try_from(extra.withdraw_delay).expect("withdrawDelay fits a u32"),
+        open_slot: rpc.get_slot().await.expect("the current slot"),
+        recipients: sole_recipient(&key(&offer.pay_to)).to_vec(),
+    };
     let channel = open.channel(&program);
     prefund_channel_rent(&rpc, &authority, &channel).await;
-    let transaction = client_built(&rpc, &payer, &sponsor_pubkey, &open).await;
-    let (status, body) = sponsor(&app, &transaction).await;
+    let transaction = client_built(&rpc, &payer, &fee_payer, &open).await;
+    // Posted as x402's own `deposit` object (SVM spec `#L378-L379`): the
+    // endpoint reads `transaction` and ignores the rest.
+    let (status, body) = sponsor_at(
+        &app,
+        &extra.sponsor_endpoint,
+        serde_json::json!({ "amount": extra.min_deposit, "transaction": transaction }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["channelId"], channel.to_string());
     assert_eq!(body["payer"], payer.payer.pubkey().to_string());
@@ -381,7 +469,6 @@ price = {PRICE}
     assert_ne!(status, StatusCode::OK, "{body}");
 
     // The channel it opened pays for a write.
-    let receiver = runtime.signer.public_key().expect("the node's wrap key");
     let response = post_ilp(
         &app,
         &solana_voucher(&channel.to_string(), PRICE, &payer.sign(&channel, PRICE)),

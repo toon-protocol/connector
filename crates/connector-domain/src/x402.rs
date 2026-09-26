@@ -104,7 +104,7 @@ impl X402PaymentRequired {
     /// written a `batch_settlement` table.
     pub fn batch_settlement_offers(&self) -> impl Iterator<Item = &X402BatchSettlementOption> {
         self.accepts.iter().filter_map(|option| match option {
-            X402AcceptOption::BatchSettlement(batch) => Some(batch),
+            X402AcceptOption::BatchSettlement(batch) => Some(batch.as_ref()),
             X402AcceptOption::Channel(_) => None,
         })
     }
@@ -185,15 +185,15 @@ pub struct X402Resource {
 /// a `toon-channel` entry never carries, so an object lacking it falls
 /// through to [`X402PaymentOption`] -- the same structural-mismatch
 /// disambiguation [`X402ChainSettlementTerms`] already uses.
-/// `Channel` is boxed only to keep this enum's own size down to its
-/// smaller variant's -- `X402PaymentOption` carries the whole
-/// `X402ChannelExtra` bag, which nothing about a `batch-settlement` entry
-/// needs. Serde boxes and unboxes it transparently, so the wire shape is
-/// unaffected.
+/// Both variants are boxed only to keep this enum's own size down to a
+/// pointer's -- `X402PaymentOption` carries the whole `X402ChannelExtra`
+/// bag, and a Solana `batch-settlement` entry's `extra` has grown to five
+/// strings (issue #1357). Serde boxes and unboxes them transparently, so the
+/// wire shape is unaffected.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum X402AcceptOption {
-    BatchSettlement(X402BatchSettlementOption),
+    BatchSettlement(Box<X402BatchSettlementOption>),
     Channel(Box<X402PaymentOption>),
 }
 
@@ -489,6 +489,16 @@ pub struct X402BatchSettlementSolanaTerms {
     /// this type's own doc).
     #[serde(rename = "withdrawDelay")]
     pub min_grace_period_secs: u64,
+    /// The token program that owns `asset`, base58 -- x402's **required**
+    /// SVM `extra.tokenProgram` (SVM spec `#L178`), which a stock client
+    /// passes as the `open`'s `token_program` account and derives both
+    /// canonical ATAs under. Always SPL Token: the connected backend refuses
+    /// to boot on a mint any other program owns, and the sponsor refuses a
+    /// Token-2022 `open` as `token_program_unsupported`, so this is the one
+    /// value an `open` it co-signs can name (issue #1357). A client still
+    /// checks it against the mint's on-chain owner, as x402 requires.
+    #[serde(rename = "tokenProgram")]
+    pub token_program: String,
     /// The smallest opening deposit, in the mint's base units, this node's
     /// sponsor will co-sign an `open` for -- `[settlement.solana.batch_settlement]
     /// min_sponsored_deposit`. Published because ADR 0074 decision 5 has
@@ -498,6 +508,16 @@ pub struct X402BatchSettlementSolanaTerms {
     /// amount on this greeting is.
     #[serde(rename = "minDeposit")]
     pub min_deposit: String,
+    /// Where the payer-signed `open` is posted for this node to co-sign and
+    /// submit: the sponsor endpoint's path, `/ilp/batch-settlement/solana/open`,
+    /// served on the same client-edge listener as `POST /ilp`
+    /// (client-edge-spec §1.11, issue #1357). A path, as the `toon-channel`
+    /// entry's `httpEndpoint` is, and resolved the same way.
+    /// This connector's own addition, like `minDeposit`: x402 hands a
+    /// `deposit` to the server with the paid request and never names a
+    /// facilitator to the client, and here the facilitator is this node.
+    #[serde(rename = "sponsorEndpoint")]
+    pub sponsor_endpoint: String,
 }
 
 /// The greeting's own `batch-settlement` `accepts[]` entry (ADR 0074
@@ -545,19 +565,34 @@ pub struct X402BatchSettlementEvmExtra {
     pub version: String,
 }
 
-/// x402 SVM batch-settlement spec `#L163-L178`: `feePayer` and
-/// `withdrawDelay` (the program's `grace_period`) are required so a client
-/// can build the channel account `open` names. `minDeposit` is this
-/// connector's own addition: the published minimum its sponsor co-signs an
-/// `open` for (ADR 0074 decision 5).
+/// x402 SVM batch-settlement spec `#L170-L183`: `feePayer`, `withdrawDelay`
+/// (the program's `grace_period`) and `tokenProgram` are the three it
+/// requires, and together with `payTo` and `asset` they are every account
+/// and field of the `open` a client builds. `minDeposit` and
+/// `sponsorEndpoint` are this connector's own additions: the published
+/// minimum its sponsor co-signs an `open` for (ADR 0074 decision 5), and
+/// where to post it (decision 9).
+///
+/// x402's optional `recentBlockhash` and `recentSlot` are deliberately
+/// **absent** (issue #1357). The spec calls them transaction-construction
+/// hints a client MAY ignore and MUST refresh when stale (`#L180-L188`,
+/// `#L997-L1001`); a blockhash lapses in about a minute, and this greeting
+/// is a projection of standing node facts (ND-11) answered to anyone
+/// without a chain read. The client needs an RPC regardless -- x402 has it
+/// verify `tokenProgram` against the mint's on-chain owner (`#L273-L275`)
+/// -- and fetches both from there.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct X402BatchSettlementSolanaExtra {
     #[serde(rename = "feePayer")]
     pub fee_payer: String,
     #[serde(rename = "withdrawDelay")]
     pub withdraw_delay: u64,
+    #[serde(rename = "tokenProgram")]
+    pub token_program: String,
     #[serde(rename = "minDeposit")]
     pub min_deposit: String,
+    #[serde(rename = "sponsorEndpoint")]
+    pub sponsor_endpoint: String,
 }
 
 /// Project [`X402BatchSettlementTerms`] into the greeting's own
@@ -594,7 +629,9 @@ fn batch_settlement_accept(
             extra: X402BatchSettlementExtra::Solana(X402BatchSettlementSolanaExtra {
                 fee_payer: solana.fee_payer.clone(),
                 withdraw_delay: solana.min_grace_period_secs,
+                token_program: solana.token_program.clone(),
                 min_deposit: solana.min_deposit.clone(),
+                sponsor_endpoint: solana.sponsor_endpoint.clone(),
             }),
         },
     }
@@ -709,7 +746,7 @@ pub fn terms_body(terms: &GreetingTerms<'_>) -> Vec<u8> {
         },
     }))];
     accepts.extend(batch_settlements.iter().map(|fact| {
-        X402AcceptOption::BatchSettlement(batch_settlement_accept(fact, amount.clone()))
+        X402AcceptOption::BatchSettlement(Box::new(batch_settlement_accept(fact, amount.clone())))
     }));
     let terms = X402PaymentRequired {
         x402_version: X402_VERSION,
@@ -1076,6 +1113,8 @@ mod tests {
             fee_payer: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
             min_grace_period_secs: 86_400,
             min_deposit: "1000000".to_string(),
+            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            sponsor_endpoint: "/ilp/batch-settlement/solana/open".to_string(),
         })
     }
 
@@ -1132,10 +1171,13 @@ mod tests {
                 "extra": {
                     "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
                     "withdrawDelay": 86400,
-                    "minDeposit": "1000000"
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                    "minDeposit": "1000000",
+                    "sponsorEndpoint": "/ilp/batch-settlement/solana/open"
                 }
             }),
-            "the sponsor's minimum deposit is published, not only enforced (ADR 0074 decision 5)"
+            "x402's required SVM tokenProgram is published, and so are where and above what the \
+             sponsor co-signs an open (ADR 0074 decisions 5, 8 and 9, issue #1357)"
         );
 
         // The greeting still reads as ordinary toon-channel terms: `.offer()`
