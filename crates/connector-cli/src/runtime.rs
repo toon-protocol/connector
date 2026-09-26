@@ -5657,9 +5657,7 @@ key_file = "{key_file}"
     mod settlement_construction {
         use super::*;
         use chrono::Duration;
-        use connector_settlement_evm::test_support::{
-            anvil_available, require_anvil, Anvil, DEPLOYER_PRIVATE_KEY,
-        };
+        use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
         use connector_settlement_evm::{ChannelIndexEvent, OrderedChannelIndexEvent};
         use connector_settlement_solana::test_support::{
             fund, require_solana_test_validator, SolanaValidator, LOCAL_TEST_PROGRAM_ID,
@@ -5704,10 +5702,7 @@ key_file = "{key_file}"
         /// resolved through a freshly deployed registry.
         #[tokio::test]
         async fn a_configured_settlement_section_is_constructed_and_attached() {
-            if !anvil_available() {
-                eprintln!(
-                    "skipping: `anvil` not found on PATH (install via https://getfoundry.sh)"
-                );
+            if !require_anvil() {
                 return;
             }
 
@@ -5792,10 +5787,7 @@ key_file = "{key_path}"
         /// connection error instead of answering correctly.
         #[tokio::test]
         async fn an_index_resolved_channel_answers_correctly_with_the_chain_unreachable() {
-            if !anvil_available() {
-                eprintln!(
-                    "skipping: `anvil` not found on PATH (install via https://getfoundry.sh)"
-                );
+            if !require_anvil() {
                 return;
             }
 
@@ -5887,10 +5879,7 @@ key_file = "{key_path}"
         /// read the chain, exactly as a node on `main` would have.
         #[tokio::test]
         async fn a_breach_re_read_bypasses_the_index_and_reads_the_chain() {
-            if !anvil_available() {
-                eprintln!(
-                    "skipping: `anvil` not found on PATH (install via https://getfoundry.sh)"
-                );
+            if !require_anvil() {
                 return;
             }
 
@@ -6137,10 +6126,7 @@ key_file = "{key_path}"
         /// what this asserts is that the derivation finds it.
         #[tokio::test]
         async fn an_evm_only_node_composes_the_legacy_terms_and_a_one_entry_settlements_list() {
-            if !anvil_available() {
-                eprintln!(
-                    "skipping: `anvil` not found on PATH (install via https://getfoundry.sh)"
-                );
+            if !require_anvil() {
                 return;
             }
 
@@ -6208,10 +6194,7 @@ key_file = "{key_path}"
         /// clean and settle at a scale nobody consults.
         #[tokio::test]
         async fn settlement_decimals_the_token_disagrees_with_refuses_to_build() {
-            if !anvil_available() {
-                eprintln!(
-                    "skipping: `anvil` not found on PATH (install via https://getfoundry.sh)"
-                );
+            if !require_anvil() {
                 return;
             }
 
@@ -6443,10 +6426,7 @@ key_file = "{key_path}"
         /// each id to its own chain.
         #[tokio::test]
         async fn a_both_chains_config_attaches_and_routes_both_backends() {
-            if !anvil_available() {
-                eprintln!(
-                    "skipping: `anvil` not found on PATH (install via https://getfoundry.sh)"
-                );
+            if !require_anvil() {
                 return;
             }
             if !require_solana_test_validator() {
@@ -6609,10 +6589,7 @@ key_file = "{solana_key_path}"
         /// rather than a fixture.
         #[tokio::test]
         async fn a_both_chains_config_composes_both_chains_greeting_facts() {
-            if !anvil_available() {
-                eprintln!(
-                    "skipping: `anvil` not found on PATH (install via https://getfoundry.sh)"
-                );
+            if !require_anvil() {
                 return;
             }
             if !require_solana_test_validator() {
@@ -7147,10 +7124,7 @@ key_file = "{key_path}"
             };
             use libsecp256k1::{Message, PublicKey, SecretKey};
 
-            if !anvil_available() {
-                eprintln!(
-                    "skipping: `anvil` not found on PATH (install via https://getfoundry.sh)"
-                );
+            if !require_anvil() {
                 return;
             }
 
