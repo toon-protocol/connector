@@ -1781,8 +1781,12 @@ mod tests {
             assert_eq!(refusal.name(), "cluster_rent_threshold_unsupported");
             assert_eq!(refusal.class(), RefusalClass::Refused);
             let detail = refusal.to_string();
-            for fact in ["2", &lamports.to_string(), &minimum.to_string()] {
-                assert!(detail.contains(fact), "{detail} names {fact}");
+            for fact in [
+                "exemption_threshold is 2,".to_string(),
+                format!("holds {lamports} lamports"),
+                format!("minimum of {minimum}"),
+            ] {
+                assert!(detail.contains(&fact), "{detail} names {fact}");
             }
             assert!(detail.contains(&channel.to_string()), "{detail}");
         }

@@ -343,6 +343,15 @@ price = {PRICE}
     // than as `simulation_failed` (issue #1356). Where the threshold is 1,
     // the same `open` is sponsored, below.
     let threshold_is_one = cluster_rent_threshold_is_one(&rpc).await;
+    // The gate's validator is what puts the refusal arm under test in CI.
+    // A pin bump that moves it to threshold 1 must say so here, not
+    // silently stop exercising the refusal end to end.
+    assert!(
+        std::env::var_os("CI").is_none() || !threshold_is_one,
+        "CI's solana-test-validator (the v2.1.21 pin) is expected to carry a rent threshold of 2, \
+         so the cluster_rent_threshold_unsupported arm below runs; if the pin moved, cover that \
+         refusal some other way"
+    );
     if !threshold_is_one {
         let unprefunded = payer
             .admissible_open(&sponsor_pubkey, &mint, MIN_SPONSORED_DEPOSIT, ONE_DAY)
