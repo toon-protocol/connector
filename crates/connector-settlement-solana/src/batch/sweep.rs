@@ -382,10 +382,10 @@ pub struct SolanaBatchWatcher {
     /// The treasury owner this deployment's `distribute` accepted, once one
     /// has.
     treasury: Mutex<Option<Pubkey>>,
-    /// Sealed channels whose latest `distribute` failed: how many passes in
-    /// a row, and the latest error. An entry leaves when its `distribute`
-    /// goes through or the channel is no longer Sealed.
-    failed_distributes: Mutex<HashMap<Pubkey, (u32, String)>>,
+    /// Sealed channels whose latest `distribute` failed, however few times.
+    /// An entry leaves when its `distribute` goes through or the channel is
+    /// no longer Sealed.
+    failed_distributes: Mutex<HashMap<Pubkey, StuckChannel>>,
 }
 
 impl SolanaBatchWatcher {
@@ -401,19 +401,21 @@ impl SolanaBatchWatcher {
     /// Every Sealed channel whose `distribute` has failed on at least
     /// [`STUCK_AFTER_FAILED_PASSES`] passes in a row, as of the last pass:
     /// payouts this watcher is retrying but not delivering (issue #1358).
+    ///
+    /// In a running node the operator's signal is the log: every failed
+    /// `distribute` from the [`STUCK_AFTER_FAILED_PASSES`]th on is an
+    /// `error!` naming the channel, where an earlier one is a `warn!`. This
+    /// is the same judgement read directly -- what a test, or a later health
+    /// surface, asks instead of scraping logs.
     pub fn stuck(&self) -> Vec<StuckChannel> {
         let failed = self
             .failed_distributes
             .lock()
             .expect("failed-distribute lock poisoned");
         let mut stuck: Vec<StuckChannel> = failed
-            .iter()
-            .filter(|(_, (passes, _))| *passes >= STUCK_AFTER_FAILED_PASSES)
-            .map(|(address, (passes, error))| StuckChannel {
-                channel: ChannelId(address.to_string()),
-                failed_passes: *passes,
-                last_error: error.clone(),
-            })
+            .values()
+            .filter(|entry| entry.failed_passes >= STUCK_AFTER_FAILED_PASSES)
+            .cloned()
             .collect();
         stuck.sort_by(|a, b| a.channel.0.cmp(&b.channel.0));
         stuck
@@ -431,13 +433,17 @@ impl SolanaBatchWatcher {
             failed.remove(channel);
             return;
         };
-        let entry = failed.entry(*channel).or_insert((0, String::new()));
-        entry.0 += 1;
-        entry.1 = error.to_string();
-        if entry.0 >= STUCK_AFTER_FAILED_PASSES {
+        let entry = failed.entry(*channel).or_insert_with(|| StuckChannel {
+            channel: ChannelId(channel.to_string()),
+            failed_passes: 0,
+            last_error: String::new(),
+        });
+        entry.failed_passes += 1;
+        entry.last_error = error.to_string();
+        if entry.failed_passes >= STUCK_AFTER_FAILED_PASSES {
             tracing::error!(
                 %channel,
-                failed_passes = entry.0,
+                failed_passes = entry.failed_passes,
                 %error,
                 "a Sealed batch-settlement channel's distribute keeps failing; this node's share \
                  and the payer's refund stay in escrow until it goes through"
@@ -445,7 +451,7 @@ impl SolanaBatchWatcher {
         } else {
             tracing::warn!(
                 %channel,
-                failed_passes = entry.0,
+                failed_passes = entry.failed_passes,
                 %error,
                 "a batch-settlement distribute failed; retrying next pass"
             );
@@ -544,18 +550,18 @@ impl SolanaBatchWatcher {
                 )
                 .await;
             if step == Step::Distribute {
+                // Counted, and logged with how often it has failed in a row.
                 self.record_distribute(&channel.address, &outcome);
-            }
-            match outcome {
-                Ok(()) => taken.push((ChannelId(channel.address.to_string()), step)),
-                // Said by `record_distribute`, with how often it has failed.
-                Err(_) if step == Step::Distribute => {}
-                Err(error) => tracing::warn!(
+            } else if let Err(error) = &outcome {
+                tracing::warn!(
                     channel = %channel.address,
                     ?step,
                     %error,
                     "a batch-settlement step failed; retrying next pass"
-                ),
+                );
+            }
+            if outcome.is_ok() {
+                taken.push((ChannelId(channel.address.to_string()), step));
             }
         }
         if !reclaimable.is_empty() {

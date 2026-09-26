@@ -356,7 +356,7 @@ pub const TOKEN_PROGRAM_FIXTURE_SHA256: &str =
 /// The executable bytes the chain at `rpc` serves for the upgradeable
 /// program `program_id`: its programdata account past the loader's header.
 /// `None` if there is no such program there.
-pub async fn served_program(rpc: &RpcClient, program_id: &Pubkey) -> Option<Vec<u8>> {
+async fn served_program(rpc: &RpcClient, program_id: &Pubkey) -> Option<Vec<u8>> {
     use solana_sdk::bpf_loader_upgradeable::{self, UpgradeableLoaderState};
     let program = rpc.get_account(program_id).await.ok()?;
     if program.owner != bpf_loader_upgradeable::id() {

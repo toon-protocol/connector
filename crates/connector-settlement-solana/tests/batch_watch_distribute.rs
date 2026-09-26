@@ -199,19 +199,21 @@ async fn a_sealed_channel_whose_distribute_keeps_failing_is_reported_stuck() {
 
     // Empty the sponsor: every lamport but the transfer's own fee.
     let balance = rpc.get_balance(&sponsor.pubkey()).await.expect("balance");
-    let fee = 5_000;
-    send(
-        &rpc,
-        &[solana_sdk::system_instruction::transfer(
-            &sponsor.pubkey(),
-            &payer.payer.pubkey(),
-            balance - fee,
-        )],
-        &sponsor,
-        &[],
-    )
-    .await
-    .expect("empty the sponsor");
+    let drain = |lamports| {
+        solana_sdk::system_instruction::transfer(&sponsor.pubkey(), &payer.payer.pubkey(), lamports)
+    };
+    let blockhash = rpc.get_latest_blockhash().await.expect("blockhash");
+    let fee = rpc
+        .get_fee_for_message(&solana_sdk::message::Message::new_with_blockhash(
+            &[drain(balance)],
+            Some(&sponsor.pubkey()),
+            &blockhash,
+        ))
+        .await
+        .expect("the transfer's fee");
+    send(&rpc, &[drain(balance - fee)], &sponsor, &[])
+        .await
+        .expect("empty the sponsor");
     assert_eq!(
         rpc.get_balance(&sponsor.pubkey()).await.expect("balance"),
         0
