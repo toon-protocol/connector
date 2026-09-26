@@ -323,6 +323,58 @@ pub fn payment_channels_fixture() -> PathBuf {
 pub const PAYMENT_CHANNELS_FIXTURE_SHA256: &str =
     "e85f751cc886752d63d054c365bdd747d996f22dd48c30f3f1060532b2b25e17";
 
+/// The Token program as mainnet-beta runs it -- p-token, the pinocchio
+/// rewrite of SPL Token -- which [`SolanaValidator::spawn`] loads into every
+/// validator's genesis at the SPL Token id, in place of the SPL Token the
+/// validator bundles (issue #1358).
+///
+/// **Why.** `payment-channels`' `distribute` sends two or more payouts -- this
+/// node's share and the payer's refund, the ordinary case -- as one SPL Token
+/// `Batch` CPI. Only p-token implements `Batch`; the SPL Token bundled with
+/// `solana-test-validator` (v2.1.21 and v3.1.12) refuses it as
+/// `InvalidInstruction` (token error 12), so without this no local chain
+/// could run the `distribute` a node settles with on mainnet-beta.
+///
+/// **Provenance.** Dumped on 2026-09-26 with
+/// `solana program dump -u m TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`
+/// from programdata `3gvYRKWyXRR9xKWe1ZjPhLY5ZJRN7KDB4rFZFGoJfFk2`, last
+/// deployed at slot 419472000 and holding no upgrade authority. 108,600
+/// bytes, SHA-256 [`TOKEN_PROGRAM_FIXTURE_SHA256`]; the source paths in its
+/// strings are pinocchio's. The same dump from devnet has the same hash.
+///
+/// Committed rather than dumped at test time so the gate needs no network;
+/// no key material is involved, only the program's public bytes.
+pub fn token_program_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/p_token.so")
+}
+
+/// The SHA-256 of [`token_program_fixture`], as dumped, pinned by a test
+/// exactly as [`PAYMENT_CHANNELS_FIXTURE_SHA256`] is.
+pub const TOKEN_PROGRAM_FIXTURE_SHA256: &str =
+    "8190d3f7ceb6cb7a7a8d8924bff89f9f611e15ce1f806f2b6237f3311a98f697";
+
+/// The executable bytes the chain at `rpc` serves for the upgradeable
+/// program `program_id`: its programdata account past the loader's header.
+/// `None` if there is no such program there.
+pub async fn served_program(rpc: &RpcClient, program_id: &Pubkey) -> Option<Vec<u8>> {
+    use solana_sdk::bpf_loader_upgradeable::{self, UpgradeableLoaderState};
+    let program = rpc.get_account(program_id).await.ok()?;
+    if program.owner != bpf_loader_upgradeable::id() {
+        return None;
+    }
+    let UpgradeableLoaderState::Program {
+        programdata_address,
+    } = bincode::deserialize(&program.data).ok()?
+    else {
+        return None;
+    };
+    let programdata = rpc.get_account(&programdata_address).await.ok()?;
+    programdata
+        .data
+        .get(UpgradeableLoaderState::size_of_programdata_metadata()..)
+        .map(<[u8]>::to_vec)
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -534,8 +586,10 @@ static NEXT_PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
 
 /// A freshly spawned `solana-test-validator` instance, with
 /// `packages/solana-program`'s own built `.so` loaded into its genesis at
-/// [`LOCAL_TEST_PROGRAM_ID`] and the committed `payment-channels` binary
-/// ([`payment_channels_fixture`]) at its canonical id, killed (and its disposable ledger directory
+/// [`LOCAL_TEST_PROGRAM_ID`], the committed `payment-channels` binary
+/// ([`payment_channels_fixture`]) at its canonical id and the committed
+/// p-token ([`token_program_fixture`]) at the SPL Token id -- read back
+/// before `spawn` returns -- killed (and its disposable ledger directory
 /// removed) when dropped. Each instance gets its own ledger directory and
 /// ports so tests spawning one concurrently don't collide.
 pub struct SolanaValidator {
@@ -586,6 +640,8 @@ impl SolanaValidator {
                 crate::batch::wire::PAYMENT_CHANNELS_PROGRAM_ID,
             ])
             .arg(payment_channels_fixture())
+            .args(["--bpf-program", &spl_token::id().to_string()])
+            .arg(token_program_fixture())
             .args(["--reset", "--quiet"])
             .args(extra)
             .stdout(Stdio::null())
@@ -608,6 +664,14 @@ impl SolanaValidator {
         assert!(
             ready,
             "solana-test-validator did not become ready at {rpc_url}"
+        );
+        let served = served_program(&rpc, &spl_token::id()).await;
+        assert!(
+            served.as_deref() == std::fs::read(token_program_fixture()).ok().as_deref(),
+            "solana-test-validator at {rpc_url} does not serve the committed p-token fixture at \
+             the SPL Token id (it served {} bytes there); a two-payout `distribute` would meet \
+             the bundled SPL Token, which refuses `Batch`",
+            served.map_or(0, |bytes| bytes.len())
         );
 
         Self {

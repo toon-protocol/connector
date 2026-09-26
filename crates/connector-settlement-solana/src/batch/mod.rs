@@ -26,8 +26,8 @@ mod sweep;
 pub mod wire;
 
 pub use sweep::{
-    next_step, SolanaBatchWatcher, SponsoredChannel, Step, CLOSING_WATCH_INTERVAL,
-    OPEN_SETTLE_INTERVAL,
+    next_step, SolanaBatchWatcher, SponsoredChannel, Step, StuckChannel, CLOSING_WATCH_INTERVAL,
+    OPEN_SETTLE_INTERVAL, STUCK_AFTER_FAILED_PASSES,
 };
 
 use std::collections::HashSet;

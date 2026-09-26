@@ -112,7 +112,9 @@ connector-settlement-solana      real Solana backend, speaking packages/solana-p
   │                               sweep.rs is its watcher, which rediscovers every
   │                               sponsored channel and seals, distributes and reclaims it
   └─ fixtures/payment_channels.so  that program's mainnet-beta binary, which tier-3
-                                  tests load into genesis at its canonical id
+     fixtures/p_token.so          tests load into genesis at its canonical id; and
+                                  mainnet-beta's Token program (p-token), loaded at
+                                  the SPL Token id so `distribute`'s `Batch` runs
 
 connector-rate-source            the chain-agnostic rate-source port + its contract suite
                                   (ADR 0071): what reading a token's price off a market

@@ -10,10 +10,11 @@
 //! as a client would.
 //!
 //! The voucher is the channel's whole deposit, so `distribute` makes exactly
-//! one payout: two or more go out as an SPL Token `Batch` CPI, which the
-//! SPL Token a local validator ships refuses (see the settlement crate's
-//! `batch_watch` test). Its own test binary: `solana-test-validator` binds
-//! fixed ports, so one validator per binary.
+//! one payout. A `distribute` that also refunds the payer -- two payouts, one
+//! SPL Token `Batch` CPI, run on the p-token the harness loads -- is covered
+//! by the settlement crate's `batch_watch_distribute` test (issue #1358).
+//! Its own test binary: `solana-test-validator` binds fixed ports, so one
+//! validator per binary.
 
 mod support;
 

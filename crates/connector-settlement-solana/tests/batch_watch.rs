@@ -8,13 +8,13 @@
 //! The watcher is driven one pass at a time here, so each assertion is about
 //! one pass; `connector-cli`'s end-to-end test runs it as the node does.
 //!
-//! **One payout per `distribute`.** The program folds two or more payouts
-//! into one SPL Token `Batch` CPI, an instruction the SPL Token a local
-//! validator ships refuses (`InvalidInstruction`, token error 12); only
-//! p-token implements it. So each channel here is distributed with exactly
-//! one nonzero payout: the closed channel's voucher is its whole deposit, so
-//! there is no refund, and the quiet one holds no voucher, so the refund is
-//! all there is.
+//! **One payout per `distribute`, here.** Each channel in this test is
+//! distributed with exactly one nonzero payout: the closed channel's voucher
+//! is its whole deposit, so there is no refund, and the quiet one holds no
+//! voucher, so the refund is all there is. Two or more payouts go out as one
+//! SPL Token `Batch` CPI, which the harness's validator runs on p-token
+//! (`test_support::token_program_fixture`); `batch_watch_distribute.rs`
+//! covers that case, the node's share plus the payer's refund (issue #1358).
 //!
 //! Its own test binary: `solana-test-validator` binds fixed ports, so one
 //! validator per binary. The ledger is warped forward so a channel can be
