@@ -649,6 +649,8 @@ mod tests {
             fee_payer: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
             min_grace_period_secs: 86_400,
             min_deposit: "1000000".to_string(),
+            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            sponsor_endpoint: "/ilp/batch-settlement/solana/open".to_string(),
         });
         let opted_in_facts = NodeFacts {
             batch_settlements: vec![evm_batch.clone(), solana_batch],
@@ -673,7 +675,9 @@ mod tests {
                 "payTo": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
                 "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
                 "withdrawDelay": 86400,
-                "minDeposit": "1000000"
+                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "minDeposit": "1000000",
+                "sponsorEndpoint": "/ilp/batch-settlement/solana/open"
             }])
         );
 
