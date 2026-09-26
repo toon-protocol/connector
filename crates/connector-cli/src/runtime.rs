@@ -2025,7 +2025,9 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 // hash (`caip2_network`), never guessed from the RPC URL.
                 // The two minimums are the batch backend's own: what it
                 // admits by and what its sponsor co-signs above are what is
-                // published, with no second read of the config.
+                // published, with no second read of the config. Issue #1357
+                // adds x402's required `tokenProgram`, the program `connect`
+                // proved owns the mint, and where the sponsor is served.
                 if let Some(batch) = &batch_settlement_solana {
                     batch_settlements.push(
                         connector_client_edge::X402BatchSettlementTerms::Solana(
@@ -2035,7 +2037,12 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                                 pay_to: backend.own_pubkey().to_string(),
                                 fee_payer: backend.own_pubkey().to_string(),
                                 min_grace_period_secs: batch.min_grace_period_secs(),
+                                token_program: backend.token_program().to_string(),
                                 min_deposit: batch.min_sponsored_deposit().to_string(),
+                                // The path `sponsor::router` mounts, from
+                                // the one constant, so the greeting can
+                                // never name a path nothing serves.
+                                sponsor_endpoint: crate::sponsor::SPONSOR_PATH.to_string(),
                             },
                         ),
                     );
@@ -6895,6 +6902,17 @@ min_grace_period_secs = 3600
             assert_eq!(
                 solana_batch.min_deposit, "1000000",
                 "the sponsor's minimum deposit is published (ADR 0074 decision 5)"
+            );
+            assert_eq!(
+                solana_batch.token_program,
+                spl_token::id().to_string(),
+                "x402's required tokenProgram is the one program the backend proved owns the \
+                 mint, and the only one the sponsor co-signs an open under (issue #1357)"
+            );
+            assert_eq!(
+                solana_batch.sponsor_endpoint,
+                crate::sponsor::SPONSOR_PATH,
+                "the greeting names the path the router actually mounts (issue #1357)"
             );
         }
 
