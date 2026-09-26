@@ -4,6 +4,8 @@
 
 **Amended 2026-09-25 (#1349 review):** EVM admission now requires a nonzero `payerAuthorizer` whatever the payer is, where it had refused only a contract-wallet payer without one (decisions 2 and 4, and the last of the choices beyond #1329's seven). An EOA can gain code later by an EIP-7702 delegation, after which the contract checks a voucher by ERC-1271 rather than ECDSA and the vouchers already accepted no longer verify the way they did. Decision 3 also records the journal's second amendment to 0005 (the `BatchChannelAdmitted` entry, which holds an EVM channel's `ChannelConfig` so held vouchers stay claimable after a restart), decision 8 records the greeting's wire names (the EVM asset's EIP-712 `name`/`version`, Solana's `withdrawDelay` for the minimum `grace_period`, and the new `minDeposit`), and decision 3's retransmission rule now says what the code always did: a byte-identical voucher buys nothing, so against a nonzero charge it is refused as an underpayment, and the vectors pin that case too.
 
+**Amended 2026-09-26 (#1356):** decision 9's sponsor endpoint supports sponsored opens on clusters whose rent `exemption_threshold` is 1 (mainnet-beta, devnet, v3+ validators), and elsewhere refuses by name, as `cluster_rent_threshold_unsupported`, an `open` whose channel does not already hold the cluster's real rent-exempt minimum. It had surfaced as `simulation_failed`. The node never prefunds the channel: not in a separate transaction, which a client could strand, and not inside the client's, whose payer signature covers the message before the node sees it.
+
 **Scope:** protocol law. It binds every implementation, because it adds a claim scheme to the wire and an offer to the greeting. The watchers and sweeps in decision 5 and the port shape in decision 9 are connector architecture. See the [ADR index](README.md).
 
 **A client may pay a connector over an x402 `batch-settlement` channel, on Base and on Solana: the
@@ -360,6 +362,15 @@ paid for and cannot be an operator write. It must be callable by a buyer the con
 heard of (0052). The endpoint takes a client-built `open` transaction. It checks every field decision
 2 and decision 5 fix, the minimum deposit, and that both token accounts exist. Only then does it
 co-sign as fee payer and `rent_payer`.
+
+**It never prefunds the channel's rent (#1356).** `payment-channels` computes rent as if the cluster's
+`exemption_threshold` were 1, as SIMD-0194 has made it on mainnet-beta, devnet and v3+ validators. On
+an older cluster an `open` alone leaves the channel short. The endpoint cannot close that gap itself:
+a separate prefund is not atomic with the client's `open`, so a client could make the node strand
+lamports at an address nobody can sign for; and an instruction added inside the client's transaction
+voids the payer's signature, which already covers the message. So such a cluster is supported only for
+a channel that already holds the real minimum, and any other `open` there is refused by name
+(`cluster_rent_threshold_unsupported`) before anything is signed.
 
 ## Prerequisites, as found
 

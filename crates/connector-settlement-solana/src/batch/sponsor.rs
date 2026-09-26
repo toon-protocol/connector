@@ -53,9 +53,19 @@
 //! of its own first, but that transaction is not atomic with the client's
 //! `open`: a client could have the node prefund a PDA and then make its
 //! `open` fail, stranding the lamports at an address nobody can sign for.
-//! That is a drain with no bound, so it is refused as
-//! [`SponsorRefusal::SimulationFailed`] instead; a test on such a validator
-//! prefunds the channel from a key of its own.
+//! That is a drain with no bound. Nor can it top the channel up *inside*
+//! the client's transaction: the payer signed the message before this node
+//! saw it, so any added instruction voids that signature, and a transfer
+//! out of the sponsor key is exactly what [`SponsorRefusal::SponsorMisused`]
+//! forbids. So before signing, the sponsor reads the cluster's Rent sysvar
+//! (once per process) and, where its threshold is not 1, the channel's
+//! balance, and refuses an `open` that would come up short as
+//! [`SponsorRefusal::ClusterRentThresholdUnsupported`] -- by name, rather
+//! than leaving the client to read a simulator log (issue #1356). A channel
+//! already holding the cluster's real minimum opens even there, because the
+//! program tops up only a shortfall; a test on such a validator prefunds
+//! the channel from a key of its own. Sponsored opens are supported on
+//! clusters whose threshold is 1: mainnet-beta, devnet and v3+ validators.
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -71,6 +81,7 @@ use solana_sdk::instruction::{CompiledInstruction, Instruction};
 use solana_sdk::message::{MessageHeader, VersionedMessage};
 use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::rent::Rent;
 use solana_sdk::signature::{Signature, Signer};
 use solana_sdk::transaction::VersionedTransaction;
 use solana_transaction_status_client_types::UiTransactionEncoding;
@@ -240,6 +251,21 @@ pub enum SponsorRefusal {
          to the program's treasury (Cantina 3.1.4)"
     )]
     PayerTokenAccountUnusable { account: Pubkey, reason: String },
+    #[error(
+        "this cluster's rent exemption_threshold is {threshold}, not 1, and the channel {channel} \
+         holds {lamports} lamports, short of the cluster's rent-exempt minimum of {minimum}. \
+         payment-channels computes rent as if the threshold were 1, so the open would fail \
+         simulation; this node sponsors an open on such a cluster only for a channel that already \
+         holds its rent"
+    )]
+    ClusterRentThresholdUnsupported {
+        /// The cluster's Rent sysvar `exemption_threshold`, as it prints:
+        /// an `f64`, which this enum's `Eq` cannot hold.
+        threshold: String,
+        channel: Pubkey,
+        lamports: u64,
+        minimum: u64,
+    },
     #[error("the co-signed transaction failed simulation: {0}")]
     SimulationFailed(String),
     #[error("the co-signed open was submitted and did not land: {0}")]
@@ -291,6 +317,9 @@ impl SponsorRefusal {
             SponsorRefusal::UnexpectedWritable(_) => "unexpected_writable_account",
             SponsorRefusal::ReceivingAccountUnusable { .. } => "receiving_account_unusable",
             SponsorRefusal::PayerTokenAccountUnusable { .. } => "payer_token_account_unusable",
+            SponsorRefusal::ClusterRentThresholdUnsupported { .. } => {
+                "cluster_rent_threshold_unsupported"
+            }
             SponsorRefusal::SimulationFailed(_) => "simulation_failed",
             SponsorRefusal::SubmissionFailed(_) => "submission_failed",
             SponsorRefusal::ChainUnavailable(_) => "chain_unavailable",
@@ -813,6 +842,41 @@ pub fn token_account_problem(
     None
 }
 
+/// Whether an `open` of `channel`, which holds `lamports` now, can pay its
+/// rent on a cluster whose Rent sysvar is `rent`.
+///
+/// `payment-channels` tops the channel up to `(128 + len) ×
+/// lamports_per_byte_year` -- pinocchio 0.11's figure, which ignores
+/// `exemption_threshold` -- and only by the shortfall against it. Where
+/// SIMD-0194 has set the threshold to 1 that is the real minimum, whatever
+/// the channel holds. Anywhere else it is short, and the `open` fails
+/// unless the channel already holds the cluster's real minimum, in which
+/// case the program tops up nothing (issue #1356).
+pub fn vet_channel_rent(
+    rent: &Rent,
+    channel: &Pubkey,
+    lamports: u64,
+) -> Result<(), SponsorRefusal> {
+    if threshold_is_one(rent) {
+        return Ok(());
+    }
+    let minimum = rent.minimum_balance(wire::CHANNEL_ACCOUNT_LEN);
+    if lamports >= minimum {
+        return Ok(());
+    }
+    Err(SponsorRefusal::ClusterRentThresholdUnsupported {
+        threshold: rent.exemption_threshold.to_string(),
+        channel: *channel,
+        lamports,
+        minimum,
+    })
+}
+
+/// SIMD-0194's threshold, the one `payment-channels`' rent figure assumes.
+fn threshold_is_one(rent: &Rent) -> bool {
+    rent.exemption_threshold == 1.0
+}
+
 impl SolanaBatchSettlement {
     /// The terms this backend's sponsor co-signs under: its own admission
     /// facts and its minimum sponsored deposit.
@@ -842,12 +906,13 @@ impl SolanaBatchSettlement {
     /// submit it, and admit the channel it made. See this module's doc for
     /// every rule, and for why it submits rather than returning the bytes.
     ///
-    /// Nothing is signed until both token accounts pass; nothing is sent
-    /// until the co-signed bytes simulate cleanly. Both reads are at
-    /// `processed`, the freshest state there is, so a client that has
-    /// already moved its tokens away is caught here rather than on chain,
-    /// where the failure would cost this node the fee. What a client does
-    /// after the simulation is the endpoint's to bound (its failure budget).
+    /// Nothing is signed until both token accounts and the cluster's rent
+    /// pass; nothing is sent until the co-signed bytes simulate cleanly.
+    /// The account reads are at `processed`, the freshest state there is,
+    /// so a client that has already moved its tokens away is caught here
+    /// rather than on chain, where the failure would cost this node the fee.
+    /// What a client does after the simulation is the endpoint's to bound
+    /// (its failure budget).
     ///
     /// The simulation hands the co-signed bytes to the settlement RPC
     /// endpoint whether or not they are then sent, so that endpoint could
@@ -865,6 +930,7 @@ impl SolanaBatchSettlement {
         } = vetted;
 
         self.vet_token_accounts(&open).await?;
+        self.vet_cluster_rent(&channel).await?;
 
         transaction.signatures[0] = self.sponsor.sign_message(&transaction.message.serialize());
         let simulated = retry_read(|| {
@@ -917,6 +983,43 @@ impl SolanaBatchSettlement {
             payer: open.payer,
             deposit: open.deposit,
         })
+    }
+
+    /// [`vet_channel_rent`] against this cluster's Rent sysvar. The sysvar is
+    /// read once per process (a cluster's threshold does not change under a
+    /// running node), and the channel only where the threshold is not 1, so
+    /// on mainnet-beta, devnet and a v3+ validator this costs no read at all
+    /// after the first.
+    async fn vet_cluster_rent(&self, channel: &Pubkey) -> Result<(), SponsorRefusal> {
+        let rent = match self.cluster_rent.get() {
+            Some(rent) => rent.clone(),
+            None => {
+                let sysvar = solana_sdk::sysvar::rent::id();
+                let account = retry_read(|| self.rpc.get_account(&sysvar))
+                    .await
+                    .map_err(|error| SponsorRefusal::ChainUnavailable(error.to_string()))?;
+                let rent: Rent = bincode::deserialize(&account.data).map_err(|error| {
+                    SponsorRefusal::ChainUnavailable(format!(
+                        "the Rent sysvar does not decode: {error}"
+                    ))
+                })?;
+                // A racing request may have set it first, to the same value.
+                let _ = self.cluster_rent.set(rent.clone());
+                rent
+            }
+        };
+        if threshold_is_one(&rent) {
+            return Ok(());
+        }
+        let lamports = retry_read(|| {
+            self.rpc
+                .get_account_with_commitment(channel, CommitmentConfig::processed())
+        })
+        .await
+        .map_err(|error| SponsorRefusal::ChainUnavailable(error.to_string()))?
+        .value
+        .map_or(0, |account| account.lamports);
+        vet_channel_rent(&rent, channel, lamports)
     }
 
     /// Both token accounts `distribute` and a refund pay into must be
@@ -1645,6 +1748,53 @@ mod tests {
             SponsorRefusal::SubmissionFailed("x".into()).class(),
             RefusalClass::Failed
         );
+    }
+
+    fn rent(exemption_threshold: f64) -> Rent {
+        Rent {
+            lamports_per_byte_year: 3_480,
+            exemption_threshold,
+            burn_percent: 50,
+        }
+    }
+
+    #[test]
+    fn a_threshold_of_one_never_refuses_whatever_the_channel_holds() {
+        let channel = Pubkey::new_unique();
+        for lamports in [0, 1, u64::MAX] {
+            assert_eq!(vet_channel_rent(&rent(1.0), &channel, lamports), Ok(()));
+        }
+    }
+
+    #[test]
+    fn another_threshold_refuses_a_channel_short_of_the_clusters_real_minimum() {
+        let channel = Pubkey::new_unique();
+        let cluster = rent(2.0);
+        let minimum = cluster.minimum_balance(wire::CHANNEL_ACCOUNT_LEN);
+        // What `payment-channels` would top the channel up to: its own
+        // threshold-ignoring figure, half the real one here.
+        let programs_figure = rent(1.0).minimum_balance(wire::CHANNEL_ACCOUNT_LEN);
+        assert_eq!(programs_figure * 2, minimum);
+
+        for lamports in [0, programs_figure, minimum - 1] {
+            let refusal = vet_channel_rent(&cluster, &channel, lamports).expect_err("short");
+            assert_eq!(refusal.name(), "cluster_rent_threshold_unsupported");
+            assert_eq!(refusal.class(), RefusalClass::Refused);
+            let detail = refusal.to_string();
+            for fact in [
+                "exemption_threshold is 2,".to_string(),
+                format!("holds {lamports} lamports"),
+                format!("minimum of {minimum}"),
+            ] {
+                assert!(detail.contains(&fact), "{detail} names {fact}");
+            }
+            assert!(detail.contains(&channel.to_string()), "{detail}");
+        }
+        // Prefunded to the real minimum, the program tops up nothing and
+        // the open is fine even here.
+        for lamports in [minimum, minimum + 1, u64::MAX] {
+            assert_eq!(vet_channel_rent(&cluster, &channel, lamports), Ok(()));
+        }
     }
 
     fn token_account(

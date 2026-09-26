@@ -32,7 +32,7 @@ pub use sweep::{
 
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use async_trait::async_trait;
 use connector_chain_rpc::{retry_read, solana::rpc_client, RpcTransport};
@@ -81,6 +81,9 @@ pub struct SolanaBatchSettlement {
     /// `min_grace_period_secs` (ADR 0074 decision 5).
     min_sponsored_deposit: u64,
     admitted: Mutex<HashSet<Pubkey>>,
+    /// The cluster's Rent sysvar, read on the first sponsored `open`
+    /// ([`sponsor`]'s rent check, issue #1356).
+    cluster_rent: OnceLock<solana_sdk::rent::Rent>,
 }
 
 impl SolanaBatchSettlement {
@@ -131,6 +134,7 @@ impl SolanaBatchSettlement {
             min_grace_period_secs,
             min_sponsored_deposit,
             admitted: Mutex::new(HashSet::new()),
+            cluster_rent: OnceLock::new(),
         })
     }
 
