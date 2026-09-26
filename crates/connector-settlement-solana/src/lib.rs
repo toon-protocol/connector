@@ -528,6 +528,15 @@ impl SolanaSettlementBackend {
         self.token_mint
     }
 
+    /// The token program that owns [`Self::token_mint`]: SPL Token, always,
+    /// because [`Self::connect`] refuses a mint any other program owns -- so
+    /// returning the constant is returning what `connect` proved. The
+    /// greeting's x402 `extra.tokenProgram` (ADR 0074 decision 8, issue
+    /// #1357) is read from here rather than from a literal of its own.
+    pub fn token_program(&self) -> Pubkey {
+        spl_token::id()
+    }
+
     /// The deployed `payment-channel` program instance this backend drives
     /// (issue #632's greeting facts -- the Solana twin of
     /// `EvmSettlementBackend::address`/`registry_address`).

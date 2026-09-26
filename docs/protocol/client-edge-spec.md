@@ -715,11 +715,46 @@ configured (below) — and carries nothing else.
 >   under. x402 requires both and an ERC-20 need not expose either, so they are not read off the
 >   chain: they are the required config keys `asset_eip712_name`/`asset_eip712_version`.
 > - **Solana:** `feePayer` (the sponsor key); `withdrawDelay`, x402's SVM field name, carrying the
->   minimum `grace_period` (`[settlement.solana.batch_settlement] min_grace_period_secs`); and
->   `minDeposit`, this connector's own addition to x402's SVM `extra`: the smallest opening deposit,
->   in the mint's base units and as a decimal string like every amount here, that the sponsor
->   endpoint (§1.11) co-signs an `open` for — the **published** minimum ADR 0074 decision 5 has the
->   sponsor refuse below (`min_sponsored_deposit`).
+>   minimum `grace_period` (`[settlement.solana.batch_settlement] min_grace_period_secs`);
+>   `tokenProgram`, x402's required SVM field naming the program that owns `asset` — always SPL
+>   Token (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`), the one program the backend boots
+>   against and the sponsor co-signs under (a Token-2022 `open` is `token_program_unsupported`,
+>   §1.11); and two of this connector's own additions to x402's SVM `extra`: `minDeposit`, the
+>   smallest opening deposit, in the mint's base units and as a decimal string like every amount
+>   here, that the sponsor endpoint (§1.11) co-signs an `open` for — the **published** minimum ADR
+>   0074 decision 5 has the sponsor refuse below (`min_sponsored_deposit`) — and `sponsorEndpoint`,
+>   the path on this node's HTTP endpoint where the payer-signed `open` is posted,
+>   `/ilp/batch-settlement/solana/open` (§1.11; issue #1357).
+>
+>   ```json
+>   {
+>     "scheme": "batch-settlement",
+>     "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+>     "amount": "100",
+>     "asset": "<mint>",
+>     "payTo": "<settlement pubkey>",
+>     "maxTimeoutSeconds": 60,
+>     "extra": {
+>       "feePayer": "<settlement pubkey>",
+>       "withdrawDelay": 86400,
+>       "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+>       "minDeposit": "1000000",
+>       "sponsorEndpoint": "/ilp/batch-settlement/solana/open"
+>     }
+>   }
+>   ```
+>
+>   That is everything a stock x402 SVM client needs to build the `open` (x402 SVM spec
+>   `#L193-L201`, `#L294-L305`) and to know where to post it. It posts x402's own `deposit` object,
+>   `{"amount", "transaction"}` (`#L378-L379`), to `sponsorEndpoint` rather than handing a whole
+>   `PaymentPayload` to the server with a paid request: the `open` leaves the packet path, and the
+>   vouchers that follow ride inside ILP (ADR 0074 decision 8). The rest comes from the client's own
+>   keys and the chain: its salt and `openSlot`, and a recent blockhash. x402's optional
+>   `recentBlockhash` and `recentSlot` hints are **not** carried (ADR 0074 decision 8, amended by
+>   #1357). A blockhash lapses in about a minute, so putting one in this answer would add a chain
+>   read to every unpaid request and still hand out stale values. x402 lets a client ignore the
+>   hints and requires it to refresh them when stale, and the client already has to reach the chain
+>   to check `tokenProgram` against the mint's owner.
 >
 > The `toon-channel` entry is unchanged and stays first. The self-description publishes the same
 > facts under `batchSettlements` (ND-11); this is a projection of that value, never a second
@@ -1400,8 +1435,9 @@ against `POST /ilp`. Nothing here calls into claim ingestion, and no per-packet 
 [ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 9. A client
 that holds the mint and no SOL opens an x402 `batch-settlement` channel on `payment-channels` with this
 node as fee payer and `rent_payer`: it builds and signs the `open` from the greeting's `batch-settlement`
-entry (`payTo`, `asset`, `extra.feePayer`, the minimum `withdrawDelay`, a deposit of at least
-`extra.minDeposit`, §1.4), and posts it here. The
+entry (`payTo`, `asset`, `extra.feePayer`, the minimum `withdrawDelay`, `extra.tokenProgram`, a
+deposit of at least `extra.minDeposit`, §1.4), and posts it to `extra.sponsorEndpoint`, which is
+this path. The
 node co-signs, **submits**, waits for the outcome, and admits the channel it made.
 
 **Public, not an operator write.** The channel does not exist yet, so the call cannot be paid for, and a
@@ -1421,7 +1457,7 @@ bound one such fee, and the budget bounds how many.
 **Request.** Base64 of the transaction's wire bytes, legacy or version 0, signed by the payer alone with
 the fee payer's signature slot left empty — exactly what a stock x402 client's
 `buildOpenPaymentChannelTransaction` returns, and what x402 carries as `deposit.transaction`. Other
-members are ignored.
+members are ignored, so x402's `deposit` object (`{"amount", "transaction"}`) is accepted as it stands.
 
 ```json
 POST /ilp/batch-settlement/solana/open

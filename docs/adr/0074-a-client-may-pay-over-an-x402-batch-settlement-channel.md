@@ -4,6 +4,8 @@
 
 **Amended 2026-09-25 (#1349 review):** EVM admission now requires a nonzero `payerAuthorizer` whatever the payer is, where it had refused only a contract-wallet payer without one (decisions 2 and 4, and the last of the choices beyond #1329's seven). An EOA can gain code later by an EIP-7702 delegation, after which the contract checks a voucher by ERC-1271 rather than ECDSA and the vouchers already accepted no longer verify the way they did. Decision 3 also records the journal's second amendment to 0005 (the `BatchChannelAdmitted` entry, which holds an EVM channel's `ChannelConfig` so held vouchers stay claimable after a restart), decision 8 records the greeting's wire names (the EVM asset's EIP-712 `name`/`version`, Solana's `withdrawDelay` for the minimum `grace_period`, and the new `minDeposit`), and decision 3's retransmission rule now says what the code always did: a byte-identical voucher buys nothing, so against a nonzero charge it is refused as an underpayment, and the vectors pin that case too.
 
+**Amended 2026-09-26 (#1357):** decision 8's Solana `extra` gains `tokenProgram`, which x402's SVM scheme requires and the entry had left out, and `sponsorEndpoint`, the path of decision 9's sponsor endpoint, which nothing on the wire had named. x402's optional `recentBlockhash` and `recentSlot` are left out on purpose, and decision 8 now says why. With these, a client builds a sponsored `open` from the greeting and the chain alone, and posts x402's own `deposit` object to `sponsorEndpoint`.
+
 **Scope:** protocol law. It binds every implementation, because it adds a claim scheme to the wire and an offer to the greeting. The watchers and sweeps in decision 5 and the port shape in decision 9 are connector architecture. See the [ADR index](README.md).
 
 **A client may pay a connector over an x402 `batch-settlement` channel, on Base and on Solana: the
@@ -331,9 +333,27 @@ names, recorded 2026-09-25, are x402's own wherever x402 has one:
   `asset_eip712_name` and `asset_eip712_version`.
 - **Solana:** `feePayer`, which is the sponsor key; `withdrawDelay`, which carries the minimum
   `grace_period` under x402's SVM field name (x402 calls the program's `grace_period`
-  `withdrawDelay` on both chains, and a stock client reads that name); and `minDeposit`, the
-  published minimum deposit decision 5 has the sponsor refuse below, as a decimal string of the
-  mint's base units. `minDeposit` is this connector's own addition: x402 has no field for it.
+  `withdrawDelay` on both chains, and a stock client reads that name); `tokenProgram`, the program
+  that owns `asset` (X402 SVM spec `#L178`, required), which is always SPL Token
+  `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`, because the backend refuses to boot on a mint
+  any other program owns and the sponsor refuses a Token-2022 `open` as
+  `token_program_unsupported`; `minDeposit`, the published minimum deposit decision 5 has the
+  sponsor refuse below, as a decimal string of the mint's base units; and `sponsorEndpoint`, the
+  path on this node's HTTP endpoint where the payer-signed `open` is posted,
+  `/ilp/batch-settlement/solana/open` (decision 9). `minDeposit` and `sponsorEndpoint` are this
+  connector's own additions, because x402 has no field for either. In x402 the client hands its
+  `deposit` to the server with a paid request and the server forwards it to a facilitator the
+  client never addresses; here the facilitator is this node, and the `open` travels outside the
+  packet.
+
+  x402's optional `recentBlockhash` and `recentSlot` (X402 SVM spec `#L180-L188`) are **not**
+  carried, on purpose (#1357). They are transaction-construction hints: a client MAY ignore them
+  and MUST fetch fresh values when they are stale (`#L997-L1001`), and a blockhash lapses in
+  about a minute. The greeting is a projection of standing node facts, answered to anyone
+  without a chain read, so a hint would add an RPC call to every unpaid request and send out a
+  value that is out of date whenever the answer is cached. A separate call is not needed either.
+  The client must reach the chain anyway, because x402 has it check `tokenProgram` against the
+  mint's on-chain owner (`#L273-L275`), and that same RPC gives it a blockhash and a slot.
 
 The self-description publishes the same facts. Vouchers still travel inside ILP. Only the one-time
 deposit or open leaves the packet path, which is why [0022](0022-a-connector-answers-it-does-not-announce.md)'s
