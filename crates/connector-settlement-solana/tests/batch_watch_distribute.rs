@@ -1,19 +1,14 @@
-//! `SolanaBatchWatcher`'s `distribute` (ADR 0074 decision 5, issue #1358),
-//! against solana-foundation's own `payment-channels` binary in a disposable
-//! validator.
+//! `SolanaBatchWatcher`'s `distribute` in the ordinary case (ADR 0074
+//! decision 5, issue #1358): a channel sealed with a voucher above zero and
+//! below its deposit pays **two** parties, this node its share and the payer
+//! the rest. The program sends both payouts in one SPL Token `Batch` CPI,
+//! which only p-token implements; the validator runs it at the SPL Token id
+//! because `SolanaValidator::spawn` loads the committed mainnet-beta dump
+//! there (`test_support::token_program_fixture`).
 //!
-//! - **Two payouts.** A channel sealed with a voucher above zero and below
-//!   its deposit pays two parties, this node its share and the payer the
-//!   rest -- the ordinary case. The program sends both payouts in one SPL
-//!   Token `Batch` CPI, which only p-token implements; the validator runs it
-//!   at the SPL Token id because `SolanaValidator::spawn` loads the committed
-//!   mainnet-beta dump there (`test_support::token_program_fixture`).
-//! - **A `distribute` that keeps failing.** A Sealed channel whose
-//!   `distribute` fails pass after pass is reported by
-//!   [`SolanaBatchWatcher::stuck`] (and logged as an error), not only retried;
-//!   the report clears once it goes through.
-//!
-//! The watcher is driven one pass at a time, as in `batch_watch.rs`.
+//! The watcher is driven one pass at a time, as in `batch_watch.rs`. Its own
+//! test binary: `solana-test-validator` binds fixed ports, so one validator
+//! per binary.
 
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -21,11 +16,9 @@ use std::sync::{Arc, RwLock};
 use connector_settlement::batch::{ChannelPresentation, HeldVoucher, HeldVouchers, Voucher};
 use connector_settlement::ChannelId;
 use connector_settlement_solana::batch::wire::{self, ChannelStatus, PAYMENT_CHANNELS_PROGRAM_ID};
-use connector_settlement_solana::batch::{
-    SolanaBatchSettlement, SolanaBatchWatcher, Step, STUCK_AFTER_FAILED_PASSES,
-};
+use connector_settlement_solana::batch::{SolanaBatchSettlement, SolanaBatchWatcher, Step};
 use connector_settlement_solana::test_support::{
-    create_mint, fund, mint_to, require_solana_test_validator, send, BatchPayer, SolanaValidator,
+    create_mint, fund, mint_to, require_solana_test_validator, BatchPayer, SolanaValidator,
 };
 use connector_settlement_solana::RpcTransport;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
@@ -63,19 +56,11 @@ fn steps_on(taken: &[(ChannelId, Step)], channel: &Pubkey) -> Vec<Step> {
         .collect()
 }
 
-/// A validator, a sponsor-keyed backend and its watcher, and one channel
-/// that watcher has sealed with [`VOUCHER`] of its [`DEPOSIT`] landed.
-struct Sealed {
-    _validator: SolanaValidator,
-    rpc: RpcClient,
-    sponsor: Keypair,
-    payer: BatchPayer,
-    mint: Pubkey,
-    watcher: SolanaBatchWatcher,
-    channel: Pubkey,
-}
-
-async fn a_channel_sealed_below_its_deposit() -> Sealed {
+#[tokio::test]
+async fn a_distribute_that_pays_the_node_and_refunds_the_payer_reaches_distributed() {
+    if !require_solana_test_validator() {
+        return;
+    }
     let validator = SolanaValidator::spawn().await;
     let rpc =
         RpcClient::new_with_commitment(validator.rpc_url.clone(), CommitmentConfig::confirmed());
@@ -132,32 +117,6 @@ async fn a_channel_sealed_below_its_deposit() -> Sealed {
         (ChannelStatus::Sealed, VOUCHER)
     );
 
-    Sealed {
-        _validator: validator,
-        rpc,
-        sponsor,
-        payer,
-        mint,
-        watcher,
-        channel,
-    }
-}
-
-#[tokio::test]
-async fn a_distribute_that_pays_the_node_and_refunds_the_payer_reaches_distributed() {
-    if !require_solana_test_validator() {
-        return;
-    }
-    let Sealed {
-        _validator,
-        rpc,
-        sponsor,
-        payer,
-        mint,
-        watcher,
-        channel,
-    } = a_channel_sealed_below_its_deposit().await;
-
     let node_before = token_balance(&rpc, &sponsor.pubkey(), &mint).await;
     let payer_before = token_balance(&rpc, &payer.payer.pubkey(), &mint).await;
     let taken = watcher.tick(false).await.expect("tick");
@@ -172,77 +131,6 @@ async fn a_distribute_that_pays_the_node_and_refunds_the_payer_reaches_distribut
         DEPOSIT - VOUCHER,
         "the payer's refund: what no voucher claimed"
     );
-    assert_eq!(
-        read(&rpc, &channel).await.map(|account| account.status),
-        Some(ChannelStatus::Distributed)
-    );
-    assert!(watcher.stuck().is_empty());
-}
-
-/// The sponsor pays for `distribute`. With no SOL left it cannot, and the
-/// channel stays Sealed: a real chain failure, pass after pass, until the
-/// sponsor is funded again.
-#[tokio::test]
-async fn a_sealed_channel_whose_distribute_keeps_failing_is_reported_stuck() {
-    if !require_solana_test_validator() {
-        return;
-    }
-    let Sealed {
-        _validator,
-        rpc,
-        sponsor,
-        payer,
-        watcher,
-        channel,
-        ..
-    } = a_channel_sealed_below_its_deposit().await;
-
-    // Empty the sponsor: every lamport but the transfer's own fee.
-    let balance = rpc.get_balance(&sponsor.pubkey()).await.expect("balance");
-    let drain = |lamports| {
-        solana_sdk::system_instruction::transfer(&sponsor.pubkey(), &payer.payer.pubkey(), lamports)
-    };
-    let blockhash = rpc.get_latest_blockhash().await.expect("blockhash");
-    let fee = rpc
-        .get_fee_for_message(&solana_sdk::message::Message::new_with_blockhash(
-            &[drain(balance)],
-            Some(&sponsor.pubkey()),
-            &blockhash,
-        ))
-        .await
-        .expect("the transfer's fee");
-    send(&rpc, &[drain(balance - fee)], &sponsor, &[])
-        .await
-        .expect("empty the sponsor");
-    assert_eq!(
-        rpc.get_balance(&sponsor.pubkey()).await.expect("balance"),
-        0
-    );
-
-    for pass in 1..STUCK_AFTER_FAILED_PASSES {
-        let taken = watcher.tick(false).await.expect("tick");
-        assert!(steps_on(&taken, &channel).is_empty(), "distribute failed");
-        assert!(
-            watcher.stuck().is_empty(),
-            "one failed pass ({pass}) is a retry, not yet a stuck channel"
-        );
-    }
-    watcher.tick(false).await.expect("tick");
-    let stuck = watcher.stuck();
-    assert_eq!(stuck.len(), 1, "{stuck:?}");
-    assert_eq!(stuck[0].channel, ChannelId(channel.to_string()));
-    assert_eq!(stuck[0].failed_passes, STUCK_AFTER_FAILED_PASSES);
-    assert!(!stuck[0].last_error.is_empty());
-    assert_eq!(
-        read(&rpc, &channel).await.map(|account| account.status),
-        Some(ChannelStatus::Sealed)
-    );
-
-    // Funded again, the next pass distributes and the report clears.
-    fund(&rpc, &sponsor.pubkey()).await;
-    let taken = watcher.tick(false).await.expect("tick");
-    assert_eq!(steps_on(&taken, &channel), vec![Step::Distribute]);
-    assert!(watcher.stuck().is_empty());
     assert_eq!(
         read(&rpc, &channel).await.map(|account| account.status),
         Some(ChannelStatus::Distributed)

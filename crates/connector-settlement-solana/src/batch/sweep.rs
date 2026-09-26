@@ -62,15 +62,6 @@ pub const OPEN_SETTLE_INTERVAL: Duration = Duration::from_secs(600);
 /// Most `reclaim`s one transaction carries: two accounts each, no signer.
 const MAX_RECLAIMS_PER_TRANSACTION: usize = 10;
 
-/// How many passes in a row a Sealed channel's `distribute` may fail before
-/// the watcher reports it [stuck](SolanaBatchWatcher::stuck) and logs every
-/// further failure as an error rather than a warning (issue #1358). One
-/// failed pass is ordinary -- an RPC hiccup, a blockhash that expired -- but
-/// a `distribute` that fails every time leaves this node's share and the
-/// payer's refund in escrow, and a watcher that only retries would never
-/// say so. Three passes is half a minute on [`CLOSING_WATCH_INTERVAL`].
-pub const STUCK_AFTER_FAILED_PASSES: u32 = 3;
-
 /// What the watcher does next with one sponsored channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -359,18 +350,6 @@ struct Held {
     signature: [u8; 64],
 }
 
-/// A Sealed channel whose `distribute` has failed on at least
-/// [`STUCK_AFTER_FAILED_PASSES`] passes in a row, as
-/// [`SolanaBatchWatcher::stuck`] reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StuckChannel {
-    pub channel: ChannelId,
-    /// Consecutive passes on which `distribute` failed.
-    pub failed_passes: u32,
-    /// The latest failure's error.
-    pub last_error: String,
-}
-
 /// The Closing watcher and Open-channel sweep over one
 /// [`SolanaBatchSettlement`], reading the vouchers to land from `held` (the
 /// client edge's claim gate, in a running node). [`run`](Self::run) is what
@@ -382,10 +361,6 @@ pub struct SolanaBatchWatcher {
     /// The treasury owner this deployment's `distribute` accepted, once one
     /// has.
     treasury: Mutex<Option<Pubkey>>,
-    /// Sealed channels whose latest `distribute` failed, however few times.
-    /// An entry leaves when its `distribute` goes through or the channel is
-    /// no longer Sealed.
-    failed_distributes: Mutex<HashMap<Pubkey, StuckChannel>>,
 }
 
 impl SolanaBatchWatcher {
@@ -394,92 +369,18 @@ impl SolanaBatchWatcher {
             backend,
             held,
             treasury: Mutex::new(None),
-            failed_distributes: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Every Sealed channel whose `distribute` has failed on at least
-    /// [`STUCK_AFTER_FAILED_PASSES`] passes in a row, as of the last pass:
-    /// payouts this watcher is retrying but not delivering (issue #1358).
-    ///
-    /// In a running node the operator's signal is the log: every failed
-    /// `distribute` from the [`STUCK_AFTER_FAILED_PASSES`]th on is an
-    /// `error!` naming the channel, where an earlier one is a `warn!`. This
-    /// is the same judgement read directly -- what a test, or a later health
-    /// surface, asks instead of scraping logs.
-    pub fn stuck(&self) -> Vec<StuckChannel> {
-        let failed = self
-            .failed_distributes
-            .lock()
-            .expect("failed-distribute lock poisoned");
-        let mut stuck: Vec<StuckChannel> = failed
-            .values()
-            .filter(|entry| entry.failed_passes >= STUCK_AFTER_FAILED_PASSES)
-            .cloned()
-            .collect();
-        stuck.sort_by(|a, b| a.channel.0.cmp(&b.channel.0));
-        stuck
-    }
-
-    /// Record the outcome of a `distribute` on `channel`, and say so: a
-    /// failure is a warning until it has repeated
-    /// [`STUCK_AFTER_FAILED_PASSES`] times, and an error from then on.
-    fn record_distribute(&self, channel: &Pubkey, outcome: &Result<(), BatchSettlementError>) {
-        let mut failed = self
-            .failed_distributes
-            .lock()
-            .expect("failed-distribute lock poisoned");
-        let Err(error) = outcome else {
-            failed.remove(channel);
-            return;
-        };
-        let entry = failed.entry(*channel).or_insert_with(|| StuckChannel {
-            channel: ChannelId(channel.to_string()),
-            failed_passes: 0,
-            last_error: String::new(),
-        });
-        entry.failed_passes += 1;
-        entry.last_error = error.to_string();
-        if entry.failed_passes >= STUCK_AFTER_FAILED_PASSES {
-            tracing::error!(
-                %channel,
-                failed_passes = entry.failed_passes,
-                %error,
-                "a Sealed batch-settlement channel's distribute keeps failing; this node's share \
-                 and the payer's refund stay in escrow until it goes through"
-            );
-        } else {
-            tracing::warn!(
-                %channel,
-                failed_passes = entry.failed_passes,
-                %error,
-                "a batch-settlement distribute failed; retrying next pass"
-            );
         }
     }
 
     /// One pass over every sponsored channel: decide each one's [`Step`] and
     /// take it. `settle_open` is whether Open channels are settled this
     /// pass. Returns the steps taken, other than [`Step::Wait`]; a step
-    /// that failed is logged, left out and tried again next pass, and a
-    /// `distribute` that keeps failing is also reported by
-    /// [`stuck`](Self::stuck).
+    /// that failed is logged, left out and tried again next pass.
     pub async fn tick(
         &self,
         settle_open: bool,
     ) -> Result<Vec<(ChannelId, Step)>, BatchSettlementError> {
         let channels = self.backend.sponsored_channels().await?;
-        // A channel that left Sealed by any road -- distributed by anyone,
-        // or deallocated -- is no longer failing to distribute.
-        self.failed_distributes
-            .lock()
-            .expect("failed-distribute lock poisoned")
-            .retain(|address, _| {
-                channels.iter().any(|channel| {
-                    channel.address == *address
-                        && channel.account.status == wire::ChannelStatus::Sealed
-                })
-            });
         if channels.is_empty() {
             return Ok(Vec::new());
         }
@@ -540,7 +441,7 @@ impl SolanaBatchWatcher {
                 ),
                 _ => {}
             }
-            let outcome = self
+            match self
                 .backend
                 .take(
                     channel,
@@ -548,20 +449,15 @@ impl SolanaBatchWatcher {
                     voucher.map(|held| held.signature),
                     &self.treasury,
                 )
-                .await;
-            if step == Step::Distribute {
-                // Counted, and logged with how often it has failed in a row.
-                self.record_distribute(&channel.address, &outcome);
-            } else if let Err(error) = &outcome {
-                tracing::warn!(
+                .await
+            {
+                Ok(()) => taken.push((ChannelId(channel.address.to_string()), step)),
+                Err(error) => tracing::warn!(
                     channel = %channel.address,
                     ?step,
                     %error,
                     "a batch-settlement step failed; retrying next pass"
-                );
-            }
-            if outcome.is_ok() {
-                taken.push((ChannelId(channel.address.to_string()), step));
+                ),
             }
         }
         if !reclaimable.is_empty() {
