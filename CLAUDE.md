@@ -80,7 +80,10 @@ disposable chain per test** and tears it down on drop:
   `make solana-test` and a hand-run `cargo build-sbf` write to as well. It also
   loads solana-foundation's `payment-channels` (ADR 0074) at its canonical id
   `CHNLx…`, from a committed mainnet-beta dump under
-  `crates/connector-settlement-solana/fixtures/` whose hash a test pins.
+  `crates/connector-settlement-solana/fixtures/` whose hash a test pins — and,
+  from the same directory and pinned the same way, mainnet-beta's Token program
+  (p-token) at the SPL Token id, because the bundled SPL Token refuses the
+  `Batch` a two-payout `distribute` sends (#1358).
 
 Nothing under `crates/` dials `localhost:8545` or `localhost:8899`. Starting
 `make anvil-up` before `cargo test` changes nothing. The containers exist for

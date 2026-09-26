@@ -28,7 +28,8 @@ use connector_settlement_solana::batch::wire::{
 use connector_settlement_solana::batch::SolanaBatchSettlement;
 use connector_settlement_solana::test_support::{
     create_mint, fund, mint_to, payment_channels_fixture, require_solana_test_validator,
-    BatchPayer, SolanaValidator, PAYMENT_CHANNELS_FIXTURE_SHA256,
+    token_program_fixture, BatchPayer, SolanaValidator, PAYMENT_CHANNELS_FIXTURE_SHA256,
+    TOKEN_PROGRAM_FIXTURE_SHA256,
 };
 use connector_settlement_solana::RpcTransport;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
@@ -406,4 +407,15 @@ fn the_payment_channels_fixture_is_the_dumped_mainnet_binary() {
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(bytes.len(), 66_240);
     assert_eq!(hex, PAYMENT_CHANNELS_FIXTURE_SHA256);
+}
+
+/// The same pin for the Token program every harness validator runs at the
+/// SPL Token id (issue #1358): p-token, as mainnet-beta serves it.
+#[test]
+fn the_token_program_fixture_is_the_dumped_mainnet_binary() {
+    let bytes = std::fs::read(token_program_fixture()).expect("the committed fixture");
+    let digest = solana_sdk::hash::hash(&bytes).to_bytes();
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(bytes.len(), 108_600);
+    assert_eq!(hex, TOKEN_PROGRAM_FIXTURE_SHA256);
 }

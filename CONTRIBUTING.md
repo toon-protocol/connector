@@ -404,7 +404,9 @@ chain-backed test forks a **disposable** node of its own on its own port and tea
 `connector_settlement_solana::test_support::SolanaValidator::spawn` for `solana-test-validator`,
 which also loads `payment_channel.so` into genesis at a fixed program id, and the committed
 `payment-channels` binary (`crates/connector-settlement-solana/fixtures/`, ADR 0074) at its
-canonical one. Nothing under `crates/`
+canonical one, and mainnet-beta's Token program (p-token, from the same directory) at the SPL
+Token id, since the validator's bundled SPL Token refuses the `Batch` a two-payout `distribute`
+sends (#1358). Nothing under `crates/`
 dials `localhost:8545` or `localhost:8899`, so running `make anvil-up` or `make solana-up` before
 `cargo test` changes nothing. The Docker chain profiles exist for running a node by hand, and for
 `local/` — not for the test gate.
