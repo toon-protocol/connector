@@ -669,9 +669,8 @@ impl SolanaValidator {
         assert!(
             served.as_deref() == std::fs::read(token_program_fixture()).ok().as_deref(),
             "solana-test-validator at {rpc_url} does not serve the committed p-token fixture at \
-             the SPL Token id (it served {} bytes there); a two-payout `distribute` would meet \
-             the bundled SPL Token, which refuses `Batch`",
-            served.map_or(0, |bytes| bytes.len())
+             the SPL Token id; a two-payout `distribute` would meet the bundled SPL Token, which \
+             refuses `Batch`"
         );
 
         Self {
