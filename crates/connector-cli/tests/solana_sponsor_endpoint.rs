@@ -336,6 +336,36 @@ price = {PRICE}
         .await,
     );
 
+    // An `open` of a channel nobody prefunded. Where the cluster's Rent
+    // sysvar still carries a threshold of 2 -- the v2.1.21 validator the
+    // Rust Workspace Gate pins -- `payment-channels` would leave it short
+    // of rent, so it is refused by name before anything is signed, rather
+    // than as `simulation_failed` (issue #1356). Where the threshold is 1,
+    // the same `open` is sponsored, below.
+    let threshold_is_one = cluster_rent_threshold_is_one(&rpc).await;
+    if !threshold_is_one {
+        let unprefunded = payer
+            .admissible_open(&sponsor_pubkey, &mint, MIN_SPONSORED_DEPOSIT, ONE_DAY)
+            .await;
+        expect_refused(
+            "cluster_rent_threshold_unsupported",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )(
+            sponsor(
+                &app,
+                &client_built(&rpc, &payer, &sponsor_pubkey, &unprefunded).await,
+            )
+            .await,
+        );
+        assert_eq!(
+            rpc.get_balance(&unprefunded.channel(&program))
+                .await
+                .expect("balance"),
+            0,
+            "nothing was sent: the channel address holds nothing"
+        );
+    }
+
     assert_eq!(
         balance().await,
         untouched,
@@ -395,4 +425,31 @@ price = {PRICE}
         )
     });
     assert_eq!(recorded.lock().unwrap().len(), 1);
+
+    // Where SIMD-0194 has set the threshold to 1 -- mainnet-beta, devnet, a
+    // v3+ validator -- the program's rent figure is the real one, and an
+    // `open` of a channel nobody prefunded is sponsored as it stands.
+    if threshold_is_one {
+        let unprefunded = payer
+            .admissible_open(&sponsor_pubkey, &mint, MIN_SPONSORED_DEPOSIT, ONE_DAY)
+            .await;
+        let (status, body) = sponsor(
+            &app,
+            &client_built(&rpc, &payer, &sponsor_pubkey, &unprefunded).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["channelId"], unprefunded.channel(&program).to_string());
+    }
+}
+
+/// Whether the cluster's Rent sysvar carries SIMD-0194's exemption
+/// threshold of 1, read the way the sponsor reads it.
+async fn cluster_rent_threshold_is_one(rpc: &RpcClient) -> bool {
+    let sysvar = rpc
+        .get_account(&solana_sdk::sysvar::rent::id())
+        .await
+        .expect("the Rent sysvar");
+    let rent: solana_sdk::rent::Rent = bincode::deserialize(&sysvar.data).expect("decodes");
+    rent.exemption_threshold == 1.0
 }
