@@ -21,7 +21,7 @@ use connector_chain_rpc::evm::EvmRpc;
 use connector_chain_rpc::RpcTransport;
 use ethers::contract::{ContractError, EthEvent};
 use ethers::providers::{Middleware, Provider, ProviderError};
-use ethers::types::{Address, ValueOrArray};
+use ethers::types::Address;
 
 use crate::bindings::token_network::{
     ChannelNewDepositFilter, ChannelOpenedFilter, ChannelSettledFilter,
@@ -30,6 +30,7 @@ use crate::bindings::token_network::{
 use crate::channel_index::{
     ChannelIndexEvent, EvmChannelIndex, EvmChannelIndexError, OrderedChannelIndexEvent,
 };
+use crate::log_query::scoped_event;
 
 /// Widest single `eth_getLogs` range this syncer asks for in one request
 /// (issue #661 decision point 3: "backfill in bounded block ranges" --
@@ -158,30 +159,9 @@ impl EvmChannelIndexSyncer {
     /// One event type's logs over `from..=to`, decoded by `into` and tagged
     /// with the `(block_number, log_index)` position the chain gave them.
     ///
-    /// The `address` filter is set EXPLICITLY, and that is the whole point
-    /// of it being written out here. `Contract::event::<D>()` builds
-    /// `D::new(Filter::new(), client)` (ethers-contract 2.0.14,
-    /// `src/contract.rs:314`) -- a bare filter carrying only the event's
-    /// topic0 and whatever block range is chained onto it. Its two
-    /// siblings, `event_with_filter` and `event_for_name`, both
-    /// `.address(self.address)` on the way through; `event` is the one that
-    /// does not, so the `eth_getLogs` this method sent named no contract at
-    /// all and asked for every `ChannelOpened`-shaped log on the chain.
-    ///
-    /// An unrestricted `eth_getLogs` is a request many public RPC providers
-    /// refuse outright rather than serve. The devnet relay and store boxes
-    /// both point `[settlement.evm].rpc_url` at
-    /// `https://base-sepolia-rpc.publicnode.com`, which answers
-    /// `-32701 Please specify an address in your request` -- so
-    /// [`Self::sync_once`] failed on its very first range, the index never
-    /// took a checkpoint, and every channel lookup on both boxes fell back
-    /// to a direct chain read for the life of the process (verified
-    /// 2026-08-14 against `connector:rust-sha-415531a`: the retry warning
-    /// below was ~99.99% of 100,000 lines of connector output). Scoping the
-    /// query to the `TokenNetwork` this syncer was built for is also simply
-    /// correct -- it is the only contract whose logs this index folds in --
-    /// and it makes the query cheaper on providers that would have served
-    /// the wide one.
+    /// The query is [`scoped_event`]'s, so it names the `TokenNetwork` this
+    /// syncer was built for: see that module for why nothing here may build
+    /// one any other way (#970).
     async fn collect_logs<E, F>(
         &self,
         from: u64,
@@ -193,10 +173,7 @@ impl EvmChannelIndexSyncer {
         E: EthEvent,
         F: Fn(E) -> ChannelIndexEvent,
     {
-        let logs = self
-            .contract
-            .event::<E>()
-            .address(ValueOrArray::Value(self.contract.address()))
+        let logs = scoped_event::<_, E>(&self.contract)
             .from_block(from)
             .to_block(to)
             .query_with_meta()
