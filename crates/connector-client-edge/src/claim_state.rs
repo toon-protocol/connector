@@ -103,7 +103,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use connector_domain::client_claim::SCHEME_BATCH_SETTLEMENT;
+use connector_domain::client_claim::{parse_evm_channel_config, SCHEME_BATCH_SETTLEMENT};
 use connector_domain::Watermark;
 use connector_signer::{
     evm_voucher_signer, verify_evm_claim_state_challenge, verify_evm_voucher_claim_state_challenge,
@@ -114,6 +114,7 @@ use connector_signer::{
 use crate::channels::{
     decode_base58_bytes, decode_hex_bytes, ChannelResolutionError, DepositFloor,
 };
+use crate::claim_gate::decode_evm_channel_config;
 use crate::{hex_encode, now_unix, ClientEdgeState};
 
 /// The wire response for a channel entry stays the single generic
@@ -172,8 +173,10 @@ enum ChannelProofRequest {
         scheme: ChannelScheme,
         /// A batch-settlement channel's `ChannelConfig`, for a channel this
         /// node has no record of yet; see [`resolve_evm_voucher`].
+        /// Parsed by `connector_domain`'s own `channelConfig` parser, the
+        /// one a voucher's goes through.
         #[serde(default)]
-        channel_config: Option<ChannelConfigRequest>,
+        channel_config: Option<serde_json::Value>,
     },
     #[serde(rename_all = "camelCase")]
     Solana {
@@ -195,35 +198,6 @@ enum ChannelScheme {
     ToonChannel,
     #[serde(rename = "batch-settlement")]
     BatchSettlement,
-}
-
-/// An x402 `ChannelConfig` as a voucher's `channelConfig` spells it.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChannelConfigRequest {
-    payer: String,
-    payer_authorizer: String,
-    receiver: String,
-    receiver_authorizer: String,
-    token: String,
-    withdraw_delay: u64,
-    salt: String,
-}
-
-impl ChannelConfigRequest {
-    /// `None` for a field that is not its hex width. A `withdrawDelay`
-    /// wider than a `uint40` decodes, and simply hashes to no real channel.
-    fn decode(&self) -> Option<BatchChannelConfig> {
-        Some(BatchChannelConfig {
-            payer: decode_hex_bytes(&self.payer)?,
-            payer_authorizer: decode_hex_bytes(&self.payer_authorizer)?,
-            receiver: decode_hex_bytes(&self.receiver)?,
-            receiver_authorizer: decode_hex_bytes(&self.receiver_authorizer)?,
-            token: decode_hex_bytes(&self.token)?,
-            withdraw_delay: self.withdraw_delay,
-            salt: decode_hex_bytes(&self.salt)?,
-        })
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -381,7 +355,7 @@ async fn resolve_evm(
     expires: u64,
     signature_text: String,
     scheme: ChannelScheme,
-    channel_config: Option<ChannelConfigRequest>,
+    channel_config: Option<serde_json::Value>,
     now: u64,
 ) -> ChannelStateResult {
     if expires <= now {
@@ -399,7 +373,13 @@ async fn resolve_evm(
 
     let requester = format!("claim-state-challenge:{signature_text}");
     if scheme == ChannelScheme::BatchSettlement {
-        let presented = match channel_config.as_ref().map(ChannelConfigRequest::decode) {
+        let presented = channel_config
+            .filter(|config| !config.is_null())
+            .map(|config| {
+                let config = parse_evm_channel_config(&config).ok()?;
+                decode_evm_channel_config(&config).ok()
+            });
+        let presented = match presented {
             Some(None) => {
                 log_outcome("evm", &channel_id_text, "malformed_channel_config");
                 return unverified("evm", channel_id_text, "unverified");

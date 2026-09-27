@@ -727,10 +727,20 @@ const UINT40_MAX: u64 = (1 << 40) - 1;
 fn parse_evm_voucher_channel_config(
     obj: &serde_json::Map<String, Value>,
 ) -> Result<Option<EvmVoucherChannelConfig>, ClientClaimError> {
-    let config = match obj.get("channelConfig") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::Object(config)) => config,
-        Some(_) => return Err(malformed("'channelConfig' must be an object when present")),
+    match obj.get("channelConfig") {
+        None | Some(Value::Null) => Ok(None),
+        Some(config) => parse_evm_channel_config(config).map(Some),
+    }
+}
+
+/// An EVM voucher's `channelConfig` object, on its own: the one parser of
+/// that wire shape, shared by a voucher and by a claim-state entry that
+/// presents a channel's config (issue #1364).
+pub fn parse_evm_channel_config(
+    config: &Value,
+) -> Result<EvmVoucherChannelConfig, ClientClaimError> {
+    let Value::Object(config) = config else {
+        return Err(malformed("'channelConfig' must be an object when present"));
     };
     let address = |field: &str| -> Result<String, ClientClaimError> {
         let value = required_str(config, field)
@@ -756,7 +766,7 @@ fn parse_evm_voucher_channel_config(
             "'channelConfig.salt' must be 0x-prefixed 64-char hex (bytes32)",
         ));
     }
-    Ok(Some(EvmVoucherChannelConfig {
+    Ok(EvmVoucherChannelConfig {
         payer: address("payer")?,
         payer_authorizer: address("payerAuthorizer")?,
         receiver: address("receiver")?,
@@ -764,7 +774,7 @@ fn parse_evm_voucher_channel_config(
         token: address("token")?,
         withdraw_delay,
         salt: salt.to_string(),
-    }))
+    })
 }
 
 fn parse_evm_voucher(

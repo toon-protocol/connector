@@ -2141,7 +2141,7 @@ fn decode_voucher_signature(claim: &ClientClaim) -> Result<VoucherSignature, Cla
 /// An EVM voucher's `channelConfig`, decoded into the struct
 /// `connector_signer` hashes. The parser has already checked every field's
 /// shape, so a decode that fails here is still reported, not unwrapped.
-fn decode_evm_channel_config(
+pub(crate) fn decode_evm_channel_config(
     config: &EvmVoucherChannelConfig,
 ) -> Result<BatchChannelConfig, ClaimIngestRejection> {
     let address = |value: &str| {
