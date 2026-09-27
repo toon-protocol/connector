@@ -57,8 +57,11 @@ pub use claim_signature::{
     verify_solana_balance_proof, EvmBalanceProof,
 };
 pub use claim_state_challenge::{
-    evm_claim_state_challenge_digest, solana_claim_state_challenge_message,
-    verify_evm_claim_state_challenge, verify_solana_claim_state_challenge, EvmClaimStateChallenge,
+    evm_claim_state_challenge_digest, evm_voucher_claim_state_challenge_digest,
+    solana_claim_state_challenge_message, solana_voucher_claim_state_challenge_message,
+    verify_evm_claim_state_challenge, verify_evm_voucher_claim_state_challenge,
+    verify_solana_claim_state_challenge, verify_solana_voucher_claim_state_challenge,
+    EvmClaimStateChallenge,
 };
 pub use ed25519_signer::{Ed25519Signer, LocalEd25519Signer};
 pub use error::SignerError;
