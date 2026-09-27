@@ -1,6 +1,6 @@
 # A peering is established from a URL, and its identity is trust-on-first-use
 
-**Status:** Accepted — **built** (#1160), and **corrected** (#1217): the written peering could accept a claim but not sign one until #1217, because nothing populated the outbound CLIENT hop `Connector::cover_forward` reads — see "Update (issue #1217)" below. `POST /peers { id, url, fee, max_packet_amount }` reads the counterparty's self-description, derives the channel, opens it if absent, registers both the PEER-role and the CLIENT-role halves of the channel binding, and writes a durable runtime peering; `build_peer_transport` adds and removes a carriage while the process serves. Built on [0050](0050-a-connectors-url-resolves-to-its-self-description.md) (#1080), [0059](0059-a-channel-is-derived-from-its-participants.md) (#1158) and [0060](0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (#1157). Completes [0034](0034-a-runtime-peer-route-table-never-shadows-the-config-file.md), whose precedence rules governed a table that could not hold a peering. Satisfies both falsifiers of [0049](0049-the-cap-bounds-one-packet-is-discovered-by-t04-and-is-set-from-outside.md). Leaves [0043](0043-purchasable-peering-is-removed.md) and [0006](0006-the-connector-is-mechanism-not-policy.md) intact; **narrows** [0022](0022-a-connector-answers-it-does-not-announce.md), and says how below.
+**Status:** Accepted — **built** (#1160), and **corrected** (#1217): the written peering could accept a claim but not sign one until #1217, because nothing populated the outbound CLIENT hop `Connector::cover_forward` reads — see "Update (issue #1217)" below. `POST /peers { id, url, fee, max_packet_amount }` reads the counterparty's self-description, derives the channel, opens it if absent, registers both the PEER-role and the CLIENT-role halves of the channel binding, and writes a durable runtime peering; `build_peer_transport` adds and removes a carriage while the process serves. Built on [0050](0050-a-connectors-url-resolves-to-its-self-description.md) (#1080), [0059](0059-a-channel-is-derived-from-its-participants.md) (#1158) and [0060](0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (#1157). Completes [0034](0034-a-runtime-peer-route-table-never-shadows-the-config-file.md), whose precedence rules governed a table that could not hold a peering. Satisfies both falsifiers of [0049](0049-the-cap-bounds-one-packet-is-discovered-by-t04-and-is-set-from-outside.md). Leaves [0043](0043-purchasable-peering-is-removed.md) and [0006](0006-the-connector-is-mechanism-not-policy.md) intact; **narrows** [0022](0022-a-connector-answers-it-does-not-announce.md), and says how below. **Amended by [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)** (accepted 2026-09-27): `POST /peers` opens and funds only this node's outbound channel; the inbound one is admitted, not derived. See the Update at the foot.
 
 **Scope:** connector architecture — internal to this codebase. The document it reads is protocol law ([0050](0050-a-connectors-url-resolves-to-its-self-description.md)); the request that reads it is not. See the [ADR index](README.md).
 
@@ -307,3 +307,18 @@ fired before it. `PeerHasNoPayChannel` still exists and still means the same thi
 None of this changes what the write asks an operator for, what it returns, or the idempotence and
 gas-spending properties above — a repeat of the same `POST /peers` still finds the same channel, and
 both roles are re-bound on every call the same way the channel-derivation logic already was.
+
+## Update (ADR 0075, issue #1371) — accepted 2026-09-27, implementation pending
+
+[0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 4 amends this
+write. `POST /peers` still reads the self-description, still checks a shared chain and token, and
+still writes a durable runtime peering, but it **opens and funds only this node's outbound x402
+channel**. "Is there a live channel with this peer?" becomes a lookup of this node's own outbound
+channels, not a derivation ([0059](0059-a-channel-is-derived-from-its-participants.md) is retired),
+so idempotence rests on the outbound channel's journal entry being written before its opening
+transaction rather than on derivation. The inbound half is admitted when the peer's first voucher
+(EVM) or sponsored `open` (Solana) arrives, and bound by the voucher signer the peer's document
+publishes. Trust-on-first-use is unchanged.
+
+Until #1371's implementing steps land, the binary behaves as this record describes above; this
+Update states what changes when they do.

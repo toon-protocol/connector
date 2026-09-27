@@ -1,6 +1,6 @@
 # A claim proves a peering; the shared secret is deleted
 
-**Status:** Accepted — **built** (#1157). Finished what issue #868 decided on 2026-08-07 and only half landed: `peer-carriage-spec.md` §1.2 had said since then that the bearer credential does not decide role, while `connector-peer-auth` still decided on it and never examined a claim. **Required by [0058](0058-a-peering-is-established-from-a-url.md)** — while a shared secret is mandatory, a public document can never be sufficient to establish a peering. Applies [0008](0008-operator-surface-splits-read-from-write.md)'s rule to the peer surface. Deleted a wire field, so it disturbs [0021](0021-vectors-are-normative-prose-is-not.md) (`schema_version` is now **4**) and [0027](0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md).
+**Status:** Accepted — **built** (#1157). Finished what issue #868 decided on 2026-08-07 and only half landed: `peer-carriage-spec.md` §1.2 had said since then that the bearer credential does not decide role, while `connector-peer-auth` still decided on it and never examined a claim. **Required by [0058](0058-a-peering-is-established-from-a-url.md)** — while a shared secret is mandatory, a public document can never be sufficient to establish a peering. Applies [0008](0008-operator-surface-splits-read-from-write.md)'s rule to the peer surface. Deleted a wire field, so it disturbs [0021](0021-vectors-are-normative-prose-is-not.md) (`schema_version` is now **4**) and [0027](0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md). **Amended by [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)** (accepted 2026-09-27): the role proof becomes a voucher on a bound channel, or for a zero-value packet a claim-state challenge from that channel's voucher signer. The principle — a signature, never a shared secret — stands. See the Update at the foot.
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 
@@ -223,3 +223,17 @@ author imagined the code would take.** A good one for this record would have nam
 symbol — `UnmetRequirement::ProvenCredential`, which the decision genuinely deletes — rather than a
 symbol the author guessed would appear. The convention's own instruction says to pick a pattern the
 implementation cannot avoid; this one picked a pattern the implementation was right to avoid.
+
+## Update (ADR 0075, issue #1371) — accepted 2026-09-27, implementation pending
+
+[0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 5 amends the role
+rule. An interaction has role `peer` if and only if it carries **a voucher on a channel bound to
+that peer**, or — for a packet that moves no value — **the voucher claim-state challenge** (#1364)
+signed by such a channel's voucher signer and unexpired. A channel is bound to a peer when its
+voucher signer is the key the peer's self-description publishes or a config row names. This replaces
+the `toon-channel` claim, and the client BTP `auth_channel_proof` declaration, as the proof. The
+decision this record made — a signature proves a peering, and no shared secret does — stands
+unchanged.
+
+Until #1371's implementing steps land, the binary behaves as this record describes above; this
+Update states what changes when they do.

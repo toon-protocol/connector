@@ -288,9 +288,11 @@ HTTP request.
 **Peer role**:
 The authority of one interaction — `peer` or `client`. Decided by a signature, never by which
 listener the bytes arrived on and never by a shared secret: an interaction is a `peer` only if it
-carries a claim on a channel one peering configures, whose signature verifies against the
-counterparty key that peering configures. **The claim names its own peering** — a channel belongs to
-at most one — so nothing has to be asserted alongside it and nothing weaker is consulted first.
+carries a voucher on a channel bound to that peering, or — for a packet that moves no value — a
+claim-state challenge signed by such a channel's voucher signer (ADR 0075). A channel is bound to a
+peering when its voucher signer is the key the peer publishes or a config row names. **The evidence
+names its own peering** — a channel belongs to at most one — so nothing has to be asserted alongside
+it and nothing weaker is consulted first.
 There is no third role, no unroled state, and no fallthrough — anything that is not a proven peer is
 a client.
 _Avoid_: peer wire, peer session (for the role rather than the connection)
@@ -320,23 +322,21 @@ would let a stale config load with the key silently ignored.
 ### Value
 
 **Payment channel**:
-A two-party agreement, anchored on a chain, that lets value move between the parties many
-times while touching the chain only to open, top up, and close. **Identified by its participants**,
-not by a name either party chose: both sides compute the same identifier from the two of them and
-the token, so either can ask the chain whether it already exists without being told anything. At
-most one is live per pair per token, on every chain — a pair that has settled starts a fresh one
-rather than holding several at once.
+A one-way agreement, anchored on a chain, by which a payer escrows value for one receiver and
+hands it over many times while touching the chain only to open, top up, land and withdraw. Always an
+x402 `batch-settlement` channel. **Named by the voucher that pays on it and verified on chain**, not
+derived: a pair may hold several. A peering is two, one each way (ADR 0075).
 _Avoid_: channel (when ambiguous with a route or a stream)
 
 **Claim**:
 A signed statement of a payment channel's cumulative state, handed from payer to payee.
 Each claim supersedes the last, so a lost claim costs nothing and a replayed claim gains
-nothing. A claim has a **scheme**: `toon-channel`, or — at the client edge only —
-`batch-settlement`, whose claims are **vouchers** (ADR 0074).
-_Avoid_: receipt, payment, balance proof; "voucher" for a `toon-channel` claim
+nothing. Every claim is a **voucher** ([ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)). Until #1371's implementing steps land, the binary
+still also speaks `toon-channel` claims, the scheme ADR 0075 retires.
+_Avoid_: receipt, payment, balance proof; `toon-channel` (retired, ADR 0075)
 
 **Voucher**:
-A claim under x402's `batch-settlement` scheme (ADR 0074).
+A claim under x402's `batch-settlement` scheme (ADR 0074, ADR 0075) — the only kind.
 
 **Sponsor**:
 A connector's Solana settlement key, in the seats it takes on a client's x402 `batch-settlement`
@@ -358,13 +358,12 @@ one), and a forward it cannot cover is refused rather than carried. On **arrival
 the client edge and at a priced termination unconditionally; on a _forwarded_ arrival it is enforced
 per peering, behind `forwarded_claim_enforcement` (issue #1142), which still defaults to observing.
 
-**Nonce**:
-The counter that orders `toon-channel` claims within a channel. A payee accepts such a claim only
-if its nonce advances. A voucher has none; its amount orders it.
+**Nonce** _(retired term, ADR 0075)_:
+The counter that ordered `toon-channel` claims. A voucher has none; its amount orders it.
 
 **Watermark**:
-The highest nonce a payee has accepted on a channel — for a voucher, the highest cumulative
-amount, which the next voucher must strictly exceed.
+The highest cumulative amount a payee has accepted on a channel, which the next voucher must
+strictly exceed.
 
 **Exposure** _(retired term, [ADR 0033](docs/adr/0033-the-exposure-machinery-is-retired-not-restated.md), issue #882)_:
 Value a payee had delivered but did not yet hold a claim for, under the pre-#868 credit window.
@@ -530,8 +529,9 @@ connector is not.
 _Avoid_: wallet, key manager, custody
 
 **Settlement backend**:
-The chain-specific implementation of opening, funding, closing and redeeming for one
-chain.
+The chain-specific implementation of the settlement port for one chain: opening, funding, signing
+and withdrawing on its outbound channels, and admitting and landing vouchers on its inbound ones
+(ADR 0075).
 
 ### Storage
 

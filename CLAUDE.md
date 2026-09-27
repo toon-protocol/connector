@@ -169,11 +169,16 @@ key handling belongs to `toon-client`.
 
 A node reads these:
 
-| Config                             | File                    | What it signs                                           |
-| ---------------------------------- | ----------------------- | ------------------------------------------------------- |
-| `[signer] key_file`                | `signer.key`            | claims and gift-wrap; 32 raw bytes or 64 hex, secp256k1 |
-| `[settlement.evm.key] key_file`    | `settlement.key`        | EVM settlement transactions                             |
-| `[settlement.solana.key] key_file` | `settlement-solana.key` | Solana settlement transactions                          |
+| Config                             | File                    | What it signs                                                                                                    |
+| ---------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `[signer] key_file`                | `signer.key`            | identity: gift-wrap and the self-description; today also client-payout claims. 32 raw bytes or 64 hex, secp256k1 |
+| `[settlement.evm.key] key_file`    | `settlement.key`        | EVM settlement transactions and EVM claims (vouchers, under ADR 0075)                                            |
+| `[settlement.solana.key] key_file` | `settlement-solana.key` | Solana settlement transactions and Solana claims (vouchers, under ADR 0075)                                      |
+
+ADR 0075 (accepted, not yet built — #1371) makes each chain's settlement key the signer of every
+voucher on that chain and leaves `[signer]` as identity only, with no spending authority. Until its
+steps land, peer claims are still `toon-channel` claims, signed by the settlement keys as the table
+says, and client-payout claims are still signed by `[signer]`.
 
 `[announce]` is gone (ADR 0046 / #1074): the section is now `[node]`, holding only `addresses`,
 `http_endpoint` and `btp_endpoint` — the facts a node cannot introspect about itself — and no key of

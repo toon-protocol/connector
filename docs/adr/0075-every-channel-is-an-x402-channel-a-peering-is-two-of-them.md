@@ -1,12 +1,12 @@
 # Every channel is an x402 channel; a peering is two of them
 
-**Status:** Proposed (issue #1371). Not accepted, not live, and nothing in `crates/` implements it. The owner's decisions of 2026-09-27 on the points this record first left open are folded in (see "Decided by the owner before acceptance"); it stays Proposed. What would make it true: the owner accepts the record, **and** the one prerequisite under "Prerequisites" still open is met: the devnet's Base Sepolia leg runs on a mintable, ERC-3009 mock USDC. (#1364's voucher claim-state challenge, the other, has landed under the current records: PR #1368.) On acceptance it **supersedes** [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 1 (scope) and decision 9's receive-only port, together with the clauses of decisions 2, 3, 4, 5, 6 and 8 that rest on decision 1 (listed under "The sweep"). It **retires** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) (the `toon-channel` claim schemes), [0059](0059-a-channel-is-derived-from-its-participants.md) (the derivation rule), and [0026](0026-client-btp-rides-the-client-edge-peers-stay-on-the-peer-wire.md)'s payout netting (#700). It **amends** [0042](0042-a-packet-carries-its-claim.md) (a peering pays and is paid over two channels), [0058](0058-a-peering-is-established-from-a-url.md) (`POST /peers` opens the outbound channel only), [0060](0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (a peering is proven by a voucher, or by a claim-state challenge, from a bound channel's voucher signer), [0005](0005-claims-are-truth-balances-are-a-projection.md) (the nonce watermark goes; the journal holds an outbound channel's config) and [0050](0050-a-connectors-url-resolves-to-its-self-description.md) (the self-description drops `settlements`). It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): `schema_version` goes to **7**. It leaves [0010](0010-flat-per-packet-fee-and-minimum-delivery.md) and [0061](0061-a-fee-attaches-to-a-peering-not-to-a-route.md) untouched. Until acceptance, the other records' Status lines, `CONTEXT.md` and `docs/protocol/` are deliberately left alone: a Proposed record binds nothing, so it amends nothing yet.
+**Status:** Accepted (owner decision, 2026-09-27, issue #1371) — **not yet built**. Nothing in `crates/` implements it yet; the implementing steps are #1371's sub-issues, and the binary still speaks `toon-channel` claims until they land. The owner decided the points this record first left open before accepting it (see "Decided by the owner before acceptance"), and its facts about the `payment-channels` deployment were read on the day of acceptance. It **supersedes in part** [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md): decision 1 (scope), decision 9's receive-only port, and the clauses of decisions 2, 3, 4, 5, 6 and 8 that rest on decision 1 (listed under "The sweep"). It **retires** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) (the `toon-channel` claim schemes), [0059](0059-a-channel-is-derived-from-its-participants.md) (the derivation rule), and [0026](0026-client-btp-rides-the-client-edge-peers-stay-on-the-peer-wire.md)'s payout netting (#700). It **amends** [0042](0042-a-packet-carries-its-claim.md) (a peering pays and is paid over two channels), [0058](0058-a-peering-is-established-from-a-url.md) (`POST /peers` opens the outbound channel only), [0060](0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (a peering is proven by a voucher, or by a claim-state challenge, from a bound channel's voucher signer), [0005](0005-claims-are-truth-balances-are-a-projection.md) (the nonce watermark goes; the journal holds an outbound channel's config) and [0050](0050-a-connectors-url-resolves-to-its-self-description.md) (the self-description drops `settlements`). It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): `schema_version` goes to **7**. It leaves [0010](0010-flat-per-packet-fee-and-minimum-delivery.md) and [0061](0061-a-fee-attaches-to-a-peering-not-to-a-route.md) untouched. Those records' Status lines, the index and `CONTEXT.md` were updated on acceptance; `docs/protocol/` is amended with each implementing step (step 12). The one release prerequisite, an ERC-3009 devnet USDC, was already met by #1337 (see "Prerequisites").
 
 **Scope:** protocol law. It binds every implementation, because it removes a claim scheme from the wire, changes what proves the peer role, and changes the greeting and the self-description. The port shape (decision 2), the operator surface (decision 11) and the config (decision 9) are connector architecture. See the [ADR index](README.md).
 
-**Falsifier:** `crates/connector-operator/src/**/*.rs` matching `/channels/[:{]id\}?/withdraw` — this record is Proposed and claims that no outbound-withdrawal write exists yet; a match is the operator surface of decision 11 built against an unaccepted record.
+**Falsifier:** `crates/connector-operator/src/**/*.rs` matching `/channels/[:{]id\}?/withdraw` — no outbound-withdrawal write exists yet. Decision 11 adds it and nothing can serve the same purpose under another path, so a match means step 8 has landed and this record's Status line must say what is built.
 
-**Falsifier:** `crates/connector-vectors/src/**/*.rs` matching `SCHEMA_VERSION: u32 = 7` — the vectors this record would regenerate (decision 14) have not moved; a match is the wire changed against an unaccepted record.
+**Falsifier:** `crates/connector-vectors/src/**/*.rs` matching `SCHEMA_VERSION: u32 = 7` — the wire still carries `toon-channel` claims at `schema_version` 6. Decision 14 moves it to 7 and nothing else does, so a match means step 9 has landed and the Status line must say the wire is built.
 
 **A connector settles only on x402 `batch-settlement` channels, on both chains.** On EVM every
 channel is an `x402BatchSettlement` channel at `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003`; on
@@ -429,15 +429,15 @@ TOON gives up owning its settlement code. In return it stops having to deploy, a
   hold, and the next attempt reads the chain before opening another.
 - **The settlement key signs every outbound voucher, on both chains** (decision 3). It already signs
   the node's claims and its settlement transactions, so no key gets hotter than it is. A separate
-  session key is admissible (0074 decision 6) and is not taken here. `CLAUDE.md`'s key table, which
-  says `signer.key` signs claims, is already wrong about today's tree and is corrected on acceptance:
-  `[signer]` signs gift wrap and identity, and each settlement key signs its chain's vouchers and
-  transactions.
+  session key is admissible (0074 decision 6) and is not taken here. `CLAUDE.md`'s key table said
+  `signer.key` signs claims, which was half right: today it signs client-payout claims, while the
+  settlement keys sign peer claims. It was corrected on acceptance: `[signer]` is identity (gift wrap,
+  the self-description), and each settlement key signs its chain's vouchers and transactions.
 - **A challenge is a bearer proof for zero-value traffic until `expires`.** It is bound to one channel,
   so only that channel's receiver can use it, and the peer role it grants moves no value.
-- **Gasless onboarding needs an ERC-3009 token**, and the devnet's current mock USDC is not one (0074,
-  prerequisite 2). The devnet therefore moves its Base Sepolia leg to a mintable, FiatToken
-  v2.2-shaped mock USDC first (see "Prerequisites"). On mainnet the token is Circle's USDC, which has
+- **Gasless onboarding needs an ERC-3009 token.** The devnet already has one: since #1337
+  (2026-09-25) its Base Sepolia USDC is a FiatToken v2.2 the faucet mints (see "Prerequisites").
+  0074's prerequisite 2 describes the mock ERC-20 it replaced. On mainnet the token is Circle's USDC, which has
   ERC-3009; x402.org's facilitator does not list Base mainnet, so a mainnet client uses another.
 
 **What it buys:**
@@ -529,13 +529,13 @@ still drives them.
 
 ## Decided by the owner before acceptance (2026-09-27)
 
-These were open when the record was first written. The owner decided them; the record stays Proposed.
+These were open when the record was first written. The owner decided them on 2026-09-27, before accepting the record the same day.
 
 1. **The voucher signer is the chain's settlement key, on both chains** — on EVM
    `payerAuthorizer == payer`. This reverses #1371's `[signer]` choice. The reasons are under decision 3.
 2. **PR #1368 lands first, as it is**, under the current records (see "Prerequisites").
-3. **The devnet's Base Sepolia leg moves to an ERC-3009 mock USDC** before this record is built on
-   devnet (see "Prerequisites").
+3. **The devnet's Base Sepolia leg runs on an ERC-3009 USDC the faucet can mint** before the first
+   release that ships this record (see "Prerequisites").
 4. **The clauses of 0074 decisions 2, 3, 4, 5, 6 and 8 that repeat decision 1's scope are superseded**
    here too (The sweep). #1371 named only decisions 1 and 9.
 5. **0024, 0053 and 0059 are _Retired by 0075_**, not superseded: their mechanisms are deleted, and what
@@ -583,8 +583,11 @@ this hash to `0c07d575`, dated 2026-07-07. Its headline status reads "not verifi
 counts only a record from the current upgrade authority, and the vault has written none.
 
 **Devnet's binary is not the audited source as far as anything here can show.** A verifiable build
-of `0c07d575` with default features (the only feature set that compiles with the placeholder `TREASURY_OWNER`, which the fixture's provenance note in `connector-settlement-solana/src/test_support.rs` says devnet's binary carries) gives `dbfdc5f1…92db`, not devnet's hash, and a `devnet`-feature build of that commit is refused by its own build-time assert on the placeholder. No later commit touches `program/`.
-So devnet runs a build of unknown provenance, under a single key.
+of `0c07d575` with default features — the only feature set that compiles with the placeholder
+`TREASURY_OWNER`, which the fixture's provenance note in `connector-settlement-solana/src/test_support.rs`
+says devnet's binary carries — gives `dbfdc5f1…92db`, not devnet's hash, and a `devnet`-feature build
+of that commit is refused by its own build-time assert on the placeholder. No later commit touches
+`program/`. So devnet runs a build of unknown provenance, under a single key.
 
 **What this means for this record.** Mainnet — where a third party's value sits — runs the audited
 source under a 3-of-5 multisig with no time lock: an upgrade needs three of five keys and takes
@@ -597,17 +600,26 @@ are what an operator on either cluster accepts.
 ## Prerequisites
 
 - **PR #1368 (#1364's voucher claim-state challenge) lands first, as it is, under the current
-  records** — met: it landed on `main` as `5d6b8f2a`. It reads only the client-edge book, "because a voucher is never a peer claim (ADR 0074
-  decision 1)", which is right until this record is accepted. Decision 5 then makes its message the
-  peer-role proof and decision 6 makes its answer the outbound watermark's authority, so the peering
-  step (step 4 under "Order of work") widens the challenge from the client-edge book to the peer book,
-  citing this record.
-- **The devnet's Base Sepolia leg moves to a mintable, FiatToken v2.2-shaped mock USDC**: ERC-3009 plus
-  an ungated `mint`, the same shape the local anvil stack uses (decision 13), minted by the faucet. That
-  keeps the faucet's "mint, never drip" rule and gives a devnet client gasless ERC-3009 deposits, so
-  "USDC only, no gas" holds on devnet with no exception. A node may deposit through ERC-3009 or through
-  Permit2 after a one-time `approve`, since it holds ETH anyway. **Circle's own Base Sepolia USDC is
-  rejected**: the faucet cannot mint it.
+  records** — met: it landed on `main` as `5d6b8f2a`. It reads only the client-edge book, "because a
+  voucher is never a peer claim (ADR 0074 decision 1)", which was right until this record was
+  accepted. Decision 5 makes its message the peer-role proof and decision 6 makes its answer the
+  outbound watermark's authority, so the peering step (step 4 under "Order of work") widens the
+  challenge from the client-edge book to the peer book, citing this record.
+- **Before the first release that ships this record, the devnet's Base Sepolia USDC is an ERC-3009
+  token the faucet mints** (the owner moved this from "before any code" to "before the release" on
+  acceptance) — **already met, by #1337.** Since 2026-09-25 the devnet USDC is Circle's FiatToken
+  v2.2 bytecode deployed by this project at `0x0C996d7c934c79a6255254875607Fe69df25C0E1`, the same
+  shape the local anvil stack uses (decision 13), and every devnet node and the faucet point at it.
+  Read on chain on 2026-09-27: `name()` is `USDC`, `version()` is `2`, it answers
+  `RECEIVE_WITH_AUTHORIZATION_TYPEHASH()`, and the faucet key `0x7eC0c44F…0dBd` is a minter with an
+  effectively unlimited allowance. It keeps "mint, never drip" and gives a devnet client gasless
+  ERC-3009 deposits, so "USDC only, no gas" holds on devnet with no exception. A node may deposit
+  through ERC-3009 or through Permit2 after a one-time `approve`, since it holds ETH anyway. Minting
+  is **minter-gated** rather than open, which the owner's condition allows: what it requires is that
+  the faucet can mint, and Circle's own Base Sepolia USDC is rejected because the faucet cannot.
+  #1337's remaining follow-ups (the `RollingSwapChannel` redeploy, which this record retires anyway,
+  and sandbox parity in toon-protocol/infra) do not bear on it. This record, first written, said the
+  devnet's USDC had no ERC-3009; that was 0074's prerequisite-2 finding, overtaken two days earlier.
 - **#1367 (scoped log queries for the withdrawal watch)** — met: closed by PR #1370. The watchers this
   record extends to every channel depend on it.
 
@@ -641,7 +653,9 @@ Each step keeps the workspace gate green, and deletes the TOON-channel path it r
 
 ## On acceptance
 
-**Status lines to update**, each naming this record:
+Applied with the acceptance (2026-09-27).
+
+**Status lines updated**, each naming this record:
 
 - 0074: _Partly superseded by 0075_ — decision 1 and decision 9's receive-only port, and the clauses
   listed under "The sweep".
@@ -651,7 +665,7 @@ Each step keeps the workspace gate green, and deletes the TOON-channel path it r
 - 0042, 0058, 0060, 0005 and 0050: _amended by 0075_, with an `## Update` section each.
 - 0021: _disturbed by 0075_ (`schema_version` 7).
 
-**Glossary** (`CONTEXT.md`), to apply on acceptance:
+**Glossary** (`CONTEXT.md`), applied on acceptance:
 
 > **Payment channel**: A one-way agreement, anchored on a chain, by which a payer escrows value for one
 > receiver and hands it over many times while touching the chain only to open, top up, land and

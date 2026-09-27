@@ -1,6 +1,6 @@
 # Claims are the source of truth; balances are a projection
 
-**Status:** Accepted, amended by [0033](0033-the-exposure-machinery-is-retired-not-restated.md). Claims-as-truth and the replayed journal stand. The exposure and ceiling arithmetic named under "Consequences" is retired — nothing projects exposure any more. The crate it names, `connector-core`, shipped as `connector-domain`. **Amended by [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)** in one clause: the journal holds a batch-settlement voucher exactly as it holds a claim, but the voucher's watermark compares amounts, not nonces. **Amended again by [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)** (decision 3, 2026-09-25): the journal also holds, as `BatchChannelAdmitted`, the EVM `ChannelConfig` a batch-settlement channel was admitted under — neither signed nor irreversible, but nowhere else after a restart, and needed to claim the vouchers held on it.
+**Status:** Accepted, amended by [0033](0033-the-exposure-machinery-is-retired-not-restated.md). Claims-as-truth and the replayed journal stand. The exposure and ceiling arithmetic named under "Consequences" is retired — nothing projects exposure any more. The crate it names, `connector-core`, shipped as `connector-domain`. **Amended by [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)** in one clause: the journal holds a batch-settlement voucher exactly as it holds a claim, but the voucher's watermark compares amounts, not nonces. **Amended again by [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)** (decision 3, 2026-09-25): the journal also holds, as `BatchChannelAdmitted`, the EVM `ChannelConfig` a batch-settlement channel was admitted under — neither signed nor irreversible, but nowhere else after a restart, and needed to claim the vouchers held on it. **Amended by [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)** (accepted 2026-09-27): the nonce watermark goes and the voucher watermark becomes the only freshness rule; the journal also holds each outbound channel's config; a journal holding `toon-channel` entries is refused at boot by name. See the Update at the foot.
 
 **Scope:** connector architecture — internal to this codebase. See the [ADR index](README.md).
 
@@ -42,3 +42,17 @@ Losing double-entry means losing its built-in `sum(debits) == sum(credits)` chec
 replacement invariant is that every peer's projected balance equals the delta between the
 cumulative in its latest sent claim and its latest received claim, plus uncovered
 fulfilments. That is checkable on every projection rebuild, and should be.
+
+## Update (ADR 0075, issue #1371) — accepted 2026-09-27, implementation pending
+
+[0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 8 amends this
+record three ways. **The nonce watermark is deleted**: `Watermark { nonce, … }`, `validate_claim`
+and `advance_watermark` go, and 0074's amount-only voucher watermark becomes the only freshness
+rule, on both books. **The journal holds one more thing that is neither signed nor irreversible**:
+an outbound channel's config (on EVM the whole `ChannelConfig`, including `salt`), written before
+the opening transaction is sent, for the reason 0074 gave for `BatchChannelAdmitted`. **A journal
+holding `toon-channel` entries is refused at boot, by name**, with the drain procedure in the
+message — never skipped. Claims-as-truth and recovery-by-replay are untouched.
+
+Until #1371's implementing steps land, the binary behaves as this record describes above; this
+Update states what changes when they do.
