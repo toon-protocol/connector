@@ -695,5 +695,63 @@
         "expected_error": "voucher_expires"
       }
     ]
+  },
+  "voucher_claim_state_challenge": {
+    "evm": [
+      {
+        "name": "voucher_claim_state_evm_valid",
+        "chain_id": 84532,
+        "verifying_contract_hex": "4020074e9df2ce1dee5a9c1b5c3f541d02a10003",
+        "channel_id_hex": "88d37e9be679d5e46c7c1d073e6f41b5ec07cc5099319a49b80ba460f0d8055d",
+        "expires": 4102444800,
+        "voucher_signer_address_hex": "70997970c51812dc3a010c7d01b50e0d17dc79c8",
+        "signer_secret_hex": "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+        "signer_address_hex": "70997970c51812dc3a010c7d01b50e0d17dc79c8",
+        "digest_hex": "ee9d9aae4b9a58dfb47ba32c22337c18eb2550718dd76cd8369803a285bfe200",
+        "signature_hex": "0x056fb8080c9058e659c8e3e745ec2f0b6e7dd9999ae8880a277edf394b0322377bcd98b130ea1ec41be9a7b4bcfd1b975e7558c686ceba5baa83b91911d1a08d1b",
+        "signature_verifies": true,
+        "entry_json": "{\"blockchain\":\"evm\",\"channelConfig\":{\"payer\":\"0x1111111111111111111111111111111111111111\",\"payerAuthorizer\":\"0x70997970c51812dc3a010c7d01b50e0d17dc79c8\",\"receiver\":\"0x3333333333333333333333333333333333333333\",\"receiverAuthorizer\":\"0x4444444444444444444444444444444444444444\",\"salt\":\"0x6666666666666666666666666666666666666666666666666666666666666666\",\"token\":\"0x5555555555555555555555555555555555555555\",\"withdrawDelay\":86400},\"channelId\":\"0x88d37e9be679d5e46c7c1d073e6f41b5ec07cc5099319a49b80ba460f0d8055d\",\"expires\":4102444800,\"scheme\":\"batch-settlement\",\"signature\":\"0x056fb8080c9058e659c8e3e745ec2f0b6e7dd9999ae8880a277edf394b0322377bcd98b130ea1ec41be9a7b4bcfd1b975e7558c686ceba5baa83b91911d1a08d1b\"}"
+      },
+      {
+        "name": "voucher_claim_state_evm_wrong_key",
+        "chain_id": 84532,
+        "verifying_contract_hex": "4020074e9df2ce1dee5a9c1b5c3f541d02a10003",
+        "channel_id_hex": "88d37e9be679d5e46c7c1d073e6f41b5ec07cc5099319a49b80ba460f0d8055d",
+        "expires": 4102444800,
+        "voucher_signer_address_hex": "70997970c51812dc3a010c7d01b50e0d17dc79c8",
+        "signer_secret_hex": "999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8",
+        "signer_address_hex": "eb66e6e9be3cac9970df42967a625fea03c26278",
+        "digest_hex": "ee9d9aae4b9a58dfb47ba32c22337c18eb2550718dd76cd8369803a285bfe200",
+        "signature_hex": "0x37cdcaa93f39c7b24abad519244bc69037a30a48f3de4f83848d2e62124a20bd458b7c050c66e1824893d407c3d60d2ab92b51b0531c4d2186918d9421dd59b71b",
+        "signature_verifies": false,
+        "entry_json": "{\"blockchain\":\"evm\",\"channelConfig\":{\"payer\":\"0x1111111111111111111111111111111111111111\",\"payerAuthorizer\":\"0x70997970c51812dc3a010c7d01b50e0d17dc79c8\",\"receiver\":\"0x3333333333333333333333333333333333333333\",\"receiverAuthorizer\":\"0x4444444444444444444444444444444444444444\",\"salt\":\"0x6666666666666666666666666666666666666666666666666666666666666666\",\"token\":\"0x5555555555555555555555555555555555555555\",\"withdrawDelay\":86400},\"channelId\":\"0x88d37e9be679d5e46c7c1d073e6f41b5ec07cc5099319a49b80ba460f0d8055d\",\"expires\":4102444800,\"scheme\":\"batch-settlement\",\"signature\":\"0x37cdcaa93f39c7b24abad519244bc69037a30a48f3de4f83848d2e62124a20bd458b7c050c66e1824893d407c3d60d2ab92b51b0531c4d2186918d9421dd59b71b\"}"
+      }
+    ],
+    "solana": [
+      {
+        "name": "voucher_claim_state_solana_valid",
+        "channel_account_base58": "EBBduiozK9vBCemy4FcAjhVkby2FLPstxZxxN7jpgxtr",
+        "expires": 4102444800,
+        "authorized_signer_base58": "m2jBwVqJLY2WBVLwCwLAnumaf9zGxZTMpbX9h5W9oQ4",
+        "signer_secret_hex": "a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0",
+        "signer_public_key_base58": "m2jBwVqJLY2WBVLwCwLAnumaf9zGxZTMpbX9h5W9oQ4",
+        "signed_message_hex": "746f6f6e2d766f75636865722d636c61696d2d73746174652d6368616c6c656e67652d7631c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3005786f400000000",
+        "signature_base64": "kuqrFa3HDOV9ZauQnceCMhY2LQbl73XQZdbag5PpAr1UJJxuDEfAl9Kn36aFC+JHXdlC0hTibX99kIlxIV1bAA==",
+        "signature_verifies": true,
+        "entry_json": "{\"blockchain\":\"solana\",\"channelAccount\":\"EBBduiozK9vBCemy4FcAjhVkby2FLPstxZxxN7jpgxtr\",\"expires\":4102444800,\"scheme\":\"batch-settlement\",\"signature\":\"kuqrFa3HDOV9ZauQnceCMhY2LQbl73XQZdbag5PpAr1UJJxuDEfAl9Kn36aFC+JHXdlC0hTibX99kIlxIV1bAA==\"}"
+      },
+      {
+        "name": "voucher_claim_state_solana_wrong_key",
+        "channel_account_base58": "EBBduiozK9vBCemy4FcAjhVkby2FLPstxZxxN7jpgxtr",
+        "expires": 4102444800,
+        "authorized_signer_base58": "m2jBwVqJLY2WBVLwCwLAnumaf9zGxZTMpbX9h5W9oQ4",
+        "signer_secret_hex": "b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0",
+        "signer_public_key_base58": "FU1V55hpMNn9RbP8QAe5Z7hbasbbZfTSKwifFbVFqbww",
+        "signed_message_hex": "746f6f6e2d766f75636865722d636c61696d2d73746174652d6368616c6c656e67652d7631c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3005786f400000000",
+        "signature_base64": "4450sYkrSQUkZ70ZRZbNxP3mjqjoNbFBrOkjMUs7O5tZcAE8yNGKnp5OwSsby+kECwr2e29q9f8U4S+tHO75Cg==",
+        "signature_verifies": false,
+        "entry_json": "{\"blockchain\":\"solana\",\"channelAccount\":\"EBBduiozK9vBCemy4FcAjhVkby2FLPstxZxxN7jpgxtr\",\"expires\":4102444800,\"scheme\":\"batch-settlement\",\"signature\":\"4450sYkrSQUkZ70ZRZbNxP3mjqjoNbFBrOkjMUs7O5tZcAE8yNGKnp5OwSsby+kECwr2e29q9f8U4S+tHO75Cg==\"}"
+      }
+    ]
   }
 }

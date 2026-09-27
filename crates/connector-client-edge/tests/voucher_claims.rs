@@ -733,3 +733,319 @@ async fn a_voucher_lookup_that_finds_nothing_is_metered() {
     .await
     .expect("a known channel is looked up whatever the budget says");
 }
+
+// -- Claim state (issue #1364) --
+//
+// A voucher has no nonce, so a client that lost its channel store has only
+// one way to learn the amount its next voucher must exceed: ask. These go
+// through the real `POST /ilp/claim-state` route over the real gate.
+
+mod claim_state {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use base64::Engine;
+    use chrono::{TimeZone, Utc};
+    use connector_client_edge::router_with_gate;
+    use connector_runtime::{Connector, FakeAppClient, InProcessPeerTransport, TestClock};
+    use connector_signer::{
+        evm_claim_state_challenge_digest, evm_voucher_claim_state_challenge_digest,
+        solana_voucher_claim_state_challenge_message, EvmClaimStateChallenge, LocalSigner,
+    };
+    use tower::ServiceExt;
+
+    /// 2031-01-01, after the test clock's 2030 and any real one's today.
+    const EXPIRES: u64 = 1_924_992_000;
+
+    fn evm_challenge(secret: &SecretKey, channel: [u8; 32]) -> String {
+        sign_digest(
+            secret,
+            &evm_voucher_claim_state_challenge_digest(&domain(), &channel, EXPIRES),
+        )
+    }
+
+    fn sign_digest(secret: &SecretKey, digest: &[u8; 32]) -> String {
+        let (signature, recovery) = libsecp256k1::sign(&Message::parse(digest), secret);
+        let mut bytes = signature.serialize().to_vec();
+        bytes.push(recovery.serialize() + 27);
+        format!("0x{}", hex::encode(bytes))
+    }
+
+    fn evm_entry(signature: String, config: Option<&BatchChannelConfig>) -> serde_json::Value {
+        let mut entry = serde_json::json!({
+            "blockchain": "evm",
+            "scheme": "batch-settlement",
+            "channelId": format!("0x{}", hex::encode(channel_id())),
+            "expires": EXPIRES,
+            "signature": signature,
+        });
+        if let Some(config) = config {
+            entry["channelConfig"] = config_json(config);
+        }
+        entry
+    }
+
+    fn solana_entry(signer: &ed25519_dalek::Keypair) -> serde_json::Value {
+        let message = solana_voucher_claim_state_challenge_message(&SOLANA_CHANNEL, EXPIRES);
+        serde_json::json!({
+            "blockchain": "solana",
+            "scheme": "batch-settlement",
+            "channelAccount": bs58::encode(SOLANA_CHANNEL).into_string(),
+            "expires": EXPIRES,
+            "signature": base64::engine::general_purpose::STANDARD
+                .encode(signer.sign(&message).to_bytes()),
+        })
+    }
+
+    async fn claim_state(gate: ClientClaimGate, entry: serde_json::Value) -> serde_json::Value {
+        let connector = Arc::new(Connector::new(
+            vec![],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            Arc::new(TestClock::new(
+                Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap(),
+            )),
+        ));
+        let app = router_with_gate(
+            connector,
+            Arc::new(LocalSigner::generate("test-signer")),
+            None,
+            gate,
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ilp/claim-state")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "channels": [entry] }).to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        body["channels"][0].clone()
+    }
+
+    #[tokio::test]
+    async fn an_evm_voucher_channel_reports_its_amount_watermark_and_headroom() {
+        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let (gate, _journal) = gate_with(&backend);
+        gate.ingest(&signed_evm_voucher(100), 100)
+            .await
+            .expect("accepted");
+
+        let entry = claim_state(
+            gate,
+            evm_entry(evm_challenge(&authorizer(), channel_id()), None),
+        )
+        .await;
+
+        assert_eq!(
+            entry,
+            serde_json::json!({
+                "blockchain": "evm",
+                "channelId": format!("0x{}", hex::encode(channel_id())),
+                "ok": true,
+                "scheme": "batch-settlement",
+                "cumulativeClaimed": "100",
+                "maxCumulative": "1000",
+                "available": "900",
+                "lastClaimTime": null,
+            })
+        );
+    }
+
+    /// The case the endpoint exists for: the connector restarted too, and
+    /// only its journal knows the channel's config -- the client presents
+    /// none, as a client that lost its store could not.
+    #[tokio::test]
+    async fn after_a_restart_the_watermark_is_answered_from_the_journal_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client-claims.journal");
+        {
+            let gate = gate_over(
+                Arc::new(FileJournal::open(&path).expect("opens")),
+                &Arc::new(FakeBatchSettlement::new(1_000)),
+            );
+            gate.ingest(&signed_evm_voucher(250), 250)
+                .await
+                .expect("accepted");
+        }
+        let gate = gate_over(
+            Arc::new(FileJournal::open(&path).expect("reopens")),
+            &Arc::new(FakeBatchSettlement::new(1_000)),
+        );
+
+        let entry = claim_state(
+            gate,
+            evm_entry(evm_challenge(&authorizer(), channel_id()), None),
+        )
+        .await;
+
+        assert_eq!(entry["ok"], true);
+        assert_eq!(entry["cumulativeClaimed"], "250");
+    }
+
+    /// A channel nothing has been paid on yet has no record here, so the
+    /// config comes from the request -- checked to hash to the channel, and
+    /// the signer still read from what the backend admitted.
+    #[tokio::test]
+    async fn a_channel_with_no_voucher_yet_is_answered_from_a_presented_config() {
+        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let (gate, _journal) = gate_with(&backend);
+
+        let entry = claim_state(
+            gate,
+            evm_entry(evm_challenge(&authorizer(), channel_id()), Some(&config())),
+        )
+        .await;
+
+        assert_eq!(entry["ok"], true);
+        assert_eq!(entry["cumulativeClaimed"], "0");
+        assert_eq!(entry["available"], "1000");
+    }
+
+    #[tokio::test]
+    async fn a_channel_with_no_record_and_no_config_is_unverified() {
+        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let (gate, _journal) = gate_with(&backend);
+
+        let entry = claim_state(
+            gate,
+            evm_entry(evm_challenge(&authorizer(), channel_id()), None),
+        )
+        .await;
+
+        assert_eq!(entry["ok"], false);
+        assert_eq!(entry["error"], "unverified");
+    }
+
+    #[tokio::test]
+    async fn a_config_that_does_not_hash_to_the_channel_is_unverified() {
+        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let (gate, _journal) = gate_with(&backend);
+        let other = BatchChannelConfig {
+            salt: [0x77; 32],
+            ..config()
+        };
+
+        let entry = claim_state(
+            gate,
+            evm_entry(evm_challenge(&authorizer(), channel_id()), Some(&other)),
+        )
+        .await;
+
+        assert_eq!(entry["error"], "unverified");
+        assert_eq!(backend.lookups(), 0, "refused before the backend is asked");
+    }
+
+    /// Only the channel's voucher signer proves control: here the payer
+    /// named a separate `payerAuthorizer`, and the payer's own key is not it.
+    #[tokio::test]
+    async fn a_challenge_not_signed_by_the_voucher_signer_is_unverified() {
+        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let (gate, _journal) = gate_with(&backend);
+        gate.ingest(&signed_evm_voucher(100), 100)
+            .await
+            .expect("accepted");
+        let stranger = SecretKey::parse(&[0x0b; 32]).expect("valid secret");
+
+        let entry = claim_state(
+            gate,
+            evm_entry(evm_challenge(&stranger, channel_id()), None),
+        )
+        .await;
+
+        assert_eq!(entry["error"], "unverified");
+    }
+
+    /// The `toon-channel` challenge -- no `scheme`, `TokenNetwork`'s struct
+    /// under whatever domain -- proves nothing about a voucher channel, even
+    /// signed by its voucher signer over x402's own address.
+    #[tokio::test]
+    async fn a_toon_channel_challenge_does_not_open_a_voucher_channel() {
+        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let (gate, _journal) = gate_with(&backend);
+        gate.ingest(&signed_evm_voucher(100), 100)
+            .await
+            .expect("accepted");
+        let digest = evm_claim_state_challenge_digest(&EvmClaimStateChallenge {
+            channel_id: channel_id(),
+            expires: EXPIRES,
+            chain_id: CHAIN_ID,
+            token_network_address: domain().verifying_contract,
+        });
+        let signature = sign_digest(&authorizer(), &digest);
+
+        for scheme in [None, Some("batch-settlement")] {
+            let mut entry = evm_entry(signature.clone(), None);
+            match scheme {
+                Some(scheme) => entry["scheme"] = scheme.into(),
+                None => {
+                    entry.as_object_mut().unwrap().remove("scheme");
+                }
+            }
+            let answer = claim_state(gate_with(&backend).0, entry.clone()).await;
+            assert_eq!(answer["error"], "unverified", "scheme {scheme:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_solana_voucher_channel_reports_its_amount_watermark() {
+        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let (gate, _journal) = gate_with(&backend);
+        gate.ingest(&solana_voucher(300, &solana_signer(), 0), 300)
+            .await
+            .expect("accepted");
+
+        let entry = claim_state(gate, solana_entry(&solana_signer())).await;
+
+        assert_eq!(
+            entry,
+            serde_json::json!({
+                "blockchain": "solana",
+                "channelId": bs58::encode(SOLANA_CHANNEL).into_string(),
+                "ok": true,
+                "scheme": "batch-settlement",
+                "cumulativeClaimed": "300",
+                "maxCumulative": "1000",
+                "available": "700",
+                "lastClaimTime": null,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_solana_challenge_by_anyone_but_the_authorized_signer_is_unverified() {
+        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let (gate, _journal) = gate_with(&backend);
+        let secret = ed25519_dalek::SecretKey::from_bytes(&[0x22; 32]).expect("seed");
+        let public = (&secret).into();
+        let stranger = ed25519_dalek::Keypair { secret, public };
+
+        let entry = claim_state(gate, solana_entry(&stranger)).await;
+
+        assert_eq!(entry["error"], "unverified");
+    }
+
+    /// ADR 0074 decision 1: a node that has not opted in knows no voucher
+    /// channel, and says no more than that.
+    #[tokio::test]
+    async fn a_node_that_has_not_opted_in_answers_unverified() {
+        let gate = ClientClaimGate::restore(
+            ClientChannelRegistry::new(),
+            Arc::new(InMemoryJournal::new()),
+        )
+        .expect("an empty journal");
+
+        let entry = claim_state(
+            gate,
+            evm_entry(evm_challenge(&authorizer(), channel_id()), Some(&config())),
+        )
+        .await;
+
+        assert_eq!(entry["error"], "unverified");
+    }
+}

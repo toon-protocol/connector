@@ -8,6 +8,8 @@
 
 **Amended 2026-09-26 (#1357):** decision 8's Solana `extra` gains `tokenProgram`, which x402's SVM scheme requires and the entry had left out, and `sponsorEndpoint`, the path of decision 9's sponsor endpoint, which nothing on the wire had named. x402's optional `recentBlockhash` and `recentSlot` are left out on purpose, and decision 8 now says why. With these, a client builds a sponsored `open` from the greeting and the chain alone, and posts x402's own `deposit` object to `sponsorEndpoint`.
 
+**Amended 2026-09-27 (#1364):** `POST /ilp/claim-state` (`client-edge-spec.md` §1.10) answers for a batch-settlement channel, so a client that lost its channel store can recover the amount watermark decision 3 has its next voucher exceed. An entry carrying `scheme: "batch-settlement"` is proved by the channel's voucher signer (decision 4's), over a claim-state challenge distinct from a voucher: on EVM the existing `ClaimStateChallenge` struct under `x402BatchSettlement`'s domain, on Solana a message tagged `toon-voucher-claim-state-challenge-v1`. It is answered with the watermark and the collateral ceiling the gate admits the next voucher against, and no nonce. The vectors gain a `voucher_claim_state_challenge` section; it is additive, so `schema_version` stays 6.
+
 **Scope:** protocol law. It binds every implementation, because it adds a claim scheme to the wire and an offer to the greeting. The watchers and sweeps in decision 5 and the port shape in decision 9 are connector architecture. See the [ADR index](README.md).
 
 **A client may pay a connector over an x402 `batch-settlement` channel, on Base and on Solana: the

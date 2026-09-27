@@ -45,10 +45,13 @@ use connector_signer::giftwrap::{
 };
 use connector_signer::{
     derive_evm_address, evm_balance_proof_digest, evm_batch_channel_id,
-    evm_claim_state_challenge_digest, evm_voucher_digest, evm_voucher_signer,
-    solana_voucher_message, verify_evm_balance_proof, verify_evm_claim_state_challenge,
-    verify_evm_voucher, verify_solana_voucher, Address, BatchChannelConfig, BatchSettlementDomain,
-    EvmBalanceProof, EvmClaimStateChallenge, LocalSigner, Signer, X402_BATCH_SETTLEMENT_ADDRESS,
+    evm_claim_state_challenge_digest, evm_voucher_claim_state_challenge_digest, evm_voucher_digest,
+    evm_voucher_signer, solana_voucher_claim_state_challenge_message, solana_voucher_message,
+    verify_evm_balance_proof, verify_evm_claim_state_challenge, verify_evm_voucher,
+    verify_evm_voucher_claim_state_challenge, verify_solana_voucher,
+    verify_solana_voucher_claim_state_challenge, Address, BatchChannelConfig,
+    BatchSettlementDomain, Ed25519Signer, EvmBalanceProof, EvmClaimStateChallenge,
+    LocalEd25519Signer, LocalSigner, Signer, X402_BATCH_SETTLEMENT_ADDRESS,
 };
 use serde::Serialize;
 
@@ -173,6 +176,7 @@ pub struct WireVectors {
     pub channel_control_declaration: ChannelControlDeclarationVectors,
     pub charge: ChargeVectors,
     pub claim_voucher: ClaimVoucherVectors,
+    pub voucher_claim_state_challenge: VoucherClaimStateChallengeVectors,
 }
 
 #[derive(Debug, Serialize)]
@@ -2440,6 +2444,238 @@ fn generate_claim_voucher_vectors() -> ClaimVoucherVectors {
     }
 }
 
+// ---------------------------------------------------------------------
+// Claim state for an x402 batch-settlement channel (issue #1364,
+// `docs/protocol/client-edge-spec.md` §1.10)
+// ---------------------------------------------------------------------
+//
+// A `POST /ilp/claim-state` entry under `scheme: "batch-settlement"` is
+// proved by the channel's voucher signer over a claim-state challenge kept
+// apart from its vouchers (`connector_signer::claim_state_challenge`): on EVM
+// `ClaimStateChallenge(bytes32 channelId,uint256 expires)` under
+// `x402BatchSettlement`'s EIP-712 domain, on Solana a message tagged
+// `toon-voucher-claim-state-challenge-v1`. Each case is on the same channel
+// as the `claim_voucher` section's, signed through the real digest and
+// self-verified through the real verifier before it is emitted.
+
+/// One EVM batch-settlement claim-state entry.
+#[derive(Debug, Serialize)]
+pub struct VoucherClaimStateEvmCase {
+    pub name: &'static str,
+    /// The EIP-712 domain's `chainId`, as in `claim_voucher.evm`.
+    pub chain_id: u64,
+    /// The EIP-712 domain's `verifyingContract`: `x402BatchSettlement`.
+    pub verifying_contract_hex: String,
+    /// `claim_voucher.evm`'s channel.
+    pub channel_id_hex: String,
+    /// Unix seconds; as `channel_control_declaration`'s, checked against
+    /// the verifier's clock, not encoded in the signature's verdict.
+    pub expires: u64,
+    /// `evm_voucher_signer(channel_config)` -- the key `signature_hex` must
+    /// recover to: `claim_voucher.evm.signer_address_hex`.
+    pub voucher_signer_address_hex: String,
+    pub signer_secret_hex: String,
+    pub signer_address_hex: String,
+    /// `keccak256(0x1901 ‖ x402DomainSeparator ‖ structHash)` for
+    /// `ClaimStateChallenge(bytes32 channelId,uint256 expires)`.
+    pub digest_hex: String,
+    /// `r ‖ s ‖ v`, 65 bytes, `v` 27 or 28, `0x`-prefixed.
+    pub signature_hex: String,
+    /// Whether `signature_hex` recovers to `voucher_signer_address_hex`.
+    pub signature_verifies: bool,
+    /// The entry, byte-for-byte as it rides in the request's `channels[]`.
+    /// It carries the channel's `channelConfig`, which a node that has not
+    /// yet accepted a voucher on the channel needs and one that has
+    /// ignores.
+    pub entry_json: String,
+}
+
+/// One Solana batch-settlement claim-state entry.
+#[derive(Debug, Serialize)]
+pub struct VoucherClaimStateSolanaCase {
+    pub name: &'static str,
+    pub channel_account_base58: String,
+    pub expires: u64,
+    /// The channel account's `authorized_signer`, as base58.
+    pub authorized_signer_base58: String,
+    /// The Ed25519 seed of the key that signed.
+    pub signer_secret_hex: String,
+    pub signer_public_key_base58: String,
+    /// `"toon-voucher-claim-state-challenge-v1" ‖ channelAccount ‖ expires
+    /// (u64 LE)` -- what `signature_base64` covers.
+    pub signed_message_hex: String,
+    /// Base64, as every Solana claim-state signature is.
+    pub signature_base64: String,
+    pub signature_verifies: bool,
+    pub entry_json: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VoucherClaimStateChallengeVectors {
+    pub evm: Vec<VoucherClaimStateEvmCase>,
+    pub solana: Vec<VoucherClaimStateSolanaCase>,
+}
+
+/// 2100-01-01T00:00:00Z, as `channel_control_declaration`'s valid cases.
+const VOUCHER_CLAIM_STATE_EXPIRES: u64 = 4_102_444_800;
+
+/// anvil's account 1 (`0x59c6995e…690d`), the `payerAuthorizer` of
+/// `claim_voucher.evm`'s channel -- a published development key, never a
+/// real one.
+const VOUCHER_EVM_AUTHORIZER_SECRET: &str =
+    "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+fn voucher_claim_state_evm_case(
+    name: &'static str,
+    signer_secret: [u8; 32],
+    expect_verifies: bool,
+) -> VoucherClaimStateEvmCase {
+    let domain = BatchSettlementDomain::x402(VOUCHER_EVM_CHAIN_ID);
+    let config = voucher_evm_fixture_config();
+    let channel_id = evm_batch_channel_id(&domain, &config);
+    let voucher_signer = evm_voucher_signer(&config);
+    let expires = VOUCHER_CLAIM_STATE_EXPIRES;
+
+    let signer = LocalSigner::from_secret_bytes(name, signer_secret)
+        .expect("fixture secret is a valid secp256k1 scalar");
+    let signer_address = derive_evm_address(&signer.public_key().expect("fixture has a key"));
+    let digest = evm_voucher_claim_state_challenge_digest(&domain, &channel_id, expires);
+    let mut signature = signer
+        .sign(&digest)
+        .expect("fixture signer signs its own digest")
+        .to_bytes();
+    // The wallet convention a voucher's own signature uses.
+    signature[64] += 27;
+
+    let signature_verifies = verify_evm_voucher_claim_state_challenge(
+        &domain,
+        &channel_id,
+        expires,
+        &signature,
+        &voucher_signer,
+    );
+    assert_eq!(
+        signature_verifies, expect_verifies,
+        "vector {name} computed the wrong verification verdict"
+    );
+
+    let signature_hex = format!("0x{}", hex_of(&signature));
+    let entry_json = serde_json::json!({
+        "blockchain": "evm",
+        "scheme": SCHEME_BATCH_SETTLEMENT,
+        "channelId": format!("0x{}", hex_of(&channel_id)),
+        "expires": expires,
+        "signature": signature_hex,
+        "channelConfig": {
+            "payer": format!("0x{}", hex_of(&config.payer)),
+            "payerAuthorizer": format!("0x{}", hex_of(&config.payer_authorizer)),
+            "receiver": format!("0x{}", hex_of(&config.receiver)),
+            "receiverAuthorizer": format!("0x{}", hex_of(&config.receiver_authorizer)),
+            "token": format!("0x{}", hex_of(&config.token)),
+            "withdrawDelay": config.withdraw_delay,
+            "salt": format!("0x{}", hex_of(&config.salt)),
+        },
+    })
+    .to_string();
+
+    VoucherClaimStateEvmCase {
+        name,
+        chain_id: VOUCHER_EVM_CHAIN_ID,
+        verifying_contract_hex: hex_of(&X402_BATCH_SETTLEMENT_ADDRESS),
+        channel_id_hex: hex_of(&channel_id),
+        expires,
+        voucher_signer_address_hex: hex_of(&voucher_signer),
+        signer_secret_hex: hex_of(&signer_secret),
+        signer_address_hex: hex_of(&signer_address),
+        digest_hex: hex_of(&digest),
+        signature_hex,
+        signature_verifies,
+        entry_json,
+    }
+}
+
+fn voucher_claim_state_solana_case(
+    name: &'static str,
+    authorized_signer: [u8; 32],
+    signer_seed: [u8; 32],
+    expect_verifies: bool,
+) -> VoucherClaimStateSolanaCase {
+    let channel_account: [u8; 32] = [0xc3; 32];
+    let expires = VOUCHER_CLAIM_STATE_EXPIRES;
+    let signer =
+        LocalEd25519Signer::from_secret_bytes(signer_seed).expect("fixture seed is 32 bytes");
+    let message = solana_voucher_claim_state_challenge_message(&channel_account, expires);
+    let signature = signer.sign(&message);
+
+    let signature_verifies = verify_solana_voucher_claim_state_challenge(
+        &channel_account,
+        expires,
+        &signature,
+        &authorized_signer,
+    );
+    assert_eq!(
+        signature_verifies, expect_verifies,
+        "vector {name} computed the wrong verification verdict"
+    );
+
+    let channel_account_base58 = bs58::encode(channel_account).into_string();
+    let signature_base64 = BASE64.encode(signature);
+    let entry_json = serde_json::json!({
+        "blockchain": "solana",
+        "scheme": SCHEME_BATCH_SETTLEMENT,
+        "channelAccount": channel_account_base58,
+        "expires": expires,
+        "signature": signature_base64,
+    })
+    .to_string();
+
+    VoucherClaimStateSolanaCase {
+        name,
+        channel_account_base58,
+        expires,
+        authorized_signer_base58: bs58::encode(authorized_signer).into_string(),
+        signer_secret_hex: hex_of(&signer_seed),
+        signer_public_key_base58: bs58::encode(signer.public_key()).into_string(),
+        signed_message_hex: hex_of(&message),
+        signature_base64,
+        signature_verifies,
+        entry_json,
+    }
+}
+
+fn generate_voucher_claim_state_challenge_vectors() -> VoucherClaimStateChallengeVectors {
+    let authorizer = hex_bytes::<32>(VOUCHER_EVM_AUTHORIZER_SECRET);
+    let evm = vec![
+        voucher_claim_state_evm_case("voucher_claim_state_evm_valid", authorizer, true),
+        voucher_claim_state_evm_case(
+            "voucher_claim_state_evm_wrong_key",
+            seq_bytes::<32>(0x99),
+            false,
+        ),
+    ];
+
+    let seed = seq_bytes::<32>(0xa1);
+    let authorized_signer = LocalEd25519Signer::from_secret_bytes(seed)
+        .expect("fixture seed is 32 bytes")
+        .public_key();
+    let solana = vec![
+        voucher_claim_state_solana_case(
+            "voucher_claim_state_solana_valid",
+            authorized_signer,
+            seed,
+            true,
+        ),
+        voucher_claim_state_solana_case(
+            "voucher_claim_state_solana_wrong_key",
+            authorized_signer,
+            seq_bytes::<32>(0xb1),
+            false,
+        ),
+    ];
+
+    VoucherClaimStateChallengeVectors { evm, solana }
+}
+
 /// Build the full committed vector set. See the module docs for what
 /// "generated from the properties" means here, and
 /// `docs/protocol/wire-vectors.md` for the invariant each section pins.
@@ -2452,6 +2688,7 @@ pub fn generate() -> WireVectors {
     let channel_control_declaration = generate_channel_control_declaration_vectors();
     let charge = generate_charge_vectors();
     let claim_voucher = generate_claim_voucher_vectors();
+    let voucher_claim_state_challenge = generate_voucher_claim_state_challenge_vectors();
 
     WireVectors {
         schema_version: SCHEMA_VERSION,
@@ -2463,6 +2700,7 @@ pub fn generate() -> WireVectors {
         channel_control_declaration,
         charge,
         claim_voucher,
+        voucher_claim_state_challenge,
     }
 }
 
