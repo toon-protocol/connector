@@ -1,6 +1,6 @@
 # Architecture decision records
 
-74 records. **Every one now carries a `**Status:**` line under its title** — that line, not this
+75 records. **Every one now carries a `**Status:**` line under its title** — that line, not this
 index, is the authority for whether a record is live. This page is the map: what is live, grouped
 by area; what is dead, grouped by what killed it; and what the folder still says that the code no
 longer does.
@@ -17,7 +17,7 @@ The numbers are permanent and are never reused or renumbered — they are cited 
 times across this repo and from `toon-meta`, `relay` and `store`. This index groups them by
 scope; it does not move them.
 
-> **0065 is taken twice, and stays that way.** Seventy-five records, seventy-four numbers.
+> **0065 is taken twice, and stays that way.** Seventy-six records, seventy-five numbers.
 > [_A price is a schedule over payload length_](0065-a-price-is-a-schedule-over-payload-length.md)
 > (#984) and [_Mina leaves the repository_](0065-mina-leaves-the-repository.md) (#1205) were both
 > written on branches cut while 0064 was the folder's highest number, and both landed on `main` on
@@ -146,6 +146,7 @@ outside this repository.
 | [0035](0035-request-request-binding-ships-no-new-mechanism.md)                         | Request-request binding ships no new mechanism                                       | Accepted                                                                                                |
 | [0052](0052-permissionless-payment-is-guaranteed-and-a-claim-is-what-authorises.md)    | Permissionless payment is guaranteed; a claim, never an identity, authorises         | Accepted — the client edge's first record                                                               |
 | [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)                 | A client may pay over an x402 batch-settlement channel, and only a client            | Accepted — **built** (#1349); amends 0059, 0005; extends 0024, 0053; `schema_version` 6                 |
+| [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)              | Every channel is an x402 channel; a peering is two of them                           | **Proposed** (#1371) — would supersede 0074 d1/d9; retire 0024, 0053, 0059; `schema_version` 7          |
 
 ### The wire and its carriage
 
