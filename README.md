@@ -334,6 +334,124 @@ things help when debugging "why is nobody paying me":
 Turning the claims you collect into money on chain is
 [the operator surface](#the-operator-surface)'s job.
 
+### Also accept x402 channels (optional)
+
+Everything above is paid over TOON's own channels, which a payer opens itself and
+pays gas for. A node can also be paid over an **x402 `batch-settlement`
+channel** ([ADR 0074](docs/adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)).
+On Base that means x402's audited `x402BatchSettlement` contract
+(`0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003`). On Solana it means
+solana-foundation's `payment-channels` program
+(`CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX`). No TOON contract is involved.
+
+What you get is a payer who needs **no native gas**. A client holding only USDC
+can open a channel to you and pay. On EVM a stock x402 facilitator relays its
+deposit. On Solana your node sponsors the open.
+
+Once the channel is open, each packet carries a **voucher** where it would carry
+a claim. A voucher is x402's signed cumulative amount, and it is still a claim:
+one per packet, journaled, each one superseding the last. It rides in the same
+places a claim does, with `"scheme": "batch-settlement"`.
+
+To opt in, write a sub-table under a chain's settlement table. Each chain is
+opted in separately, and neither is on by default. There is no `enabled` key,
+because the table being there is the switch:
+
+```toml
+[settlement.evm.batch_settlement]
+asset_eip712_name    = "USDC"   # the EIP-712 domain of [settlement.evm] token_address --
+asset_eip712_version = "2"      # "USDC" / "2" for Circle's FiatToken v2.2, the devnet token
+# min_withdraw_delay_secs = 86400   # default one day; 900 at least, 30 days at most
+
+[settlement.solana.batch_settlement]
+min_sponsored_deposit = 1000000   # base units: the smallest deposit whose open you will pay rent for
+# min_grace_period_secs = 86400     # default one day; 900 at least
+```
+
+The token and the receiver are not declared again: they are the enclosing
+table's `token_address` and settlement key. The x402 contract address and program
+id are not settings at all. Each is deployed at the same address on testnets and
+mainnets, so the binary holds them as constants and never takes them from a
+voucher. `payment-channels` is unrelated to `[settlement.solana] program_id`,
+which stays TOON's own program. The two `asset_eip712_*` keys have no default,
+because a wrong domain gives clients a deposit signature that never verifies.
+Read them off the token with `cast call <token> 'name()(string)'` and
+`'version()(string)'` rather than copying the devnet values: Base mainnet's
+native USDC (`0x833589fC…2913`) is **`"USD Coin"`** / `"2"`, not `"USDC"`. The
+node boots either way, since it never signs under this domain itself, so a wrong
+name shows up only as every client's deposit failing.
+`min_sponsored_deposit` has none either, and `0` is refused, because it is the
+bound on an endpoint that spends your SOL.
+
+**What a payer sees.** The `402` greeting keeps its `toon-channel` entry first
+and gains one `batch-settlement` entry for each chain you opted in to. That entry
+is valid x402: a CAIP-2 `network`, the `asset`, `payTo` set to your settlement
+address, and an `extra` holding everything a stock x402 client needs to open a
+channel you will accept. `GET /ilp` publishes the same facts under
+`batchSettlements`.
+
+**How a channel gets opened.** Your node only admits a channel whose terms are
+the ones it published:
+
+- **EVM.** The client picks its own `payer` and `salt`. `receiver` and
+  `receiverAuthorizer` must both be your settlement address, `token` must be your
+  token, and `withdrawDelay` must be at least your minimum. `payerAuthorizer`
+  must be **nonzero**. That last rule is stricter than x402, which allows a zero
+  one, and the greeting has no field to say so. A channel with a zero one is
+  refused on its first voucher. The client deposits through any x402 facilitator.
+  x402.org's facilitator relays deposits on Base Sepolia and pays their gas, but
+  only a token with ERC-3009 skips the payer's one-time `approve`, and devnet
+  USDC has ERC-3009. The first voucher on a channel your node has not seen carries
+  the full `channelConfig`, and the node recomputes the channel id from it.
+- **Solana.** The client builds an `open` in which your settlement key is the fee
+  payer, `rent_payer` and `payee`. It signs it and posts it to
+  `POST /ilp/batch-settlement/solana/open`, which the greeting names as
+  `extra.sponsorEndpoint`. The node checks every field, co-signs, submits, waits
+  for the channel to confirm, and admits it. This endpoint is **public** and
+  unauthenticated, because the buyer is a stranger with no channel yet. Its
+  limits are what it will sign, a cap of 8 sponsorships in flight and 1 per payer,
+  and an hourly budget of failed opens. Only SPL Token mints are accepted:
+  Token-2022 is refused.
+
+**How vouchers are checked.** A voucher has no nonce. It is accepted only if its
+amount is **strictly greater** than the last one accepted on that channel, by at
+least the route's charge. A replayed voucher buys nothing. A packet to a free
+route carries no voucher at all. A Solana voucher with a nonzero `expiresAt` is
+refused. A client that lost track of its last voucher asks
+`POST /ilp/claim-state` with `"scheme": "batch-settlement"` to learn the amount
+it has to beat.
+
+**How you get paid.** Automatically, with no operator write. On EVM, the node
+claims every held voucher in one `claim` and then `settle`s to your address every
+ten minutes. It also watches for `WithdrawInitiated`, and the moment a payer
+starts a withdrawal it claims that channel's latest voucher. That matters because
+only the amount already claimed on chain survives the withdrawal. On Solana, the
+node `settle`s open channels every ten minutes. It rediscovers its sponsored
+channels from the chain every ten seconds. On a closing channel it lands the
+latest voucher with `settle_and_seal` inside the grace period, then
+`distribute`s, then `reclaim`s the rent. The one-day minimum delay is how long a
+delayed or censored transaction still has to land.
+
+Before you opt in, know what it costs and what you are trusting:
+
+- **Payer-only.** Value moves one way. A client that expects payouts back from
+  you needs a TOON channel, because nothing is ever credited to an x402 one.
+- **Solana costs SOL.** Each sponsored channel locks about 0.0047 SOL of rent
+  (4,711,920 lamports) until it is reclaimed. Your node's token account for the
+  mint must already exist, because the sponsor refuses to open a channel into an
+  account that would forfeit its payout.
+- **Third-party code.** The EVM contracts are ownerless and immutable. That also
+  means nothing can rescue an escrow that USDC's blacklist has frozen.
+  `payment-channels` can be upgraded by solana-foundation's key. What you risk is
+  whatever you have accepted in vouchers and not yet landed on chain. The fleet
+  does not opt in.
+
+[`client-edge-spec.md`](docs/protocol/client-edge-spec.md) §1.3, §1.4, §1.10
+and §1.11 are the wire rules, and
+[`configuration-spec.md`](docs/protocol/configuration-spec.md) is the keys. The
+voucher's exact bytes are `claim_voucher` in
+[`vectors/wire-vectors.json`](vectors/wire-vectors.json).
+
 ---
 
 ## 4. Peer with another node
