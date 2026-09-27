@@ -481,11 +481,9 @@ fn read_request_body(stream: &mut std::net::TcpStream) -> Option<Vec<u8>> {
 /// Every `eth_getLogs` this syncer sends names the `TokenNetwork` it was
 /// built for, so an address-restricted provider serves it.
 ///
-/// `ethers-contract`'s `Contract::event::<D>()` builds `D::new(Filter::new(),
-/// ..)` -- a filter with no address -- where its siblings `event_with_filter`
-/// and `event_for_name` both set one. That difference is invisible against
-/// `anvil` and fatal against the endpoint the fleet runs on, which is why
-/// this case asserts on the FILTER rather than only on the sync succeeding.
+/// An address-less query is invisible against `anvil` and fatal against the
+/// endpoint the fleet runs on (see `src/log_query.rs`), which is why this
+/// case asserts on the FILTER rather than only on the sync succeeding.
 #[tokio::test]
 async fn every_log_query_names_the_token_network_so_a_restricted_rpc_serves_it() {
     let rpc = AddressRestrictedRpc::start(100);
@@ -522,6 +520,26 @@ async fn every_log_query_names_the_token_network_so_a_restricted_rpc_serves_it()
             "every query must be scoped to the TokenNetwork this syncer indexes: {filter}"
         );
     }
+    let topic0s: Vec<serde_json::Value> = filters
+        .iter()
+        .map(|filter| filter["topics"][0].clone())
+        .collect();
+    let expected: Vec<serde_json::Value> = [
+        "ChannelOpened(bytes32,address,address,uint256)",
+        "ChannelNewDeposit(bytes32,address,uint256)",
+        "ChannelSettled(bytes32,uint256,uint256)",
+    ]
+    .iter()
+    .map(|signature| {
+        serde_json::json!(ethers::types::H256::from(ethers::utils::keccak256(
+            signature.as_bytes()
+        )))
+    })
+    .collect();
+    assert_eq!(
+        topic0s, expected,
+        "each query is still one indexed event's, in the order the syncer folds them"
+    );
 }
 
 /// And the index really did take a checkpoint -- the thing that never

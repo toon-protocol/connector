@@ -29,6 +29,7 @@ mod bindings;
 mod channel_id;
 mod channel_index;
 pub mod channel_index_sync;
+mod log_query;
 mod send;
 // Also compiled for this crate's own `#[cfg(test)]` unit tests (none left
 // after issue #576 removed the #568 constructor-guard tests, which were

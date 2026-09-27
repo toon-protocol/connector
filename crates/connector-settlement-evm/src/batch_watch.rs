@@ -44,6 +44,7 @@ use connector_settlement::batch::{
 use connector_settlement::ChannelId;
 use connector_signer::{evm_voucher_signer, verify_evm_voucher};
 use ethers::abi::{AbiDecode, AbiEncode};
+use ethers::contract::Event;
 use ethers::middleware::Middleware;
 use ethers::types::Bytes;
 
@@ -51,9 +52,11 @@ use crate::batch_settlement::{
     backend_error, chain_config, parse_id, signer_config, EvmBatchSettlementBackend,
 };
 use crate::bindings::x402_batch_settlement::{
-    ChannelsCall, ChannelsReturn, Voucher as X402Voucher, VoucherClaim,
+    ChannelsCall, ChannelsReturn, Voucher as X402Voucher, VoucherClaim, WithdrawInitiatedFilter,
+    X402BatchSettlement,
 };
 use crate::channel_id::format_channel_id;
+use crate::log_query::scoped_event;
 use crate::send::confirm;
 
 /// How often the watcher reads new `WithdrawInitiated` logs. The same
@@ -122,6 +125,18 @@ pub struct SweepReport {
     pub settled: u128,
 }
 
+/// The `eth_getLogs` [`EvmBatchSettlementBackend::withdrawals_initiated`]
+/// sends for blocks `from..=to`: `WithdrawInitiated` logs of `contract`
+/// itself, scoped by [`scoped_event`] so an address-restricted RPC serves
+/// it (#1367).
+fn withdrawals_initiated_query<M: Middleware>(
+    contract: &X402BatchSettlement<M>,
+    from: u64,
+    to: u64,
+) -> Event<Arc<M>, M, WithdrawInitiatedFilter> {
+    scoped_event(contract).from_block(from).to_block(to)
+}
+
 impl EvmBatchSettlementBackend {
     /// The chain's current block.
     pub async fn block_number(&self) -> Result<u64, BatchSettlementError> {
@@ -143,11 +158,7 @@ impl EvmBatchSettlementBackend {
         let mut start = from;
         while start <= to {
             let end = start.saturating_add(MAX_BLOCK_RANGE - 1).min(to);
-            let logs = self
-                .contract
-                .withdraw_initiated_filter()
-                .from_block(start)
-                .to_block(end)
+            let logs = withdrawals_initiated_query(&self.contract, start, end)
                 .query()
                 .await
                 .map_err(backend_error)?;
@@ -474,7 +485,42 @@ impl EvmBatchWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use connector_signer::X402_BATCH_SETTLEMENT_ADDRESS;
+    use ethers::contract::EthEvent;
+    use ethers::providers::{Http, Provider};
+    use ethers::types::{Address, BlockNumber, FilterBlockOption, ValueOrArray};
     use proptest::prelude::*;
+
+    /// The withdrawal watch's `eth_getLogs` names `x402BatchSettlement`, so
+    /// an address-restricted RPC (publicnode's `-32701`) serves it rather
+    /// than refusing every tick (#1367). Asserted on the filter itself,
+    /// because `anvil` serves the address-less query just as happily.
+    #[test]
+    fn the_withdrawal_watch_query_names_the_contract_and_the_event() {
+        let address = Address::from(X402_BATCH_SETTLEMENT_ADDRESS);
+        let provider = Provider::<Http>::try_from("http://127.0.0.1:1").expect("provider");
+        let contract = X402BatchSettlement::new(address, Arc::new(provider));
+
+        let filter = withdrawals_initiated_query(&contract, 10, 20).filter;
+
+        assert_eq!(
+            filter.address,
+            Some(ValueOrArray::Value(contract.address()))
+        );
+        assert_eq!(
+            filter.topics[0],
+            Some(ValueOrArray::Value(Some(
+                WithdrawInitiatedFilter::signature()
+            )))
+        );
+        assert_eq!(
+            filter.block_option,
+            FilterBlockOption::Range {
+                from_block: Some(BlockNumber::Number(10.into())),
+                to_block: Some(BlockNumber::Number(20.into())),
+            }
+        );
+    }
 
     proptest! {
         /// A claim never records more than the voucher signs or the channel
