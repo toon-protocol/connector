@@ -103,7 +103,7 @@ use connector_signer::{
 };
 use ethers::contract::{abigen, LogMeta};
 use ethers::providers::{Http, Middleware, Provider};
-use ethers::types::{Address as EvmAddress, U256, U64};
+use ethers::types::{Address as EvmAddress, ValueOrArray, U256, U64};
 
 abigen!(
     Erc20,
@@ -274,8 +274,12 @@ async fn redeeming_transaction(
     claimant: EvmAddress,
 ) -> (ChannelClaimedFilter, LogMeta) {
     let contract = TokenNetworkClaims::new(token_network, Arc::new(provider.clone()));
+    // Scoped by hand: the generated `*_filter()` drops the address, and a
+    // public RPC refuses an address-less `eth_getLogs` (see
+    // `connector-settlement-evm`'s `log_query`).
     let logs = contract
         .channel_claimed_filter()
+        .address(ValueOrArray::Value(token_network))
         .from_block(from_block)
         .query_with_meta()
         .await
