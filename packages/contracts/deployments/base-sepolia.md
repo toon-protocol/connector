@@ -11,7 +11,8 @@ mock USDC, for the devnet nodes' EVM settlement to point at.
 
 - **Network:** Base Sepolia (`chainId 84532`)
 - **RPC:** https://sepolia.base.org
-- **Deployed:** 2026-07-18
+- **Deployed:** 2026-07-18 (2026-07-18T23:55:12Z). All four transactions below landed in the same
+  block, **44325312**.
 - **Script:** `packages/contracts/script/DeployTestnet.s.sol`
 - **Explorer:** https://sepolia.basescan.org
 
@@ -34,8 +35,14 @@ Verified on-chain: `getTokenNetwork(0x49beE1…) == 0x1E95493f…`.
 | --------------------------------- | -------------------------------------------------------------------- |
 | Deploy TokenNetworkRegistry       | `0x3db004967999e24a51c61251534a1bd507e679d4db94cf71eb1a4b08de2f1e49` |
 | Deploy Mock USDC (MockERC20)      | `0x60bf2264a0f543593e155732e194f50855a38e1d2d33b9ff3d21a426a0019b08` |
-| registry.createTokenNetwork(USDC) | `0xb066cf35dd118d21ff269c60466b5bd5a922d56a4f38a968c6c012d2199046c5` |
-| Mock USDC mint → deployer         | `0xf2855eea2a81157ffbd832cefd05528c62aeeac0945203661dd314a36a4c1ed5` |
+| registry.createTokenNetwork(USDC) | `0xf2855eea2a81157ffbd832cefd05528c62aeeac0945203661dd314a36a4c1ed5` |
+| Mock USDC mint → deployer         | `0xb066cf35dd118d21ff269c60466b5bd5a922d56a4f38a968c6c012d2199046c5` |
+
+> The two rows above were swapped in this table before TOON_Network#182 (both dated 2026-07-18):
+> `eth_getTransactionReceipt` against https://sepolia.base.org shows `0xf2855eea…` calling `to ==`
+> the registry `0xcC9079ad…` and emitting the `0x1E95493f…` `TokenNetworkCreated`-shaped log, while
+> `0xb066cf35…` calls `to ==` the mock USDC `0x49beE1Bca5…` and emits its `Transfer` mint event.
+> Fixed here; nothing downstream keyed off the old labels.
 
 ## Deployer / distributor
 
@@ -138,7 +145,13 @@ its `TokenNetwork` are new.
 
 Initialisation: `initialize` `0x8d521728…`, `initializeV2` `0xb94a2c0e…`, `initializeV2_1`
 `0x952a0392…`, `initializeV2_2` `0x8773b6f3…`, and `configureMinter(faucet, max)` `0xe111f9bf…`.
-`createTokenNetwork` was called through the live registry `0x0c41D9D4…`.
+`createTokenNetwork` was called through the live registry `0x0c41D9D4…`, tx
+`0xba947142c3c9d1101684ea515680d1d476ff80533ca55e7fca5be156b02abeb7`, **block 47285026**
+(2026-09-25T12:12:20Z) — the block of the range above that actually created `0x1B460621…`, and, per
+TOON_Network#182, what a node's `[settlement.evm] channel_index_from_block` should be set to on this
+preset: `eth_getCode` on `0x1B460621…` is empty at block 47285025 and non-empty at 47285026, and
+`base-sepolia-rpc.publicnode.com` (the devnet bundles' default RPC) already prunes below block
+46000000, so this is also the earliest safe value on that endpoint's current retention.
 
 Verified on-chain after broadcast:
 
