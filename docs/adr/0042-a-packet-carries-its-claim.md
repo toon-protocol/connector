@@ -1,6 +1,6 @@
 # A packet carries its claim
 
-**Status:** Accepted — **built** (issue #1145). **Supersedes [0031](0031-a-peer-prepare-arrives-with-its-covering-claim-or-it-is-greeted.md)**, retires [0004](0004-value-moves-on-fulfilment.md)'s headline, and amends [0010](0010-flat-per-packet-fee-and-minimum-delivery.md) and [0011](0011-rejects-accumulate-fees-and-probes-discover-cost.md). Built: the cap (`max_packet_amount`, with a default), the send half on **both chains** (`[[pay_channels]]` populating `outbound_client_hops` — issue #881 for EVM, issue #1146 for Solana), the rule that a **forwarded** arrival must carry a covering claim (issue #1142, per-peer `forwarded_claim_enforcement`, still defaulting to observe), and — issue #1145 — the **deletion of the postpay path** that made all of the above optional. `[[pay_channels]]` is now required of a peering this node forwards to, refused at load by name. (`ClaimEnforcement::Observe` was another item once listed here; it is resolved — **deleted**, decided in issue #1062 and deleted from the tree in issue #1077 — and it never governed forwarded arrivals in the first place, since `payment_required` filtered to `ClientRouteKind::Terminated`.) ~~Until an operator writes `forwarded_claim_enforcement = "enforce"`, forwarding still runs [0004](0004-value-moves-on-fulfilment.md)'s model end to end.~~ **That sentence is retired: 0004's model is deleted from the tree, and forwarding is covered whether or not a peering enforces on arrival.** See the issue #1145 Update at the foot of this record.
+**Status:** Accepted — **built** (issue #1145). **Supersedes [0031](0031-a-peer-prepare-arrives-with-its-covering-claim-or-it-is-greeted.md)**, retires [0004](0004-value-moves-on-fulfilment.md)'s headline, and amends [0010](0010-flat-per-packet-fee-and-minimum-delivery.md) and [0011](0011-rejects-accumulate-fees-and-probes-discover-cost.md). Built: the cap (`max_packet_amount`, with a default), the send half on **both chains** (`[[pay_channels]]` populating `outbound_client_hops` — issue #881 for EVM, issue #1146 for Solana), the rule that a **forwarded** arrival must carry a covering claim (issue #1142, per-peer `forwarded_claim_enforcement`, still defaulting to observe), and — issue #1145 — the **deletion of the postpay path** that made all of the above optional. `[[pay_channels]]` is now required of a peering this node forwards to, refused at load by name. (`ClaimEnforcement::Observe` was another item once listed here; it is resolved — **deleted**, decided in issue #1062 and deleted from the tree in issue #1077 — and it never governed forwarded arrivals in the first place, since `payment_required` filtered to `ClientRouteKind::Terminated`.) ~~Until an operator writes `forwarded_claim_enforcement = "enforce"`, forwarding still runs [0004](0004-value-moves-on-fulfilment.md)'s model end to end.~~ **That sentence is retired: 0004's model is deleted from the tree, and forwarding is covered whether or not a peering enforces on arrival.** See the issue #1145 Update at the foot of this record. **Amended by [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)** (accepted 2026-09-27): a peering pays over one channel and is paid over another, both x402. The rule that a packet carries its claim is unchanged. See the Update at the foot.
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 
@@ -450,3 +450,16 @@ topology directories one glob per line would pass today and silently cover no to
 tomorrow, which is a check that looks complete and is not — the same failure one level up. So this
 one stays a human's job, alongside `docs/adr/README.md`'s index rows, which
 `records_state_their_own_falsifier.rs` declines to cover for the same kind of reason.
+
+## Update (ADR 0075, issue #1371) — accepted 2026-09-27, implementation pending
+
+[0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 4 amends this
+record's one-channel peering. A peering pays over this node's outbound x402 channel and is paid over
+the peer's, and each side opens and funds only its own. `[[pay_channels]]` and the runtime hop sign
+vouchers on the outbound channel; the next hop's `POST /ilp/claim-state` stays the watermark
+authority. **The rule is unchanged**: every PREPARE carries the claim that pays for it, now a
+voucher, and the cap, the forwarded-arrival rule and `amount_after_fee(amount, fee)` are untouched.
+Each direction settles on its own; nothing nets.
+
+Until #1371's implementing steps land, the binary behaves as this record describes above; this
+Update states what changes when they do.

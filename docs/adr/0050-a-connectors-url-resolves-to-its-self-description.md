@@ -1,6 +1,6 @@
 # A connector's URL resolves to its self-description
 
-**Status:** Accepted — **built** (#1080). `GET /ilp` serves the document, `[announce]` is now `[node]`, and the x402 greeting is a projection of the same source. Completes [0022](0022-a-connector-answers-it-does-not-announce.md) by giving "answering" a single surface, and is what [0046](0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md) left behind when the announce was removed (#1074). Narrows [0003](0003-clean-room-peer-wire-versioned-client-edge.md)'s version-discovery mechanism onto this document. **[0058](0058-a-peering-is-established-from-a-url.md) builds on it** — a peering established from a URL reads this document and nothing else. Extended by [0067](0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md), which adds one more fact to what both surfaces publish: what a route wants sent to it.
+**Status:** Accepted — **built** (#1080). `GET /ilp` serves the document, `[announce]` is now `[node]`, and the x402 greeting is a projection of the same source. Completes [0022](0022-a-connector-answers-it-does-not-announce.md) by giving "answering" a single surface, and is what [0046](0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md) left behind when the announce was removed (#1074). Narrows [0003](0003-clean-room-peer-wire-versioned-client-edge.md)'s version-discovery mechanism onto this document. **[0058](0058-a-peering-is-established-from-a-url.md) builds on it** — a peering established from a URL reads this document and nothing else. Extended by [0067](0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md), which adds one more fact to what both surfaces publish: what a route wants sent to it. **Amended by [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)** (accepted 2026-09-27): the self-description drops `settlements` and publishes each chain's voucher signer. See the Update at the foot.
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 
@@ -178,3 +178,14 @@ endpoints may be omitted, and `[node]` may still exist for its `addresses` alone
 unpeerable, self-description. `docs/protocol/configuration-spec.md` CF-08 is amended to state the
 rule and cross-reference CF-17, which is what defines "carriage" and "exposed" here. The README
 gains a "Being peerable" step showing the three keys together.
+
+## Update (ADR 0075, issue #1371) — accepted 2026-09-27, implementation pending
+
+[0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 10 amends what
+the document publishes. `settlements` (the TOON channel terms) is dropped and `batchSettlements`
+stays. The document also publishes, per chain, the node's **voucher signer** — its settlement
+address on EVM, its settlement key on Solana — which is what a peer binds this node's inbound
+channel by. The greeting's `accepts[]` is `batch-settlement` entries only.
+
+Until #1371's implementing steps land, the binary behaves as this record describes above; this
+Update states what changes when they do.
