@@ -1,6 +1,6 @@
 # Every channel is an x402 channel; a peering is two of them
 
-**Status:** Proposed (issue #1371). Not accepted, not live, and nothing in `crates/` implements it. The owner's decisions of 2026-09-27 on the points this record first left open are folded in (see "Decided by the owner before acceptance"); it stays Proposed. What would make it true: the owner accepts the record, **and** the prerequisites under "Prerequisites" are met — #1364's voucher claim-state challenge (PR #1368) has landed under the current records, and the devnet's Base Sepolia leg runs on a mintable, ERC-3009 mock USDC. On acceptance it **supersedes** [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 1 (scope) and decision 9's receive-only port, together with the clauses of decisions 2, 3, 4, 5, 6 and 8 that rest on decision 1 (listed under "The sweep"). It **retires** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) (the `toon-channel` claim schemes), [0059](0059-a-channel-is-derived-from-its-participants.md) (the derivation rule), and [0026](0026-client-btp-rides-the-client-edge-peers-stay-on-the-peer-wire.md)'s payout netting (#700). It **amends** [0042](0042-a-packet-carries-its-claim.md) (a peering pays and is paid over two channels), [0058](0058-a-peering-is-established-from-a-url.md) (`POST /peers` opens the outbound channel only), [0060](0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (a peering is proven by a voucher, or by a claim-state challenge, from a bound channel's voucher signer), [0005](0005-claims-are-truth-balances-are-a-projection.md) (the nonce watermark goes; the journal holds an outbound channel's config) and [0050](0050-a-connectors-url-resolves-to-its-self-description.md) (the self-description drops `settlements`). It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): `schema_version` goes to **7**. It leaves [0010](0010-flat-per-packet-fee-and-minimum-delivery.md) and [0061](0061-a-fee-attaches-to-a-peering-not-to-a-route.md) untouched. Until acceptance, the other records' Status lines, `CONTEXT.md` and `docs/protocol/` are deliberately left alone: a Proposed record binds nothing, so it amends nothing yet.
+**Status:** Proposed (issue #1371). Not accepted, not live, and nothing in `crates/` implements it. The owner's decisions of 2026-09-27 on the points this record first left open are folded in (see "Decided by the owner before acceptance"); it stays Proposed. What would make it true: the owner accepts the record, **and** the one prerequisite under "Prerequisites" still open is met: the devnet's Base Sepolia leg runs on a mintable, ERC-3009 mock USDC. (#1364's voucher claim-state challenge, the other, has landed under the current records: PR #1368.) On acceptance it **supersedes** [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 1 (scope) and decision 9's receive-only port, together with the clauses of decisions 2, 3, 4, 5, 6 and 8 that rest on decision 1 (listed under "The sweep"). It **retires** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) (the `toon-channel` claim schemes), [0059](0059-a-channel-is-derived-from-its-participants.md) (the derivation rule), and [0026](0026-client-btp-rides-the-client-edge-peers-stay-on-the-peer-wire.md)'s payout netting (#700). It **amends** [0042](0042-a-packet-carries-its-claim.md) (a peering pays and is paid over two channels), [0058](0058-a-peering-is-established-from-a-url.md) (`POST /peers` opens the outbound channel only), [0060](0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (a peering is proven by a voucher, or by a claim-state challenge, from a bound channel's voucher signer), [0005](0005-claims-are-truth-balances-are-a-projection.md) (the nonce watermark goes; the journal holds an outbound channel's config) and [0050](0050-a-connectors-url-resolves-to-its-self-description.md) (the self-description drops `settlements`). It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): `schema_version` goes to **7**. It leaves [0010](0010-flat-per-packet-fee-and-minimum-delivery.md) and [0061](0061-a-fee-attaches-to-a-peering-not-to-a-route.md) untouched. Until acceptance, the other records' Status lines, `CONTEXT.md` and `docs/protocol/` are deliberately left alone: a Proposed record binds nothing, so it amends nothing yet.
 
 **Scope:** protocol law. It binds every implementation, because it removes a claim scheme from the wire, changes what proves the peer role, and changes the greeting and the self-description. The port shape (decision 2), the operator surface (decision 11) and the config (decision 9) are connector architecture. See the [ADR index](README.md).
 
@@ -390,9 +390,16 @@ in. It now covers **every unit of value a node holds**, with no opt-out:
 - **EVM.** The contracts are ownerless and immutable. Nothing can change them and nothing can rescue a
   stuck escrow: a USDC-blacklisted payer or receiver traps a channel for good (Cantina 3.2.1,
   acknowledged). That now includes a node's own outbound collateral toward its peers and its clients.
-- **Solana.** `payment-channels` can be upgraded by solana-foundation's key. Whether that authority is
-  a single keypair or a multisig was not determined, and whether the deployed binary equals the audited
-  source was not verified on either cluster (0074, decision 5).
+- **Solana.** `payment-channels` is upgradeable. On mainnet-beta its upgrade authority is a **Squads v4
+  multisig vault, 3 of 5**, with no time lock; on devnet it is a **single keypair**. The mainnet binary
+  **is** the audited source: a verifiable build of the audited commit reproduces it byte for byte. The
+  devnet binary matches **neither** verifiable build of the audited commit that was tried. The facts,
+  and how each was established, are under "The `payment-channels` deployment, as found".
+- **Audit scope.** Cantina's July 2026 report on `payment-channels` lists no `settle.rs`, `top_up.rs`
+  or `request_close.rs` in its scope (0074, decision 5). Under 0074 only a client called `top_up` and
+  `request_close`. Under this record a paying node calls both on every channel it funds and winds down,
+  and every receiving node lands through `settle`. The code that moves a node's own money is the code
+  the audit left out, and nothing here closes that gap.
 - **What a node risks.** As a receiver: what it has accepted but not landed. As a payer: its outbound
   deposits, which the program or contract holds and the node recovers only by withdrawing.
 
@@ -534,16 +541,63 @@ These were open when the record was first written. The owner decided them; the r
 5. **0024, 0053 and 0059 are _Retired by 0075_**, not superseded: their mechanisms are deleted, and what
    does the job — 0074 decision 4's voucher — existed before this record.
 
-## What the owner is asked to settle
+## The `payment-channels` deployment, as found
 
-- **What the Solana `payment-channels` upgrade authority and deployed binary are.** 0074 left both
-  undetermined for client-edge value. They are now undetermined for all of a node's value. The record
-  accepts that; the owner may want them determined first.
+Read on 2026-09-27 from public RPC only. Nothing was signed or sent. This settles the question 0074
+left open, and this record first carried as one for the owner, for both clusters.
+
+|                            | mainnet-beta                                                                                                                                                                           | devnet                                                             |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Program / ProgramData      | `CHNLxYvV…yGsX` / `CghQXkmw2F6p1exMETiZdNeUx9QGraWsNZ4eom1Cuiw1`                                                                                                                       | the same two addresses                                             |
+| Upgrade authority          | `DXtFpbPjcn2hxPnw79x1Pfoj35vXh5AsWBkS37YnXMVv`                                                                                                                                         | `4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap`                     |
+| What the authority is      | **A Squads v4 vault, 3 of 5**: vault 0 of multisig `4CxQs26DewQ1KaCHfyyjktkYjndNdUqCJvVdygtJFwcJ`, threshold 3, 5 members each with every permission, time lock 0, no config authority | **A single keypair**                                               |
+| Last deployed              | slot 431447053 (2026-07-07), by keypair `96WoyH3J…KuD`; authority moved to the vault at slot 435599419 (2026-07-27)                                                                    | slot 480232051 (2026-07-31), by the authority keypair itself       |
+| On-chain executable hash   | `afe23e2373acb36fa7317b7044beb07d785c2dacd5e0a494586cbabaa67485f2`                                                                                                                     | `6b5b11c1a42b294748b0759a04971cd4f3970092f48d012383fe4af8a110114d` |
+| Equals the audited source? | **Yes, established here**                                                                                                                                                              | **Not established**                                                |
+
+**How the authority was established.** `solana program show` gave each authority. Both accounts are
+owned by the System Program and hold no data, which on its own does not tell a keypair from a Squads
+vault. What does: the mainnet authority is **off** the ed25519 curve, so it is a program-derived
+address with no private key, and deriving Squads v4's vault 0
+(`["multisig", multisig, "vault", 0]` under `SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf`) for
+multisig `4CxQs…` gives exactly `DXtFp…`. That multisig was found from the authority's earliest
+transaction, a Squads `MultisigCreateV2`. It is owned by the Squads v4 program, and it is itself the
+PDA of its `create_key`. Its account data, read by the Squads v4 layout, gives threshold 3, time lock
+0, 5 members with permission mask 7 (initiate, vote, execute), and a config authority of the default
+key, so only the multisig itself can change its own members or threshold. Who the five members are
+was not determined; they are keys, not named parties. The devnet authority is **on** the curve, so
+it is not a program-derived address. It signed the devnet deploy itself: one key, which can replace
+devnet's program at any moment.
+
+**How the binary was established.** The on-chain executable hash is `solana-verify
+get-program-hash` (v0.5.2); a `solana program dump` hashed the same way, with trailing zeros trimmed,
+agrees on both clusters. The mainnet hash is the hash of the committed fixture
+`crates/connector-settlement-solana/fixtures/payment_channels.so`, whose whole-file SHA-256 a test
+pins as `PAYMENT_CHANNELS_FIXTURE_SHA256`. A verifiable build (`solana-verify build`, image
+`solanafoundation/solana-verifiable-build:3.1.13`, the upstream `justfile`'s recipe) of the audited
+commit `0c07d575` with `--no-default-features --features mainnet-beta` produced
+`afe23e23…85f2`, **the mainnet hash exactly**. The pin 0074 cites, `3ffa4d67`, has no change under
+`program/` since `0c07d575`, so the same holds for it. Third-party evidence agrees and is only that:
+OtterSec's verification API holds a verify record from `96WoyH3J…KuD`, the deploying key, matching
+this hash to `0c07d575`, dated 2026-07-07. Its headline status reads "not verified" because OtterSec
+counts only a record from the current upgrade authority, and the vault has written none.
+
+**Devnet's binary is not the audited source as far as anything here can show.** A verifiable build
+of `0c07d575` with default features (the only feature set that compiles with the placeholder `TREASURY_OWNER`, which the fixture's provenance note in `connector-settlement-solana/src/test_support.rs` says devnet's binary carries) gives `dbfdc5f1…92db`, not devnet's hash, and a `devnet`-feature build of that commit is refused by its own build-time assert on the placeholder. No later commit touches `program/`.
+So devnet runs a build of unknown provenance, under a single key.
+
+**What this means for this record.** Mainnet — where a third party's value sits — runs the audited
+source under a 3-of-5 multisig with no time lock: an upgrade needs three of five keys and takes
+effect at once, with no window in which a node could withdraw first. Devnet is weaker on both
+counts, and devnet is where this repository's own nodes settle. Neither changes the decision; both
+are what an operator on either cluster accepts.
+
+- **Still open:** what devnet's binary was built from.
 
 ## Prerequisites
 
 - **PR #1368 (#1364's voucher claim-state challenge) lands first, as it is, under the current
-  records.** It reads only the client-edge book, "because a voucher is never a peer claim (ADR 0074
+  records** — met: it landed on `main` as `5d6b8f2a`. It reads only the client-edge book, "because a voucher is never a peer claim (ADR 0074
   decision 1)", which is right until this record is accepted. Decision 5 then makes its message the
   peer-role proof and decision 6 makes its answer the outbound watermark's authority, so the peering
   step (step 4 under "Order of work") widens the challenge from the client-edge book to the peer book,
