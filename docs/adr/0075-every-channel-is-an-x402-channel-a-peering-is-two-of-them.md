@@ -1,6 +1,6 @@
 # Every channel is an x402 channel; a peering is two of them
 
-**Status:** Proposed (issue #1371). Not accepted, not live, and nothing in `crates/` implements it. What would make it true: the owner accepts the decisions below, including the three questions under "What the owner is asked to settle", **and** the one prerequisite under "Prerequisites" is closed: #1364's voucher claim-state challenge (open PR #1368) lands, because decision 5 makes it the peer-role proof and decision 6 makes it the outbound watermark's authority. On acceptance it **supersedes** [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 1 (scope) and decision 9's receive-only port, together with the clauses of decisions 2, 3, 4, 5, 6 and 8 that rest on decision 1 (listed under "The sweep"). It **retires** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) (the `toon-channel` claim schemes), [0059](0059-a-channel-is-derived-from-its-participants.md) (the derivation rule), and [0026](0026-client-btp-rides-the-client-edge-peers-stay-on-the-peer-wire.md)'s payout netting (#700). It **amends** [0042](0042-a-packet-carries-its-claim.md) (a peering pays and is paid over two channels), [0058](0058-a-peering-is-established-from-a-url.md) (`POST /peers` opens the outbound channel only), [0060](0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (a peering is proven by a voucher, or by a claim-state challenge, from a bound channel's voucher signer), [0005](0005-claims-are-truth-balances-are-a-projection.md) (the nonce watermark goes; the journal holds an outbound channel's config) and [0050](0050-a-connectors-url-resolves-to-its-self-description.md) (the self-description drops `settlements`). It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): `schema_version` goes to **7**. It leaves [0010](0010-flat-per-packet-fee-and-minimum-delivery.md) and [0061](0061-a-fee-attaches-to-a-peering-not-to-a-route.md) untouched. Until acceptance, the other records' Status lines, `CONTEXT.md` and `docs/protocol/` are deliberately left alone: a Proposed record binds nothing, so it amends nothing yet.
+**Status:** Proposed (issue #1371). Not accepted, not live, and nothing in `crates/` implements it. The owner's decisions of 2026-09-27 on the points this record first left open are folded in (see "Decided by the owner before acceptance"); it stays Proposed. What would make it true: the owner accepts the record, **and** the prerequisites under "Prerequisites" are met — #1364's voucher claim-state challenge (PR #1368) has landed under the current records, and the devnet's Base Sepolia leg runs on a mintable, ERC-3009 mock USDC. On acceptance it **supersedes** [0074](0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 1 (scope) and decision 9's receive-only port, together with the clauses of decisions 2, 3, 4, 5, 6 and 8 that rest on decision 1 (listed under "The sweep"). It **retires** [0024](0024-peer-wire-claims-sign-the-eip-712-balance-proof.md) and [0053](0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) (the `toon-channel` claim schemes), [0059](0059-a-channel-is-derived-from-its-participants.md) (the derivation rule), and [0026](0026-client-btp-rides-the-client-edge-peers-stay-on-the-peer-wire.md)'s payout netting (#700). It **amends** [0042](0042-a-packet-carries-its-claim.md) (a peering pays and is paid over two channels), [0058](0058-a-peering-is-established-from-a-url.md) (`POST /peers` opens the outbound channel only), [0060](0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (a peering is proven by a voucher, or by a claim-state challenge, from a bound channel's voucher signer), [0005](0005-claims-are-truth-balances-are-a-projection.md) (the nonce watermark goes; the journal holds an outbound channel's config) and [0050](0050-a-connectors-url-resolves-to-its-self-description.md) (the self-description drops `settlements`). It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): `schema_version` goes to **7**. It leaves [0010](0010-flat-per-packet-fee-and-minimum-delivery.md) and [0061](0061-a-fee-attaches-to-a-peering-not-to-a-route.md) untouched. Until acceptance, the other records' Status lines, `CONTEXT.md` and `docs/protocol/` are deliberately left alone: a Proposed record binds nothing, so it amends nothing yet.
 
 **Scope:** protocol law. It binds every implementation, because it removes a claim scheme from the wire, changes what proves the peer role, and changes the greeting and the self-description. The port shape (decision 2), the operator surface (decision 11) and the config (decision 9) are connector architecture. See the [ADR index](README.md).
 
@@ -100,8 +100,8 @@ genesis.
 **EVM, paying side.** The node builds a `ChannelConfig`:
 
 - `payer` is its EVM settlement address;
-- `payerAuthorizer` is its `[signer]` address (see the first question under "What the owner is asked
-  to settle");
+- `payerAuthorizer` is **the same settlement address** — `payerAuthorizer == payer`, which the
+  contract permits and 0074 decision 2's nonzero rule is satisfied by;
 - `receiver` and `receiverAuthorizer` are both the counterparty's published settlement address, as
   0074 decision 2 requires of any channel the counterparty will admit;
 - `token` is the token the two share;
@@ -112,10 +112,25 @@ It deposits by sending `deposit(config, amount, collector, collectorData)` itsel
 gas; no facilitator is involved. The deposit still passes through one of x402's collectors, because
 the contract has no other way in: `ERC3009DepositCollector` where the token has ERC-3009 (Circle
 USDC, and the local stack's FiatToken), with a fresh collector salt per deposit because it makes the
-ERC-3009 nonce; `Permit2DepositCollector` after a one-time `approve` where it does not (the devnet's
-mock USDC — 0074, prerequisite 2). A top-up is another `deposit` into the same config. Vouchers are
+ERC-3009 nonce; `Permit2DepositCollector` after a one-time `approve` where it does not (a
+node holds ETH, so a one-time `approve` costs it nothing that matters). A top-up is another `deposit` into the same config. Vouchers are
 EIP-712 `Voucher(channelId, maxClaimableAmount)` under the `x402BatchSettlement` domain, and the first
 voucher on a new channel carries `channelConfig`, exactly as a client's does today.
+
+**Which key signs a voucher: the chain's settlement key, on both chains** (owner's decision,
+2026-09-27; #1371 had proposed the `[signer]` address for EVM's `payerAuthorizer`). On EVM
+`payerAuthorizer == payer`; on Solana `authorized_signer` is the payer. The reasons:
+
+- **One rule on both chains.** Solana has to use the ed25519 settlement key anyway, because `[signer]`
+  is secp256k1 and cannot be an `authorized_signer`.
+- **It is today's rule.** An EVM peer claim is signed by the settlement key now, not by `[signer]`
+  (`connector-cli/src/runtime.rs`, `peer_claim_identity`), and a Solana one by the Solana settlement
+  key (`peer_claim_identity_solana`).
+- **`[signer]` stays the node's identity** — gift wrap ([0018](0018-a-payload-is-sealed-to-the-terminating-connector.md))
+  and the self-description — and never gains spending authority. [0058](0058-a-peering-is-established-from-a-url.md)'s
+  three identities stay apart.
+- **Separating the keys would buy little.** Both are hot on the same node, and the settlement key
+  already signs every deposit, top-up and withdrawal on the same channel.
 
 **Solana, paying side.** The node builds a `payment-channels` `open` in which:
 
@@ -152,8 +167,8 @@ opens and funds only this node's outbound channel. **It retires
   are legal, as they already are at the client edge.
 - **The inbound half is admitted, not configured.** The peer's voucher on its own channel is admitted
   by the receiving half's rules. The channel is then **bound** to that peer when its voucher signer —
-  EVM `payerAuthorizer`, Solana `authorized_signer` — is the key the peer's self-description publishes,
-  or the key a config row names. On EVM the channel shows up with its first voucher; on Solana it shows
+  EVM `payerAuthorizer`, Solana `authorized_signer` — is the peer's settlement address or key on that
+  chain as its self-description publishes it (decision 10), or the key a config row names. On EVM the channel shows up with its first voucher; on Solana it shows
   up when the peer posts its `open` to this node's sponsor endpoint. Neither operator pastes the other's
   channel id anywhere.
 - **Symmetry survives without derivation.** 0059's argument was that _"B must be able to add A the same
@@ -295,8 +310,9 @@ This **amends 0074 decision 8** and **[0050](0050-a-connectors-url-resolves-to-i
   `X402SolanaSettlementTerms`. The `batch-settlement` entries, one per configured chain, are the whole
   list, and every one is x402-valid. A stock x402 client can pay any TOON connector.
 - **The self-description** drops `settlements` (the TOON channel terms) and keeps `batchSettlements`.
-  It also publishes, per chain, the node's **voucher signer** — the key its outbound channels name — so
-  that a peer can bind the inbound channel (decision 4). The announcer sidecar reads channel terms from
+  It also publishes, per chain, the node's **voucher signer** — its settlement address on EVM, its
+  settlement key on Solana, which its outbound channels name (decision 3) — as the value a peer binds
+  the inbound channel by (decision 4). The announcer sidecar reads channel terms from
   `batchSettlements` alone.
 
 ### 11. The operator surface
@@ -351,8 +367,8 @@ channels live on them until drained.
 This disturbs [0021](0021-vectors-are-normative-prose-is-not.md). `vectors/wire-vectors.json` drops
 every `toon-channel` section — the top-level `claim` cases; `peer_carriage`'s `claim_evm`,
 `claim_solana`, `claim_digest_hex` and nonce cases; and `channel_control_declaration`, the
-`TokenNetwork`-domain `auth_channel_proof` — and gains a **peer voucher** case, a **zero-value peer packet** case, and a **peer-role
-challenge** case. The ack's cases are regenerated for vouchers. `schema_version` goes from 6 to **7**,
+`TokenNetwork`-domain `auth_channel_proof` — and gains a **peer voucher** case, a **zero-value peer
+packet** case, and a **peer-role challenge** case. The ack's cases are regenerated for vouchers. `schema_version` goes from 6 to **7**,
 and each voucher case is still cross-checked against the deployed `getVoucherDigest`. `toon-client`,
 `rig` and `swap` replay it; their implementations are theirs.
 
@@ -404,15 +420,18 @@ TOON gives up owning its settlement code. In return it stops having to deploy, a
   is why that entry is written **before** the opening transaction is sent (a choice this record makes;
   see below). A crash between the two leaves an entry that names a channel the chain may or may not
   hold, and the next attempt reads the chain before opening another.
-- **The Solana settlement key signs every outbound voucher.** It already signs the node's Solana claims
-  and transactions, so no key gets hotter than it is; a separate `authorized_signer` is admissible
-  (0074 decision 6) and is not taken here.
+- **The settlement key signs every outbound voucher, on both chains** (decision 3). It already signs
+  the node's claims and its settlement transactions, so no key gets hotter than it is. A separate
+  session key is admissible (0074 decision 6) and is not taken here. `CLAUDE.md`'s key table, which
+  says `signer.key` signs claims, is already wrong about today's tree and is corrected on acceptance:
+  `[signer]` signs gift wrap and identity, and each settlement key signs its chain's vouchers and
+  transactions.
 - **A challenge is a bearer proof for zero-value traffic until `expires`.** It is bound to one channel,
   so only that channel's receiver can use it, and the peer role it grants moves no value.
-- **Gasless onboarding depends on the token.** A client deposits with no gas only where the token has
-  ERC-3009 (Circle USDC on Base), or where a facilitator funds a Permit2 `approve`. The devnet's mock
-  USDC has neither, so on devnet a client that is not served by such a facilitator still needs a sliver
-  of Base Sepolia ETH (0074, prerequisite 2). x402.org's facilitator does not list Base mainnet.
+- **Gasless onboarding needs an ERC-3009 token**, and the devnet's current mock USDC is not one (0074,
+  prerequisite 2). The devnet therefore moves its Base Sepolia leg to a mintable, FiatToken
+  v2.2-shaped mock USDC first (see "Prerequisites"). On mainnet the token is Circle's USDC, which has
+  ERC-3009; x402.org's facilitator does not list Base mainnet, so a mainnet client uses another.
 
 **What it buys:**
 
@@ -501,31 +520,42 @@ still drives them.
 - **Run an x402 facilitator.** Out of scope. A node pays its own gas when it deposits, and clients keep
   using stock facilitators on EVM.
 
+## Decided by the owner before acceptance (2026-09-27)
+
+These were open when the record was first written. The owner decided them; the record stays Proposed.
+
+1. **The voucher signer is the chain's settlement key, on both chains** — on EVM
+   `payerAuthorizer == payer`. This reverses #1371's `[signer]` choice. The reasons are under decision 3.
+2. **PR #1368 lands first, as it is**, under the current records (see "Prerequisites").
+3. **The devnet's Base Sepolia leg moves to an ERC-3009 mock USDC** before this record is built on
+   devnet (see "Prerequisites").
+4. **The clauses of 0074 decisions 2, 3, 4, 5, 6 and 8 that repeat decision 1's scope are superseded**
+   here too (The sweep). #1371 named only decisions 1 and 9.
+5. **0024, 0053 and 0059 are _Retired by 0075_**, not superseded: their mechanisms are deleted, and what
+   does the job — 0074 decision 4's voucher — existed before this record.
+
 ## What the owner is asked to settle
 
-Three points on which #1371 and the tree do not say the same thing. The decisions above follow #1371;
-the owner confirms or changes each on acceptance.
-
-1. **Which key is `payerAuthorizer` on EVM.** #1371 names the `[signer]` address. Today an EVM peer
-   claim is signed by the **settlement** key, not `[signer]`'s (`connector-cli/src/runtime.rs`,
-   `peer_claim_identity`), because `TokenNetwork` requires the claim signer to be a participant; and
-   0058 keeps a node's three identities apart. Under x402 either key is admissible (0074 decision 6).
-   `[signer]` keeps the key that pays gas off the packet path. The settlement address would make the
-   voucher signer the settlement address the self-description already publishes, on both chains, so
-   decision 10 would publish nothing new. Either way, the self-description names the key.
-2. **What the Solana `payment-channels` authority and binary are.** 0074 left both open for client-edge
-   value. They are now open for all of a node's value. The record accepts that; the owner may want them
-   determined first.
-3. **The statuses on acceptance.** This record calls 0024, 0053 and 0059 **retired** — the mechanism is
-   deleted, and what does the job (0074 decision 4's voucher) existed before this record — rather than
-   superseded by it.
+- **What the Solana `payment-channels` upgrade authority and deployed binary are.** 0074 left both
+  undetermined for client-edge value. They are now undetermined for all of a node's value. The record
+  accepts that; the owner may want them determined first.
 
 ## Prerequisites
 
-- **#1364's voucher claim-state challenge must land** (open PR #1368). Decision 5 makes its message the
-  peer-role proof and decision 6 makes its answer the outbound watermark's authority. As written, #1368
-  reads only the client-edge book "because a voucher is never a peer claim (ADR 0074 decision 1)" — the
-  clause this record supersedes. Whichever lands second reconciles that sentence.
+- **PR #1368 (#1364's voucher claim-state challenge) lands first, as it is, under the current
+  records.** It reads only the client-edge book, "because a voucher is never a peer claim (ADR 0074
+  decision 1)", which is right until this record is accepted. Decision 5 then makes its message the
+  peer-role proof and decision 6 makes its answer the outbound watermark's authority, so the peering
+  step (step 4 under "Order of work") widens the challenge from the client-edge book to the peer book,
+  citing this record.
+- **The devnet's Base Sepolia leg moves to a mintable, FiatToken v2.2-shaped mock USDC**: ERC-3009 plus
+  an ungated `mint`, the same shape the local anvil stack uses (decision 13), minted by the faucet. That
+  keeps the faucet's "mint, never drip" rule and gives a devnet client gasless ERC-3009 deposits, so
+  "USDC only, no gas" holds on devnet with no exception. A node may deposit through ERC-3009 or through
+  Permit2 after a one-time `approve`, since it holds ETH anyway. **Circle's own Base Sepolia USDC is
+  rejected**: the faucet cannot mint it.
+- **#1367 (scoped log queries for the withdrawal watch)** — met: closed by PR #1370. The watchers this
+  record extends to every channel depend on it.
 
 ## Choices this record makes beyond #1371
 
@@ -535,8 +565,6 @@ the owner confirms or changes each on acceptance.
   journaled.
 - **A peer-role challenge's `expires` is to be short**, since within it the challenge is a bearer proof
   (decision 5). The bound is the implementing ticket's to fix.
-- **The consequential clauses of 0074 decisions 2, 3, 4, 5, 6 and 8** are superseded here too (The
-  sweep). #1371 names only decisions 1 and 9, but each of these clauses restates decision 1.
 
 ## Order of work
 
