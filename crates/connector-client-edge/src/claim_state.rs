@@ -70,12 +70,26 @@
 //! book they landed in. See [`verified_state`] for what went wrong each
 //! time it did not.
 //!
+//! **An x402 `batch-settlement` channel (issue #1364).** An entry carrying
+//! `scheme: "batch-settlement"` asks about a channel this node receives
+//! **vouchers** on (ADR 0074). A voucher has no nonce, so this endpoint is
+//! the only place a client that lost its channel store can learn the amount
+//! its next voucher must strictly exceed: the chain's `totalClaimed` /
+//! `settled` is only a floor, trailing the watermark until this node lands
+//! its latest voucher. Such an entry is proved by the channel's voucher
+//! signer over a challenge of its own ([`resolve_evm_voucher`],
+//! [`resolve_solana_voucher`]), and answered with the amount watermark and
+//! the ceiling the claim gate admits the next voucher against, and no nonce
+//! ([`VerifiedVoucherChannelState`]). Without the discriminator, an entry
+//! is a `toon-channel` one and a voucher channel is never found.
+//!
 //! **The admission path is untouched.** This handler only reads --
 //! [`crate::ClientClaimGate::watermark`], [`crate::ClientClaimGate::channels`],
 //! [`crate::ClientClaimGate::last_claim_time`] -- and a channel lookup that
 //! is not already known goes through the same budgeted
 //! [`crate::channels::ClientChannelRegistry::evm`]/`::solana` resolution a
-//! claim's own channel lookup does, so a flood of fabricated channel ids
+//! claim's own channel lookup does (a voucher channel, through the same
+//! metered batch-settlement lookup a voucher's does), so a flood of fabricated channel ids
 //! against this endpoint is bounded exactly as issue #613 already bounds
 //! it for claims. Nothing here calls `ingest`/`admit`, and no new work
 //! lands on `handle_prepare`'s packet path (see #686/#690).
@@ -89,14 +103,18 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use connector_domain::client_claim::{parse_evm_channel_config, SCHEME_BATCH_SETTLEMENT};
 use connector_domain::Watermark;
 use connector_signer::{
-    verify_evm_claim_state_challenge, verify_solana_claim_state_challenge, EvmClaimStateChallenge,
+    evm_voucher_signer, verify_evm_claim_state_challenge, verify_evm_voucher_claim_state_challenge,
+    verify_solana_claim_state_challenge, verify_solana_voucher_claim_state_challenge,
+    BatchChannelConfig, EvmClaimStateChallenge,
 };
 
 use crate::channels::{
     decode_base58_bytes, decode_hex_bytes, ChannelResolutionError, DepositFloor,
 };
+use crate::claim_gate::decode_evm_channel_config;
 use crate::{hex_encode, now_unix, ClientEdgeState};
 
 /// The wire response for a channel entry stays the single generic
@@ -151,13 +169,35 @@ enum ChannelProofRequest {
         channel_id: String,
         expires: u64,
         signature: String,
+        #[serde(default)]
+        scheme: ChannelScheme,
+        /// A batch-settlement channel's `ChannelConfig`, for a channel this
+        /// node has no record of yet; see [`resolve_evm_voucher`].
+        /// Parsed by `connector_domain`'s own `channelConfig` parser, the
+        /// one a voucher's goes through.
+        #[serde(default)]
+        channel_config: Option<serde_json::Value>,
     },
     #[serde(rename_all = "camelCase")]
     Solana {
         channel_account: String,
         expires: u64,
         signature: String,
+        #[serde(default)]
+        scheme: ChannelScheme,
     },
+}
+
+/// Which kind of channel an entry asks about, spelled as a claim's own
+/// `scheme` discriminator (ADR 0074 decision 4): absent means
+/// `toon-channel`, as it does on a claim.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum ChannelScheme {
+    #[default]
+    #[serde(rename = "toon-channel")]
+    ToonChannel,
+    #[serde(rename = "batch-settlement")]
+    BatchSettlement,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,6 +213,7 @@ pub(crate) struct ClaimStateResponse {
 #[serde(untagged)]
 enum ChannelStateResult {
     Verified(VerifiedChannelState),
+    VerifiedVoucher(VerifiedVoucherChannelState),
     Unverified(UnverifiedChannelState),
 }
 
@@ -206,6 +247,36 @@ struct VerifiedChannelState {
     /// [`crate::ClientClaimGate`]'s `last_claim_seen` doc: this figure is
     /// best-effort and non-durable by design, unlike every other field
     /// here).
+    last_claim_time: Option<u64>,
+}
+
+/// A verified x402 `batch-settlement` channel's answer (issue #1364). A
+/// voucher has no nonce, so there is none here; its watermark is an amount,
+/// and the next voucher must strictly exceed `cumulativeClaimed` (ADR 0074
+/// decision 3).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifiedVoucherChannelState {
+    blockchain: &'static str,
+    channel_id: String,
+    ok: bool,
+    /// Always `"batch-settlement"`: what tells a reader this entry has no
+    /// `nonce`.
+    scheme: &'static str,
+    /// The highest cumulative amount this node has accepted a voucher for
+    /// on this channel, `"0"` for none. Not the chain's `totalClaimed` /
+    /// `settled`, which trails it until this node lands its latest voucher.
+    cumulative_claimed: String,
+    /// The highest cumulative amount a voucher may name and be accepted, as
+    /// the claim gate's collateral check reads it now: the amount already
+    /// landed plus what still backs a voucher above it -- EVM `balance −
+    /// pendingWithdrawal`, Solana `deposit` while Open (ADR 0074 decision 5).
+    /// It can fall on EVM.
+    max_cumulative: String,
+    /// `maxCumulative − cumulativeClaimed`, at least zero: how much the next
+    /// voucher may add.
+    available: String,
+    /// As [`VerifiedChannelState::last_claim_time`].
     last_claim_time: Option<u64>,
 }
 
@@ -255,12 +326,26 @@ async fn resolve_channel_proof(
             channel_id,
             expires,
             signature,
-        } => resolve_evm(state, channel_id, expires, signature, now).await,
+            scheme,
+            channel_config,
+        } => {
+            resolve_evm(
+                state,
+                channel_id,
+                expires,
+                signature,
+                scheme,
+                channel_config,
+                now,
+            )
+            .await
+        }
         ChannelProofRequest::Solana {
             channel_account,
             expires,
             signature,
-        } => resolve_solana(state, channel_account, expires, signature, now).await,
+            scheme,
+        } => resolve_solana(state, channel_account, expires, signature, scheme, now).await,
     }
 }
 
@@ -269,6 +354,8 @@ async fn resolve_evm(
     channel_id_text: String,
     expires: u64,
     signature_text: String,
+    scheme: ChannelScheme,
+    channel_config: Option<serde_json::Value>,
     now: u64,
 ) -> ChannelStateResult {
     if expires <= now {
@@ -285,6 +372,34 @@ async fn resolve_evm(
     };
 
     let requester = format!("claim-state-challenge:{signature_text}");
+    if scheme == ChannelScheme::BatchSettlement {
+        let presented = channel_config
+            .filter(|config| !config.is_null())
+            .map(|config| {
+                let config = parse_evm_channel_config(&config).ok()?;
+                decode_evm_channel_config(&config).ok()
+            });
+        let presented = match presented {
+            Some(None) => {
+                log_outcome("evm", &channel_id_text, "malformed_channel_config");
+                return unverified("evm", channel_id_text, "unverified");
+            }
+            Some(Some(config)) => Some(config),
+            None => None,
+        };
+        return resolve_evm_voucher(
+            state,
+            channel_id_text,
+            channel_id,
+            VoucherProof {
+                expires,
+                signature: &signature,
+                requester: &requester,
+            },
+            presented,
+        )
+        .await;
+    }
     let lookup = state
         .claim_gate
         .channels()
@@ -333,6 +448,7 @@ async fn resolve_solana(
     channel_account_text: String,
     expires: u64,
     signature_text: String,
+    scheme: ChannelScheme,
     now: u64,
 ) -> ChannelStateResult {
     if expires <= now {
@@ -349,6 +465,19 @@ async fn resolve_solana(
     };
 
     let requester = format!("claim-state-challenge:{signature_text}");
+    if scheme == ChannelScheme::BatchSettlement {
+        return resolve_solana_voucher(
+            state,
+            channel_account_text,
+            channel_account,
+            VoucherProof {
+                expires,
+                signature: &signature,
+                requester: &requester,
+            },
+        )
+        .await;
+    }
     let lookup = state
         .claim_gate
         .channels()
@@ -393,6 +522,142 @@ async fn resolve_solana(
         // `ClientClaimGate::credited`'s own doc.
         0,
     ))
+}
+
+/// A batch-settlement entry's already-decoded proof.
+struct VoucherProof<'a> {
+    expires: u64,
+    signature: &'a [u8],
+    requester: &'a str,
+}
+
+/// An EVM entry under `scheme: "batch-settlement"` (issue #1364): an x402
+/// channel this node receives vouchers on, proved by its **voucher signer**
+/// -- the verified `ChannelConfig`'s `payerAuthorizer`, else `payer` (ADR
+/// 0074 decision 4) -- over the claim-state challenge under
+/// `x402BatchSettlement`'s domain.
+///
+/// The chain stores the channel by id alone, so the config comes from this
+/// node's record of the channel -- every channel it has accepted a voucher
+/// on, journaled -- or, for one it has not, from the entry's own
+/// `channelConfig`. Either way it must hash to `channelId`, and the signer
+/// is read from what the backend admitted, never from the request. A client
+/// that lost its store therefore needs only the channel id and its signing
+/// key for any channel it has paid on.
+async fn resolve_evm_voucher(
+    state: &ClientEdgeState,
+    channel_id_text: String,
+    channel_id: [u8; 32],
+    proof: VoucherProof<'_>,
+    presented: Option<BatchChannelConfig>,
+) -> ChannelStateResult {
+    let lookup = state
+        .claim_gate
+        .evm_voucher_channel(&channel_id, presented, proof.requester)
+        .await;
+    let (domain, channel) = match lookup {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            log_outcome("evm", &channel_id_text, "channel_unknown");
+            return unverified("evm", channel_id_text, "unverified");
+        }
+        Err(error) => {
+            log_lookup_error("evm", &channel_id_text, &error);
+            return unverified("evm", channel_id_text, "unverified");
+        }
+    };
+    if !verify_evm_voucher_claim_state_challenge(
+        &domain,
+        &channel_id,
+        proof.expires,
+        proof.signature,
+        &evm_voucher_signer(&channel.config),
+    ) {
+        log_outcome("evm", &channel_id_text, "signature_invalid");
+        return unverified("evm", channel_id_text, "unverified");
+    }
+    log_outcome("evm", &channel_id_text, "verified");
+    let channel_id_hex = format!("0x{}", hex_encode(&channel_id));
+    let channel_key = format!("evm:{channel_id_hex}");
+    verified_voucher_state(
+        "evm",
+        channel_id_hex,
+        state,
+        &channel_key,
+        channel.max_cumulative,
+    )
+}
+
+/// A Solana entry under `scheme: "batch-settlement"` (issue #1364), proved
+/// by the channel account's `authorized_signer`, read from the chain.
+async fn resolve_solana_voucher(
+    state: &ClientEdgeState,
+    channel_account_text: String,
+    channel_account: [u8; 32],
+    proof: VoucherProof<'_>,
+) -> ChannelStateResult {
+    let lookup = state
+        .claim_gate
+        .solana_voucher_channel(&channel_account, proof.requester)
+        .await;
+    let channel = match lookup {
+        Ok(Some(channel)) => channel,
+        Ok(None) => {
+            log_outcome("solana", &channel_account_text, "channel_unknown");
+            return unverified("solana", channel_account_text, "unverified");
+        }
+        Err(error) => {
+            log_lookup_error("solana", &channel_account_text, &error);
+            return unverified("solana", channel_account_text, "unverified");
+        }
+    };
+    if !verify_solana_voucher_claim_state_challenge(
+        &channel_account,
+        proof.expires,
+        proof.signature,
+        &channel.authorized_signer,
+    ) {
+        log_outcome("solana", &channel_account_text, "signature_invalid");
+        return unverified("solana", channel_account_text, "unverified");
+    }
+    log_outcome("solana", &channel_account_text, "verified");
+    let channel_key = format!("solana:{channel_account_text}");
+    verified_voucher_state(
+        "solana",
+        channel_account_text,
+        state,
+        &channel_key,
+        channel.max_cumulative,
+    )
+}
+
+/// A verified voucher channel's figures (issue #1364). The watermark is the
+/// client edge's book alone: a voucher is never a peer claim (ADR 0074
+/// decision 1), so the peer book [`verified_state`] also consults never
+/// holds one.
+fn verified_voucher_state(
+    blockchain: &'static str,
+    channel_id: String,
+    state: &ClientEdgeState,
+    channel_key: &str,
+    max_cumulative: u64,
+) -> ChannelStateResult {
+    let cumulative_claimed = state
+        .claim_gate
+        .watermark(channel_key)
+        .map_or(0, |watermark| watermark.cumulative_amount);
+    ChannelStateResult::VerifiedVoucher(VerifiedVoucherChannelState {
+        blockchain,
+        channel_id,
+        ok: true,
+        scheme: SCHEME_BATCH_SETTLEMENT,
+        cumulative_claimed: cumulative_claimed.to_string(),
+        max_cumulative: max_cumulative.to_string(),
+        available: max_cumulative
+            .saturating_sub(cumulative_claimed)
+            .to_string(),
+        last_claim_time: state.claim_gate.last_claim_time(channel_key),
+    })
 }
 
 /// `deposit_total`, `cumulativeClaimed`, `nonce` and the netted

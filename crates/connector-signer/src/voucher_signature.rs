@@ -146,7 +146,7 @@ impl BatchSettlementDomain {
         keccak256(&buf)
     }
 
-    fn hash_typed_data(&self, struct_hash: &[u8; 32]) -> [u8; 32] {
+    pub(crate) fn hash_typed_data(&self, struct_hash: &[u8; 32]) -> [u8; 32] {
         let mut buf = Vec::with_capacity(2 + 32 + 32);
         buf.extend_from_slice(&[0x19, 0x01]);
         buf.extend_from_slice(&self.separator());

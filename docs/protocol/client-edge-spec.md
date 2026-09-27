@@ -1411,6 +1411,91 @@ answer: answered out of the wrong book, it re-signs one cumulative amount at a f
 `lastClaimTime` is the one field that does not follow — the peer book records no timestamp for an
 accepted claim, so a peer channel reports `null` there, within the best-effort licence above.
 
+**An x402 `batch-settlement` channel (issue #1364).** An entry MAY carry `scheme`, spelled as a
+claim's own discriminator (§1.3, ADR 0074 decision 4): absent or `"toon-channel"` asks about a
+`TokenNetwork` or TOON-program channel, exactly as above; `"batch-settlement"` asks about a channel
+this connector receives **vouchers** on. A voucher has no nonce, so this is the only way a client
+that lost its channel store learns the amount its next voucher must strictly exceed — the chain's
+`totalClaimed` (EVM) or `settled` (Solana) is only a floor, trailing the watermark until the
+connector lands its latest voucher.
+
+```json
+{
+  "channels": [
+    {
+      "blockchain": "evm",
+      "scheme": "batch-settlement",
+      "channelId": "0x<64-char hex>",
+      "expires": 1735689600,
+      "signature": "0x<65-byte r||s||v hex>",
+      "channelConfig": {
+        "payer": "0x…",
+        "payerAuthorizer": "0x…",
+        "receiver": "0x…",
+        "receiverAuthorizer": "0x…",
+        "token": "0x…",
+        "withdrawDelay": 86400,
+        "salt": "0x…"
+      }
+    },
+    {
+      "blockchain": "solana",
+      "scheme": "batch-settlement",
+      "channelAccount": "<base58>",
+      "expires": 1735689600,
+      "signature": "<base64 64-byte Ed25519>"
+    }
+  ]
+}
+```
+
+- **Who signs.** The channel's voucher signer, taken from the chain and never from the request: on
+  EVM the verified `ChannelConfig`'s `payerAuthorizer` (else `payer`), on Solana the channel
+  account's `authorized_signer`.
+- **What is signed**, kept apart from the key's vouchers:
+  - **evm** — EIP-712 `ClaimStateChallenge(bytes32 channelId,uint256 expires)`, the struct above,
+    under **`x402BatchSettlement`'s** domain (`("x402 Batch Settlement", "1", chainId,
+0x4020074e…0003)`, this connector's, never the request's). A different typehash from `Voucher`
+    and a different domain from `TokenNetwork`'s, so it is neither a voucher nor a `toon-channel`
+    challenge.
+  - **solana** — Ed25519 over
+    `"toon-voucher-claim-state-challenge-v1" || channelAccount(32 bytes) || expires(u64 LE)`.
+- **`channelConfig` (EVM, optional).** The contract stores a channel by id alone, so the connector
+  finds one by its config: its own journaled record for every channel it has accepted a voucher
+  on, else this field, in a voucher's own spelling. Either must hash to `channelId`. A client
+  that lost its store therefore needs only the channel id and its signing key for any channel it
+  has paid on; for one it has not, it presents the config it opened the channel with.
+
+A verified voucher channel is answered in its own shape, with no `nonce`:
+
+```json
+{
+  "blockchain": "evm",
+  "channelId": "0x...",
+  "ok": true,
+  "scheme": "batch-settlement",
+  "cumulativeClaimed": "250000",
+  "maxCumulative": "1000000",
+  "available": "750000",
+  "lastClaimTime": 1735680000
+}
+```
+
+- `cumulativeClaimed` — the amount watermark: the highest cumulative amount the connector has
+  accepted a voucher for on this channel, `"0"` for none. The next voucher must strictly exceed it
+  (ADR 0074 decision 3). A voucher is never a peer claim, so only this edge's book is consulted.
+- `maxCumulative` — the highest cumulative amount a voucher may name and be accepted, as §1.3 step
+  5 reads it now: the amount landed on chain plus what still backs a voucher above it, which is
+  `balance − pendingWithdrawal` on EVM and `deposit` on an Open Solana channel (ADR 0074 decision 5).
+  It **can fall** on EVM, when the payer initiates a withdrawal.
+- `available` — `maxCumulative − cumulativeClaimed`, at least `"0"`: what the next voucher may add.
+- `lastClaimTime` — as above.
+
+Every refusal is the same `"unverified"` as above: a node that has not opted in to the chain's
+vouchers, a channel with no record and no `channelConfig`, a config that hashes to another
+channel, a channel that is not admitted or no longer accepts vouchers, or a signature by any other
+key.
+
 **What a failed entry reveals.** `ok: false` carries only `error`, one of:
 
 - `"expired"` — `expires` is not in the future. A fact about the request, safe to report exactly.
