@@ -162,6 +162,17 @@ bytecode on an `anvil` at chain 84532 — and whose
 `amount_only_watermark`/`invalid` cases are checked against the real `validate_voucher` and claim
 parser before being committed.
 
+### 8. A voucher channel's claim-state challenge is its voucher signer's, and not a voucher
+
+Issue #1364: `POST /ilp/claim-state` answers for an x402 `batch-settlement` channel only against a
+signature by the key the chain checks that channel's vouchers against — never a key the request
+names — over a challenge no voucher and no `toon-channel` challenge can stand in for: on EVM the
+`ClaimStateChallenge` struct under `x402BatchSettlement`'s domain, on Solana a message tagged
+`toon-voucher-claim-state-challenge-v1`. Held open by `connector-signer`'s
+`claim_state_challenge::tests` (each challenge against a voucher and against the other scheme's
+challenge), by `connector-client-edge`'s `voucher_claims.rs` (the endpoint over the real gate), and
+pinned cross-repo by the `voucher_claim_state_challenge` section.
+
 ## Generation
 
 `crates/connector-vectors` builds the committed set from **fixed literal fixtures** — hardcoded

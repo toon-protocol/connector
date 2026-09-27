@@ -586,4 +586,38 @@ presented_amount, presented_signature_hex, charge, outcome, advanced }`: the out
   here carries `solana`'s own genuine channel, signer and signature bytes with only `expiresAt`
   changed, which is what makes this a structural refusal rather than a signature failure.
 
+### `voucher_claim_state_challenge`
+
+Issue #1364, `client-edge-spec.md` §1.10: the signature a `POST /ilp/claim-state` entry under
+`scheme: "batch-settlement"` carries, proving control of an x402 channel so the connector will
+report its voucher watermark. Additive, so `schema_version` stays **6**. It is signed by the
+channel's **voucher signer** -- `payerAuthorizer`, else `payer`, of the verified `ChannelConfig` on
+EVM; `authorized_signer` on Solana (ADR 0074 decision 4) -- over a challenge kept apart from that
+key's vouchers, as `channel_control_declaration`'s challenge is kept apart from a `BalanceProof`.
+Both chains' cases are on the `claim_voucher` section's channels. As in
+`channel_control_declaration`, `signature_verifies` is about the signature alone, and every case's
+`expires` is 2100-01-01T00:00:00Z; a replaying SDK applies the `expires <= now` check itself.
+
+- **`evm[]`** -- `{ name, chain_id, verifying_contract_hex, channel_id_hex, expires,
+voucher_signer_address_hex, signer_secret_hex, signer_address_hex, digest_hex, signature_hex,
+signature_verifies, entry_json }`. `digest_hex` is `keccak256(0x1901 || domainSeparator ||
+  structHash)` with `channel_control_declaration`'s `structHash` --
+  `ClaimStateChallenge(bytes32 channelId,uint256 expires)` -- under **`x402BatchSettlement`'s**
+  domain, `("x402 Batch Settlement", "1", chain_id, verifying_contract_hex)`, the one
+  `claim_voucher.evm`'s digest uses. A distinct type hash from `Voucher`, and a distinct domain
+  from `TokenNetwork`'s, so it stands in for neither a voucher nor a `toon-channel` challenge.
+  `signature_hex` is `0x`-prefixed `r ‖ s ‖ v` with `v` 27 or 28. `voucher_claim_state_evm_valid`
+  is signed by `voucher_signer_address_hex` (anvil's published account 1, the fixture's
+  `payerAuthorizer`); `voucher_claim_state_evm_wrong_key` by an unrelated key, and does not verify.
+- **`solana[]`** -- `{ name, channel_account_base58, expires, authorized_signer_base58,
+signer_secret_hex, signer_public_key_base58, signed_message_hex, signature_base64,
+signature_verifies, entry_json }`. `signed_message_hex` is
+  `"toon-voucher-claim-state-challenge-v1" ‖ channel_account (32 bytes) ‖ expires (u64 LE)`, and
+  `signature_base64` its Ed25519 signature, base64 as every Solana claim-state signature is (not
+  base58, as a voucher's is). `signer_secret_hex` is the Ed25519 seed that signed.
+- **`entry_json`** is the entry byte-for-byte as it rides in the request's `channels[]`. The EVM
+  entry carries the channel's `channelConfig`, in a voucher's own spelling: a node that has
+  accepted a voucher on the channel already holds it and ignores this, and one that has not needs
+  it, because the contract stores a channel by id alone.
+
 [ADR 0018]: ../docs/adr/0018-a-payload-is-sealed-to-the-terminating-connector.md

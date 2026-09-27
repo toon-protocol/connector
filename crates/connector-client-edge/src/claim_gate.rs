@@ -153,12 +153,13 @@ use connector_domain::{
 use connector_runtime::{ChannelDomain, Journal, JournalError, WireClaim};
 use connector_signer::{
     evm_batch_channel_id, evm_voucher_signer, verify_evm_balance_proof, verify_evm_voucher,
-    verify_solana_balance_proof, verify_solana_voucher, BatchChannelConfig, EvmBalanceProof,
-    VoucherSignature,
+    verify_solana_balance_proof, verify_solana_voucher, BatchChannelConfig, BatchSettlementDomain,
+    EvmBalanceProof, VoucherSignature,
 };
 
 use crate::batch_settlement::{
-    journaled_batch_channels, BatchSettlementChannels, JournaledBatchChannel,
+    journaled_batch_channels, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
+    BatchSettlementChannels, JournaledBatchChannel,
 };
 use crate::channels::{
     decode_base58_bytes, decode_hex_bytes, ChannelResolutionError, ClientChannelRegistry,
@@ -800,6 +801,108 @@ impl ClientClaimGate {
             .collect()
     }
 
+    /// The EVM batch-settlement channel `channel_id`, found for a claim-state
+    /// read (issue #1364) the way [`Self::admit_voucher`] finds it for a
+    /// voucher, with the domain its challenge is verified under: the config
+    /// is `presented` if the request carried one, else this gate's record of
+    /// the channel, and either must hash to `channel_id` before the backend
+    /// is asked. `Ok(None)` for a node that has not opted in to EVM
+    /// vouchers, a channel with neither config, a config that hashes to
+    /// another channel, or one the backend does not admit.
+    pub(crate) async fn evm_voucher_channel(
+        &self,
+        channel_id: &[u8; 32],
+        presented: Option<BatchChannelConfig>,
+        requester: &str,
+    ) -> Result<Option<(BatchSettlementDomain, AdmittedEvmVoucherChannel)>, ChannelResolutionError>
+    {
+        let Some(backend) = self.batch_settlement.as_deref() else {
+            return Ok(None);
+        };
+        let Some(domain) = backend.evm_domain() else {
+            return Ok(None);
+        };
+        let key = format!("{EVM_NAMESPACE}:0x{}", hex::encode(channel_id));
+        let recorded = match self.known_batch_channel(&key) {
+            Some(JournaledBatchChannel::Evm { config, .. }) => Some(config),
+            _ => None,
+        };
+        let Some(config) = presented.or(recorded) else {
+            return Ok(None);
+        };
+        if evm_batch_channel_id(&domain, &config) != *channel_id {
+            return Ok(None);
+        }
+        let found = self
+            .metered_voucher_lookup(
+                recorded.is_none(),
+                requester,
+                backend.evm(channel_id, Some(&config)),
+            )
+            .await?;
+        // As in `verify_voucher`: the signer is read from the backend's
+        // config, so it has to be this channel's.
+        Ok(found
+            .filter(|channel| evm_batch_channel_id(&domain, &channel.config) == *channel_id)
+            .map(|channel| (domain, channel)))
+    }
+
+    /// As [`Self::evm_voucher_channel`], for the Solana channel account
+    /// `channel_account`: every field is on chain, so nothing is presented.
+    pub(crate) async fn solana_voucher_channel(
+        &self,
+        channel_account: &[u8; 32],
+        requester: &str,
+    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
+        let Some(backend) = self
+            .batch_settlement
+            .as_deref()
+            .filter(|backend| backend.accepts_solana())
+        else {
+            return Ok(None);
+        };
+        let key = JournaledBatchChannel::Solana {
+            channel_account: *channel_account,
+        }
+        .channel_key();
+        let unseen = self.known_batch_channel(&key).is_none();
+        self.metered_voucher_lookup(unseen, requester, backend.solana(channel_account))
+            .await
+    }
+
+    fn known_batch_channel(&self, key: &str) -> Option<JournaledBatchChannel> {
+        self.batch_channels
+            .read()
+            .expect("batch channels lock poisoned")
+            .get(key)
+            .copied()
+    }
+
+    /// Run a batch-settlement `lookup` for a read, metered as a voucher's is
+    /// (issue #613): a channel this gate has no record of is a discovery,
+    /// charged before the backend is asked and given back if it found one.
+    async fn metered_voucher_lookup<T>(
+        &self,
+        unseen: bool,
+        requester: &str,
+        lookup: impl std::future::Future<Output = Result<Option<T>, ChannelResolutionError>>,
+    ) -> Result<Option<T>, ChannelResolutionError> {
+        let budget = self.lookup_budget();
+        let reservation = if unseen {
+            Some(
+                budget
+                    .reserve(requester)
+                    .await
+                    .map_err(ChannelResolutionError::Budgeted)?,
+            )
+        } else {
+            None
+        };
+        let found = lookup.await?;
+        refund_if_found(budget, reservation, found.is_some());
+        Ok(found)
+    }
+
     /// Every channel this gate has ever accepted a claim on, and that
     /// claim's watermark (issue #1218): what `GET /claims` and
     /// `GET /channels` need to enumerate the client-edge book, the same way
@@ -1172,12 +1275,7 @@ impl ClientClaimGate {
         // A channel this gate has accepted a voucher on before: its record
         // supplies the EVM config a voucher may omit, and its lookup is not
         // a discovery the unresolvable-lookup budget meters.
-        let known = self
-            .batch_channels
-            .read()
-            .expect("batch channels lock poisoned")
-            .get(&key)
-            .copied();
+        let known = self.known_batch_channel(&key);
         let verified = verify_voucher(
             backend,
             &claim,
@@ -2043,7 +2141,7 @@ fn decode_voucher_signature(claim: &ClientClaim) -> Result<VoucherSignature, Cla
 /// An EVM voucher's `channelConfig`, decoded into the struct
 /// `connector_signer` hashes. The parser has already checked every field's
 /// shape, so a decode that fails here is still reported, not unwrapped.
-fn decode_evm_channel_config(
+pub(crate) fn decode_evm_channel_config(
     config: &EvmVoucherChannelConfig,
 ) -> Result<BatchChannelConfig, ClaimIngestRejection> {
     let address = |value: &str| {
