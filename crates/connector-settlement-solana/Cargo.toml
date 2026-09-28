@@ -28,8 +28,13 @@ chrono = "0.4"
 rand = "0.8"
 # The paying half posts its payer-signed `open` to a counterparty's sponsor
 # endpoint (ADR 0074 decision 9, ADR 0075 decision 3) and reads the JSON it
-# answers with. The same line and TLS stack the rest of the workspace uses.
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
+# answers with -- through `socks_proxy` when that sponsor is an onion host
+# (ADR 0070). The same line and TLS stack the rest of the workspace uses.
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json", "socks"] }
+# The one host rule, `is_onion_endpoint` (ADR 0070): which sponsor posts
+# leave on the proxy. Read from the one implementation, never re-derived.
+connector-config = { path = "../connector-config" }
+url = "2"
 serde_json = "1"
 thiserror = "2"
 # solana-rpc-client, NOT the solana-client meta-crate: this backend only does
@@ -66,3 +71,6 @@ connector-settlement-solana = { path = ".", features = ["test-util"] }
 connector-settlement = { path = "../connector-settlement", features = ["test-util"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
 tempfile = "3"
+# A real SOCKS5 server on loopback (`Socks5TestServer`): which socket a
+# sponsor post to an onion host left on (ADR 0070, issue #1379).
+connector-runtime = { path = "../connector-runtime", features = ["test-support"] }

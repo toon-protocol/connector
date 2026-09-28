@@ -1354,46 +1354,6 @@ impl SettlementBackend for SolanaSettlementBackend {
             }),
         }
     }
-
-    /// The port's ADR 0059 question. On Solana it has always been
-    /// answerable: the channel account is a PDA seeded on the sorted pair
-    /// and the mint (`processor.rs`, `wire::channel_pda`), so deriving
-    /// the address and reading the account *is* the answer. One RPC.
-    ///
-    /// `None` when nothing is at that address -- which includes a pair
-    /// whose channel has settled, since settlement closes the account and
-    /// frees the PDA for their next one. `Err` only when the account
-    /// could not be read at all, so "no channel" is never confused with
-    /// "I could not find out".
-    ///
-    /// `counterparty` is a 32-byte ed25519 public key, the same identity
-    /// [`open`](SettlementBackend::open) takes -- never an EVM address and
-    /// never a node's secp256k1 edge identity, neither of which the
-    /// deployed program could hold as a participant.
-    async fn live_channel_with(
-        &self,
-        counterparty: Vec<u8>,
-    ) -> Result<Option<ChannelId>, SettlementError> {
-        let counterparty = Pubkey::try_from(counterparty.as_slice()).map_err(|_| {
-            SettlementError::Backend(format!(
-                "a packages/solana-program counterparty must be a 32-byte Solana pubkey, got {} bytes",
-                counterparty.len()
-            ))
-        })?;
-        let (channel, _bump) = wire::channel_pda(
-            &self.payer.pubkey(),
-            &counterparty,
-            &self.token_mint,
-            &self.program_id,
-        );
-        let Some(account) = self.fetch_account(&channel).await? else {
-            return Ok(None);
-        };
-        if account.status == wire::ChannelStatus::Settled {
-            return Ok(None);
-        }
-        Ok(Some(ChannelId(channel.to_string())))
-    }
 }
 
 #[cfg(test)]

@@ -463,5 +463,6 @@ Each direction settles on its own; nothing nets.
 
 **Built for runtime EVM peerings by #1378:** every forward to such a peer is covered by a voucher on
 this node's outbound channel (a zero-value one by the peer-role challenge instead), judged by the next
-hop against the channel's one watermark and acknowledged in the ack. `[[pay_channels]]` (#1380),
-Solana peerings (#1379) and payouts (#1381) still sign `toon-channel` claims.
+hop against the channel's one watermark and acknowledged in the ack. **And for runtime Solana
+peerings by #1379**, on a `payment-channels` channel opened through the next hop's sponsor
+endpoint. `[[pay_channels]]` (#1380) still signs `toon-channel` claims.

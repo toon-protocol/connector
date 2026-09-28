@@ -81,10 +81,7 @@ pub use peer_transport::{
     InProcessPeerTransport, PeerForward, PeerRegistrar, PeerTransport, NO_SOCKS_PROXY,
 };
 // ADR 0058's one operator write: establish a peering from a URL.
-pub use peering::{
-    ChannelBranch, EstablishPeeringError, EstablishedChannel, PeeringEstablished,
-    PEERING_SETTLEMENT_TIMEOUT_SECONDS,
-};
+pub use peering::{ChannelBranch, EstablishPeeringError, EstablishedChannel, PeeringEstablished};
 // The rate table a forward reads and the background poller that keeps it
 // fresh (ADR 0071 decision 6, issue #1294). Two halves of one rule: the
 // poller is the only thing here that awaits anything, and the read side is

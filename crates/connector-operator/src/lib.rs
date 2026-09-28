@@ -23,10 +23,10 @@
 //! channel now) -- are this crate's write endpoints, beside the peering and
 //! route writes. The `toon-channel` writes `redeem`, `redeem-latest`,
 //! `close`, `settle` and `cooperative-close` are deleted, and so are the
-//! EVM `toon-channel` open and top-up (#1376, #1378): an EVM peering opens
-//! and funds its outbound x402 channel through `POST /peers` itself. `POST
-//! /channels` and `/fund` still serve a Solana `toon-channel` for
-//! `local/keys.sh` until #1383.
+//! EVM `toon-channel` open and top-up (#1376, #1378): a peering, on either
+//! chain (#1378, #1379), opens and funds its outbound x402 channel through
+//! `POST /peers` itself. `POST /channels` and `/fund` still serve a Solana
+//! `toon-channel` for `local/keys.sh` until #1383.
 //! Every one calls
 //! [`write_auth::authenticate_write`] first and nothing else in this
 //! crate accepts a body, so a write cannot reach [`Connector`] without a
@@ -629,12 +629,14 @@ fn peer_route_table_error_response(error: PeerRouteTableError) -> Response {
 ///   settling on more than one chain in common. Left out, a single shared
 ///   chain is used and several are refused by name rather than resolved
 ///   silently, the same posture `POST /channels` takes.
-/// * `deposit` is what an EVM peering's outbound x402 channel is opened
-///   with, in base units of the shared token (ADR 0075 decision 4): this
-///   node opens and funds its own channel toward the counterparty and
-///   nothing else. Required only when this node has no open channel toward
-///   it yet -- a repeat finds that channel and spends nothing; top it up
-///   with `POST /channels/:id/fund`.
+/// * `deposit` is what the peering's outbound x402 channel is opened with,
+///   in base units of the shared token (ADR 0075 decision 4), on either
+///   chain: this node opens and funds its own channel toward the
+///   counterparty and nothing else -- on Solana through the counterparty's
+///   sponsor endpoint, so the counterparty holds the `payee` seat. Required
+///   only when this node has no open channel toward it yet -- a repeat finds
+///   that channel and spends nothing; top it up with
+///   `POST /channels/:id/fund`.
 ///
 /// `fee` and `max_packet_amount` are the operator's policy about this
 /// counterparty, and are in this request precisely because no document can
@@ -698,7 +700,6 @@ fn establish_peering_error_response(error: EstablishPeeringError) -> Response {
             (StatusCode::CONFLICT, error.to_string()).into_response()
         }
         EstablishPeeringError::Outbound(error) => batch_channel_error_response(error),
-        EstablishPeeringError::Channel(error) => channel_operation_error_response(error),
         EstablishPeeringError::Table(error) => peer_route_table_error_response(error),
     }
 }

@@ -319,39 +319,4 @@ pub trait SettlementBackend: Send + Sync {
 
     /// The current state of `channel`, as last recorded by this backend.
     async fn channel_state(&self, channel: &ChannelId) -> Result<ChannelState, SettlementError>;
-
-    /// **"Do I already have a channel with this counterparty?"** -- ADR
-    /// 0059's one question, asked of whichever chain this backend settles
-    /// on.
-    ///
-    /// `Ok(Some(id))` when a live channel exists between this backend's
-    /// own on-chain identity and `counterparty`; `Ok(None)` when the pair
-    /// has none and [`open`](SettlementBackend::open) is what to do next.
-    /// `Err` is reserved for a lookup that genuinely failed, so "there is
-    /// no channel" is never confused with "I could not find out" -- a
-    /// caller that opens on the second would spend gas on a duplicate.
-    ///
-    /// **Live is `Open` or `Closed`.** A closed channel is still inside
-    /// its challenge window, still holds collateral and still occupies the
-    /// pair's identifier, so reporting it absent hands the caller an
-    /// `open` that fails. Only once it has `Settled` does the pair report
-    /// none again, which is what lets two parties start a fresh channel
-    /// after finishing one (`CONTEXT.md`, **Payment channel**).
-    ///
-    /// The answer must come from the chain's own current state rather than
-    /// from anything this process has observed and remembered: an index
-    /// replayed from a starting block cannot see a channel opened before
-    /// it, and "none exists" out of a half-built index looks exactly like
-    /// the true answer while being the expensive wrong one (ADR 0059
-    /// rejects a local participant index for this reason).
-    ///
-    /// `counterparty` is the same identity [`open`](SettlementBackend::open)
-    /// takes -- **the settlement address of this backend's own chain**, 20
-    /// bytes on EVM and a 32-byte ed25519 public key on Solana, never a
-    /// node's edge identity. An identity this backend cannot parse is
-    /// [`SettlementError::Backend`], the same refusal `open` gives it.
-    async fn live_channel_with(
-        &self,
-        counterparty: Vec<u8>,
-    ) -> Result<Option<ChannelId>, SettlementError>;
 }

@@ -810,9 +810,16 @@ async fn build_evm_batch_settlement(
 /// The Solana twin of [`build_evm_batch_settlement`]: bound over the table's
 /// one transport, under its settlement key as the sponsor (ADR 0074
 /// decision 5), in its `token_address` mint.
+///
+/// Given the node's `socks_proxy`, if any, for its paying half's posts to a
+/// counterparty's sponsor endpoint (ADR 0070, issue #1379): an onion
+/// counterparty's sponsor is reached through it, every other one direct,
+/// by `connector_config::is_onion_endpoint`. The settlement `rpc_url` is
+/// not affected -- that is `transport`'s, under ADR 0073.
 async fn build_solana_batch_settlement(
     settlement: &SolanaSettlementConfig,
     transport: &RpcTransport,
+    socks_proxy: Option<&url::Url>,
 ) -> Result<Option<Arc<SolanaBatchSettlement>>, RuntimeError> {
     let Some(batch) = settlement.batch_settlement() else {
         return Ok(None);
@@ -832,6 +839,10 @@ async fn build_solana_batch_settlement(
     )
     .await
     .map_err(unusable)?;
+    let backend = match socks_proxy {
+        Some(proxy) => backend.with_socks_proxy(proxy).map_err(unusable)?,
+        None => backend,
+    };
     Ok(Some(Arc::new(backend)))
 }
 
@@ -1804,6 +1815,10 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         config.peer_allow_plaintext_endpoints(),
         config.socks_proxy(),
     )))
+    // ...and a runtime peering's claim-state ask, where the peer's client
+    // edge is an onion host, by the same rule (issue #1379): an onion peer's
+    // watermark is restored over the circuit its packets ride.
+    .with_socks_proxy(config.socks_proxy().cloned())
     // The same node-wide opt-in a `[[peers]]` endpoint takes (issue #678
     // gap 3), so a peering established at runtime picks its carriage by
     // exactly the rule a config-file peering does.
@@ -2031,7 +2046,8 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 let transport = transports.for_chain(SettlementChain::Solana)?;
                 let backend = build_solana_settlement_backend(solana, transport).await?;
                 // ADR 0074: the opt-in, over the same transport (ADR 0073).
-                batch_settlement_solana = build_solana_batch_settlement(solana, transport).await?;
+                batch_settlement_solana =
+                    build_solana_batch_settlement(solana, transport, config.socks_proxy()).await?;
                 // Which chain that connection actually reached, from the
                 // chain's own genesis hash rather than from the shape of
                 // the URL used to reach it (issue #1131).
@@ -2062,7 +2078,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 if let Some(batch) = &batch_settlement_solana {
                     // ADR 0075 decisions 3 and 10: the Solana settlement key
                     // is `authorized_signer` on every channel this node
-                    // opens (#1379 binds by it).
+                    // opens, and what a peer binds that channel by (#1379).
                     voucher_signers.push(connector_domain::VoucherSignerFact {
                         network: backend.caip2_network(),
                         signer: backend.own_pubkey().to_string(),

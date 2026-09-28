@@ -105,10 +105,11 @@ pub struct SolanaBatchSettlement {
     /// each: the paying half's memory, for the process lifetime (ADR 0075
     /// decision 2).
     outbound: Mutex<HashMap<Pubkey, pay::Outbound>>,
-    /// Posts a payer-signed `open` to a counterparty's sponsor endpoint. Not
+    /// Posts a payer-signed `open` to a counterparty's sponsor endpoint --
+    /// direct, or through `socks_proxy` for an onion sponsor (ADR 0070). Not
     /// the settlement `rpc_url`'s transport: the endpoint is a peer's, not
     /// the chain's (ADR 0073 governs only the latter).
-    sponsor_http: reqwest::Client,
+    sponsor_http: pay::SponsorClients,
     /// The treasury owner this deployment's `distribute` accepted, once one
     /// has, for the paying half's own distributions.
     treasury: Mutex<Option<Pubkey>>,
@@ -164,9 +165,23 @@ impl SolanaBatchSettlement {
             admitted: Mutex::new(HashSet::new()),
             cluster_rent: OnceLock::new(),
             outbound: Mutex::new(HashMap::new()),
-            sponsor_http: pay::sponsor_http_client()?,
+            sponsor_http: pay::SponsorClients::new(None)?,
             treasury: Mutex::new(None),
         })
+    }
+
+    /// Post every `open` toward a counterparty whose sponsor endpoint is an
+    /// onion host through `socks_proxy` (ADR 0070): the node's one
+    /// root-level proxy, chosen per post by
+    /// `connector_config::is_onion_endpoint`. A sponsor on any other host is
+    /// still posted to direct. Without this, an onion sponsor is refused by
+    /// name at the post, before anything is dialed.
+    pub fn with_socks_proxy(
+        mut self,
+        socks_proxy: &url::Url,
+    ) -> Result<Self, BatchSettlementError> {
+        self.sponsor_http = pay::SponsorClients::new(Some(socks_proxy))?;
+        Ok(self)
     }
 
     /// The sponsor key: `payee` and `rent_payer` of every channel this node

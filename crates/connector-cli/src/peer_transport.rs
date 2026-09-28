@@ -56,7 +56,7 @@ use connector_peer_btp::{BtpPeerTransport, TungsteniteDialer};
 use connector_peer_http::{HttpPeerTransport, ReqwestPeerClient};
 use connector_runtime::{
     ClaimAckOutcome, Clock, Covering, InProcessPeerTransport, PeerForward, PeerRegistrar,
-    PeerTransport, RuntimePeerChannel, RuntimePeering, WireClaim,
+    PeerTransport, RuntimePeering, WireClaim,
 };
 
 /// One [`PeerTransport`] over both carriages, dispatching by peer id --
@@ -211,9 +211,11 @@ impl PeerRegistrar for ConfiguredPeerTransport {
             self.deregister(peer_id);
             return;
         };
-        // A runtime peering's `toon-channel` claims are Solana ones only
-        // since #1378, so it binds no EIP-712 domain.
-        let (domains, programs) = (HashMap::new(), solana_programs(peering));
+        // A runtime peering pays and is paid with vouchers on its x402
+        // channels on both chains (#1378, #1379), which reach the carriage
+        // already rendered: it binds no `toon-channel` EIP-712 domain and no
+        // TOON program, and a row naming a `toon-channel` is refused at boot.
+        let (domains, programs) = (HashMap::new(), HashMap::new());
         let answer_timeout = Duration::from_millis(DEFAULT_PEER_TIMEOUT_MS);
         match carriage {
             PeerCarriage::Btp => self.btp.add_peer(connector_peer_btp::PeerRelation::new(
@@ -250,29 +252,6 @@ impl PeerRegistrar for ConfiguredPeerTransport {
     }
 }
 
-/// The programs a runtime peering's Solana channels bind to (ADR 0053) --
-/// the map `PeerRelation::from_config` builds out of `[[peer_channels]]`,
-/// built instead out of the durable row, until #1379.
-///
-/// There is no EVM counterpart: a runtime EVM peering pays with vouchers on
-/// its own x402 channel since #1378, which reach the carriage already
-/// rendered and need no EIP-712 domain from it, and a row naming a
-/// `TokenNetwork` channel is refused at boot.
-fn solana_programs(peering: &RuntimePeering) -> HashMap<String, String> {
-    peering
-        .channels
-        .iter()
-        .filter_map(|binding| match binding {
-            RuntimePeerChannel::Solana {
-                channel_account,
-                program_id,
-                ..
-            } => Some((channel_account.clone(), program_id.clone())),
-            RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::EvmVoucher { .. } => None,
-        })
-        .collect()
-}
-
 #[async_trait]
 impl PeerTransport for ConfiguredPeerTransport {
     async fn forward(
@@ -298,6 +277,7 @@ impl PeerTransport for ConfiguredPeerTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use connector_runtime::RuntimePeerChannel;
     use std::io::Write as _;
 
     use chrono::{TimeZone, Utc};

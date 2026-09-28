@@ -128,13 +128,15 @@ every other infra-touching ticket in this repo's history records when it applies
    a peering — before it is trusted with a peer claim from the apex.
 
 7. **Channel open.** Open a payment channel from the apex's settlement identity to the relay's, via
-   the apex's operator surface (ADR 0008, issue #459). **On EVM this step is now `POST /peers`**
-   (ADR 0075, #1378): each box writes `POST /peers { id, url, fee, max_packet_amount, deposit }`
-   naming the other's URL, which opens and funds that box's own outbound x402 channel and binds the
-   other's by its published voucher signer — nothing below applies to the EVM leg, no channel id is
-   recorded, and no `[[peer_channels]]` row is written for it
-   ([`operator-spec.md` §1.5](../protocol/operator-spec.md)). The `"chain":"evm"` `toon-channel`
-   open and top-up below are refused by name. What follows is the **Solana** leg only, until #1379.
+   the apex's operator surface (ADR 0008, issue #459). **On either chain this step is now
+   `POST /peers`** (ADR 0075, #1378 on EVM, #1379 on Solana): each box writes
+   `POST /peers { id, url, fee, max_packet_amount, deposit }` naming the other's URL, which opens
+   and funds that box's own outbound x402 channel — on Solana through the other box's sponsor endpoint — and binds the other's
+   by its published voucher signer. No channel id is recorded and no `[[peer_channels]]` row is
+   written for it ([`operator-spec.md` §1.5](../protocol/operator-spec.md)). The `"chain":"evm"`
+   `toon-channel` open and top-up below are refused by name. What follows is only for a **Solana**
+   leg declared in the config file's `[[peer_channels]]` rows, which still pays over a
+   `toon-channel` until #1380.
 
    ```sh
    curl -X POST https://proxy.devnet.toonprotocol.dev/channels \

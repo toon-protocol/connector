@@ -673,6 +673,46 @@ key_file = "{key_file}"
     }
 }
 
+/// ADR 0075 decision 8, issue #1379: the Solana twin. A durable runtime
+/// Solana peering over a `toon-channel` of TOON's own payment-channel
+/// program -- what `POST /peers` wrote before this build -- is refused at
+/// boot **by name**, with the drain procedure in the message, rather than
+/// dropped or served.
+#[test]
+fn exits_non_zero_naming_the_drain_on_a_runtime_peering_over_a_toon_program_channel() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    std::fs::write(
+        state_dir.path().join("runtime-peers.json"),
+        r#"{"peers":[{"id":"apex-sol","fee":0,"max_packet_amount":0,
+        "endpoint":"https://relay.example/ilp",
+        "channels":[{"chain":"solana",
+        "channel_account":"4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+        "counterparty_key":"9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+        "program_id":"Toon11111111111111111111111111111111111111"}]}],"routes":[]}"#,
+    )
+    .expect("write a pre-ADR-0075 runtime peer table");
+    let config_file = write_config(&format!(
+        r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+"#,
+        key_file = key_file.path().display(),
+        state_dir = state_dir.path().display(),
+    ));
+
+    let output = run(Some(config_file.path()));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in ["apex-sol", "toon-channel", "ADR 0075", "Draining"] {
+        assert!(stderr.contains(named), "expected {named} in: {stderr}");
+    }
+}
+
 /// A journal this build cannot decode stops the node. Refusing to start is
 /// the whole point: the only other option is starting from no watermarks,
 /// which is exactly the defect.

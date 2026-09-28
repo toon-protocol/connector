@@ -244,5 +244,6 @@ both carriages (`connector_peer_btp::role_gate::decide_frame`, `connector_peer_a
 and binding a voucher signer to a peering is a runtime operation (`Connector::bind_voucher_signer`).
 The `toon-channel` proof stays until #1380 moves the last peering off it. #1378 supplies the first
 source of a binding: `POST /peers` on EVM binds the key the peer's self-description publishes, and a
-restart rebinds it from the durable row; #1380 adds a config row's.
+restart rebinds it from the durable row; #1379 does the same on Solana, binding the published key as
+the inbound channel's `authorized_signer`; #1380 adds a config row's.
 `peer-carriage-spec.md` §1.2 states both proofs.
