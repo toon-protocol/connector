@@ -434,6 +434,19 @@ impl X402Chain {
             .expect("channels")
     }
 
+    /// `pendingWithdrawals(id)`: `(amount, initiatedAt)`. `initiatedAt` is
+    /// zero exactly when nothing is pending, so a test reads this directly
+    /// rather than through a payer's own state to see what the chain itself
+    /// shows.
+    pub async fn pending_withdrawal(&self, channel: &ChannelId) -> (u128, u64) {
+        let id = crate::channel_id::parse_channel_id(channel).expect("a channel id");
+        X402BatchSettlement::new(batch_settlement_address(), Arc::clone(&self.provider))
+            .pending_withdrawals(id)
+            .call()
+            .await
+            .expect("pendingWithdrawals")
+    }
+
     /// The deployed contract's own `getChannelId(config)`: what the chain,
     /// not this workspace, says a config hashes to.
     pub async fn contract_channel_id(&self, config: &EvmChannelConfig) -> [u8; 32] {
