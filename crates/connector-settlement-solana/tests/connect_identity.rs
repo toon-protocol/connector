@@ -120,6 +120,45 @@ async fn connect_refuses_a_mint_the_spl_token_program_does_not_own() {
     );
 }
 
+/// A fresh node has its receiving account -- the sponsor key's token
+/// account for the mint -- once it has connected, so a channel can be
+/// opened toward it from the first request; and a restart that finds it
+/// sends nothing (ADR 0073 decision 5).
+#[tokio::test]
+async fn connect_creates_the_receiving_account_once() {
+    if !require_solana_test_validator() {
+        return;
+    }
+    let (validator, rpc, mint) = chain().await;
+    let seed = funded_seed(&rpc, [8u8; 32]).await;
+    let owner = solana_sdk::signer::keypair::keypair_from_seed(&seed)
+        .expect("derive keypair")
+        .pubkey();
+    let receiving = spl_associated_token_account::get_associated_token_address(&owner, &mint);
+    assert!(
+        rpc.get_account(&receiving).await.is_err(),
+        "none before boot"
+    );
+
+    connect(&validator.rpc_url, &seed, mint, 6)
+        .await
+        .expect("first boot");
+    assert!(
+        rpc.get_account(&receiving).await.is_ok(),
+        "a fresh node has its receiving account"
+    );
+
+    let watched = FakeRpc::spawn_in_front_of(&validator.rpc_url, |_| RpcReply::Forward).await;
+    connect(&watched.url(), &seed, mint, 6)
+        .await
+        .expect("second boot");
+    assert_eq!(
+        watched.count("sendTransaction"),
+        0,
+        "a receiving account that exists is read, not created again"
+    );
+}
+
 /// Issue #1131 and ADR 0074 decision 8: a `solana-test-validator` mints a
 /// fresh genesis on every run, so it names no public cluster -- and still
 /// connects, with a CAIP-2 network of its own, which every `local/`

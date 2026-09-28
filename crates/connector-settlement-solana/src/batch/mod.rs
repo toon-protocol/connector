@@ -214,7 +214,7 @@ impl SolanaBatchSettlement {
                  any settlement transaction; fund it before starting the node"
             )));
         }
-        Ok(SolanaBatchSettlement {
+        let backend = SolanaBatchSettlement {
             rpc,
             confirm: ConfirmPolicy::for_transport(transport),
             program_id,
@@ -228,6 +228,49 @@ impl SolanaBatchSettlement {
             outbound: Mutex::new(HashMap::new()),
             sponsor_http: pay::SponsorClients::new(None)?,
             treasury: Mutex::new(None),
+        };
+        backend.ensure_receiving_account().await?;
+        Ok(backend)
+    }
+
+    /// Create this node's receiving account -- the sponsor key's associated
+    /// token account for the mint -- if it does not exist yet. Every channel
+    /// this node admits distributes to it, and the sponsor endpoint refuses
+    /// an `open` by name while it is missing, since a payout to a missing
+    /// account forfeits to the program's treasury (Cantina 3.1.4). So a node
+    /// that booted without one could never be opened toward.
+    ///
+    /// Read before it transacts (ADR 0073 decision 5): a restart whose
+    /// account already exists sends nothing, and the create is idempotent
+    /// for the one that races it.
+    async fn ensure_receiving_account(&self) -> Result<(), BatchSettlementError> {
+        let owner = self.sponsor.pubkey();
+        let receiving =
+            spl_associated_token_account::get_associated_token_address(&owner, &self.mint);
+        let existing = retry_read(|| {
+            self.rpc
+                .get_account_with_commitment(&receiving, CommitmentConfig::confirmed())
+        })
+        .await
+        .map_err(backend_error)?;
+        if existing.value.is_some() {
+            return Ok(());
+        }
+        self.submit(&[
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &owner,
+                &owner,
+                &self.mint,
+                &spl_token::id(),
+            ),
+        ])
+        .await
+        .map_err(|error| {
+            BatchSettlementError::Backend(format!(
+                "[settlement.solana] could not create this node's receiving account {receiving} \
+                 for mint {}: {error}",
+                self.mint
+            ))
         })
     }
 
