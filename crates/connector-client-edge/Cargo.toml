@@ -19,6 +19,9 @@ connector-peer-auth = { path = "../connector-peer-auth" }
 connector-peer-btp = { path = "../connector-peer-btp" }
 connector-peer-http = { path = "../connector-peer-http" }
 connector-runtime = { path = "../connector-runtime" }
+# The settlement port's payout types (ADR 0075 decision 7, issue #1381): a
+# client payout is a voucher on one of this node's outbound x402 channels.
+connector-settlement = { path = "../connector-settlement" }
 connector-signer = { path = "../connector-signer" }
 async-trait = "0.1"
 # `ws` for the client BTP websocket carriage (client-edge-spec.md §1.9, ADR
@@ -31,11 +34,6 @@ futures-util = "0.3"
 base64 = "0.22"
 bs58 = "0.5"
 hex = "0.4"
-# `ClientPayoutLedger` (issue #699) signs a payout claim against the same
-# clock-supplied timestamp `connector_runtime::ClaimBook::record_fulfillment`
-# takes, so `DateTime<Utc>` rides in this crate's own public API now, not
-# just its tests.
-chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `time`: the unresolvable-lookup shaper (issue #613) holds a lookup for
@@ -52,6 +50,7 @@ tracing = "0.1"
 sha2 = "0.10"
 
 [dev-dependencies]
+chrono = "0.4"
 connector-settlement = { path = "../connector-settlement" }
 connector-settlement-evm = { path = "../connector-settlement-evm", features = ["test-util"] }
 ethers = { version = "2", default-features = false, features = ["rustls"] }
@@ -64,10 +63,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { version = "0.4", features = ["util"] }
 hyper = { version = "0.14", features = ["full"] }
 libsecp256k1 = "0.6"
-# Interleaved inbound/outbound netting proptests (issue #700) -- the same
-# vectors-and-proptest treatment `connector-domain`/`connector-runtime`'s own
-# claim code already gets.
-proptest = "1"
 rand = "0.7"
 # The payer half of `tests/pay_channel_claim_state_round_trip.rs`:
 # `OwnedHttpClaimState` asks a real `POST /ilp/claim-state` over a real

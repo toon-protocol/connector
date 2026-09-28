@@ -2774,14 +2774,16 @@ fn client_channels(
 /// the unaffiliated buyer's claims are exactly as replay-proof across a
 /// restart as a declared buyer's are.
 ///
-/// Bound to [`client_payout_ledger`] (issue #770) before it is returned:
-/// without this, a node's own outbound crediting is netted against nothing
-/// (`ClientClaimGate::credited_evm`'s pre-#770 default), which is exactly
-/// the production gap issue #770 closes -- the gate and the ledger it nets
-/// against must never be assembled separately again.
+/// Bound to a [`ClientPayoutLedger`] over `outbound` -- this node's journaled
+/// outbound x402 channels -- before it is returned (issue #770, ADR 0075
+/// decision 7): a client session's earnings are paid as vouchers on the
+/// channel an operator opened toward that client, signed by the chain's
+/// settlement key, and the watermark survives a restart with the channel's
+/// journal. A node with no batch-settlement backend has no outbound
+/// channels and pays no client.
 fn client_claim_gate(
     config: &Config,
-    signer: Arc<dyn Signer>,
+    outbound: Option<Arc<OutboundChannels>>,
     evm_source: Option<Arc<dyn ClientChannelSource>>,
     solana_source: Option<Arc<dyn ClientChannelSource>>,
     solana_cluster: Option<&'static str>,
@@ -2801,43 +2803,10 @@ fn client_claim_gate(
         journal,
     )
     .map_err(|source| RuntimeError::JournalUnreplayable { path, source })?;
-    Ok(gate.with_payout_ledger(client_payout_ledger(config, signer)))
-}
-
-/// This connector's own outbound claim ledger for the client edge (issue
-/// #770): every EVM `[[client_channels]]` entry, registered under the same
-/// signer that already signs this connector's identity and its peer-role
-/// outbound claims (`Connector::with_identity_signer`) -- one signing key
-/// for everything this connector owes, not a second one minted for this
-/// edge alone. A session earning against an undeclared (chain-resolved)
-/// channel is not covered here: crediting one requires knowing which
-/// domain to sign under, and only a declared `[[client_channels]]` entry
-/// carries that -- the same reason `client_channels` above resolves an
-/// *inbound* claim's channel from the chain but a payout ledger cannot
-/// mirror it for the outbound direction.
-///
-/// Solana channels are skipped: [`ClientPayoutLedger`] wraps
-/// `connector_runtime::ClaimBook`, which only ever signs an EVM balance
-/// proof (issue #742's own scope note) -- a Solana client channel nets
-/// nothing yet, matching `ClientClaimGate::credited`'s existing "Solana
-/// channel nets 0" rule.
-fn client_payout_ledger(config: &Config, signer: Arc<dyn Signer>) -> Arc<ClientPayoutLedger> {
-    let mut ledger = ClientPayoutLedger::new();
-    ledger.set_signer(signer);
-    for channel in config.client_channels() {
-        if let ClientChannelConfig::Evm(evm) = channel {
-            ledger
-                .set_channel_domain(
-                    evm.channel_id(),
-                    ChannelDomain {
-                        chain_id: evm.chain_id(),
-                        token_network_address: evm.token_network_address(),
-                    },
-                )
-                .expect("config load already validated every channel_id as a 32-byte identifier");
-        }
-    }
-    Arc::new(ledger)
+    Ok(match outbound {
+        Some(outbound) => gate.with_payout_ledger(Arc::new(ClientPayoutLedger::new(outbound))),
+        None => gate,
+    })
 }
 
 /// This node's own facts (ADR 0050), assembled once at router construction:
@@ -2912,7 +2881,7 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     let wrap_receiver_secret = Some(read_signer_secret(config.signer_key())?);
     let mut claim_gate = client_claim_gate(
         config,
-        signer.clone(),
+        runtime.outbound_channels.clone(),
         runtime.client_channel_source_evm.clone(),
         runtime.client_channel_source_solana.clone(),
         runtime.solana_cluster,
@@ -3070,14 +3039,6 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("temp state dir").keep();
         format!("state_dir = \"{}\"\n{text}", dir.display())
-    }
-
-    /// A throwaway signer for a [`client_claim_gate`] call whose test is
-    /// about channel resolution or journal behaviour, never about payout
-    /// signing (issue #770 gave the function a signer parameter it did not
-    /// have before).
-    fn test_signer() -> Arc<dyn Signer> {
-        Arc::new(LocalSigner::generate("connector-cli-runtime-test"))
     }
 
     /// Load a minimal config with `extra` spliced in at the top level, and
@@ -4416,7 +4377,7 @@ key_file = "{key_path}"
             )
         });
 
-        client_claim_gate(&config, test_signer(), None, None, None)
+        client_claim_gate(&config, None, None, None, None)
             .expect("a writable state_dir produces a gate");
         assert!(
             state_dir.path().join(CLIENT_EDGE_JOURNAL).exists(),
@@ -4448,7 +4409,7 @@ key_file = "{key_path}"
             )
         });
 
-        let Err(error) = client_claim_gate(&config, test_signer(), None, None, None) else {
+        let Err(error) = client_claim_gate(&config, None, None, None, None) else {
             panic!("an unusable state_dir must not produce a gate");
         };
         assert!(matches!(error, RuntimeError::StateDirUnusable { .. }));
@@ -4484,7 +4445,7 @@ key_file = "{key_path}"
             )
         });
 
-        let Err(error) = client_claim_gate(&config, test_signer(), None, None, None) else {
+        let Err(error) = client_claim_gate(&config, None, None, None, None) else {
             panic!("a corrupt journal must not produce a gate");
         };
         assert!(matches!(error, RuntimeError::JournalUnreplayable { .. }));
@@ -5162,7 +5123,7 @@ key_file = "{key_file}"
 
         /// A real [`PeerTransport`] that fulfils every forward and keeps
         /// what rode with it -- so the forward genuinely fulfils and the
-        /// postpay path's `record_fulfillment` genuinely runs. Its
+        /// retired postpay path would have signed, were it still there. Its
         /// fulfilment rides home unchecked (issue #1269 / ADR 0069), so it
         /// need not derive from anything [`peer_bound_prepare`] sets.
         struct RecordingPeerTransport {
@@ -7172,7 +7133,7 @@ key_file = "{key_path}"
 
             let gate = client_claim_gate(
                 &config,
-                test_signer(),
+                None,
                 None,
                 Some(Arc::new(SolanaChannelSource {
                     backend: Arc::new(node_backend),
@@ -7207,7 +7168,7 @@ key_file = "{key_path}"
             .expect("connect under the opener's identity, bound to the channel's own mint");
             let gate = client_claim_gate(
                 &config,
-                test_signer(),
+                None,
                 None,
                 Some(Arc::new(SolanaChannelSource {
                     backend: Arc::new(matching_backend),
@@ -7317,7 +7278,7 @@ key_file = "{key_path}"
             ));
             let gate = client_claim_gate(
                 &config,
-                test_signer(),
+                None,
                 Some(Arc::new(SettlementChannelSource {
                     backend: backend.clone(),
                 })),
@@ -7484,7 +7445,7 @@ key_file = "{key_path}"
             ));
             let gate = client_claim_gate(
                 &config,
-                test_signer(),
+                None,
                 None,
                 Some(Arc::new(SolanaChannelSource {
                     backend: Arc::new(node_backend),

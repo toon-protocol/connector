@@ -111,7 +111,7 @@ pub use lookup_budget::{
     DEFAULT_UNRESOLVABLE_LOOKUPS_TOTAL, DEFAULT_UNRESOLVABLE_LOOKUP_MAX_WAIT,
     DEFAULT_UNRESOLVABLE_LOOKUP_WINDOW, MAX_UNRESOLVABLE_LOOKUP_WINDOW,
 };
-pub use outbound_ledger::ClientPayoutLedger;
+pub use outbound_ledger::{ClientPayoutLedger, PayoutVoucher};
 pub use peer::PeerCarriages;
 pub use session_registry::SESSION_LEASE_BACKSTOP_TTL;
 

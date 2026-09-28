@@ -6,8 +6,9 @@
 //! real [`FileJournal`] on a real filesystem, so the syscalls are the ones
 //! the connector actually makes -- `strace` counts them from the outside,
 //! nothing here counts them for itself. Nothing is stubbed on the money
-//! path: the inbound claims are signed by a second, real [`ClaimBook`]
-//! standing in for the upstream node, the downstream peer is a second real
+//! path: the inbound claims are genuine EIP-712 balance proofs signed by a
+//! real [`LocalSigner`] standing in for the upstream node, the downstream
+//! peer is a second real
 //! `Connector` reached over [`InProcessPeerTransport`], and the covering
 //! claim box 1 signs per forward comes out of a real file-backed
 //! [`OutboundClientLedger`] signed by a real [`LocalSigner`].
@@ -61,7 +62,6 @@
 //! up front, outside the timed loop, exactly as they happen on another box
 //! in a real deployment.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -69,12 +69,14 @@ use chrono::{Duration as ChronoDuration, Utc};
 use connector_config::StaticRoute;
 use connector_domain::{EnvelopeRequest, EnvelopeResponse, PacketResponse, Prepare};
 use connector_runtime::{
-    AppOutcome, ChannelDomain, ClaimBook, ClaimStateDomain, ClaimStateSource, ClaimWatermark,
+    AppOutcome, ChannelDomain, ClaimSignature, ClaimStateDomain, ClaimStateSource, ClaimWatermark,
     Connector, EvmDomain, FakeAppClient, FileJournal, InProcessPeerTransport, OutboundClientError,
     OutboundClientLedger, PeerRoute, SystemClock, WireClaim,
 };
 use connector_signer::giftwrap::seal_request;
-use connector_signer::{derive_evm_address, Address, LocalSigner, Signer};
+use connector_signer::{
+    derive_evm_address, evm_balance_proof_digest, Address, EvmBalanceProof, LocalSigner, Signer,
+};
 
 /// The prefix box 1 forwards over its peer route, and the address every
 /// packet is ultimately destined for on box 2.
@@ -82,9 +84,6 @@ const DESTINATION: &str = "g.bench.app";
 /// The peer id box 1 forwards to. Not any deployment's peer id -- nothing
 /// here is written to any config.
 const DOWNSTREAM_PEER: &str = "peer-downstream";
-/// The peer id box 1 is known by upstream, used only to key the upstream
-/// `ClaimBook`'s outbound ledger.
-const UPSTREAM_SELF: &str = "box-1";
 /// Every packet carries the same amount; the peer route's fee is zero, so
 /// this is also what is forwarded and what each claim covers.
 const AMOUNT: u64 = 1_000;
@@ -227,20 +226,33 @@ fn downstream_box(identity: Arc<dyn Signer>) -> Arc<Connector> {
     )
 }
 
-/// The upstream node's own `ClaimBook`, used only to sign the claims that
-/// ride into box 1 -- the same `record_fulfillment` path a real peer signs
-/// its claims on, so what box 1 verifies is a genuine claim and not a
-/// hand-assembled one. Its journal is the default in-memory one, so it
-/// costs no syscalls.
-fn upstream_claim_source(signer: Arc<dyn Signer>) -> ClaimBook {
-    let book = ClaimBook::new(
-        Some(signer),
-        HashMap::from([(UPSTREAM_SELF.to_string(), channel_id(1))]),
-        HashMap::new(),
-    );
-    book.set_channel_domain(channel_id(1), bench_channel_domain())
-        .expect("channel 1 is a valid on-chain channel id");
-    book
+/// The `nonce`th claim the upstream node signs on channel 1, covering
+/// `nonce` packets: the EIP-712 `BalanceProof` a peer signs (ADR 0024), so
+/// what box 1 verifies is a genuine claim.
+fn upstream_claim(signer: &dyn Signer, nonce: u64) -> WireClaim {
+    let domain = bench_channel_domain();
+    let mut on_chain_id = [0u8; 32];
+    on_chain_id[31] = 1;
+    let cumulative_amount = nonce * AMOUNT;
+    let proof = EvmBalanceProof {
+        channel_id: on_chain_id,
+        nonce,
+        transferred_amount: u128::from(cumulative_amount),
+        locked_amount: 0,
+        locks_root: [0u8; 32],
+        chain_id: domain.chain_id,
+        token_network_address: domain.token_network_address,
+    };
+    WireClaim {
+        channel_id: channel_id(1),
+        nonce,
+        cumulative_amount,
+        signature: ClaimSignature::Evm(
+            signer
+                .sign(&evm_balance_proof_digest(&proof))
+                .expect("the upstream node signs a claim"),
+        ),
+    }
 }
 
 /// A PREPARE sealed to `identity` -- so it fulfils when it reaches an app
@@ -348,15 +360,10 @@ async fn main() {
     // Sender-side work, done up front so it is not inside the timed loop:
     // sealing a packet and signing the claim covering it both happen on
     // another box in a real deployment.
-    let upstream = upstream_claim_source(upstream_signer);
     let mut arrivals: Vec<(Prepare, Option<WireClaim>)> = Vec::with_capacity(args.packets);
-    for _ in 0..args.packets {
+    for n in 1..=args.packets as u64 {
         let claim = if args.mode.carries_claim() {
-            Some(
-                upstream
-                    .record_fulfillment(UPSTREAM_SELF, AMOUNT, Utc::now())
-                    .expect("the upstream node signs a claim"),
-            )
+            Some(upstream_claim(upstream_signer.as_ref(), n))
         } else {
             None
         };

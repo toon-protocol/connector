@@ -1,30 +1,28 @@
 //! Per-peering-relation claim exchange (ADR 0004, ADR 0005, ADR 0024,
-//! `docs/protocol/peer-semantics-pre-868.md` §3, issue #423): signing and tracking
-//! the claim this connector owes a peer on fulfilment, and verifying and
-//! watermarking a claim a peer sends back. The nonce/watermark rule itself
-//! lives in `connector_domain::validate_claim`; this module is the
-//! in-memory bookkeeping and wire shape around it, plus the chain-specific
-//! digest a claim's signature actually covers (issue #575:
-//! `connector_signer::evm_balance_proof_digest`, the same EIP-712
-//! `BalanceProof` digest `packages/contracts/src/TokenNetwork.sol` verifies
-//! on redemption -- not a connector-internal SHA-256 tuple nothing on chain
-//! ever checks). Durable persistence of this state (ADR 0005's journal) is
-//! issue #424's job -- [`ClaimBook`] holds it only for the lifetime of the
-//! process, exactly like `Connector`'s `leased_routes`.
+//! `docs/protocol/peer-semantics-pre-868.md` §3, issue #423): verifying and
+//! watermarking a `toon-channel` claim a peer sends, and the wire shape a
+//! claim travels in. The nonce/watermark rule itself lives in
+//! `connector_domain::validate_claim`; this module is the in-memory
+//! bookkeeping around it, plus the chain-specific digest a claim's
+//! signature covers (issue #575: `connector_signer::evm_balance_proof_digest`,
+//! the same EIP-712 `BalanceProof` digest `TokenNetwork.sol` verifies).
+//!
+//! Signing a claim this connector owes lived here too, as
+//! `ClaimBook::record_fulfillment`, until its last caller -- the client
+//! payout ledger -- moved to vouchers on an outbound x402 channel (ADR 0075
+//! decision 7, issue #1381). Every outbound claim is now a voucher, signed
+//! through `crate::OutboundChannels`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 
-use connector_domain::{
-    advance_watermark, validate_claim, ClaimError, JournalEntry, Projection, Watermark,
-};
+use connector_domain::{advance_watermark, validate_claim, ClaimError, JournalEntry, Watermark};
 use connector_signer::{
-    evm_balance_proof_digest, solana_balance_proof_message, verify_evm_balance_proof,
-    verify_solana_balance_proof, Address, Ed25519Signer, EvmBalanceProof, Signature, Signer,
+    verify_evm_balance_proof, verify_solana_balance_proof, Address, Ed25519Signer, EvmBalanceProof,
+    Signature, Signer,
 };
 use thiserror::Error;
 
@@ -36,7 +34,7 @@ use crate::operator_view::ClaimView;
 /// is expected to already name the channel's on-chain `bytes32` (see
 /// [`ClaimBook::set_channel_domain`]) -- this type itself carries it as an
 /// opaque `String` (as it always has) so the wire encoding below is
-/// unchanged; it is [`ClaimBook`] that refuses to sign or accept a claim
+/// unchanged; it is [`ClaimBook`] that refuses to accept a claim
 /// whose `channel_id` was never registered as one. Distinct from
 /// `connector_settlement::Claim` -- that is the on-chain redemption claim
 /// (issue #425); this is the per-peering-relation claim exchanged before
@@ -398,41 +396,6 @@ pub(crate) fn evm_proof(
     }
 }
 
-/// One peer's outbound claim ledger: what this connector owes it, signed
-/// here and piggybacked on the next frame out.
-#[derive(Default)]
-struct OutboundLedger {
-    channel_id: String,
-    pending: Option<WireClaim>,
-    pending_since: Option<DateTime<Utc>>,
-    nonce: u64,
-    cumulative_amount: u64,
-}
-
-/// The part of an [`OutboundLedger`] a fulfilment advances -- and therefore
-/// the whole of what a batch that could not be made durable has to put
-/// back. Deliberately **not** a snapshot of the whole ledger: `pending` is
-/// armed by the committer only *after* its claim's entry is durable
-/// ([`GroupCommitter`]), so it is never part of an advance, and restoring a
-/// snapshot of it would discard a claim that became durable in the
-/// meantime.
-#[derive(Clone)]
-struct LedgerSequence {
-    channel_id: String,
-    nonce: u64,
-    cumulative_amount: u64,
-}
-
-impl LedgerSequence {
-    fn of(ledger: &OutboundLedger) -> LedgerSequence {
-        LedgerSequence {
-            channel_id: ledger.channel_id.clone(),
-            nonce: ledger.nonce,
-            cumulative_amount: ledger.cumulative_amount,
-        }
-    }
-}
-
 /// This connector's claim state across every peering relation (ADR 0004,
 /// ADR 0005). Signing requires a [`Signer`]; a node with none configured
 /// simply never emits a claim, matching how a node with no settlement
@@ -470,12 +433,9 @@ pub struct ClaimBook {
     /// why that is the right trade here.
     outbound_channels: ArcSwap<HashMap<String, String>>,
     /// `channel_id` -> its parsed on-chain `bytes32` and the EIP-712 domain
-    /// its claims are signed and verified under (issue #575/#566). Shared
-    /// by both directions -- outbound signing (`record_fulfillment`) and
-    /// inbound verification (`accept_inbound`) build the same
-    /// [`EvmBalanceProof`] shape from the same channel, differing only in
-    /// which nonce/amount they carry and, for inbound, which address the
-    /// recovered signer must match.
+    /// its claims are verified under (issue #575/#566): `accept_inbound`
+    /// builds the [`EvmBalanceProof`] a claim's signature must recover
+    /// over from it.
     channel_domains: ArcSwap<HashMap<String, (OnChainChannelId, ChannelDomain)>>,
     /// `channel_id` -> the EVM address whose signature this connector
     /// accepts on a claim for that channel -- recovered from the signature
@@ -492,27 +452,14 @@ pub struct ClaimBook {
     /// chain's signature for a channel deserves. See
     /// [`ClaimBook::set_solana_channel`].
     solana_channels: ArcSwap<HashMap<String, SolanaChannel>>,
-    /// `Arc`-wrapped, like `inbound_watermarks` and `projection`, so
-    /// [`GroupCommitter`]'s thread can arm a peer's pending claim once its
-    /// entry is durable -- and put this ledger back if it never is --
-    /// without needing `self`.
-    outbound: Arc<RwLock<HashMap<String, OutboundLedger>>>,
     /// `channel_id` -> the highest nonce/amount accepted on it so far.
     inbound_watermarks: Arc<RwLock<HashMap<String, Watermark>>>,
-    /// Durable record of every claim signed and every claim accepted (ADR
-    /// 0005, issue #424). Defaults to [`InMemoryJournal`] -- a node that
-    /// never configures a real one keeps working exactly as it did before
-    /// this issue, just without surviving a restart, matching how
-    /// `settlement` degrades to `None`.
+    /// Durable record of every claim accepted (ADR 0005, issue #424).
+    /// Defaults to [`InMemoryJournal`] -- a node that never configures a
+    /// real one keeps working, just without surviving a restart.
     journal: Arc<dyn Journal>,
-    /// Balances, derived from `journal`'s own entries rather than stored
-    /// independently (ADR 0005). Updated alongside every journal append so
-    /// a live read never has to replay the journal. `Arc`-wrapped so
-    /// [`GroupCommitter`]'s background thread can fold a batch's entries in
-    /// -- in batch order, under one lock hold -- without needing `self`.
-    projection: Arc<RwLock<Projection>>,
-    /// Issue #710: batches concurrent [`ClaimBook::record_fulfillment`] and
-    /// [`ClaimBook::accept_inbound`] journal appends into one
+    /// Issue #710: batches concurrent [`ClaimBook::accept_inbound`] journal
+    /// appends into one
     /// [`Journal::append_batch`] write, the same group-commit mechanism
     /// issue #686 gave the client edge's `ClientClaimGate`
     /// (`connector_client_edge::claim_gate::GroupCommitter`), rollback of
@@ -527,14 +474,10 @@ impl ClaimBook {
         counterparties: HashMap<String, Address>,
     ) -> ClaimBook {
         let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
-        let projection = Arc::new(RwLock::new(Projection::default()));
-        let outbound = Arc::new(RwLock::new(HashMap::new()));
         let inbound_watermarks = Arc::new(RwLock::new(HashMap::new()));
         let committer = GroupCommitter::spawn(CommitState {
             journal: journal.clone(),
-            outbound: outbound.clone(),
             inbound_watermarks: inbound_watermarks.clone(),
-            projection: projection.clone(),
         });
         ClaimBook {
             signer,
@@ -543,18 +486,10 @@ impl ClaimBook {
             channel_domains: ArcSwap::from_pointee(HashMap::new()),
             counterparties: ArcSwap::from_pointee(counterparties),
             solana_channels: ArcSwap::from_pointee(HashMap::new()),
-            outbound,
             inbound_watermarks,
             journal,
-            projection,
             committer,
         }
-    }
-
-    fn outbound_mut(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, OutboundLedger>> {
-        self.outbound
-            .write()
-            .expect("outbound claims lock poisoned")
     }
 
     /// Configure this connector's own signer, used to sign every outbound
@@ -766,174 +701,52 @@ impl ClaimBook {
     }
 
     /// Configure the durable journal claims are persisted to, replaying
-    /// every entry already in it to rebuild this book's in-memory state
-    /// (ADR 0005, issue #424: "rebuilt from the journal on start"). Call
-    /// this *after* [`ClaimBook::set_signer`] and every
-    /// [`ClaimBook::set_channel_domain`] call -- rebuild re-signs a fresh
-    /// claim for any peer left with an unacknowledged one (see
-    /// [`ClaimBook::rebuild_from`]'s own doc), which needs both a signer
-    /// and that channel's domain already in place to do; without either,
-    /// that peer's cumulative state still recovers correctly, it just
-    /// cannot re-arm a claim to send until a fulfilment next changes it.
-    /// Takes `&mut self` for the same reason `set_signer` does -- called
-    /// only while a `Connector` is still being built.
+    /// every entry already in it to rebuild this book's inbound watermarks
+    /// (ADR 0005, issue #424: "rebuilt from the journal on start"). Takes
+    /// `&mut self` for the same reason `set_signer` does -- called only while
+    /// a `Connector` is still being built.
+    ///
+    /// A journal written before ADR 0075 (issue #1381) may still carry
+    /// `OutboundClaimSigned` entries from the retired payout ledger; nothing
+    /// signs one any more, and they replay as nothing.
     pub fn set_journal(&mut self, journal: Arc<dyn Journal>) -> Result<(), JournalError> {
         let entries = journal.read_all()?;
-        let (outbound, inbound_watermarks, projection) = Self::rebuild_from(
-            &entries,
-            self.signer.as_ref(),
-            &self.channel_domains.load(),
-            self.solana_signer.as_ref(),
-            &self.solana_channels.load(),
-        );
-        let projection = Arc::new(RwLock::new(projection));
-        let outbound = Arc::new(RwLock::new(outbound));
-        let inbound_watermarks = Arc::new(RwLock::new(inbound_watermarks));
+        let inbound_watermarks = Arc::new(RwLock::new(Self::rebuild_from(&entries)));
         // A fresh committer bound to the real journal and to the state the
         // replay just rebuilt -- the one spawned in `new` was writing to
-        // the default `InMemoryJournal`, and holds `Arc`s to the maps this
-        // method is about to replace, so it would keep batching entries
-        // into a journal nothing ever replays and arming claims on ledgers
-        // nothing ever reads. Dropping the old `GroupCommitter` here drops
-        // its sender, which ends that thread's loop; called only while a
-        // `Connector` is still being built (this method's own doc), so no
-        // commit can be in flight on it.
+        // the default `InMemoryJournal`, and holds an `Arc` to the map this
+        // method is about to replace. Dropping the old `GroupCommitter` here
+        // drops its sender, which ends that thread's loop; called only while
+        // a `Connector` is still being built, so no commit can be in flight
+        // on it.
         self.committer = GroupCommitter::spawn(CommitState {
             journal: journal.clone(),
-            outbound: outbound.clone(),
             inbound_watermarks: inbound_watermarks.clone(),
-            projection: projection.clone(),
         });
         self.journal = journal;
-        self.outbound = outbound;
         self.inbound_watermarks = inbound_watermarks;
-        self.projection = projection;
         Ok(())
     }
 
-    /// Fold `entries` into fresh outbound/inbound state and a
-    /// [`Projection`] -- the pure replay [`ClaimBook::set_journal`] drives.
-    /// A peer left with `pending` unacknowledged is *always* re-armed with
-    /// a freshly signed claim of the same nonce/cumulative amount when both
-    /// that chain's signer and that channel's binding are available:
-    /// resending an already-acknowledged claim costs nothing (the peer's
-    /// own `accept_inbound` simply rejects a nonce that does not advance
-    /// its watermark), so recovery needs no separate "was this
-    /// acknowledged" record -- treating every rebuilt claim as pending is
-    /// always safe, matching the acceptance criteria's "no manual repair".
-    /// A ledger whose channel has no binding configured on either chain is
-    /// left with no pending claim, exactly as
-    /// [`ClaimBook::record_fulfillment`] would have refused to sign one for
-    /// it live.
-    ///
-    /// Which chain a ledger's `channel_id` re-signs under is decided the
-    /// same way [`ClaimBook::record_fulfillment`] decides it live:
-    /// `channel_domains` is tried first, then `solana_channels` -- never
-    /// both, and never guessed from the journal entry itself.
-    /// `JournalEntry::OutboundClaimSigned` carries no chain discriminator
-    /// of its own, and does not need one: a channel is registered on
-    /// exactly one chain (`ClaimBook::set_solana_channel`'s own doc), and an
-    /// EVM `channel_id` (0x-hex or a decimal numeral) and a Solana one
-    /// (base58 of 32 bytes) can never collide, so `channel_id` alone is
-    /// already enough to tell the two apart on replay.
-    fn rebuild_from(
-        entries: &[JournalEntry],
-        signer: Option<&Arc<dyn Signer>>,
-        channel_domains: &HashMap<String, (OnChainChannelId, ChannelDomain)>,
-        solana_signer: Option<&Arc<dyn Ed25519Signer>>,
-        solana_channels: &HashMap<String, SolanaChannel>,
-    ) -> (
-        HashMap<String, OutboundLedger>,
-        HashMap<String, Watermark>,
-        Projection,
-    ) {
-        let mut outbound: HashMap<String, OutboundLedger> = HashMap::new();
+    /// Fold `entries` into fresh inbound watermarks -- the pure replay
+    /// [`ClaimBook::set_journal`] drives.
+    fn rebuild_from(entries: &[JournalEntry]) -> HashMap<String, Watermark> {
         let mut inbound_watermarks: HashMap<String, Watermark> = HashMap::new();
-        let mut projection = Projection::default();
         for entry in entries {
-            projection.apply(entry);
-            match entry {
-                JournalEntry::OutboundClaimSigned {
-                    peer_id,
-                    channel_id,
-                    nonce,
-                    cumulative_amount,
-                } => {
-                    outbound.insert(
-                        peer_id.clone(),
-                        OutboundLedger {
-                            channel_id: channel_id.clone(),
-                            pending: None,
-                            pending_since: None,
-                            nonce: *nonce,
-                            cumulative_amount: *cumulative_amount,
-                        },
-                    );
-                }
-                JournalEntry::InboundClaimAccepted {
-                    channel_id,
-                    nonce,
-                    cumulative_amount,
-                    ..
-                } => {
-                    inbound_watermarks.insert(
-                        channel_id.clone(),
-                        advance_watermark(*nonce, *cumulative_amount),
-                    );
-                }
-                JournalEntry::InboundFulfillmentRecorded { .. } => {}
-                // Written only to the client edge's own journal (issue
-                // #977) -- see the variant's own doc. `ClaimBook` is the
-                // peer semantics's book and never sees one of these in practice,
-                // but the two journals share this enum, so every entry kind
-                // in it must still be handled here.
-                JournalEntry::InboundClaimWatermarkReset { .. } => {}
-                // Written only to the client edge's own journal (issue
-                // #1012) -- see the variant's own doc; same reasoning as
-                // `InboundClaimWatermarkReset` above.
-                JournalEntry::InboundClaimRolledBack { .. } => {}
-                // Written only to the client edge's own journal (ADR 0074)
-                // -- same reasoning again.
-                JournalEntry::BatchChannelAdmitted { .. } => {}
-                // Written only to the outbound channels' own journal (ADR
-                // 0075 decision 8) -- same reasoning again.
-                JournalEntry::OutboundChannelOpening { .. }
-                | JournalEntry::OutboundChannelOpened { .. }
-                | JournalEntry::OutboundChannelAbandoned { .. }
-                | JournalEntry::OutboundVoucherSigned { .. } => {}
-            }
-        }
-        for ledger in outbound.values_mut() {
-            if let (Some(signer), Some(&(on_chain_id, domain))) =
-                (signer, channel_domains.get(&ledger.channel_id))
+            if let JournalEntry::InboundClaimAccepted {
+                channel_id,
+                nonce,
+                cumulative_amount,
+                ..
+            } = entry
             {
-                let proof = evm_proof(on_chain_id, domain, ledger.nonce, ledger.cumulative_amount);
-                if let Ok(signature) = signer.sign(&evm_balance_proof_digest(&proof)) {
-                    ledger.pending = Some(WireClaim {
-                        channel_id: ledger.channel_id.clone(),
-                        nonce: ledger.nonce,
-                        cumulative_amount: ledger.cumulative_amount,
-                        signature: ClaimSignature::Evm(signature),
-                    });
-                }
-            } else if let (Some(solana_signer), Some(&channel)) =
-                (solana_signer, solana_channels.get(&ledger.channel_id))
-            {
-                let message = solana_balance_proof_message(
-                    &channel.program_id,
-                    &channel.channel_account,
-                    ledger.nonce,
-                    ledger.cumulative_amount,
+                inbound_watermarks.insert(
+                    channel_id.clone(),
+                    advance_watermark(*nonce, *cumulative_amount),
                 );
-                ledger.pending = Some(WireClaim {
-                    channel_id: ledger.channel_id.clone(),
-                    nonce: ledger.nonce,
-                    cumulative_amount: ledger.cumulative_amount,
-                    signature: ClaimSignature::Solana(solana_signer.sign(&message)),
-                });
             }
         }
-        (outbound, inbound_watermarks, projection)
+        inbound_watermarks
     }
 
     /// The channel this connector claims against when it owes `peer_id`,
@@ -942,246 +755,6 @@ impl ClaimBook {
     /// whether a claim happens to be pending right now).
     pub fn outbound_channel_id(&self, peer_id: &str) -> Option<String> {
         self.outbound_channels.load().get(peer_id).cloned()
-    }
-
-    /// The latest claim this connector has ever accepted on `channel_id`
-    /// (issue #425), ready to submit to a `SettlementBackend::redeem` --
-    /// never a superseded one, since the projection this reads from only
-    /// ever retains the highest-nonce claim (peer-semantics-pre-868.md §3.4).
-    /// `None` if no claim has ever been accepted on this channel.
-    pub fn latest_inbound_claim(&self, channel_id: &str) -> Option<connector_settlement::Claim> {
-        let (nonce, cumulative_amount, signature) = self
-            .projection
-            .read()
-            .expect("projection lock poisoned")
-            .latest_inbound_claim(channel_id)?;
-        Some(connector_settlement::Claim {
-            nonce,
-            cumulative_amount: cumulative_amount as u128,
-            signature,
-        })
-    }
-
-    /// Record that a packet forwarded to `peer_id` fulfilled, owing it
-    /// `amount` more (ADR 0004 -- value moves on fulfilment). Signs a fresh
-    /// claim for the new cumulative total, over that channel's own binding
-    /// -- the EIP-712 domain for an EVM channel (issue #575), or the
-    /// ed25519 balance-proof message for a Solana one (issue #742) -- and
-    /// arms it pending. `channel_domains` is tried first and
-    /// `solana_channels` second, the same order and the same "exactly one,
-    /// never both" rule [`ClaimBook::rebuild_from`] and
-    /// [`ClaimBook::verify_signature`] hold to. Exactly one claim is
-    /// produced per call -- never batched: a second fulfilment before the
-    /// first claim has gone out simply supersedes it with a fresher nonce
-    /// and a higher cumulative amount (peer-semantics-pre-868.md §3.2). Does
-    /// nothing -- and leaves this peer's ledger untouched -- for a peer
-    /// with no configured channel, or a channel whose chain has no signer
-    /// or no binding configured (AC3): every one of those is a reason a
-    /// claim cannot be produced at all, not a reason to produce one under a
-    /// defaulted or wrong domain.
-    ///
-    /// **The claim is armed only once its journal entry is durable** (ADR
-    /// 0005: value is not moved until the entry is durable). The advance
-    /// and the enqueue happen under the outbound write lock; the fsync
-    /// happens outside it, in the committer's batch; and it is the
-    /// committer -- after that batch lands -- that sets `pending`, so no
-    /// concurrent [`ClaimBook::pending_claim`] can ever read a claim whose
-    /// entry is still in flight and ship it to the peer. A batch that
-    /// cannot be made durable puts this peer's ledger back where it was
-    /// and this returns `None`: nothing was signed, as far as any caller
-    /// or any restart is concerned.
-    pub fn record_fulfillment(
-        &self,
-        peer_id: &str,
-        amount: u64,
-        now: DateTime<Utc>,
-    ) -> Option<WireClaim> {
-        let channel_id = self.outbound_channels.load().get(peer_id)?.clone();
-
-        enum Binding<'a> {
-            Evm(&'a Arc<dyn Signer>, OnChainChannelId, ChannelDomain),
-            Solana(&'a Arc<dyn Ed25519Signer>, SolanaChannel),
-        }
-        let binding =
-            if let Some(&(on_chain_id, domain)) = self.channel_domains.load().get(&channel_id) {
-                let signer = self.signer.as_ref()?;
-                Binding::Evm(signer, on_chain_id, domain)
-            } else if let Some(&channel) = self.solana_channels.load().get(&channel_id) {
-                let solana_signer = self.solana_signer.as_ref()?;
-                Binding::Solana(solana_signer, channel)
-            } else {
-                return None;
-            };
-
-        let mut outbound = self.outbound_mut();
-        let ledger = outbound
-            .entry(peer_id.to_string())
-            .or_insert_with(|| OutboundLedger {
-                channel_id: channel_id.clone(),
-                ..Default::default()
-            });
-        if ledger.channel_id != channel_id {
-            // Config now names a different channel for this peer than the
-            // one this ledger's nonce/cumulative sequence was built against
-            // (a peer-channel migration, issue #832) -- a new channel starts
-            // its own nonce/amount sequence by definition, so carrying the
-            // old watermark across it is never correct. The signing path
-            // below re-signs and re-journals from nonce 1, which is exactly
-            // what a restart replaying that fresh entry through
-            // `rebuild_from` will also land on, so the rebind needs no
-            // journal entry of its own -- but it does get a log line, since
-            // discarding a watermark is precisely the kind of
-            // revenue-affecting event issue #832 found happening silently.
-            tracing::warn!(
-                peer_id,
-                retired_channel_id = %ledger.channel_id,
-                retired_nonce = ledger.nonce,
-                retired_cumulative_amount = ledger.cumulative_amount,
-                channel_id = %channel_id,
-                "config names a new channel for this peer; rebinding the outbound ledger from nonce 1"
-            );
-            *ledger = OutboundLedger {
-                channel_id: channel_id.clone(),
-                ..Default::default()
-            };
-        }
-        // The sequence state a failed batch has to put back: taken after
-        // any rebind above, so what is restored is the ledger this claim
-        // was actually built on top of.
-        let previous = if ledger.nonce == 0 {
-            None
-        } else {
-            Some(LedgerSequence::of(ledger))
-        };
-        ledger.cumulative_amount += amount;
-        ledger.nonce += 1;
-        let signature = match binding {
-            Binding::Evm(signer, on_chain_id, domain) => {
-                let proof = evm_proof(on_chain_id, domain, ledger.nonce, ledger.cumulative_amount);
-                let signature = signer.sign(&evm_balance_proof_digest(&proof)).ok()?;
-                ClaimSignature::Evm(signature)
-            }
-            Binding::Solana(solana_signer, channel) => {
-                let message = solana_balance_proof_message(
-                    &channel.program_id,
-                    &channel.channel_account,
-                    ledger.nonce,
-                    ledger.cumulative_amount,
-                );
-                ClaimSignature::Solana(solana_signer.sign(&message))
-            }
-        };
-        let claim = WireClaim {
-            channel_id: ledger.channel_id.clone(),
-            nonce: ledger.nonce,
-            cumulative_amount: ledger.cumulative_amount,
-            signature,
-        };
-        // Enqueue while still holding the outbound write lock, then drop it
-        // before waiting for the batch's fsync (issue #710) -- the same
-        // shape issue #686 gave the client edge's `ClientClaimGate::admit`.
-        // Enqueueing under the lock is what keeps the committer's batch
-        // order identical to the order every peer's ledger actually
-        // advanced in; waiting outside it is what lets a fulfilment to one
-        // peer share its fsync with a concurrent fulfilment to another,
-        // instead of serializing the whole connector behind one lock for
-        // the length of a disk write.
-        //
-        // `pending` is deliberately NOT set here. Arming it is the
-        // committer's job, once the entry is durable: on `main` the append
-        // ran under this same lock, so nothing could read a claim before
-        // its record existed, and releasing the lock to batch the fsync
-        // must not quietly give that up (ADR 0005).
-        let ticket = match self.committer.enqueue(PendingCommit {
-            entry: JournalEntry::OutboundClaimSigned {
-                peer_id: peer_id.to_string(),
-                channel_id: claim.channel_id.clone(),
-                nonce: claim.nonce,
-                cumulative_amount: claim.cumulative_amount,
-            },
-            effect: CommitEffect::OutboundClaimSigned {
-                peer_id: peer_id.to_string(),
-                claim: claim.clone(),
-                signed_at: now,
-                previous: previous.clone(),
-            },
-        }) {
-            Ok(ticket) => ticket,
-            Err(CommitterGone) => {
-                // Nothing will ever fsync this entry. Undo the advance
-                // while still holding the lock -- no other fulfilment has
-                // seen it -- and produce no claim, exactly as a peer with
-                // no signer configured produces none.
-                restore_ledger(&mut outbound, peer_id, previous);
-                tracing::error!(
-                    peer_id,
-                    "not signing a claim: the peer claim journal committer is gone, so it \
-                     could not be durably recorded"
-                );
-                return None;
-            }
-        };
-        drop(outbound);
-        if !ticket.durable() {
-            // The committer has already put this peer's ledger back (see
-            // `group_commit_loop`); the claim never existed.
-            return None;
-        }
-        Some(claim)
-    }
-
-    /// The claim owed to `peer_id`, if one is pending -- what the next
-    /// frame out to that peer should carry (peer-semantics-pre-868.md §3.2).
-    pub fn pending_claim(&self, peer_id: &str) -> Option<WireClaim> {
-        self.outbound
-            .read()
-            .expect("outbound claims lock poisoned")
-            .get(peer_id)
-            .and_then(|ledger| ledger.pending.clone())
-    }
-
-    /// The total this connector has ever signed an outbound claim for on
-    /// `peer_id` -- unlike [`ClaimBook::pending_claim`], which answers
-    /// `None` once the most recent claim has been acknowledged, this never
-    /// resets: [`ClaimBook::acknowledge_outbound`] only ever clears
-    /// `pending`, never `cumulative_amount` (issue #700's netting --
-    /// `client-edge-spec.md`'s "credited" term is what this connector has
-    /// *committed* to pay, not what is still in flight, since an
-    /// acknowledgement confirms delivery of a claim rather than undoing the
-    /// commitment it represents). `0` for a peer this book has never signed
-    /// a claim for.
-    pub fn outbound_cumulative_amount(&self, peer_id: &str) -> u64 {
-        self.outbound
-            .read()
-            .expect("outbound claims lock poisoned")
-            .get(peer_id)
-            .map(|ledger| ledger.cumulative_amount)
-            .unwrap_or(0)
-    }
-
-    /// Record the outcome of a claim of `nonce` sent to `peer_id`. On
-    /// acceptance the pending mark clears -- but only if `nonce` still
-    /// names the claim actually pending: a fresher fulfilment may already
-    /// have superseded it while the acknowledgement was in flight, and
-    /// acknowledging the stale nonce must not clear that newer claim
-    /// (peer-semantics-pre-868.md §3.2).
-    pub fn acknowledge_outbound(&self, peer_id: &str, nonce: u64, outcome: ClaimAckOutcome) {
-        if let ClaimAckOutcome::Rejected(reason) = outcome {
-            // Same rationale as `accept_inbound`'s warn (issue #832): a peer
-            // rejecting a claim this connector signed is revenue-affecting
-            // and must not be silent.
-            tracing::warn!(peer_id, nonce, reason = ?reason, "peer rejected outbound claim");
-        }
-        if outcome != ClaimAckOutcome::Accepted {
-            return;
-        }
-        let mut outbound = self.outbound_mut();
-        if let Some(ledger) = outbound.get_mut(peer_id) {
-            if ledger.pending.as_ref().map(|c| c.nonce) == Some(nonce) {
-                ledger.pending = None;
-                ledger.pending_since = None;
-            }
-        }
     }
 
     /// Whether `claim`'s signature is genuine, for the chain the signature
@@ -1303,8 +876,8 @@ impl ClaimBook {
                     advance_watermark(claim.nonce, claim.cumulative_amount),
                 );
                 // Enqueue before dropping the watermark lock, then wait
-                // outside it (issue #710, mirroring `record_fulfillment`
-                // and issue #686's own `ClientClaimGate::admit`): a claim
+                // outside it (issue #710, mirroring issue #686's own
+                // `ClientClaimGate::admit`): a claim
                 // accepted on one channel shares its fsync with a
                 // concurrent acceptance on another instead of serializing
                 // behind one lock for the length of a disk write, and this
@@ -1377,40 +950,21 @@ impl ClaimBook {
     /// entry for the same reason `accept_inbound` needs none: the peer semantics
     /// has no identity handshake yet, so only the channel is known.
     pub fn views(&self) -> Vec<ClaimView> {
-        let mut views: Vec<ClaimView> = self
-            .outbound
+        self.inbound_watermarks
             .read()
-            .expect("outbound claims lock poisoned")
+            .expect("inbound watermarks lock poisoned")
             .iter()
-            .filter(|(_, ledger)| ledger.nonce > 0)
-            .map(|(peer_id, ledger)| ClaimView {
-                peer_id: Some(peer_id.clone()),
-                channel_id: ledger.channel_id.clone(),
-                direction: crate::operator_view::ClaimDirection::Outbound,
-                nonce: ledger.nonce,
-                cumulative_amount: ledger.cumulative_amount,
-                pending: ledger.pending.is_some(),
+            .map(|(channel_id, watermark)| ClaimView {
+                peer_id: None,
+                channel_id: channel_id.clone(),
+                direction: crate::operator_view::ClaimDirection::Inbound,
+                nonce: watermark.nonce,
+                cumulative_amount: watermark.cumulative_amount,
+                pending: false,
                 book: crate::operator_view::ClaimBookKind::Peer,
                 scheme: crate::operator_view::ClaimScheme::ToonChannel,
             })
-            .collect();
-        views.extend(
-            self.inbound_watermarks
-                .read()
-                .expect("inbound watermarks lock poisoned")
-                .iter()
-                .map(|(channel_id, watermark)| ClaimView {
-                    peer_id: None,
-                    channel_id: channel_id.clone(),
-                    direction: crate::operator_view::ClaimDirection::Inbound,
-                    nonce: watermark.nonce,
-                    cumulative_amount: watermark.cumulative_amount,
-                    pending: false,
-                    book: crate::operator_view::ClaimBookKind::Peer,
-                    scheme: crate::operator_view::ClaimScheme::ToonChannel,
-                }),
-        );
-        views
+            .collect()
     }
 }
 
@@ -1422,21 +976,9 @@ impl ClaimBook {
 const GROUP_COMMIT_MAX_BATCH: usize = 4096;
 
 /// What the state this connector reads live still owes a queued
-/// [`JournalEntry`] once its batch resolves: the advance to *complete* if
-/// the batch is durable, and the advance to *undo* if it is not. One
-/// variant per journal entry [`ClaimBook`] writes.
+/// [`JournalEntry`] once its batch resolves: the advance to *undo* if it is
+/// not durable. One variant per journal entry [`ClaimBook`] writes.
 enum CommitEffect {
-    /// `record_fulfillment` advanced `peer_id`'s ledger to `claim`'s
-    /// nonce/cumulative amount. On success `claim` is armed as that peer's
-    /// pending claim -- the first moment anything may transmit it (ADR
-    /// 0005). On failure the ledger goes back to `previous`, so the next
-    /// fulfilment re-signs this same nonce rather than skipping it.
-    OutboundClaimSigned {
-        peer_id: String,
-        claim: WireClaim,
-        signed_at: DateTime<Utc>,
-        previous: Option<LedgerSequence>,
-    },
     /// `accept_inbound` advanced `channel_id`'s watermark; on failure it
     /// goes back to `previous`, so the peer's retransmission of the very
     /// same claim is judged fresh again rather than bouncing off its own
@@ -1470,7 +1012,7 @@ struct DurabilityTicket {
 impl DurabilityTicket {
     /// Block until this entry's batch -- and every other entry sharing it
     /// -- has been written, and answer whether it is durable.
-    /// `record_fulfillment`/`accept_inbound`'s entire durability contract:
+    /// `accept_inbound`'s entire durability contract:
     /// synchronous, and it always returns. A sender dropped without an
     /// answer is a committer that died mid-batch, which is not durable
     /// either.
@@ -1480,22 +1022,18 @@ impl DurabilityTicket {
 }
 
 /// Everything the committer thread touches: the journal it writes and the
-/// three pieces of live state a batch completes or undoes. Grouped so
-/// [`GroupCommitter::spawn`] takes one argument rather than four, and so
-/// [`ClaimBook::set_journal`] cannot rebind one of them and forget another.
+/// live state a failed batch undoes. Grouped so [`ClaimBook::set_journal`]
+/// cannot rebind one and forget the other.
 struct CommitState {
     journal: Arc<dyn Journal>,
-    outbound: Arc<RwLock<HashMap<String, OutboundLedger>>>,
     inbound_watermarks: Arc<RwLock<HashMap<String, Watermark>>>,
-    projection: Arc<RwLock<Projection>>,
 }
 
 /// Issue #710's group commit for [`ClaimBook`]'s peer claim journal: a
 /// dedicated thread that drains every [`PendingCommit`] queued since the
 /// last batch and writes them as one [`Journal::append_batch`] -- one
 /// write, one fsync -- instead of the one-fsync-per-entry `Journal::append`
-/// calls `record_fulfillment`/`accept_inbound` each made directly before
-/// this issue. The mechanism is issue #686's, adopted rather than
+/// calls `accept_inbound` made directly before this issue. The mechanism is issue #686's, adopted rather than
 /// reinvented (see `connector_client_edge::claim_gate::GroupCommitter`):
 /// concurrent forwards queue behind one another only for the microseconds
 /// it takes to enqueue, not for a whole fsync each.
@@ -1505,32 +1043,17 @@ struct CommitState {
 /// nothing else; it exits when the book is dropped (the sender goes away)
 /// and takes nothing with it.
 ///
-/// **Nothing is published before its entry is durable, and a batch that
-/// cannot be made durable is rolled back.** Those are the two halves of
+/// **A batch that cannot be made durable is rolled back** -- the half of
 /// ADR 0005 that holding the append under the caller's write lock used to
 /// give for free, and moving the fsync out from under that lock has to buy
-/// back explicitly:
-///
-/// * *Publish after.* A signed outbound claim is a bearer instrument --
-///   `Connector::forward` reads `pending_claim` and ships it -- so
-///   `record_fulfillment` advances the ledger and enqueues under the lock
-///   but does not arm `pending`; this thread arms it, after the batch
-///   lands. Without that, a forward on another thread could transmit a
-///   nonce whose journal entry never made it to disk, and a restart would
-///   replay a lower nonce that the peer already holds and will reject as
-///   non-advancing -- the value unrecoverable, which is precisely what
-///   ADR 0005 exists to prevent.
-/// * *Roll back.* A failed batch leaves ledger nonces and inbound
-///   watermarks promising a durable record that does not exist. So this
-///   thread retakes the write locks those advances were decided under,
-///   drains whatever else was queued against the now-unrecorded state
-///   (it could only have landed in this batch or a later one, and there is
-///   no later one until this loop comes back around), restores every
-///   touched peer and channel to its state before the *earliest* failed
-///   entry, and only then releases the waiters -- who answer `None` /
-///   *not acknowledged*. The projection is likewise folded only on
-///   success: under ADR 0005 it is derived from the journal, so an entry
-///   with no journal line behind it has no business in it.
+/// back explicitly. A failed batch leaves inbound watermarks promising a
+/// durable record that does not exist. So this thread retakes the write
+/// lock those advances were decided under, drains whatever else was queued
+/// against the now-unrecorded state (it could only have landed in this
+/// batch or a later one, and there is no later one until this loop comes
+/// back around), restores every touched channel to its state before the
+/// *earliest* failed entry, and only then releases the waiters -- who
+/// answer *not acknowledged*.
 struct GroupCommitter {
     sender: mpsc::Sender<(PendingCommit, mpsc::Sender<bool>)>,
 }
@@ -1581,18 +1104,6 @@ fn group_commit_loop(receiver: mpsc::Receiver<QueuedCommit>, state: CommitState)
                 .unzip();
         match state.journal.append_batch(&entries) {
             Ok(()) => {
-                {
-                    // Applied in batch order, so the projection never sees
-                    // a later entry before an earlier one for the same
-                    // channel, regardless of which caller's thread wakes
-                    // first.
-                    let mut projection =
-                        state.projection.write().expect("projection lock poisoned");
-                    for entry in &entries {
-                        projection.apply(entry);
-                    }
-                }
-                arm_pending_claims(&state.outbound, &resolved);
                 for (_, done) in resolved {
                     // A receiver gone before its batch lands means the
                     // caller stopped waiting for some other reason -- the
@@ -1617,38 +1128,6 @@ fn group_commit_loop(receiver: mpsc::Receiver<QueuedCommit>, state: CommitState)
     }
 }
 
-/// Arm every outbound claim in a batch that has just been made durable --
-/// the moment a signed claim becomes visible to `pending_claim`, and
-/// therefore transmittable. In batch order, so when one peer's ledger
-/// advanced twice in a batch the fresher claim is the one left pending
-/// (peer-semantics-pre-868.md §3.2's supersession), and under one lock hold.
-fn arm_pending_claims(
-    outbound: &RwLock<HashMap<String, OutboundLedger>>,
-    resolved: &[(CommitEffect, mpsc::Sender<bool>)],
-) {
-    if !resolved
-        .iter()
-        .any(|(effect, _)| matches!(effect, CommitEffect::OutboundClaimSigned { .. }))
-    {
-        return;
-    }
-    let mut ledgers = outbound.write().expect("outbound claims lock poisoned");
-    for (effect, _) in resolved {
-        if let CommitEffect::OutboundClaimSigned {
-            peer_id,
-            claim,
-            signed_at,
-            ..
-        } = effect
-        {
-            if let Some(ledger) = ledgers.get_mut(peer_id) {
-                ledger.pending = Some(claim.clone());
-                ledger.pending_since = Some(*signed_at);
-            }
-        }
-    }
-}
-
 /// Undo every advance a failed batch recorded, plus every advance queued
 /// behind it -- see [`GroupCommitter`]'s doc for why both. `resolved` is
 /// extended with whatever is drained, so its waiters are refused too.
@@ -1657,14 +1136,8 @@ fn roll_back(
     receiver: &mpsc::Receiver<QueuedCommit>,
     resolved: &mut Vec<(CommitEffect, mpsc::Sender<bool>)>,
 ) {
-    // Both locks for the whole unwind, taken in this order everywhere they
-    // are taken together (only here -- `record_fulfillment` and
-    // `accept_inbound` each take exactly one), so nothing can be decided
-    // against state that is about to be rolled back.
-    let mut ledgers = state
-        .outbound
-        .write()
-        .expect("outbound claims lock poisoned");
+    // The lock for the whole unwind, so nothing can be decided against
+    // state that is about to be rolled back.
     let mut watermarks = state
         .inbound_watermarks
         .write()
@@ -1672,54 +1145,16 @@ fn roll_back(
     while let Ok((pending, done)) = receiver.try_recv() {
         resolved.push((pending.effect, done));
     }
-    // First failed effect per peer/channel wins: effects are in advance
-    // order, so its `previous` is the last state with a durable record
-    // behind it. Two sets rather than one -- a peer id and a channel id
-    // are different namespaces and may collide as strings.
-    let mut restored_peers: HashSet<&str> = HashSet::new();
+    // First failed effect per channel wins: effects are in advance order,
+    // so its `previous` is the last state with a durable record behind it.
     let mut restored_channels: HashSet<&str> = HashSet::new();
     for (effect, _) in resolved.iter() {
-        match effect {
-            CommitEffect::OutboundClaimSigned {
-                peer_id, previous, ..
-            } => {
-                if restored_peers.insert(peer_id.as_str()) {
-                    restore_ledger(&mut ledgers, peer_id, previous.clone());
-                }
-            }
-            CommitEffect::InboundClaimAccepted {
-                channel_id,
-                previous,
-            } => {
-                if restored_channels.insert(channel_id.as_str()) {
-                    restore_watermark(&mut watermarks, channel_id, *previous);
-                }
-            }
-        }
-    }
-}
-
-/// Put `peer_id`'s ledger sequence back to `previous` -- the inverse of one
-/// fulfilment's advance. `pending` and `pending_since` are deliberately
-/// left alone: they are armed only after a batch is durable, so whatever
-/// they hold is a claim with a journal line behind it that this unwind has
-/// no business discarding. `None` is a ledger that had never advanced, so
-/// the entry goes with it.
-fn restore_ledger(
-    ledgers: &mut HashMap<String, OutboundLedger>,
-    peer_id: &str,
-    previous: Option<LedgerSequence>,
-) {
-    match previous {
-        Some(sequence) => {
-            if let Some(ledger) = ledgers.get_mut(peer_id) {
-                ledger.channel_id = sequence.channel_id;
-                ledger.nonce = sequence.nonce;
-                ledger.cumulative_amount = sequence.cumulative_amount;
-            }
-        }
-        None => {
-            ledgers.remove(peer_id);
+        let CommitEffect::InboundClaimAccepted {
+            channel_id,
+            previous,
+        } = effect;
+        if restored_channels.insert(channel_id.as_str()) {
+            restore_watermark(&mut watermarks, channel_id, *previous);
         }
     }
 }
@@ -1746,11 +1181,7 @@ fn restore_watermark(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use connector_signer::{derive_evm_address, LocalSigner};
-
-    fn now() -> DateTime<Utc> {
-        "2030-01-01T00:00:00Z".parse().unwrap()
-    }
+    use connector_signer::{derive_evm_address, evm_balance_proof_digest, LocalSigner};
 
     /// A fixed EIP-712 domain every test channel shares -- Base Sepolia's
     /// chain id and an arbitrary `TokenNetwork` address; nothing in this
@@ -1774,7 +1205,7 @@ mod tests {
     }
 
     /// Sign a claim for `channel`/`nonce`/`amount` under [`test_domain`],
-    /// exactly as [`ClaimBook::record_fulfillment`] would.
+    /// exactly as a peer signs one.
     fn sign_claim(signer: &LocalSigner, channel: &str, nonce: u64, amount: u64) -> WireClaim {
         let on_chain_id = parse_channel_id(channel).expect("test channel id is valid");
         let proof = evm_proof(on_chain_id, test_domain(), nonce, amount);
@@ -1888,164 +1319,6 @@ mod tests {
 
             assert_eq!(result, Err(InvalidChannelId("channel-a".to_string())));
         }
-    }
-
-    #[test]
-    fn no_claim_is_recorded_without_a_signer() {
-        let mut outbound_channels = HashMap::new();
-        outbound_channels.insert("peer-b".to_string(), channel_id(1));
-        let book = ClaimBook::new(None, outbound_channels, HashMap::new());
-        book.set_channel_domain(channel_id(1), test_domain())
-            .unwrap();
-
-        assert!(book.record_fulfillment("peer-b", 100, now()).is_none());
-    }
-
-    #[test]
-    fn no_claim_is_recorded_for_an_unregistered_peer() {
-        let book = ClaimBook::new(
-            Some(Arc::new(LocalSigner::generate("k"))),
-            HashMap::new(),
-            HashMap::new(),
-        );
-
-        assert!(book.record_fulfillment("peer-b", 100, now()).is_none());
-    }
-
-    #[test]
-    fn no_claim_is_recorded_for_a_channel_with_no_domain_configured() {
-        let signer = Arc::new(LocalSigner::generate("k"));
-        let mut outbound_channels = HashMap::new();
-        outbound_channels.insert("peer-b".to_string(), channel_id(1));
-        // Deliberately never calling `set_channel_domain`.
-        let book = ClaimBook::new(Some(signer), outbound_channels, HashMap::new());
-
-        assert!(book.record_fulfillment("peer-b", 100, now()).is_none());
-        assert_eq!(book.pending_claim("peer-b"), None);
-    }
-
-    #[test]
-    fn recording_a_fulfillment_arms_exactly_one_pending_claim_with_nonce_one() {
-        let key = derive_evm_address(&LocalSigner::generate("k").public_key().unwrap());
-        let book = book_with_peer("peer-b", &channel_id(1), key);
-
-        let claim = book.record_fulfillment("peer-b", 100, now()).unwrap();
-
-        assert_eq!(claim.nonce, 1);
-        assert_eq!(claim.cumulative_amount, 100);
-        assert_eq!(book.pending_claim("peer-b"), Some(claim));
-    }
-
-    #[test]
-    fn a_second_fulfillment_before_the_first_drains_supersedes_it_rather_than_batching() {
-        let key = derive_evm_address(&LocalSigner::generate("k").public_key().unwrap());
-        let book = book_with_peer("peer-b", &channel_id(1), key);
-
-        book.record_fulfillment("peer-b", 100, now()).unwrap();
-        let second = book.record_fulfillment("peer-b", 50, now()).unwrap();
-
-        // Exactly one pending claim, holding the latest cumulative state --
-        // not two, and not the first one.
-        assert_eq!(second.nonce, 2);
-        assert_eq!(second.cumulative_amount, 150);
-        assert_eq!(book.pending_claim("peer-b"), Some(second));
-    }
-
-    #[test]
-    fn a_channel_change_rebinds_the_ledger_instead_of_carrying_the_old_watermark() {
-        let key = derive_evm_address(&LocalSigner::generate("k").public_key().unwrap());
-        let book = book_with_peer("peer-b", &channel_id(1), key);
-        book.record_fulfillment("peer-b", 100, now()).unwrap();
-        book.record_fulfillment("peer-b", 50, now()).unwrap();
-        assert_eq!(book.outbound_cumulative_amount("peer-b"), 150);
-
-        // Config now names a different channel for the same peer -- a
-        // peer-channel migration (issue #832). Reach in and repoint
-        // `outbound_channels` the way `Connector` reconfiguring
-        // `[[peer_channels]]` and restarting would.
-        book.set_channel_domain(channel_id(2), test_domain())
-            .unwrap();
-        book.set_outbound_channel("peer-b", channel_id(2));
-
-        let claim = book.record_fulfillment("peer-b", 10, now()).unwrap();
-
-        // A fresh nonce/amount sequence on the new channel, not nonce 3 /
-        // cumulative 160 carried over from the old one.
-        assert_eq!(claim.channel_id, channel_id(2));
-        assert_eq!(claim.nonce, 1);
-        assert_eq!(claim.cumulative_amount, 10);
-        assert_eq!(book.outbound_cumulative_amount("peer-b"), 10);
-    }
-
-    #[test]
-    fn acknowledging_the_pending_nonce_clears_it() {
-        let key = derive_evm_address(&LocalSigner::generate("k").public_key().unwrap());
-        let book = book_with_peer("peer-b", &channel_id(1), key);
-        let claim = book.record_fulfillment("peer-b", 100, now()).unwrap();
-
-        book.acknowledge_outbound("peer-b", claim.nonce, ClaimAckOutcome::Accepted);
-
-        assert_eq!(book.pending_claim("peer-b"), None);
-    }
-
-    #[test]
-    fn acknowledging_a_stale_nonce_does_not_clear_a_fresher_pending_claim() {
-        let key = derive_evm_address(&LocalSigner::generate("k").public_key().unwrap());
-        let book = book_with_peer("peer-b", &channel_id(1), key);
-        let first = book.record_fulfillment("peer-b", 100, now()).unwrap();
-        let second = book.record_fulfillment("peer-b", 50, now()).unwrap();
-
-        book.acknowledge_outbound("peer-b", first.nonce, ClaimAckOutcome::Accepted);
-
-        assert_eq!(book.pending_claim("peer-b"), Some(second));
-    }
-
-    #[test]
-    fn a_rejected_ack_leaves_the_claim_pending() {
-        let key = derive_evm_address(&LocalSigner::generate("k").public_key().unwrap());
-        let book = book_with_peer("peer-b", &channel_id(1), key);
-        let claim = book.record_fulfillment("peer-b", 100, now()).unwrap();
-
-        book.acknowledge_outbound(
-            "peer-b",
-            claim.nonce,
-            ClaimAckOutcome::Rejected(ClaimRejectReason::SignatureInvalid),
-        );
-
-        assert_eq!(book.pending_claim("peer-b"), Some(claim));
-    }
-
-    #[test]
-    fn outbound_cumulative_amount_is_zero_for_a_peer_never_signed_for() {
-        let book = ClaimBook::new(None, HashMap::new(), HashMap::new());
-
-        assert_eq!(book.outbound_cumulative_amount("peer-b"), 0);
-    }
-
-    #[test]
-    fn outbound_cumulative_amount_tracks_the_running_total_across_fulfillments() {
-        let key = derive_evm_address(&LocalSigner::generate("k").public_key().unwrap());
-        let book = book_with_peer("peer-b", &channel_id(1), key);
-
-        book.record_fulfillment("peer-b", 100, now()).unwrap();
-        book.record_fulfillment("peer-b", 50, now()).unwrap();
-
-        assert_eq!(book.outbound_cumulative_amount("peer-b"), 150);
-    }
-
-    #[test]
-    fn outbound_cumulative_amount_survives_acknowledgement() {
-        let key = derive_evm_address(&LocalSigner::generate("k").public_key().unwrap());
-        let book = book_with_peer("peer-b", &channel_id(1), key);
-        let claim = book.record_fulfillment("peer-b", 100, now()).unwrap();
-
-        book.acknowledge_outbound("peer-b", claim.nonce, ClaimAckOutcome::Accepted);
-
-        // Acknowledgement clears `pending`, not the running total this
-        // connector committed to -- the whole point of issue #700's
-        // "credited" being distinct from "pending".
-        assert_eq!(book.pending_claim("peer-b"), None);
-        assert_eq!(book.outbound_cumulative_amount("peer-b"), 100);
     }
 
     #[test]
@@ -2164,98 +1437,6 @@ mod tests {
         );
     }
 
-    /// Issue #575's AC5: a claim this connector signs recovers, through
-    /// `connector_signer::verify_evm_balance_proof`, to this connector's
-    /// own address -- and does not recover under a different domain.
-    #[test]
-    fn an_outbound_claim_recovers_to_the_signers_own_address_and_not_under_a_different_domain() {
-        let signer = LocalSigner::generate("claim-key");
-        let own_address = derive_evm_address(&signer.public_key().unwrap());
-        let mut outbound_channels = HashMap::new();
-        outbound_channels.insert("peer-b".to_string(), channel_id(1));
-        let book = ClaimBook::new(Some(Arc::new(signer)), outbound_channels, HashMap::new());
-        book.set_channel_domain(channel_id(1), test_domain())
-            .unwrap();
-
-        let claim = book.record_fulfillment("peer-b", 100, now()).unwrap();
-        let on_chain_id = parse_channel_id(&channel_id(1)).unwrap();
-        let proof = evm_proof(
-            on_chain_id,
-            test_domain(),
-            claim.nonce,
-            claim.cumulative_amount,
-        );
-
-        assert!(verify_evm_balance_proof(
-            &proof,
-            &claim.signature.to_bytes(),
-            &own_address
-        ));
-
-        let wrong_domain = ChannelDomain {
-            token_network_address: [0xAA; 20],
-            ..test_domain()
-        };
-        let proof_under_wrong_domain = evm_proof(
-            on_chain_id,
-            wrong_domain,
-            claim.nonce,
-            claim.cumulative_amount,
-        );
-        assert!(!verify_evm_balance_proof(
-            &proof_under_wrong_domain,
-            &claim.signature.to_bytes(),
-            &own_address
-        ));
-    }
-
-    mod redemption {
-        use super::*;
-
-        #[test]
-        fn no_claim_is_redeemable_before_one_is_accepted() {
-            let book = ClaimBook::new(None, HashMap::new(), HashMap::new());
-            assert_eq!(book.latest_inbound_claim(&channel_id(1)), None);
-        }
-
-        #[test]
-        fn the_latest_accepted_claim_is_redeemable_and_carries_its_signature() {
-            let peer_signer = LocalSigner::generate("peer-key");
-            let key = derive_evm_address(&peer_signer.public_key().unwrap());
-            let book = book_with_peer("peer-b", &channel_id(1), key);
-            let first = sign_claim(&peer_signer, &channel_id(1), 1, 100);
-            assert_eq!(book.accept_inbound(&first), ClaimAckOutcome::Accepted);
-            let second = sign_claim(&peer_signer, &channel_id(1), 2, 150);
-            assert_eq!(book.accept_inbound(&second), ClaimAckOutcome::Accepted);
-
-            // Only the higher-nonce claim is redeemable -- the superseded
-            // first claim is never returned (peer-semantics-pre-868.md §3.4: claims
-            // supersede rather than accumulate).
-            let redeemable = book.latest_inbound_claim(&channel_id(1)).unwrap();
-            assert_eq!(redeemable.nonce, 2);
-            assert_eq!(redeemable.cumulative_amount, 150);
-            assert_eq!(redeemable.signature, second.signature.to_bytes().to_vec());
-        }
-
-        /// Issue #573's own regression: `connector_settlement::Claim` must
-        /// carry the nonce its signature covers, or nothing it produces is
-        /// redeemable on any real chain -- a chain-side check this test
-        /// cannot exercise directly, so it pins the one thing that would
-        /// silently regress that guarantee: `latest_inbound_claim` reporting
-        /// the accepted claim's own nonce, not a default or dropped one.
-        #[test]
-        fn the_redeemable_claims_nonce_is_the_one_the_peer_actually_signed() {
-            let peer_signer = LocalSigner::generate("peer-key");
-            let key = derive_evm_address(&peer_signer.public_key().unwrap());
-            let book = book_with_peer("peer-b", &channel_id(1), key);
-            let claim = sign_claim(&peer_signer, &channel_id(1), 7, 300);
-            assert_eq!(book.accept_inbound(&claim), ClaimAckOutcome::Accepted);
-
-            let redeemable = book.latest_inbound_claim(&channel_id(1)).unwrap();
-            assert_eq!(redeemable.nonce, 7);
-        }
-    }
-
     #[test]
     fn outbound_channel_id_reports_the_configured_channel_for_a_peer() {
         let book = ClaimBook::new(None, HashMap::new(), HashMap::new());
@@ -2274,160 +1455,59 @@ mod tests {
             let mut book = ClaimBook::new(None, HashMap::new(), HashMap::new());
             book.set_journal(Arc::new(InMemoryJournal::new())).unwrap();
 
-            assert_eq!(book.latest_inbound_claim(&channel_id(1)), None);
+            assert_eq!(book.inbound_watermark(&channel_id(1)), None);
         }
 
         /// The acceptance criteria's own scenario: a node killed mid-traffic
         /// recovers its money state by replay, with no manual repair. This
         /// rebuilds a *fresh* `ClaimBook` from the same durable journal a
-        /// prior instance wrote to, standing in for a restart, and asserts
-        /// both sides of its money state -- what it owes downstream and what
-        /// a channel has claimed -- come back exactly as they were.
+        /// prior instance wrote to, standing in for a restart, and asserts a
+        /// channel's watermark comes back exactly as it was. The journal also
+        /// carries an `OutboundClaimSigned` line from the retired payout
+        /// ledger (ADR 0075 decision 7), which replays as nothing.
         #[test]
         fn a_node_restarted_against_the_same_journal_recovers_its_money_state() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("journal.log");
-            let signer = Arc::new(LocalSigner::generate("claim-key"));
             let peer_key = LocalSigner::generate("peer-key");
-            let out_channel = channel_id(1);
             let in_channel = channel_id(2);
-
-            {
-                let mut book = ClaimBook::new(
-                    Some(signer.clone() as Arc<dyn Signer>),
-                    HashMap::new(),
-                    HashMap::new(),
-                );
-                book.set_outbound_channel("peer-b", out_channel.clone());
+            let book_over = |path: &std::path::Path| {
+                let mut book = ClaimBook::new(None, HashMap::new(), HashMap::new());
                 book.set_verification_key(
                     in_channel.clone(),
                     derive_evm_address(&peer_key.public_key().unwrap()),
                 );
-                book.set_channel_domain(out_channel.clone(), test_domain())
-                    .unwrap();
                 book.set_channel_domain(in_channel.clone(), test_domain())
                     .unwrap();
-                book.set_journal(Arc::new(FileJournal::open(&path).unwrap()))
+                book.set_journal(Arc::new(FileJournal::open(path).unwrap()))
                     .unwrap();
+                book
+            };
 
-                // What we owe peer-b: two fulfilments, superseding into one
-                // pending claim.
-                book.record_fulfillment("peer-b", 100, now());
-                book.record_fulfillment("peer-b", 50, now());
-
-                // A claim channel-in sent us.
+            FileJournal::open(&path)
+                .unwrap()
+                .append(&JournalEntry::OutboundClaimSigned {
+                    peer_id: "peer-b".to_string(),
+                    channel_id: channel_id(1),
+                    nonce: 2,
+                    cumulative_amount: 150,
+                })
+                .unwrap();
+            {
+                let book = book_over(&path);
                 let claim = sign_claim(&peer_key, &in_channel, 1, 40);
                 assert_eq!(book.accept_inbound(&claim), ClaimAckOutcome::Accepted);
             }
 
-            // A fresh book, backed by the same journal file, standing in for
-            // a restarted process -- nothing here was told about the prior
-            // instance's in-memory state directly. Channel domains are
-            // reconfigured before the journal, exactly like a real restart
-            // reloading its static config before replaying its journal.
-            let mut restarted = ClaimBook::new(
-                Some(signer as Arc<dyn Signer>),
-                HashMap::new(),
-                HashMap::new(),
-            );
-            restarted.set_outbound_channel("peer-b", out_channel.clone());
-            restarted
-                .set_channel_domain(out_channel.clone(), test_domain())
-                .unwrap();
-            restarted
-                .set_channel_domain(in_channel.clone(), test_domain())
-                .unwrap();
-            restarted
-                .set_journal(Arc::new(FileJournal::open(&path).unwrap()))
-                .unwrap();
-
-            // The outbound debt to peer-b survived, re-armed with a fresh
-            // signature over the same nonce/cumulative amount -- resendable
-            // with no manual repair.
-            let pending = restarted.pending_claim("peer-b").expect("still pending");
-            assert_eq!(pending.nonce, 2);
-            assert_eq!(pending.cumulative_amount, 150);
-            // The inbound claim's watermark survived too.
-            let redeemable = restarted.latest_inbound_claim(&in_channel).unwrap();
-            assert_eq!(redeemable.nonce, 1);
-            assert_eq!(redeemable.cumulative_amount, 40);
-        }
-
-        /// Issue #832's own regression scenario: a journal that names
-        /// channel A for `peer_id`, replayed against config that now names
-        /// channel B for the same peer (a peer-channel migration's config
-        /// edit, applied exactly as the runbook prescribes). The next claim
-        /// signed must bind to B at a fresh nonce/amount, not silently carry
-        /// A's watermark forward into a claim signed under B's domain --
-        /// asserted against the journal itself, since that is what a
-        /// restart actually replays, not just the returned `WireClaim`.
-        #[test]
-        fn a_peer_channel_migration_rebinds_from_config_not_the_replayed_journal() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("journal.log");
-            let signer = Arc::new(LocalSigner::generate("claim-key"));
-            let channel_a = channel_id(1);
-            let channel_b = channel_id(2);
-
-            {
-                let mut book = ClaimBook::new(
-                    Some(signer.clone() as Arc<dyn Signer>),
-                    HashMap::new(),
-                    HashMap::new(),
-                );
-                book.set_outbound_channel("peer-b", channel_a.clone());
-                book.set_channel_domain(channel_a.clone(), test_domain())
-                    .unwrap();
-                book.set_journal(Arc::new(FileJournal::open(&path).unwrap()))
-                    .unwrap();
-
-                book.record_fulfillment("peer-b", 100, now()).unwrap();
-                book.record_fulfillment("peer-b", 50, now()).unwrap();
-            }
-
-            // The premise the migration is applied on top of, asserted
-            // rather than assumed: the journal on disk ends on channel A.
+            let restarted = book_over(&path);
             assert_eq!(
-                FileJournal::open(&path).unwrap().read_all().unwrap().last(),
-                Some(&JournalEntry::OutboundClaimSigned {
-                    peer_id: "peer-b".to_string(),
-                    channel_id: channel_a,
-                    nonce: 2,
-                    cumulative_amount: 150,
-                })
+                restarted.inbound_watermark(&in_channel),
+                Some(advance_watermark(1, 40))
             );
-
-            // A fresh process, standing in for the restart the migration
-            // runbook's step 6 performs: config now names channel B for
-            // peer-b, the journal on disk still ends on channel A.
-            let mut migrated = ClaimBook::new(
-                Some(signer as Arc<dyn Signer>),
-                HashMap::new(),
-                HashMap::new(),
-            );
-            migrated.set_outbound_channel("peer-b", channel_b.clone());
-            migrated
-                .set_channel_domain(channel_b.clone(), test_domain())
-                .unwrap();
-            migrated
-                .set_journal(Arc::new(FileJournal::open(&path).unwrap()))
-                .unwrap();
-
-            let claim = migrated.record_fulfillment("peer-b", 10, now()).unwrap();
-
-            assert_eq!(claim.channel_id, channel_b);
-            assert_eq!(claim.nonce, 1);
-            assert_eq!(claim.cumulative_amount, 10);
-
-            let entries = migrated.journal.read_all().unwrap();
             assert_eq!(
-                entries.last(),
-                Some(&JournalEntry::OutboundClaimSigned {
-                    peer_id: "peer-b".to_string(),
-                    channel_id: channel_b,
-                    nonce: 1,
-                    cumulative_amount: 10,
-                })
+                restarted.accept_inbound(&sign_claim(&peer_key, &in_channel, 1, 40)),
+                ClaimAckOutcome::Rejected(ClaimRejectReason::NonceNotAdvancing),
+                "the replayed watermark refuses the claim it already holds"
             );
         }
     }
@@ -2544,159 +1624,10 @@ mod tests {
             );
             for n in 1..=CHANNELS {
                 assert_eq!(
-                    book.latest_inbound_claim(&channel_id(n)),
-                    Some(connector_settlement::Claim {
-                        nonce: 1,
-                        cumulative_amount: 100,
-                        signature: sign_claim(&peer_key, &channel_id(n), 1, 100)
-                            .signature
-                            .to_bytes(),
-                    })
+                    book.inbound_watermark(&channel_id(n)),
+                    Some(advance_watermark(1, 100))
                 );
             }
-        }
-
-        /// The send-side mirror of the receive-side test above:
-        /// `record_fulfillment` holds a single global outbound-ledger lock
-        /// across every peer (issue #710's own "under one lock"), so it is
-        /// this path -- not `accept_inbound`'s -- where a fsync held under
-        /// the lock would have serialized every forward in the connector,
-        /// not just forwards on the same peer.
-        #[test]
-        fn concurrent_outbound_fulfillments_across_peers_share_a_batch() {
-            const PEERS: u8 = 8;
-            let signer = Arc::new(LocalSigner::generate("claim-key"));
-            let mut outbound_channels = HashMap::new();
-            for n in 1..=PEERS {
-                outbound_channels.insert(format!("peer-{n}"), channel_id(n));
-            }
-            let mut book = ClaimBook::new(Some(signer), outbound_channels, HashMap::new());
-            for n in 1..=PEERS {
-                book.set_channel_domain(channel_id(n), test_domain())
-                    .unwrap();
-            }
-            let journal = Arc::new(StallingJournal::new());
-            book.set_journal(journal.clone()).unwrap();
-            let book = Arc::new(book);
-
-            let barrier = Arc::new(Barrier::new(PEERS as usize));
-            let handles: Vec<_> = (1..=PEERS)
-                .map(|n| {
-                    let book = book.clone();
-                    let barrier = barrier.clone();
-                    thread::spawn(move || {
-                        barrier.wait();
-                        book.record_fulfillment(&format!("peer-{n}"), 100, now())
-                            .expect("channel is bound and signed")
-                    })
-                })
-                .collect();
-            for handle in handles {
-                handle.join().expect("fulfilling thread panicked");
-            }
-
-            let batch_sizes = journal.batch_sizes.lock().expect("lock poisoned");
-            assert_eq!(
-                batch_sizes.iter().sum::<usize>(),
-                PEERS as usize,
-                "every signed claim must land in exactly one batch: {batch_sizes:?}"
-            );
-            assert!(
-                batch_sizes.iter().any(|&size| size > 1),
-                "expected at least one batch to carry more than one entry \
-                 (group commit not amortizing concurrent appends), got {batch_sizes:?}"
-            );
-            for n in 1..=PEERS {
-                assert_eq!(book.pending_claim(&format!("peer-{n}")).unwrap().nonce, 1);
-            }
-        }
-
-        /// A [`Journal`] that parks inside `append_batch` until a test
-        /// releases it, so the test can observe the book at exactly the
-        /// moment an entry has been enqueued but is not yet durable -- the
-        /// window `record_fulfillment` opened when it stopped holding the
-        /// outbound lock across the fsync.
-        struct GatedJournal {
-            inner: InMemoryJournal,
-            entered: mpsc::Sender<()>,
-            release: Mutex<mpsc::Receiver<()>>,
-        }
-
-        impl Journal for GatedJournal {
-            fn append(&self, entry: &JournalEntry) -> Result<(), JournalError> {
-                self.inner.append(entry)
-            }
-
-            fn append_batch(&self, entries: &[JournalEntry]) -> Result<(), JournalError> {
-                self.entered.send(()).expect("the test is still watching");
-                self.release
-                    .lock()
-                    .expect("lock poisoned")
-                    .recv()
-                    .expect("the test releases every batch it gates");
-                self.inner.append_batch(entries)
-            }
-
-            fn read_all(&self) -> Result<Vec<JournalEntry>, JournalError> {
-                self.inner.read_all()
-            }
-        }
-
-        /// ADR 0005 at the boundary this issue moved: a signed claim is a
-        /// bearer instrument -- `Connector::forward` reads `pending_claim`
-        /// and ships it -- so it must not be visible until its journal
-        /// entry is durable. Before the fix that shape was inverted:
-        /// `record_fulfillment` armed `pending` under the lock and *then*
-        /// waited for the batch, leaving a window in which a concurrent
-        /// forward could transmit a nonce whose entry never reached disk.
-        #[test]
-        fn a_signed_claim_is_not_visible_until_its_batch_is_durable() {
-            let (entered_tx, entered_rx) = mpsc::channel();
-            let (release_tx, release_rx) = mpsc::channel();
-            let journal = Arc::new(GatedJournal {
-                inner: InMemoryJournal::new(),
-                entered: entered_tx,
-                release: Mutex::new(release_rx),
-            });
-
-            let signer = Arc::new(LocalSigner::generate("claim-key"));
-            let mut outbound_channels = HashMap::new();
-            outbound_channels.insert("peer-a".to_string(), channel_id(1));
-            let mut book = ClaimBook::new(Some(signer), outbound_channels, HashMap::new());
-            book.set_channel_domain(channel_id(1), test_domain())
-                .unwrap();
-            book.set_journal(journal.clone()).unwrap();
-            let book = Arc::new(book);
-
-            let fulfilling = {
-                let book = book.clone();
-                thread::spawn(move || book.record_fulfillment("peer-a", 100, now()))
-            };
-
-            // The committer is now inside `append_batch` with the entry
-            // queued and the outbound lock long since released -- exactly
-            // the moment a concurrent `Connector::forward` would read the
-            // ledger.
-            entered_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("the committer reaches the journal");
-            assert_eq!(
-                book.pending_claim("peer-a"),
-                None,
-                "a claim whose journal entry is still in flight must not be transmittable"
-            );
-
-            release_tx.send(()).expect("the committer is waiting");
-            let claim = fulfilling
-                .join()
-                .expect("fulfilling thread panicked")
-                .expect("channel is bound and signed");
-            assert_eq!(claim.nonce, 1);
-            assert_eq!(
-                book.pending_claim("peer-a").map(|claim| claim.nonce),
-                Some(1),
-                "the claim is armed once -- and only once -- its entry is durable"
-            );
         }
 
         /// A [`Journal`] whose writes can be made to fail and work again
@@ -2747,82 +1678,6 @@ mod tests {
             }
         }
 
-        fn signing_book(peer_id: &str, journal: Arc<BreakableJournal>) -> ClaimBook {
-            let signer = Arc::new(LocalSigner::generate("claim-key"));
-            let mut outbound_channels = HashMap::new();
-            outbound_channels.insert(peer_id.to_string(), channel_id(1));
-            let mut book = ClaimBook::new(Some(signer), outbound_channels, HashMap::new());
-            book.set_channel_domain(channel_id(1), test_domain())
-                .unwrap();
-            book.set_journal(journal).unwrap();
-            book
-        }
-
-        /// A fulfilment whose batch cannot be made durable leaves the peer
-        /// exactly as it found it: no claim returned, no claim armed, and
-        /// -- the part that matters after a restart -- the ledger's nonce
-        /// and cumulative amount back where they were, so the next
-        /// fulfilment re-signs this nonce instead of skipping past it into
-        /// a sequence the journal has no record of.
-        #[test]
-        fn a_batch_that_cannot_be_made_durable_rolls_the_outbound_ledger_back() {
-            let journal = Arc::new(BreakableJournal::new(false));
-            let book = signing_book("peer-a", journal.clone());
-
-            let first = book
-                .record_fulfillment("peer-a", 100, now())
-                .expect("a working journal signs a claim");
-            assert_eq!((first.nonce, first.cumulative_amount), (1, 100));
-
-            journal.set_broken(true);
-            assert_eq!(
-                book.record_fulfillment("peer-a", 100, now()),
-                None,
-                "a claim that could not be journaled was never signed"
-            );
-            assert_eq!(
-                book.pending_claim("peer-a").map(|claim| claim.nonce),
-                Some(1),
-                "the rolled-back fulfilment must not disturb the claim already armed"
-            );
-            assert_eq!(
-                book.outbound_cumulative_amount("peer-a"),
-                100,
-                "the ledger is back at the last durably journaled advance"
-            );
-
-            // And the sequence resumes at the nonce the failure rolled
-            // back to, not one past it.
-            journal.set_broken(false);
-            let resumed = book
-                .record_fulfillment("peer-a", 100, now())
-                .expect("a working journal signs a claim");
-            assert_eq!((resumed.nonce, resumed.cumulative_amount), (2, 200));
-            assert_eq!(
-                journal.read_all().unwrap().len(),
-                2,
-                "only the two durable advances are on record"
-            );
-        }
-
-        /// The very first fulfilment on a peer has no earlier state to go
-        /// back to, so rolling it back means removing the ledger outright
-        /// -- and the peer must look untouched to `views`, not like a peer
-        /// carrying an advance nothing recorded.
-        #[test]
-        fn a_first_fulfilment_that_cannot_be_journaled_leaves_no_ledger_behind() {
-            let journal = Arc::new(BreakableJournal::new(true));
-            let book = signing_book("peer-a", journal);
-
-            assert_eq!(book.record_fulfillment("peer-a", 100, now()), None);
-            assert_eq!(book.pending_claim("peer-a"), None);
-            assert_eq!(book.outbound_cumulative_amount("peer-a"), 0);
-            assert!(
-                book.views().is_empty(),
-                "a rolled-back first fulfilment leaves nothing for the operator surface to see"
-            );
-        }
-
         /// The inbound half of the same rule: an acceptance that cannot be
         /// journaled is not acknowledged (peer-semantics-pre-868.md §6.3) and its
         /// watermark is restored, so the payer's retransmission of the
@@ -2847,9 +1702,9 @@ mod tests {
                  nor rejected"
             );
             assert_eq!(
-                book.latest_inbound_claim(&channel_id(1)),
+                book.inbound_watermark(&channel_id(1)),
                 None,
-                "an acceptance with no journal line behind it is not in the projection either"
+                "an acceptance with no journal line behind it leaves no watermark"
             );
 
             // The retransmission -- byte-identical, as §6.3 expects -- is
@@ -2865,7 +1720,7 @@ mod tests {
     /// alongside the `outbound` submodule below).
     mod solana {
         use super::*;
-        use connector_signer::{solana_balance_proof_message, LocalEd25519Signer};
+        use connector_signer::solana_balance_proof_message;
         use ed25519_dalek::{Keypair, PublicKey, SecretKey, Signer as DalekSigner};
 
         /// A deterministic ed25519 keypair -- no RNG, so a failure here
@@ -3036,20 +1891,13 @@ mod tests {
             assert_eq!(book.accept_inbound(&first), ClaimAckOutcome::Accepted);
             assert_eq!(book.accept_inbound(&second), ClaimAckOutcome::Accepted);
 
-            // The watermark moved, and the ledger reports the *latest*
-            // claim -- with its 64 ed25519 bytes intact, not padded to
-            // EVM's 65.
+            // The watermark moved to the *latest* claim.
             let view = book
                 .views()
                 .into_iter()
                 .find(|view| view.channel_id == base58(&account(1)))
                 .expect("the channel is known");
             assert_eq!((view.nonce, view.cumulative_amount), (2, 250));
-            let latest = book
-                .latest_inbound_claim(&base58(&account(1)))
-                .expect("a claim was accepted");
-            assert_eq!((latest.nonce, latest.cumulative_amount), (2, 250));
-            assert_eq!(latest.signature.len(), 64);
 
             // Replaying either is refused rather than re-accepted.
             assert_eq!(
@@ -3152,58 +2000,6 @@ mod tests {
             );
         }
 
-        /// **The bidirectional ledger** (#262's riskiest surface, and the
-        /// reason a second chain doubles it): one `ClaimBook` holds live
-        /// outbound state *and* live inbound state at the same time, and
-        /// after #732 the two can be on different chains. Interleaving an
-        /// EVM outbound ledger with a Solana inbound watermark must leave
-        /// each exactly where it would have been alone -- the failure mode
-        /// is lost money, not a wrong number.
-        #[test]
-        fn an_evm_outbound_ledger_and_a_solana_inbound_watermark_do_not_disturb_each_other() {
-            let peer = keypair(1);
-            let evm_key = derive_evm_address(&LocalSigner::generate("k").public_key().unwrap());
-            let book = book_with_peer("peer-b", &channel_id(1), evm_key);
-            book.set_solana_channel(
-                base58(&account(1)),
-                &base58(&peer.public.to_bytes()),
-                "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx",
-            )
-            .unwrap();
-
-            book.record_fulfillment("peer-b", 100, now()).unwrap();
-            assert_eq!(
-                book.accept_inbound(&sign_solana(&peer, 1, 1, 70)),
-                ClaimAckOutcome::Accepted
-            );
-            let outbound = book.record_fulfillment("peer-b", 50, now()).unwrap();
-            assert_eq!(
-                book.accept_inbound(&sign_solana(&peer, 1, 2, 90)),
-                ClaimAckOutcome::Accepted
-            );
-
-            // Outbound: still EVM-signed, still the running total, and
-            // untouched by anything that arrived on the Solana channel.
-            assert_eq!(book.outbound_cumulative_amount("peer-b"), 150);
-            assert!(matches!(outbound.signature, ClaimSignature::Evm(_)));
-            assert_eq!(book.pending_claim("peer-b"), Some(outbound));
-            assert_eq!(book.outbound_channel_id("peer-b"), Some(channel_id(1)));
-
-            // Inbound: the Solana watermark is the Solana claims' own, and
-            // the EVM channel has no watermark at all -- no claim arrived
-            // on it.
-            assert_eq!(
-                book.accept_inbound(&sign_solana(&peer, 1, 2, 90)),
-                ClaimAckOutcome::Rejected(ClaimRejectReason::NonceNotAdvancing)
-            );
-            assert!(book
-                .views()
-                .iter()
-                .any(|view| view.channel_id == base58(&account(1))
-                    && view.direction == crate::operator_view::ClaimDirection::Inbound
-                    && view.nonce == 2));
-        }
-
         proptest::proptest! {
             /// The watermark rule is the same rule on both chains
             /// (`connector_domain::validate_claim`, not a per-chain
@@ -3241,18 +2037,10 @@ mod tests {
                     }
                 }
 
-                match accepted {
-                    None => proptest::prop_assert!(
-                        book.latest_inbound_claim(&base58(&account(1))).is_none()
-                    ),
-                    Some((nonce, amount)) => {
-                        let latest = book
-                            .latest_inbound_claim(&base58(&account(1)))
-                            .expect("a claim was accepted");
-                        proptest::prop_assert_eq!(latest.nonce, nonce);
-                        proptest::prop_assert_eq!(latest.cumulative_amount, u128::from(amount));
-                    }
-                }
+                proptest::prop_assert_eq!(
+                    book.inbound_watermark(&base58(&account(1))),
+                    accepted.map(|(nonce, amount)| advance_watermark(nonce, amount))
+                );
             }
 
             /// A signature is only ever accepted for the exact
@@ -3290,223 +2078,6 @@ mod tests {
                     book.accept_inbound(&genuine),
                     ClaimAckOutcome::Accepted
                 );
-            }
-        }
-
-        /// Issue #742: the other direction. `ClaimBook` could verify a
-        /// Solana peer claim since #732/#738 but never sign one --
-        /// `record_fulfillment` fell straight through to `evm_proof` and
-        /// refused (via `channel_domains.get(&channel_id)?`) any channel
-        /// that was only ever registered as Solana. These tests mirror the
-        /// outer `tests` module's EVM outbound fixture set (`sign_claim`,
-        /// `book_with_peer`, `no_claim_is_recorded_*`,
-        /// `an_outbound_claim_recovers_to_the_signers_own_address_*`, the
-        /// journal-replay regression) one for one.
-        mod outbound {
-            use super::*;
-
-            /// A book that signs outbound claims to `peer_id` on Solana
-            /// channel `n` with the identity derived from `seed` -- the
-            /// Solana counterpart of the outer module's `book_with_peer`.
-            /// Re-derives the signer from `seed` a second time to read back
-            /// its own public key, since [`LocalEd25519Signer`] holds its
-            /// key pair privately rather than exposing it for cloning.
-            fn book_with_solana_peer(peer_id: &str, n: u8, seed: [u8; 32]) -> ClaimBook {
-                let mut outbound_channels = HashMap::new();
-                outbound_channels.insert(peer_id.to_string(), base58(&account(n)));
-                let mut book = ClaimBook::new(None, outbound_channels, HashMap::new());
-                book.set_solana_signer(Arc::new(
-                    LocalEd25519Signer::from_secret_bytes(seed).expect("32 bytes is a valid seed"),
-                ));
-                let public_key = LocalEd25519Signer::from_secret_bytes(seed)
-                    .expect("32 bytes is a valid seed")
-                    .public_key();
-                book.set_solana_channel(
-                    base58(&account(n)),
-                    &base58(&public_key),
-                    "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx",
-                )
-                .expect("a 32-byte base58 account and key");
-                book
-            }
-
-            #[test]
-            fn no_outbound_solana_claim_is_recorded_without_a_solana_signer() {
-                let mut outbound_channels = HashMap::new();
-                outbound_channels.insert("peer-b".to_string(), base58(&account(1)));
-                let book = ClaimBook::new(None, outbound_channels, HashMap::new());
-                book.set_solana_channel(
-                    base58(&account(1)),
-                    &base58(&keypair(1).public.to_bytes()),
-                    "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx",
-                )
-                .unwrap();
-
-                assert!(book.record_fulfillment("peer-b", 100, now()).is_none());
-            }
-
-            #[test]
-            fn no_outbound_solana_claim_is_recorded_for_a_channel_with_no_binding_configured() {
-                let mut outbound_channels = HashMap::new();
-                outbound_channels.insert("peer-b".to_string(), base58(&account(1)));
-                let mut book = ClaimBook::new(None, outbound_channels, HashMap::new());
-                book.set_solana_signer(Arc::new(LocalEd25519Signer::generate()));
-
-                assert!(book.record_fulfillment("peer-b", 100, now()).is_none());
-            }
-
-            #[test]
-            fn recording_a_fulfillment_arms_a_pending_solana_claim_with_nonce_one() {
-                let book = book_with_solana_peer("peer-b", 1, [5u8; 32]);
-
-                let claim = book.record_fulfillment("peer-b", 100, now()).unwrap();
-
-                assert_eq!(claim.channel_id, base58(&account(1)));
-                assert_eq!(claim.nonce, 1);
-                assert_eq!(claim.cumulative_amount, 100);
-                assert!(matches!(claim.signature, ClaimSignature::Solana(_)));
-                assert_eq!(book.pending_claim("peer-b"), Some(claim));
-            }
-
-            /// A second fulfilment before the first claim drains supersedes
-            /// it with a fresher nonce and a higher cumulative amount --
-            /// the same rule the EVM ledger is held to, since it is
-            /// `OutboundLedger`'s rule and not a per-chain one.
-            #[test]
-            fn a_second_fulfillment_supersedes_the_first_pending_solana_claim() {
-                let book = book_with_solana_peer("peer-b", 1, [5u8; 32]);
-
-                book.record_fulfillment("peer-b", 100, now()).unwrap();
-                let second = book.record_fulfillment("peer-b", 50, now()).unwrap();
-
-                assert_eq!((second.nonce, second.cumulative_amount), (2, 150));
-                assert_eq!(book.pending_claim("peer-b"), Some(second));
-            }
-
-            /// Issue #742's own acceptance criteria, mirroring #575's AC5
-            /// for EVM: a Solana claim this connector signs recovers,
-            /// through `connector_signer::verify_solana_balance_proof`, to
-            /// this connector's own ed25519 identity -- and not to a
-            /// different key, including the counterparty's own (a claim
-            /// this connector signs is never checked against the *peer's*
-            /// key, the same asymmetry `set_solana_channel`'s doc draws
-            /// between "who signs" and "who is accepted from").
-            #[test]
-            fn an_outbound_solana_claim_recovers_to_the_signers_own_public_key_and_not_a_different_one(
-            ) {
-                let seed = [9u8; 32];
-                let book = book_with_solana_peer("peer-b", 1, seed);
-                let own_public_key = LocalEd25519Signer::from_secret_bytes(seed)
-                    .unwrap()
-                    .public_key();
-                let counterparty = keypair(1);
-
-                let claim = book.record_fulfillment("peer-b", 100, now()).unwrap();
-
-                assert!(verify_solana_balance_proof(
-                    &[7u8; 32],
-                    &account(1),
-                    claim.nonce,
-                    claim.cumulative_amount,
-                    &claim.signature.to_bytes(),
-                    &own_public_key,
-                ));
-                assert!(!verify_solana_balance_proof(
-                    &[7u8; 32],
-                    &account(1),
-                    claim.nonce,
-                    claim.cumulative_amount,
-                    &claim.signature.to_bytes(),
-                    &counterparty.public.to_bytes(),
-                ));
-            }
-
-            /// The acceptance criteria's own restart scenario, ported from
-            /// the outer module's `a_node_restarted_against_the_same_journal_recovers_its_money_state`:
-            /// a pending outbound Solana claim survives a restart, re-armed
-            /// with a fresh signature over the same nonce/cumulative amount
-            /// from the same journal entry -- no chain discriminator was
-            /// added to `JournalEntry::OutboundClaimSigned` for this,
-            /// because the channel id alone (base58 of 32 bytes, disjoint
-            /// from every EVM shape `parse_channel_id` accepts) already
-            /// tells `rebuild_from` which map, and therefore which chain,
-            /// governs replay.
-            #[test]
-            fn an_outbound_solana_claim_survives_a_restart_and_is_resigned_from_the_journal() {
-                let seed = [3u8; 32];
-                let peer_id = "peer-b";
-                let journal = Arc::new(InMemoryJournal::new());
-
-                let mut book = book_with_solana_peer(peer_id, 1, seed);
-                book.set_journal(journal.clone()).unwrap();
-                book.record_fulfillment(peer_id, 100, now());
-                book.record_fulfillment(peer_id, 50, now());
-
-                let mut restarted = book_with_solana_peer(peer_id, 1, seed);
-                restarted.set_journal(journal).unwrap();
-
-                let pending = restarted.pending_claim(peer_id).expect("still pending");
-                assert_eq!((pending.nonce, pending.cumulative_amount), (2, 150));
-                assert!(matches!(pending.signature, ClaimSignature::Solana(_)));
-                let own_public_key = LocalEd25519Signer::from_secret_bytes(seed)
-                    .unwrap()
-                    .public_key();
-                assert!(verify_solana_balance_proof(
-                    &[7u8; 32],
-                    &account(1),
-                    pending.nonce,
-                    pending.cumulative_amount,
-                    &pending.signature.to_bytes(),
-                    &own_public_key,
-                ));
-            }
-
-            /// The mirror image of the outer module's
-            /// `an_evm_outbound_ledger_and_a_solana_inbound_watermark_do_not_disturb_each_other`:
-            /// a Solana outbound ledger and an EVM inbound watermark, on
-            /// the same book, must leave each other exactly where they
-            /// would have been alone -- #262's riskiest surface, now
-            /// exercised in both directions.
-            #[test]
-            fn a_solana_outbound_ledger_and_an_evm_inbound_watermark_do_not_disturb_each_other() {
-                let evm_peer_signer = LocalSigner::generate("peer-key");
-                let evm_key = derive_evm_address(&evm_peer_signer.public_key().unwrap());
-
-                let book = book_with_solana_peer("peer-b", 1, [6u8; 32]);
-                book.set_verification_key(channel_id(2), evm_key);
-                book.set_channel_domain(channel_id(2), test_domain())
-                    .unwrap();
-
-                let outbound = book.record_fulfillment("peer-b", 100, now()).unwrap();
-                assert_eq!(
-                    book.accept_inbound(&sign_claim(&evm_peer_signer, &channel_id(2), 1, 70)),
-                    ClaimAckOutcome::Accepted
-                );
-                let outbound2 = book.record_fulfillment("peer-b", 50, now()).unwrap();
-                assert_eq!(
-                    book.accept_inbound(&sign_claim(&evm_peer_signer, &channel_id(2), 2, 90)),
-                    ClaimAckOutcome::Accepted
-                );
-
-                // Outbound: still Solana-signed, still the running total.
-                assert_eq!(book.outbound_cumulative_amount("peer-b"), 150);
-                assert!(matches!(outbound2.signature, ClaimSignature::Solana(_)));
-                assert_eq!(book.pending_claim("peer-b"), Some(outbound2));
-                assert_eq!(outbound.channel_id, base58(&account(1)));
-
-                // Inbound: the EVM watermark is the EVM claims' own, and
-                // the Solana channel has no watermark -- no claim arrived
-                // on it.
-                assert_eq!(
-                    book.accept_inbound(&sign_claim(&evm_peer_signer, &channel_id(2), 2, 90)),
-                    ClaimAckOutcome::Rejected(ClaimRejectReason::NonceNotAdvancing)
-                );
-                assert!(book
-                    .views()
-                    .iter()
-                    .any(|view| view.channel_id == channel_id(2)
-                        && view.direction == crate::operator_view::ClaimDirection::Inbound
-                        && view.nonce == 2));
             }
         }
     }

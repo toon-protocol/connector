@@ -434,8 +434,9 @@ delayed or censored transaction still has to land.
 
 Before you opt in, know what it costs and what you are trusting:
 
-- **Payer-only.** Value moves one way. A client that expects payouts back from
-  you needs a TOON channel, because nothing is ever credited to an x402 one.
+- **One way per channel.** Value moves one way on a channel. To pay a client
+  back, open a channel of your own toward the terms it publishes
+  (`POST /channels`); its payouts arrive as vouchers on that channel.
 - **Solana costs SOL.** Each sponsored channel locks about 0.0047 SOL of rent
   (4,711,920 lamports) until it is reclaimed. Your node's token account for the
   mint must already exist, because the sponsor refuses to open a channel into an

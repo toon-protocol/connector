@@ -2686,9 +2686,8 @@ impl Connector {
     /// here for any peering with no [`Connector::with_outbound_client_hop`],
     /// and ADR 0042 exists to retire it. It is gone from the peer role
     /// entirely: no fulfilment arms a peer claim, so no packet leaves owing
-    /// one. (`ClaimBook::record_fulfillment` itself survives for a different
-    /// caller on a different edge -- `ClientPayoutLedger`, this connector
-    /// paying a *client* back, ADR 0026.)
+    /// one. (`ClaimBook::record_fulfillment` is gone too: its last caller,
+    /// the client payout ledger, pays in vouchers since ADR 0075 decision 7.)
     ///
     /// # The cap (ADR 0042)
     ///
@@ -7781,11 +7780,6 @@ mod tests {
                 1,
                 "the receiver is asked once per covered packet, not once per attempt"
             );
-            assert!(
-                connector.claims.pending_claim("second-hop").is_none(),
-                "a packet already covered by a client claim must not also arm a peer claim -- \
-                 one packet, one debt"
-            );
         }
 
         /// No double-spend, part two: even a fully failed forward --
@@ -7894,10 +7888,6 @@ mod tests {
             assert_eq!(claim.cumulative_amount, PACKET_AMOUNT);
             assert_eq!(ledger.issued_nonce("second-hop"), 1);
             assert_eq!(receiver.asked.load(Ordering::SeqCst), 1);
-            assert!(
-                connector.claims.pending_claim("second-hop").is_none(),
-                "a packet covered by the client-role claim must not also arm a peer-role one"
-            );
         }
 
         /// **A peering that cannot cover a forward does not forward it**
@@ -7956,11 +7946,6 @@ mod tests {
             assert!(
                 peer.seen().is_empty(),
                 "nothing may reach the peer when nothing could pay for it"
-            );
-            assert!(
-                connector.claims.pending_claim("second-hop").is_none(),
-                "and nothing is owed afterwards either -- the postpay ledger is not armed by \
-                 anything any more"
             );
         }
 

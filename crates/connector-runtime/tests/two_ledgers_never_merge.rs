@@ -87,7 +87,7 @@ impl ClaimStateSource for ReceiverSaying {
     }
 }
 
-/// Sign a claim on [`CHANNEL`] exactly as a peer's `record_fulfillment`
+/// Sign a claim on [`CHANNEL`] exactly as a peer signs one
 /// would, so `accept_inbound` verifies a real signature rather than being
 /// handed a pre-accepted stub.
 fn signed_inbound_claim(
@@ -162,10 +162,10 @@ async fn an_inbound_claim_and_an_outbound_client_claim_never_move_each_others_le
         "the fixture claim has to actually be accepted, or the rest proves nothing"
     );
     let accepted = book
-        .latest_inbound_claim(CHANNEL_HEX)
+        .inbound_watermark(CHANNEL_HEX)
         .expect("the journal now holds an accepted claim");
     assert_eq!(accepted.nonce, INBOUND_NONCE);
-    assert_eq!(accepted.cumulative_amount, u128::from(INBOUND_CUMULATIVE));
+    assert_eq!(accepted.cumulative_amount, INBOUND_CUMULATIVE);
 
     // ── ...and the outbound side did not ─────────────────────────────────
     assert_eq!(
@@ -234,7 +234,7 @@ async fn an_inbound_claim_and_an_outbound_client_claim_never_move_each_others_le
         "the inbound journal file must be byte-identical after an outbound claim"
     );
     assert_eq!(
-        book.latest_inbound_claim(CHANNEL_HEX)
+        book.inbound_watermark(CHANNEL_HEX)
             .expect("the accepted claim is still there")
             .nonce,
         INBOUND_NONCE,

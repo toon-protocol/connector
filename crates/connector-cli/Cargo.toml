@@ -121,6 +121,11 @@ tempfile = "3"
 # `test-util` for the rate poller's spawn test (issue #1294): a paused clock
 # asserts the cadence a `ttl` implies without spending it in real seconds.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
+# The client half of the client-payout end-to-end tests (issue #1381): a real
+# BTP websocket session against a served node. The same 0.20 axum's `ws`
+# feature resolves to.
+tokio-tungstenite = "0.20"
+futures-util = "0.3"
 tower = { version = "0.4", features = ["util"] }
 # Reads the WARNs `ConfiguredPeerTransport` emits when a peering registers
 # no carriage (issue #1240). A silence is only fixed if something fails when

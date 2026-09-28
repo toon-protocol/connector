@@ -392,6 +392,9 @@ impl OutboundChannels {
         if let Some(tracked) = self.channels().get_mut(id) {
             tracked.opened = true;
             tracked.restored = true;
+            // The payer restores the larger of the journaled mark and what
+            // the chain shows landed, so this copy never lags it.
+            tracked.signed = tracked.signed.max(state.signed);
         }
         Ok(state)
     }
@@ -581,6 +584,38 @@ impl OutboundChannels {
     /// Whether `id` names an outbound channel this node journaled.
     pub fn knows(&self, id: &str) -> bool {
         self.channels().contains_key(&canonical_id(id))
+    }
+
+    /// Every opened outbound channel that pays `receiver` -- EVM `receiver`,
+    /// Solana the one distribution recipient -- on `receiver`'s chain, in a
+    /// stable order: "is there a channel toward this party?" as a lookup of
+    /// this node's own journal, not a derivation (ADR 0075 decision 4).
+    /// Several are legal. A channel still opening is not listed: nothing
+    /// can be signed on it yet.
+    ///
+    /// What a client payout is signed on (ADR 0075 decision 7, issue
+    /// #1381): the channel the operator opened toward the client.
+    pub fn opened_toward(&self, receiver: &VoucherSigner) -> Vec<String> {
+        let (chain, receiver) = match receiver {
+            VoucherSigner::Evm(address) => (SettlementChain::Evm, address.to_vec()),
+            VoucherSigner::Solana(key) => (SettlementChain::Solana, key.to_vec()),
+        };
+        self.channels()
+            .iter()
+            .filter(|(_, tracked)| {
+                tracked.opened && tracked.chain == chain && tracked.record.receiver() == receiver
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// The highest amount this node has journaled a voucher for on the
+    /// outbound channel `id`: the watermark the next voucher it signs there
+    /// must exceed. `None` for a channel it did not open.
+    pub fn signed(&self, id: &str) -> Option<u128> {
+        self.channels()
+            .get(&canonical_id(id))
+            .map(|tracked| tracked.signed)
     }
 
     /// Every outbound channel, read from its chain now.
