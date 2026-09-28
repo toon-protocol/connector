@@ -134,6 +134,20 @@ impl Sender {
         self.wallet.address()
     }
 
+    /// The settlement key's signature over a 32-byte EIP-712 digest, as
+    /// `r ‖ s ‖ v` with `v` of 27 or 28: what a voucher, an ERC-3009
+    /// authorisation and a Permit2 transfer are each signed with when this
+    /// node is the payer (ADR 0075 decision 3). The key stays here, beside
+    /// the nonce it also signs transactions under, and is never handed out.
+    pub(crate) fn sign_digest(&self, digest: [u8; 32]) -> Result<[u8; 65], SettlementError> {
+        let signature = self
+            .wallet
+            .sign_hash(ethers::types::H256::from(digest))
+            .map_err(|error| SettlementError::Backend(error.to_string()))?;
+        let bytes: [u8; 65] = signature.into();
+        Ok(bytes)
+    }
+
     /// Fill, sign and send `transaction`, returning its hash once the node
     /// has it, or once the answer was lost and the hash is all there is to
     /// go on. See the module doc for each outcome.

@@ -93,3 +93,24 @@ pub(crate) mod x402_batch_settlement {
         "./contracts/x402/x402BatchSettlement.abi.json"
     );
 }
+
+// What the paying half of the batch-settlement port (ADR 0075 decision 3,
+// issue #1374) asks of the token it deposits, and of Permit2, and nothing
+// more. `authorizationState` is EIP-3009's own view function: a token that
+// answers it takes deposits through `ERC3009DepositCollector`, and one whose
+// dispatcher reverts on it takes them through `Permit2DepositCollector`.
+// `DOMAIN_SEPARATOR` is read from the token and from Permit2 alike, so
+// neither EIP-712 domain is rebuilt here from anything a config says.
+pub(crate) mod deposit {
+    use ethers::contract::abigen;
+
+    abigen!(
+        DepositToken,
+        r#"[
+            function authorizationState(address authorizer, bytes32 nonce) external view returns (bool)
+            function DOMAIN_SEPARATOR() external view returns (bytes32)
+            function allowance(address owner, address spender) external view returns (uint256)
+            function approve(address spender, uint256 amount) external returns (bool)
+        ]"#
+    );
+}
