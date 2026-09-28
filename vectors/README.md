@@ -153,7 +153,10 @@ that pinned it is gone: the top-level `claim` section (the EIP-712 `BalanceProof
 the voucher claim-state challenge on the client BTP `auth` entry's `channelChallenge`). New:
 `peer_carriage.voucher_evm`/`voucher_solana`, `peer_carriage.zero_value_challenge`, and the
 top-level `toon_channel_refused` and `payout_voucher` sections. A claim with no `scheme` is now a
-claim every connector refuses by name -- which is why this is a bump, not an addition.
+claim every connector refuses by name -- which is why this is a bump, not an addition. Issue #1408
+later added the top-level `client_auth_channel_challenge` and `claim_state_toon_channel_refused`
+sections, purely additively -- the two elements ADR 0075 decision 14 named but #1384 had not yet
+pinned -- so `schema_version` stays 7.
 
 ### `envelope`
 
@@ -549,5 +552,60 @@ max_claimable_amount, signed_message_hex, signature_base58, json, btp_transfer_h
 - A client lands a payout itself: it can restore the envelope and parse `json` as its own voucher
   claim (the generator does exactly this before committing each case), and only the channel's
   receiver can land it.
+
+### `client_auth_channel_challenge`
+
+Issue #1408, ADR 0075 decision 5, `client-edge-spec.md` §1.9 step 1: the client BTP `auth` entry's
+`channelChallenge` field -- the same voucher claim-state challenge `voucher_claim_state_challenge`
+and `peer_carriage.zero_value_challenge` carry -- declares a channel before its session has paid
+anything. Extraction never depends on whether the challenge verifies or is in its window: a
+malformed one is simply absent, and every case here parses. What decides `accepted` is the one
+bound a peer's challenge is held to
+(`connector_peer_btp::role_gate::MAX_PEER_CHALLENGE_LIFETIME_SECS`, 300 seconds, `max_lifetime_secs`
+below): `expires` must be ahead of the connector's clock (`now`) and no more than that many seconds
+ahead, checked by `challenge_in_window` -- the same function `connector_client_edge::btp`'s auth
+handler calls before ever resolving the channel or checking the signature. An expired challenge and
+one signed too far ahead both fail this bound and are refused the same way: quietly, so the session
+still binds and simply learns no payee at auth (`crates/connector-client-edge/src/btp.rs`'s
+`verify_and_record_declared_channel`).
+
+- `now`, `max_lifetime_secs`: the shared clock and bound every case below is judged against
+  (`2000000000`, `300`).
+- **`evm[]`** / **`solana[]`** -- `{ name, blockchain, now, expires, accepted, challenge_json,
+auth_entry_json, btp_message_hex }`. `challenge_json` is the `channelChallenge` value alone,
+  genuinely signed by the channel's voucher signer in every case (checked against
+  `verify_evm_voucher_claim_state_challenge`/`verify_solana_voucher_claim_state_challenge` before
+  being committed) -- only `expires` relative to `now` differs between an accepted and a refused
+  case. `auth_entry_json` is the full `auth` entry, `{"peerId", "secret", "channelChallenge"}`.
+  `btp_message_hex` is the complete BTP MESSAGE frame carrying `auth_entry_json` as its `auth`
+  protocolData entry (`AUTH_PROTOCOL`, `"auth"`), raw UTF-8, the same shape the deployed client's
+  own auth frame carries.
+- `evm` and `solana` each have three cases on the same bound: `..._accepted` (`expires = now + 60`),
+  `..._refused_expired` (`expires = now - 1`) and `..._refused_too_far_ahead`
+  (`expires = now + max_lifetime_secs + 1`).
+- Held open, against the real parser and window check, by
+  `connector-client-edge`'s `btp::tests::the_committed_client_auth_channel_challenge_vectors_match_the_real_parser`.
+
+### `claim_state_toon_channel_refused`
+
+Issue #1408, ADR 0075 decision 8: a `POST /ilp/claim-state` entry's `scheme` is required exactly as
+a claim's is (`connector_domain::client_claim::declared_scheme`, the same function `toon_channel_refused`
+above pins for a claim). An entry with no `scheme`, or with `scheme: "toon-channel"`, asks about the
+retired `toon-channel` channel and is answered `"toon-channel-refused"` by name, on both chains,
+before the settlement backend is ever asked -- distinct from `toon_channel_refused`, which pins the
+same refusal for a claim riding a PREPARE (`POST /packets`), not a claim-state entry.
+
+- `cases[]`: `{ name, blockchain, request_entry_json, response_entry_json }`. `request_entry_json`
+  is the entry exactly as it rides in the request's `channels[]`; `response_entry_json` is the
+  answer, always `{"blockchain", "channelId", "ok": false, "error": "toon-channel-refused"}` --
+  **`channelId` even on a Solana entry**, since the endpoint's one refused-entry shape has no
+  separate `channelAccount` field, so a Solana refusal's `channelId` carries the base58 channel
+  account text instead.
+- Four cases: `claim_state_evm_no_scheme_is_toon_channel_refused`,
+  `claim_state_evm_explicit_toon_channel_scheme_is_refused`,
+  `claim_state_solana_no_scheme_is_toon_channel_refused` and
+  `claim_state_solana_explicit_toon_channel_scheme_is_refused`.
+- Held open, against the real `POST /ilp/claim-state` route, by `connector-client-edge`'s
+  `claim_state::the_committed_claim_state_toon_channel_refused_vectors_match_the_real_endpoint`.
 
 [ADR 0018]: [ADR 0018]: ../docs/adr/0018-a-payload-is-sealed-to-the-terminating-connector.md

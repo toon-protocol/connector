@@ -217,42 +217,55 @@ async fn evm_batch_settlement_payer_upholds_the_paying_contract_over_permit2() {
 /// and the payer's account pays the opening deposit exactly once: the
 /// authorisation is the config's own, and the token spends it once, so
 /// whichever sending lands second reverts.
+///
+/// Each route is raced several times over one chain. The first race also
+/// races Permit2's one-time `approve`, so each node sends two writes and
+/// can take the nonce the other has just re-read (#1371); the later races
+/// race the deposit alone. The deterministic form of that collision is
+/// `send`'s own
+/// `a_nonce_taken_again_after_the_reseed_is_reseeded_again_and_the_write_lands_once`.
 #[tokio::test]
 async fn an_open_sent_twice_at_once_deposits_once_for_both_token_routes() {
     if !require_anvil() {
         return;
     }
+    // One race with the `approve` in it, then three of the deposit alone,
+    // at well under a second each.
+    const RACES: usize = 4;
     for token in [Token::FiatToken, Token::Plain] {
         let peering = Peering::spawn(token).await;
-        let before = peering.payer_balance().await;
-        let record = peering
-            .payer
-            .prepare_open(peering.terms(), 1_000)
-            .await
-            .expect("prepare");
-        let crashed = peering.node(DEPLOYER_PRIVATE_KEY).await;
-        let restarted = peering.node(DEPLOYER_PRIVATE_KEY).await;
-        let (first, second) = tokio::join!(
-            crashed.open_prepared(&record),
-            restarted.open_prepared(&record)
-        );
-        let (first, second) = (first.expect("first"), second.expect("second"));
-        assert_eq!(first.presentation, record.presentation());
-        assert_eq!(second.presentation, record.presentation());
-        assert_eq!(
-            peering.payer_balance().await,
-            before - 1_000,
-            "one record, one opening deposit"
-        );
-        assert_eq!(
-            restarted
-                .outbound_state(record.channel())
+        for race in 0..RACES {
+            let before = peering.payer_balance().await;
+            let record = peering
+                .payer
+                .prepare_open(peering.terms(), 1_000)
                 .await
-                .expect("state")
-                .on_chain
-                .collateral,
-            1_000
-        );
+                .expect("prepare");
+            let crashed = peering.node(DEPLOYER_PRIVATE_KEY).await;
+            let restarted = peering.node(DEPLOYER_PRIVATE_KEY).await;
+            let (first, second) = tokio::join!(
+                crashed.open_prepared(&record),
+                restarted.open_prepared(&record)
+            );
+            let first = first.unwrap_or_else(|error| panic!("race {race}: first: {error:?}"));
+            let second = second.unwrap_or_else(|error| panic!("race {race}: second: {error:?}"));
+            assert_eq!(first.presentation, record.presentation());
+            assert_eq!(second.presentation, record.presentation());
+            assert_eq!(
+                peering.payer_balance().await,
+                before - 1_000,
+                "race {race}: one record, one opening deposit"
+            );
+            assert_eq!(
+                restarted
+                    .outbound_state(record.channel())
+                    .await
+                    .expect("state")
+                    .on_chain
+                    .collateral,
+                1_000
+            );
+        }
     }
 }
 

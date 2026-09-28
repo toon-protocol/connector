@@ -7,7 +7,11 @@ decision 14): every claim is an x402 voucher, and every `toon-channel` section �
 `TokenNetwork`-domain `channel_control_declaration` — is gone from the committed set. Its Scope
 section was stale and is corrected as part of the vector-coverage work (issue #1073): the committed
 set carries a `peer_carriage` section (dual-encoded entries, several of them behavioural), and a
-client-edge carriage section only for the `payout-claim` TRANSFER (`payout_voucher`). _Originally:_
+client-edge carriage section only for the `payout-claim` TRANSFER (`payout_voucher`). Issue #1408
+added the client BTP auth frame's `channelChallenge` (`client_auth_channel_challenge`, invariant 11)
+and the `POST /ilp/claim-state` `"toon-channel-refused"` answer (`claim_state_toon_channel_refused`,
+invariant 12) — two elements decision 14 named but #1384 had not yet pinned — purely additively, so
+`schema_version` stays 7. _Originally:_
 Non-normative. Per [ADR 0021](../adr/0021-vectors-are-normative-prose-is-not.md), the
 committed vector set (`vectors/wire-vectors.json`) is the cross-repo contract; this document only
 names the invariants it is evidence of, written down before any vector was generated, per its own
@@ -197,6 +201,41 @@ client's payee key, carried in a BTP TRANSFER's `payout-claim` entry whose `amou
 cumulative amount. The entry is the voucher claim JSON less its envelope, and on EVM always carries
 the `channelConfig` landing needs. Pinned by the `payout_voucher` section, whose generator restores
 the envelope and parses each case with the client edge's own parser, and verifies each signature.
+
+### 11. A client declares a channel at BTP auth with a genuinely signed challenge, and the 300-second bound alone decides whether it is heard
+
+ADR 0075 decision 5, issue #1408: the client BTP `auth` entry's `channelChallenge` field — invariant
+8's message, riding in its own slot beside `peerId`/`secret` — declares a channel before its session
+has paid anything. Extraction never depends on the window: a challenge that is expired, or signed too
+far ahead, still parses, exactly as one within the bound does. What decides whether it is heard is
+`expires` against the connector's clock alone — ahead, and no more than `MAX_PEER_CHALLENGE_LIFETIME_SECS`
+(300 seconds) ahead — the same bound a peer's challenge is held to (invariant 9). A challenge outside
+it is refused quietly: the session still binds, and simply learns no payee at auth.
+
+Held open by `connector-client-edge`'s `btp::tests` module (`a_channel_challenge_at_auth_credits_a_session_that_never_paid`,
+`a_channel_challenge_that_does_not_hold_teaches_nothing`), and pinned cross-repo by the
+`client_auth_channel_challenge` section, whose generator signs each challenge genuinely — checked
+against `verify_evm_voucher_claim_state_challenge`/`verify_solana_voucher_claim_state_challenge` —
+and varies only `expires` relative to a fixed `now` between an accepted and a refused case, each
+read back by the real BTP frame decoder and the client edge's own `auth_channel_challenge` extractor
+and `challenge_in_window` check before being committed (`connector-client-edge`'s
+`btp::tests::the_committed_client_auth_channel_challenge_vectors_match_the_real_parser`).
+
+### 12. A claim-state entry naming a retired scheme is refused by name, and costs no lookup
+
+ADR 0075 decision 8, issue #1408: `POST /ilp/claim-state` requires `scheme` exactly as a claim does
+(invariant 5's `declared_scheme`). An entry with no `scheme`, or with `scheme: "toon-channel"`, asks
+about the retired `toon-channel` channel and is answered `"toon-channel-refused"` by name — distinct
+from invariant 5's refusal of a claim riding a PREPARE — before the settlement backend is ever asked,
+even for a channel its own voucher signer genuinely controls. The response's channel field is always
+`channelId`, on both chains: a Solana refusal's `channelId` carries the channel account's base58 text,
+since the endpoint's one refused-entry shape has no separate `channelAccount` field.
+
+Held open by `connector-client-edge`'s `claim_state::a_toon_channel_entry_is_refused_by_name_without_a_lookup`,
+and pinned cross-repo by the `claim_state_toon_channel_refused` section, checked against
+`connector_domain::client_claim::declared_scheme` — the same function the endpoint branches on —
+before being committed, and replayed against the real route, over a backend admitting nothing, by
+`connector-client-edge`'s `claim_state::the_committed_claim_state_toon_channel_refused_vectors_match_the_real_endpoint`.
 
 ## Generation
 
