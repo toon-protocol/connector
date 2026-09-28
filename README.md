@@ -232,59 +232,78 @@ deliberate, because it is never silently free.
 ## 3. Get paid
 
 A price makes a route cost something. A **settlement backend** is what lets
-anyone actually pay it. There are two chains. A node may carry either table or
-both — with both, it accepts claims on both at once.
+anyone actually pay it. There are two chains, and a node may carry either
+table or both — with both, it accepts vouchers on both at once. Every channel
+is an **x402 `batch-settlement` channel**
+([ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)):
+on EVM that is x402's audited `x402BatchSettlement` contract, and on Solana
+solana-foundation's `payment-channels` program. Both are **constants of the
+binary**, the same address on every network, so there is nothing chain-specific
+to name here beyond your own RPC, token and key.
+
+> [!NOTE]
+> **Upgrading a node that still holds TOON channels?** Read
+> [`docs/operators/draining-toon-channels.md`](docs/operators/draining-toon-channels.md)
+> first — a journal holding a `toon-channel` entry is refused at boot, by name.
 
 ```toml
 # EVM — Base Sepolia. These are live addresses, not placeholders.
 [settlement.evm]
-rpc_url          = "https://base-sepolia-rpc.publicnode.com"
-contract_address = "0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5"  # the TokenNetworkRegistry, not a TokenNetwork
-token_address    = "0x0C996d7c934c79a6255254875607Fe69df25C0E1"  # the token every price on this node is in
-decimals         = 6              # units per token: 6 means 1,000,000 = 1.00
+rpc_url               = "https://base-sepolia-rpc.publicnode.com"
+token_address         = "0x0C996d7c934c79a6255254875607Fe69df25C0E1"  # the token every price on this node is in
+decimals              = 6              # units per token: 6 means 1,000,000 = 1.00
+asset_eip712_name     = "USDC"         # the token's own EIP-712 domain --
+asset_eip712_version  = "2"            # `cast call <token> 'name()(string)'` / `'version()(string)'`
+# min_withdraw_delay_secs = 86400      # default one day; 900 at least, 30 days at most
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
 
-# Solana — public devnet. Note `program_id` where EVM has `contract_address`:
-# there is no registry to resolve a channel contract through, so this names the
-# payment-channel program itself, and `token_address` is an SPL mint.
+# Solana — public devnet.
 [settlement.solana]
-rpc_url       = "https://api.devnet.solana.com"
-program_id    = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip"
-token_address = "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU"
-decimals      = 6
+rpc_url               = "https://api.devnet.solana.com"
+token_address         = "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU"  # an SPL mint; Token-2022 is refused
+decimals              = 6
+min_sponsored_deposit = 1000000        # base units: the smallest deposit whose open you will pay rent for
+# min_grace_period_secs = 86400        # default one day; 900 at least
 
 [settlement.solana.key]
 key_file = "/app/data/settlement-solana.key"
 ```
 
-Copy those addresses rather than picking your own: a claim resolves against
-**one** deployment, so every node that might accept a given claim has to name the
-same one.
+Copy the token address rather than picking your own: a voucher resolves
+against **one** token, so every node that might accept a given voucher has to
+name the same one. The two `asset_eip712_*` keys and `min_sponsored_deposit`
+have no default and are **required** wherever their table exists — read the
+EIP-712 name and version off the token itself rather than copying the devnet
+values, because Base mainnet's native USDC (`0x833589fC…2913`) is
+**`"USD Coin"`** / `"2"`, not `"USDC"`. The node boots either way, since it
+never signs under this domain itself, so a wrong name shows up only as every
+client's deposit failing; `0` is refused for `min_sponsored_deposit`, because
+it bounds an endpoint that spends your SOL.
 
-|                  | EVM                                                                                                                                                                                   | Solana                                                                                                                                                                          |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Chain            | Base Sepolia, chain id `84532`                                                                                                                                                        | public devnet (`solana:devnet`)                                                                                                                                                 |
-| RPC              | `https://base-sepolia-rpc.publicnode.com`                                                                                                                                             | `https://api.devnet.solana.com`                                                                                                                                                 |
-| Channels live in | [`0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5`](https://sepolia.basescan.org/address/0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5) — `TokenNetworkRegistry`                              | [`2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip`](https://explorer.solana.com/address/2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip?cluster=devnet) — the payment-channel program |
-| Token            | [`0x0C996d7c934c79a6255254875607Fe69df25C0E1`](https://sepolia.basescan.org/address/0x0C996d7c934c79a6255254875607Fe69df25C0E1) — devnet USDC (Circle FiatToken v2.2, ERC-3009), 6 dp | [`34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU`](https://explorer.solana.com/address/34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU?cluster=devnet) — mock USDC mint, 6 dp        |
-| Funding the key  | Base Sepolia ETH for gas; devnet USDC from the [devnet faucet](https://faucet.devnet.toonprotocol.dev)                                                                                | devnet SOL (`solana airdrop 1 <address> -u devnet`); mock USDC from the same faucet                                                                                             |
-| Full record      | [`docs/deployments/base-sepolia.md`](docs/deployments/base-sepolia.md)                                                                                                                | [`docs/deployments/devnet-public.md`](docs/deployments/devnet-public.md)                                                                                                        |
+|                  | EVM                                                                                                                                                                                   | Solana                                                                                                                                                         |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Chain            | Base Sepolia, chain id `84532`                                                                                                                                                        | public devnet (`solana:devnet`)                                                                                                                                |
+| RPC              | `https://base-sepolia-rpc.publicnode.com`                                                                                                                                             | `https://api.devnet.solana.com`                                                                                                                                |
+| Channels live in | [`x402BatchSettlement`](https://sepolia.basescan.org/address/0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003) — the same address on every network                                          | [`payment-channels`](https://explorer.solana.com/address/CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX?cluster=devnet) — the same program id on every cluster  |
+| Token            | [`0x0C996d7c934c79a6255254875607Fe69df25C0E1`](https://sepolia.basescan.org/address/0x0C996d7c934c79a6255254875607Fe69df25C0E1) — devnet USDC (Circle FiatToken v2.2, ERC-3009), 6 dp | [`34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU`](https://explorer.solana.com/address/34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU?cluster=devnet) — mock USDC mint, 6 dp |
+| Funding the key  | Base Sepolia ETH for gas; devnet USDC from the [devnet faucet](https://faucet.devnet.toonprotocol.dev)                                                                                | devnet SOL (`solana airdrop 1 <address> -u devnet`); mock USDC from the same faucet                                                                            |
 
-There is no Solana _testnet_ deployment: the program is on devnet and on
-mainnet-beta, nowhere else. **Mainnet exists on both chains**, deployed by hand
-and used by one third-party operator's node, not by this repository's fleet:
-the Base mainnet contracts
-([`docs/deployments/base-mainnet.md`](docs/deployments/base-mainnet.md),
-2026-09-01) and the Solana mainnet-beta program
-([`docs/deployments/mainnet-beta.md`](docs/deployments/mainnet-beta.md),
-2026-08-14, upgraded in place 2026-08-29). The devnet table above is what the
-fleet and the faucet serve; a node on mainnet funds itself. Because a Solana
-claim's signed message binds the settlement program, a node pointing
-`[settlement.solana]` at a mainnet RPC while naming the devnet program id would
-take money for claims it can never redeem: take the program id from the mainnet
-record. The fleet's production tier is still a **named, empty tier**
+There is no Solana _testnet_ deployment: `payment-channels` is on devnet and
+on mainnet-beta, nowhere else. **Mainnet exists on both chains** — used by one
+third-party operator's node, not by this repository's fleet. The devnet table
+above is what the fleet and the faucet serve; a node on mainnet funds itself.
+Because the x402 contract and program are the same address everywhere, there
+is no deployment record to get wrong here — the one thing that still has to
+match the network is the **token**: point `token_address` at Base mainnet's
+USDC or Solana mainnet-beta's, never the devnet one. TOON's own retired
+contracts still have deployment records, now under
+[`docs/deployments/`](docs/deployments/) (moved out of `packages/contracts`
+and `packages/solana-program` when #1386 removed those packages), but this
+build reads none of them — see
+[the drain procedure](docs/operators/draining-toon-channels.md) if that is
+why you are here. The fleet's production tier is still a **named, empty tier**
 ([ADR 0056](docs/adr/0056-production-is-a-named-empty-tier.md)): no fleet
 machine, no fleet key, and
 [`connector.production.toml`](deploy/connector-rust/connector.production.toml) is
@@ -300,18 +319,62 @@ every route by a factor of ten or more.
 
 Every other settlement value is verified against the chain the same way, which is
 why there is no `--network` flag: which chain a node is on **is** these values and
-nothing else. The EVM backend reads the chain id off the RPC and calls
-`getTokenNetwork()` to prove the address really is a registry; the Solana backend
-proves `program_id` is executable _and_ behaves like the payment-channel program,
-that `token_address` is an SPL mint, and asks the chain its own genesis hash so a
-claim declaring the wrong cluster is refused.
+nothing else. The node reads the chain id off the RPC and confirms
+`x402BatchSettlement`'s code is present at its fixed address before it will
+serve (ADR 0075 decision 1). The Solana backend proves the program account
+behaves like `payment-channels`, that `token_address` is an SPL mint, and asks
+the chain its own genesis hash so a voucher declaring the wrong cluster is
+refused.
 
 **You do not list the channels your payers will use, and you could not** — a
-client's channel does not exist until that client opens it on chain, long after
-your node booted. The settlement section gives this node its on-chain identity,
-and it is where a claim naming a channel you have never heard of is **resolved
-from chain** and accepted, which is what makes paying you permissionless rather
-than an arrangement.
+client's channel does not exist until that client opens it toward you, long
+after your node booted. The settlement section gives this node its on-chain
+identity, and it is where a voucher naming a channel you have never heard of
+is **resolved from chain** and admitted, which is what makes paying you
+permissionless rather than an arrangement. Your node only admits a channel
+whose terms are the ones it published:
+
+- **EVM.** The client picks its own `payer` and `salt`. `receiver` and
+  `receiverAuthorizer` must both be your settlement address, `token` must be your
+  token, and `withdrawDelay` must be at least your minimum. `payerAuthorizer`
+  must be **nonzero**. That last rule is stricter than x402, which allows a zero
+  one, and the greeting has no field to say so. A channel with a zero one is
+  refused on its first voucher. The client deposits through any x402 facilitator.
+  x402.org's facilitator relays deposits on Base Sepolia and pays their gas, but
+  only a token with ERC-3009 skips the payer's one-time `approve`, and devnet
+  USDC has ERC-3009. The first voucher on a channel your node has not seen carries
+  the full `channelConfig`, and the node recomputes the channel id from it.
+- **Solana.** The client builds an `open` in which your settlement key is the fee
+  payer, `rent_payer` and `payee`. It signs it and posts it to
+  `POST /ilp/batch-settlement/solana/open`, which the greeting names as
+  `extra.sponsorEndpoint`. The node checks every field, co-signs, submits, waits
+  for the channel to confirm, and admits it. This endpoint is **public** and
+  unauthenticated, because the buyer is a stranger with no channel yet. Its
+  limits are what it will sign, a cap of 8 sponsorships in flight and 1 per payer,
+  and an hourly budget of failed opens. Only SPL Token mints are accepted:
+  Token-2022 is refused.
+
+**How a voucher is checked.** A voucher has no nonce. It is accepted only if
+its amount is **strictly greater** than the last one accepted on that channel,
+by at least the route's charge. A replayed voucher buys nothing. A packet to a
+free route carries no voucher at all. A Solana voucher with a nonzero
+`expiresAt` is refused. A client that lost track of its last voucher asks
+`POST /ilp/claim-state` with `"scheme": "batch-settlement"` to learn the
+amount it has to beat.
+
+**How you get paid.** Automatically, with no operator write, for what lands on
+chain. On EVM, the node claims every held voucher in one `claim` and then
+`settle`s to your address every ten minutes. It also watches for
+`WithdrawInitiated`, and the moment a payer starts a withdrawal it claims that
+channel's latest voucher. That matters because only the amount already
+claimed on chain survives the withdrawal. On Solana, the node `settle`s open
+channels every ten minutes. It rediscovers its sponsored channels from the
+chain every ten seconds. On a closing channel it lands the latest voucher with
+`settle_and_seal` inside the grace period, then `distribute`s, then
+`reclaim`s the rent. The one-day minimum delay is how long a delayed or
+censored transaction still has to land. `POST /channels/:id/land` is the
+manual lever for planned maintenance — see
+[the operator surface](#the-operator-surface).
 
 > [!WARNING]
 > **Fund the settlement key _before_ you start the node**, and know that
@@ -326,73 +389,20 @@ things help when debugging "why is nobody paying me":
 
 - **An ILP outcome is never an HTTP one.** A `FULFILL` and a `REJECT` both come
   back at HTTP **200**.
-- **A caller with no claim on a priced route gets `402`**, carrying the route's
-  **greeting**: a document quoting the same price a real request would be
-  charged.
+- **A caller with no voucher on a priced route gets `402`**, carrying the
+  route's **greeting**: a document quoting the same price a real request
+  would be charged. Its `accepts[]` holds one `batch-settlement` entry for
+  each chain you configured, and nothing else — a `toon-channel` claim is
+  refused by name, so a node with no `[settlement]` table can be paid by
+  nobody. The price and your node's addresses ride beside it in
+  `extensions.toon`. Each entry is valid x402: a CAIP-2 `network`, the
+  `asset`, `payTo` set to your settlement address, and an `extra` holding
+  everything a stock x402 client needs to open a channel you will accept.
+  `GET /ilp` publishes the same facts under `batchSettlements`.
 
-Turning the claims you collect into money on chain is
-[the operator surface](#the-operator-surface)'s job.
-
-### Also accept x402 channels (optional)
-
-Everything above is paid over TOON's own channels, which a payer opens itself and
-pays gas for. A node can also be paid over an **x402 `batch-settlement`
-channel** ([ADR 0074](docs/adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)).
-On Base that means x402's audited `x402BatchSettlement` contract
-(`0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003`). On Solana it means
-solana-foundation's `payment-channels` program
-(`CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX`). No TOON contract is involved.
-
-What you get is a payer who needs **no native gas**. A client holding only USDC
-can open a channel to you and pay. On EVM a stock x402 facilitator relays its
-deposit. On Solana your node sponsors the open.
-
-Once the channel is open, each packet carries a **voucher** where it would carry
-a claim. A voucher is x402's signed cumulative amount, and it is still a claim:
-one per packet, journaled, each one superseding the last. It rides in the same
-places a claim does, with `"scheme": "batch-settlement"`.
-
-To opt in, write a sub-table under a chain's settlement table. Each chain is
-opted in separately, and neither is on by default. There is no `enabled` key,
-because the table being there is the switch:
-
-```toml
-[settlement.evm.batch_settlement]
-asset_eip712_name    = "USDC"   # the EIP-712 domain of [settlement.evm] token_address --
-asset_eip712_version = "2"      # "USDC" / "2" for Circle's FiatToken v2.2, the devnet token
-# min_withdraw_delay_secs = 86400   # default one day; 900 at least, 30 days at most
-
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = 1000000   # base units: the smallest deposit whose open you will pay rent for
-# min_grace_period_secs = 86400     # default one day; 900 at least
-```
-
-The token and the receiver are not declared again: they are the enclosing
-table's `token_address` and settlement key. The x402 contract address and program
-id are not settings at all. Each is deployed at the same address on testnets and
-mainnets, so the binary holds them as constants and never takes them from a
-voucher. `payment-channels` is unrelated to `[settlement.solana] program_id`,
-which stays TOON's own program. The two `asset_eip712_*` keys have no default,
-because a wrong domain gives clients a deposit signature that never verifies.
-Read them off the token with `cast call <token> 'name()(string)'` and
-`'version()(string)'` rather than copying the devnet values: Base mainnet's
-native USDC (`0x833589fC…2913`) is **`"USD Coin"`** / `"2"`, not `"USDC"`. The
-node boots either way, since it never signs under this domain itself, so a wrong
-name shows up only as every client's deposit failing.
-`min_sponsored_deposit` has none either, and `0` is refused, because it is the
-bound on an endpoint that spends your SOL.
-
-**What a payer sees.** The `402` greeting's `accepts[]` holds one
-`batch-settlement` entry for each chain you opted in to, and nothing else — a
-`toon-channel` claim is refused by name since #1384, so a node that opts in on
-no chain can be paid by nobody. The price and your node's addresses ride beside
-it in `extensions.toon`. Each entry is valid x402: a CAIP-2 `network`, the `asset`, `payTo` set to your settlement
-address, and an `extra` holding everything a stock x402 client needs to open a
-channel you will accept. `GET /ilp` publishes the same facts under
-`batchSettlements`.
-
-**How a channel gets opened.** Your node only admits a channel whose terms are
-the ones it published:
+Turning the vouchers you collect into money on chain is
+[the operator surface](#the-operator-surface)'s job. Before you rely on this,
+know what it costs and what you are trusting:
 
 - **EVM.** The client picks its own `payer` and `salt`. `receiver` and
   `receiverAuthorizer` must both be your settlement address, `token` must be your
@@ -433,8 +443,6 @@ latest voucher with `settle_and_seal` inside the grace period, then
 `distribute`s, then `reclaim`s the rent. The one-day minimum delay is how long a
 delayed or censored transaction still has to land.
 
-Before you opt in, know what it costs and what you are trusting:
-
 - **One way per channel.** Value moves one way on a channel. To pay a client
   back, open a channel of your own toward the terms it publishes
   (`POST /channels`); its payouts arrive as vouchers on that channel.
@@ -442,11 +450,11 @@ Before you opt in, know what it costs and what you are trusting:
   (4,711,920 lamports) until it is reclaimed. Your node's token account for the
   mint must already exist, because the sponsor refuses to open a channel into an
   account that would forfeit its payout.
-- **Third-party code.** The EVM contracts are ownerless and immutable. That also
+- **Third-party code.** The EVM contract is ownerless and immutable. That also
   means nothing can rescue an escrow that USDC's blacklist has frozen.
-  `payment-channels` can be upgraded by solana-foundation's key. What you risk is
-  whatever you have accepted in vouchers and not yet landed on chain. The fleet
-  does not opt in.
+  `payment-channels` can be upgraded — on mainnet-beta by a 3-of-5 Squads
+  multisig with no time lock, on devnet by a single keypair. What you risk is
+  whatever you have accepted in vouchers and not yet landed on chain.
 
 [`client-edge-spec.md`](docs/protocol/client-edge-spec.md) §1.3, §1.4, §1.10
 and §1.11 are the wire rules, and
@@ -555,9 +563,8 @@ chain a peering is **two one-way x402 channels**, one opened by each side
 ([ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)):
 you open and fund yours toward their `payTo`, they open theirs toward yours, and
 each node recognises the other's channel by the `voucherSigners` key the other
-publishes — so no identifier is ever exchanged. Both nodes need the chain's
-`batch_settlement` sub-table configured (`[settlement.evm.batch_settlement]` or
-`[settlement.solana.batch_settlement]`). On Solana your node opens its channel
+publishes — so no identifier is ever exchanged. Both nodes need that chain's
+`[settlement.<chain>]` table configured. On Solana your node opens its channel
 **through their sponsor endpoint**, so they hold the `payee` seat and can always
 land your latest voucher, even after you ask to close. There is no shared secret
 either — a peer's role is proved per packet by its voucher signature
@@ -721,21 +728,21 @@ docker compose --profile evm up -d --wait anvil
 
 That starts `anvil` on `127.0.0.1:8545` and seeds it (`infra/anvil/seed.sh`):
 x402's `x402BatchSettlement` and its deposit collectors at their canonical
-addresses, Circle's FiatToken v2.2 as USDC, and the `TokenNetworkRegistry` the
-connector still boots through. `--wait anvil` is doing two jobs: it blocks
-until anvil reports **healthy**, which for this service means the seed has
-actually landed rather than that the
+addresses, and Circle's FiatToken v2.2 as USDC. No TOON contract is deployed —
+every channel is an x402 channel (ADR 0075), so there is nothing else to seed.
+`--wait anvil` is doing two jobs: it blocks until anvil reports **healthy**,
+which for this service means the seed has actually landed rather than that the
 process started — and naming the service keeps the `evm` profile's other member,
 a devnet `faucet` container irrelevant to this walkthrough, out of the way.
 
-Three addresses, deterministic on every fresh anvil, which is what lets them be
+Two addresses, deterministic on every fresh anvil, which is what lets them be
 written down here:
 
-| What                                         | Address                                      |
-| -------------------------------------------- | -------------------------------------------- |
-| `TokenNetworkRegistry` (`contract_address`)  | `0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0` |
-| USDC, FiatToken v2.2, 6 dp (`token_address`) | `0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512` |
-| Chain id                                     | `31337`                                      |
+| What                                         | Address                                                                             |
+| -------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `x402BatchSettlement`                        | `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003` — a constant of the binary, not config |
+| USDC, FiatToken v2.2, 6 dp (`token_address`) | `0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512`                                        |
+| Chain id                                     | `31337`                                                                             |
 
 Anvil's account 0 — `0xf39F…2266`, private key
 `0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80` — is the
@@ -783,8 +790,12 @@ chmod -R a+rX node-a/data node-b/data
 
 #### 3. Fund the settlement keys
 
-Only **B** pays: it opens the channel (gas) and deposits the collateral (USDC).
-A needs a little ETH so its backend has a funded account, and no USDC at all.
+A peering is **two** x402 channels (ADR 0075): B opens and funds the one that
+carries real traffic to A, and A opens a small one of its own back toward B —
+unfunded past its opening deposit, since no packet ever flows on it, but
+still a real on-chain deposit that has to come from somewhere. So both keys
+need a little ETH for gas and a little USDC; B needs much more USDC, since
+its channel is the one that gets topped up and actually spent from.
 
 ```bash
 cd "$REPO"
@@ -803,6 +814,7 @@ echo "A $A_ADDR   B $B_ADDR"
 
 cast send --rpc-url $RPC --private-key $DEPLOYER --value 10ether  "$A_ADDR"
 cast send --rpc-url $RPC --private-key $DEPLOYER --value 100ether "$B_ADDR"
+cast send --rpc-url $RPC --private-key $MINTER "$USDC" "mint(address,uint256)" "$A_ADDR" 10000
 cast send --rpc-url $RPC --private-key $MINTER "$USDC" "mint(address,uint256)" "$B_ADDR" 1000000000
 
 # check it landed: 100 ETH, and 1000 USDC at 6 decimals
@@ -815,8 +827,13 @@ a config error in the logs.
 
 #### 4. The two configs
 
-`$LAB/node-a/connector.toml` — the payee. It is the only side that needs
-`[node]` and `peer_expose`, because it is the side being read:
+A peering is two one-way channels, so **both** nodes have to be peerable
+(`[node]` and `peer_expose`) — each dials the other's self-description once,
+whichever end opens which channel. Neither names the peering, or the other's
+voucher signer, in its config: both writes happen at runtime, in the next
+step.
+
+`$LAB/node-a/connector.toml` — the terminating side:
 
 ```toml
 client_edge_addr               = "0.0.0.0:3000"
@@ -841,23 +858,29 @@ bearer_token_file = "/app/data/operator-bearer-token"
 write_keys_file   = "/app/data/operator-write-keys"
 
 [settlement.evm]
-rpc_url          = "http://anvil:8545"
-contract_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
-token_address    = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-decimals         = 6
+rpc_url               = "http://anvil:8545"
+token_address         = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+decimals              = 6
+asset_eip712_name     = "USDC"
+asset_eip712_version  = "2"
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
 ```
 
-`$LAB/node-b/connector.toml` — the payer. Note what is **absent**: no
-`[[peers]]`, no channel tables, no `[node]`. The peering has not been written yet,
-and when it is, it is written at runtime rather than here:
+`$LAB/node-b/connector.toml` — the forwarding side. It also needs `[node]`
+and `peer_expose` now: A's own `POST /peers` (below) dials B's self-description
+to open A's small reverse channel and bind B's voucher signer to it:
 
 ```toml
 client_edge_addr               = "0.0.0.0:3000"
 state_dir                      = "/app/state"
+peer_expose                    = "http"
 peer_allow_plaintext_endpoints = true
+
+[node]
+addresses     = ["g.lab.b"]
+http_endpoint = "http://node-b:3000/ilp"
 
 [signer]
 key_file = "/app/data/signer.key"
@@ -867,10 +890,11 @@ bearer_token_file = "/app/data/operator-bearer-token"
 write_keys_file   = "/app/data/operator-write-keys"
 
 [settlement.evm]
-rpc_url          = "http://anvil:8545"
-contract_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
-token_address    = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-decimals         = 6
+rpc_url               = "http://anvil:8545"
+token_address         = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+decimals              = 6
+asset_eip712_name     = "USDC"
+asset_eip712_version  = "2"
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
@@ -961,23 +985,37 @@ curl -s http://127.0.0.1:3010/ilp | jq
 ```
 
 `"peerCarriages": ["http"]`, an `httpEndpoint`, an `edgeIdentity` and one
-`batchSettlements` entry on `eip155:31337` means A is peerable. B's own document, at
-`http://127.0.0.1:3011/ilp`, has `"peerCarriages": []` — B dials, it is not
-dialed, and that asymmetry is fine.
+`batchSettlements` entry on `eip155:31337` means A is peerable — and B's own
+document, at `http://127.0.0.1:3011/ilp`, now shows the same three, since B
+also has to be dialed for A's reverse channel in the next step.
 
 #### 6. Peer them
 
-Three signed writes against **B**. `sign-write.sh` lives in this repository:
+Four signed writes — two against each node — because a peering is two
+channels and each node opens its own. `sign-write.sh` lives in this
+repository:
 
 ```bash
 SW="$REPO"/docs/operators/sign-write.sh
-K="$LAB"/node-b/data/operator-send.key
+KA="$LAB"/node-a/data/operator-send.key
+KB="$LAB"/node-b/data/operator-send.key
+A=http://127.0.0.1:3010
 B=http://127.0.0.1:3011
 
-# 1. Establish. B reads A's self-description and opens the channel on chain.
-$SW -k $K -X POST -p /peers -u $B \
-  -b '{"id":"a","url":"http://node-a:3000/ilp","fee":100,"max_packet_amount":5000}'
+# 1. A's own reverse leg first, so B's first voucher already arrives on a
+#    bound channel: A reads B's self-description and opens a small channel
+#    of its own toward B, with `fee` and `max_packet_amount` both 0 because
+#    nothing is ever forwarded on it.
+$SW -k $KA -X POST -p /peers -u $A \
+  -b '{"id":"b","url":"http://node-b:3000/ilp","fee":0,"max_packet_amount":0,"deposit":1000}'
+
+# 2. B's own leg. B reads A's self-description and opens the channel that
+#    actually carries traffic, with an opening deposit.
+$SW -k $KB -X POST -p /peers -u $B \
+  -b '{"id":"a","url":"http://node-a:3000/ilp","fee":100,"max_packet_amount":5000,"deposit":5000}'
 ```
+
+B's answer to its own write:
 
 ```json
 {
@@ -994,25 +1032,26 @@ retyping 66 hex characters — `sign-write.sh` prints its three headers first, s
 the response body is the last line:
 
 ```bash
-CH=$($SW -k $K -X POST -p /peers -u $B \
-      -b '{"id":"a","url":"http://node-a:3000/ilp","fee":100,"max_packet_amount":5000}' \
+CH=$($SW -k $KB -X POST -p /peers -u $B \
+      -b '{"id":"a","url":"http://node-a:3000/ilp","fee":100,"max_packet_amount":5000,"deposit":5000}' \
      | tail -1 | jq -r .channel.id)
 echo "$CH"
 ```
 
 Re-running `POST /peers` like this is safe: the peering is already established, so
-this second call finds the same channel and answers `"status":"found"`.
+this second call finds the same channel, spends no `deposit` again, and answers
+`"status":"found"`.
 
 ```bash
+# 3. Top B's channel up — its own collateral behind its own vouchers. Ten
+#    packets' worth: every packet spends collateral INCLUDING one that comes
+#    back REJECT, so leave yourself room to experiment. `fund` takes an
+#    INCREMENT, so this adds 5000 to the 5000 already deposited, for 10000
+#    total. Running out reads as "T00 ... has 0 base units of headroom left".
+$SW -k $KB -X POST -p /channels/$CH/fund -u $B -b '{"amount":5000}'
 
-# 2. Fund it — B's own collateral behind B's own claims. Ten packets' worth:
-#    every packet spends collateral INCLUDING one that comes back REJECT, so
-#    leave yourself room to experiment. Running out reads as
-#    "T00 ... has 0 base units of headroom left".
-$SW -k $K -X POST -p /channels/$CH/fund -u $B -b '{"amount":10000}'
-
-# 3. Route through it. 1100 in, 100 kept, 1000 forwarded — exactly A's price.
-$SW -k $K -X POST -p /routes/peers -u $B \
+# 4. Route through it. 1100 in, 100 kept, 1000 forwarded — exactly A's price.
+$SW -k $KB -X POST -p /routes/peers -u $B \
   -b '{"prefix":"g.lab.a","peer_id":"a","price":1100}'
 ```
 
@@ -1235,8 +1274,9 @@ The watchers land your inbound vouchers on their own; `land` is the lever for
 planned maintenance. `POST /channels` journals the channel before it spends, so a
 retry after an error resumes that channel rather than opening a second
 (ADR 0075). The `toon-channel` writes `redeem`, `redeem-latest`, `settle`,
-`close` and `cooperative-close` are gone; a node draining live TOON channels does
-so on the last release that has them.
+`close` and `cooperative-close` are gone; a node draining channels left over
+from before ADR 0075 does so on the last release that had them — see
+[`docs/operators/draining-toon-channels.md`](docs/operators/draining-toon-channels.md).
 
 Channel operations answer **503** when no x402 batch-settlement backend is configured.
 
@@ -1295,19 +1335,19 @@ tier is still named and empty** (ADR 0056): no fleet machine, no fleet key.
 
 ## Where to go next
 
-| Path                                                                               | What it is                                                                                  |
-| ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| [`docs/the-yellow-brick-road.md`](docs/the-yellow-brick-road.md)                   | **The idea.** Why you pay a path and not a destination, and why the road earns the traffic. |
-| [`docs/rfcs/`](docs/rfcs/README.md)                                                | **The protocol.** Interledger, the ten vendored RFCs, and where TOON departs from each.     |
-| [`docs/protocol/configuration-spec.md`](docs/protocol/configuration-spec.md)       | Every config key, and what each one binds.                                                  |
-| [`docs/protocol/operator-spec.md`](docs/protocol/operator-spec.md)                 | The operator surface's rules, numbered.                                                     |
-| [`docs/protocol/self-description-spec.md`](docs/protocol/self-description-spec.md) | What `GET /ilp` must and must not carry, rule by rule.                                      |
-| [`docs/operators/`](docs/operators/)                                               | Runbooks: box bring-up, key rotation, fleet release and health, signing a write.            |
-| [`deploy/connector-rust/README.md`](deploy/connector-rust/README.md)               | The container path in full, including the image tag table.                                  |
-| [`local/`](local/README.md)                                                        | The shipped image against real chains — `make local-verify`.                                |
-| [`CONTEXT.md`](CONTEXT.md)                                                         | The vocabulary. Read before writing docs or naming anything.                                |
-| [`docs/adr/`](docs/adr/README.md)                                                  | Why any of this is the way it is. The tiebreaker for everything.                            |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md)                                               | Building from source, the test gate, the chain binaries it needs.                           |
+| Path                                                                               | What it is                                                                                               |
+| ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| [`docs/the-yellow-brick-road.md`](docs/the-yellow-brick-road.md)                   | **The idea.** Why you pay a path and not a destination, and why the road earns the traffic.              |
+| [`docs/rfcs/`](docs/rfcs/README.md)                                                | **The protocol.** Interledger, the ten vendored RFCs, and where TOON departs from each.                  |
+| [`docs/protocol/configuration-spec.md`](docs/protocol/configuration-spec.md)       | Every config key, and what each one binds.                                                               |
+| [`docs/protocol/operator-spec.md`](docs/protocol/operator-spec.md)                 | The operator surface's rules, numbered.                                                                  |
+| [`docs/protocol/self-description-spec.md`](docs/protocol/self-description-spec.md) | What `GET /ilp` must and must not carry, rule by rule.                                                   |
+| [`docs/operators/`](docs/operators/)                                               | Runbooks: box bring-up, key rotation, fleet release and health, signing a write, draining TOON channels. |
+| [`deploy/connector-rust/README.md`](deploy/connector-rust/README.md)               | The container path in full, including the image tag table.                                               |
+| [`local/`](local/README.md)                                                        | The shipped image against real chains — `make local-verify`.                                             |
+| [`CONTEXT.md`](CONTEXT.md)                                                         | The vocabulary. Read before writing docs or naming anything.                                             |
+| [`docs/adr/`](docs/adr/README.md)                                                  | Why any of this is the way it is. The tiebreaker for everything.                                         |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md)                                               | Building from source, the test gate, the chain binaries it needs.                                        |
 
 ## License
 

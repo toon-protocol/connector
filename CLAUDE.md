@@ -168,13 +168,14 @@ A node reads these:
 | `[settlement.evm.key] key_file`    | `settlement.key`        | EVM settlement transactions and EVM claims, client-payout vouchers included (ADR 0075)       |
 | `[settlement.solana.key] key_file` | `settlement-solana.key` | Solana settlement transactions and Solana claims, client-payout vouchers included (ADR 0075) |
 
-ADR 0075 (built — #1371) makes each chain's settlement key the signer of every voucher on that
-chain and leaves `[signer]` as identity only, with no spending authority: client payouts and peer
-claims are vouchers signed by the chain's settlement key, and every claim at the client edge is a
-voucher too; a `toon-channel` claim is refused by name. Each `[settlement.<chain>]` table carries
-that chain's x402 terms directly (the old `batch_settlement` sub-table, `contract_address` and
-`program_id` are refused by name), and a node boots only on a chain where the x402 contract or
-program is deployed (#1385).
+Each chain's settlement key signs every voucher on that chain — client payouts and peer claims
+included — under [ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md).
+`[signer]` has no spending authority. A claim at the client edge is a voucher too; anything else
+(`toon-channel`, no `scheme` at all) is refused by name. Each `[settlement.<chain>]` table carries
+that chain's x402 terms directly — `contract_address`, `program_id` and the old `batch_settlement`
+sub-table are refused by name — and a node boots only on a chain where the x402 contract or program
+is deployed. A node still holding a live TOON channel drains it on the last TOON-capable release
+before upgrading: [`docs/operators/draining-toon-channels.md`](docs/operators/draining-toon-channels.md).
 
 `[announce]` is gone (ADR 0046 / #1074): the section is now `[node]`, holding only `addresses`,
 `http_endpoint` and `btp_endpoint` — the facts a node cannot introspect about itself — and no key of
@@ -246,8 +247,9 @@ keypair and has no mainnet-shaped mode. In tests, funding is
 **Devnet** settles on _public_ chains — Base Sepolia and Solana devnet — and is
 funded by the faucet (`infra/linode-faucet/`), not by any of the above. The
 faucet **mints** on both legs rather than paying out of a balance: Base Sepolia's
-mock USDC has an ungated `mint()`, and on Solana the faucet's own keypair is the
-mint authority of a mint it created for itself
+USDC is a Circle FiatToken v2.2 this project deployed (#1337), whose minter is the
+faucet's key — minter-gated, not open, but the faucet can always mint — and on Solana
+the faucet's own keypair is the mint authority of a mint it created for itself
 (`infra/linode-faucet/create-devnet-usdc-mint.sh`). So neither leg can run dry, and
 there is no separate deployer key to lose — which is what happened to the mint used
 before 2026-08, killing that leg with no repair path. The faucet is a separate
@@ -381,7 +383,12 @@ Single-context: `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents
   `cargo run -p connector-vectors --bin generate-vectors` after any change to the
   envelope, gift wrap, fulfilment derivation or claim signing.
 - `docs/operators/` — runbooks for the devnet fleet: box bring-up, key rotation, release
-  and health, peering bring-up, onion-endpoint bring-up.
+  and health, peering bring-up, onion-endpoint bring-up — plus one that is not for the fleet
+  at all: draining a non-fleet node's live TOON channels before it upgrades.
+- `docs/releases/` — release notes for a breaking build, when the GitHub Release body
+  alone is not enough room: a before-and-after config, every key removed or newly
+  required. Not every release gets one; most need nothing beyond the release workflow's
+  own generated body.
 - `docs/agents/` — issue tracker, triage labels, domain docs conventions.
 - `docs/rfcs/` — the ten Interledger RFCs this connector implements, vendored verbatim
   and pinned, each under a **TOON profile** recording where this connector departs and

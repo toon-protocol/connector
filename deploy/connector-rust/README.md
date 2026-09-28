@@ -15,17 +15,24 @@ All commands below run from the repository root.
 | `connector.production.toml` | **A skeleton for a tier that does not exist.** Do not fill it in. It documents what standing production up would require, and every value in it is invalid on purpose. |
 
 The second one needs a word of warning, because it looks like the first. There
-is no production tier: no machine, no mainnet contract, no key, no deploy
-([ADR 0056](../../docs/adr/0056-production-is-a-named-empty-tier.md)). Two of
-its settings cannot be filled in even in principle — `packages/contracts` has
-never been deployed to an EVM mainnet, so there is no `TokenNetworkRegistry`
-to name, and the Solana payment-channel program
-(`2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip`) exists on devnet only, which
-matters because ADR 0053 binds the settlement program into a claim's signed
-message. Copying a devnet address across to "make it valid" produces a node
-that boots, looks healthy, and cannot redeem a claim.
+is no production tier: no machine, no key, no deploy
+([ADR 0056](../../docs/adr/0056-production-is-a-named-empty-tier.md)). The
+missing contract is no longer the reason. Every channel is an x402
+`batch-settlement` channel (ADR 0075): `x402BatchSettlement` at its canonical
+address on EVM, and solana-foundation's `payment-channels` at `CHNLx…` on
+Solana, both constants of the binary rather than config — and both live on
+mainnet as well as on the devnet clusters this repository funds, so there is
+no missing deployment to point at. Mainnet contracts exist for TOON's own,
+retired channel type too, run by a third-party operator, not by this tier
+(see `CLAUDE.md`'s "Where money comes from"), but this build no longer binds
+to them regardless of network. What actually blocks this tier is everything
+ADR 0056 records as this tier's own to choose and not yet having chosen: a
+mainnet RPC, token and mint, a settlement key, the token's EIP-712 domain and
+the Solana sponsor's minimum deposit. Filling any of those in with a
+plausible-looking value produces a node that boots, looks healthy, and is
+still not a decision this tier has made.
 `crates/connector-bin/tests/production_skeleton_is_inert.rs` fails the build if
-that happens.
+the skeleton stops failing to load.
 
 ## Pulling the published image
 
