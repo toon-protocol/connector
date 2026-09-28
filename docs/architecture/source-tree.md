@@ -86,11 +86,16 @@ connector-chain-rpc              the HTTP transport every settlement table's RPC
 connector-settlement             the chain-agnostic settlement port + its contract suite
   ├─ port.rs, contract.rs        the port, and the one suite every backend is run against
   ├─ in_memory.rs                the fake — the first implementation to pass that suite
-  └─ batch/                      a second, receive-only port for x402 batch-settlement
-                                  channels a client opens (ADR 0074 decision 9): admit,
-                                  read collateral and lifecycle, land a voucher. Its own
-                                  port.rs, contract.rs and in_memory.rs, in the same shape,
-                                  and held.rs: where the watchers read the latest voucher
+  └─ batch/                      a second port for x402 batch-settlement channels, in
+                                  two halves (ADR 0074 decision 9, ADR 0075 decision 2).
+                                  Receiving: admit, read collateral and lifecycle, land a
+                                  voucher. Paying: open toward a receiver's published
+                                  terms, top up, sign a voucher, withdraw, read outbound
+                                  state. Its own port.rs, a contract.rs suite per half,
+                                  and in_memory.rs, a fake chain several nodes share,
+                                  each implementing both halves; and held.rs: where the
+                                  watchers read the latest voucher. The chain backends
+                                  implement the paying half in #1374 and #1375
 connector-settlement-evm         real EVM backend: TokenNetworkRegistry → TokenNetwork,
                                   holding no local channel state; every method reads the
                                   chain fresh
