@@ -136,7 +136,7 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
 /// One node's key material: a raw 32-byte seed on disk, read as both its
 /// `[signer]` key (secp256k1, the edge identity a payload is sealed to)
 /// and its `[settlement.solana]` key (ed25519, the channel participant).
-/// Two curves, one file -- the same shape `settlement_lifecycle.rs` uses.
+/// Two curves, one file -- the same shape the since-deleted `settlement_lifecycle.rs` used.
 struct NodeKeys {
     seed: [u8; 32],
     key_file: tempfile::NamedTempFile,

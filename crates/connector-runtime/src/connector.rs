@@ -17,7 +17,7 @@ use connector_domain::{
     Fulfill, PacketResponse, Prepare, Price, RateLookup, Reject, RejectCode, Watermark,
     FORWARDING_MESSAGE_WINDOW,
 };
-use connector_settlement::{ChannelId, Claim, SettlementBackend, SettlementError};
+use connector_settlement::{ChannelId, SettlementBackend, SettlementError};
 use connector_signer::giftwrap::{derive_fulfillment, open_request, seal_response};
 use connector_signer::{Address, Ed25519Signer, Signer};
 use rand::rngs::OsRng;
@@ -170,13 +170,6 @@ pub enum ChannelOperationError {
     /// pick one).
     #[error("this node settles on more than one chain -- name which chain to open the channel on")]
     AmbiguousSettlementChain,
-    /// [`Connector::redeem_latest_claim`] or [`Connector::cooperative_close`]
-    /// was asked to redeem a channel this node has never accepted an
-    /// inbound claim on (issue #425) -- distinct from
-    /// [`SettlementError::StaleClaim`], which means a claim exists but the
-    /// chain has already redeemed at least that much.
-    #[error("no claim has been accepted on this channel to redeem")]
-    NoClaimToRedeem,
     #[error(transparent)]
     Settlement(#[from] SettlementError),
 }
@@ -3923,16 +3916,30 @@ impl Connector {
         &self,
         channel_id: &str,
     ) -> Result<&Arc<dyn SettlementBackend>, ChannelOperationError> {
+        let chain = self.settlement_chain_for_channel(channel_id)?;
+        self.settlement_on(chain)
+    }
+
+    /// The chain whose backend [`Self::settlement_for_channel`] routes
+    /// `channel_id` to, by the same rule: the one backend on a node with one,
+    /// the id's own namespace otherwise. What the operator surface reads to
+    /// refuse a write on a chain whose `toon-channel` writes ADR 0075 retired
+    /// (#1376) before it reaches a backend.
+    pub fn settlement_chain_for_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<SettlementChain, ChannelOperationError> {
         match self.settlements.as_slice() {
             [] => Err(ChannelOperationError::NoSettlementBackend),
-            [(_, settlement)] => Ok(settlement),
+            [(chain, _)] => Ok(*chain),
             _ => {
                 let chain = Self::channel_id_chain(channel_id).ok_or_else(|| {
                     ChannelOperationError::Settlement(SettlementError::ChannelNotFound(ChannelId(
                         channel_id.to_string(),
                     )))
                 })?;
-                self.settlement_on(chain)
+                self.settlement_on(chain)?;
+                Ok(chain)
             }
         }
     }
@@ -3999,150 +4006,10 @@ impl Connector {
         Ok(ChannelView::from(state))
     }
 
-    /// Redeem `claim` against `channel_id` (issue #459), on whichever chain
-    /// the id itself names ([`Self::settlement_for_channel`]).
-    pub async fn redeem_channel(
-        &self,
-        channel_id: &str,
-        claim: Claim,
-    ) -> Result<ChannelView, ChannelOperationError> {
-        let state = self
-            .settlement_for_channel(channel_id)?
-            .redeem(&ChannelId(channel_id.to_string()), claim)
-            .await?;
-        Ok(ChannelView::from(state))
-    }
-
-    /// Close `channel_id` (issue #459), on whichever chain the id itself
-    /// names ([`Self::settlement_for_channel`]): no further funding or
-    /// redemption is possible against it afterward.
-    pub async fn close_channel(
-        &self,
-        channel_id: &str,
-    ) -> Result<ChannelView, ChannelOperationError> {
-        let state = self
-            .settlement_for_channel(channel_id)?
-            .close(&ChannelId(channel_id.to_string()))
-            .await?;
-        Ok(ChannelView::from(state))
-    }
-
-    /// Settle `channel_id` (issue #1129) once its challenge period --
-    /// the `settlement_timeout` [`Connector::open_channel`] was given,
-    /// counted from [`Connector::close_channel`] -- has elapsed: the
-    /// remainder of each side's deposit is paid back out on chain and the
-    /// channel becomes permanently done.
-    ///
-    /// This is the operation that *finishes* a close. Nothing else does:
-    /// [`Connector::close_channel`] only starts the challenge window
-    /// (issue #574), and [`Connector::cooperative_close`] is a redeem
-    /// followed by that same close, so a channel closed by either route
-    /// still holds every un-claimed deposit until this runs. Before #1129
-    /// no surface reached it at all and the remainder was recoverable only
-    /// by an out-of-band chain call.
-    ///
-    /// [`SettlementError::SettlementNotYetDue`] while the window is still
-    /// open (or if the channel was never closed) -- a named, retry-later
-    /// answer rather than a generic backend failure. There is deliberately
-    /// no timer here that settles a channel on the node's own initiative:
-    /// when a node settles is an operator's call, made with an
-    /// authenticated write, exactly like when it closes.
-    pub async fn settle_channel(
-        &self,
-        channel_id: &str,
-    ) -> Result<ChannelView, ChannelOperationError> {
-        let state = self
-            .settlement_for_channel(channel_id)?
-            .settle(&ChannelId(channel_id.to_string()))
-            .await?;
-        Ok(ChannelView::from(state))
-    }
-
-    /// Redeem the latest claim this node has accepted on `channel_id`
-    /// (issue #425, story 36): looks up the highest-nonce claim this node
-    /// has ever verified and accepted from that channel's counterparty --
-    /// never a superseded one, since `ClaimBook` only ever retains the
-    /// latest -- and submits exactly that one claim to the configured
-    /// settlement backend. [`ChannelOperationError::NoClaimToRedeem`] if
-    /// this channel has never had a claim accepted on it; a claim already
-    /// fully redeemed reports [`SettlementError::StaleClaim`] through the
-    /// backend rather than being treated as success here, so a failed
-    /// submission never silently reports a stale channel state as if the
-    /// redemption happened (leaving the channel's actual on-chain state
-    /// the one place a caller need look to retry).
-    pub async fn redeem_latest_claim(
-        &self,
-        channel_id: &str,
-    ) -> Result<ChannelView, ChannelOperationError> {
-        let claim = self
-            .claims
-            .latest_inbound_claim(channel_id)
-            .ok_or(ChannelOperationError::NoClaimToRedeem)?;
-        let state = self
-            .settlement_for_channel(channel_id)?
-            .redeem(&ChannelId(channel_id.to_string()), claim)
-            .await?;
-        Ok(ChannelView::from(state))
-    }
-
-    /// Cooperatively close `channel_id` (issue #425, story 37): redeem
-    /// whatever claim this node last accepted on it, then close -- one
-    /// operator-driven action rather than two.
-    ///
-    /// "Cooperative" names the *claim* half only: it collects what this
-    /// node is owed in the same breath as closing, rather than leaving a
-    /// redemption to be raced into the challenge window afterwards. It
-    /// does **not** skip that window. This method was written (2026-07-26)
-    /// against a port where `close` was terminal; issue #574 reversed that
-    /// two days later, and `close` now starts a challenge period on both
-    /// chains -- so the deposits still sit on chain until
-    /// [`Connector::settle_channel`] runs (issue #1129). A caller wanting
-    /// the collateral back needs both.
-    ///
-    /// A channel with no claim ever accepted closes directly,
-    /// exactly like [`Connector::close_channel`]. A claim already fully
-    /// redeemed (`SettlementError::StaleClaim`, or `StaleNonce` -- issue
-    /// #573 -- for the same already-redeemed claim) is not a reason to
-    /// refuse closing -- there is nothing left to collect -- but any other
-    /// redemption failure stops here without closing, so a reverted or
-    /// failed settlement transaction leaves the channel open and the claim
-    /// still redeemable rather than closing over an unclaimed balance.
-    pub async fn cooperative_close(
-        &self,
-        channel_id: &str,
-    ) -> Result<ChannelView, ChannelOperationError> {
-        let settlement = self.settlement_for_channel(channel_id)?;
-        let id = ChannelId(channel_id.to_string());
-        if let Some(claim) = self.claims.latest_inbound_claim(channel_id) {
-            match settlement.redeem(&id, claim).await {
-                Ok(_)
-                | Err(SettlementError::StaleClaim { .. })
-                | Err(SettlementError::StaleNonce { .. }) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let state = settlement.close(&id).await?;
-        Ok(ChannelView::from(state))
-    }
-
     /// Claims exchanged with peers (issue #423), for the operator surface's
     /// read-only inspection interface.
     pub fn claims(&self) -> Vec<ClaimView> {
         self.claims.views()
-    }
-
-    /// The latest claim this connector's own peer-semantics book -- never
-    /// the client edge's second book -- has accepted on `channel_id` (issue
-    /// #1218): the read half of what [`Self::redeem_latest_claim`] and
-    /// [`Self::cooperative_close`] already consult internally, exposed so a
-    /// caller holding a second claim book (`connector_client_edge::ClientClaimGate`)
-    /// can tell, before it redeems anything, whether the peer book is the
-    /// authority for `channel_id` or whether it should fall back to its own
-    /// -- the same "which book is the authority is a property of the
-    /// channel, never of who is asking" doctrine `Self::peer_channel_watermark`
-    /// already serves `POST /ilp/claim-state` with.
-    pub fn peer_inbound_claim(&self, channel_id: &str) -> Option<connector_settlement::Claim> {
-        self.claims.latest_inbound_claim(channel_id)
     }
 }
 
@@ -4200,7 +4067,6 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{Duration, TimeZone, Utc};
     use connector_domain::{Guards, MaxMove, Rate, RateTable, Spread, Ttl};
-    use connector_signer::derive_evm_address;
 
     /// Seals `data` (issue #524) -- what a genuine sender does before ever
     /// transmitting a packet, so a plain `prepare()` call is, by
@@ -8429,7 +8295,7 @@ mod tests {
             async fn redeem(
                 &self,
                 _channel: &ChannelId,
-                _claim: Claim,
+                _claim: connector_settlement::Claim,
             ) -> Result<ChannelState, SettlementError> {
                 Err(SettlementError::Backend(format!("{}: redeem", self.0)))
             }
@@ -8499,8 +8365,8 @@ mod tests {
                 "evm: fund"
             );
             assert_eq!(
-                backend_reached(connector.close_channel(SOLANA_CHANNEL).await),
-                "solana: close"
+                backend_reached(connector.fund_channel(SOLANA_CHANNEL, 5).await),
+                "solana: fund"
             );
             // A bare (un-`0x`-prefixed) hex id is the same EVM namespace,
             // exactly as `EvmSettlementBackend::parse_channel_id` accepts.
@@ -8706,280 +8572,6 @@ mod tests {
                     SettlementError::ChannelNotFound(_)
                 ))
             ));
-        }
-    }
-
-    mod redemption {
-        use super::*;
-        use connector_settlement::{ChannelStatus, InMemorySettlementBackend};
-        use connector_signer::LocalSigner;
-
-        fn connector_with_settlement(
-            settlement: Arc<InMemorySettlementBackend>,
-            peer_signer: &LocalSigner,
-            channel_id: &str,
-        ) -> Connector {
-            Connector::new(
-                vec![],
-                vec![],
-                Arc::new(FakeAppClient::new()),
-                Arc::new(InProcessPeerTransport::new()),
-                test_clock(),
-            )
-            .with_settlement(SettlementChain::Evm, settlement)
-            .with_channel_verification_key(
-                channel_id,
-                derive_evm_address(&peer_signer.public_key().unwrap()),
-            )
-            .with_channel_domain(channel_id, test_channel_domain())
-            .unwrap()
-        }
-
-        /// `channel_id` here is `InMemorySettlementBackend::open`'s own
-        /// generated id -- a plain decimal counter (issue #575), which
-        /// `crate::claim::parse_channel_id` accepts as the same on-chain
-        /// value that decimal numeral names.
-        fn sign_claim(
-            signer: &LocalSigner,
-            channel_id: &str,
-            nonce: u64,
-            cumulative_amount: u64,
-        ) -> WireClaim {
-            let on_chain_id = crate::claim::parse_channel_id(channel_id).unwrap();
-            let proof = crate::claim::evm_proof(
-                on_chain_id,
-                test_channel_domain(),
-                nonce,
-                cumulative_amount,
-            );
-            WireClaim {
-                channel_id: channel_id.to_string(),
-                nonce,
-                cumulative_amount,
-                signature: crate::claim::ClaimSignature::Evm(
-                    signer
-                        .sign(&connector_signer::evm_balance_proof_digest(&proof))
-                        .unwrap(),
-                ),
-            }
-        }
-
-        #[tokio::test]
-        async fn redeeming_with_no_claim_ever_accepted_is_refused() {
-            let settlement = Arc::new(InMemorySettlementBackend::new());
-            let channel_id = settlement
-                .open(b"peer".to_vec(), Duration::seconds(3600))
-                .await
-                .unwrap();
-            let peer_signer = LocalSigner::generate("peer-key");
-            let connector = connector_with_settlement(settlement, &peer_signer, &channel_id.0);
-
-            let result = connector.redeem_latest_claim(&channel_id.0).await;
-
-            assert_eq!(result, Err(ChannelOperationError::NoClaimToRedeem));
-        }
-
-        /// Issue #1218: `peer_inbound_claim` is the read half
-        /// `redeem_latest_claim`/`cooperative_close` already use
-        /// internally, exposed so a caller holding a second book (the
-        /// client edge's own) can tell whether the peer book already
-        /// answers for a channel before falling back to its own.
-        #[tokio::test]
-        async fn peer_inbound_claim_answers_none_until_a_claim_is_accepted_then_the_latest() {
-            let settlement = Arc::new(InMemorySettlementBackend::new());
-            let channel_id = settlement
-                .open(b"peer".to_vec(), Duration::seconds(3600))
-                .await
-                .unwrap();
-            settlement
-                .fund_counterparty(&channel_id, 1_000)
-                .await
-                .unwrap();
-            let peer_signer = LocalSigner::generate("peer-key");
-            let connector =
-                connector_with_settlement(settlement.clone(), &peer_signer, &channel_id.0);
-
-            assert_eq!(connector.peer_inbound_claim(&channel_id.0), None);
-
-            assert_eq!(
-                connector.handle_peer_claim(sign_claim(&peer_signer, &channel_id.0, 1, 100)),
-                ClaimAckOutcome::Accepted
-            );
-            assert_eq!(
-                connector.handle_peer_claim(sign_claim(&peer_signer, &channel_id.0, 2, 400)),
-                ClaimAckOutcome::Accepted
-            );
-
-            let claim = connector
-                .peer_inbound_claim(&channel_id.0)
-                .expect("a claim has been accepted");
-            assert_eq!(claim.nonce, 2);
-            assert_eq!(claim.cumulative_amount, 400);
-        }
-
-        #[tokio::test]
-        async fn redeeming_submits_only_the_highest_nonce_claim_ever_accepted() {
-            let settlement = Arc::new(InMemorySettlementBackend::new());
-            let channel_id = settlement
-                .open(b"peer".to_vec(), Duration::seconds(3600))
-                .await
-                .unwrap();
-            // The peer signs the claims redeemed below, so it is the peer's
-            // own deposit that backs them (issue #1118).
-            settlement
-                .fund_counterparty(&channel_id, 1_000)
-                .await
-                .unwrap();
-            let peer_signer = LocalSigner::generate("peer-key");
-            let connector =
-                connector_with_settlement(settlement.clone(), &peer_signer, &channel_id.0);
-
-            assert_eq!(
-                connector.handle_peer_claim(sign_claim(&peer_signer, &channel_id.0, 1, 100)),
-                ClaimAckOutcome::Accepted
-            );
-            assert_eq!(
-                connector.handle_peer_claim(sign_claim(&peer_signer, &channel_id.0, 2, 400)),
-                ClaimAckOutcome::Accepted
-            );
-
-            let view = connector.redeem_latest_claim(&channel_id.0).await.unwrap();
-
-            // Never the superseded 100 -- only ever the latest.
-            assert_eq!(view.redeemed, 400);
-        }
-
-        #[tokio::test]
-        async fn a_redemption_the_backend_refuses_leaves_the_channel_untouched() {
-            let settlement = Arc::new(InMemorySettlementBackend::new());
-            let channel_id = settlement
-                .open(b"peer".to_vec(), Duration::seconds(3600))
-                .await
-                .unwrap();
-            // The peer signs the claims redeemed below, so it is the peer's
-            // own deposit that backs them (issue #1118).
-            settlement
-                .fund_counterparty(&channel_id, 100)
-                .await
-                .unwrap();
-            let peer_signer = LocalSigner::generate("peer-key");
-            let connector =
-                connector_with_settlement(settlement.clone(), &peer_signer, &channel_id.0);
-            connector.handle_peer_claim(sign_claim(&peer_signer, &channel_id.0, 1, 500));
-
-            let result = connector.redeem_latest_claim(&channel_id.0).await;
-
-            assert_eq!(
-                result,
-                Err(ChannelOperationError::Settlement(
-                    SettlementError::InsufficientChannelBalance {
-                        requested: 500,
-                        deposited: 100,
-                    }
-                ))
-            );
-            // Recoverable: a refused redemption never touches the channel's
-            // real state, so there is nothing to roll back before retrying.
-            let state = settlement.channel_state(&channel_id).await.unwrap();
-            assert_eq!(state.redeemed, 0);
-        }
-
-        #[tokio::test]
-        async fn cooperative_close_with_no_claim_ever_accepted_just_closes() {
-            let settlement = Arc::new(InMemorySettlementBackend::new());
-            let channel_id = settlement
-                .open(b"peer".to_vec(), Duration::seconds(3600))
-                .await
-                .unwrap();
-            let peer_signer = LocalSigner::generate("peer-key");
-            let connector = connector_with_settlement(settlement, &peer_signer, &channel_id.0);
-
-            let view = connector.cooperative_close(&channel_id.0).await.unwrap();
-
-            assert_eq!(view.status, crate::operator_view::ChannelViewStatus::Closed);
-        }
-
-        #[tokio::test]
-        async fn cooperative_close_redeems_the_latest_claim_before_closing() {
-            let settlement = Arc::new(InMemorySettlementBackend::new());
-            let channel_id = settlement
-                .open(b"peer".to_vec(), Duration::seconds(3600))
-                .await
-                .unwrap();
-            // The peer signs the claims redeemed below, so it is the peer's
-            // own deposit that backs them (issue #1118).
-            settlement
-                .fund_counterparty(&channel_id, 1_000)
-                .await
-                .unwrap();
-            let peer_signer = LocalSigner::generate("peer-key");
-            let connector =
-                connector_with_settlement(settlement.clone(), &peer_signer, &channel_id.0);
-            connector.handle_peer_claim(sign_claim(&peer_signer, &channel_id.0, 1, 700));
-
-            let view = connector.cooperative_close(&channel_id.0).await.unwrap();
-
-            assert_eq!(view.redeemed, 700);
-            assert_eq!(view.status, crate::operator_view::ChannelViewStatus::Closed);
-        }
-
-        #[tokio::test]
-        async fn cooperative_close_still_closes_when_the_claim_was_already_redeemed() {
-            let settlement = Arc::new(InMemorySettlementBackend::new());
-            let channel_id = settlement
-                .open(b"peer".to_vec(), Duration::seconds(3600))
-                .await
-                .unwrap();
-            // The peer signs the claims redeemed below, so it is the peer's
-            // own deposit that backs them (issue #1118).
-            settlement
-                .fund_counterparty(&channel_id, 1_000)
-                .await
-                .unwrap();
-            let peer_signer = LocalSigner::generate("peer-key");
-            let connector =
-                connector_with_settlement(settlement.clone(), &peer_signer, &channel_id.0);
-            connector.handle_peer_claim(sign_claim(&peer_signer, &channel_id.0, 1, 700));
-            connector.redeem_latest_claim(&channel_id.0).await.unwrap();
-
-            // The same claim is now stale on chain -- cooperative close
-            // does not treat that as a reason to refuse closing.
-            let view = connector.cooperative_close(&channel_id.0).await.unwrap();
-
-            assert_eq!(view.status, crate::operator_view::ChannelViewStatus::Closed);
-        }
-
-        #[tokio::test]
-        async fn a_cooperative_close_whose_redemption_fails_leaves_the_channel_open() {
-            let settlement = Arc::new(InMemorySettlementBackend::new());
-            let channel_id = settlement
-                .open(b"peer".to_vec(), Duration::seconds(3600))
-                .await
-                .unwrap();
-            // The peer signs the claims redeemed below, so it is the peer's
-            // own deposit that backs them (issue #1118).
-            settlement
-                .fund_counterparty(&channel_id, 100)
-                .await
-                .unwrap();
-            let peer_signer = LocalSigner::generate("peer-key");
-            let connector =
-                connector_with_settlement(settlement.clone(), &peer_signer, &channel_id.0);
-            connector.handle_peer_claim(sign_claim(&peer_signer, &channel_id.0, 1, 500));
-
-            let result = connector.cooperative_close(&channel_id.0).await;
-
-            assert_eq!(
-                result,
-                Err(ChannelOperationError::Settlement(
-                    SettlementError::InsufficientChannelBalance {
-                        requested: 500,
-                        deposited: 100,
-                    }
-                ))
-            );
-            let state = settlement.channel_state(&channel_id).await.unwrap();
-            assert_eq!(state.status, ChannelStatus::Open);
         }
     }
 

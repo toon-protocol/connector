@@ -266,6 +266,233 @@ pub struct OpenedChannel {
     pub voucher_signer: VoucherSigner,
 }
 
+/// Everything this node needs to open an outbound channel, or find one it
+/// opened, again: what [`BatchSettlementPayer::prepare_open`] builds and the
+/// caller journals **before** [`BatchSettlementPayer::open_prepared`] sends
+/// anything (ADR 0075 decision 8). Nothing else can rebuild it: on EVM the
+/// contract stores a `ChannelConfig` only as a hash, and on Solana the
+/// channel's address is a PDA over a random `salt` and the slot the open
+/// was built at.
+///
+/// Neither signed by a counterparty nor irreversible, and journaled anyway,
+/// for the reason ADR 0074 gave for `BatchChannelAdmitted`: a crash between
+/// sending the opening transaction and recording it would otherwise leave
+/// this node's own deposit in a channel it no longer knows it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundChannelRecord {
+    /// EVM: the whole `ChannelConfig`, `salt` included, from which the
+    /// channel id derives, and the opening deposit. The deposit's collector
+    /// authorisation is derived from the config's `salt`, so the opening
+    /// deposit can be sent again after a crash without ever landing twice.
+    Evm {
+        channel: ChannelId,
+        config: EvmChannelConfig,
+        deposit: u128,
+    },
+    /// Solana: the `open` this node built and signed as payer, byte for
+    /// byte, with what it cannot be read back from. The transaction carries
+    /// the `salt` and the counterparty's seats; posting the same bytes again
+    /// can never make a second channel, because a signature lands once.
+    Solana {
+        channel: ChannelId,
+        /// The owner of the counterparty's receiving account: the one
+        /// distribution recipient the `open` commits to only by hash, which
+        /// `distribute` must name again.
+        receiver: [u8; 32],
+        /// Where the `open` is posted to be co-signed (ADR 0074 decision 9).
+        sponsor_endpoint: String,
+        deposit: u128,
+        /// The payer-signed `open`, as wire bytes.
+        transaction: Vec<u8>,
+        /// The last block height at which the transaction's blockhash is
+        /// valid. Past it, an `open` the chain does not hold never will.
+        last_valid_block_height: u64,
+    },
+}
+
+impl OutboundChannelRecord {
+    /// The channel this record opens.
+    pub fn channel(&self) -> &ChannelId {
+        match self {
+            OutboundChannelRecord::Evm { channel, .. }
+            | OutboundChannelRecord::Solana { channel, .. } => channel,
+        }
+    }
+
+    /// `"evm"` or `"solana"`, spelled as [`ChannelPresentation::chain`].
+    pub fn chain(&self) -> &'static str {
+        match self {
+            OutboundChannelRecord::Evm { .. } => "evm",
+            OutboundChannelRecord::Solana { .. } => "solana",
+        }
+    }
+
+    /// The opening deposit, in base units.
+    pub fn deposit(&self) -> u128 {
+        match self {
+            OutboundChannelRecord::Evm { deposit, .. }
+            | OutboundChannelRecord::Solana { deposit, .. } => *deposit,
+        }
+    }
+
+    /// Who the channel pays: EVM `receiver`, Solana the distribution
+    /// recipient. What a retried open is matched on (ADR 0075,
+    /// Consequences).
+    pub fn receiver(&self) -> Vec<u8> {
+        match self {
+            OutboundChannelRecord::Evm { config, .. } => config.receiver.to_vec(),
+            OutboundChannelRecord::Solana { receiver, .. } => receiver.to_vec(),
+        }
+    }
+
+    /// The channel as the receiver is shown it: on EVM with the config its
+    /// first voucher carries.
+    pub fn presentation(&self) -> ChannelPresentation {
+        match self {
+            OutboundChannelRecord::Evm {
+                channel, config, ..
+            } => ChannelPresentation::Evm {
+                channel: channel.clone(),
+                config: config.clone(),
+            },
+            OutboundChannelRecord::Solana { channel, .. } => ChannelPresentation::Solana {
+                channel: channel.clone(),
+            },
+        }
+    }
+
+    /// This record as bytes, for a journal to carry opaquely. Versioned, so
+    /// a record written by this build is never misread by a later one.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![RECORD_VERSION];
+        match self {
+            OutboundChannelRecord::Evm {
+                channel,
+                config,
+                deposit,
+            } => {
+                out.push(RECORD_EVM);
+                put_str(&mut out, &channel.0);
+                for address in [
+                    config.payer,
+                    config.payer_authorizer,
+                    config.receiver,
+                    config.receiver_authorizer,
+                    config.token,
+                ] {
+                    out.extend_from_slice(&address);
+                }
+                out.extend_from_slice(&config.withdraw_delay.to_be_bytes());
+                out.extend_from_slice(&config.salt);
+                out.extend_from_slice(&deposit.to_be_bytes());
+            }
+            OutboundChannelRecord::Solana {
+                channel,
+                receiver,
+                sponsor_endpoint,
+                deposit,
+                transaction,
+                last_valid_block_height,
+            } => {
+                out.push(RECORD_SOLANA);
+                put_str(&mut out, &channel.0);
+                out.extend_from_slice(receiver);
+                put_str(&mut out, sponsor_endpoint);
+                out.extend_from_slice(&deposit.to_be_bytes());
+                out.extend_from_slice(&last_valid_block_height.to_be_bytes());
+                out.extend_from_slice(&(transaction.len() as u32).to_be_bytes());
+                out.extend_from_slice(transaction);
+            }
+        }
+        out
+    }
+
+    /// Read back what [`encode`](Self::encode) wrote; `None` for anything
+    /// else, trailing bytes included.
+    pub fn decode(bytes: &[u8]) -> Option<OutboundChannelRecord> {
+        let mut reader = Reader(bytes);
+        if reader.take(1)?[0] != RECORD_VERSION {
+            return None;
+        }
+        let record = match reader.take(1)?[0] {
+            RECORD_EVM => {
+                let channel = ChannelId(reader.string()?);
+                let payer = reader.array()?;
+                let payer_authorizer = reader.array()?;
+                let receiver = reader.array()?;
+                let receiver_authorizer = reader.array()?;
+                let token = reader.array()?;
+                let withdraw_delay = u64::from_be_bytes(reader.array()?);
+                let salt = reader.array()?;
+                let deposit = u128::from_be_bytes(reader.array()?);
+                OutboundChannelRecord::Evm {
+                    channel,
+                    config: EvmChannelConfig {
+                        payer,
+                        payer_authorizer,
+                        receiver,
+                        receiver_authorizer,
+                        token,
+                        withdraw_delay,
+                        salt,
+                    },
+                    deposit,
+                }
+            }
+            RECORD_SOLANA => {
+                let channel = ChannelId(reader.string()?);
+                let receiver = reader.array()?;
+                let sponsor_endpoint = reader.string()?;
+                let deposit = u128::from_be_bytes(reader.array()?);
+                let last_valid_block_height = u64::from_be_bytes(reader.array()?);
+                let len = u32::from_be_bytes(reader.array()?) as usize;
+                let transaction = reader.take(len)?.to_vec();
+                OutboundChannelRecord::Solana {
+                    channel,
+                    receiver,
+                    sponsor_endpoint,
+                    deposit,
+                    transaction,
+                    last_valid_block_height,
+                }
+            }
+            _ => return None,
+        };
+        reader.0.is_empty().then_some(record)
+    }
+}
+
+const RECORD_VERSION: u8 = 1;
+const RECORD_EVM: u8 = 1;
+const RECORD_SOLANA: u8 = 2;
+
+fn put_str(out: &mut Vec<u8>, text: &str) {
+    out.extend_from_slice(&(text.len() as u32).to_be_bytes());
+    out.extend_from_slice(text.as_bytes());
+}
+
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        if self.0.len() < len {
+            return None;
+        }
+        let (head, tail) = self.0.split_at(len);
+        self.0 = tail;
+        Some(head)
+    }
+
+    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.take(N)?.try_into().ok()
+    }
+
+    fn string(&mut self) -> Option<String> {
+        let len = u32::from_be_bytes(self.array()?) as usize;
+        String::from_utf8(self.take(len)?.to_vec()).ok()
+    }
+}
+
 /// A channel this node pays on, as its paying half sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundChannelState {
@@ -440,6 +667,13 @@ pub enum BatchSettlementError {
         remaining_secs: u64,
     },
 
+    /// Solana: a prepared `open` the chain does not hold and never will,
+    /// because its blockhash has expired. Nothing was opened, and a fresh
+    /// open is safe. EVM has no such state: its opening deposit never
+    /// expires, so a prepared EVM open stays resumable.
+    #[error("the open of batch-settlement channel '{0}' lapsed: the chain never took it")]
+    OpenLapsed(ChannelId),
+
     #[error("batch-settlement backend error: {0}")]
     Backend(String),
 }
@@ -568,39 +802,94 @@ pub trait BatchSettlementBackend: Send + Sync {
 /// Solana `authorized_signer` is the payer. `[signer]` is identity only and
 /// never appears (ADR 0075 decision 3).
 ///
-/// **What is not here.** Journaling an outbound channel's config before its
-/// opening transaction is sent, and bringing an outbound channel back after
-/// a restart with its watermark from the receiver's `POST /ilp/claim-state`,
-/// belong to the operator surface and the peering (issues #1376, #1378):
-/// this half remembers what it opened, and what it signed, for the process
-/// lifetime.
+/// **Surviving a restart (ADR 0075 decision 8).** Opening is two steps, so
+/// that the caller can journal the channel between them:
+/// [`prepare_open`](Self::prepare_open) builds the channel and sends
+/// nothing, and [`open_prepared`](Self::open_prepared) sends it. A node that
+/// restarts brings each channel it opened back with
+/// [`restore_outbound`](Self::restore_outbound), from the record and the
+/// highest amount it journaled a voucher for. The journal itself is the
+/// caller's: this half remembers only for the process lifetime.
+/// Restoring the watermark from the receiver's `POST /ilp/claim-state`, for
+/// a node that lost its journal, is the peering's (issue #1378).
 #[async_trait]
 pub trait BatchSettlementPayer: Send + Sync {
-    /// Open a channel toward the counterparty that published `terms`, and
-    /// deposit `deposit` into it, paying from this node's settlement
-    /// account. The channel names this node's settlement key as payer and
-    /// voucher signer, the counterparty in every seat its receiving half
-    /// requires, the shared token, the counterparty's minimum delay and a
-    /// fresh salt, so the counterparty admits it.
+    /// Build a channel toward the counterparty that published `terms`, with
+    /// an opening deposit of `deposit`, and send nothing. The channel names
+    /// this node's settlement key as payer and voucher signer, the
+    /// counterparty in every seat its receiving half requires, the shared
+    /// token, the counterparty's minimum delay and a fresh salt, so the
+    /// counterparty admits it. On Solana the `open` is signed here, as
+    /// payer; on EVM nothing is signed yet.
     ///
-    /// On EVM a `deposit` this node sends and pays gas for; on Solana an
-    /// `open` this node signs and posts to the counterparty's sponsor
-    /// endpoint, which co-signs and submits it.
-    ///
-    /// Refuses, opening nothing, terms for another chain
+    /// Refuses, building nothing, terms for another chain
     /// ([`WrongChain`](BatchSettlementError::WrongChain)), terms in a token
     /// this node does not settle in
-    /// ([`TokenNotShared`](BatchSettlementError::TokenNotShared)), and an
-    /// open the counterparty declines
-    /// ([`OpenRefused`](BatchSettlementError::OpenRefused)).
+    /// ([`TokenNotShared`](BatchSettlementError::TokenNotShared)), and a
+    /// deposit the chain cannot take.
     ///
-    /// Never idempotent: two opens on the same terms are two channels, both
-    /// live, as several channels to one receiver may be.
+    /// Never idempotent: two records on the same terms are two channels.
+    async fn prepare_open(
+        &self,
+        terms: ReceiverTerms,
+        deposit: u128,
+    ) -> Result<OutboundChannelRecord, BatchSettlementError>;
+
+    /// Open the channel `record` names, paying the opening deposit from this
+    /// node's settlement account: on EVM a `deposit` this node sends and pays
+    /// gas for; on Solana the `open`, posted to the counterparty's sponsor
+    /// endpoint, which co-signs and submits it.
+    ///
+    /// **Safe to call again on the same record, by this process or one
+    /// restarted after a crash.** If the chain already holds the channel,
+    /// it is adopted as it stands and nothing is sent. Otherwise the open is
+    /// sent again in a form that can land at most once: on EVM the same
+    /// deposit authorisation, on Solana the same signed transaction. So a
+    /// record opens exactly one channel with exactly one opening deposit,
+    /// however many times this is called.
+    ///
+    /// Refuses an open the counterparty declines
+    /// ([`OpenRefused`](BatchSettlementError::OpenRefused)), and, on Solana,
+    /// one whose blockhash expired before the chain took it
+    /// ([`OpenLapsed`](BatchSettlementError::OpenLapsed)), after which the
+    /// record opens nothing, ever.
+    async fn open_prepared(
+        &self,
+        record: &OutboundChannelRecord,
+    ) -> Result<OpenedChannel, BatchSettlementError>;
+
+    /// [`prepare_open`](Self::prepare_open) then
+    /// [`open_prepared`](Self::open_prepared), with nothing journaled
+    /// between them: for a caller that keeps no journal.
     async fn open(
         &self,
         terms: ReceiverTerms,
         deposit: u128,
-    ) -> Result<OpenedChannel, BatchSettlementError>;
+    ) -> Result<OpenedChannel, BatchSettlementError> {
+        let record = self.prepare_open(terms, deposit).await?;
+        self.open_prepared(&record).await
+    }
+
+    /// Bring back a channel this node opened in an earlier process, from its
+    /// journaled `record`, so this half can read, top up, sign on and
+    /// withdraw from it again. `signed` is the highest amount this node
+    /// journaled a voucher for on it; the watermark restored is the larger
+    /// of that and what the chain shows landed, so it never goes backwards
+    /// and never below what the receiver already holds on chain.
+    ///
+    /// Refuses a record for another chain
+    /// ([`WrongChain`](BatchSettlementError::WrongChain)), one whose channel
+    /// the chain does not hold
+    /// ([`ChannelNotFound`](BatchSettlementError::ChannelNotFound): an open
+    /// never sent, or not yet landed), and one naming a channel this node is
+    /// not the payer of ([`NotOutbound`](BatchSettlementError::NotOutbound)).
+    /// Restoring a channel already known changes nothing but raises its
+    /// watermark to `signed` if that is higher.
+    async fn restore_outbound(
+        &self,
+        record: &OutboundChannelRecord,
+        signed: u128,
+    ) -> Result<OutboundChannelState, BatchSettlementError>;
 
     /// Add `increment` to the deposit of a channel this node opened: EVM
     /// another `deposit` into the same config, Solana `top_up`. An
@@ -673,4 +962,65 @@ pub trait BatchSettlementPayer: Send + Sync {
         &self,
         channel: &ChannelId,
     ) -> Result<OutboundChannelState, BatchSettlementError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evm_record() -> OutboundChannelRecord {
+        OutboundChannelRecord::Evm {
+            channel: ChannelId(format!("0x{}", "ab".repeat(32))),
+            config: EvmChannelConfig {
+                payer: [1; 20],
+                payer_authorizer: [1; 20],
+                receiver: [2; 20],
+                receiver_authorizer: [2; 20],
+                token: [3; 20],
+                withdraw_delay: 86_400,
+                salt: [4; 32],
+            },
+            deposit: u128::MAX - 7,
+        }
+    }
+
+    fn solana_record() -> OutboundChannelRecord {
+        OutboundChannelRecord::Solana {
+            channel: ChannelId("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string()),
+            receiver: [5; 32],
+            sponsor_endpoint: "https://peer.example/ilp/batch-settlement/solana/open".to_string(),
+            deposit: 1_000,
+            transaction: vec![6; 301],
+            last_valid_block_height: 123_456,
+        }
+    }
+
+    /// The journal carries a record as bytes, so every field must come back
+    /// exactly: a salt or a transaction off by one byte is a channel this
+    /// node can never find again.
+    #[test]
+    fn a_record_round_trips_through_its_bytes() {
+        for record in [evm_record(), solana_record()] {
+            assert_eq!(
+                OutboundChannelRecord::decode(&record.encode()),
+                Some(record)
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_whole_record_decode_to_nothing() {
+        let bytes = evm_record().encode();
+        assert_eq!(
+            OutboundChannelRecord::decode(&bytes[..bytes.len() - 1]),
+            None
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(OutboundChannelRecord::decode(&trailing), None);
+        let mut other_version = bytes;
+        other_version[0] = 2;
+        assert_eq!(OutboundChannelRecord::decode(&other_version), None);
+        assert_eq!(OutboundChannelRecord::decode(&[]), None);
+    }
 }

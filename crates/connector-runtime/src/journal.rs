@@ -152,6 +152,20 @@ fn encode_line(entry: &JournalEntry) -> String {
             "batch_channel_admitted\t{channel_id}\t{}",
             encode_hex(presentation)
         ),
+        JournalEntry::OutboundChannelOpening { channel_id, record } => format!(
+            "outbound_channel_opening\t{channel_id}\t{}",
+            encode_hex(record)
+        ),
+        JournalEntry::OutboundChannelOpened { channel_id } => {
+            format!("outbound_channel_opened\t{channel_id}")
+        }
+        JournalEntry::OutboundChannelAbandoned { channel_id } => {
+            format!("outbound_channel_abandoned\t{channel_id}")
+        }
+        JournalEntry::OutboundVoucherSigned {
+            channel_id,
+            cumulative_amount,
+        } => format!("outbound_voucher_signed\t{channel_id}\t{cumulative_amount}"),
     }
 }
 
@@ -198,6 +212,24 @@ fn decode_line(line: &str) -> Result<JournalEntry, JournalError> {
             Ok(JournalEntry::BatchChannelAdmitted {
                 channel_id: channel_id.to_string(),
                 presentation: decode_hex(presentation).ok_or_else(corrupt)?,
+            })
+        }
+        ["outbound_channel_opening", channel_id, record] => {
+            Ok(JournalEntry::OutboundChannelOpening {
+                channel_id: channel_id.to_string(),
+                record: decode_hex(record).ok_or_else(corrupt)?,
+            })
+        }
+        ["outbound_channel_opened", channel_id] => Ok(JournalEntry::OutboundChannelOpened {
+            channel_id: channel_id.to_string(),
+        }),
+        ["outbound_channel_abandoned", channel_id] => Ok(JournalEntry::OutboundChannelAbandoned {
+            channel_id: channel_id.to_string(),
+        }),
+        ["outbound_voucher_signed", channel_id, cumulative_amount] => {
+            Ok(JournalEntry::OutboundVoucherSigned {
+                channel_id: channel_id.to_string(),
+                cumulative_amount: cumulative_amount.parse::<u128>().map_err(|_| corrupt())?,
             })
         }
         _ => Err(corrupt()),
@@ -306,6 +338,22 @@ mod tests {
             JournalEntry::BatchChannelAdmitted {
                 channel_id: "solana:channel-d".to_string(),
                 presentation: Vec::new(),
+            },
+            JournalEntry::OutboundChannelOpening {
+                channel_id: "evm:0xef01".to_string(),
+                record: vec![0x01, 0x01, 0xff],
+            },
+            JournalEntry::OutboundChannelOpened {
+                channel_id: "evm:0xef01".to_string(),
+            },
+            JournalEntry::OutboundChannelAbandoned {
+                channel_id: "solana:channel-e".to_string(),
+            },
+            // A voucher amount is a u128, and must survive the text line
+            // whole.
+            JournalEntry::OutboundVoucherSigned {
+                channel_id: "evm:0xef01".to_string(),
+                cumulative_amount: u128::MAX,
             },
         ]
     }

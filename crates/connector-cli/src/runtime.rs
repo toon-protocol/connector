@@ -26,13 +26,15 @@ use connector_config::{
 use connector_domain::AssetChain;
 use connector_rate_source_evm::UniswapV3RateSource;
 use connector_runtime::{
-    BoundedHttpSelfDescription, ChannelDomain, ClaimStateChallengeSigner, Connector, DeclaredRates,
-    EvmDomain, FileJournal, HttpAppClient, InMemoryJournal, Journal, JournalError,
-    OutboundClientError, OutboundClientLedger, OwnedHttpClaimState, PeerRegistrar, PeerRoute,
-    PeerRouteStore, PeerRouteStoreError, PeerTransport, QuotePathUnusable, RatePoller, RateSources,
-    SharedRateTable, SystemClock,
+    BatchChannels, BoundedHttpSelfDescription, ChannelDomain, ClaimStateChallengeSigner, Connector,
+    DeclaredRates, EvmDomain, FileJournal, HttpAppClient, InMemoryJournal, Journal, JournalError,
+    OutboundChannels, OutboundClientError, OutboundClientLedger, OwnedHttpClaimState,
+    PeerRegistrar, PeerRoute, PeerRouteStore, PeerRouteStoreError, PeerTransport,
+    QuotePathUnusable, RatePoller, RateSources, SharedRateTable, SystemClock,
 };
-use connector_settlement::batch::{BatchSettlementBackend, BatchSettlementError, HeldVouchers};
+use connector_settlement::batch::{
+    BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer, HeldVouchers,
+};
 use connector_settlement::{SettlementBackend, SettlementError};
 use connector_settlement_evm::{
     ChannelIndexLookup, EvmBatchSettlementBackend, EvmBatchWatcher, EvmChannelIndex,
@@ -1138,6 +1140,11 @@ impl ClientChannelSource for SolanaChannelSource {
 /// the same path.
 const PEER_CLAIM_JOURNAL: &str = "peer-claims.log";
 const CLIENT_EDGE_JOURNAL: &str = "client-edge-claims.log";
+/// The third book (ADR 0075 decision 8): the x402 channels this node pays
+/// on -- each one's record, journaled before its opening transaction is
+/// sent, and every voucher signed on it. A file of its own for the same
+/// reason as the two above: its own owner, [`OutboundChannels`], replays it.
+const OUTBOUND_CHANNEL_JOURNAL: &str = "outbound-channels.log";
 /// Issue #884's runtime peer/route table -- a whole-table JSON snapshot,
 /// not an append-only journal line format like the two above (see
 /// `connector_runtime::PeerRouteStore`'s own docs for why).
@@ -1673,6 +1680,14 @@ pub struct Runtime {
     /// when `[settlement.solana.batch_settlement]` is written -- and what
     /// the public sponsor endpoint (issue #1346) co-signs an `open` with.
     pub batch_settlement_solana: Option<Arc<SolanaBatchSettlement>>,
+    /// The x402 channels this node pays on (ADR 0075 decisions 8 and 11),
+    /// over the paying half of the backends above and journaled to
+    /// [`OUTBOUND_CHANNEL_JOURNAL`]: `Some` exactly when either backend is.
+    /// Every channel that journal names is restored by the time [`build`]
+    /// returns, with the highest voucher journaled on it, so the operator
+    /// surface can fund, withdraw from and sign on it from the first
+    /// request.
+    pub outbound_channels: Option<Arc<OutboundChannels>>,
 }
 
 /// Construct the live [`Connector`] and [`Signer`] a validated [`Config`]
@@ -2161,6 +2176,8 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
             .await;
         }
     }
+    let outbound_channels =
+        restore_outbound_channels(config, &batch_settlement_evm, &batch_settlement_solana).await?;
     let connector = Arc::new(connector);
     Ok(Runtime {
         connector,
@@ -2173,7 +2190,95 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         rate_table,
         batch_settlement_evm,
         batch_settlement_solana,
+        outbound_channels,
     })
+}
+
+/// The x402 channels this node pays on, restored from
+/// [`OUTBOUND_CHANNEL_JOURNAL`] to the paying half of each batch-settlement
+/// backend (ADR 0075 decision 8), or `None` when this node has none. A
+/// journal that will not replay stops the node, as the claim books' do: a
+/// channel it cannot read back is one holding this node's deposit that it
+/// would otherwise forget. A node with no `state_dir` keeps the record in
+/// memory, which survives nothing -- the same posture its claim books take.
+async fn restore_outbound_channels(
+    config: &Config,
+    evm: &Option<Arc<EvmBatchSettlementBackend>>,
+    solana: &Option<Arc<SolanaBatchSettlement>>,
+) -> Result<Option<Arc<OutboundChannels>>, RuntimeError> {
+    let mut payers: Vec<(SettlementChain, Arc<dyn BatchSettlementPayer>)> = Vec::new();
+    if let Some(evm) = evm {
+        payers.push((
+            SettlementChain::Evm,
+            Arc::clone(evm) as Arc<dyn BatchSettlementPayer>,
+        ));
+    }
+    if let Some(solana) = solana {
+        payers.push((
+            SettlementChain::Solana,
+            Arc::clone(solana) as Arc<dyn BatchSettlementPayer>,
+        ));
+    }
+    if payers.is_empty() {
+        return Ok(None);
+    }
+    let (journal, path): (Arc<dyn Journal>, PathBuf) = match config.state_dir() {
+        Some(state_dir) => (
+            open_journal(state_dir, OUTBOUND_CHANNEL_JOURNAL)?,
+            state_dir.join(OUTBOUND_CHANNEL_JOURNAL),
+        ),
+        None => (
+            Arc::new(connector_runtime::InMemoryJournal::new()),
+            PathBuf::from(OUTBOUND_CHANNEL_JOURNAL),
+        ),
+    };
+    let outbound = OutboundChannels::restore(journal, payers)
+        .await
+        .map_err(|source| RuntimeError::JournalUnreplayable { path, source })?;
+    Ok(Some(Arc::new(outbound)))
+}
+
+/// Every x402 channel of this node's, both ways, as the operator surface
+/// drives them (ADR 0075 decision 11): the outbound ones [`build`]
+/// restored, the receiving half of each backend, the claim gate's held
+/// vouchers, and this node's own network on each chain, which a
+/// counterparty's terms must match.
+fn batch_channels_for_operator(
+    runtime: &Runtime,
+    claim_gate: &Arc<ClientClaimGate>,
+) -> Option<Arc<BatchChannels>> {
+    let outbound = Arc::clone(runtime.outbound_channels.as_ref()?);
+    let mut receivers: Vec<(SettlementChain, Arc<dyn BatchSettlementBackend>)> = Vec::new();
+    if let Some(evm) = &runtime.batch_settlement_evm {
+        receivers.push((
+            SettlementChain::Evm,
+            Arc::clone(evm) as Arc<dyn BatchSettlementBackend>,
+        ));
+    }
+    if let Some(solana) = &runtime.batch_settlement_solana {
+        receivers.push((
+            SettlementChain::Solana,
+            Arc::clone(solana) as Arc<dyn BatchSettlementBackend>,
+        ));
+    }
+    let networks = runtime
+        .batch_settlements
+        .iter()
+        .map(|terms| match terms {
+            connector_client_edge::X402BatchSettlementTerms::Evm(evm) => {
+                (SettlementChain::Evm, evm.network.clone())
+            }
+            connector_client_edge::X402BatchSettlementTerms::Solana(solana) => {
+                (SettlementChain::Solana, solana.network.clone())
+            }
+        })
+        .collect();
+    Some(Arc::new(BatchChannels::new(
+        outbound,
+        receivers,
+        Arc::new(ClaimGateVouchers(Arc::clone(claim_gate))),
+        networks,
+    )))
 }
 
 /// The claim gate's view of this node's batch-settlement backends (ADR
@@ -2874,14 +2979,18 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
         runtime.batch_settlement_solana.clone(),
     ));
     Ok(match config.operator() {
-        Some(operator) => app.merge(connector_operator::router(
-            connector,
-            claim_gate,
-            signer,
-            operator.bearer_token().to_string(),
-            operator.write_keys().to_vec(),
-            declared_rates(runtime, config),
-        )),
+        Some(operator) => {
+            let batch_channels = batch_channels_for_operator(runtime, &claim_gate);
+            app.merge(connector_operator::router_with_batch_channels(
+                connector,
+                claim_gate,
+                signer,
+                operator.bearer_token().to_string(),
+                operator.write_keys().to_vec(),
+                declared_rates(runtime, config),
+                batch_channels,
+            ))
+        }
         None => app,
     })
 }
@@ -6557,18 +6666,18 @@ key_file = "{solana_key_path}"
             assert!(channels.iter().any(|view| view.id == evm_channel.id));
             assert!(channels.iter().any(|view| view.id == solana_channel.id));
 
-            // Per-channel-id ops route by the id's own namespace: closing
+            // Per-channel-id ops route by the id's own namespace: reading
             // each channel lands on the chain that opened it (on the
-            // last-one-wins slot, closing the EVM id asked Solana, which
+            // last-one-wins slot, reading the EVM id asked Solana, which
             // knows no such channel).
             connector
-                .close_channel(&evm_channel.id)
+                .channel_view(&evm_channel.id)
                 .await
-                .expect("closing the EVM channel routes to the EVM backend");
+                .expect("reading the EVM channel routes to the EVM backend");
             connector
-                .close_channel(&solana_channel.id)
+                .channel_view(&solana_channel.id)
                 .await
-                .expect("closing the Solana channel routes to the Solana backend");
+                .expect("reading the Solana channel routes to the Solana backend");
 
             // And an open that names no chain is ambiguous here, not
             // silently resolved to either backend.

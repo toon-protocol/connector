@@ -895,6 +895,12 @@ impl ClaimBook {
                 // Written only to the client edge's own journal (ADR 0074)
                 // -- same reasoning again.
                 JournalEntry::BatchChannelAdmitted { .. } => {}
+                // Written only to the outbound channels' own journal (ADR
+                // 0075 decision 8) -- same reasoning again.
+                JournalEntry::OutboundChannelOpening { .. }
+                | JournalEntry::OutboundChannelOpened { .. }
+                | JournalEntry::OutboundChannelAbandoned { .. }
+                | JournalEntry::OutboundVoucherSigned { .. } => {}
             }
         }
         for ledger in outbound.values_mut() {
@@ -1385,6 +1391,7 @@ impl ClaimBook {
                 cumulative_amount: ledger.cumulative_amount,
                 pending: ledger.pending.is_some(),
                 book: crate::operator_view::ClaimBookKind::Peer,
+                scheme: crate::operator_view::ClaimScheme::ToonChannel,
             })
             .collect();
         views.extend(
@@ -1400,6 +1407,7 @@ impl ClaimBook {
                     cumulative_amount: watermark.cumulative_amount,
                     pending: false,
                     book: crate::operator_view::ClaimBookKind::Peer,
+                    scheme: crate::operator_view::ClaimScheme::ToonChannel,
                 }),
         );
         views

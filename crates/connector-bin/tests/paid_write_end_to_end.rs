@@ -33,8 +33,6 @@ use libsecp256k1::{Message, PublicKey, SecretKey};
 use rand::rngs::OsRng;
 
 use connector_domain::{EnvelopeResponse, Fulfill, Prepare, Reject};
-use connector_operator::test_support::sign_request;
-use connector_runtime::ChannelView;
 use connector_settlement::SettlementBackend;
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
 use connector_settlement_evm::EvmSettlementBackend;
@@ -49,7 +47,7 @@ use support::{
 
 /// `anvil`'s own default chain id (`Anvil::spawn`'s `--chain-id 31337`), and
 /// so the EIP-712 domain a claim against its deployed `TokenNetwork` must be
-/// signed under -- matching `connector-cli/tests/settlement_lifecycle.rs`'s
+/// signed under -- matching the (since deleted, #1376) `settlement_lifecycle.rs`'s
 /// own constant of the same name and value.
 const ANVIL_CHAIN_ID: u64 = 31_337;
 
@@ -491,47 +489,32 @@ token_network_address = "{token_network}"
     );
     assert_eq!(recorded_header(&after_paid[0], "x-toon-chain"), Some("evm"));
 
-    // AC2/AC3: redeem that exact claim against the real chain, through the
-    // connector's own operator surface -- not inferred from the fulfil, and
-    // not a second, hand-built settlement backend reaching around the
-    // connector under test. A signature `TokenNetwork.claimFromChannel`
+    // AC2/AC3: redeem that exact claim against the real chain -- not
+    // inferred from the fulfil. A signature `TokenNetwork.claimFromChannel`
     // would refuse to recover (e.g. against the wrong deposit) fails this
     // redeem for real; joining it to the same test as the fulfilled write
     // is what proves the accept decision and the on-chain value are the
     // same claim, not two coincidentally-matching half-proofs.
-    let redeem_body = serde_json::to_vec(&serde_json::json!({
-        "nonce": 1,
-        "cumulative_amount": ROUTE_PRICE,
-        "signature_hex": format!("0x{}", hex_encode(&claim_signature)),
-    }))
-    .expect("encode redeem body");
-    let redeem_path = format!("/channels/{}/redeem", paid_channel.0);
-    let (sig_input, sig, digest) = sign_request(
-        &write_keypair,
-        "POST",
-        &redeem_path,
-        &redeem_body,
-        1_000,
-        Some(9_999_999_999),
-    );
-    let response = client
-        .post(format!(
-            "http://{}{redeem_path}",
-            connector.client_edge_addr
-        ))
-        .header("signature-input", sig_input)
-        .header("signature", sig)
-        .header("content-digest", digest)
-        .body(redeem_body)
-        .send()
+    //
+    // Through a settlement backend over the node's own settlement key, not
+    // the operator surface: ADR 0075 decision 11 deleted the operator's
+    // `toon-channel` redeem write (#1376), and the automatic landing of TOON
+    // claims is what a node keeps until #1381 retires the scheme.
+    let redeemed = backend
+        .redeem(
+            &paid_channel,
+            connector_settlement::Claim {
+                nonce: 1,
+                cumulative_amount: ROUTE_PRICE,
+                signature: claim_signature.clone(),
+            },
+        )
         .await
-        .expect("POST /channels/:id/redeem");
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let redeemed: ChannelView = response.json().await.expect("decode ChannelView");
+        .expect("the claim the connector accepted redeems on chain");
     assert_eq!(
         redeemed.redeemed, ROUTE_PRICE,
-        "the claim's cumulative amount, read back from the chain through the operator \
-         surface, advanced by exactly the route's price -- not inferred from the fulfil"
+        "the claim's cumulative amount, read back from the chain, advanced by exactly the \
+         route's price -- not inferred from the fulfil"
     );
 
     // AC4: an underpaid packet -- a fresh claim on a channel genuinely

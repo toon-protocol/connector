@@ -208,6 +208,21 @@ pub struct ClaimView {
     /// crate has no dependency on and so cannot tag itself. An additive
     /// field: every row this crate itself produces is `Peer`.
     pub book: ClaimBookKind,
+    /// Which claim scheme the row's claims are: a `toon-channel` claim or
+    /// an x402 voucher (ADR 0075). The peer book holds only the former; the
+    /// client book holds both until #1381 retires the first; the outbound
+    /// channels' book holds only vouchers.
+    pub scheme: ClaimScheme,
+}
+
+/// Which claim scheme a [`ClaimView`] row reports on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClaimScheme {
+    #[serde(rename = "toon-channel")]
+    ToonChannel,
+    /// An x402 `batch-settlement` voucher (ADR 0074, ADR 0075).
+    #[serde(rename = "batch-settlement")]
+    BatchSettlement,
 }
 
 /// Which side of a peering relation a [`ClaimView`] reports on.
@@ -230,6 +245,9 @@ pub enum ClaimDirection {
 pub enum ClaimBookKind {
     Peer,
     Client,
+    /// The vouchers this node signed on its own outbound x402 channels,
+    /// journaled to `outbound-channels.log` (ADR 0075 decision 8).
+    Outbound,
 }
 
 /// What one declared pair is doing as of one instant (issue #1297, ADR

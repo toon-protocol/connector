@@ -46,15 +46,26 @@
 //! after a deposit is confirmed, so a voucher is never signed against
 //! backing that is on its way out.
 //!
-//! Journaling an outbound config before its opening deposit is sent, and
-//! bringing a channel back after a restart with its watermark from the
-//! receiver's `POST /ilp/claim-state`, are the operator surface's and the
-//! peering's (issues #1376, #1378).
+//! # Across a crash (ADR 0075 decision 8)
+//!
+//! [`prepare_open`](BatchSettlementPayer::prepare_open) builds the config
+//! and sends nothing; the caller journals it; then
+//! [`open_prepared`](BatchSettlementPayer::open_prepared) sends the opening
+//! deposit. The opening deposit's collector nonce is derived from the
+//! config's salt rather than drawn fresh, so sending the same record again
+//! after a crash re-uses one authorisation the token (or Permit2) spends
+//! once: however many times a record is sent, one deposit lands, and a
+//! channel already on chain is adopted without sending at all.
+//! [`restore_outbound`](BatchSettlementPayer::restore_outbound) brings a
+//! journaled channel back with its journaled watermark, never below the
+//! chain's `totalClaimed`. Restoring the watermark from the receiver's
+//! `POST /ilp/claim-state`, for a node that lost its journal, is the
+//! peering's (issue #1378).
 
 use async_trait::async_trait;
 use connector_settlement::batch::{
-    BatchSettlementError, BatchSettlementPayer, ChannelPresentation, EvmChannelConfig,
-    OpenedChannel, OutboundChannelState, ReceiverTerms, Voucher, VoucherSigner,
+    BatchSettlementError, BatchSettlementPayer, EvmChannelConfig, OpenedChannel,
+    OutboundChannelRecord, OutboundChannelState, ReceiverTerms, Voucher, VoucherSigner,
 };
 use connector_settlement::ChannelId;
 use connector_signer::evm_voucher_digest;
@@ -157,6 +168,34 @@ impl DepositFailure {
     }
 }
 
+/// Which deposit into a channel this is, which decides its collector nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepositKind {
+    /// The one opening deposit. Its nonce is derived from the config, so an
+    /// open sent again after a crash carries the same authorisation and
+    /// whichever sending lands second reverts: a record opens its channel
+    /// with one deposit, however many times it is sent.
+    Opening,
+    /// A top-up: a fresh nonce, since each is a deposit of its own.
+    TopUp,
+}
+
+/// The collector nonce of `config`'s opening deposit: the ERC-3009 salt, or
+/// the Permit2 nonce. `keccak256` of a domain tag and the config's own
+/// `salt`, which is fresh per channel, so no two channels share one and one
+/// channel never has two.
+fn opening_deposit_nonce(config: &EvmChannelConfig) -> U256 {
+    let mut preimage = b"toon-x402-opening-deposit".to_vec();
+    preimage.extend_from_slice(&config.salt);
+    U256::from_big_endian(&keccak256(preimage))
+}
+
+/// Whether a reading shows a channel on chain: one is created by its first
+/// deposit, and holds a balance until everything unclaimed is withdrawn.
+fn exists(snapshot: &Snapshot) -> bool {
+    snapshot.balance > 0 || snapshot.total_claimed > 0
+}
+
 /// A deposit of nothing, which `x402BatchSettlement` reverts on: refused
 /// here, before anything is signed or sent.
 fn zero_deposit() -> BatchSettlementError {
@@ -234,6 +273,39 @@ impl EvmBatchSettlementBackend {
         })
     }
 
+    /// The channel an EVM `record` names, its config and its raw id, once
+    /// the record is shown to be for this chain, to name itself
+    /// consistently, and to be this node's: a config whose `payer` or
+    /// `payerAuthorizer` is another key is not a channel this node can pay
+    /// on, whoever journaled it.
+    fn own_record(
+        &self,
+        record: &OutboundChannelRecord,
+    ) -> Result<(ChannelId, EvmChannelConfig, [u8; 32]), BatchSettlementError> {
+        let OutboundChannelRecord::Evm {
+            channel, config, ..
+        } = record
+        else {
+            return Err(BatchSettlementError::WrongChain {
+                presented: record.chain(),
+                backend: "evm",
+            });
+        };
+        let id = connector_signer::evm_batch_channel_id(&self.domain(), &signer_config(config));
+        let canonical = format_channel_id(id);
+        if *channel != canonical {
+            return Err(BatchSettlementError::ChannelIdMismatch {
+                presented: channel.clone(),
+                derived: canonical,
+            });
+        }
+        let own = self.own_address.to_fixed_bytes();
+        if config.payer != own || config.payer_authorizer != own {
+            return Err(BatchSettlementError::NotOutbound(canonical));
+        }
+        Ok((canonical, config.clone(), id))
+    }
+
     fn require_outbound(&self, channel: &ChannelId) -> Result<Outbound, BatchSettlementError> {
         self.outbound_record()
             .get(channel)
@@ -303,7 +375,12 @@ impl EvmBatchSettlementBackend {
     /// [`Sender`](crate::send::Sender) sends nothing on a refusal, and once
     /// it has handed over a hash the deposit may land however the wait for
     /// it ends.
-    async fn deposit(&self, config: &EvmChannelConfig, amount: u128) -> Result<(), DepositFailure> {
+    async fn deposit(
+        &self,
+        config: &EvmChannelConfig,
+        amount: u128,
+        kind: DepositKind,
+    ) -> Result<(), DepositFailure> {
         if amount == 0 {
             return Err(DepositFailure::NotSent(zero_deposit()));
         }
@@ -313,9 +390,13 @@ impl EvmBatchSettlementBackend {
             .deposit_route()
             .await
             .map_err(DepositFailure::NotSent)?;
+        let nonce = match kind {
+            DepositKind::Opening => opening_deposit_nonce(config),
+            DepositKind::TopUp => U256::from_big_endian(&random::<[u8; 32]>()),
+        };
         let (collector, collector_data) = match route {
-            DepositRoute::Erc3009 => self.erc3009_authorization(channel_id, amount).await,
-            DepositRoute::Permit2 => self.permit2_transfer(channel_id, amount).await,
+            DepositRoute::Erc3009 => self.erc3009_authorization(channel_id, amount, nonce).await,
+            DepositRoute::Permit2 => self.permit2_transfer(channel_id, amount, nonce).await,
         }
         .map_err(DepositFailure::NotSent)?;
         let hash = self
@@ -335,11 +416,14 @@ impl EvmBatchSettlementBackend {
 
     /// `ERC3009DepositCollector`'s `collectorData`: a
     /// `receiveWithAuthorization` from this node to the collector, whose
-    /// nonce is `keccak256(channelId, salt)` under a fresh salt.
+    /// nonce is `keccak256(channelId, salt)` under the collector `salt`
+    /// given. The token spends an authorisation once, so one salt can never
+    /// deposit twice.
     async fn erc3009_authorization(
         &self,
         channel_id: [u8; 32],
         amount: u128,
+        salt: U256,
     ) -> Result<(Address, Bytes), BatchSettlementError> {
         let collector = Address::from(ERC3009_DEPOSIT_COLLECTOR_ADDRESS);
         let token = DepositToken::new(self.token, std::sync::Arc::clone(&self.client));
@@ -347,7 +431,6 @@ impl EvmBatchSettlementBackend {
             connector_chain_rpc::retry_read(|| async { token.domain_separator().call().await })
                 .await
                 .map_err(backend_error)?;
-        let salt = U256::from_big_endian(&random::<[u8; 32]>());
         let nonce = keccak256(encode(&[
             Token::FixedBytes(channel_id.to_vec()),
             Token::Uint(salt),
@@ -376,12 +459,14 @@ impl EvmBatchSettlementBackend {
 
     /// `Permit2DepositCollector`'s `collectorData`: a Permit2
     /// `permitWitnessTransferFrom` to the collector, its witness the
-    /// channel, under a fresh unordered nonce. Approves Permit2 for the
-    /// token first, once, if it is not already approved for `amount`.
+    /// channel, under the unordered `nonce` given, which Permit2 spends once.
+    /// Approves Permit2 for the token first, once, if it is not already
+    /// approved for `amount`.
     async fn permit2_transfer(
         &self,
         channel_id: [u8; 32],
         amount: u128,
+        nonce: U256,
     ) -> Result<(Address, Bytes), BatchSettlementError> {
         let collector = Address::from(PERMIT2_DEPOSIT_COLLECTOR_ADDRESS);
         let permit2 = Address::from(PERMIT2_ADDRESS);
@@ -401,7 +486,6 @@ impl EvmBatchSettlementBackend {
         .await
         .map_err(backend_error)?;
 
-        let nonce = U256::from_big_endian(&random::<[u8; 32]>());
         let deadline = U256::MAX;
         let permitted = keccak256(encode(&[
             Token::FixedBytes(keccak256(TOKEN_PERMISSIONS_TYPE).to_vec()),
@@ -463,14 +547,36 @@ impl EvmBatchSettlementBackend {
 
 #[async_trait]
 impl BatchSettlementPayer for EvmBatchSettlementBackend {
-    async fn open(
+    /// The config [`outbound_config`](EvmBatchSettlementBackend::outbound_config)
+    /// builds, and the opening deposit. Nothing is signed or sent.
+    async fn prepare_open(
         &self,
         terms: ReceiverTerms,
         deposit: u128,
-    ) -> Result<OpenedChannel, BatchSettlementError> {
+    ) -> Result<OutboundChannelRecord, BatchSettlementError> {
         let config = self.outbound_config(terms)?;
+        if deposit == 0 {
+            return Err(zero_deposit());
+        }
         let id = connector_signer::evm_batch_channel_id(&self.domain(), &signer_config(&config));
-        let channel = format_channel_id(id);
+        Ok(OutboundChannelRecord::Evm {
+            channel: format_channel_id(id),
+            config,
+            deposit,
+        })
+    }
+
+    /// Adopts the channel if the chain already shows it; otherwise sends the
+    /// opening deposit under the authorisation the config derives
+    /// ([`DepositKind::Opening`]), which the token or Permit2 spends once.
+    /// So an open sent twice -- once before a crash, once after -- lands one
+    /// deposit, and the second sending reverts.
+    async fn open_prepared(
+        &self,
+        record: &OutboundChannelRecord,
+    ) -> Result<OpenedChannel, BatchSettlementError> {
+        let (channel, config, id) = self.own_record(record)?;
+        let deposit = record.deposit();
         if deposit == 0 {
             return Err(zero_deposit());
         }
@@ -478,44 +584,86 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
         // Recorded before the deposit is sent, backing nothing yet, so a
         // deposit whose confirmation is lost still leaves a channel this
         // node can read, top up and withdraw from.
-        self.outbound_record().insert(
-            channel.clone(),
-            Outbound {
+        self.outbound_record()
+            .entry(channel.clone())
+            .or_insert_with(|| Outbound {
                 config: config.clone(),
                 signed: 0,
                 backed: 0,
-            },
-        );
-        match self.deposit(&config, deposit).await {
-            // Never sent, so it cannot land: the channel is not this node's.
-            Err(DepositFailure::NotSent(error)) => {
-                self.outbound_record().remove(&channel);
-                return Err(error);
-            }
-            // Sent: kept either way. If the chain already shows a balance it
-            // landed, whatever the wait said -- the salt is fresh, so nothing
-            // but this deposit can have put one there. If not, it may still
-            // land later, and forgetting the config would strand it.
-            Err(DepositFailure::Sent(error)) => match self.snapshot(id).await {
-                Ok(snapshot) if snapshot.balance > 0 => {
-                    self.record_backing(&channel, backing(&snapshot));
-                }
-                _ => {
-                    return Err(BatchSettlementError::Backend(format!(
-                        "the opening deposit into '{channel}' was sent and not confirmed; \
-                         this node keeps the channel as its own, so it can be read again \
-                         once the deposit lands or is known not to: {error}"
-                    )));
-                }
-            },
-            Ok(()) => {
-                let snapshot = self.snapshot(id).await?;
-                self.record_backing(&channel, backing(&snapshot));
-            }
-        }
-        Ok(OpenedChannel {
-            presentation: ChannelPresentation::Evm { channel, config },
+            });
+        let opened = OpenedChannel {
+            presentation: record.presentation(),
             voucher_signer: VoucherSigner::Evm(self.own_address.to_fixed_bytes()),
+        };
+        // Already on chain -- a sending before a crash that landed -- and
+        // so adopted as it stands. Nothing but this record's deposit can
+        // have put a balance there: the salt is fresh.
+        let before = self.snapshot(id).await?;
+        if exists(&before) {
+            self.record_backing(&channel, backing(&before));
+            return Ok(opened);
+        }
+        let sent = self.deposit(&config, deposit, DepositKind::Opening).await;
+        // However the sending ended, the chain says whether the channel is
+        // there now. A refusal before sending can still be followed by a
+        // balance: an earlier sending of the same authorisation landed
+        // meanwhile, which is exactly why the second one was refused.
+        let after = self.snapshot(id).await;
+        match (sent, after) {
+            (_, Ok(after)) if exists(&after) => {
+                self.record_backing(&channel, backing(&after));
+                Ok(opened)
+            }
+            (Ok(()), Ok(_)) => Err(BatchSettlementError::Backend(format!(
+                "the opening deposit into '{channel}' confirmed, and the chain shows no balance \
+                 there"
+            ))),
+            // Never sent by this call, and nothing on chain: this process
+            // holds no channel. A journal still holding the record resumes
+            // it, and if an earlier sending lands meanwhile, the resumption
+            // adopts it.
+            (Err(DepositFailure::NotSent(error)), _) => {
+                self.outbound_record().remove(&channel);
+                Err(error)
+            }
+            // Sent: kept either way, since it may still land, and forgetting
+            // the config would strand it.
+            (Err(DepositFailure::Sent(error)), _) => Err(BatchSettlementError::Backend(format!(
+                "the opening deposit into '{channel}' was sent and not confirmed; this node keeps \
+                 the channel as its own, and opening the same record again adopts it once the \
+                 deposit lands, or sends it again if it never does: {error}"
+            ))),
+            (Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    async fn restore_outbound(
+        &self,
+        record: &OutboundChannelRecord,
+        signed: u128,
+    ) -> Result<OutboundChannelState, BatchSettlementError> {
+        let (channel, config, id) = self.own_record(record)?;
+        let _paying = self.paying.lock().await;
+        let snapshot = self.snapshot(id).await?;
+        if !exists(&snapshot) {
+            return Err(BatchSettlementError::ChannelNotFound(channel));
+        }
+        let watermark = {
+            let mut record = self.outbound_record();
+            let outbound = record.entry(channel.clone()).or_insert_with(|| Outbound {
+                config: config.clone(),
+                signed: 0,
+                backed: 0,
+            });
+            // Never backwards, and never below what the receiver has
+            // already landed, which this node must have signed.
+            outbound.signed = outbound.signed.max(signed).max(snapshot.total_claimed);
+            outbound.backed = backing(&snapshot);
+            outbound.signed
+        };
+        Ok(OutboundChannelState {
+            on_chain: self.state(&channel, &config, &snapshot),
+            signed: watermark,
         })
     }
 
@@ -526,7 +674,7 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
     ) -> Result<OutboundChannelState, BatchSettlementError> {
         let config = self.require_outbound(channel)?.config;
         let _paying = self.paying.lock().await;
-        self.deposit(&config, increment)
+        self.deposit(&config, increment, DepositKind::TopUp)
             .await
             .map_err(DepositFailure::into_error)?;
         self.read_outbound(channel, &config).await
@@ -659,6 +807,35 @@ mod tests {
         assert_eq!(
             spelled(PERMIT2_ADDRESS),
             "0x000000000022d473030f116ddee9f6b43ac78ba3"
+        );
+    }
+
+    /// The opening deposit's authorisation is a function of the channel
+    /// alone, so the same record sent before and after a crash carries the
+    /// same one -- which the token spends once -- while two channels never
+    /// share one.
+    #[test]
+    fn the_opening_deposit_nonce_is_the_channels_own_and_no_other_channels() {
+        let config = EvmChannelConfig {
+            payer: [1; 20],
+            payer_authorizer: [1; 20],
+            receiver: [2; 20],
+            receiver_authorizer: [2; 20],
+            token: [3; 20],
+            withdraw_delay: 86_400,
+            salt: [4; 32],
+        };
+        assert_eq!(
+            opening_deposit_nonce(&config),
+            opening_deposit_nonce(&config.clone())
+        );
+        let other = EvmChannelConfig {
+            salt: [5; 32],
+            ..config.clone()
+        };
+        assert_ne!(
+            opening_deposit_nonce(&config),
+            opening_deposit_nonce(&other)
         );
     }
 
