@@ -131,7 +131,7 @@ impl PeerChannelConfig {
 
 fn resolve_peer_channel(
     raw: RawPeerChannel,
-    tables: SettlementTables<'_>,
+    tables: SettlementTables,
 ) -> Result<PeerChannelConfig, ConfigError> {
     // First, because "you wrote a key that no longer exists" explains the
     // file better than any other complaint when both are true, and because
@@ -183,7 +183,7 @@ fn resolve_peer_channel(
 
 pub(crate) fn resolve_peer_channels(
     raw: Vec<RawPeerChannel>,
-    tables: SettlementTables<'_>,
+    tables: SettlementTables,
 ) -> Result<Vec<PeerChannelConfig>, ConfigError> {
     let mut seen_signers = HashSet::with_capacity(raw.len());
     let mut seen_channels = HashSet::with_capacity(raw.len());
@@ -230,7 +230,7 @@ mod tests {
     fn resolve(rows: &[&str]) -> Result<Vec<PeerChannelConfig>, ConfigError> {
         resolve_peer_channels(
             rows.iter().map(|text| parse(text)).collect(),
-            SettlementTables::for_x402_tests(true, true),
+            SettlementTables::for_tests(true, true),
         )
     }
 
@@ -365,14 +365,14 @@ mod tests {
     #[test]
     fn a_row_on_a_chain_without_x402_is_refused_per_chain() {
         let rows = || vec![parse(&row(EVM_SIGNER))];
-        let error = resolve_peer_channels(rows(), SettlementTables::for_x402_tests(false, true))
+        let error = resolve_peer_channels(rows(), SettlementTables::for_tests(false, true))
             .unwrap_err();
         assert!(matches!(
             error,
             ConfigError::PeerChannelWithoutX402 { chain: "evm", .. }
         ));
         assert!(
-            resolve_peer_channels(rows(), SettlementTables::for_x402_tests(true, false)).is_ok(),
+            resolve_peer_channels(rows(), SettlementTables::for_tests(true, false)).is_ok(),
             "the rule is per chain"
         );
     }

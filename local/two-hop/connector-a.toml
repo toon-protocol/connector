@@ -90,20 +90,17 @@ write_keys_file = "/app/data/operator-write-keys"
 # whole local chain environment rather than a per-topology subset; nothing here
 # dials it.
 #
-# The token, the EIP-712 domain and the boot-only `contract_address` are
+# The token and the EIP-712 domain are
 # `local/solo/connector.toml`'s, for the reasons written there. The
 # `[settlement.evm]` key is also what signs this node's vouchers (ADR 0075
 # decision 3: `payerAuthorizer == payer`), so its address is the voucher
 # signer A's self-description publishes and B binds.
 [settlement.evm]
 rpc_url = "http://anvil:8545"
-contract_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
 token_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
-
-[settlement.evm.batch_settlement]
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"

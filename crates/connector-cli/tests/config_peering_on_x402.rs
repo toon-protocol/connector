@@ -347,16 +347,14 @@ price = {APP_PRICE}
 {peering}
 [settlement.evm]
 rpc_url = "{rpc_url}"
-contract_address = "{registry:?}"
 token_address = "{token:?}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{settlement_key}"
 
-[settlement.evm.batch_settlement]
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
 "#,
             name = self.name,
             addr = self.addr,

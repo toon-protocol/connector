@@ -91,16 +91,14 @@ key_file = "{signer_key}"
 
 [settlement.evm]
 rpc_url = "{rpc_url}"
-contract_address = "{registry:?}"
 token_address = "{token:?}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{settlement_key}"
 
-[settlement.evm.batch_settlement]
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
 "#,
         state_dir = state_dir.path().display(),
         signer_key = signer_key.path().display(),

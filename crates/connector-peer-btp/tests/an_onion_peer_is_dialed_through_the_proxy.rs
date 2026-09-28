@@ -465,16 +465,13 @@ key_file = "{key_file}"
 # the channel's on-chain participant.
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
-
-[settlement.evm.batch_settlement]
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
 
 [[peers]]
 id = "onion-peer"

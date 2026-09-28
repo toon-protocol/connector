@@ -92,15 +92,12 @@ key_file = "{signer_key}"
 
 [settlement.solana]
 rpc_url = "{rpc_url}"
-program_id = "{LOCAL_TEST_PROGRAM_ID}"
 token_address = "{mint}"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{settlement_key}"
-
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = 1
 
 [[routes]]
 prefix = "{ROUTE}"

@@ -2608,14 +2608,14 @@ client_edge_addr = "127.0.0.1:0"
 [signer]
 key_file = "{key_path}"
 
-[settlement]
-chain = "evm"
+[settlement.evm]
 rpc_url = "{rpc_url}"
-contract_address = "{registry_address:?}"
 token_address = "{token:?}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
-[settlement.key]
+[settlement.evm.key]
 key_file = "{key_path}"
 "#,
                 key_path = key_path.display(),
@@ -2677,14 +2677,14 @@ client_edge_addr = "127.0.0.1:0"
 [signer]
 key_file = "{key_path}"
 
-[settlement]
-chain = "evm"
+[settlement.evm]
 rpc_url = "{rpc_url}"
-contract_address = "{registry_address:?}"
 token_address = "{token:?}"
 decimals = 18
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
-[settlement.key]
+[settlement.evm.key]
 key_file = "{key_path}"
 "#,
                 key_path = key_path.display(),
@@ -2781,9 +2781,9 @@ key_file = "{key_path}"
 
 [settlement.solana]
 rpc_url = "{rpc_url}"
-program_id = "{program_id}"
 token_address = "{token_mint}"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key_path}"
@@ -2846,9 +2846,9 @@ key_file = "{key_path}"
 
 [settlement.solana]
 rpc_url = "{rpc_url}"
-program_id = "{program_id}"
 token_address = "{token_mint}"
 decimals = 9
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key_path}"
@@ -2933,18 +2933,19 @@ key_file = "{evm_key_path}"
 
 [settlement.evm]
 rpc_url = "{evm_rpc_url}"
-contract_address = "{registry_address:?}"
 token_address = "{token:?}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{evm_key_path}"
 
 [settlement.solana]
 rpc_url = "{solana_rpc_url}"
-program_id = "{program_id}"
 token_address = "{token_mint}"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{solana_key_path}"
@@ -3098,30 +3099,25 @@ key_file = "{evm_key_path}"
 
 [settlement.evm]
 rpc_url = "{evm_rpc_url}"
-contract_address = "{registry_address:?}"
 token_address = "{token:?}"
 decimals = 6
-
-[settlement.evm.key]
-key_file = "{evm_key_path}"
-
-[settlement.evm.batch_settlement]
 min_withdraw_delay_secs = 3600
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
+[settlement.evm.key]
+key_file = "{evm_key_path}"
+
 [settlement.solana]
 rpc_url = "{solana_rpc_url}"
-program_id = "{program_id}"
 token_address = "{token_mint}"
 decimals = 6
+min_sponsored_deposit = 1000000
+min_grace_period_secs = 3600
 
 [settlement.solana.key]
 key_file = "{solana_key_path}"
 
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = 1000000
-min_grace_period_secs = 3600
 "#,
                 evm_key_path = evm_key_path.display(),
                 solana_key_path = solana_key_path.display(),
@@ -3252,9 +3248,9 @@ key_file = "{key_path}"
 
 [settlement.solana]
 rpc_url = "{rpc_url}"
-program_id = "{wrong_program_id}"
 token_address = "{token_mint}"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key_path}"
@@ -3411,9 +3407,10 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
 token_address = "{USDC}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
@@ -3497,9 +3494,10 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
 token_address = "{USDC}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
@@ -3561,9 +3559,9 @@ key_file = "{key_file}"
 
 [settlement.solana]
 rpc_url = "http://127.0.0.1:8899"
-program_id = "{SOL_PROGRAM_ID}"
 token_address = "{USDC_SOLANA}"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key_file}"
@@ -3706,20 +3704,21 @@ key_file = "{key}"
 
 [settlement.evm]
 rpc_url = "http://{EVM_HOST}/"
-contract_address = "0x00000000000000000000000000000000000000aa"
 token_address = "0x00000000000000000000000000000000000000bb"
 decimals = 6
 rpc_via_socks_proxy = {evm_proxied}
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key}"
 
 [settlement.solana]
 rpc_url = "http://{SOLANA_HOST}/"
-program_id = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip"
 token_address = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
 decimals = 6
 rpc_via_socks_proxy = true
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key}"

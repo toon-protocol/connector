@@ -1,13 +1,12 @@
-//! `[settlement.evm.batch_settlement]` and `[settlement.solana.batch_settlement]`:
-//! whether this node accepts x402 `batch-settlement` channels on that chain,
-//! and on what terms (ADR 0074 decisions 1 and 5).
-
+//! The x402 `batch-settlement` terms of `[settlement.evm]` and
+//! `[settlement.solana]`: on what terms this node accepts, and opens, x402
+//! channels on that chain (ADR 0074 decisions 1 and 5, ADR 0075 decision 9).
 //!
-//! **Off unless configured.** Writing the table is the opt-in; a node whose
-//! `[settlement.<chain>]` table has no `batch_settlement` sub-table offers no
-//! `batch-settlement` entry on that chain and refuses a voucher by name. There
-//! is no `enabled` key: presence already says it, and a second spelling of
-//! "on" is a second place for the two to disagree.
+//! **Always on.** Every channel is an x402 channel (ADR 0075), so every
+//! settlement table carries these terms. They used to be an opt-in
+//! `[settlement.<chain>.batch_settlement]` sub-table; its keys now sit in the
+//! settlement table itself, keeping their bounds, and the sub-table is
+//! refused by name (`crate::settlement`).
 //!
 //! **What is not here.** Everything ADR 0074 decision 2 _fixes_ about an
 //! admissible channel is read from the enclosing settlement table and never
@@ -18,9 +17,10 @@
 //! domain), so each is a single constant in the crate that binds to it --
 //! `connector_signer::X402_BATCH_SETTLEMENT_ADDRESS` and
 //! `connector_settlement_solana::batch::wire::PAYMENT_CHANNELS_PROGRAM_ID`
-//! -- and no key here can name another. These tables hold only the terms
-//! that are this node's to choose.
+//! -- and no key here can name another. These terms are only the ones that
+//! are this node's to choose.
 
+#[cfg(test)]
 use serde::Deserialize;
 
 use crate::error::ConfigError;
@@ -41,33 +41,32 @@ pub const DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS: u64 = 86_400;
 /// published minimum above it would admit no channel at all.
 pub const EVM_BATCH_SETTLEMENT_MAX_WITHDRAW_DELAY_SECS: u64 = 30 * 86_400;
 
-/// `[settlement.evm.batch_settlement]` as written. `asset_eip712_name` and
-/// `asset_eip712_version` are required as soon as the table exists (issue
-/// #1345); every other key is optional -- writing the table is the opt-in
-/// (ADR 0074 decision 1), and each value it omits takes the default the
-/// record chose.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The EVM terms as `[settlement.evm]` wrote them. `asset_eip712_name` and
+/// `asset_eip712_version` are required (issue #1345, ADR 0075 decision 9);
+/// an omitted `min_withdraw_delay_secs` takes the default the record chose.
+#[derive(Debug)]
+#[cfg_attr(test, derive(Deserialize))]
 pub(crate) struct RawEvmBatchSettlementTable {
-    #[serde(default)]
-    min_withdraw_delay_secs: Option<u64>,
-    asset_eip712_name: String,
-    asset_eip712_version: String,
+    #[cfg_attr(test, serde(default))]
+    pub(crate) min_withdraw_delay_secs: Option<u64>,
+    pub(crate) asset_eip712_name: String,
+    pub(crate) asset_eip712_version: String,
 }
 
-/// `[settlement.solana.batch_settlement]` as written. `min_sponsored_deposit`
-/// is required: it bounds a public endpoint that spends this node's lamports
-/// (ADR 0074 decision 9), and no one number is a safe default for every mint.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The Solana terms as `[settlement.solana]` wrote them.
+/// `min_sponsored_deposit` is required: it bounds a public endpoint that
+/// spends this node's lamports (ADR 0074 decision 9), and no one number is a
+/// safe default for every mint.
+#[derive(Debug)]
+#[cfg_attr(test, derive(Deserialize))]
 pub(crate) struct RawSolanaBatchSettlementTable {
-    #[serde(default)]
-    min_grace_period_secs: Option<u64>,
-    min_sponsored_deposit: u64,
+    #[cfg_attr(test, serde(default))]
+    pub(crate) min_grace_period_secs: Option<u64>,
+    pub(crate) min_sponsored_deposit: u64,
 }
 
-/// A validated `[settlement.evm.batch_settlement]`: this node accepts x402
-/// `batch-settlement` channels on EVM (ADR 0074).
+/// This node's validated x402 `batch-settlement` terms on EVM (ADR 0074,
+/// ADR 0075 decision 9).
 ///
 /// It names only the terms that are this node's to choose. `receiver` and
 /// `receiverAuthorizer` must both be the enclosing `[settlement.evm]` table's
@@ -105,9 +104,8 @@ impl EvmBatchSettlementConfig {
     }
 }
 
-/// A validated `[settlement.solana.batch_settlement]`: this node accepts,
-/// and sponsors the opening of, x402 `batch-settlement` channels on Solana
-/// (ADR 0074).
+/// This node's validated x402 `batch-settlement` terms on Solana: it accepts,
+/// and sponsors the opening of, x402 channels (ADR 0074, ADR 0075).
 ///
 /// As on EVM, what the record fixes comes from the enclosing
 /// `[settlement.solana]` table: the sponsor key (`payee` and `rent_payer`) is
@@ -269,44 +267,6 @@ mod tests {
         evm("min_withdraw_delay_secs = 2592000").expect("thirty days exactly is the maximum");
     }
 
-    /// ADR 0074 fixes `x402BatchSettlement` at one address, so the table
-    /// has no key to name another: it is not a setting.
-    #[test]
-    fn the_evm_table_names_no_contract() {
-        assert!(toml::from_str::<RawEvmBatchSettlementTable>(
-            "asset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"\n\
-             contract_address = \"0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003\""
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn an_unknown_key_in_the_evm_table_is_refused() {
-        let error = toml::from_str::<RawEvmBatchSettlementTable>("enabled = true")
-            .expect_err("deny_unknown_fields");
-        assert!(error.to_string().contains("unknown field"));
-    }
-
-    /// The Solana-only key is not accepted on the EVM table: each table
-    /// takes its own chain's terms and nothing else.
-    #[test]
-    fn a_solana_key_in_the_evm_table_is_refused() {
-        assert!(
-            toml::from_str::<RawEvmBatchSettlementTable>("min_grace_period_secs = 900").is_err()
-        );
-    }
-
-    /// Issue #1345: a table naming neither the EIP-712 name nor version at
-    /// all is refused by `deny_unknown_fields`'s own required-field check,
-    /// naming the missing key.
-    #[test]
-    fn an_evm_table_missing_the_eip712_domain_fields_is_refused_by_name() {
-        let error = toml::from_str::<RawEvmBatchSettlementTable>("min_withdraw_delay_secs = 900")
-            .expect_err("both keys are required as soon as the table exists");
-        let message = error.to_string();
-        assert!(message.contains("asset_eip712_name"), "got: {message}");
-    }
-
     /// A table that writes the two keys empty is refused by this module's
     /// own check, not merely accepted with a useless value published.
     #[test]
@@ -356,19 +316,6 @@ mod tests {
         assert_eq!(config.min_sponsored_deposit(), 1_000_000);
     }
 
-    /// Decision 5: the sponsor endpoint is public and spends lamports, so
-    /// the bound on it has no safe default. Omitting it is refused by the
-    /// key's own name.
-    #[test]
-    fn a_solana_table_without_a_minimum_sponsored_deposit_is_refused_by_name() {
-        let error = toml::from_str::<RawSolanaBatchSettlementTable>("min_grace_period_secs = 900")
-            .expect_err("the minimum deposit is required");
-        assert!(
-            error.to_string().contains("min_sponsored_deposit"),
-            "got: {error}"
-        );
-    }
-
     #[test]
     fn a_zero_minimum_sponsored_deposit_is_refused_by_name() {
         let error = solana("min_sponsored_deposit = 0").expect_err("zero bounds nothing");
@@ -406,21 +353,4 @@ mod tests {
         assert_eq!(config.min_grace_period_secs(), 31_536_000);
     }
 
-    /// ADR 0074 fixes `payment-channels` at one program id, so the table
-    /// has no key to name another.
-    #[test]
-    fn the_solana_table_names_no_program() {
-        assert!(toml::from_str::<RawSolanaBatchSettlementTable>(
-            "min_sponsored_deposit = 1\nprogram_id = \"CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX\""
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn an_unknown_key_in_the_solana_table_is_refused() {
-        assert!(toml::from_str::<RawSolanaBatchSettlementTable>(
-            "min_sponsored_deposit = 1\nmin_withdraw_delay_secs = 900"
-        )
-        .is_err());
-    }
 }

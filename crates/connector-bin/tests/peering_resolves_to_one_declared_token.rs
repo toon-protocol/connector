@@ -109,11 +109,8 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
-
-[settlement.evm.batch_settlement]
 asset_eip712_name = "USD Coin"
 asset_eip712_version = "2"
 
@@ -165,11 +162,8 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
-
-[settlement.evm.batch_settlement]
 asset_eip712_name = "USD Coin"
 asset_eip712_version = "2"
 
@@ -178,11 +172,8 @@ key_file = "{key_file}"
 
 [settlement.solana]
 rpc_url = "https://api.devnet.solana.com"
-program_id = "{SOLANA_PROGRAM_ID}"
 token_address = "{SOLANA_MINT}"
 decimals = 6
-
-[settlement.solana.batch_settlement]
 min_sponsored_deposit = 1000000
 
 [settlement.solana.key]

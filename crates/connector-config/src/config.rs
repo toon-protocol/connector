@@ -1401,16 +1401,14 @@ handler_url = "http://localhost:5000"
             r#"
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
 
-[settlement.evm.batch_settlement]
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
 "#,
             key_file = key_path.display(),
         )
@@ -1772,9 +1770,10 @@ key_file = "{key}"
 
 [settlement.evm]
 rpc_url = "{evm_rpc}"
-contract_address = "0x00000000000000000000000000000000000000aa"
 token_address = "0x00000000000000000000000000000000000000bb"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 {evm_line}
 
 [settlement.evm.key]
@@ -1782,9 +1781,9 @@ key_file = "{key}"
 
 [settlement.solana]
 rpc_url = "{solana_rpc}"
-program_id = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip"
 token_address = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
 decimals = 6
+min_sponsored_deposit = 1
 {solana_line}
 
 [settlement.solana.key]
@@ -2116,20 +2115,18 @@ key_file = "{key}"
         extra_line: &str,
         settlement_program_id: Option<&str>,
     ) -> String {
-        let settlement = settlement_program_id.map_or_else(String::new, |program_id| {
+        let settlement = settlement_program_id.map_or_else(String::new, |_| {
             format!(
                 r#"
 [settlement.solana]
 rpc_url = "https://api.devnet.solana.com"
-program_id = "{program_id}"
 token_address = "{SOLANA_COUNTERPARTY_KEY}"
 decimals = 6
+min_sponsored_deposit = 1000000
 
 [settlement.solana.key]
 key_file = "{key_file}"
 
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = 1000000
 "#,
                 key_file = key_path.display(),
             )
@@ -2276,15 +2273,13 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
             r#"{evm}
 [settlement.solana]
 rpc_url = "https://api.devnet.solana.com"
-program_id = "{SOLANA_PROGRAM_ID}"
 token_address = "{SOLANA_MINT}"
 decimals = 6
+min_sponsored_deposit = 1000000
 
 [settlement.solana.key]
 key_file = "{key_file}"
 
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = 1000000
 "#,
             evm = evm_settlement(key_path),
             key_file = key_path.display(),
@@ -2522,9 +2517,9 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
             r#"
 [settlement.solana]
 rpc_url = "https://api.devnet.solana.com"
-program_id = "{SOLANA_PROGRAM_ID}"
 token_address = "{SOLANA_MINT}"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key_file}"
@@ -2677,7 +2672,7 @@ key_file = "{key_file}"
             )
         });
         assert!(
-            message.contains("[settlement.evm]") && message.contains("batch_settlement"),
+            message.contains("[settlement.evm]") && message.contains("no"),
             "got: {message}"
         );
     }
@@ -2855,10 +2850,10 @@ key_file = "{key_file}"
         });
     }
 
-    /// An EVM pay row on a node whose EVM table takes no x402 channel has
-    /// no paying half to sign a voucher with.
+    /// An EVM pay row on a node with no EVM settlement table has no paying
+    /// half to sign a voucher with.
     #[test]
-    fn rejects_a_pay_channel_on_a_chain_this_node_pays_no_x402_on() {
+    fn rejects_a_pay_channel_on_a_chain_this_node_does_not_settle_on() {
         let state_dir = tempfile::tempdir().expect("temp state dir");
         let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
         key_file
@@ -2882,7 +2877,7 @@ key_file = "{key_file}"
                 ConfigError::PayChannelWithoutX402 { peer_id, chain: "evm" } if peer_id == "store"
             )
         });
-        assert!(message.contains("batch_settlement"), "got: {message}");
+        assert!(message.contains("[settlement.evm]"), "got: {message}");
     }
 
     /// The Solana shapes: a Solana pay row names a channel account, and the
@@ -3636,14 +3631,14 @@ state_dir = "/tmp"
 [signer]
 key_file = "{}"
 
-[settlement]
-chain = "evm"
+[settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
-[settlement.key]
+[settlement.evm.key]
 key_file = "{}"
 "#,
                 key_path.display(),
@@ -3677,9 +3672,10 @@ key_file = "{}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{}"
@@ -3694,12 +3690,12 @@ key_file = "{}"
         assert_eq!(config.settlements()[0].chain(), crate::SettlementChain::Evm);
     }
 
-    /// ADR 0074 decision 1, through the one loader the binary uses: the
-    /// opt-in to x402 batch settlement is a sub-table of the chain's own
-    /// settlement table, and a below-floor minimum refuses to boot by name.
+    /// ADR 0075 decision 9, through the one loader the binary uses: the x402
+    /// terms sit in the chain's own settlement table, and a below-floor
+    /// minimum refuses to boot by name.
     #[test]
-    fn a_batch_settlement_opt_in_loads_under_its_settlement_table() {
-        let load = |batch: &str| {
+    fn x402_terms_load_from_their_settlement_table() {
+        let load = |delay: &str| {
             with_key_file(|key_path| {
                 format!(
                     r#"
@@ -3711,39 +3707,27 @@ key_file = "{key_path}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+{delay}
 
 [settlement.evm.key]
 key_file = "{key_path}"
-
-[settlement.evm.batch_settlement]
-{batch}
 "#,
                     key_path = key_path.display()
                 )
             })
         };
 
-        let config = load(
-            "min_withdraw_delay_secs = 7200\nasset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"",
-        )
-        .expect("load");
+        let config = load("min_withdraw_delay_secs = 7200").expect("load");
         let SettlementConfig::Evm(evm) = &config.settlements()[0] else {
             panic!("expected the EVM table");
         };
-        assert_eq!(
-            evm.batch_settlement()
-                .expect("opted in")
-                .min_withdraw_delay_secs(),
-            7200
-        );
+        assert_eq!(evm.batch_settlement().min_withdraw_delay_secs(), 7200);
 
-        let error = load(
-            "min_withdraw_delay_secs = 600\nasset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"",
-        )
-        .expect_err("below the floor");
+        let error = load("min_withdraw_delay_secs = 600").expect_err("below the floor");
         assert!(matches!(
             error,
             ConfigError::BatchSettlementDelayBelowFloor { value: 600, .. }
@@ -3765,18 +3749,19 @@ key_file = "{key_path}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117893403F9498119a9Ce"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_path}"
 
 [settlement.solana]
 rpc_url = "http://127.0.0.1:8899"
-program_id = "TokenNetworkProgram11111111111111111111111"
 token_address = "SoLMint11111111111111111111111111111111111"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key_path}"
@@ -3813,9 +3798,9 @@ key_file = "{key_path}"
 
 [settlement.solana]
 rpc_url = "http://127.0.0.1:8899"
-program_id = "TokenNetworkProgram11111111111111111111111"
 token_address = "SoLMint11111111111111111111111111111111111"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key_path}"
@@ -3832,8 +3817,10 @@ key_file = "{key_path}"
         );
     }
 
+    /// ADR 0075 decision 9, through the one loader: the flat `[settlement]`
+    /// shape named a `TokenNetworkRegistry` and is refused by name.
     #[test]
-    fn a_settlement_section_that_cannot_be_satisfied_refuses_to_load() {
+    fn the_legacy_flat_settlement_shape_refuses_to_load_by_name() {
         let result = with_key_file(|key_path| {
             format!(
                 r#"
@@ -3843,7 +3830,7 @@ client_edge_addr = "127.0.0.1:3000"
 key_file = "{}"
 
 [settlement]
-chain = "made-up-chain"
+chain = "evm"
 rpc_url = "http://127.0.0.1:8545"
 contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
@@ -3859,7 +3846,7 @@ key_file = "{}"
 
         assert!(matches!(
             result,
-            Err(ConfigError::SettlementUnknownChain { .. })
+            Err(ConfigError::SettlementLegacyShapeRemoved)
         ));
     }
 

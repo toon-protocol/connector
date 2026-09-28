@@ -122,13 +122,13 @@ fn the_production_skeleton_refuses_to_load_even_with_key_files_present() {
 
 /// No real EVM address may appear in it.
 ///
-/// The header explains the block: `packages/contracts` has never been deployed
-/// to an EVM mainnet, so `contract_address` — the `TokenNetworkRegistry` every
-/// channel resolves through — has no correct value in existence. The failure
+/// The header explains the block: no mainnet token has been chosen for this
+/// tier, so `token_address` has no correct value in existence. The failure
 /// mode this guards is not "the file loads" (the case above covers that) but
-/// "somebody pasted the devnet registry in to make it look finished". A
-/// connector pointed at the wrong registry resolves `getTokenNetwork()` to the
-/// wrong channel contract and accepts claims that settle nowhere.
+/// "somebody pasted a devnet address in to make it look finished". A connector
+/// pointed at a devnet token under a mainnet RPC settles in a token nobody
+/// chose. The x402 contract is a constant of the binary (ADR 0075), so no
+/// address of it belongs here either.
 ///
 /// Comments are scanned too, deliberately. A commented-out real address is a
 /// value one keystroke from being live, and this file is read by whoever
@@ -146,10 +146,9 @@ fn the_production_skeleton_names_no_real_evm_address() {
                 !(candidate.len() == 40 && candidate.chars().all(|c| c.is_ascii_hexdigit())),
                 "deploy/connector-rust/connector.production.toml line {} contains what looks \
                  like a real EVM address (`0x{candidate}`). No mainnet \
-                 `TokenNetworkRegistry` is deployed, so there is no correct value for one \
+                 token has been chosen for this tier, so there is no correct value for one \
                  here, and a devnet address copied across is worse than an invalid \
-                 placeholder: the node boots, resolves the wrong channel contract, and \
-                 accepts claims that settle nowhere. See ADR 0056.",
+                 placeholder. See ADR 0056.",
                 i + 1
             );
             rest = &rest[at + 2..];

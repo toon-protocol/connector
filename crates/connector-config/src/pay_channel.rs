@@ -186,7 +186,7 @@ fn resolve_client_edge_url(
 
 fn resolve_pay_channel(
     raw: RawPayChannel,
-    tables: SettlementTables<'_>,
+    tables: SettlementTables,
     allow_plaintext: bool,
 ) -> Result<PayChannelConfig, ConfigError> {
     // First, for the reason `resolve_peer_channel` gives: a removed key is
@@ -236,7 +236,7 @@ fn resolve_pay_channel(
 pub(crate) fn resolve_pay_channels(
     raw: Vec<RawPayChannel>,
     allow_plaintext: bool,
-    tables: SettlementTables<'_>,
+    tables: SettlementTables,
 ) -> Result<Vec<PayChannelConfig>, ConfigError> {
     let mut seen_peers = HashSet::with_capacity(raw.len());
     let mut seen_channels = HashSet::with_capacity(raw.len());
@@ -296,7 +296,7 @@ mod tests {
         resolve_pay_channels(
             rows.iter().map(|text| parse(text)).collect(),
             allow_plaintext,
-            SettlementTables::for_x402_tests(true, true),
+            SettlementTables::for_tests(true, true),
         )
     }
 
@@ -407,7 +407,7 @@ mod tests {
         let error = resolve_pay_channels(
             vec![parse(&row("relay", CHANNEL))],
             false,
-            SettlementTables::for_x402_tests(false, true),
+            SettlementTables::for_tests(false, true),
         )
         .unwrap_err();
         assert!(matches!(
@@ -417,7 +417,7 @@ mod tests {
         assert!(resolve_pay_channels(
             vec![parse(&row("store", ACCOUNT))],
             false,
-            SettlementTables::for_x402_tests(false, true),
+            SettlementTables::for_tests(false, true),
         )
         .is_ok());
     }

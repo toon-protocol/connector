@@ -88,11 +88,10 @@
 # Live, and deliberately identical to the relay box's
 # (infra/linode-relay/connector-rust.toml) -- and, while it still ran,
 # identical to the apex's own (infra/linode-node/connector-rust.toml, removed
-# by issue #872): the same Base Sepolia `TokenNetworkRegistry` and USDC, the
-# same Solana payment-channel program and mint, both at 6 decimals. It has to
-# be the same deployment — a claim this node accepts is written against the
-# channel the buyer opened on the shared devnet contracts, and a node pointed
-# at a different registry cannot resolve it.
+# by issue #872): the same Base Sepolia USDC and the same Solana mint, both
+# at 6 decimals, on the x402 contract and program the binary fixes (ADR
+# 0075). It has to be the same token -- a voucher this node accepts is on the
+# channel the buyer opened in it.
 #
 # DECISION (owner-confirmed 2026-08-03): this node settles on BOTH chains.
 #
@@ -276,26 +275,26 @@ price = 1000
 # in compiled code) closes the gap rather than relocating and pricing it.
 
 # ── Settlement ─────────────────────────────────────────────────────────────
-# Same registry/token/decimals the relay box's own file names (and, while it
-# still ran, the apex's): `TokenNetwork.owner()` is the registry below, which
-# forwards no call into a `TokenNetwork` and never calls `transferOwnership`
-# -- so `pause`/`emergencyWithdraw` are unreachable here too (issue #577,
-# `docs/evm-deployment.md` for the full citation).
+# Same token/decimals the relay box's own file names (and, while it still
+# ran, the apex's). `asset_eip712_*` is the devnet USDC's own EIP-712 domain
+# (`name()` "USDC", `version()` "2", read on chain, ADR 0075 Prerequisites);
+# `min_sponsored_deposit` is one USDC in base units.
 
 [settlement.evm]
 rpc_url = "https://base-sepolia-rpc.publicnode.com"
-contract_address = "0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5"
 token_address = "0x0C996d7c934c79a6255254875607Fe69df25C0E1"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
 
 [settlement.solana]
 rpc_url = "https://api.devnet.solana.com"
-program_id = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip"
 token_address = "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU"
 decimals = 6
+min_sponsored_deposit = 1000000
 
 [settlement.solana.key]
 key_file = "/app/data/settlement-solana.key"

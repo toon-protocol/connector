@@ -3,7 +3,7 @@
 # =============================================================================
 # ── READ THIS BEFORE ANYTHING ELSE ──────────────────────────────────────────
 # **This file does not describe a running node, and there is no production
-# node.** No machine, no mainnet contract, no key, no DNS name, no deploy.
+# node.** No machine, no key, no DNS name, no deploy.
 # Production is a NAMED, EMPTY tier: named so that the questions it raises can
 # be written down where they will be found, empty because none of them has
 # been answered.
@@ -29,23 +29,24 @@
 # rather than deployments, so a skeleton belongs here.
 #
 # ── WHAT CANNOT BE FILLED IN YET, AND WHY ───────────────────────────────────
-# Two of these are hard blockers, not omissions:
+# The settlement contracts are no longer the blocker. Every channel is an x402
+# `batch-settlement` channel (ADR 0075): `x402BatchSettlement` at its
+# canonical address on EVM and `payment-channels` at `CHNLx...` on Solana,
+# both constants of the binary rather than config, and a node refuses to start
+# on a chain where its contract or program is absent. What is missing is everything that is
+# this tier's own to choose, and ADR 0056 records that the fleet has chosen
+# none of it:
 #
-#   1. **There is no mainnet `TokenNetworkRegistry`.** `packages/contracts` has
-#      never been deployed to an EVM mainnet. `contract_address` below has no
-#      correct value to hold, and inventing one is not a smaller problem than
-#      leaving it invalid — a connector that boots against the wrong registry
-#      resolves `getTokenNetwork()` to the wrong channel contract and accepts
-#      claims that settle nowhere.
-#   2. **The Solana payment-channel program is devnet-only.** The deployed
-#      program id `2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip` exists on
-#      Solana devnet and nowhere else. A claim's signed domain binds the
-#      settlement program (ADR 0053), so a mainnet claim would have to name a
-#      mainnet program that does not exist, and a devnet program id under a
-#      mainnet RPC is a node that takes money for claims it can never redeem.
+#   1. **No mainnet RPC, token or mint has been chosen.** Each is a
+#      placeholder that fails to parse.
+#   2. **No settlement key exists.** Each key file below names a path that
+#      does not exist.
+#   3. **No terms have been set.** The EIP-712 domain of the chosen token and
+#      the sponsor's minimum deposit are written empty and zero, both refused
+#      at load.
 #
-# Neither is a config problem. Both are deployments that have not happened,
-# and both are prerequisites of this tier existing at all.
+# None is a config problem. Each is a decision this tier has not made, and
+# the tier is empty until someone makes them.
 #
 # ── THE TIERS ───────────────────────────────────────────────────────────────
 #   local       docker-compose chain profiles + `local/` (issue #1099).
@@ -155,50 +156,46 @@ bearer_token = "CHANGE-ME-there-is-no-production-operator-token"
 write_keys = ["REPLACE-WITH-A-64-HEX-CHARACTER-ED25519-PUBLIC-KEY-NO-PRODUCTION-KEY-EXISTS"]
 
 # ── Settlement: EVM ──────────────────────────────────────────────────────────
-# BLOCKED. See the header: `packages/contracts` has never been deployed to an
-# EVM mainnet, so `contract_address` — the `TokenNetworkRegistry` this node
-# resolves every channel through — has no correct value in existence.
+# BLOCKED on the choices above. The contract is not configured: the binary
+# fixes it (ADR 0075 decision 1) and reads its code at boot.
 #
 # `decimals` is checked against the token's own on-chain `decimals()` at
 # startup and a disagreement refuses the boot (#564), so a stale value here is
 # a loud failure rather than a mispriced route. That check is one of the few
 # things below that would work unchanged in production.
 #
-# Every node that might ever accept a given claim must agree on WHICH
-# deployment it resolves against — a claim resolves against one, and one only.
-# On devnet that agreement is why both boxes carry byte-identical settlement
-# blocks. Production would need the same agreement, over contracts that do not
-# yet exist, with whatever set of nodes production turns out to mean.
+# `asset_eip712_name`/`asset_eip712_version` are the chosen token's own
+# EIP-712 domain, which a payer signs its deposit under. They are empty on
+# purpose, which is refused at load.
 #
 # The placeholders are not `0x`-prefixed hex and will not parse as addresses.
 [settlement.evm]
 rpc_url = "REPLACE-ME-no-mainnet-rpc-chosen"
-contract_address = "REPLACE-ME-NO-MAINNET-TOKENNETWORKREGISTRY-IS-DEPLOYED"
 token_address = "REPLACE-ME-no-mainnet-token-chosen"
 decimals = 6
+asset_eip712_name = ""
+asset_eip712_version = ""
 
 [settlement.evm.key]
 key_file = "/nonexistent/production-evm-settlement-key-does-not-exist"
 
 # ── Settlement: Solana ───────────────────────────────────────────────────────
-# BLOCKED, and more sharply than the EVM side.
+# BLOCKED on the same choices. The program is `payment-channels`, fixed by the
+# binary. TOON's own payment-channel program
+# (`2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip` on devnet) is retired from
+# the connector (ADR 0075) and no key can name it.
 #
-# The payment-channel program in `packages/solana-program` is deployed at
-# `2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip` on **Solana devnet** and
-# nowhere else. ADR 0053 binds the settlement program into a Solana claim's
-# signed message, so the program id is not a deployment detail a node can be
-# vague about: it is part of what the counterparty signed. Pointing this
-# section at a mainnet RPC while naming the devnet program id produces a node
-# that accepts claims it can never redeem — it takes the money and has no
-# on-chain counterparty to settle against.
+# `min_sponsored_deposit` bounds a public endpoint that spends this node's
+# lamports (ADR 0074 decision 9). It is zero on purpose, which is refused at
+# load.
 #
 # Mina is not a settlement chain for this binary and no section for it belongs
 # here at any tier (ADR 0002).
 [settlement.solana]
 rpc_url = "REPLACE-ME-no-mainnet-rpc-chosen"
-program_id = "REPLACE-ME-NO-MAINNET-PAYMENT-CHANNEL-PROGRAM-IS-DEPLOYED"
 token_address = "REPLACE-ME-no-mainnet-mint-chosen"
 decimals = 6
+min_sponsored_deposit = 0
 
 [settlement.solana.key]
 key_file = "/nonexistent/production-solana-settlement-key-does-not-exist"

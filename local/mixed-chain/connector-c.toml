@@ -66,12 +66,9 @@ write_keys_file = "/app/data/operator-write-keys"
 # toward C through C's sponsor endpoint.
 [settlement.solana]
 rpc_url = "http://solana-validator:8899"
-program_id = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR"
 token_address = "H8HSreUF2s8r8hem4qMttE3bWYCpFuh71jbuos5bA77H"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "/app/data/settlement-solana.key"
-
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = 1

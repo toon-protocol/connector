@@ -234,16 +234,14 @@ impl Chain {
             r#"
 [settlement.evm]
 rpc_url = "{rpc_url}"
-contract_address = "{registry:?}"
 token_address = "{token:?}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
 
-[settlement.evm.batch_settlement]
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
 "#,
             rpc_url = self.anvil.rpc_url,
             registry = self.registry,

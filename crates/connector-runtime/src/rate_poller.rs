@@ -815,9 +815,10 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
 token_address = "{usdc}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
@@ -897,18 +898,19 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
 token_address = "{usdc}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
 
 [settlement.solana]
 rpc_url = "http://127.0.0.1:8899"
-program_id = "{program_id}"
 token_address = "{sol_numeraire}"
 decimals = 9
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key_file}"
