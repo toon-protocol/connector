@@ -12,11 +12,8 @@
 //!   tops it up, signs vouchers on it and winds it down with
 //!   `request_close` and `distribute`.
 //!
-//! It shares nothing with [`SolanaSettlementBackend`](crate::SolanaSettlementBackend)
-//! but the crate: a different program, a different account, a different
-//! port. What it does reuse is this crate's transaction submission and
-//! confirm loop, the table's one [`RpcTransport`] (ADR 0073), the
-//! Ed25519 precompile layout in [`crate::wire`] and the voucher message and
+//! It uses this crate's transaction submission and confirm loop, the
+//! table's one [`RpcTransport`] (ADR 0073), and the voucher message and
 //! verifier in `connector-signer` (issue #1341).
 //!
 //! Watching for Closing, `distribute`, `reclaim` and `getProgramAccounts`
@@ -25,8 +22,8 @@
 //!
 //! **What is not here.** The public sponsor
 //! endpoint is issue #1346's, and builds on [`wire::OpenChannel`]. The
-//! runtime builds this backend when `[settlement.solana.batch_settlement]`
-//! is written and hands it to the client edge's claim gate
+//! runtime builds this backend from every `[settlement.solana]` table and
+//! hands it to the client edge's claim gate
 //! (`connector-cli`'s `batch_settlement` module).
 
 mod pay;
@@ -54,6 +51,7 @@ use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client::rpc_client::RpcClientConfig;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::instruction::Instruction;
+use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
@@ -96,6 +94,9 @@ pub struct SolanaBatchSettlement {
     /// bounds only the public sponsor endpoint, and is published beside
     /// `min_grace_period_secs` (ADR 0074 decision 5).
     min_sponsored_deposit: u64,
+    /// The chain's own genesis hash, read at connect: what
+    /// [`Self::caip2_network`] names the network by.
+    genesis_hash: solana_sdk::hash::Hash,
     admitted: Mutex<HashSet<Pubkey>>,
     /// The cluster's Rent sysvar, read on the first sponsored `open`
     /// ([`sponsor`]'s rent check, issue #1356) or the first `open` this node
@@ -124,12 +125,27 @@ impl SolanaBatchSettlement {
     /// ed25519 seed), sponsoring an `open` only for a deposit of at least
     /// `min_sponsored_deposit`.
     ///
-    /// Refuses, naming it, a chain on which that id is not an executable
-    /// account: a node that would otherwise admit nothing and say nothing.
+    /// Refuses, in order:
+    ///
+    /// * [`BatchSettlementError::NotDeployed`] when no account lives at that
+    ///   id, and by name when the account there is not an executable
+    ///   program: a chain `payment-channels` has not deployed to (ADR 0075
+    ///   decision 1);
+    /// * a `mint` the SPL Token program does not own (Token-2022 stays
+    ///   refused, ADR 0075 decision 1), or whose own `decimals` disagree with
+    ///   `expected_decimals` (issue #564): nothing scales by it, so it is
+    ///   checked rather than applied;
+    /// * a sponsor key holding no lamports, which could pay for nothing.
+    ///
+    /// It also reads the chain's genesis hash, which names the network the
+    /// greeting publishes ([`Self::caip2_network`], issue #1131). Every read
+    /// is retried with backoff before it fails the node (ADR 0073 decision
+    /// 5).
     pub async fn connect(
         transport: &RpcTransport,
         sponsor_seed: &[u8; 32],
         mint: Pubkey,
+        expected_decimals: u8,
         min_grace_period_secs: u64,
         min_sponsored_deposit: u64,
     ) -> Result<Self, BatchSettlementError> {
@@ -141,20 +157,64 @@ impl SolanaBatchSettlement {
             transport,
             RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
         );
-        let program = retry_read(|| rpc.get_account(&program_id))
+        let commitment = CommitmentConfig::confirmed();
+        let program = retry_read(|| rpc.get_account_with_commitment(&program_id, commitment))
             .await
             .map_err(|error| {
                 BatchSettlementError::Backend(format!(
                     "payment-channels ({program_id}) could not be read: {error}"
                 ))
-            })?;
+            })?
+            .value;
+        let Some(program) = program else {
+            return Err(BatchSettlementError::NotDeployed(format!(
+                "payment-channels ({program_id})"
+            )));
+        };
         if !program.executable {
-            return Err(BatchSettlementError::Backend(format!(
-                "payment-channels ({program_id}) is not an executable program account on this \
-                 chain"
+            return Err(BatchSettlementError::NotDeployed(format!(
+                "payment-channels ({program_id}): the account there is not an executable program"
             )));
         }
-        Ok(SolanaBatchSettlement {
+        let mint_account = retry_read(|| rpc.get_account(&mint))
+            .await
+            .map_err(|error| {
+                BatchSettlementError::Backend(format!(
+                    "[settlement.solana] token_address {mint} could not be read: {error}"
+                ))
+            })?;
+        if mint_account.owner != spl_token::id() {
+            return Err(BatchSettlementError::Backend(format!(
+                "[settlement.solana] token_address {mint} is not owned by the SPL Token program"
+            )));
+        }
+        let decimals = spl_token::state::Mint::unpack(&mint_account.data)
+            .map_err(backend_error)?
+            .decimals;
+        if decimals != expected_decimals {
+            return Err(BatchSettlementError::Backend(format!(
+                "[settlement.solana] decimals is {expected_decimals}, but mint {mint} reports \
+                 decimals = {decimals}"
+            )));
+        }
+        let genesis_hash = retry_read(|| rpc.get_genesis_hash())
+            .await
+            .map_err(|error| {
+                BatchSettlementError::Backend(format!(
+                    "could not read the cluster's genesis hash: {error}"
+                ))
+            })?;
+        let sponsor_pubkey = sponsor.pubkey();
+        let lamports = retry_read(|| rpc.get_balance(&sponsor_pubkey))
+            .await
+            .map_err(backend_error)?;
+        if lamports == 0 {
+            return Err(BatchSettlementError::Backend(format!(
+                "[settlement.solana] key {sponsor_pubkey} holds no lamports, so it cannot pay for \
+                 any settlement transaction; fund it before starting the node"
+            )));
+        }
+        let backend = SolanaBatchSettlement {
             rpc,
             confirm: ConfirmPolicy::for_transport(transport),
             program_id,
@@ -162,12 +222,78 @@ impl SolanaBatchSettlement {
             mint,
             min_grace_period_secs,
             min_sponsored_deposit,
+            genesis_hash,
             admitted: Mutex::new(HashSet::new()),
             cluster_rent: OnceLock::new(),
             outbound: Mutex::new(HashMap::new()),
             sponsor_http: pay::SponsorClients::new(None)?,
             treasury: Mutex::new(None),
+        };
+        backend.ensure_receiving_account().await?;
+        Ok(backend)
+    }
+
+    /// Create this node's receiving account -- the sponsor key's associated
+    /// token account for the mint -- if it does not exist yet. Every channel
+    /// this node admits distributes to it, and the sponsor endpoint refuses
+    /// an `open` by name while it is missing, since a payout to a missing
+    /// account forfeits to the program's treasury (Cantina 3.1.4). So a node
+    /// that booted without one could never be opened toward.
+    ///
+    /// Read before it transacts (ADR 0073 decision 5): a restart whose
+    /// account already exists sends nothing, and the create is idempotent
+    /// for the one that races it.
+    async fn ensure_receiving_account(&self) -> Result<(), BatchSettlementError> {
+        let owner = self.sponsor.pubkey();
+        let receiving =
+            spl_associated_token_account::get_associated_token_address(&owner, &self.mint);
+        let existing = retry_read(|| {
+            self.rpc
+                .get_account_with_commitment(&receiving, CommitmentConfig::confirmed())
         })
+        .await
+        .map_err(backend_error)?;
+        if existing.value.is_some() {
+            return Ok(());
+        }
+        self.submit(&[
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &owner,
+                &owner,
+                &self.mint,
+                &spl_token::id(),
+            ),
+        ])
+        .await
+        .map_err(|error| {
+            BatchSettlementError::Backend(format!(
+                "[settlement.solana] could not create this node's receiving account {receiving} \
+                 for mint {}: {error}",
+                self.mint
+            ))
+        })
+    }
+
+    /// The CAIP-2 network id of the chain this node connected to (ADR 0074
+    /// decision 8): the greeting's `network`, read off the chain's own
+    /// genesis hash rather than guessed from the RPC URL.
+    pub fn caip2_network(&self) -> String {
+        crate::caip2_solana_network(&self.genesis_hash)
+    }
+
+    /// The public cluster the chain's genesis hash names, or `None` for any
+    /// other chain -- every `solana-test-validator` among them (issue
+    /// #1131).
+    pub fn cluster(&self) -> Option<&'static str> {
+        crate::cluster_for_genesis_hash(&self.genesis_hash)
+    }
+
+    /// The token program that owns [`Self::mint`]: SPL Token, always,
+    /// because [`Self::connect`] refuses a mint any other program owns. The
+    /// greeting's x402 `extra.tokenProgram` (ADR 0074 decision 8, issue
+    /// #1357) is read from here.
+    pub fn token_program(&self) -> Pubkey {
+        spl_token::id()
     }
 
     /// Post every `open` toward a counterparty whose sponsor endpoint is an

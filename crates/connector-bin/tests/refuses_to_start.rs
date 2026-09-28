@@ -483,9 +483,10 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
@@ -557,10 +558,10 @@ key_file = "{key_file}"
 
 [settlement.solana]
 rpc_url = "https://api.devnet.solana.com"
-program_id = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip"
 token_address = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
 decimals = 6
 rpc_via_socks_proxy = true
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key_file}"
@@ -728,6 +729,363 @@ key_file = "{key_file}"
         stderr.contains("client-edge-claims.log"),
         "expected the error to name the journal it could not replay, got: {stderr}"
     );
+}
+
+// -- ADR 0075 decisions 1, 8 and 9 (issue #1385): TOON's channels leave the
+// port, the config and the boot --
+
+/// A `[settlement.evm]` table with `extra` written into it, on a node with a
+/// state_dir.
+fn evm_settlement_config(
+    key_file: &std::path::Path,
+    state_dir: &std::path::Path,
+    rpc_url: &str,
+    extra: &str,
+) -> tempfile::NamedTempFile {
+    write_config(&format!(
+        r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement.evm]
+rpc_url = "{rpc_url}"
+token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
+decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+{extra}
+
+[settlement.evm.key]
+key_file = "{key_file}"
+"#,
+        key_file = key_file.display(),
+        state_dir = state_dir.display(),
+    ))
+}
+
+/// ADR 0075 decision 1, through the real binary: a node pointed at a chain
+/// on which `x402BatchSettlement` is not deployed -- here a bare anvil --
+/// refuses to start, by name, rather than boot a node that admits nothing
+/// and says nothing.
+#[tokio::test]
+async fn exits_non_zero_naming_x402_on_a_chain_without_the_x402_contract() {
+    if !connector_settlement_evm::test_support::require_anvil() {
+        return;
+    }
+    let anvil = connector_settlement_evm::test_support::Anvil::spawn(24_700).await;
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let config_file = evm_settlement_config(key_file.path(), state_dir.path(), &anvil.rpc_url, "");
+
+    let output = run(Some(config_file.path()));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in [
+        "[settlement.evm]",
+        "x402BatchSettlement",
+        "not deployed",
+        "ADR 0075",
+    ] {
+        assert!(stderr.contains(named), "expected {named} in: {stderr}");
+    }
+}
+
+/// ADR 0075 decision 1, Solana, through the real binary: a node pointed at a
+/// chain on which `payment-channels` is not deployed refuses to start, by
+/// name.
+#[tokio::test]
+async fn exits_non_zero_naming_payment_channels_on_a_chain_without_it() {
+    if !connector_settlement_solana::test_support::require_solana_test_validator() {
+        return;
+    }
+    let validator =
+        connector_settlement_solana::test_support::SolanaValidator::spawn_without_payment_channels(
+        )
+        .await;
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let config_file = write_config(&format!(
+        r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement.solana]
+rpc_url = "{rpc_url}"
+token_address = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+decimals = 6
+min_sponsored_deposit = 1
+
+[settlement.solana.key]
+key_file = "{key_file}"
+"#,
+        key_file = key_file.path().display(),
+        state_dir = state_dir.path().display(),
+        rpc_url = validator.rpc_url,
+    ));
+
+    let output = run(Some(config_file.path()));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in [
+        "[settlement.solana]",
+        "payment-channels",
+        "not deployed",
+        "ADR 0075",
+    ] {
+        assert!(stderr.contains(named), "expected {named} in: {stderr}");
+    }
+}
+
+/// ADR 0075 decision 9, at the level an operator meets it: every
+/// settlement key or shape that named TOON's own channels is refused by
+/// name, never parsed and ignored.
+#[test]
+fn exits_non_zero_naming_each_removed_settlement_key() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    for (extra, named) in [
+        (
+            "contract_address = \"0x1234567890123456789012345678901234567890\"",
+            "contract_address",
+        ),
+        (
+            "\n[settlement.evm.batch_settlement]\nmin_withdraw_delay_secs = 3600",
+            "[settlement.evm.batch_settlement]",
+        ),
+        ("channel_index_from_block = 1", "channel_index_from_block"),
+    ] {
+        let config_file = evm_settlement_config(
+            key_file.path(),
+            state_dir.path(),
+            "http://127.0.0.1:8545",
+            extra,
+        );
+        let output = run(Some(config_file.path()));
+        assert!(!output.status.success(), "{named}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(named) && stderr.contains("ADR 0075"),
+            "expected {named} and the record in: {stderr}"
+        );
+    }
+
+    let solana = |extra: &str| {
+        write_config(&format!(
+            r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement.solana]
+rpc_url = "http://127.0.0.1:8899"
+token_address = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+decimals = 6
+min_sponsored_deposit = 1
+{extra}
+
+[settlement.solana.key]
+key_file = "{key_file}"
+"#,
+            key_file = key_file.path().display(),
+            state_dir = state_dir.path().display(),
+        ))
+    };
+    for (extra, named) in [
+        (
+            "program_id = \"2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip\"",
+            "program_id",
+        ),
+        (
+            "\n[settlement.solana.batch_settlement]\nmin_sponsored_deposit = 1",
+            "[settlement.solana.batch_settlement]",
+        ),
+    ] {
+        let config_file = solana(extra);
+        let output = run(Some(config_file.path()));
+        assert!(!output.status.success(), "{named}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(named) && stderr.contains("ADR 0075"),
+            "expected {named} and the record in: {stderr}"
+        );
+    }
+
+    let flat = write_config(&format!(
+        r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement]
+chain = "evm"
+rpc_url = "http://127.0.0.1:8545"
+contract_address = "0x1234567890123456789012345678901234567890"
+token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
+decimals = 6
+
+[settlement.key]
+key_file = "{key_file}"
+"#,
+        key_file = key_file.path().display(),
+        state_dir = state_dir.path().display(),
+    ));
+    let output = run(Some(flat.path()));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("flat [settlement] shape") && stderr.contains("ADR 0075"),
+        "expected the legacy shape named in: {stderr}"
+    );
+}
+
+/// ADR 0075 decision 9: the terms that have no safe default are required
+/// wherever their table exists, and a table without one is refused by name.
+#[test]
+fn exits_non_zero_naming_a_missing_required_settlement_key() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let config_file = write_config(&format!(
+        r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement.evm]
+rpc_url = "http://127.0.0.1:8545"
+token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
+decimals = 6
+
+[settlement.evm.key]
+key_file = "{key_file}"
+"#,
+        key_file = key_file.path().display(),
+        state_dir = state_dir.path().display(),
+    ));
+
+    let output = run(Some(config_file.path()));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[settlement.evm]") && stderr.contains("asset_eip712_name"),
+        "expected the table and the missing key in: {stderr}"
+    );
+}
+
+/// Write `entries` to the journal `name` under `state_dir`, in the one
+/// format a node writes them in.
+fn write_journal(
+    state_dir: &std::path::Path,
+    name: &str,
+    entries: &[connector_domain::JournalEntry],
+) {
+    use connector_runtime::Journal;
+    let journal =
+        connector_runtime::FileJournal::open(state_dir.join(name)).expect("open the journal");
+    for entry in entries {
+        journal.append(entry).expect("append a journal entry");
+    }
+}
+
+/// ADR 0075 decision 8, issue #1385: a journal an older build wrote, holding
+/// claims on TOON's own channels, stops the node by name -- in either book
+/// -- with the drain procedure in the message. It is never skipped: a
+/// skipped entry is a claim somebody could still redeem that this node has
+/// forgotten it accepted.
+#[test]
+fn exits_non_zero_naming_the_drain_on_a_toon_channel_journal() {
+    let toon_channel = format!("0x{}", "ab".repeat(32));
+    for name in ["peer-claims.log", "client-edge-claims.log"] {
+        let key_file = write_raw_key_file();
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        write_journal(
+            state_dir.path(),
+            name,
+            &[connector_domain::JournalEntry::InboundClaimAccepted {
+                channel_id: toon_channel.clone(),
+                nonce: 3,
+                cumulative_amount: 900,
+                signature: vec![0; 65],
+            }],
+        );
+        let config_file = write_config(&format!(
+            r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+"#,
+            key_file = key_file.path().display(),
+            state_dir = state_dir.path().display(),
+        ));
+
+        let output = run(Some(config_file.path()));
+
+        assert!(!output.status.success(), "{name}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for named in [
+            name,
+            "toon-channel",
+            toon_channel.as_str(),
+            "ADR 0075",
+            "Draining a node with live TOON channels",
+            "docs/operators/draining-toon-channels.md",
+        ] {
+            assert!(
+                stderr.contains(named),
+                "{name}: expected {named} in: {stderr}"
+            );
+        }
+    }
+}
+
+/// The twin of the refusal above: a client-edge journal holding only
+/// vouchers is this build's own, and a node whose `state_dir` holds one
+/// starts and serves.
+#[tokio::test]
+async fn a_voucher_only_journal_is_not_refused() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    write_journal(
+        state_dir.path(),
+        "client-edge-claims.log",
+        &[connector_domain::JournalEntry::OutboundVoucherSigned {
+            channel_id: format!("evm:0x{}", "cd".repeat(32)),
+            cumulative_amount: 10,
+        }],
+    );
+    let config_file = write_config(&format!(
+        r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+"#,
+        key_file = key_file.path().display(),
+        state_dir = state_dir.path().display(),
+    ));
+
+    let mut child = spawn(config_file.path());
+    let addr = wait_for_listen_addr(&mut child);
+    assert!(!addr.is_empty());
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // -- The deleted raw-TCP transport (ADR 0027, issue #679) and the peer
@@ -1016,16 +1374,13 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
-
-[settlement.evm.batch_settlement]
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
 
 [[peers]]
 id = "store"

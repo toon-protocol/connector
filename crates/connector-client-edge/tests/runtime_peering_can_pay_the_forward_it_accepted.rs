@@ -53,7 +53,6 @@ use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
-use connector_settlement_evm::EvmSettlementBackend;
 use connector_signer::giftwrap::{open_response, seal_request};
 use connector_signer::{
     BatchChannelConfig, BatchSettlementDomain, LocalSigner, PublicKeyBytes, Signer,
@@ -270,20 +269,16 @@ fn transport_to(payee: std::net::SocketAddr) -> Arc<dyn PeerTransport> {
 /// journal file in `state_dir`: what a booting node restores.
 async fn outbound_channels(
     rpc_url: &str,
-    registry: Address,
     token: Address,
     state_dir: &std::path::Path,
 ) -> Arc<OutboundChannels> {
-    let payer = EvmSettlementBackend::connect(
+    let payer = connector_settlement_evm::EvmBatchSettlementBackend::connect(
         &connector_settlement_evm::RpcTransport::direct(rpc_url).expect("rpc transport"),
         DEPLOYER_PRIVATE_KEY,
-        registry,
         token,
         6,
+        86_400,
     )
-    .await
-    .expect("connect the payer's settlement key")
-    .batch_settlement(86_400)
     .await
     .expect("the payer's x402 half");
     let journal: Arc<dyn Journal> = Arc::new(
@@ -315,10 +310,6 @@ async fn a_runtime_established_peering_can_pay_the_forward_it_accepted() {
     let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
     let mut x402 = X402Chain::place(&anvil.rpc_url).await;
     let token = x402.deploy_fiat_token().await;
-    let registry = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("a TokenNetwork registry to connect the settlement key through")
-        .registry_address();
     x402.mint(token, address_of(DEPLOYER_PRIVATE_KEY), 1_000_000)
         .await;
 
@@ -343,7 +334,7 @@ async fn a_runtime_established_peering_can_pay_the_forward_it_accepted() {
         .with_peer_allow_plaintext_endpoints(true)
         .with_runtime_peer_route_store(store, peers, routes)
     };
-    let outbound = outbound_channels(&anvil.rpc_url, registry, token, state_dir.path()).await;
+    let outbound = outbound_channels(&anvil.rpc_url, token, state_dir.path()).await;
     let payer = boot(Arc::clone(&outbound));
 
     // ── The write ADR 0058 promises: accept AND pay ─────────────────────
@@ -386,7 +377,7 @@ async fn a_runtime_established_peering_can_pay_the_forward_it_accepted() {
     // ── A restart rehydrates a payable hop, not a name ──────────────────
     drop(payer);
     drop(outbound);
-    let outbound = outbound_channels(&anvil.rpc_url, registry, token, state_dir.path()).await;
+    let outbound = outbound_channels(&anvil.rpc_url, token, state_dir.path()).await;
     let payer = boot(Arc::clone(&outbound));
     let (prepare, shared_secret) = sealed_prepare(b"after a restart", &payee_identity);
     let response = payer.handle_prepare(prepare).await;

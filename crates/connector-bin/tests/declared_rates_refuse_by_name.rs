@@ -97,9 +97,10 @@ key_file = "{}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{}"

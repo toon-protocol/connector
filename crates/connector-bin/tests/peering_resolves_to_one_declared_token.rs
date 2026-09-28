@@ -54,7 +54,6 @@ const SOLANA_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const PEER_VOUCHER_SIGNER: &str = "0x2222222222222222222222222222222222222222";
 /// The Solana peer's voucher signer: its settlement public key.
 const SOLANA_VOUCHER_SIGNER: &str = "8pM1DN3RiT8vbom5u1sNryaNT1nyL8CTTW3b5PwWXRBH";
-const SOLANA_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 fn run(config_path: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_connector"))
@@ -109,11 +108,8 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
-
-[settlement.evm.batch_settlement]
 asset_eip712_name = "USD Coin"
 asset_eip712_version = "2"
 
@@ -165,11 +161,8 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
-
-[settlement.evm.batch_settlement]
 asset_eip712_name = "USD Coin"
 asset_eip712_version = "2"
 
@@ -178,11 +171,8 @@ key_file = "{key_file}"
 
 [settlement.solana]
 rpc_url = "https://api.devnet.solana.com"
-program_id = "{SOLANA_PROGRAM_ID}"
 token_address = "{SOLANA_MINT}"
 decimals = 6
-
-[settlement.solana.batch_settlement]
 min_sponsored_deposit = 1000000
 
 [settlement.solana.key]

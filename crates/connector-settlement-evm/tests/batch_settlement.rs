@@ -22,7 +22,7 @@ use connector_settlement::batch::{
 use connector_settlement::ChannelId;
 use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
-use connector_settlement_evm::{EvmBatchSettlementBackend, EvmSettlementBackend};
+use connector_settlement_evm::{EvmBatchSettlementBackend, RpcTransport};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::Address;
 
@@ -62,13 +62,15 @@ impl Chain {
         let mut x402 = X402Chain::place(&anvil.rpc_url).await;
         let token = x402.deploy_fiat_token().await;
         let other_token = x402.deploy_fiat_token().await;
-        let settlement = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-            .await
-            .expect("this node's settlement backend, over the FiatToken");
-        let backend = settlement
-            .batch_settlement(ONE_DAY)
-            .await
-            .expect("the batch-settlement backend binds to x402BatchSettlement");
+        let backend = EvmBatchSettlementBackend::connect(
+            &RpcTransport::direct(&anvil.rpc_url).expect("transport"),
+            DEPLOYER_PRIVATE_KEY,
+            token,
+            6,
+            ONE_DAY,
+        )
+        .await
+        .expect("the batch-settlement backend binds to x402BatchSettlement");
 
         let payer = LocalWallet::from_bytes(&[0x51; 32]).expect("key");
         let session = LocalWallet::from_bytes(&[0x52; 32]).expect("key");
@@ -487,25 +489,61 @@ async fn a_finalised_withdrawal_leaves_an_open_channel_backing_nothing_new() {
     );
 }
 
-/// The backend refuses to bind on a chain where no `x402BatchSettlement`
-/// answers at its fixed address: here, one x402 was never placed on.
+/// ADR 0075 decision 1: the backend refuses to bind, by name, on a chain
+/// where no `x402BatchSettlement` is deployed at its fixed address: here,
+/// one x402 was never placed on.
 #[tokio::test]
-async fn binding_where_x402_batch_settlement_is_not_deployed_is_refused() {
+async fn binding_where_x402_batch_settlement_is_not_deployed_is_refused_by_name() {
     if !require_anvil() {
         return;
     }
     let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
-    let token = EvmSettlementBackend::deploy_mock_token(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, 0)
-        .await
-        .expect("a token");
-    let settlement = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("this node's settlement backend");
-    let Err(err) = settlement.batch_settlement(ONE_DAY).await else {
+    let token = connector_settlement_evm::test_support::deploy_plain_token(
+        &anvil.rpc_url,
+        DEPLOYER_PRIVATE_KEY,
+        0,
+    )
+    .await;
+    let Err(err) = EvmBatchSettlementBackend::connect(
+        &RpcTransport::direct(&anvil.rpc_url).expect("transport"),
+        DEPLOYER_PRIVATE_KEY,
+        token,
+        6,
+        ONE_DAY,
+    )
+    .await
+    else {
         panic!("bound where no x402BatchSettlement is deployed");
     };
     assert!(
-        matches!(&err, BatchSettlementError::Backend(message) if message.contains("no x402BatchSettlement")),
+        matches!(&err, BatchSettlementError::NotDeployed(what) if what.contains("x402BatchSettlement")),
+        "{err:?}"
+    );
+}
+
+/// A `decimals` the token disagrees with is refused rather than honoured as
+/// a line with no effect (issue #564).
+#[tokio::test]
+async fn a_decimals_the_token_disagrees_with_is_refused() {
+    if !require_anvil() {
+        return;
+    }
+    let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+    let mut x402 = X402Chain::place(&anvil.rpc_url).await;
+    let token = x402.deploy_fiat_token().await;
+    let Err(err) = EvmBatchSettlementBackend::connect(
+        &RpcTransport::direct(&anvil.rpc_url).expect("transport"),
+        DEPLOYER_PRIVATE_KEY,
+        token,
+        18,
+        ONE_DAY,
+    )
+    .await
+    else {
+        panic!("bound over a decimals the token disagrees with");
+    };
+    assert!(
+        matches!(&err, BatchSettlementError::Backend(message) if message.contains("decimals")),
         "{err:?}"
     );
 }

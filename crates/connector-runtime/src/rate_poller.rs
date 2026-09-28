@@ -552,9 +552,6 @@ mod tests {
     /// A real Raydium account address: a base58 32-byte pool name, which is
     /// all `canonical_pool` asks of a Solana pool.
     const POOL_SOL_DEALT_NUMERAIRE: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
-    /// The payment-channel program id `local/dealing` names -- a
-    /// `[settlement.solana]` table needs one, and nothing here dials it.
-    const SOL_PROGRAM_ID: &str = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR";
 
     fn asset(text: &str) -> AssetId {
         text.parse::<AssetId>().expect("a declared asset")
@@ -815,9 +812,10 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
 token_address = "{usdc}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
@@ -897,18 +895,19 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
 token_address = "{usdc}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
 
 [settlement.solana]
 rpc_url = "http://127.0.0.1:8899"
-program_id = "{program_id}"
 token_address = "{sol_numeraire}"
 decimals = 9
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key_file}"
@@ -939,7 +938,6 @@ max_move = {{ numerator = 5, denominator = 100 }}
             state_dir = state_dir.display(),
             key_file = key_file.display(),
             usdc = USDC.trim_start_matches("evm:"),
-            program_id = SOL_PROGRAM_ID,
             sol_numeraire = SOL_NUMERAIRE.trim_start_matches("solana:"),
             sol_numeraire_asset = SOL_NUMERAIRE,
             sol_dealt = SOL_DEALT,

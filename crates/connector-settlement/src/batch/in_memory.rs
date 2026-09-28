@@ -9,7 +9,7 @@ use super::port::{
     EvmReceiverTerms, OpenedChannel, OutboundChannelRecord, OutboundChannelState, ReceiverTerms,
     SolanaReceiverTerms, Voucher, VoucherSigner,
 };
-use crate::port::ChannelId;
+use crate::ChannelId;
 
 /// How the payer of a channel on this fake leaves it, which is the one place
 /// the two chains' lifecycles differ in a way the port can see.

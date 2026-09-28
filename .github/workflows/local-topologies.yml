@@ -96,9 +96,10 @@ jobs:
           sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.21/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
 
-      # A speed-up, and only that. `make local-up` builds the program through
-      # tools/solana/build-sbf.sh, which bootstraps $HOME/.cache/solana from
-      # cold; a miss here costs one platform-tools download.
+      # Since #1385 `make local-up` builds no SBF program at all -- the local
+      # validator loads only the committed payment-channels and p-token
+      # fixtures -- so this cache is unused here; it stays until #1386
+      # removes the program.
       #
       # It was not always only that, and the difference is the whole point of
       # the change that added this comment: this step's real job used to be

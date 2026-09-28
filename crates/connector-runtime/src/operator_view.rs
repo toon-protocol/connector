@@ -2,10 +2,10 @@
 //! here is exactly what [`crate::Connector`] hands back to a read handler --
 //! no method beyond what the handler serializes as-is.
 //!
-//! [`ChannelView`] gained real fields in #459, once a settlement backend
-//! existed for [`Connector`] to project channel state from. [`ClaimView`]
-//! gained real fields in #423, once `crate::claim::ClaimBook` existed to
-//! report on. [`PeerView`] gained its first field in #884, once
+//! [`ClaimView`] gained real fields in #423; since ADR 0075 (issue #1385)
+//! every row is an x402 voucher, read from the client edge's book or the
+//! outbound channels' (a `ChannelView` of TOON's own channels, and the peer
+//! book it reported, are deleted with them). [`PeerView`] gained its first field in #884, once
 //! [`Connector`] gained a runtime-mutable peer table to report on --
 //! before that it was a literal empty struct, since nothing in the
 //! runtime tracked peer identity at all (peer carriage credentials live
@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use connector_domain::{AssetId, Freshness, Price, Rate, RateLookup, RefusedRefresh};
-use connector_settlement::{ChannelState, ChannelStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::rate_table::SharedRateTable;
@@ -112,75 +111,6 @@ pub struct PeerRouteView {
     pub source: RouteSource,
 }
 
-/// A payment channel as seen by the operator surface (issue #459).
-/// `counterparty` is hex-encoded (`0x`-prefixed) since it is arbitrary
-/// bytes, not necessarily UTF-8 -- an EVM backend's is a 20-byte address,
-/// but the port itself (`connector_settlement::SettlementBackend::open`)
-/// takes an opaque `Vec<u8>`, so this view makes no assumption about its
-/// shape beyond "some bytes, safe to put in JSON".
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChannelView {
-    pub id: String,
-    pub counterparty: String,
-    pub status: ChannelViewStatus,
-    /// What the counterparty has deposited on their own side -- the
-    /// collateral backing claims this node can redeem. Keeps its name and
-    /// its meaning across issue #1118; what changed is that
-    /// `POST /channels/:id/fund` no longer moves it.
-    pub deposited: u128,
-    /// What this node has deposited on its own side -- the collateral
-    /// backing claims this node signs, and what
-    /// `POST /channels/:id/fund` raises (issue #1118). Added rather than
-    /// replacing `deposited`, so a reader of `GET /channels` sees both
-    /// halves of a two-sided channel instead of one number whose side
-    /// depended on who was asking.
-    pub own_deposited: u128,
-    pub redeemed: u128,
-}
-
-/// A channel's lifecycle status as reported over the operator surface --
-/// mirrors [`connector_settlement::ChannelStatus`] rather than reusing it
-/// directly, so this crate's read models stay serializable without
-/// requiring that of every port type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ChannelViewStatus {
-    Open,
-    /// Closed: its challenge period is running (or has elapsed but not yet
-    /// been settled) -- `redeem` still works against it (issue #574).
-    Closed,
-    /// Settled: terminal, no further `fund` or `redeem` is possible.
-    Settled,
-}
-
-impl From<ChannelState> for ChannelView {
-    fn from(state: ChannelState) -> Self {
-        ChannelView {
-            id: state.id.0,
-            counterparty: encode_hex(&state.counterparty),
-            status: match state.status {
-                ChannelStatus::Open => ChannelViewStatus::Open,
-                ChannelStatus::Closed => ChannelViewStatus::Closed,
-                ChannelStatus::Settled => ChannelViewStatus::Settled,
-            },
-            deposited: state.counterparty_deposited,
-            own_deposited: state.own_deposited,
-            redeemed: state.redeemed,
-        }
-    }
-}
-
-/// `0x`-prefixed lowercase hex -- the one encoding this crate uses whenever
-/// arbitrary bytes need to round-trip through JSON.
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut hex = String::with_capacity(2 + bytes.len() * 2);
-    hex.push_str("0x");
-    for byte in bytes {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    hex
-}
-
 /// A claim as seen by the operator surface (issue #423): one entry per
 /// direction per peering relation with a claim ever exchanged -- what this
 /// connector has claimed to the peer ([`ClaimDirection::Outbound`]) and
@@ -200,28 +130,20 @@ pub struct ClaimView {
     /// always `false` for an inbound claim, which is accepted or rejected
     /// the instant it is received, never left pending.
     pub pending: bool,
-    /// Which of this node's two claim books this entry came from (issue
-    /// #1218): [`ClaimBookKind::Peer`] for everything above, which is
-    /// always `crate::ClaimBook`'s own -- `connector-operator` is the one
-    /// caller that also merges in [`ClaimBookKind::Client`] entries, read
-    /// from `connector_client_edge::ClientClaimGate`, a second book this
-    /// crate has no dependency on and so cannot tag itself. An additive
-    /// field: every row this crate itself produces is `Peer`.
+    /// Which of this node's claim books this entry came from (issue
+    /// #1218): the client edge's ([`ClaimBookKind::Client`], vouchers
+    /// received) or the outbound channels' ([`ClaimBookKind::Outbound`],
+    /// vouchers signed).
     pub book: ClaimBookKind,
-    /// Which claim scheme the row's claims are: a `toon-channel` claim or
-    /// an x402 voucher (ADR 0075). The peer book holds only the former, as
-    /// history an older build's journal replays; the client book accepts
-    /// only vouchers since #1384, and reports a `toon-channel` row only for
-    /// a watermark such a journal left behind; the outbound channels' book
-    /// holds only vouchers.
+    /// Which claim scheme the row's claims are: always an x402 voucher
+    /// (ADR 0075). A `toon-channel` book is refused at boot (issue #1385),
+    /// so none is ever reported.
     pub scheme: ClaimScheme,
 }
 
-/// Which claim scheme a [`ClaimView`] row reports on.
+/// Which claim scheme a [`ClaimView`] row reports on: the one there is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClaimScheme {
-    #[serde(rename = "toon-channel")]
-    ToonChannel,
     /// An x402 `batch-settlement` voucher (ADR 0074, ADR 0075).
     #[serde(rename = "batch-settlement")]
     BatchSettlement,
@@ -236,15 +158,13 @@ pub enum ClaimDirection {
 }
 
 /// Which claim book a [`ClaimView`] was read out of (issue #1218): the
-/// peer semantics's own `crate::ClaimBook` -- since ADR 0075 (#1380) only
-/// the replay of a `peer-claims.log` an older build wrote -- or the client
-/// edge's `connector_client_edge::ClientClaimGate`, journaled separately to
-/// `client-edge-claims.log`. The two never merge; this field says which one
-/// a given row answers for, since `GET /claims` reads both.
+/// client edge's `connector_client_edge::ClientClaimGate`, journaled to
+/// `client-edge-claims.log`, or the outbound channels' own. The peer book,
+/// the replay of a `peer-claims.log` an older build wrote, is deleted: such
+/// a journal is refused at boot (ADR 0075 decision 8, issue #1385).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClaimBookKind {
-    Peer,
     Client,
     /// The vouchers this node signed on its own outbound x402 channels,
     /// journaled to `outbound-channels.log` (ADR 0075 decision 8).

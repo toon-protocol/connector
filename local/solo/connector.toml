@@ -72,9 +72,10 @@ write_keys_file = "/app/data/operator-write-keys"
 # `x402BatchSettlement` at its canonical address, on Solana solana-foundation's
 # `payment-channels` at `CHNLx...` -- both constants of the binary, and both
 # placed on the local chains by `infra/anvil/seed.sh` and
-# `infra/solana/entrypoint.sh`. The `batch_settlement` sub-tables turn both
-# halves of the port on: this node pays over its own outbound channels and is
-# paid over channels opened toward it.
+# `infra/solana/entrypoint.sh`. The node reads each at boot and refuses to
+# start on a chain without it. Both halves of the port are always on: this
+# node pays over its own outbound channels and is paid over channels opened
+# toward it.
 #
 # `token_address` is Circle's FiatToken v2.2, deployed by `infra/anvil/seed.sh`
 # from anvil's account 0 at nonce 1 -- deterministic, so committable. It is
@@ -82,24 +83,15 @@ write_keys_file = "/app/data/operator-write-keys"
 # `receiveWithAuthorization` signs under and so what the two `asset_eip712_*`
 # keys must say. `connect` reads its `decimals()` and refuses to start if 6 is
 # wrong (issue #564).
-#
-# `contract_address` is the one TOON fact left in this table: the connector on
-# this tree still BOOTS by resolving `getTokenNetwork(token_address)` through a
-# TokenNetworkRegistry and refuses to start when that is zero. The registry
-# `infra/anvil/seed.sh` deploys exists for that and nothing else -- no channel
-# is ever opened on it -- and both go with the boot dependency (#1385).
 [settlement.evm]
 rpc_url = "http://anvil:8545"
-contract_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
 token_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
-
-[settlement.evm.batch_settlement]
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
 
 # `token_address` is the deterministic mock mint from
 # `infra/solana/create-usdc-mint.sh`, seeded by `make solana-mint-usdc`, under
@@ -108,23 +100,14 @@ asset_eip712_version = "2"
 # loudly rather than warning, because a validator without this mint cannot
 # satisfy this line and the node will refuse to start.
 #
-# `program_id` is TOON's own payment-channel program, and the Solana twin of
-# `contract_address` above: still a boot requirement on this tree (#1385), so
-# `infra/solana/entrypoint.sh` still loads it at genesis under
-# `connector_settlement_solana::test_support::LOCAL_TEST_PROGRAM_ID`. No channel
-# is ever opened on it.
-#
 # `min_sponsored_deposit` is the smallest opening deposit this node's sponsor
 # endpoint co-signs an `open` for (ADR 0074 decision 9): a counterparty that
 # peers with this node posts its payer-signed `open` there.
 [settlement.solana]
 rpc_url = "http://solana-validator:8899"
-program_id = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR"
 token_address = "H8HSreUF2s8r8hem4qMttE3bWYCpFuh71jbuos5bA77H"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "/app/data/settlement-solana.key"
-
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = 1

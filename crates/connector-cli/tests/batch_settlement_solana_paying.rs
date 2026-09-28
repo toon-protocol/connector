@@ -147,7 +147,7 @@ impl World {
 
         let transport = RpcTransport::direct(&rpc_url).expect("rpc transport");
         let payer =
-            SolanaBatchSettlement::connect(&transport, &seed_of(&payer_key), mint, ONE_DAY, 1)
+            SolanaBatchSettlement::connect(&transport, &seed_of(&payer_key), mint, 6, ONE_DAY, 1)
                 .await
                 .expect("connect the paying node");
         let receiver = Arc::new(
@@ -155,6 +155,7 @@ impl World {
                 &transport,
                 &seed_of(&receiver_key),
                 mint,
+                6,
                 min_grace_period_secs,
                 MIN_SPONSORED_DEPOSIT,
             )
@@ -271,7 +272,7 @@ async fn solana_batch_settlement_upholds_the_paying_contract() {
                 Box::pin(async move {
                     let transport = RpcTransport::direct(&rpc_url).expect("rpc transport");
                     Arc::new(
-                        SolanaBatchSettlement::connect(&transport, &seed, mint, ONE_DAY, 1)
+                        SolanaBatchSettlement::connect(&transport, &seed, mint, 6, ONE_DAY, 1)
                             .await
                             .expect("reconnect the paying node"),
                     ) as Arc<dyn BatchSettlementPayer>

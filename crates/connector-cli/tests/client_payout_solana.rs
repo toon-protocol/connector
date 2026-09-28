@@ -26,7 +26,6 @@ use connector_runtime::receiver_terms;
 use connector_settlement::batch::BatchSettlementBackend;
 use connector_settlement_solana::test_support::{
     create_mint, fund, mint_to, require_solana_test_validator, SolanaValidator,
-    LOCAL_TEST_PROGRAM_ID,
 };
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -63,15 +62,13 @@ key_file = "{signer_key}"
 
 [settlement.solana]
 rpc_url = "{rpc_url}"
-program_id = "{LOCAL_TEST_PROGRAM_ID}"
 token_address = "{mint}"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{settlement_key}"
 
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = 1
 "#,
         state_dir = state_dir.path().display(),
         signer_key = signer_key.path().display(),

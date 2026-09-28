@@ -11,9 +11,6 @@
 //! read the latest voucher on each channel before they land it.
 //! The chain implementations are modules of `connector-settlement-evm` and
 //! `connector-settlement-solana`, held to the same suites.
-//!
-//! A separate port from [`SettlementBackend`](crate::SettlementBackend), and
-//! deliberately so: see [`BatchSettlementBackend`]'s own documentation.
 
 mod held;
 mod in_memory;

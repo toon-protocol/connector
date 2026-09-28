@@ -95,6 +95,7 @@ async fn world() -> World {
         &RpcTransport::direct(&validator.rpc_url).expect("rpc transport"),
         &seed_of(&sponsor),
         settled_mint,
+        6,
         ONE_DAY,
         1,
     )

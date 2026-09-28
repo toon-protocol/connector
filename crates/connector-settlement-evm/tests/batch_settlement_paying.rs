@@ -25,9 +25,7 @@ use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
-use connector_settlement_evm::{
-    DepositRoute, EvmBatchSettlementBackend, EvmSettlementBackend, RpcTransport,
-};
+use connector_settlement_evm::{DepositRoute, EvmBatchSettlementBackend, RpcTransport};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, Signature, H256};
 
@@ -73,13 +71,15 @@ impl Peering {
                 x402.mint(token, payer_address, FUNDED).await;
                 token
             }
-            Token::Plain => EvmSettlementBackend::deploy_mock_token(
-                &anvil.rpc_url,
-                DEPLOYER_PRIVATE_KEY,
-                FUNDED,
-            )
-            .await
-            .expect("a token with no EIP-3009, minted to the payer"),
+            // A token with no EIP-3009, minted to the payer.
+            Token::Plain => {
+                connector_settlement_evm::test_support::deploy_plain_token(
+                    &anvil.rpc_url,
+                    DEPLOYER_PRIVATE_KEY,
+                    FUNDED,
+                )
+                .await
+            }
         };
         let payer = build_node(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token).await;
         let receiver = build_node(&anvil.rpc_url, COUNTERPARTY_PRIVATE_KEY, token).await;
@@ -133,12 +133,15 @@ impl Peering {
 }
 
 async fn build_node(rpc_url: &str, key: &str, token: Address) -> EvmBatchSettlementBackend {
-    EvmSettlementBackend::deploy(rpc_url, key, token)
-        .await
-        .expect("a node's settlement backend")
-        .batch_settlement(ONE_DAY)
-        .await
-        .expect("its batch-settlement backend")
+    EvmBatchSettlementBackend::connect(
+        &RpcTransport::direct(rpc_url).expect("transport"),
+        key,
+        token,
+        6,
+        ONE_DAY,
+    )
+    .await
+    .expect("a node's batch-settlement backend")
 }
 
 fn hex32(text: &str) -> [u8; 32] {
@@ -214,42 +217,55 @@ async fn evm_batch_settlement_payer_upholds_the_paying_contract_over_permit2() {
 /// and the payer's account pays the opening deposit exactly once: the
 /// authorisation is the config's own, and the token spends it once, so
 /// whichever sending lands second reverts.
+///
+/// Each route is raced several times over one chain. The first race also
+/// races Permit2's one-time `approve`, so each node sends two writes and
+/// can take the nonce the other has just re-read (#1371); the later races
+/// race the deposit alone. The deterministic form of that collision is
+/// `send`'s own
+/// `a_nonce_taken_again_after_the_reseed_is_reseeded_again_and_the_write_lands_once`.
 #[tokio::test]
 async fn an_open_sent_twice_at_once_deposits_once_for_both_token_routes() {
     if !require_anvil() {
         return;
     }
+    // One race with the `approve` in it, then three of the deposit alone,
+    // at well under a second each.
+    const RACES: usize = 4;
     for token in [Token::FiatToken, Token::Plain] {
         let peering = Peering::spawn(token).await;
-        let before = peering.payer_balance().await;
-        let record = peering
-            .payer
-            .prepare_open(peering.terms(), 1_000)
-            .await
-            .expect("prepare");
-        let crashed = peering.node(DEPLOYER_PRIVATE_KEY).await;
-        let restarted = peering.node(DEPLOYER_PRIVATE_KEY).await;
-        let (first, second) = tokio::join!(
-            crashed.open_prepared(&record),
-            restarted.open_prepared(&record)
-        );
-        let (first, second) = (first.expect("first"), second.expect("second"));
-        assert_eq!(first.presentation, record.presentation());
-        assert_eq!(second.presentation, record.presentation());
-        assert_eq!(
-            peering.payer_balance().await,
-            before - 1_000,
-            "one record, one opening deposit"
-        );
-        assert_eq!(
-            restarted
-                .outbound_state(record.channel())
+        for race in 0..RACES {
+            let before = peering.payer_balance().await;
+            let record = peering
+                .payer
+                .prepare_open(peering.terms(), 1_000)
                 .await
-                .expect("state")
-                .on_chain
-                .collateral,
-            1_000
-        );
+                .expect("prepare");
+            let crashed = peering.node(DEPLOYER_PRIVATE_KEY).await;
+            let restarted = peering.node(DEPLOYER_PRIVATE_KEY).await;
+            let (first, second) = tokio::join!(
+                crashed.open_prepared(&record),
+                restarted.open_prepared(&record)
+            );
+            let first = first.unwrap_or_else(|error| panic!("race {race}: first: {error:?}"));
+            let second = second.unwrap_or_else(|error| panic!("race {race}: second: {error:?}"));
+            assert_eq!(first.presentation, record.presentation());
+            assert_eq!(second.presentation, record.presentation());
+            assert_eq!(
+                peering.payer_balance().await,
+                before - 1_000,
+                "race {race}: one record, one opening deposit"
+            );
+            assert_eq!(
+                restarted
+                    .outbound_state(record.channel())
+                    .await
+                    .expect("state")
+                    .on_chain
+                    .collateral,
+                1_000
+            );
+        }
     }
 }
 
@@ -504,18 +520,13 @@ async fn an_opening_deposit_that_lands_behind_a_lost_confirmation_is_kept() {
     let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
     let mut x402 = X402Chain::place(&anvil.rpc_url).await;
     let token = x402.deploy_fiat_token().await;
-    let settlement = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("the payer's settlement backend");
-    x402.mint(token, settlement.own_address(), FUNDED).await;
-    let receiver = EvmSettlementBackend::deploy(&anvil.rpc_url, COUNTERPARTY_PRIVATE_KEY, token)
-        .await
-        .expect("the receiver's settlement backend")
-        .batch_settlement(ONE_DAY)
-        .await
-        .expect("its batch-settlement backend");
+    let payer_own = LocalWallet::from_bytes(&hex32(DEPLOYER_PRIVATE_KEY))
+        .expect("key")
+        .address();
+    x402.mint(token, payer_own, FUNDED).await;
+    let receiver = build_node(&anvil.rpc_url, COUNTERPARTY_PRIVATE_KEY, token).await;
 
-    let payer_address = format!("{:?}", settlement.own_address());
+    let payer_address = format!("{payer_own:?}");
     let lying = FakeRpc::spawn_in_front_of(&anvil.rpc_url, move |call| {
         if call.method != "eth_getTransactionReceipt" {
             return RpcReply::Forward;
@@ -531,18 +542,15 @@ async fn an_opening_deposit_that_lands_behind_a_lost_confirmation_is_kept() {
         }))
     })
     .await;
-    let payer = EvmSettlementBackend::connect(
+    let payer = EvmBatchSettlementBackend::connect(
         &RpcTransport::direct(&lying.url()).expect("transport"),
         DEPLOYER_PRIVATE_KEY,
-        settlement.registry_address(),
         token,
         6,
+        ONE_DAY,
     )
     .await
-    .expect("the payer, over the lying endpoint")
-    .batch_settlement(ONE_DAY)
-    .await
-    .expect("its batch-settlement backend");
+    .expect("the payer, over the lying endpoint");
 
     let opened = payer
         .open(

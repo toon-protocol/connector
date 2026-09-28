@@ -61,7 +61,7 @@
 use libsecp256k1::{Message, RecoveryId, Signature as RawSignature};
 
 use crate::address::derive_evm_address;
-use crate::claim_signature::{keccak256, word_address, word_u64_be};
+use crate::eip712::{keccak256, word_address, word_u64_be};
 use crate::signer::PublicKeyBytes;
 use crate::Address;
 
@@ -301,8 +301,6 @@ pub fn verify_solana_voucher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claim_signature::{evm_balance_proof_digest, solana_balance_proof_message};
-    use crate::EvmBalanceProof;
     use ed25519_dalek::Signer as _;
     use libsecp256k1::{PublicKey, SecretKey};
     use proptest::prelude::*;
@@ -532,27 +530,6 @@ mod tests {
         ));
     }
 
-    /// A voucher's digest is not a balance proof's for any input, so neither
-    /// kind of signature can stand in for the other -- the domain name alone
-    /// separates them, before the struct does.
-    #[test]
-    fn a_voucher_digest_is_never_a_balance_proof_digest() {
-        let channel_id = evm_batch_channel_id(&fixture_domain(), &fixture_config());
-        let proof = EvmBalanceProof {
-            channel_id,
-            nonce: 0,
-            transferred_amount: 5_000,
-            locked_amount: 0,
-            locks_root: [0u8; 32],
-            chain_id: FIXTURE_CHAIN_ID,
-            token_network_address: X402_BATCH_SETTLEMENT_ADDRESS,
-        };
-        assert_ne!(
-            evm_voucher_digest(&fixture_domain(), &channel_id, 5_000),
-            evm_balance_proof_digest(&proof)
-        );
-    }
-
     // -- Solana: a vector from OpenSSL's Ed25519 --
     //
     // `openssl pkeyutl -sign -rawin` with the Ed25519 key whose 32-byte seed
@@ -637,16 +614,6 @@ mod tests {
                 "changing the {label} must invalidate the voucher"
             );
         }
-    }
-
-    /// Neither Solana message can be read as the other: a voucher is 50
-    /// bytes behind `0x5601`, a balance proof 96 behind `TOON-BALPROOF-V2`.
-    #[test]
-    fn a_voucher_message_is_never_a_balance_proof_message() {
-        let voucher = solana_voucher_message(&FIXTURE_SOLANA_CHANNEL, 5_000, 0);
-        let proof = solana_balance_proof_message(&[0u8; 32], &FIXTURE_SOLANA_CHANNEL, 0, 5_000);
-        assert_ne!(voucher.len(), proof.len());
-        assert_ne!(voucher[0..2], proof[0..2]);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use super::port::{
     BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, OutboundChannelRecord,
     ReceiverTerms, SolanaReceiverTerms, Voucher, VoucherSigner,
 };
-use crate::port::ChannelId;
+use crate::ChannelId;
 
 pub use super::in_memory::ChannelTerms;
 pub use super::port::OpenedChannel;

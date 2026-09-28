@@ -226,7 +226,7 @@ config names each half without opening either.
 peer_expose = "btp"
 state_dir = "/app/state"
 
-# [settlement.evm] ... and its [settlement.evm.batch_settlement] sub-table:
+# [settlement.evm] ..., which carries the chain's x402 terms:
 # both channel rows below are refused by name without it.
 
 [[peers]]
@@ -503,13 +503,13 @@ this document or the configuration spec.
 | `PeerChannelInvalidVoucherSigner`                                       | a `voucher_signer` that is neither `0x` + 40 hex nor base58 of 32 bytes                                                 | fix the value                                                                                     |
 | `PeerChannelInvalidInboundChannel`                                      | an `inbound_channel` that is not an x402 channel on the `voucher_signer`'s chain                                        | fix the value, or delete the line                                                                 |
 | `PeerChannelDuplicate`                                                  | one `voucher_signer` or `inbound_channel` on two `[[peer_channels]]` rows — which peering it proves would be file order | one signer, one peering: delete the duplicate                                                     |
-| `PeerChannelWithoutX402`                                                | a `[[peer_channels]]` row on a chain with no `[settlement.<chain>.batch_settlement]` sub-table                          | add the sub-table, or peer on a chain this node takes vouchers on                                 |
+| `PeerChannelWithoutX402`                                                | a `[[peer_channels]]` row on a chain with no `[settlement.<chain>]` table                                               | add the table, or peer on a chain this node takes vouchers on                                     |
 | `PeerChannelsWithoutStateDir`                                           | `[[peer_channels]]` with no `state_dir`                                                                                 | set `state_dir` and mount it                                                                      |
 | `PeerChannelToonFieldRemoved`                                           | a `[[peer_channels]]` row writing a `toon-channel` field (ADR 0075, issue #1380)                                        | drain the channel on the last TOON-capable release; rewrite the row                               |
 | `PayChannelUnbound`                                                     | a route whose next hop is a peering with no `[[pay_channels]]` row (ADR 0042, issue #1145)                              | open an outbound channel with `POST /channels` and add the row                                    |
 | `PayChannelOrphaned`                                                    | a `[[pay_channels]]` row naming a `peer_id` no `[[peers]]` entry configures                                             | fix the `peer_id` typo, or add the peer                                                           |
 | `PayChannelOutboundChannelMissing` / `PayChannelInvalidOutboundChannel` | a `[[pay_channels]]` row with no `outbound_channel`, or one that is not an x402 channel id or account                   | name the channel `POST /channels` answered                                                        |
-| `PayChannelWithoutX402`                                                 | a `[[pay_channels]]` row on a chain with no `[settlement.<chain>.batch_settlement]` sub-table                           | add the sub-table, or pay on a chain this node settles x402 on                                    |
+| `PayChannelWithoutX402`                                                 | a `[[pay_channels]]` row on a chain with no `[settlement.<chain>]` table                                                | add the table, or pay on a chain this node settles x402 on                                        |
 | `PayChannelInvalidClientEdgeUrl` / `PayChannelClientEdgeUrlScheme`      | a `client_edge_url` that is not a URL, or not `https://`                                                                | the peer's own `POST /ilp` URL                                                                    |
 | `PayChannelDuplicatePeer` / `PayChannelDuplicate`                       | one peering on two `[[pay_channels]]` rows, or one channel paying two                                                   | one peering, one outbound channel                                                                 |
 | `PayChannelsWithoutStateDir`                                            | `[[pay_channels]]` with no `state_dir`                                                                                  | set `state_dir` and mount it                                                                      |

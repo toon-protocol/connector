@@ -9,7 +9,7 @@
 //! production packet -- and the replacement carriages (BTP over `wss://`
 //! and ILP-over-HTTP over `https://`, issue #676) will be built behind this
 //! same trait. Everything above the port -- [`crate::Connector`]'s peer
-//! forwarding, [`crate::ClaimBook`], fees, routing -- is carriage-agnostic
+//! forwarding, its vouchers, fees, routing -- is carriage-agnostic
 //! and was untouched by that deletion.
 //!
 //! Until a carriage lands, [`InProcessPeerTransport`] is the only

@@ -31,9 +31,16 @@
 //! - **It accepted the transaction:** the nonce advances.
 //! - **It answered with an error** (a JSON-RPC error, so it definitely did
 //!   not take the transaction). A nonce conflict re-seeds from `pending` and
-//!   signs this same operation once more. That is not a resubmit, because
-//!   the operation was never accepted. Any other error is returned and
-//!   nothing was sent.
+//!   signs this same operation again. That is not a resubmit, because the
+//!   operation was never accepted. Another client on the same key can take
+//!   the fresh nonce too, between the `pending` read and the send (issue
+//!   #1371: two nodes opening one record, each sending an `approve` and a
+//!   `deposit`), so this repeats, up to [`MAX_NONCE_CONFLICTS`] refusals:
+//!   each one means some write on this key took the nonce, so the key is
+//!   moving and the bound only stops a key that never stops being raced.
+//!   The re-reads back off, so a lagging `pending` cannot use them all up
+//!   on one stale answer.
+//!   Any other error is returned and nothing was sent.
 //! - **The answer was lost** (a timeout, a reset, a refusal that outlasted
 //!   its retries). The transaction's hash is known before it is sent, so it
 //!   is looked up **by hash**. If the node does not have it, the **same
@@ -58,12 +65,23 @@ use std::time::{Duration, Instant};
 
 use connector_chain_rpc::evm::{answered, EvmRpc};
 use connector_chain_rpc::{retry_read, RpcTransport};
-use connector_settlement::SettlementError;
 use ethers::providers::{Middleware, Provider, ProviderError};
 use ethers::signers::{LocalWallet, Signer as EvmSigner};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::types::{Address, BlockNumber, TransactionReceipt, TxHash, U256, U64};
 use ethers::utils::keccak256;
+
+/// Why a write could not be sent, or was not confirmed: the one failure
+/// this module reports, carried as its message so a caller's
+/// `BatchSettlementError::Backend` reads it once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SendError(pub(crate) String);
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// How [`confirm`] paces itself and when it stops.
 #[derive(Debug, Clone, Copy)]
@@ -105,6 +123,16 @@ pub(crate) struct Sender {
     nonces: tokio::sync::Mutex<NonceState>,
 }
 
+/// How many nonce-conflict refusals one [`Sender::send`] takes before it
+/// gives up. Each refusal is another writer on this key taking the nonce
+/// between the `pending` read and the send, so two nodes racing a handful
+/// of writes needs a few; the bound stops a send that never wins.
+const MAX_NONCE_CONFLICTS: u32 = 8;
+
+/// The wait before the first re-read after a nonce conflict, doubled for
+/// each conflict after it: about 13s across all [`MAX_NONCE_CONFLICTS`].
+const NONCE_CONFLICT_BACKOFF: Duration = Duration::from_millis(50);
+
 /// The sender's nonce bookkeeping.
 #[derive(Default)]
 struct NonceState {
@@ -139,11 +167,11 @@ impl Sender {
     /// authorisation and a Permit2 transfer are each signed with when this
     /// node is the payer (ADR 0075 decision 3). The key stays here, beside
     /// the nonce it also signs transactions under, and is never handed out.
-    pub(crate) fn sign_digest(&self, digest: [u8; 32]) -> Result<[u8; 65], SettlementError> {
+    pub(crate) fn sign_digest(&self, digest: [u8; 32]) -> Result<[u8; 65], SendError> {
         let signature = self
             .wallet
             .sign_hash(ethers::types::H256::from(digest))
-            .map_err(|error| SettlementError::Backend(error.to_string()))?;
+            .map_err(|error| SendError(error.to_string()))?;
         let bytes: [u8; 65] = signature.into();
         Ok(bytes)
     }
@@ -154,10 +182,10 @@ impl Sender {
     pub(crate) async fn send(
         &self,
         mut transaction: TypedTransaction,
-    ) -> Result<TxHash, SettlementError> {
+    ) -> Result<TxHash, SendError> {
         let own = self.wallet.address();
         let mut nonces = self.nonces.lock().await;
-        let mut reseeded = false;
+        let mut conflicts = 0u32;
         loop {
             let nonce = match nonces.next {
                 Some(nonce) => nonce,
@@ -171,12 +199,12 @@ impl Sender {
             self.provider
                 .fill_transaction(&mut transaction, None)
                 .await
-                .map_err(|error| SettlementError::Backend(error.to_string()))?;
+                .map_err(|error| SendError(error.to_string()))?;
             let signature = self
                 .wallet
                 .sign_transaction(&transaction)
                 .await
-                .map_err(|error| SettlementError::Backend(error.to_string()))?;
+                .map_err(|error| SendError(error.to_string()))?;
             let raw = transaction.rlp_signed(&signature);
             let hash = TxHash::from(keccak256(&raw));
 
@@ -194,14 +222,20 @@ impl Sender {
                     // the local count is still right is another matter, so
                     // the next write reads `pending` again.
                     nonces.next = None;
-                    if nonce_conflict(&error) && !reseeded {
+                    if nonce_conflict(&error) && conflicts < MAX_NONCE_CONFLICTS {
                         // Never accepted, so signing it again at a fresh
                         // `pending` nonce is this operation's first send,
                         // not a second one.
-                        reseeded = true;
+                        // Backed off, so a `pending` that lags the chain
+                        // (a load-balanced endpoint) has time to catch up
+                        // rather than spending every re-read on one stale
+                        // answer.
+                        tokio::time::sleep(failure_backoff(NONCE_CONFLICT_BACKOFF, conflicts))
+                            .await;
+                        conflicts += 1;
                         continue;
                     }
-                    return Err(SettlementError::Backend(format!(
+                    return Err(SendError(format!(
                         "transaction {hash:#x} was refused by the node and never sent: {error}"
                     )));
                 }
@@ -235,7 +269,7 @@ impl Sender {
     /// write takes the nonce after it. That is what keeps a lagging
     /// backend's `pending` from rewinding the count onto a nonce that may
     /// already carry a transaction.
-    async fn seed_nonce(&self, nonces: &mut NonceState) -> Result<U256, SettlementError> {
+    async fn seed_nonce(&self, nonces: &mut NonceState) -> Result<U256, SendError> {
         let own = self.wallet.address();
         let pending = retry_read(|| {
             self.provider
@@ -243,7 +277,7 @@ impl Sender {
         })
         .await
         .map_err(|error| {
-            SettlementError::Backend(format!(
+            SendError(format!(
                 "could not read this account's pending nonce: {error}"
             ))
         })?;
@@ -300,7 +334,7 @@ pub(crate) async fn confirm(
     provider: &Provider<EvmRpc>,
     hash: TxHash,
     policy: ConfirmPolicy,
-) -> Result<TransactionReceipt, SettlementError> {
+) -> Result<TransactionReceipt, SendError> {
     let started = Instant::now();
     let mut observed = false;
     // When polls began answering "not found" without a failure in between.
@@ -314,7 +348,7 @@ pub(crate) async fn confirm(
         match provider.get_transaction_receipt(hash).await {
             Ok(Some(receipt)) => {
                 if receipt.status == Some(U64::zero()) {
-                    return Err(SettlementError::Backend(format!(
+                    return Err(SendError(format!(
                         "transaction {:#x} reverted on chain",
                         receipt.transaction_hash
                     )));
@@ -355,7 +389,7 @@ pub(crate) async fn confirm(
 
         let unseen_for = unseen_since.map(|since| since.elapsed());
         if !observed && unseen_for.is_some_and(|unseen| unseen >= policy.unobserved) {
-            return Err(SettlementError::Backend(format!(
+            return Err(SendError(format!(
                 "transaction {hash:#x} was not observed: this endpoint answered 'not found' for \
                  {}s -- this is not proof it was dropped, only that this endpoint has not \
                  confirmed it yet; check its status by hash (a block explorer or a fresh \
@@ -371,7 +405,7 @@ pub(crate) async fn confirm(
             } else {
                 "could not be confirmed"
             };
-            return Err(SettlementError::Backend(format!(
+            return Err(SendError(format!(
                 "transaction {hash:#x} {seen} within {}s (last RPC error: {last_error}); it may \
                  still mine, so check its status by hash before resubmitting, since a retry of a \
                  transaction that later mines is a double spend",
@@ -400,7 +434,7 @@ pub(crate) fn failure_backoff(poll: Duration, failures: u32) -> Duration {
 /// [`FakeRpc`]: connector_chain_rpc::FakeRpc
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use connector_chain_rpc::{FakeRpc, RpcReply};
     use ethers::types::TransactionRequest;
@@ -474,10 +508,7 @@ mod tests {
         let (provider, _) = sender(&anvil.rpc_url);
         let hash = TxHash::from_low_u64_be(1);
 
-        let SettlementError::Backend(message) = confirm(&provider, hash, FAST).await.unwrap_err()
-        else {
-            panic!("expected SettlementError::Backend");
-        };
+        let SendError(message) = confirm(&provider, hash, FAST).await.unwrap_err();
         assert!(!message.contains("dropped before mining"), "{message}");
         assert!(message.contains("not observed"), "{message}");
         assert!(message.contains(&format!("{hash:#x}")), "{message}");
@@ -658,5 +689,49 @@ mod tests {
             .await
             .expect("a nonce conflict re-reads pending rather than failing the write");
         confirm(&provider, hash, FAST).await.expect("confirm");
+    }
+
+    /// Issue #1371: two nodes on one key each send more than one write, so
+    /// the nonce this sender re-read after its first refusal is taken by the
+    /// other node before its send arrives, and is refused again. Modelled by
+    /// an endpoint whose `pending` trails the chain by what the other node
+    /// sent in the window: it answers each of the first two reads with a
+    /// nonce the chain has already spent. Every refusal is the real chain's.
+    /// The write still lands, once, at the next free nonce.
+    #[tokio::test]
+    async fn a_nonce_taken_again_after_the_reseed_is_reseeded_again_and_the_write_lands_once() {
+        if !require_anvil() {
+            return;
+        }
+        let anvil = Anvil::spawn(19_650).await;
+        // The other node's writes: nonces 0, 1 and 2 spent.
+        let (other_provider, other) = sender(&anvil.rpc_url);
+        for _ in 0..3 {
+            let hash = other.send(self_transfer(&other)).await.expect("send");
+            confirm(&other_provider, hash, FAST).await.expect("confirm");
+        }
+        let reads = AtomicU32::new(0);
+        let raced = FakeRpc::spawn_in_front_of(&anvil.rpc_url, move |call| {
+            if call.method == "eth_getTransactionCount" {
+                match reads.fetch_add(1, Ordering::SeqCst) {
+                    0 => return RpcReply::Result(serde_json::json!("0x1")),
+                    1 => return RpcReply::Result(serde_json::json!("0x2")),
+                    _ => {}
+                }
+            }
+            RpcReply::Forward
+        })
+        .await;
+        let (provider, sender) = sender(&raced.url());
+        let hash = sender
+            .send(self_transfer(&sender))
+            .await
+            .expect("a nonce taken twice is re-read twice, not a failed write");
+        confirm(&provider, hash, FAST).await.expect("confirm");
+        assert_eq!(
+            nonce_on_chain(&anvil, sender.address()).await,
+            U256::from(4),
+            "sent once, at the free nonce"
+        );
     }
 }

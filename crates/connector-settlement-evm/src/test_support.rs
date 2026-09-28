@@ -12,9 +12,19 @@ pub mod x402;
 
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ethers::providers::{Http, Middleware, Provider};
+use ethers::signers::{LocalWallet, Signer};
+use ethers::types::{Address, U256};
+
+mod mock_erc20 {
+    // A plain, mintable ERC-20 with no EIP-3009 (`contracts/MockERC20.sol`):
+    // the token a test needs when its subject is the Permit2 deposit route,
+    // or any token that is not Circle's FiatToken.
+    ethers::contract::abigen!(MockErc20, "./contracts/MockERC20.json");
+}
 
 /// Anvil's first well-known dev account -- the same one
 /// `packages/contracts/script/DeployLocal.s.sol` already uses as its
@@ -24,17 +34,10 @@ pub const DEPLOYER_PRIVATE_KEY: &str =
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
 /// Anvil's *second* well-known dev account (`0x7099…79C8`), genesis-funded
-/// with ETH exactly like [`DEPLOYER_PRIVATE_KEY`].
-///
-/// Needed once `SettlementBackend::fund` became a self-deposit (issue
-/// #1118): a test that wants collateral on **both** sides of a channel now
-/// needs two identities that can each sign for themselves, and they cannot
-/// be the same address. Two `EvmSettlementBackend`s built for one address
-/// count two independent local nonces over one nonce sequence, so the
-/// second one to write is refused `nonce too low` and has to re-read
-/// `pending` (ADR 0073) -- which is not a path a test should lean on for its
-/// counterparty, since on a real chain the counterparty is a different
-/// party with a different key anyway.
+/// with ETH exactly like [`DEPLOYER_PRIVATE_KEY`]: the other node of a test
+/// that needs two, each signing for itself. Two backends built for one
+/// address count two independent local nonces over one nonce sequence, so
+/// a test's counterparty is a different key, as it is on a real chain.
 pub const COUNTERPARTY_PRIVATE_KEY: &str =
     "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 
@@ -69,6 +72,66 @@ pub fn require_anvil() -> bool {
          needs a real chain and only skips because this is not a CI run"
     );
     false
+}
+
+/// Deploy a plain, mintable 6-decimal ERC-20 with no EIP-3009
+/// (`contracts/MockERC20.sol`) from `private_key`, minting
+/// `mint_to_deployer` of it to that key's own address, and return its
+/// address. Never used against a real chain.
+pub async fn deploy_plain_token(
+    rpc_url: &str,
+    private_key: &str,
+    mint_to_deployer: u128,
+) -> Address {
+    let provider = Provider::<Http>::try_from(rpc_url).expect("provider");
+    let chain_id = provider.get_chainid().await.expect("chain id").as_u64();
+    let wallet: LocalWallet = private_key.parse().expect("key");
+    let wallet = wallet.with_chain_id(chain_id);
+    let owner = wallet.address();
+    let client = Arc::new(ethers::middleware::SignerMiddleware::new(provider, wallet));
+    let token = mock_erc20::MockErc20::deploy(
+        Arc::clone(&client),
+        ("USD Coin (mock)".to_string(), "USDC".to_string(), 6u8),
+    )
+    .expect("deploy transaction")
+    .send()
+    .await
+    .expect("deploy MockERC20");
+    if mint_to_deployer > 0 {
+        token
+            .mint(owner, U256::from(mint_to_deployer))
+            .send()
+            .await
+            .expect("send mint")
+            .await
+            .expect("mint");
+    }
+    token.address()
+}
+
+/// Mint `amount` of a [`deploy_plain_token`] token to `owner`, signed by
+/// any funded key (the mock's `mint` is ungated).
+pub async fn mint_plain_token(
+    rpc_url: &str,
+    private_key: &str,
+    token: Address,
+    owner: Address,
+    amount: u128,
+) {
+    let provider = Provider::<Http>::try_from(rpc_url).expect("provider");
+    let chain_id = provider.get_chainid().await.expect("chain id").as_u64();
+    let wallet: LocalWallet = private_key.parse().expect("key");
+    let client = Arc::new(ethers::middleware::SignerMiddleware::new(
+        provider,
+        wallet.with_chain_id(chain_id),
+    ));
+    mock_erc20::MockErc20::new(token, client)
+        .mint(owner, U256::from(amount))
+        .send()
+        .await
+        .expect("send mint")
+        .await
+        .expect("mint");
 }
 
 static NEXT_PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
@@ -108,9 +171,7 @@ impl Anvil {
             .arg(chain_id.to_string())
             .args([
                 // Two genesis accounts, not one: `DEPLOYER_PRIVATE_KEY` and
-                // `COUNTERPARTY_PRIVATE_KEY`. A channel is two-sided and
-                // `fund` is a self-deposit (issue #1118), so a test that
-                // wants collateral on both sides needs both identities to
+                // `COUNTERPARTY_PRIVATE_KEY`, so a test's two nodes each
                 // hold ETH for their own gas.
                 "--accounts",
                 "2",

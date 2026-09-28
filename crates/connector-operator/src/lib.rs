@@ -74,7 +74,6 @@ pub mod test_support {
     pub use crate::signing::{compute_content_digest, keyid_hex, sign_request};
 }
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -330,34 +329,13 @@ async fn leased_routes(State(state): State<OperatorState>) -> Json<Vec<LeasedRou
     Json(state.connector.leased_routes())
 }
 
-/// `GET /channels`: every channel this node opened itself
-/// ([`Connector::channels`]) plus every client channel it has merely
-/// recognized (issue #1218) -- a channel the counterparty opened, which
-/// [`Connector::channels`] structurally cannot list, since nothing about
-/// it is in [`Connector`]'s own `known_channels`. A recognized channel this
-/// node also happens to have opened (unusual, but not impossible) is not
-/// duplicated.
-///
-/// Then every x402 `batch-settlement` channel (ADR 0075 decision 11):
-/// inbound ones this node holds a voucher on and outbound ones it opened,
-/// each with its `direction`, `collateral`, `watermark` and `status`, and
-/// `scheme: "batch-settlement"` to tell them from the `toon-channel` rows
-/// above, which carry none of those fields.
+/// `GET /channels`: every x402 `batch-settlement` channel (ADR 0075
+/// decision 11) -- inbound ones this node holds a voucher on and outbound
+/// ones it opened, each with its `direction`, `collateral`, `watermark` and
+/// `status`. TOON's own channels, which this list used to lead with, are
+/// deleted (issue #1385).
 async fn channels(State(state): State<OperatorState>) -> Json<Vec<serde_json::Value>> {
-    let mut toon = state.connector.channels().await;
-    let already_listed: HashSet<String> = toon.iter().map(|view| view.id.clone()).collect();
-    for channel_id in state.connector.recognized_channel_ids() {
-        if already_listed.contains(&channel_id) {
-            continue;
-        }
-        if let Ok(view) = state.connector.channel_view(&channel_id).await {
-            toon.push(view);
-        }
-    }
-    let mut views: Vec<serde_json::Value> = toon
-        .iter()
-        .map(|view| serde_json::to_value(view).expect("a channel view serializes"))
-        .collect();
+    let mut views = Vec::new();
     if let Some(batch) = &state.batch {
         views.extend(
             batch
@@ -370,45 +348,29 @@ async fn channels(State(state): State<OperatorState>) -> Json<Vec<serde_json::Va
     Json(views)
 }
 
-/// `GET /claims`: every claim the peer semantics's own book holds
-/// ([`Connector::claims`]) plus every claim the client edge's own book
-/// holds (issue #1218) -- money a payer proved at `POST /ilp` and this
-/// node journaled to `client-edge-claims.log`, invisible here before this
-/// endpoint also read that book. `book` on each row says which one it came
-/// from; a client-edge entry is always inbound and never pending, the same
-/// as an inbound peer-book entry.
-///
-/// `direction` and `scheme` on every row say which way it pays and whether
-/// it is a `toon-channel` claim or an x402 voucher (ADR 0075 decision 11):
-/// vouchers received are the client book's `batch-settlement` rows, and
-/// vouchers signed are the outbound channels' own book, one row per
-/// channel at the highest amount signed on it.
+/// `GET /claims`: every voucher this node holds -- those received, the
+/// client edge's book (issue #1218), journaled to `client-edge-claims.log`,
+/// and those signed, the outbound channels' own book, one row per channel
+/// at the highest amount signed on it (ADR 0075 decision 11). `book` on
+/// each row says which one it came from; a received voucher is always
+/// inbound and never pending.
 async fn claims(State(state): State<OperatorState>) -> Json<Vec<ClaimView>> {
-    let mut views = state.connector.claims();
-    let vouchers: HashSet<String> = state
+    let mut views: Vec<ClaimView> = state
         .claim_gate
-        .batch_channels()
+        .accepted_channels()
         .into_iter()
-        .map(|channel| channel.channel_key())
-        .collect();
-    views.extend(state.claim_gate.accepted_channels().into_iter().map(
-        |(channel_id, watermark)| ClaimView {
-            scheme: if vouchers.contains(&channel_id) {
-                ClaimScheme::BatchSettlement
-            } else {
-                ClaimScheme::ToonChannel
-            },
+        .map(|(channel_id, watermark)| ClaimView {
+            scheme: ClaimScheme::BatchSettlement,
             peer_id: None,
             channel_id,
             direction: ClaimDirection::Inbound,
-            // A voucher has no nonce (ADR 0075 decision 8); a `toon-channel`
-            // row a pre-ADR 0075 journal left is replayed by amount alone.
+            // A voucher has no nonce (ADR 0075 decision 8).
             nonce: connector_domain::VOUCHER_WATERMARK_NONCE,
             cumulative_amount: watermark.cumulative_amount,
             pending: false,
             book: ClaimBookKind::Client,
-        },
-    ));
+        })
+        .collect();
     if let Some(batch) = &state.batch {
         views.extend(batch.outbound().claims());
     }

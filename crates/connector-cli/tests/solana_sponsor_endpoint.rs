@@ -41,7 +41,6 @@ use connector_settlement_solana::batch::wire::{
 };
 use connector_settlement_solana::test_support::{
     create_mint, fund, mint_to, require_solana_test_validator, send, BatchPayer, SolanaValidator,
-    LOCAL_TEST_PROGRAM_ID,
 };
 use connector_signer::PublicKeyBytes;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
@@ -217,15 +216,12 @@ key_file = "{signer_key}"
 
 [settlement.solana]
 rpc_url = "{rpc_url}"
-program_id = "{LOCAL_TEST_PROGRAM_ID}"
 token_address = "{mint}"
 decimals = 6
+min_sponsored_deposit = {MIN_SPONSORED_DEPOSIT}
 
 [settlement.solana.key]
 key_file = "{settlement_key}"
-
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = {MIN_SPONSORED_DEPOSIT}
 
 [[routes]]
 prefix = "{ROUTE}"
