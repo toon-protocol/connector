@@ -235,8 +235,8 @@ refused at config load by name — the node does not start. The row names that
 outbound channel (open it first with `POST /channels`; a row naming a channel
 this node did not open stops the node at boot) and the peer's `POST /ilp`
 URL. A peering this node only _accepts_ on needs no such row; the requirement
-is keyed on the route. Both rows need the chain's
-`[settlement.<chain>.batch_settlement]` sub-table and `state_dir`.
+is keyed on the route. Both rows need the chain's `[settlement.<chain>]`
+table and `state_dir`.
 
 That key became required rather than optional, which by ADR 0009 makes it a
 **breaking deploy**: land the config carrying the row first, then move the
@@ -270,22 +270,25 @@ A packet routed to a peer this node cannot dial is still answered
 
 ## 4b. (Optional) settlement
 
-Omit `[settlement]` entirely and the node routes and charges normally, but
-every channel operation on the operator surface answers `503` — there is no
-backend to run it. Configure it and the node resolves the
-`TokenNetworkRegistry` at `contract_address` **at startup**, so a wrong RPC
-URL or a registry that does not answer `getTokenNetwork(token)` is an
-exit-1, not a runtime surprise. Only `chain = "evm"` is accepted today.
+Omit `[settlement]` entirely and the node settles on no chain, so it takes no
+claim at all -- every claim is an x402 voucher (ADR 0075). Configure
+`[settlement.evm]` and/or `[settlement.solana]` -- an `rpc_url`, a
+`token_address`, its `decimals`, the chain's x402 terms and a key table (see
+`docs/protocol/configuration-spec.md` §2.1) -- and the node reads the chain
+**at startup**: a chain without `x402BatchSettlement` (EVM) or
+`payment-channels` (Solana), or a token whose `decimals` disagree, is an
+exit-1, not a runtime surprise. There is no contract or program to name; both
+are constants of the binary, and `contract_address`/`program_id` are refused
+by name (#1385).
 
-`infra/linode-store/connector-rust.toml` carries a commented, annotated
-`[settlement]` block to copy from; `crates/connector-bin/tests/devnet_configs_load.rs`
-boots exactly that block against a freshly deployed registry on anvil, so it
-is a template that is known to load.
+`infra/linode-store/connector-rust.toml` carries an annotated settlement block
+to copy from; `crates/connector-bin/tests/devnet_configs_load.rs` boots its EVM
+leg against anvil with x402 placed, so it is a template that is known to load.
 
 ## 4c. Durable claim state
 
 `connector.toml` sets `state_dir = "/app/state"`. That directory holds the
-append-only claim journals — `client-edge-claims.log` and `peer-claims.log` —
+append-only journals — `client-edge-claims.log` and `outbound-channels.log` —
 whose replay is what makes a claim's **replay watermark** survive a restart.
 Without it the watermarks live only in process memory: a restart resets every
 channel to "no claim ever seen", and a channel with no watermark accepts any

@@ -81,19 +81,16 @@ committed bytes the tier-3 tests place:
   copied. p-token is there because the bundled SPL Token refuses the `Batch` a
   two-payout `distribute` sends (#1358).
 
-**One TOON deployment is left on each chain, and no channel is ever opened on
-it.** The connector on this tree still BOOTS through `[settlement.evm]
-contract_address` (it resolves `getTokenNetwork(token_address)` and refuses to
-start when that is zero) and `[settlement.solana] program_id` (it checks the
-program is executable). So anvil still carries a `TokenNetworkRegistry` with a
-`TokenNetwork` for the FiatToken, deployed from the committed registry bytecode,
-and the validator still loads TOON's `payment_channel.so`. Both go with that boot
-dependency (#1385). There is no `MockERC20`, no ERC-2771 forwarder and no
-`RollingSwapChannel` on the local chain any more, and nothing runs `forge`.
+**No TOON deployment is left on either chain.** A node boots only where the
+x402 contract or program is deployed, and refuses by name where it is not (ADR
+0075 decision 1, #1385), so anvil carries no `TokenNetworkRegistry`,
+`TokenNetwork`, `MockERC20`, ERC-2771 forwarder or `RollingSwapChannel`, the
+validator loads no `payment_channel.so`, and nothing runs `forge` or
+`cargo build-sbf`.
 
-anvil's healthcheck waits on the **last** contract the seed creates, and the
-seed runs under `set -e` in its own process, so a healthy anvil is a fully
-seeded one. A failed seed leaves anvil serving an empty chain that never turns
+anvil's healthcheck waits on the **last** step the seed takes -- account 1
+becoming USDC's minter -- and the seed runs under `set -e` in its own process,
+so a healthy anvil is a fully seeded one. A failed seed leaves anvil serving an empty chain that never turns
 healthy, with the reason in its log.
 
 ## Topologies

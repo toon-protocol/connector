@@ -319,15 +319,10 @@ jobs:
           sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.21/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
 
-      # connector-settlement-solana's test harness builds packages/solana-program with
-      # the pinned platform-tools line when target/deploy/payment_channel.so is not
-      # already in the cached `target` dir (issue #567) -- cache the platform-tools
-      # install exactly like the solana-program job below does, so a workspace-cache miss
-      # doesn't also re-download the SBF toolchain inside a test run.
-      #
-      # A speed-up, not a dependency: the harness builds through
-      # tools/solana/build-sbf.sh, which bootstraps $HOME/.cache/solana from cold.
-      # A miss here costs a download, not a red job.
+      # A speed-up only, and since #1385 an unused one for this job: the test harness
+      # no longer builds or loads packages/solana-program (its validator loads the
+      # committed payment-channels and p-token fixtures). The step stays until #1386
+      # removes the program and the jobs that build it.
       - name: Cache Solana platform-tools
         uses: actions/cache@v4
         with:
