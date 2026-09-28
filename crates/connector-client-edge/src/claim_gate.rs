@@ -371,16 +371,25 @@ pub struct ClientClaimGate {
     /// every constructor's default -- pays nothing. Never consulted on the
     /// admission path: a payout nets against nothing.
     payout_ledger: Option<Arc<ClientPayoutLedger>>,
-    /// A client session's bound ILP address -> the key its payouts are
-    /// paid to (issues #787, #1381). A BTP session is keyed by ILP address
-    /// (issue #736/toon-client#503), so nothing else joins "which session
-    /// earned this fulfilment" to "which channel pays it".
-    /// [`Self::record_session_payee`] is the only writer, and each of its
-    /// callers has verified a signature by that key first -- never a
-    /// session's own say-so. Best-effort and non-durable, like
-    /// [`Self::last_claim_seen`]: the next accepted voucher or verified
-    /// challenge from that session teaches it again.
-    session_payees: RwLock<HashMap<String, VoucherSigner>>,
+    /// Each live client session's payee, keyed by the **authenticated
+    /// session** -- the generation `SessionRegistry::bind` issued it -- never
+    /// by the ILP address alone (issues #787, #1381, #1396). A session's
+    /// `peerId` is its own say-so; nothing verifies it, and two sockets can
+    /// declare the same one. Keyed by address, whatever key the latest
+    /// socket to declare an address proved decided where every session at
+    /// that address was paid; keyed by generation, what a session proves is
+    /// visible to that session alone.
+    ///
+    /// [`Self::open_session`] creates a session's slot, empty, when it
+    /// binds; [`Self::record_session_payee`] fills it, and each of its
+    /// callers has verified a signature by the key first; and
+    /// [`Self::close_session`] removes it when the session unbinds. A record
+    /// for a session that is not open -- one that has already closed, whose
+    /// voucher finished its durability wait afterwards, say -- is dropped,
+    /// so nothing here outlives its session. Best-effort and non-durable,
+    /// like [`Self::last_claim_seen`]: a reconnecting client proves its key
+    /// again, by voucher or by `channelChallenge`, on its new session.
+    session_payees: RwLock<HashMap<u64, SessionPayee>>,
     /// The voucher signer of every batch-settlement channel this gate has
     /// accepted a voucher on since it started, by canonical key: read from
     /// the chain when the voucher was verified, never from the voucher. How
@@ -405,6 +414,14 @@ pub struct ClientClaimGate {
     ///
     /// Wherever both are held, this lock is taken after [`Self::watermarks`].
     batch_channels: RwLock<HashMap<String, JournaledBatchChannel>>,
+}
+
+/// One client session's slot in [`ClientClaimGate`]'s payee map (issue
+/// #1396): the address it bound at, and the payee it has proved, if any.
+#[derive(Debug)]
+struct SessionPayee {
+    address: String,
+    payee: Option<VoucherSigner>,
 }
 
 impl ClientClaimGate {
@@ -484,67 +501,136 @@ impl ClientClaimGate {
         self.payout_ledger.as_ref()
     }
 
-    /// Learn that `address` -- a client session's own bound ILP address --
-    /// is paid at `payee`, the key a payout channel toward it names as
-    /// receiver. Every caller has verified a signature by `payee` first:
-    /// `crate::btp::record_accepted_claim`, once [`Self::admit`] has
-    /// accepted a voucher whose channel's voucher signer is `payee`, and
-    /// `crate::btp::verify_and_record_declared_channel`, once a session's
-    /// voucher claim-state challenge at BTP auth has verified against
-    /// `payee`, its channel's voucher signer as the chain records it (issues
-    /// #790, #1384). Overwrites any previous association: a best-current
-    /// belief, not a ledger.
-    pub(crate) fn record_session_payee(&self, address: &str, payee: VoucherSigner) {
+    /// Open the payee slot of the client session `generation` just bound at
+    /// `address` -- empty: a new session is paid nowhere until it proves a
+    /// key on itself (issue #1396), whatever an earlier session at the same
+    /// address proved. Called from the BTP auth branch, right after
+    /// `SessionRegistry::bind` issued `generation`.
+    pub(crate) fn open_session(&self, address: &str, generation: u64) {
         self.session_payees
             .write()
             .expect("session payee map lock poisoned")
-            .insert(address.to_string(), payee);
+            .insert(
+                generation,
+                SessionPayee {
+                    address: address.to_string(),
+                    payee: None,
+                },
+            );
     }
 
-    /// The payee [`Self::record_session_payee`] associated with `address`.
-    pub(crate) fn session_payee(&self, address: &str) -> Option<VoucherSigner> {
+    /// Close the payee slot [`Self::open_session`] opened for `generation`:
+    /// called wherever the BTP session calls `SessionRegistry::unbind` for
+    /// the same pair. Generations are never reused, so closing a superseded
+    /// session touches nothing the session that superseded it learned.
+    pub(crate) fn close_session(&self, address: &str, generation: u64) {
+        let mut payees = self
+            .session_payees
+            .write()
+            .expect("session payee map lock poisoned");
+        if payees
+            .get(&generation)
+            .is_some_and(|slot| slot.address == address)
+        {
+            payees.remove(&generation);
+        }
+    }
+
+    /// Learn that the client session `generation`, bound at `address`, is
+    /// paid at `payee`, the key a payout channel toward it names as
+    /// receiver. Every caller has verified a signature by `payee` first, on
+    /// this same session: `crate::btp::record_accepted_claim`, once
+    /// [`Self::admit`] has accepted a voucher whose channel's voucher signer
+    /// is `payee`, and `crate::btp::verify_and_record_declared_channel`,
+    /// once a voucher claim-state challenge at BTP auth has verified against
+    /// `payee`, its channel's voucher signer as the chain records it (issues
+    /// #790, #1384).
+    ///
+    /// Scoped to the session (issue #1396): it never changes any other
+    /// session's payee, another session's at the same address included.
+    /// Within the session, the latest proof wins. A session that is not
+    /// open learns nothing. `true` if this changed the session's payee --
+    /// the signal that a payout already owed to `payee` may now be
+    /// deliverable to this session.
+    pub(crate) fn record_session_payee(
+        &self,
+        address: &str,
+        generation: u64,
+        payee: VoucherSigner,
+    ) -> bool {
+        let mut payees = self
+            .session_payees
+            .write()
+            .expect("session payee map lock poisoned");
+        match payees.get_mut(&generation) {
+            Some(slot) if slot.address == address => slot.payee.replace(payee) != Some(payee),
+            _ => false,
+        }
+    }
+
+    /// The payee the client session `generation`, bound at `address`, has
+    /// proved -- `None` for a session that proved none, one that has closed,
+    /// or a generation that was never bound at `address`. There is no
+    /// lookup by address alone (issue #1396).
+    pub(crate) fn session_payee(&self, address: &str, generation: u64) -> Option<VoucherSigner> {
         self.session_payees
             .read()
             .expect("session payee map lock poisoned")
-            .get(address)
-            .copied()
+            .get(&generation)
+            .filter(|slot| slot.address == address)
+            .and_then(|slot| slot.payee)
     }
 
-    /// `destination`'s payee together with this gate's payout ledger (issue
-    /// #779): what `session_route::deliver_pending_claim` needs to resend a
-    /// stranded payout voucher. `None` if no ledger is configured or
-    /// `destination` has no payee yet -- both reasons there is nothing to
-    /// resend, not errors.
+    /// The session `generation`'s payee together with this gate's payout
+    /// ledger (issue #779): what `session_route::deliver_pending_claim`
+    /// needs to resend a stranded payout voucher. `None` if no ledger is
+    /// configured or the session has proved no payee -- both reasons there
+    /// is nothing to resend, not errors.
     pub(crate) fn payout_for_session(
         &self,
         destination: &str,
+        generation: u64,
     ) -> Option<(VoucherSigner, Arc<ClientPayoutLedger>)> {
-        let payee = self.session_payee(destination)?;
+        let payee = self.session_payee(destination, generation)?;
         let ledger = Arc::clone(self.payout_ledger()?);
         Some((payee, ledger))
     }
 
-    /// Pay the client session bound at `destination` `amount` for the job
-    /// `job_id`, through [`ClientPayoutLedger::record_payout_once`] --
-    /// resolving `destination` (a session's bound ILP address, never a
-    /// channel id, issue #787) to its payee first.
+    /// Pay the client session `generation`, bound at `destination` (a
+    /// session's bound ILP address, never a channel id, issue #787),
+    /// `amount` for the job `job_id` it did, through
+    /// [`ClientPayoutLedger::record_payout_once`] -- at the payee *that
+    /// session* proved (issue #1396), never one another session at the same
+    /// address proved.
     ///
-    /// `None`, logged rather than left silent, for a destination this gate
-    /// has never learned a payee for -- a session that has neither paid a
-    /// voucher nor proved a channel with a challenge at auth -- and under
-    /// every condition
-    /// `record_payout_once` itself declines on.
+    /// `payee_at_dispatch` is the payee the same session had proved when
+    /// the job was handed to it, read by the caller before the session
+    /// answered: it stands in when the session has since closed (a client
+    /// may drop its socket the moment it has fulfilled), so the job is still
+    /// paid, and left pending for the client's next session to be resent.
+    /// It is never another session's payee.
+    ///
+    /// `None`, logged rather than left silent, for a session that has
+    /// proved no payee -- neither paid a voucher nor proved a channel with a
+    /// challenge at auth -- and under every condition `record_payout_once`
+    /// itself declines on.
     pub(crate) async fn credit_session_payout(
         &self,
         destination: &str,
+        generation: u64,
+        payee_at_dispatch: Option<VoucherSigner>,
         job_id: &[u8; 32],
         amount: u64,
     ) -> Option<PayoutVoucher> {
         let ledger = self.payout_ledger()?;
-        let Some(payee) = self.session_payee(destination) else {
+        let Some(payee) = self
+            .session_payee(destination, generation)
+            .or(payee_at_dispatch)
+        else {
             tracing::info!(
                 destination = %destination,
-                "no payee is associated with this session yet -- paying nothing"
+                generation,
+                "the session that did this job has proved no payee -- paying nothing"
             );
             return None;
         };
@@ -2258,10 +2344,59 @@ mod tests {
             ))
             .await,
         );
+        gate.open_session("g.toon.nobody", 1);
         assert!(gate
-            .credit_session_payout("g.toon.nobody", &[1; 32], 100)
+            .credit_session_payout("g.toon.nobody", 1, None, &[1; 32], 100)
             .await
             .is_none());
+    }
+
+    /// Issue #1396: a payee belongs to the session that proved it. Another
+    /// session at the same address -- open before it or after -- neither
+    /// sees it nor changes it; closing a session clears only its own; and a
+    /// session that is not open learns nothing.
+    #[test]
+    fn a_session_payee_is_scoped_to_the_session_that_proved_it() {
+        let gate = gate();
+        let (first, second) = (
+            VoucherSigner::Evm([0x0a; 20]),
+            VoucherSigner::Evm([0x0b; 20]),
+        );
+
+        gate.open_session("g.toon.agent", 1);
+        assert!(gate.record_session_payee("g.toon.agent", 1, first));
+        assert!(
+            !gate.record_session_payee("g.toon.agent", 1, first),
+            "proving the same key again changes nothing"
+        );
+
+        gate.open_session("g.toon.agent", 2);
+        assert_eq!(
+            gate.session_payee("g.toon.agent", 2),
+            None,
+            "a new session at the same address starts with no payee"
+        );
+        assert!(gate.record_session_payee("g.toon.agent", 2, second));
+        assert_eq!(gate.session_payee("g.toon.agent", 1), Some(first));
+        assert_eq!(gate.session_payee("g.toon.agent", 2), Some(second));
+        assert_eq!(
+            gate.session_payee("g.toon.other", 1),
+            None,
+            "a generation resolves only at the address it was bound at"
+        );
+
+        // The superseded session closing leaves the newer one's payee intact.
+        gate.close_session("g.toon.agent", 1);
+        assert_eq!(gate.session_payee("g.toon.agent", 1), None);
+        assert_eq!(gate.session_payee("g.toon.agent", 2), Some(second));
+
+        gate.close_session("g.toon.agent", 2);
+        assert_eq!(gate.session_payee("g.toon.agent", 2), None);
+        assert!(
+            !gate.record_session_payee("g.toon.agent", 2, second),
+            "a closed session learns nothing"
+        );
+        assert_eq!(gate.session_payee("g.toon.agent", 2), None);
     }
 
     /// An accepted voucher teaches the gate its channel's voucher signer as

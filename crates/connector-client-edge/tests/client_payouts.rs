@@ -72,16 +72,27 @@ fn client_ed25519() -> ed25519_dalek::Keypair {
     ed25519_dalek::Keypair { secret, public }
 }
 
+/// A second client, with a key of its own, that declares the same `peerId`
+/// as the first (issue #1396).
+fn other_secret() -> SecretKey {
+    SecretKey::parse(&[0x48; 32]).expect("valid secret")
+}
+
+fn address_of(secret: &SecretKey) -> [u8; 20] {
+    derive_evm_address(&PublicKey::from_secret_key(secret).serialize())
+}
+
 fn domain() -> BatchSettlementDomain {
     BatchSettlementDomain::x402(CHAIN_ID)
 }
 
-/// The client's channel toward this node: it pays, and signs its vouchers
-/// with its own key.
-fn client_channel_config() -> BatchChannelConfig {
+/// The EVM channel toward this node that the holder of `secret` pays on,
+/// signing its vouchers with its own key.
+fn channel_config_of(secret: &SecretKey) -> BatchChannelConfig {
+    let key = address_of(secret);
     BatchChannelConfig {
-        payer: client_address(),
-        payer_authorizer: client_address(),
+        payer: key,
+        payer_authorizer: key,
         receiver: [0x33; 20],
         receiver_authorizer: [0x33; 20],
         token: [0x55; 20],
@@ -98,10 +109,16 @@ fn hex20(bytes: &[u8; 20]) -> String {
 
 /// The client's voucher for `amount` on its own EVM channel, as it sends one.
 fn client_evm_voucher(amount: u64) -> String {
-    let config = client_channel_config();
+    evm_voucher_by(&client_secret(), amount)
+}
+
+/// The voucher for `amount` the holder of `secret` signs on its own EVM
+/// channel toward this node.
+fn evm_voucher_by(secret: &SecretKey, amount: u64) -> String {
+    let config = channel_config_of(secret);
     let channel = evm_batch_channel_id(&domain(), &config);
     let digest = evm_voucher_digest(&domain(), &channel, u128::from(amount));
-    let (signature, recovery) = libsecp256k1::sign(&Message::parse(&digest), &client_secret());
+    let (signature, recovery) = libsecp256k1::sign(&Message::parse(&digest), secret);
     let mut bytes = signature.serialize().to_vec();
     bytes.push(recovery.serialize() + 27);
     serde_json::json!({
@@ -166,14 +183,14 @@ impl BatchSettlementChannels for ClientChannels {
         channel_id: &[u8; 32],
         _presented_config: Option<&BatchChannelConfig>,
     ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
-        Ok(
-            (*channel_id == evm_batch_channel_id(&domain(), &client_channel_config())).then_some(
-                AdmittedEvmVoucherChannel {
-                    config: client_channel_config(),
-                    max_cumulative: CLIENT_COLLATERAL,
-                },
-            ),
-        )
+        Ok([client_secret(), other_secret()]
+            .iter()
+            .map(channel_config_of)
+            .find(|config| *channel_id == evm_batch_channel_id(&domain(), config))
+            .map(|config| AdmittedEvmVoucherChannel {
+                config,
+                max_cumulative: CLIENT_COLLATERAL,
+            }))
     }
 
     async fn solana(
@@ -707,4 +724,232 @@ async fn a_session_that_proved_no_payee_is_paid_nothing() {
     assert!(silent.is_err(), "no payout TRANSFER follows: {silent:?}");
     let views = outbound.views().await;
     assert_eq!(views[0].watermark, 0, "nothing was signed");
+}
+
+// ─── issue #1396: a payee belongs to the session that proved it ───
+
+/// Terms for a payout channel toward the EVM key `receiver`.
+fn evm_terms_toward(receiver: [u8; 20]) -> ReceiverTerms {
+    ReceiverTerms::Evm(EvmReceiverTerms {
+        receiver,
+        token: [TOKEN; 20],
+        min_withdraw_delay_secs: ONE_DAY,
+    })
+}
+
+/// What this node has signed on its outbound channel `channel` so far.
+async fn signed_on(outbound: &OutboundChannels, channel: &ChannelId) -> u128 {
+    outbound
+        .views()
+        .await
+        .into_iter()
+        .find(|view| view.id == channel.0)
+        .map(|view| view.watermark)
+        .expect("the payout channel is tracked")
+}
+
+/// An EVM payout chain with a channel open toward each of the two clients,
+/// and the edge serving over it: `(edge, outbound, first client's payout
+/// channel, second client's payout channel)`.
+async fn two_payees() -> (SocketAddr, Arc<OutboundChannels>, ChannelId, ChannelId) {
+    let payout = PayoutChain::evm();
+    let other = address_of(&other_secret());
+    assert_ne!(
+        other[0], payout.client_party,
+        "the fake chain tells parties apart by first byte"
+    );
+    let outbound = payout
+        .outbound(Arc::new(connector_runtime::InMemoryJournal::new()))
+        .await;
+    let (victims, _) = outbound
+        .open(payout.terms.clone(), PAYOUT_DEPOSIT)
+        .await
+        .expect("the payout channel toward the first client opens");
+    let (others, _) = outbound
+        .open(evm_terms_toward(other), PAYOUT_DEPOSIT)
+        .await
+        .expect("the payout channel toward the second client opens");
+    let addr = serve(Arc::clone(&outbound)).await;
+    (addr, outbound, victims.on_chain.id, others.on_chain.id)
+}
+
+/// A buyer's PREPARE for `amount` to [`ADDRESS`], over HTTP, handed to
+/// `session`: the buyer's task, and the PREPARE as the session received it.
+async fn job_for(
+    addr: SocketAddr,
+    session: &mut Session,
+    amount: u64,
+    tag: u8,
+) -> (tokio::task::JoinHandle<StatusCode>, Frame) {
+    let body = Prepare {
+        amount,
+        expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
+        greeting: false,
+        destination: ADDRESS.to_string(),
+        data: vec![tag],
+    }
+    .encode();
+    let buyer = tokio::spawn(async move {
+        HttpClient::new()
+            .request(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("http://{addr}/ilp"))
+                    .body(HttpBody::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("the connector answers")
+            .status()
+    });
+    let forwarded = next_frame(session).await;
+    assert_eq!(forwarded.frame_type, BTP_MESSAGE);
+    (buyer, forwarded)
+}
+
+fn fulfil(forwarded: &Frame, tag: u8) -> Vec<u8> {
+    btp_response(
+        forwarded.request_id,
+        &Fulfill {
+            fulfillment: [tag; 32],
+            data: Vec::new(),
+        }
+        .encode(),
+    )
+}
+
+/// A client reconnecting on a new socket and proving itself with
+/// `voucher`: the connected session, and the payout TRANSFER the proof
+/// earns it, acknowledged. The TRANSFER is a resend spawned when the
+/// voucher teaches the session its payee, so it races the voucher's own
+/// answer; either order is fine.
+async fn reconnect_and_collect(addr: SocketAddr, voucher: &str) -> (Session, Frame) {
+    let (mut session, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ilp/btp"))
+        .await
+        .expect("the upgrade succeeds");
+    let auth = format!(r#"{{"peerId":"{ADDRESS}","secret":""}}"#);
+    send(
+        &mut session,
+        btp_message(1, &[("auth", auth.as_bytes())], &[]),
+    )
+    .await;
+    assert_eq!(next_frame(&mut session).await.frame_type, BTP_RESPONSE);
+    let probe = Prepare {
+        amount: 0,
+        expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
+        greeting: false,
+        destination: "g.toon.nowhere".to_string(),
+        data: Vec::new(),
+    };
+    send(
+        &mut session,
+        btp_message(
+            2,
+            &[("payment-channel-claim", voucher.as_bytes())],
+            &probe.encode(),
+        ),
+    )
+    .await;
+    let (mut answered, mut transfer) = (false, None);
+    while !answered || transfer.is_none() {
+        let frame = next_frame(&mut session).await;
+        match frame.frame_type {
+            BTP_TRANSFER => {
+                send(&mut session, btp_response(frame.request_id, &[])).await;
+                transfer = Some(frame);
+            }
+            BTP_RESPONSE if frame.request_id == 2 => answered = true,
+            other => panic!("unexpected frame type {other}"),
+        }
+    }
+    (session, transfer.expect("the resend arrived"))
+}
+
+async fn assert_silent(session: &mut Session, why: &str) {
+    let silent = tokio::time::timeout(std::time::Duration::from_millis(300), session.next()).await;
+    assert!(silent.is_err(), "{why}: {silent:?}");
+}
+
+/// Issue #1396: a second session declaring the same `peerId` and proving a
+/// key of its own changes nothing about where the first session's work is
+/// paid. A job the first session was handed, and fulfils after the second
+/// session bound, is paid toward the first session's key -- not redirected
+/// to the second's, and not withheld: it is signed, and the first client,
+/// reconnecting and proving its key again, is handed it.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_session_at_the_same_address_neither_redirects_nor_withholds_a_payout() {
+    let (addr, outbound, victims, others) = two_payees().await;
+
+    let mut victim = client_session(addr, &client_evm_voucher(100)).await;
+    let (buyer, forwarded) = job_for(addr, &mut victim, 300, 1).await;
+
+    // A second session binds the same `peerId`, and proves its own channel.
+    let mut other = client_session(addr, &evm_voucher_by(&other_secret(), 100)).await;
+
+    // The first session finishes the job it was handed.
+    send(&mut victim, fulfil(&forwarded, 1)).await;
+    assert_eq!(buyer.await.unwrap(), StatusCode::OK);
+
+    assert_eq!(
+        signed_on(&outbound, &others).await,
+        0,
+        "nothing is signed toward the second session's key for the first's work"
+    );
+    assert_eq!(
+        signed_on(&outbound, &victims).await,
+        300,
+        "the job is paid toward the key of the session that did it"
+    );
+    assert_silent(&mut other, "the second session is handed no payout").await;
+
+    // The first client reconnects and proves its key again: the payout the
+    // second session's bind left undelivered reaches it.
+    drop(victim);
+    let (_victim, transfer) = reconnect_and_collect(addr, &client_evm_voucher(200)).await;
+    let (_, presentation, voucher) = payout_of(&transfer);
+    assert_eq!(presentation.channel(), &victims);
+    assert_eq!(voucher.cumulative_amount, 300);
+    assert_eq!(signed_on(&outbound, &others).await, 0);
+}
+
+/// Issue #1396, the stranded-resend half: a payout left pending when its
+/// session could not take it is resent to a later session only once that
+/// session proves the key it is owed to. A session at the same address
+/// that proves a different key is resent nothing; the client itself,
+/// reconnecting and proving its key, is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stranded_payout_is_resent_only_to_a_session_that_proves_its_key() {
+    let (addr, outbound, victims, others) = two_payees().await;
+
+    // The client earns, but refuses the payout TRANSFER, then drops: the
+    // voucher stays pending for its key.
+    let mut victim = client_session(addr, &client_evm_voucher(100)).await;
+    let (buyer, forwarded) = job_for(addr, &mut victim, 300, 1).await;
+    send(&mut victim, fulfil(&forwarded, 1)).await;
+    let transfer = next_frame(&mut victim).await;
+    assert_eq!(transfer.frame_type, BTP_TRANSFER);
+    send(
+        &mut victim,
+        connector_btp::encode_error(transfer.request_id, "F00", "NotAcceptedError", b"not now"),
+    )
+    .await;
+    assert_eq!(buyer.await.unwrap(), StatusCode::OK);
+    assert_eq!(signed_on(&outbound, &victims).await, 300);
+    drop(victim);
+
+    // A session at the same address proving a different key.
+    let mut other = client_session(addr, &evm_voucher_by(&other_secret(), 100)).await;
+    assert_silent(
+        &mut other,
+        "a session proving another key is resent nothing",
+    )
+    .await;
+    drop(other);
+
+    // The client reconnects and proves its own key.
+    let (_victim, transfer) = reconnect_and_collect(addr, &client_evm_voucher(200)).await;
+    let (_, presentation, voucher) = payout_of(&transfer);
+    assert_eq!(presentation.channel(), &victims);
+    assert_eq!(voucher.cumulative_amount, 300);
+    assert_eq!(signed_on(&outbound, &others).await, 0);
 }

@@ -47,6 +47,7 @@
 use connector_btp::{BtpFrame, BTP_RESPONSE};
 use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 use connector_runtime::ClientRouteKind;
+use connector_settlement::batch::VoucherSigner;
 use sha2::{Digest, Sha256};
 
 use crate::btp::payout_voucher_protocol_data;
@@ -127,6 +128,15 @@ pub(crate) async fn route_prepare(
         return response;
     }
 
+    // Issue #1396: the payee this session has proved as the job is handed
+    // to it. The session's payee is cleared when it unbinds, and a client
+    // may close its socket the moment it has sent its FULFILL -- read only
+    // after the answer, that would find nothing and leave the job unpaid
+    // with nothing pending to resend. Read again after the answer too, so
+    // a key the session proves while working is not missed either.
+    let payee_at_dispatch = state
+        .claim_gate
+        .session_payee(&destination, lease.generation);
     let response = match state
         .session_registry
         .deliver(&destination, Some(lease.generation), &[], &encoded, now)
@@ -137,7 +147,12 @@ pub(crate) async fn route_prepare(
     };
 
     if matches!(response, PacketResponse::Fulfill(_)) {
-        credit_session_earnings(state, &destination, lease.generation, &job_id, amount, now).await;
+        let session = PaidSession {
+            destination: &destination,
+            generation: lease.generation,
+            payee_at_dispatch,
+        };
+        credit_session_earnings(state, session, &job_id, amount, now).await;
     }
 
     response
@@ -145,11 +160,13 @@ pub(crate) async fn route_prepare(
 
 /// Issue #770's wiring point: `destination` (the address `prepare` was
 /// just genuinely fulfilled at) is a client session's own bound *ILP
-/// address* (issue #736/toon-client#503) -- never a channel id.
+/// address* (issue #736/toon-client#503) -- never a channel id -- and
+/// `generation` is the lease the fulfilling session holds it under.
 /// [`crate::claim_gate::ClientClaimGate::credit_session_payout`] resolves
-/// it to the session's payee, the key an earlier verified voucher or
-/// channel-control proof on this session taught the gate (issues #787,
-/// #1381).
+/// that session -- never the address alone (issue #1396) -- to its payee,
+/// the key an earlier verified voucher or channel-control proof on the same
+/// session taught the gate (issues #787, #1381). The job is paid at the
+/// payee of the session that did it.
 ///
 /// Both steps are best-effort once reached, and neither holds up
 /// `route_prepare`'s own answer (already decided by the time this runs):
@@ -177,24 +194,43 @@ pub(crate) async fn route_prepare(
 ///    failed gets resent rather than stranded.
 async fn credit_session_earnings(
     state: &ClientEdgeState,
-    destination: &str,
-    generation: u64,
+    session: PaidSession<'_>,
     job_id: &[u8; 32],
     amount: u64,
     now: u64,
 ) {
     let _ = state
         .claim_gate
-        .credit_session_payout(destination, job_id, amount)
+        .credit_session_payout(
+            session.destination,
+            session.generation,
+            session.payee_at_dispatch,
+            job_id,
+            amount,
+        )
         .await;
-    deliver_pending_claim(state, destination, Some(generation), now).await;
+    deliver_pending_claim(state, session.destination, session.generation, now).await;
+}
+
+/// The session a fulfilled job is paid to (issue #1396): its bound
+/// address, the generation it did the job under, and the payee it had
+/// proved when the job was handed to it -- see `route_prepare` for why
+/// that last is read before the session answers.
+struct PaidSession<'a> {
+    destination: &'a str,
+    generation: u64,
+    payee_at_dispatch: Option<VoucherSigner>,
 }
 
 /// Issue #779: resend whatever payout voucher
 /// [`crate::outbound_ledger::ClientPayoutLedger::pending_for`] still holds
-/// unacknowledged for `destination`'s payee, over its currently bound
-/// session, fenced against `expected_generation` exactly like every other
-/// delivery this module makes -- one TRANSFER per payout channel.
+/// unacknowledged for the payee the session `generation` at `destination`
+/// has proved, over that same session, fenced against `generation` exactly
+/// like every other delivery this module makes -- one TRANSFER per payout
+/// channel. The generation is required, not optional (issue #1396): the
+/// payee is looked up for the session the voucher is delivered over, so a
+/// voucher owed to one key only ever reaches a session that proved that
+/// key, and there is no unfenced lookup by address to fall back on.
 ///
 /// The TRANSFER's own `amount` field carries the voucher's cumulative
 /// amount rather than any one job's increment: this call has no specific
@@ -209,18 +245,23 @@ async fn credit_session_earnings(
 /// write that never lands, a timeout, or the client's own ERROR) leaves it
 /// pending to be resent.
 ///
-/// Two production call sites: [`credit_session_earnings`] above (every
-/// fulfilled delivery, deduped or not) and `crate::btp::handle_frame`'s auth
-/// branch, once a session (re)establishes. The two can run at once, which
-/// costs at worst one duplicate TRANSFER of the *same* voucher: it is
-/// cumulative, so the client lands the same figure either way.
+/// Three production call sites: [`credit_session_earnings`] above (every
+/// fulfilled delivery, deduped or not), `crate::btp::handle_frame`'s auth
+/// branch once a session (re)establishes -- after a `channelChallenge` on
+/// that auth has been recorded -- and `crate::btp::record_accepted_claim`
+/// when a voucher first teaches a session its payee. The last two are how a
+/// reconnecting client is resent what an earlier session of its own left
+/// stranded: it proves the same key on its new session, and the ledger's
+/// pending set is keyed by that key. They can run at once, which costs at
+/// worst one duplicate TRANSFER of the *same* voucher: it is cumulative, so
+/// the client lands the same figure either way.
 pub(crate) async fn deliver_pending_claim(
     state: &ClientEdgeState,
     destination: &str,
-    expected_generation: Option<u64>,
+    generation: u64,
     now: u64,
 ) {
-    let Some((payee, ledger)) = state.claim_gate.payout_for_session(destination) else {
+    let Some((payee, ledger)) = state.claim_gate.payout_for_session(destination, generation) else {
         return;
     };
     for payout in ledger.pending_for(&payee) {
@@ -228,7 +269,7 @@ pub(crate) async fn deliver_pending_claim(
             .session_registry
             .deliver_transfer(
                 destination,
-                expected_generation,
+                Some(generation),
                 u64::try_from(payout.cumulative_amount()).unwrap_or(u64::MAX),
                 &[payout_voucher_protocol_data(&payout)],
                 now,
@@ -792,15 +833,20 @@ mod tests {
         VoucherSigner::Evm(PAYEE)
     }
 
-    /// A gate over `ledger` that already knows `address` is paid at
-    /// [`payee`] -- what a verified voucher or channel-control proof on this
-    /// session teaches it (`crate::btp::record_accepted_claim`).
-    fn gate_paying(address: &str, ledger: &Arc<ClientPayoutLedger>) -> ClientClaimGate {
-        let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
+    /// A gate paying through `ledger`.
+    fn gate_over(ledger: &Arc<ClientPayoutLedger>) -> ClientClaimGate {
+        ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
             .expect("a fresh in-memory journal has nothing to replay")
-            .with_payout_ledger(Arc::clone(ledger));
-        gate.record_session_payee(address, payee());
-        gate
+            .with_payout_ledger(Arc::clone(ledger))
+    }
+
+    /// Teach `gate` that the session `generation` bound at `address` is
+    /// paid at [`payee`] -- what a verified voucher or channel-control proof
+    /// on that session teaches it (`crate::btp::record_accepted_claim`,
+    /// issue #1396: per session, never per address).
+    fn pay_session(gate: &ClientClaimGate, address: &str, generation: u64) {
+        gate.open_session(address, generation);
+        gate.record_session_payee(address, generation, payee());
     }
 
     /// The production wiring, at the real call site (issue #770's AC4: this
@@ -815,11 +861,12 @@ mod tests {
     async fn a_fulfilled_session_delivery_pays_a_voucher_over_the_session() {
         let address = "g.provider.nine";
         let ledger = test_ledger_paying(PAYEE).await;
-        let gate = gate_paying(address, &ledger);
+        let gate = gate_over(&ledger);
 
         let registry = SessionRegistry::new();
         let (handle, mut reply_rx, outbound) = test_handle();
-        registry.bind(address, handle, crate::now_unix());
+        let generation = registry.bind(address, handle, crate::now_unix());
+        pay_session(&gate, address, generation);
         let state = test_state_with_gate(empty_connector(), registry, gate);
 
         let prepare = Prepare {
@@ -891,11 +938,12 @@ mod tests {
     async fn a_retried_delivery_of_the_same_job_is_paid_once() {
         let address = "g.provider.eleven";
         let ledger = test_ledger_paying(PAYEE).await;
-        let gate = gate_paying(address, &ledger);
+        let gate = gate_over(&ledger);
 
         let registry = SessionRegistry::new();
         let (handle, mut reply_rx, outbound) = test_handle();
-        registry.bind(address, handle, crate::now_unix());
+        let generation = registry.bind(address, handle, crate::now_unix());
+        pay_session(&gate, address, generation);
         let state = test_state_with_gate(empty_connector(), registry, gate);
 
         // The session answers whatever it is sent -- a MESSAGE with a
@@ -952,11 +1000,12 @@ mod tests {
     ) {
         let address = "g.provider.dishonest";
         let ledger = test_ledger_paying(PAYEE).await;
-        let gate = gate_paying(address, &ledger);
+        let gate = gate_over(&ledger);
 
         let registry = SessionRegistry::new();
         let (handle, mut reply_rx, outbound) = test_handle();
-        registry.bind(address, handle, crate::now_unix());
+        let generation = registry.bind(address, handle, crate::now_unix());
+        pay_session(&gate, address, generation);
         let state = test_state_with_gate(empty_connector(), registry, gate);
 
         let peer = tokio::spawn(async move {
@@ -995,6 +1044,56 @@ mod tests {
         peer.await.expect("the peer task");
 
         assert_eq!(ledger.signed_toward(&payee()), 5_000);
+    }
+
+    /// Issue #1396: a session's payee is cleared when it unbinds, and a
+    /// client may drop its socket the moment it has sent its FULFILL. The
+    /// job is still paid at the payee the session had proved when it was
+    /// handed the job, and the voucher is left pending for the client's next
+    /// session to be resent -- never lost for want of a live session.
+    #[tokio::test]
+    async fn a_session_that_closes_as_it_fulfils_is_still_paid() {
+        let address = "g.provider.leaving";
+        let ledger = test_ledger_paying(PAYEE).await;
+        let gate = gate_over(&ledger);
+
+        let registry = SessionRegistry::new();
+        let (handle, mut reply_rx, outbound) = test_handle();
+        let generation = registry.bind(address, handle, crate::now_unix());
+        pay_session(&gate, address, generation);
+        let state = test_state_with_gate(empty_connector(), registry, gate);
+
+        let job = Prepare {
+            amount: 2_500,
+            ..sample_prepare(address)
+        };
+        let (response, ()) = tokio::join!(route_prepare(&state, job, None), async {
+            let sent = reply_rx.recv().await.expect("the MESSAGE was written");
+            let decoded = decode_frame(&sent).expect("the connector's own encoder");
+            // The socket closes before its FULFILL is read back: the
+            // session's teardown runs first.
+            state.session_registry.unbind(address, generation);
+            state.claim_gate.close_session(address, generation);
+            outbound.resolve(BtpFrame {
+                frame_type: BTP_RESPONSE,
+                request_id: decoded.request_id,
+                amount: None,
+                protocol_data: Vec::new(),
+                ilp_packet: Fulfill {
+                    fulfillment: FULFILLMENT,
+                    data: Vec::new(),
+                }
+                .encode(),
+            });
+        });
+        assert!(matches!(response, PacketResponse::Fulfill(_)));
+
+        assert_eq!(ledger.signed_toward(&payee()), 2_500);
+        assert_eq!(
+            ledger.pending_for(&payee()).len(),
+            1,
+            "the voucher waits for the client's next session"
+        );
     }
 
     /// Issue #787's own scenario under ADR 0075 decision 7: a session that
@@ -1049,11 +1148,12 @@ mod tests {
     async fn a_payee_with_no_open_channel_toward_it_is_not_paid() {
         let address = "g.provider.unchanneled";
         let ledger = test_ledger_paying([0x77; 20]).await;
-        let gate = gate_paying(address, &ledger);
+        let gate = gate_over(&ledger);
 
         let registry = SessionRegistry::new();
         let (handle, mut reply_rx, outbound) = test_handle();
-        registry.bind(address, handle, crate::now_unix());
+        let generation = registry.bind(address, handle, crate::now_unix());
+        pay_session(&gate, address, generation);
         let state = test_state_with_gate(empty_connector(), registry, gate);
 
         let peer = tokio::spawn(async move {
@@ -1092,11 +1192,12 @@ mod tests {
     {
         let address = "g.provider.stranded";
         let ledger = test_ledger_paying(PAYEE).await;
-        let gate = gate_paying(address, &ledger);
+        let gate = gate_over(&ledger);
 
         let registry = SessionRegistry::new();
         let (handle, mut reply_rx, outbound) = test_handle();
-        registry.bind(address, handle, crate::now_unix());
+        let generation = registry.bind(address, handle, crate::now_unix());
+        pay_session(&gate, address, generation);
         let state = test_state_with_gate(empty_connector(), registry, gate);
 
         let peer = tokio::spawn(async move {
@@ -1133,10 +1234,13 @@ mod tests {
             "a failed delivery leaves the voucher pending for the next caller to find"
         );
 
+        // The client reconnects, and proves its payee again on the new
+        // session (issue #1396: a payee is never inherited by address).
         let (handle2, mut reply_rx2, outbound2) = test_handle();
-        state
+        let generation2 = state
             .session_registry
             .bind(address, handle2, crate::now_unix());
+        pay_session(&state.claim_gate, address, generation2);
         let peer2 = tokio::spawn(async move {
             answer_next_message(
                 &mut reply_rx2,
@@ -1209,11 +1313,12 @@ mod tests {
             .record_payout_once(payee(), &[1; 32], 4_000)
             .await
             .expect("a channel toward the payee is open");
-        let gate = gate_paying(address, &ledger);
+        let gate = gate_over(&ledger);
 
         let registry = SessionRegistry::new();
         let (handle, mut reply_rx, outbound) = test_handle();
-        registry.bind(address, handle, crate::now_unix());
+        let generation = registry.bind(address, handle, crate::now_unix());
+        pay_session(&gate, address, generation);
         let state = test_state_with_gate(empty_connector(), registry, gate);
 
         let peer = tokio::spawn(async move {
@@ -1229,7 +1334,7 @@ mod tests {
             });
         });
 
-        deliver_pending_claim(&state, address, None, crate::now_unix()).await;
+        deliver_pending_claim(&state, address, generation, crate::now_unix()).await;
         peer.await.expect("the peer task");
 
         assert_eq!(

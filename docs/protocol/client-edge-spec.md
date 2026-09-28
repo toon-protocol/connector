@@ -1082,14 +1082,25 @@ silently dropped exactly as it was before TRANSFER existed.
      pays this connector on (EVM `payerAuthorizer`, Solana `authorized_signer`, as the chain records
      it), taught when a voucher on it is accepted on the session; or the voucher signer a
      `channelChallenge` at auth (step 1) proved. There is no client-declared payout address, and
-     nothing a client merely asserts teaches a payee. The payee is recorded against the session's
-     bound `peerId`, which the client asserts: issue #1396 (an unauthenticated `peerId` can
-     overwrite another session's payee) is open, and #1384 neither fixes nor widens it — the key it
-     teaches is still one a signature proved, of a channel open toward this connector. A payout is signed on this connector's
-     open outbound channel whose receiver is that key; a session with no payee, or a payee with no
-     open channel toward it, is paid nothing and the packet still answers as it would. A voucher is
-     landable only by its channel's receiver, so a payout delivered to the wrong socket pays nobody
-     else.
+     nothing a client merely asserts teaches a payee.
+   - **Whose payee it is.** The payee belongs to the **authenticated session** that proved it — the
+     session generation its bind issued (§1.9 step 1's "the socket is the lease") — never to the
+     `peerId` it bound, which the client merely asserts and another socket can assert too (issue
+     #1396). A new session starts with **no** payee, whatever an earlier session that declared the
+     same `peerId` proved, and what it proves changes no other session's payee; the payee is cleared
+     when the session unbinds, a superseded session's unbind clearing only its own. A fulfilled
+     delivery is paid at the payee of **the session that fulfilled it**, and a session that has
+     proved none is paid nothing for it. A payout is signed on this connector's open outbound channel
+     whose receiver is that key; a session with no payee, or a payee with no open channel toward it,
+     is paid nothing and the packet still answers as it would. A voucher is landable only by its
+     channel's receiver, so a payout delivered to the wrong socket pays nobody else.
+   - **Reconnecting.** A payout voucher still unacknowledged when its session dropped stays owed to
+     its payee **key**, not to an address. A client reconnects on a new session and proves the same
+     key again — a `channelChallenge` on its `auth` (step 1), or a voucher (§1.3) on the new session
+     — and at that moment every voucher still pending toward that key is resent over the new session
+     (after the challenge is recorded, never before). A session that proves a different key is
+     resent nothing, and where the old key's vouchers are owed does not change. A client that
+     reconnects without proving a key is paid nothing until it does.
    - **The signer.** Each chain's settlement key signs the voucher; `[signer]` signs none.
    - **The wire.** The TRANSFER's `payout-claim` protocolData entry is the voucher as JSON, spelled
      as a client spells its own voucher claim (§1.3) less the envelope fields: `blockchain`,

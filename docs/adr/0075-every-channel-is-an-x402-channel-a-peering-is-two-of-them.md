@@ -752,7 +752,7 @@ the wire open:
   payee is still keyed by the session's self-declared `peerId`, so #1396 (an unauthenticated
   `peerId` can overwrite another session's payee) is neither fixed nor widened: the key an
   attacker must prove is still one of a channel open toward this node, as it was for the retired
-  proof.
+  proof. (#1396 has since fixed this: see "Update (issue #1396)".)
 - **Config keys pulled forward from #1385.** The EVM channel index and its syncer are deleted here,
   with the client-edge channel registry they fed, so the keys that tuned them are refused by name
   now rather than parsed and ignored: `[settlement.evm] channel_index_from_block` and
@@ -792,3 +792,25 @@ Decisions 1, 2, 8, 9 and 12 are built. The choices #1385 made where this record 
   reverted-redeem and channel-derivation tests, the `abi_provenance` check, the Base Sepolia redeem
   proof and its dispatch-only workflow, and the Solana program-id guards. Nonce ordering under
   concurrent writes stays covered by `send.rs`'s own tests, now reached through the x402 backend.
+
+## Update (issue #1396) — a client's payee belongs to the session that proved it
+
+Decision 7 pays a client at its payee key. Until #1396 that key was recorded against the session's
+bound `peerId`, which the client asserts and nothing verifies, so a session could change where
+another session declaring the same `peerId` was paid. The key a session proves is now recorded
+against the **authenticated session** — the generation `SessionRegistry::bind` issued it, "the
+socket is the lease" — and nothing else:
+
+- A new session starts with no payee, whatever an earlier session at the same `peerId` proved, and
+  what it proves changes no other session's payee. Unbinding a session clears its payee; a
+  superseded session's unbind clears only its own.
+- A fulfilled delivery is paid at the payee of the session that fulfilled it. No payout path looks a
+  payee up by address alone: `deliver_pending_claim` takes the generation, not an `Option` of one.
+- A voucher still pending when its session dropped stays owed to its payee key. It is resent to a
+  later session once that session proves the same key — a `channelChallenge` at `auth` (recorded
+  before the resend, as before) or an accepted voucher, which now triggers the same resend when it
+  first teaches the session its payee. A session proving a different key is resent nothing.
+
+No wire, vector or config change. Session takeover itself — a later socket binding the same
+`peerId` and receiving its routed jobs — is unchanged (#698); only where the payout goes is.
+`client-edge-spec.md` §1.9 step 7 carries the rule.
