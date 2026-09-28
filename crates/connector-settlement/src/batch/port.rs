@@ -604,7 +604,8 @@ pub trait BatchSettlementPayer: Send + Sync {
 
     /// Add `increment` to the deposit of a channel this node opened: EVM
     /// another `deposit` into the same config, Solana `top_up`. An
-    /// increment, never a total. Returns the state after.
+    /// increment, never a total. Returns the state after. Refuses a sealed
+    /// channel ([`ChannelSealed`](BatchSettlementError::ChannelSealed)).
     async fn top_up(
         &self,
         channel: &ChannelId,
@@ -638,7 +639,8 @@ pub trait BatchSettlementPayer: Send + Sync {
     /// land the latest one it holds. Returns the state after.
     ///
     /// Starting a withdrawal already started changes nothing, and returns
-    /// the state.
+    /// the state. A sealed channel has nothing left to withdraw
+    /// ([`ChannelSealed`](BatchSettlementError::ChannelSealed)).
     async fn start_withdrawal(
         &self,
         channel: &ChannelId,
@@ -649,6 +651,12 @@ pub trait BatchSettlementPayer: Send + Sync {
     /// `finalizeWithdraw`, Solana `distribute`. A voucher the receiver
     /// landed inside the delay is the receiver's, whatever the withdrawal
     /// asked for. Returns the state after.
+    ///
+    /// On Solana `distribute` is due once the receiver has sealed the
+    /// channel or the grace period has run. The `reclaim` that follows it
+    /// returns rent to the channel's `rent_payer`, which is the receiver's
+    /// sponsor key, so it is the receiver's sweep, not this node's
+    /// (ADR 0074 decision 5).
     ///
     /// Refuses a withdrawal never started
     /// ([`NoWithdrawalPending`](BatchSettlementError::NoWithdrawalPending))

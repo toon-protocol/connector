@@ -143,6 +143,18 @@ impl InMemoryBatchChain {
         }
     }
 
+    /// Refuse anything for a chain other than this one.
+    fn require(&self, chain: &'static str) -> Result<(), BatchSettlementError> {
+        if chain == self.chain_name() {
+            Ok(())
+        } else {
+            Err(BatchSettlementError::WrongChain {
+                presented: chain,
+                backend: self.chain_name(),
+            })
+        }
+    }
+
     fn channel_id(&self, index: usize) -> ChannelId {
         match self.exit {
             PayerExit::Withdrawal => ChannelId(format!("0x{index:064x}")),
@@ -306,11 +318,6 @@ impl InMemoryBatchSettlement {
     pub fn with_min_sponsored_deposit(mut self, minimum: u128) -> Self {
         self.min_sponsored_deposit = minimum;
         self
-    }
-
-    /// The chain this node is on.
-    pub fn chain(&self) -> &Arc<InMemoryBatchChain> {
-        &self.chain
     }
 
     /// Credit this node's settlement account with `amount` of the settled
@@ -516,12 +523,7 @@ impl InMemoryBatchSettlement {
         &self,
         presentation: &ChannelPresentation,
     ) -> Result<ChannelId, BatchSettlementError> {
-        if presentation.chain() != self.chain.chain_name() {
-            return Err(BatchSettlementError::WrongChain {
-                presented: presentation.chain(),
-                backend: self.chain.chain_name(),
-            });
-        }
+        self.chain.require(presentation.chain())?;
         let id = presentation.channel().clone();
         let ledger = self.chain.ledger();
         if let ChannelPresentation::Evm { config, .. } = presentation {
@@ -649,12 +651,9 @@ impl BatchSettlementPayer for InMemoryBatchSettlement {
         deposit: u128,
     ) -> Result<OpenedChannel, BatchSettlementError> {
         let chain = &self.chain;
-        if terms.chain() != chain.chain_name() {
-            return Err(BatchSettlementError::WrongChain {
-                presented: terms.chain(),
-                backend: chain.chain_name(),
-            });
-        }
+        chain.require(terms.chain())?;
+        // Every party on the fake is one byte repeated, so the first byte of
+        // the published address names the receiver.
         let receiver = match &terms {
             ReceiverTerms::Evm(evm) => {
                 if evm.token != [SETTLED_TOKEN; 20] {
@@ -1042,6 +1041,38 @@ mod tests {
         assert_eq!(state.on_chain.status, BatchChannelStatus::Sealed);
         assert_eq!(a.balance(), 10_000 - 250);
         assert_eq!(b.balance(), 10_000 + 250);
+    }
+
+    /// Solana: a close the receiver never seals is distributed once the
+    /// grace period has run, and not a second before; the payer gets back
+    /// everything the receiver did not land.
+    #[tokio::test]
+    async fn an_unsealed_close_is_distributed_once_the_grace_period_runs() {
+        let chain = InMemoryBatchChain::new(PayerExit::Close);
+        let a = InMemoryBatchSettlement::on(Arc::clone(&chain), 0x01, ONE_DAY);
+        let b = InMemoryBatchSettlement::on(Arc::clone(&chain), 0x02, ONE_DAY);
+        a.fund(10_000);
+        let opened = a.open(b.published_terms(), 1_000).await.expect("open");
+        let channel = opened.presentation.channel().clone();
+        b.admit(opened.presentation).await.expect("admit");
+        let voucher = a.sign_voucher(&channel, 300).await.expect("sign");
+        b.land(&channel, voucher).await.expect("settle while open");
+
+        a.start_withdrawal(&channel).await.expect("request_close");
+        chain.advance_time(ONE_DAY - 1);
+        assert_eq!(
+            a.finish_withdrawal(&channel).await.unwrap_err(),
+            BatchSettlementError::WithdrawalNotDue {
+                channel: channel.clone(),
+                remaining_secs: 1,
+            }
+        );
+        chain.advance_time(1);
+        let state = a.finish_withdrawal(&channel).await.expect("distribute");
+        assert_eq!(state.on_chain.status, BatchChannelStatus::Sealed);
+        assert_eq!(state.on_chain.landed, 300);
+        assert_eq!(a.balance(), 10_000 - 300);
+        assert_eq!(b.balance(), 300);
     }
 
     /// A node cannot pay more into a channel than its account holds.

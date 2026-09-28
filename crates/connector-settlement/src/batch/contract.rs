@@ -24,7 +24,7 @@ use std::sync::Arc;
 use super::port::{
     AdmissionRefusal, BatchChannelStatus, BatchSettlementBackend, BatchSettlementError,
     BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, ReceiverTerms,
-    SolanaReceiverTerms, Voucher,
+    SolanaReceiverTerms, Voucher, VoucherSigner,
 };
 use crate::port::ChannelId;
 
@@ -387,9 +387,16 @@ pub struct PayingContractFixture {
     /// The payer's settlement account's balance of the shared token, read
     /// from the chain.
     pub payer_balance: BalanceFn,
+    /// The payer's settlement key, as the chain names a voucher signer: its
+    /// settlement address on EVM, its Solana settlement key on Solana. Every
+    /// channel it opens must name this and nothing else, `[signer]` least of
+    /// all (ADR 0075 decision 3).
+    pub payer_settlement_key: VoucherSigner,
     /// Let the receiver's minimum delay pass on the chain, so a withdrawal
-    /// started before it may finish: anvil moves its clock, a Solana
-    /// validator is waited on.
+    /// started before it may finish: anvil moves its clock. The suite only
+    /// finishes a Solana close after the receiver has sealed it, which is
+    /// due at once, so on a validator, whose clock cannot be moved, this
+    /// may do nothing.
     pub let_delay_pass: LetDelayPassFn,
     /// A channel, in this chain's spelling, that the payer did not open.
     pub not_outbound: ChannelId,
@@ -448,6 +455,7 @@ where
         receiver,
         terms,
         payer_balance,
+        payer_settlement_key,
         let_delay_pass,
         not_outbound,
     } = build().await;
@@ -491,6 +499,10 @@ where
     let opened = payer.open(terms.clone(), 1_000).await.expect("open");
     let channel = opened.presentation.channel().clone();
     assert_eq!(opened.presentation.chain(), terms.chain());
+    assert_eq!(
+        opened.voucher_signer, payer_settlement_key,
+        "the payer's settlement key signs its vouchers: on EVM payerAuthorizer == payer"
+    );
     assert_eq!(
         payer_balance().await,
         funded - 1_000,
@@ -798,6 +810,10 @@ mod tests {
                     let payer = Arc::clone(&payer);
                     Box::pin(async move { payer.balance() })
                 })
+            },
+            payer_settlement_key: match exit {
+                PayerExit::Withdrawal => VoucherSigner::Evm([0x01; 20]),
+                PayerExit::Close => VoucherSigner::Solana([0x01; 32]),
             },
             let_delay_pass: Box::new(move || {
                 let chain = Arc::clone(&chain);
