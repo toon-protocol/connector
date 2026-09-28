@@ -108,6 +108,8 @@ struct World {
     mint: Pubkey,
     mint_authority: Keypair,
     payer_key: Pubkey,
+    /// The paying node's settlement key, for a restart to connect again.
+    payer_seed: [u8; 32],
     payer: Arc<SolanaBatchSettlement>,
     receiver: Arc<SolanaBatchSettlement>,
     terms: ReceiverTerms,
@@ -177,6 +179,7 @@ impl World {
             mint,
             mint_authority,
             payer_key: payer_key.pubkey(),
+            payer_seed: seed_of(&payer_key),
             payer: Arc::new(payer),
             receiver,
             terms,
@@ -258,6 +261,23 @@ async fn solana_batch_settlement_upholds_the_paying_contract() {
         // which is due at once; a validator's clock cannot be moved anyway.
         let_delay_pass: Box::new(|| Box::pin(async {})),
         not_outbound,
+        // A node restarting: `connect` again from the same settlement key,
+        // as a booting node does, remembering nothing.
+        restart: {
+            let rpc_url = world.rpc_url.clone();
+            let (seed, mint) = (world.payer_seed, world.mint);
+            Box::new(move || {
+                let rpc_url = rpc_url.clone();
+                Box::pin(async move {
+                    let transport = RpcTransport::direct(&rpc_url).expect("rpc transport");
+                    Arc::new(
+                        SolanaBatchSettlement::connect(&transport, &seed, mint, ONE_DAY, 1)
+                            .await
+                            .expect("reconnect the paying node"),
+                    ) as Arc<dyn BatchSettlementPayer>
+                })
+            })
+        },
     };
     assert_upholds_the_paying_contract(|| async move { fixture }).await;
 }

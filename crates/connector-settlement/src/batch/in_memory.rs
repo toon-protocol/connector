@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use super::port::{
     AdmissionRefusal, BatchChannelState, BatchChannelStatus, BatchSettlementBackend,
     BatchSettlementError, BatchSettlementPayer, ChannelPresentation, EvmChannelConfig,
-    EvmReceiverTerms, OpenedChannel, OutboundChannelState, ReceiverTerms, SolanaReceiverTerms,
-    Voucher, VoucherSigner,
+    EvmReceiverTerms, OpenedChannel, OutboundChannelRecord, OutboundChannelState, ReceiverTerms,
+    SolanaReceiverTerms, Voucher, VoucherSigner,
 };
 use crate::port::ChannelId;
 
@@ -97,6 +97,9 @@ struct Opening {
 
 struct Ledger {
     channels: HashMap<ChannelId, FakeChannel>,
+    /// The index the next channel id is minted from: every channel opened,
+    /// and every open prepared, takes one.
+    next_index: usize,
     /// Each party's balance of the settled token, outside any channel.
     accounts: HashMap<Party, u128>,
     /// Seconds, moved only by [`InMemoryBatchChain::advance_time`].
@@ -119,6 +122,7 @@ impl InMemoryBatchChain {
             exit,
             ledger: Mutex::new(Ledger {
                 channels: HashMap::new(),
+                next_index: 0,
                 accounts: HashMap::new(),
                 now: 0,
             }),
@@ -169,8 +173,54 @@ impl InMemoryBatchChain {
         }
     }
 
+    /// Reserve the next channel id, and on an EVM-shaped chain the config
+    /// it derives from, without putting anything on the chain: what a
+    /// prepared open names before it is sent.
+    fn reserve(
+        &self,
+        ledger: &mut Ledger,
+        opening: &Opening,
+    ) -> (ChannelId, Option<EvmChannelConfig>) {
+        let index = ledger.next_index;
+        ledger.next_index += 1;
+        let id = self.channel_id(index);
+        let config = match self.exit {
+            PayerExit::Withdrawal => {
+                let mut salt = [0u8; 32];
+                salt[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                Some(EvmChannelConfig {
+                    payer: [opening.payer; 20],
+                    payer_authorizer: [opening.payer_authorizer; 20],
+                    receiver: [opening.receiver; 20],
+                    receiver_authorizer: [opening.receiver; 20],
+                    token: [if opening.in_settled_token {
+                        SETTLED_TOKEN
+                    } else {
+                        OTHER_TOKEN
+                    }; 20],
+                    withdraw_delay: opening.delay_secs,
+                    salt,
+                })
+            }
+            PayerExit::Close => None,
+        };
+        (id, config)
+    }
+
     /// Put a channel on the chain and say how it is presented.
     fn create(&self, ledger: &mut Ledger, opening: Opening) -> OpenedChannel {
+        let (id, config) = self.reserve(ledger, &opening);
+        self.insert(ledger, id, config, opening)
+    }
+
+    /// Put the channel reserved as `id` on the chain.
+    fn insert(
+        &self,
+        ledger: &mut Ledger,
+        id: ChannelId,
+        config: Option<EvmChannelConfig>,
+        opening: Opening,
+    ) -> OpenedChannel {
         let Opening {
             payer,
             payer_authorizer,
@@ -179,28 +229,6 @@ impl InMemoryBatchChain {
             delay_secs,
             deposit,
         } = opening;
-        let index = ledger.channels.len();
-        let id = self.channel_id(index);
-        let config = match self.exit {
-            PayerExit::Withdrawal => {
-                let mut salt = [0u8; 32];
-                salt[..8].copy_from_slice(&(index as u64).to_be_bytes());
-                Some(EvmChannelConfig {
-                    payer: [payer; 20],
-                    payer_authorizer: [payer_authorizer; 20],
-                    receiver: [receiver; 20],
-                    receiver_authorizer: [receiver; 20],
-                    token: [if in_settled_token {
-                        SETTLED_TOKEN
-                    } else {
-                        OTHER_TOKEN
-                    }; 20],
-                    withdraw_delay: delay_secs,
-                    salt,
-                })
-            }
-            PayerExit::Close => None,
-        };
         let voucher_signer = self.voucher_signer(payer_authorizer);
         ledger.channels.insert(
             id.clone(),
@@ -256,6 +284,24 @@ fn debit(ledger: &mut Ledger, party: Party, amount: u128) -> Result<(), BatchSet
     }
     *balance -= amount;
     Ok(())
+}
+
+/// How long, in the fake chain's seconds, a prepared Solana-shaped open
+/// stays sendable: its stand-in for a blockhash's lifetime.
+const OPEN_LIFETIME_SECS: u64 = 90;
+
+/// The fake's stand-in for a payer-signed `open`: the delay the payer built
+/// it with and the sponsor's published minimum deposit.
+fn fake_open_transaction(delay_secs: u64, min_deposit: u128) -> Vec<u8> {
+    let mut bytes = delay_secs.to_be_bytes().to_vec();
+    bytes.extend_from_slice(&min_deposit.to_be_bytes());
+    bytes
+}
+
+fn parse_fake_open_transaction(bytes: &[u8]) -> Option<(u64, u128)> {
+    let delay = u64::from_be_bytes(bytes.get(..8)?.try_into().ok()?);
+    let min_deposit = u128::from_be_bytes(bytes.get(8..24)?.try_into().ok()?);
+    Some((delay, min_deposit))
 }
 
 fn credit(ledger: &mut Ledger, party: Party, amount: u128) {
@@ -645,57 +691,143 @@ impl BatchSettlementBackend for InMemoryBatchSettlement {
 
 #[async_trait]
 impl BatchSettlementPayer for InMemoryBatchSettlement {
-    async fn open(
+    async fn prepare_open(
         &self,
         terms: ReceiverTerms,
         deposit: u128,
-    ) -> Result<OpenedChannel, BatchSettlementError> {
+    ) -> Result<OutboundChannelRecord, BatchSettlementError> {
         let chain = &self.chain;
         chain.require(terms.chain())?;
-        // Every party on the fake is one byte repeated, so the first byte of
-        // the published address names the receiver.
-        let receiver = match &terms {
-            ReceiverTerms::Evm(evm) => {
-                if evm.token != [SETTLED_TOKEN; 20] {
-                    return Err(BatchSettlementError::TokenNotShared);
-                }
-                evm.receiver[0]
-            }
-            ReceiverTerms::Solana(solana) => {
-                if solana.mint != [SETTLED_TOKEN; 32] {
-                    return Err(BatchSettlementError::TokenNotShared);
-                }
-                // The sponsor co-signs only at or above its published
-                // minimum, and says so by name (ADR 0074 decision 5).
-                if deposit < solana.min_deposit {
-                    return Err(BatchSettlementError::OpenRefused(format!(
-                        "deposit_below_minimum: deposit is {deposit}; the sponsor co-signs an \
-                         open only at or above {}",
-                        solana.min_deposit
-                    )));
-                }
-                solana.receiver[0]
-            }
+        let (token, receiver) = match &terms {
+            ReceiverTerms::Evm(evm) => (evm.token[0], evm.receiver[0]),
+            ReceiverTerms::Solana(solana) => (solana.mint[0], solana.receiver[0]),
+        };
+        if token != SETTLED_TOKEN {
+            return Err(BatchSettlementError::TokenNotShared);
+        }
+        let opening = Opening {
+            payer: self.node,
+            // The settlement key signs the vouchers too: on EVM
+            // `payerAuthorizer == payer` (ADR 0075 decision 3).
+            payer_authorizer: self.node,
+            receiver,
+            in_settled_token: true,
+            delay_secs: terms.min_delay_secs(),
+            deposit,
         };
         let mut ledger = chain.ledger();
+        let (channel, config) = chain.reserve(&mut ledger, &opening);
+        Ok(match (terms, config) {
+            (ReceiverTerms::Evm(_), Some(config)) => OutboundChannelRecord::Evm {
+                channel,
+                config,
+                deposit,
+            },
+            (ReceiverTerms::Solana(solana), _) => OutboundChannelRecord::Solana {
+                channel,
+                receiver: solana.receiver,
+                sponsor_endpoint: solana.sponsor_endpoint,
+                deposit,
+                // The fake's own "signed open": what the chain needs to
+                // create the channel, since the fake parses no transaction.
+                transaction: fake_open_transaction(opening.delay_secs, solana.min_deposit),
+                last_valid_block_height: ledger.now + OPEN_LIFETIME_SECS,
+            },
+            (ReceiverTerms::Evm(_), None) => unreachable!("an EVM-shaped chain reserves a config"),
+        })
+    }
+
+    async fn open_prepared(
+        &self,
+        record: &OutboundChannelRecord,
+    ) -> Result<OpenedChannel, BatchSettlementError> {
+        let chain = &self.chain;
+        chain.require(record.chain())?;
+        let channel = record.channel().clone();
+        let deposit = record.deposit();
+        let mut ledger = chain.ledger();
+        // Already on chain: adopted as it stands, nothing sent.
+        if let Some(stored) = ledger.channels.get(&channel) {
+            let presentation = record.presentation();
+            let voucher_signer = stored.voucher_signer;
+            drop(ledger);
+            self.outbound().entry(channel).or_insert(0);
+            return Ok(OpenedChannel {
+                presentation,
+                voucher_signer,
+            });
+        }
+        let (config, receiver, delay_secs) = match record {
+            OutboundChannelRecord::Evm { config, .. } => (
+                Some(config.clone()),
+                config.receiver[0],
+                config.withdraw_delay,
+            ),
+            OutboundChannelRecord::Solana {
+                receiver,
+                transaction,
+                last_valid_block_height,
+                ..
+            } => {
+                if ledger.now > *last_valid_block_height {
+                    return Err(BatchSettlementError::OpenLapsed(channel));
+                }
+                let (delay_secs, min_deposit) = parse_fake_open_transaction(transaction)
+                    .ok_or_else(|| {
+                        BatchSettlementError::Backend("not a fake open transaction".to_string())
+                    })?;
+                // The sponsor co-signs only at or above its published
+                // minimum, and says so by name (ADR 0074 decision 5).
+                if deposit < min_deposit {
+                    return Err(BatchSettlementError::OpenRefused(format!(
+                        "deposit_below_minimum: deposit is {deposit}; the sponsor co-signs an \
+                         open only at or above {min_deposit}"
+                    )));
+                }
+                (None, receiver[0], delay_secs)
+            }
+        };
         debit(&mut ledger, self.node, deposit)?;
-        let opened = chain.create(
+        let opened = chain.insert(
             &mut ledger,
+            channel.clone(),
+            config,
             Opening {
                 payer: self.node,
-                // The settlement key signs the vouchers too: on EVM
-                // `payerAuthorizer == payer` (ADR 0075 decision 3).
                 payer_authorizer: self.node,
                 receiver,
                 in_settled_token: true,
-                delay_secs: terms.min_delay_secs(),
+                delay_secs,
                 deposit,
             },
         );
         drop(ledger);
-        self.outbound()
-            .insert(opened.presentation.channel().clone(), 0);
+        self.outbound().insert(channel, 0);
         Ok(opened)
+    }
+
+    async fn restore_outbound(
+        &self,
+        record: &OutboundChannelRecord,
+        signed: u128,
+    ) -> Result<OutboundChannelState, BatchSettlementError> {
+        self.chain.require(record.chain())?;
+        let channel = record.channel().clone();
+        let ledger = self.chain.ledger();
+        let stored = ledger
+            .channels
+            .get(&channel)
+            .ok_or_else(|| BatchSettlementError::ChannelNotFound(channel.clone()))?;
+        if stored.payer != self.node {
+            return Err(BatchSettlementError::NotOutbound(channel));
+        }
+        let landed = stored.landed;
+        let mut outbound = self.outbound();
+        let watermark = outbound.entry(channel.clone()).or_insert(0);
+        *watermark = (*watermark).max(signed).max(landed);
+        let watermark = *watermark;
+        drop(outbound);
+        self.outbound_state_of(&ledger, &channel, watermark)
     }
 
     async fn top_up(
@@ -1073,6 +1205,41 @@ mod tests {
         assert_eq!(state.on_chain.landed, 300);
         assert_eq!(a.balance(), 10_000 - 300);
         assert_eq!(b.balance(), 300);
+    }
+
+    /// Solana: a prepared open the chain never took, once its blockhash has
+    /// expired, never will. The record opens nothing and spends nothing, and
+    /// says so by name, so the caller can abandon it and open afresh.
+    #[tokio::test]
+    async fn a_prepared_solana_open_lapses_once_its_blockhash_expires() {
+        let chain = InMemoryBatchChain::new(PayerExit::Close);
+        let a = InMemoryBatchSettlement::on(Arc::clone(&chain), 0x01, ONE_DAY);
+        let b = InMemoryBatchSettlement::on(Arc::clone(&chain), 0x02, ONE_DAY);
+        a.fund(10_000);
+        let record = a
+            .prepare_open(b.published_terms(), 1_000)
+            .await
+            .expect("prepare");
+        chain.advance_time(OPEN_LIFETIME_SECS + 1);
+        assert_eq!(
+            a.open_prepared(&record).await.unwrap_err(),
+            BatchSettlementError::OpenLapsed(record.channel().clone())
+        );
+        assert_eq!(a.balance(), 10_000);
+    }
+
+    /// EVM: an open prepared long ago is still sendable, since its opening
+    /// deposit never expires.
+    #[tokio::test]
+    async fn a_prepared_evm_open_never_lapses() {
+        let (a, b) = peers(PayerExit::Withdrawal);
+        let record = a
+            .prepare_open(b.published_terms(), 1_000)
+            .await
+            .expect("prepare");
+        a.chain.advance_time(10 * ONE_DAY);
+        a.open_prepared(&record).await.expect("still opens");
+        assert_eq!(a.balance(), 9_000);
     }
 
     /// A node cannot pay more into a channel than its account holds.

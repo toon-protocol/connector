@@ -14,15 +14,19 @@
 //! 0012), exposed for inspection at `GET /audit-log`.
 //!
 //! `POST /packets` -- originating a packet outward -- `POST /routes/leased`
-//! -- creating or renewing a leased route (issue #427) -- and
-//! `POST /channels`, `POST /channels/:id/fund`, `POST /channels/:id/redeem`,
-//! `POST /channels/:id/close` (channel lifecycle, ADR 0008's third write,
-//! issue #459), `POST /channels/:id/settle` (issue #1129 -- the write that
-//! *finishes* a close, once its challenge period has elapsed),
-//! `POST /channels/:id/redeem-latest` and
-//! `POST /channels/:id/cooperative-close` (on-chain redemption and
-//! cooperative close of whatever claim this node already holds, issue #425)
-//! -- are this crate's write endpoints. Every one calls
+//! -- creating or renewing a leased route (issue #427) -- and the channel
+//! writes of ADR 0075 decision 11 (issue #1376): `POST /channels` (open an
+//! outbound x402 channel, journaled before it is sent), `POST
+//! /channels/:id/fund` (top one up by an increment), `POST
+//! /channels/:id/withdraw` (start a withdrawal, and finish it once due) and
+//! `POST /channels/:id/land` (land the latest voucher held on an inbound
+//! channel now) -- are this crate's write endpoints, beside the peering and
+//! route writes. The `toon-channel` writes `redeem`, `redeem-latest`,
+//! `close`, `settle` and `cooperative-close` are deleted, and so is the EVM
+//! `toon-channel` open. `POST /channels` still opens a Solana `toon-channel`
+//! for `local/keys.sh` until #1383, and `/fund` still funds a `toon-channel`
+//! on either chain -- on EVM for a `POST /peers` peering, until #1378.
+//! Every one calls
 //! [`write_auth::authenticate_write`] first and nothing else in this
 //! crate accepts a body, so a write cannot reach [`Connector`] without a
 //! valid, allowlisted, unexpired, non-replayed signature. Bearer tokens
@@ -82,13 +86,15 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use connector_client_edge::ClientClaimGate;
+use connector_domain::x402::X402BatchSettlementTerms;
 use connector_domain::{PacketResponse, Prepare, Price};
 use connector_runtime::{
-    ChannelOperationError, ChannelView, ClaimBookKind, ClaimDirection, ClaimView, Connector,
-    DeclaredRates, EstablishPeeringError, LeaseRouteError, LeasedRouteView, PeerRouteTableError,
-    PeerRouteView, PeerView, RateView, RouteView, SelfDescriptionError, SettlementChain,
+    BatchChannelError, BatchChannelView, BatchChannels, ChannelOperationError, ChannelView,
+    ClaimBookKind, ClaimDirection, ClaimScheme, ClaimView, Connector, DeclaredRates,
+    EstablishPeeringError, LeaseRouteError, LeasedRouteView, PeerRouteTableError, PeerRouteView,
+    PeerView, RateView, RouteView, SelfDescriptionError, SettlementChain, WithdrawStep,
 };
-use connector_settlement::{Claim, SettlementError};
+use connector_settlement::batch::BatchSettlementError;
 use connector_signer::{derive_evm_address, to_hex, Signer, SignerError};
 use url::Url;
 use write_auth::{authenticate_write, AuditRecord, WriteAuth};
@@ -128,6 +134,31 @@ struct OperatorState {
     /// and a `404` would make an operator wonder whether the surface was
     /// too old to have the endpoint.
     rates: Option<DeclaredRates>,
+    /// This node's x402 `batch-settlement` channels, both ways (ADR 0075
+    /// decision 11), or `None` on a node with no x402 backend: its x402
+    /// writes answer `503`, and its reads list none.
+    batch: Option<Arc<BatchChannels>>,
+}
+
+/// [`router_with_batch_channels`] for a node with no x402 batch-settlement
+/// backend.
+pub fn router(
+    connector: Arc<Connector>,
+    claim_gate: Arc<ClientClaimGate>,
+    signer: Arc<dyn Signer>,
+    bearer_token: impl Into<String>,
+    write_keys: Vec<[u8; 32]>,
+    declared_rates: Option<DeclaredRates>,
+) -> Router {
+    router_with_batch_channels(
+        connector,
+        claim_gate,
+        signer,
+        bearer_token,
+        write_keys,
+        declared_rates,
+        None,
+    )
 }
 
 /// Mount the operator surface's read-only half at `connector`: `GET`
@@ -143,14 +174,17 @@ struct OperatorState {
 /// `declared_rates` is this node's dealing, read over the same shared
 /// table the forwarding path converts against (issue #1297, ADR 0071) --
 /// `None` for a node that declares no `[[tokens]]`, which is every node
-/// predating the record.
-pub fn router(
+/// predating the record. `batch_channels` is this node's x402 channels,
+/// both ways (ADR 0075 decision 11): what the x402 channel writes drive and
+/// `GET /channels` and `GET /claims` list.
+pub fn router_with_batch_channels(
     connector: Arc<Connector>,
     claim_gate: Arc<ClientClaimGate>,
     signer: Arc<dyn Signer>,
     bearer_token: impl Into<String>,
     write_keys: Vec<[u8; 32]>,
     declared_rates: Option<DeclaredRates>,
+    batch_channels: Option<Arc<BatchChannels>>,
 ) -> Router {
     let state = OperatorState {
         connector,
@@ -159,6 +193,7 @@ pub fn router(
         bearer_token: Arc::from(bearer_token.into()),
         write_auth: Arc::new(WriteAuth::new(write_keys)),
         rates: declared_rates,
+        batch: batch_channels,
     };
 
     // Reads: gated by the bearer token and nothing else. Writes: gated by
@@ -190,11 +225,8 @@ pub fn router(
         .route("/routes/peers/:prefix", delete(remove_peer_route))
         .route("/channels", post(open_channel))
         .route("/channels/:id/fund", post(fund_channel))
-        .route("/channels/:id/redeem", post(redeem_channel))
-        .route("/channels/:id/redeem-latest", post(redeem_latest_claim))
-        .route("/channels/:id/close", post(close_channel))
-        .route("/channels/:id/settle", post(settle_channel))
-        .route("/channels/:id/cooperative-close", post(cooperative_close));
+        .route("/channels/:id/withdraw", post(withdraw_channel))
+        .route("/channels/:id/land", post(land_channel));
 
     // The dashboard page: served without a token because it is inert
     // markup -- it holds no figure and no key, and only becomes anything
@@ -303,16 +335,35 @@ async fn leased_routes(State(state): State<OperatorState>) -> Json<Vec<LeasedRou
 /// it is in [`Connector`]'s own `known_channels`. A recognized channel this
 /// node also happens to have opened (unusual, but not impossible) is not
 /// duplicated.
-async fn channels(State(state): State<OperatorState>) -> Json<Vec<ChannelView>> {
-    let mut views = state.connector.channels().await;
-    let already_listed: HashSet<String> = views.iter().map(|view| view.id.clone()).collect();
+///
+/// Then every x402 `batch-settlement` channel (ADR 0075 decision 11):
+/// inbound ones this node holds a voucher on and outbound ones it opened,
+/// each with its `direction`, `collateral`, `watermark` and `status`, and
+/// `scheme: "batch-settlement"` to tell them from the `toon-channel` rows
+/// above, which carry none of those fields.
+async fn channels(State(state): State<OperatorState>) -> Json<Vec<serde_json::Value>> {
+    let mut toon = state.connector.channels().await;
+    let already_listed: HashSet<String> = toon.iter().map(|view| view.id.clone()).collect();
     for channel_id in state.connector.recognized_channel_ids() {
         if already_listed.contains(&channel_id) {
             continue;
         }
         if let Ok(view) = state.connector.channel_view(&channel_id).await {
-            views.push(view);
+            toon.push(view);
         }
+    }
+    let mut views: Vec<serde_json::Value> = toon
+        .iter()
+        .map(|view| serde_json::to_value(view).expect("a channel view serializes"))
+        .collect();
+    if let Some(batch) = &state.batch {
+        views.extend(
+            batch
+                .views()
+                .await
+                .iter()
+                .map(|view| serde_json::to_value(view).expect("a channel view serializes")),
+        );
     }
     Json(views)
 }
@@ -324,10 +375,27 @@ async fn channels(State(state): State<OperatorState>) -> Json<Vec<ChannelView>> 
 /// endpoint also read that book. `book` on each row says which one it came
 /// from; a client-edge entry is always inbound and never pending, the same
 /// as an inbound peer-book entry.
+///
+/// `direction` and `scheme` on every row say which way it pays and whether
+/// it is a `toon-channel` claim or an x402 voucher (ADR 0075 decision 11):
+/// vouchers received are the client book's `batch-settlement` rows, and
+/// vouchers signed are the outbound channels' own book, one row per
+/// channel at the highest amount signed on it.
 async fn claims(State(state): State<OperatorState>) -> Json<Vec<ClaimView>> {
     let mut views = state.connector.claims();
+    let vouchers: HashSet<String> = state
+        .claim_gate
+        .batch_channels()
+        .into_iter()
+        .map(|channel| channel.channel_key())
+        .collect();
     views.extend(state.claim_gate.accepted_channels().into_iter().map(
         |(channel_id, watermark)| ClaimView {
+            scheme: if vouchers.contains(&channel_id) {
+                ClaimScheme::BatchSettlement
+            } else {
+                ClaimScheme::ToonChannel
+            },
             peer_id: None,
             channel_id,
             direction: ClaimDirection::Inbound,
@@ -337,6 +405,9 @@ async fn claims(State(state): State<OperatorState>) -> Json<Vec<ClaimView>> {
             book: ClaimBookKind::Client,
         },
     ));
+    if let Some(batch) = &state.batch {
+        views.extend(batch.outbound().claims());
+    }
     Json(views)
 }
 
@@ -764,17 +835,28 @@ async fn remove_peer_route(
     }
 }
 
-/// A `POST /channels` request body: open a channel to `counterparty_hex`
-/// (arbitrary bytes, hex-encoded -- an EVM backend expects a 20-byte
-/// address, a Solana one a 32-byte pubkey, but the port itself takes
-/// opaque bytes) with a `settlement_timeout_seconds`-second
-/// withdrawal-safety window (issue #459, ADR 0008). `chain` names which
-/// configured settlement backend opens it (`"evm"` or `"solana"`, the
-/// config file's own chain names, issue #630); omitted, it means "the
-/// configured backend", which a node settling on more than one chain
-/// refuses as ambiguous rather than resolving silently.
+/// A `POST /channels` body that opens an **outbound x402 channel** (ADR 0075
+/// decision 11): `terms` is the counterparty's `batchSettlements` entry for
+/// one chain, exactly as its self-description publishes it; `deposit` is
+/// the opening deposit in the token's base units; `url` is the
+/// counterparty's URL, which a Solana `sponsorEndpoint` published as a path
+/// resolves against.
 #[derive(Debug, Deserialize)]
-struct OpenChannelRequest {
+#[serde(deny_unknown_fields)]
+struct OpenOutboundChannelRequest {
+    terms: X402BatchSettlementTerms,
+    deposit: u128,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// A `POST /channels` body that opens a **Solana `toon-channel`**: the one
+/// TOON-channel write still served, because `local/keys.sh`'s
+/// `solana-channels` stage opens its channels through it until #1383 moves
+/// the local stack to x402 (ADR 0075 decision 13). `chain` must be
+/// `"solana"`; the EVM branch is deleted (#1376).
+#[derive(Debug, Deserialize)]
+struct OpenToonChannelRequest {
     counterparty_hex: String,
     settlement_timeout_seconds: i64,
     #[serde(default)]
@@ -784,11 +866,11 @@ struct OpenChannelRequest {
 /// A `POST /channels/:id/fund` request body, in one of two forms:
 ///
 /// - `{"amount": n}` deposits `n` more of this node's own collateral. An
-///   increment, so a retry after an ambiguous outcome deposits again.
+///   increment, so a retry after an ambiguous outcome deposits again. The
+///   only form an x402 channel takes (ADR 0075 decision 11).
 /// - `{"total": n}` raises this node's own deposit **to** `n` and no
-///   further, so it can be repeated until it is answered (ADR 0073). A
-///   total already reached deposits nothing and answers the channel as it
-///   stands.
+///   further, so it can be repeated until it is answered (ADR 0073). Solana
+///   `toon-channel` only.
 ///
 /// Exactly one of the two.
 #[derive(Debug, Deserialize)]
@@ -799,17 +881,10 @@ struct FundChannelRequest {
     total: Option<u128>,
 }
 
-/// A `POST /channels/:id/redeem` request body: redeem a claim of
-/// `cumulative_amount` at `nonce` (issue #573 -- without it, nothing this
-/// submits is redeemable on any real chain), authorized by `signature_hex`
-/// (opaque, hex-encoded -- this port does not verify it; see
-/// `connector_settlement::Claim`).
-#[derive(Debug, Deserialize)]
-struct RedeemChannelRequest {
-    nonce: u64,
-    cumulative_amount: u128,
-    signature_hex: String,
-}
+/// The refusal a request for the retired EVM `toon-channel` writes gets.
+const EVM_TOON_CHANNEL_RETIRED: &str =
+    "EVM toon-channel channels are no longer opened here (ADR 0075, #1376): open an outbound \
+     x402 batch-settlement channel by posting the counterparty's `terms` instead";
 
 fn channel_operation_response(result: Result<ChannelView, ChannelOperationError>) -> Response {
     match result {
@@ -830,12 +905,58 @@ fn channel_operation_error_response(error: ChannelOperationError) -> Response {
         | ChannelOperationError::NoSettlementBackendForChain(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()
         }
-        ChannelOperationError::NoClaimToRedeem
-        | ChannelOperationError::AmbiguousSettlementChain
-        | ChannelOperationError::Settlement(_) => {
+        ChannelOperationError::AmbiguousSettlementChain | ChannelOperationError::Settlement(_) => {
             (StatusCode::BAD_REQUEST, error.to_string()).into_response()
         }
     }
+}
+
+/// The status a failed x402 channel operation answers with.
+///
+/// - `503`: this node has no x402 backend on that chain -- its own config.
+/// - `404`: not a channel of this node's, or none held to land.
+/// - `409`: the channel's state refuses the step now, and a later retry may
+///   not: still opening, a withdrawal not yet due or none to finish, a
+///   voucher already landed, a sealed channel, a lapsed open.
+/// - `502`: the counterparty or the chain -- a sponsor that refused the
+///   open, an RPC that failed.
+/// - `500`: the journal could not be written, so nothing was sent.
+/// - `400`: everything the request itself got wrong.
+fn batch_channel_error_response(error: BatchChannelError) -> Response {
+    let status = match &error {
+        BatchChannelError::NoBackend(_) => StatusCode::SERVICE_UNAVAILABLE,
+        BatchChannelError::UnknownChannel(_) | BatchChannelError::NoVoucherHeld(_) => {
+            StatusCode::NOT_FOUND
+        }
+        BatchChannelError::StillOpening(_) => StatusCode::CONFLICT,
+        BatchChannelError::InvalidTerms(_) => StatusCode::BAD_REQUEST,
+        BatchChannelError::Journal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        BatchChannelError::Settlement(settlement) => match settlement {
+            BatchSettlementError::WithdrawalNotDue { .. }
+            | BatchSettlementError::NoWithdrawalPending(_)
+            | BatchSettlementError::StaleVoucher { .. }
+            | BatchSettlementError::ChannelSealed(_)
+            | BatchSettlementError::OpenLapsed(_) => StatusCode::CONFLICT,
+            BatchSettlementError::OpenRefused(_) | BatchSettlementError::Backend(_) => {
+                StatusCode::BAD_GATEWAY
+            }
+            BatchSettlementError::NotOutbound(_) | BatchSettlementError::ChannelNotFound(_) => {
+                StatusCode::NOT_FOUND
+            }
+            _ => StatusCode::BAD_REQUEST,
+        },
+    };
+    (status, error.to_string()).into_response()
+}
+
+/// The `503` a node without an x402 backend answers every x402 channel
+/// write with.
+fn no_batch_backend() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "this node has no x402 batch-settlement backend configured",
+    )
+        .into_response()
 }
 
 /// Decode `0x`-optional hex into raw bytes; `Err` on odd length or a
@@ -851,10 +972,19 @@ fn decode_hex(input: &str) -> Result<Vec<u8>, ()> {
         .collect()
 }
 
-/// `POST /channels`: open a new payment channel (issue #459, ADR 0008).
-/// Authenticated exactly like every other write on this surface --
-/// [`authenticate_write`] first, nothing else in this handler accepts the
-/// request until that succeeds.
+/// `POST /channels`: open an outbound x402 channel toward a counterparty
+/// (ADR 0075 decision 11), or -- the one retained TOON branch -- a Solana
+/// `toon-channel`. A body carrying `terms` is the former; one carrying
+/// `counterparty_hex` the latter. Authenticated exactly like every other
+/// write on this surface -- [`authenticate_write`] first, nothing else in
+/// this handler accepts the request until that succeeds.
+///
+/// **This endpoint spends.** Its x402 branch is safe to retry: the channel
+/// is journaled before its opening transaction is sent, and a retry toward
+/// the same receiver while that open is unconfirmed resumes it rather than
+/// opening a second (ADR 0075 decision 8). The answer says which it did --
+/// `resumed: true` -- so an unintended second channel is visible in the
+/// operator's own output.
 async fn open_channel(
     State(state): State<OperatorState>,
     method: Method,
@@ -866,27 +996,42 @@ async fn open_channel(
         return error.into_response();
     }
 
-    let request: OpenChannelRequest = match serde_json::from_slice(&body) {
+    let fields: serde_json::Map<String, serde_json::Value> = match serde_json::from_slice(&body) {
+        Ok(fields) => fields,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    if fields.contains_key("terms") {
+        return open_outbound_channel(&state, &body).await;
+    }
+
+    let request: OpenToonChannelRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
+    match request.chain.as_deref() {
+        Some("solana") => {}
+        Some("evm") => return (StatusCode::BAD_REQUEST, EVM_TOON_CHANNEL_RETIRED).into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "a toon-channel open is served only on Solana and must say `\"chain\": \
+                 \"solana\"`; an x402 channel is opened by posting the counterparty's `terms`",
+            )
+                .into_response()
+        }
+    }
     let counterparty = match decode_hex(&request.counterparty_hex) {
         Ok(bytes) => bytes,
         Err(()) => {
             return (StatusCode::BAD_REQUEST, "counterparty_hex must be hex").into_response()
         }
     };
-    let chain = match request.chain.as_deref().map(str::parse::<SettlementChain>) {
-        None => None,
-        Some(Ok(chain)) => Some(chain),
-        Some(Err(error)) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
-    };
 
     channel_operation_response(
         state
             .connector
             .open_channel(
-                chain,
+                Some(SettlementChain::Solana),
                 counterparty,
                 chrono::Duration::seconds(request.settlement_timeout_seconds),
             )
@@ -894,8 +1039,49 @@ async fn open_channel(
     )
 }
 
-/// `POST /channels/:id/fund`: deposit into an existing channel (issue
-/// #459, ADR 0008).
+/// The answer to an x402 `POST /channels`: the channel, and whether this
+/// request resumed an open journaled earlier rather than building one.
+#[derive(Debug, Serialize)]
+struct OpenedOutboundChannel {
+    #[serde(flatten)]
+    channel: BatchChannelView,
+    resumed: bool,
+}
+
+async fn open_outbound_channel(state: &OperatorState, body: &Bytes) -> Response {
+    let Some(batch) = state.batch.as_ref() else {
+        return no_batch_backend();
+    };
+    let request: OpenOutboundChannelRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let url = match request.url.as_deref().map(Url::parse) {
+        None => None,
+        Some(Ok(url)) => Some(url),
+        Some(Err(error)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("`url` is not a URL: {error}"),
+            )
+                .into_response()
+        }
+    };
+    match batch
+        .open(&request.terms, url.as_ref(), request.deposit)
+        .await
+    {
+        Ok((channel, resumed)) => Json(OpenedOutboundChannel { channel, resumed }).into_response(),
+        Err(error) => batch_channel_error_response(error),
+    }
+}
+
+/// `POST /channels/:id/fund`: top up a channel this node pays on, by an
+/// increment (ADR 0075 decision 11). An outbound x402 channel takes
+/// `{"amount": n}`. A `toon-channel` takes either form: on Solana
+/// `local/keys.sh` funds through it until #1383, and on EVM a `POST /peers`
+/// peering, whose channel that write opens, is collateralised through it
+/// until #1378 moves the peering to x402.
 async fn fund_channel(
     State(state): State<OperatorState>,
     Path(channel_id): Path<String>,
@@ -913,6 +1099,24 @@ async fn fund_channel(
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
+    if let Some(batch) = state
+        .batch
+        .as_ref()
+        .filter(|batch| batch.outbound().knows(&channel_id))
+    {
+        let (Some(amount), None) = (request.amount, request.total) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "an x402 channel is topped up by an increment: give exactly `amount`",
+            )
+                .into_response();
+        };
+        return match batch.outbound().top_up(&channel_id, amount).await {
+            Ok(state) => Json(batch.outbound().view_of(&state)).into_response(),
+            Err(error) => batch_channel_error_response(error),
+        };
+    }
+
     let result =
         match (request.amount, request.total) {
             (Some(amount), None) => state.connector.fund_channel(&channel_id, amount).await,
@@ -927,9 +1131,26 @@ async fn fund_channel(
     channel_operation_response(result)
 }
 
-/// `POST /channels/:id/redeem`: redeem a claim against an existing channel
-/// (issue #459, ADR 0008).
-async fn redeem_channel(
+/// The answer to `POST /channels/:id/withdraw`: which step it took, and
+/// the channel after it.
+#[derive(Debug, Serialize)]
+struct WithdrawnChannel {
+    step: WithdrawStep,
+    #[serde(flatten)]
+    channel: BatchChannelView,
+}
+
+/// `POST /channels/:id/withdraw`: wind down an outbound x402 channel (ADR
+/// 0075 decision 11). One lever with two steps, which the chain decides:
+/// on an open channel it **starts** -- EVM `initiateWithdraw`, Solana
+/// `request_close` -- and once that is due it **finishes** -- EVM
+/// `finalizeWithdraw`, Solana `distribute`. Between them the receiver has
+/// the channel's delay in which to land its latest voucher, which is what
+/// protects it. Called too early, it answers `409` with the seconds left.
+/// No request body.
+///
+/// Replaces the `toon-channel` `close` and `settle` writes, deleted here.
+async fn withdraw_channel(
     State(state): State<OperatorState>,
     Path(channel_id): Path<String>,
     method: Method,
@@ -940,34 +1161,30 @@ async fn redeem_channel(
     if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
         return error.into_response();
     }
-
-    let request: RedeemChannelRequest = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    let Some(batch) = state.batch.as_ref() else {
+        return no_batch_backend();
     };
-    let signature = match decode_hex(&request.signature_hex) {
-        Ok(bytes) => bytes,
-        Err(()) => return (StatusCode::BAD_REQUEST, "signature_hex must be hex").into_response(),
-    };
-
-    channel_operation_response(
-        state
-            .connector
-            .redeem_channel(
-                &channel_id,
-                Claim {
-                    nonce: request.nonce,
-                    cumulative_amount: request.cumulative_amount,
-                    signature,
-                },
-            )
-            .await,
-    )
+    match batch.outbound().withdraw(&channel_id).await {
+        Ok((step, state)) => Json(WithdrawnChannel {
+            step,
+            channel: batch.outbound().view_of(&state),
+        })
+        .into_response(),
+        Err(error) => batch_channel_error_response(error),
+    }
 }
 
-/// `POST /channels/:id/close`: close an existing channel (issue #459, ADR
-/// 0008). No request body.
-async fn close_channel(
+/// `POST /channels/:id/land`: land the latest voucher this node holds on an
+/// inbound x402 channel now (ADR 0075 decision 11) -- EVM `claim`, Solana
+/// `settle`, or `settle_and_seal` on a channel its payer is closing. The
+/// watchers and sweeps land vouchers on their own; this is the manual lever
+/// for planned maintenance. No request body: the voucher landed is the one
+/// the client edge accepted and journaled, never one the caller supplies.
+///
+/// Replaces the `toon-channel` `redeem`, `redeem-latest` and
+/// `cooperative-close` writes, deleted here. Landing the same voucher twice
+/// answers `409` by name.
+async fn land_channel(
     State(state): State<OperatorState>,
     Path(channel_id): Path<String>,
     method: Method,
@@ -978,245 +1195,13 @@ async fn close_channel(
     if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
         return error.into_response();
     }
-
-    channel_operation_response(state.connector.close_channel(&channel_id).await)
-}
-
-/// `POST /channels/:id/settle`: settle a closed channel whose challenge
-/// period has elapsed, paying each side's remaining deposit back out on
-/// chain and making the channel permanently done (issue #1129). No request
-/// body.
-///
-/// The seventh channel write, and the one that finishes what
-/// `POST /channels/:id/close` starts. Before it, `close` began a challenge
-/// period no operator surface could then settle: `cooperative-close` is a
-/// redeem plus that same close, so it did not finish one either, and the
-/// remainder came back only by calling the chain directly -- possible with
-/// `cast send` against `TokenNetwork.settleChannel`, and possible with
-/// *nothing* on Solana, whose CLI cannot build a `SettleChannel`
-/// instruction. That is the same argument that made `POST /channels` a
-/// write rather than a runbook (issue #459).
-///
-/// Authenticated like every other write here (ADR 0008), even though both
-/// chains make settling permissionless -- `TokenNetwork.settleChannel` and
-/// `packages/solana-program`'s `SettleChannel` each let any caller settle
-/// once the window has passed. The signature is not guarding who may
-/// settle; it is guarding this node's settlement key, which pays the gas
-/// and whose nonce sequence the transaction joins.
-///
-/// Settling before the window closes answers `400` with
-/// `SettlementError::SettlementNotYetDue` named in the body, exactly like
-/// every other settlement refusal on this surface -- a retry-later answer,
-/// not a different status code.
-///
-/// # Retiring the client edge's watermark (issue #1283)
-///
-/// A settle is the one channel write after which the channel can never be
-/// paid on again, so it is also the point at which the client edge's
-/// replay watermark for it stops being a defence and starts being a
-/// liability. On Solana a channel's address is derived from the sorted
-/// participants and the mint with no epoch in the seeds, so the payer's
-/// next channel with this node is *the same address* -- and would inherit
-/// the settled incarnation's watermark, making every fresh claim either a
-/// replay or a demand for money already paid out. `ClientClaimGate`'s
-/// periodic sweep cannot catch that on its own: it resets only while the
-/// chain reports the channel gone, and a payer who reopens between the
-/// settle and the next sweep leaves no gap for it to see.
-///
-/// So this handler retires it directly, and only on the settle's own
-/// success -- never on `close`, which merely starts the challenge period,
-/// and never on `cooperative-close`, which is a redeem plus that same
-/// close. Both leave a channel whose watermark is still owed its job and
-/// whose last claim is still what a redemption would submit.
-///
-/// The retirement is recorded as durably as an acceptance, but it cannot
-/// fail the request. The chain has already moved the money by the time it
-/// runs, and answering `500` would invite an operator to retry a settle
-/// that has already happened; `retire_settled_channel` logs at `error`
-/// instead, and that log line is the operator's cue rather than a
-/// guarantee -- the sweep picks the channel up only while the payer has
-/// not yet reopened at the same address.
-async fn settle_channel(
-    State(state): State<OperatorState>,
-    Path(channel_id): Path<String>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
-        return error.into_response();
-    }
-
-    let settled = state.connector.settle_channel(&channel_id).await;
-    if settled.is_ok() {
-        // `None` for an id in neither chain's shape, which the client edge
-        // could never have journaled a watermark under either.
-        if let Some(key) = client_edge_channel_key(&channel_id) {
-            state.claim_gate.retire_settled_channel(&key).await;
-        }
-    }
-    channel_operation_response(settled)
-}
-
-/// The key `ClientClaimGate` would have journaled `channel_id` under, could
-/// it be a client channel at all -- `"evm:"` or `"solana:"` plus the id,
-/// exactly what `connector_domain::client_claim::ClientClaim::channel_key`
-/// produces from a parsed claim. This surface is handed a bare path
-/// parameter, not a parsed claim, so the chain has to be guessed from the
-/// id's own shape first: the same rule `connector_runtime::Connector`'s own
-/// (private) channel-id dispatch uses -- an EVM id is `0x`-optional 64 hex
-/// characters, a Solana one is base58 decoding to exactly 32 bytes -- and
-/// provably disjoint, so at most one of the two ever matches. `None` for an
-/// id in neither shape, which the client edge could never have journaled
-/// anything under either.
-fn client_edge_channel_key(channel_id: &str) -> Option<String> {
-    let hex = channel_id.strip_prefix("0x").unwrap_or(channel_id);
-    if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Some(format!("evm:0x{}", hex.to_ascii_lowercase()));
-    }
-    if bs58::decode(channel_id)
-        .into_vec()
-        .is_ok_and(|bytes| bytes.len() == 32)
-    {
-        return Some(format!("solana:{channel_id}"));
-    }
-    None
-}
-
-/// The claim the client edge's own book holds on `channel_id`, as a
-/// redeemable [`Claim`] (issue #1218). `None` for an id the client edge
-/// could never have journaled anything under ([`client_edge_channel_key`])
-/// as well as for one it simply has no claim on: neither is redeemable, and
-/// the two are the same answer to every caller here.
-fn client_edge_claim(state: &OperatorState, channel_id: &str) -> Option<Claim> {
-    let key = client_edge_channel_key(channel_id)?;
-    let (nonce, cumulative_amount, signature) = state.claim_gate.latest_inbound_claim(&key)?;
-    Some(Claim {
-        nonce,
-        cumulative_amount: u128::from(cumulative_amount),
-        signature,
-    })
-}
-
-/// The claim this connector holds on `channel_id` that supersedes every
-/// other it holds there (issues #1218, #1257): the peer semantics's own
-/// `ClaimBook` and the client edge's `ClientClaimGate` are both read, and
-/// the one with the higher cumulative amount wins -- the nonce breaking a
-/// tie -- which is the claim the chain would actually pay out on.
-///
-/// `ConfigError::ChannelInBothNamespaces` keeps a *configured* channel out
-/// of both books, and #1218 once relied on that to take the peer book's
-/// claim whenever it had one. But a `POST /peers` peering (ADR 0058) binds
-/// a peer channel at runtime with no such check, and an operator who
-/// migrates a config-file peering to a runtime one keeps the old peer-book
-/// journal, as the state-volume doctrine tells them to. Both books then hold
-/// the channel, and the peer book's older, already-redeemed claim shadowed
-/// the client edge's newer one: `redeem-latest` refused with "does not
-/// supersede the channel's already-redeemed" and pointed the operator at
-/// money they already had, not the money they did not (#1257, measured on
-/// a live mainnet node). Where only one book holds the channel -- every
-/// case #1218 was written for -- this answers exactly what it did before.
-fn latest_claim(state: &OperatorState, channel_id: &str) -> Option<Claim> {
-    higher_claim(
-        state.connector.peer_inbound_claim(channel_id),
-        client_edge_claim(state, channel_id),
-    )
-}
-
-/// The claim with the higher `(cumulative_amount, nonce)`, or whichever one
-/// exists. Ties go to `peer`, the book #1218 already preferred, so a channel
-/// the two books agree on keeps its old answer byte for byte.
-fn higher_claim(peer: Option<Claim>, client: Option<Claim>) -> Option<Claim> {
-    match (peer, client) {
-        (Some(peer), Some(client))
-            if (client.cumulative_amount, client.nonce) > (peer.cumulative_amount, peer.nonce) =>
-        {
-            Some(client)
-        }
-        (Some(peer), _) => Some(peer),
-        (None, client) => client,
-    }
-}
-
-/// `POST /channels/:id/redeem-latest`: redeem the latest claim this node
-/// has itself verified and accepted on the channel named by the path
-/// (issue #425) -- unlike `POST /channels/:id/redeem`, the caller supplies
-/// no claim; the connector submits whichever one it already holds, from
-/// whichever of its two books is that channel's authority (issue #1218,
-/// [`latest_claim`]). No request body.
-async fn redeem_latest_claim(
-    State(state): State<OperatorState>,
-    Path(channel_id): Path<String>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
-        return error.into_response();
-    }
-
-    let result = match latest_claim(&state, &channel_id) {
-        Some(claim) => state.connector.redeem_channel(&channel_id, claim).await,
-        None => Err(ChannelOperationError::NoClaimToRedeem),
+    let Some(batch) = state.batch.as_ref() else {
+        return no_batch_backend();
     };
-    channel_operation_response(result)
-}
-
-/// `POST /channels/:id/cooperative-close`: redeem whatever claim this node
-/// last accepted on the channel named by the path, then close it -- one
-/// write instead of two, and no dispute window to wait out (issue #425,
-/// story 37). No request body.
-///
-/// A peer channel delegates entirely to [`Connector::cooperative_close`],
-/// unchanged (issue #1218's peer-book behaviour stays byte for byte the
-/// same) -- unless the client edge's book holds a claim on the same channel
-/// that supersedes the peer book's ([`latest_claim`]'s rule, issue #1257).
-/// Only then, or once the peer book has no claim on this channel, does this
-/// handler consult the client edge's own book itself: redeem what it
-/// holds, tolerating an already-redeemed claim exactly as
-/// [`Connector::cooperative_close`] does for its own book, then close --
-/// or, if the client edge has nothing either, close directly, the same
-/// no-claim path `Connector::cooperative_close` would have taken anyway.
-async fn cooperative_close(
-    State(state): State<OperatorState>,
-    Path(channel_id): Path<String>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
-        return error.into_response();
+    match batch.land(&channel_id).await {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => batch_channel_error_response(error),
     }
-
-    // Issue #1257: the peer book keeps its whole delegation only while no
-    // client-edge claim supersedes what it holds -- a stale peer-book row
-    // (a migrated peering's old journal) must not close the channel on a
-    // claim older than the one the client edge accepted.
-    let peer = state.connector.peer_inbound_claim(&channel_id);
-    let client = client_edge_claim(&state, &channel_id);
-    let client_supersedes = match (&peer, &client) {
-        (Some(peer), Some(client)) => {
-            (client.cumulative_amount, client.nonce) > (peer.cumulative_amount, peer.nonce)
-        }
-        _ => false,
-    };
-    if peer.is_some() && !client_supersedes {
-        return channel_operation_response(state.connector.cooperative_close(&channel_id).await);
-    }
-
-    let Some(claim) = client else {
-        return channel_operation_response(state.connector.cooperative_close(&channel_id).await);
-    };
-    match state.connector.redeem_channel(&channel_id, claim).await {
-        Ok(_)
-        | Err(ChannelOperationError::Settlement(SettlementError::StaleClaim { .. }))
-        | Err(ChannelOperationError::Settlement(SettlementError::StaleNonce { .. })) => {}
-        Err(error) => return channel_operation_response(Err(error)),
-    }
-    channel_operation_response(state.connector.close_channel(&channel_id).await)
 }
 
 async fn identity(State(state): State<OperatorState>) -> Response {
@@ -1295,41 +1280,6 @@ mod tests {
     /// nowhere durable -- the operator-surface tests below that are not
     /// specifically about the client-edge book (most of them) need a
     /// `ClientClaimGate` to satisfy `router`'s signature and nothing more.
-    /// Issue #1257's rule, without a chain: the higher `(cumulative, nonce)`
-    /// wins across the two books, and a tie keeps #1218's peer-book answer.
-    #[test]
-    fn the_superseding_claim_wins_across_both_books() {
-        let claim = |nonce: u64, cumulative_amount: u128, tag: u8| Claim {
-            nonce,
-            cumulative_amount,
-            signature: vec![tag],
-        };
-        assert_eq!(higher_claim(None, None), None);
-        assert_eq!(
-            higher_claim(Some(claim(1, 10, 1)), None),
-            Some(claim(1, 10, 1))
-        );
-        assert_eq!(
-            higher_claim(None, Some(claim(1, 10, 2))),
-            Some(claim(1, 10, 2))
-        );
-        assert_eq!(
-            higher_claim(Some(claim(8, 242_700, 1)), Some(claim(9, 243_600, 2))),
-            Some(claim(9, 243_600, 2)),
-            "#1257: the stale peer-book row must not shadow the newer client-edge claim"
-        );
-        assert_eq!(
-            higher_claim(Some(claim(3, 900, 1)), Some(claim(1, 400, 2))),
-            Some(claim(3, 900, 1)),
-            "the peer book still wins when it is the one that supersedes"
-        );
-        assert_eq!(
-            higher_claim(Some(claim(2, 500, 1)), Some(claim(2, 500, 2))),
-            Some(claim(2, 500, 1)),
-            "a tie keeps the peer book's answer, byte for byte what #1218 returned"
-        );
-    }
-
     fn empty_claim_gate() -> Arc<ClientClaimGate> {
         Arc::new(
             ClientClaimGate::restore(
@@ -1450,6 +1400,12 @@ mod tests {
             "write('POST', '/routes/leased'",
             "write('DELETE', `/peers/${",
             "write('DELETE', `/routes/peers/${",
+            // ADR 0075 decision 11: the x402 channel writes.
+            "write('POST', '/channels'",
+            "channelPath(c, 'fund')",
+            "channelPath(c, 'withdraw')",
+            "channelPath(c, 'land')",
+            "`/channels/${encodeURIComponent(c.id)}/${step}`",
         ] {
             assert!(
                 DASHBOARD_HTML.contains(write),
@@ -1894,46 +1850,6 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
-
-        /// `POST /channels/:id/settle` is a write (issue #1129), so it is
-        /// behind a signature like every other one -- an unsigned call is
-        /// refused before it reaches a settlement backend at all. Both
-        /// chains let *anyone* settle a channel whose window has passed,
-        /// which is exactly why this needs saying out loud: the signature
-        /// is not guarding the settlement, it is guarding this node's
-        /// settlement key and the gas it spends.
-        #[tokio::test]
-        async fn settling_a_channel_with_no_signature_at_all_is_rejected() {
-            let app = router_with_write_keys(vec![]);
-
-            let request = Request::builder()
-                .method("POST")
-                .uri("/channels/0xdeadbeef/settle")
-                .body(Body::empty())
-                .unwrap();
-
-            let response = app.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
-
-        /// The read token is not a write credential, on this endpoint as on
-        /// every other (ADR 0008): no shared secret is ever sufficient to
-        /// move value, and settling moves every un-claimed deposit in a
-        /// channel.
-        #[tokio::test]
-        async fn a_bearer_token_alone_does_not_authorize_settling_a_channel() {
-            let app = router_with_write_keys(vec![]);
-
-            let request = Request::builder()
-                .method("POST")
-                .uri("/channels/0xdeadbeef/settle")
-                .header(header::AUTHORIZATION, "Bearer correct-token")
-                .body(Body::empty())
-                .unwrap();
-
-            let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
 
@@ -2630,13 +2546,79 @@ mod tests {
                 .unwrap()
         }
 
+        /// A node settling on Solana only, over the in-memory `toon-channel`
+        /// backend: the one `toon-channel` branch of `POST /channels` and
+        /// `/fund` still served, because `local/keys.sh` opens and funds its
+        /// Solana channels through it until #1383.
+        fn solana_toon_router(write_keys: Vec<[u8; 32]>) -> Router {
+            let connector = Arc::new(
+                Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(TestClock::new(chrono::Utc::now())),
+                )
+                .with_settlement(
+                    SettlementChain::Solana,
+                    Arc::new(InMemorySettlementBackend::new()),
+                ),
+            );
+            router(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                write_keys,
+                None,
+            )
+        }
+
+        /// ADR 0075, #1376: the EVM `toon-channel` branch of `POST /channels`
+        /// is deleted, and refused by name rather than served -- and a
+        /// `toon-channel` open that names no chain is refused too, since the
+        /// one it could mean is no longer a choice. (`/fund` keeps its EVM
+        /// branch: an EVM `POST /peers` peering is collateralised through it
+        /// until #1378 moves the peering to x402.)
+        #[tokio::test]
+        async fn the_evm_toon_channel_open_is_refused_by_name() {
+            let keypair = keypair();
+            let app = router_with(vec![keypair.public.to_bytes()]);
+            for body in [
+                serde_json::json!({
+                    "counterparty_hex": COUNTERPARTY_SETTLEMENT,
+                    "settlement_timeout_seconds": 3600,
+                    "chain": "evm",
+                }),
+                serde_json::json!({
+                    "counterparty_hex": COUNTERPARTY_SETTLEMENT,
+                    "settlement_timeout_seconds": 3600,
+                }),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(signed(
+                        &keypair,
+                        "POST",
+                        "/channels",
+                        serde_json::to_vec(&body).unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                assert!(String::from_utf8_lossy(&body).contains("toon-channel"));
+            }
+        }
+
         /// `POST /channels/:id/fund` with a `total` is the retry-safe form
         /// (ADR 0073): the same body, re-signed and sent again, deposits
         /// nothing more. A body naming both forms, or neither, is refused.
+        /// On the retained Solana `toon-channel` branch.
         #[tokio::test]
         async fn funding_to_a_total_can_be_repeated_without_depositing_twice() {
             let keypair = keypair();
-            let app = router_with(vec![keypair.public.to_bytes()]);
+            let app = solana_toon_router(vec![keypair.public.to_bytes()]);
             let signed_at = |created: u64, path: &str, body: serde_json::Value| {
                 let body = serde_json::to_vec(&body).unwrap();
                 let (sig_input, sig, digest) =
@@ -2659,6 +2641,7 @@ mod tests {
                     serde_json::json!({
                         "counterparty_hex": COUNTERPARTY_SETTLEMENT,
                         "settlement_timeout_seconds": 3600,
+                        "chain": "solana",
                     }),
                 ))
                 .await
@@ -2951,1135 +2934,439 @@ mod tests {
         }
     }
 
-    /// Channel lifecycle (issue #459, ADR 0008) driven entirely through
-    /// this operator surface, against a real, disposable `anvil` chain --
-    /// not a fake settlement backend. Skips itself (rather than failing
-    /// the gate) if `anvil` is not on `PATH`; see
-    /// `connector-settlement-evm/tests/support/mod.rs` for why this crate
-    /// spawns one directly instead of going through `make anvil-up`.
-    mod channel_lifecycle {
+    /// The x402 channel writes (ADR 0075 decision 11), driven as an external
+    /// caller through the production router over the settlement port's
+    /// in-memory fake -- the fake that passes both halves' contract suites,
+    /// so these tests exercise the surface, and the chains' own suites the
+    /// chains (ADR 0007). The end-to-end runs against anvil and a validator
+    /// are the settlement crates' and `connector-cli`'s.
+    mod batch_channel_writes {
         use super::*;
         use crate::rfc9421::sign_request;
-        use connector_runtime::{ChannelDomain, ChannelViewStatus, WireClaim};
-        use connector_settlement::SettlementBackend;
-        use connector_settlement_evm::EvmSettlementBackend;
-        use connector_signer::{derive_evm_address, evm_balance_proof_digest, EvmBalanceProof};
+        use connector_runtime::OutboundChannels;
+        use connector_settlement::batch::{
+            BatchSettlementBackend, BatchSettlementPayer, HeldVoucher, InMemoryBatchChain,
+            InMemoryBatchSettlement, PayerExit,
+        };
         use ed25519_dalek::Keypair;
         use rand::rngs::OsRng;
-        use std::process::{Child, Command, Stdio};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::RwLock;
 
-        const DEPLOYER_PRIVATE_KEY: &str =
-            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        const ONE_DAY: u64 = 86_400;
 
-        fn anvil_available() -> bool {
-            Command::new("anvil")
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
+        /// This node (`0x01` on the fake chain) and a counterparty (`0x02`),
+        /// each holding 10,000; this node's surface; and the vouchers its
+        /// client edge holds, which a test fills.
+        struct Node {
+            app: Router,
+            operator: Keypair,
+            created: AtomicU64,
+            batch: Arc<BatchChannels>,
+            chain: Arc<InMemoryBatchChain>,
+            this: Arc<InMemoryBatchSettlement>,
+            counterparty: Arc<InMemoryBatchSettlement>,
+            held: Arc<RwLock<Vec<HeldVoucher>>>,
         }
 
-        /// "Fail loudly in CI, skip locally" (issue #471), the same rule
-        /// `connector_settlement_evm::test_support::require_anvil` states
-        /// for the shared harness. This module keeps its own `Anvil` rather
-        /// than depending on that one, and until issue #1129 it kept the
-        /// bare availability check too -- which meant a CI run with no
-        /// Foundry would have skipped these tests and reported success. A
-        /// guard that returns early and reports `passed` in `0.00s` is
-        /// worse than a missing test.
-        fn require_anvil() -> bool {
-            if anvil_available() {
-                return true;
-            }
-            if std::env::var_os("CI").is_some() {
-                panic!(
-                    "anvil is not on PATH, but CI is set -- the Rust Workspace Gate must \
-                     install Foundry (foundry-rs/foundry-toolchain) before this test runs. \
-                     Refusing to silently skip and report success here; see issue #471."
-                );
-            }
-            eprintln!(
-                "skipping: anvil is not on PATH (install Foundry: https://getfoundry.sh) -- \
-                 this test needs a real chain and only skips because this is not a CI run"
-            );
-            false
-        }
-
-        struct Anvil {
-            child: Child,
-            rpc_url: String,
-        }
-
-        /// Distinguishes concurrently spawned `Anvil` instances *within this
-        /// same test binary* -- `std::process::id()` alone is constant for
-        /// every test in it, so two anvil-spawning tests (this module now
-        /// has two, issue #425) running concurrently would otherwise both
-        /// compute the identical port and race to bind it. Mirrors
-        /// `connector-settlement-evm/tests/support/mod.rs`'s own
-        /// `NEXT_PORT_OFFSET`.
-        static NEXT_PORT_OFFSET: std::sync::atomic::AtomicU16 =
-            std::sync::atomic::AtomicU16::new(0);
-
-        impl Anvil {
-            async fn spawn() -> Self {
-                let offset = NEXT_PORT_OFFSET.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let port = 18_900u16
-                    .wrapping_add((std::process::id() as u16) % 1_000)
-                    .wrapping_add(offset);
-                let rpc_url = format!("http://127.0.0.1:{port}");
-                let child = Command::new("anvil")
-                    .args(["--host", "127.0.0.1", "--port"])
-                    .arg(port.to_string())
-                    .args([
-                        "--chain-id",
-                        "31337",
-                        "--accounts",
-                        "1",
-                        "--balance",
-                        "10000",
-                    ])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .expect("spawn anvil");
-
-                use ethers::providers::{Http, Middleware, Provider};
-                let provider = Provider::<Http>::try_from(rpc_url.as_str()).expect("provider");
-                for _ in 0..200 {
-                    if provider.get_chainid().await.is_ok() {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-                Self { child, rpc_url }
-            }
-        }
-
-        impl Drop for Anvil {
-            fn drop(&mut self) {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
-        }
-
-        fn keypair() -> Keypair {
-            Keypair::generate(&mut OsRng)
-        }
-
-        fn signed_post(keypair: &Keypair, path: &str, body: Vec<u8>) -> Request<Body> {
-            let (sig_input, sig, digest) =
-                sign_request(keypair, "POST", path, &body, 1_000, Some(9_999_999_999));
-            Request::builder()
-                .method("POST")
-                .uri(path)
-                .header("signature-input", sig_input)
-                .header("signature", sig)
-                .header("content-digest", digest)
-                .body(Body::from(body))
-                .unwrap()
-        }
-
-        /// A signature from a key that is not on `[operator] write_keys`
-        /// buys nothing on `POST /channels/:id/settle` (issue #1129): the
-        /// allowlist is what revocation acts on, so a well-formed RFC 9421
-        /// signature from a retired operator must be as useless as none at
-        /// all. No chain is needed to prove it -- the refusal happens
-        /// before any settlement backend is consulted, which is why this
-        /// test has no `anvil` gate and still runs everywhere.
-        #[tokio::test]
-        async fn settling_a_channel_signed_by_a_key_not_on_the_allowlist_is_rejected() {
-            let stranger = keypair();
-            let allowed = keypair();
-            let app_client = Arc::new(FakeAppClient::new());
-            let clock = Arc::new(TestClock::new(chrono::Utc::now()));
-            let connector = Arc::new(Connector::new(
-                vec![],
-                vec![],
-                app_client,
-                Arc::new(InProcessPeerTransport::new()),
-                clock,
-            ));
-            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
-            let app = router(
-                connector,
-                empty_claim_gate(),
-                signer,
-                "correct-token".to_string(),
-                vec![allowed.public.to_bytes()],
-                None,
-            );
-
-            let response = app
-                .oneshot(signed_post(
-                    &stranger,
-                    "/channels/0xdeadbeef/settle",
-                    Vec::new(),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
-
-        /// AC: "an EVM implementation opens, funds and closes a payment
-        /// channel against a real chain", "channel lifecycle is driven
-        /// entirely through the operator surface". Every step below is a
-        /// real, signed HTTP write against this crate's actual `router()`,
-        /// reaching a real `TokenNetwork` contract on a real (if
-        /// disposable) chain -- nothing here is faked.
-        #[tokio::test]
-        async fn opening_funding_and_closing_a_channel_over_the_operator_surface_reaches_a_real_chain(
-        ) {
-            if !require_anvil() {
-                return;
-            }
-
-            let anvil = Anvil::spawn().await;
-            let token = EvmSettlementBackend::deploy_mock_token(
-                &anvil.rpc_url,
-                DEPLOYER_PRIVATE_KEY,
-                1_000_000,
-            )
-            .await
-            .expect("deploy mock USDC");
-            let settlement =
-                EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-                    .await
-                    .expect("deploy a TokenNetwork through a fresh registry");
-
-            let app_client = Arc::new(FakeAppClient::new());
-            let clock = Arc::new(TestClock::new(chrono::Utc::now()));
-            let connector = Arc::new(
-                Connector::new(
-                    vec![],
-                    vec![],
-                    app_client,
-                    Arc::new(InProcessPeerTransport::new()),
-                    clock,
-                )
-                .with_settlement(SettlementChain::Evm, Arc::new(settlement)),
-            );
-            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
-            let keypair = keypair();
-            let app = router(
-                connector,
-                empty_claim_gate(),
-                signer,
-                "correct-token".to_string(),
-                vec![keypair.public.to_bytes()],
-                None,
-            );
-
-            // Open.
-            let open_body = serde_json::to_vec(&serde_json::json!({
-                "counterparty_hex": "0x00000000000000000000000000000000000000aa",
-                "settlement_timeout_seconds": 3600,
-            }))
-            .unwrap();
-            let response = app
-                .clone()
-                .oneshot(signed_post(&keypair, "/channels", open_body))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            let opened: ChannelView = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(opened.deposited, 0);
-
-            // Fund.
-            let fund_body = serde_json::to_vec(&serde_json::json!({ "amount": 1_000 })).unwrap();
-            let fund_path = format!("/channels/{}/fund", opened.id);
-            let response = app
-                .clone()
-                .oneshot(signed_post(&keypair, &fund_path, fund_body))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            let funded: ChannelView = serde_json::from_slice(&bytes).unwrap();
-            // `POST /channels/:id/fund` is a SELF-deposit (issue #1118):
-            // it puts this node's own collateral behind its own claims. It
-            // does not, and on Solana never could, credit the
-            // counterparty's side -- that deposit is the counterparty's
-            // own transaction from their own wallet.
-            assert_eq!(funded.own_deposited, 1_000);
-            assert_eq!(funded.deposited, 0);
-
-            // The freshly opened, freshly funded channel is visible over
-            // the read surface too, reported fresh from the real chain.
-            let response = get(app.clone(), "/channels", Some("correct-token")).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            let channels: Vec<ChannelView> = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(channels, vec![funded.clone()]);
-
-            // Close.
-            let close_path = format!("/channels/{}/close", opened.id);
-            let response = app
-                .clone()
-                .oneshot(signed_post(&keypair, &close_path, Vec::new()))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            let closed: ChannelView = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(closed.status, ChannelViewStatus::Closed);
-
-            // Terminal: funding a closed channel is rejected, not silently
-            // accepted.
-            let fund_again_body = serde_json::to_vec(&serde_json::json!({ "amount": 1 })).unwrap();
-            let response = app
-                .clone()
-                .oneshot(signed_post(&keypair, &fund_path, fund_again_body))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-            // `close` above started a one-hour challenge period, and no
-            // time has passed: `POST /channels/:id/settle` must refuse, and
-            // refuse by name (issue #1129). The refusal is the interesting
-            // half here -- that the settle *succeeds* once the window has
-            // genuinely elapsed is proven against real chains, on both
-            // backends, from a config-driven node in
-            // `connector-cli/tests/settlement_lifecycle.rs`.
-            let settle_path = format!("/channels/{}/settle", opened.id);
-            let response = app
-                .oneshot(signed_post(&keypair, &settle_path, Vec::new()))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            let message = String::from_utf8(bytes.to_vec()).unwrap();
-            assert!(
-                message.contains("not yet due"),
-                "an early settle must say the window is still open, not fail \
-                 generically: {message}"
-            );
-        }
-
-        /// AC (issue #425): "the latest received claim can be redeemed on
-        /// chain through the operator surface" and "a cooperative close
-        /// path settles without waiting out a dispute window" -- both
-        /// driven entirely through this crate's actual `router()` against a
-        /// real, disposable `anvil` chain, exactly like the lifecycle test
-        /// above. The claim itself is fed in via
-        /// `Connector::handle_peer_claim` directly rather than a real peer
-        /// wire connection -- the peer semantics (#416) is a separate concern
-        /// from this ticket's settlement-side one, and `handle_peer_claim`
-        /// is the same entry point a real inbound PREPARE's piggybacked
-        /// claim reaches.
-        #[tokio::test]
-        async fn redeeming_the_latest_claim_and_closing_cooperatively_reach_a_real_chain() {
-            if !require_anvil() {
-                return;
-            }
-
-            let anvil = Anvil::spawn().await;
-            let token = EvmSettlementBackend::deploy_mock_token(
-                &anvil.rpc_url,
-                DEPLOYER_PRIVATE_KEY,
-                1_000_000,
-            )
-            .await
-            .expect("deploy mock USDC");
-            let settlement =
-                EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-                    .await
-                    .expect("deploy a TokenNetwork through a fresh registry");
-            // The real EIP-712 domain a claim against this backend's own
-            // `TokenNetwork` must be signed under (issue #576) -- `anvil`'s
-            // own default chain id, and the real deployed contract address,
-            // not a Base Sepolia placeholder nothing here actually talks to.
-            let peer_channel_domain = ChannelDomain {
-                chain_id: 31_337,
-                token_network_address: settlement.address().to_fixed_bytes(),
-            };
-
-            // `TokenNetwork.claimFromChannel` verifies a real signature
-            // recovering to the channel's actual counterparty (issue #576),
-            // so that counterparty must be an address `peer_signer` holds
-            // the key for -- not an arbitrary placeholder. The channel is
-            // opened directly against the backend (rather than through this
-            // surface's own `/channels`, already covered by the lifecycle
-            // test above) so its real, keccak-derived id is known before
-            // configuring the claim verification key and domain against it.
-            let peer_signer = LocalSigner::generate("peer-claim-key");
-            let peer_address = derive_evm_address(&peer_signer.public_key().unwrap());
-            let settlement = Arc::new(settlement);
-            let channel_id = settlement
-                .open(peer_address.to_vec(), chrono::Duration::seconds(3600))
-                .await
-                .expect("open a real channel directly against the backend");
-
-            let app_client = Arc::new(FakeAppClient::new());
-            let clock = Arc::new(TestClock::new(chrono::Utc::now()));
-            let connector = Arc::new(
-                Connector::new(
-                    vec![],
-                    vec![],
-                    app_client,
-                    Arc::new(InProcessPeerTransport::new()),
-                    clock,
-                )
-                .with_settlement(
-                    SettlementChain::Evm,
-                    Arc::clone(&settlement) as Arc<dyn connector_settlement::SettlementBackend>,
-                )
-                .with_channel_verification_key(channel_id.0.clone(), peer_address)
-                .with_channel_domain(channel_id.0.clone(), peer_channel_domain)
-                .unwrap(),
-            );
-            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
-            let keypair = keypair();
-            let app = router(
-                connector.clone(),
-                empty_claim_gate(),
-                signer,
-                "correct-token".to_string(),
-                vec![keypair.public.to_bytes()],
-                None,
-            );
-
-            // Fund, through the operator surface, exactly like the
-            // lifecycle test above -- the channel itself was already opened
-            // directly against the backend above. This is the node's own
-            // collateral (issue #1118), so it is not what the peer's claim
-            // below is redeemed out of.
-            let fund_body = serde_json::to_vec(&serde_json::json!({ "amount": 1_000 })).unwrap();
-            let fund_path = format!("/channels/{}/fund", channel_id.0);
-            let response = app
-                .clone()
-                .oneshot(signed_post(&keypair, &fund_path, fund_body))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-
-            // The peer's own deposit -- the side a claim signed by the peer
-            // is drawn from, and the one no operator write on this node can
-            // make. On a real deployment the peer submits it themselves;
-            // here the fixture-only delegate deposit stands in.
-            settlement
-                .fund_counterparty(&channel_id, 1_000)
-                .await
-                .expect("the peer deposits on their own side");
-
-            // A genuine claim from the channel's counterparty, accepted
-            // exactly as an inbound PREPARE's piggybacked claim would be.
-            let mut on_chain_id = [0u8; 32];
-            let hex_digits = channel_id.0.trim_start_matches("0x");
-            for (i, byte) in on_chain_id.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&hex_digits[i * 2..i * 2 + 2], 16)
-                    .expect("channel id is 0x-prefixed 64-hex");
-            }
-            let sign_claim = |nonce: u64, amount: u64| {
-                let proof = EvmBalanceProof {
-                    channel_id: on_chain_id,
-                    nonce,
-                    transferred_amount: u128::from(amount),
-                    locked_amount: 0,
-                    locks_root: [0u8; 32],
-                    chain_id: peer_channel_domain.chain_id,
-                    token_network_address: peer_channel_domain.token_network_address,
-                };
-                // `peer_signer.sign` produces a recovery id in
-                // `libsecp256k1`'s own `{0, 1}` convention
-                // (`connector_signer::crypto::sign_digest`), exactly what
-                // the wire carries (peer-semantics-pre-868.md §3.5). No `+ 27`
-                // here: `EvmSettlementBackend::redeem` is the one place
-                // that gets normalized to the Ethereum-wallet `{27, 28}`
-                // range `TokenNetwork`'s on-chain `ECDSA.recover` requires
-                // (issue #590) -- this test proves that normalization by
-                // signing through the production path unmodified and
-                // still redeeming against the real chain below.
-                let signature = peer_signer.sign(&evm_balance_proof_digest(&proof)).unwrap();
-                WireClaim {
-                    channel_id: channel_id.0.clone(),
-                    nonce,
-                    cumulative_amount: amount,
-                    signature: connector_runtime::ClaimSignature::Evm(signature),
-                }
-            };
-            assert_eq!(
-                connector.handle_peer_claim(sign_claim(1, 400)),
-                connector_runtime::ClaimAckOutcome::Accepted
-            );
-
-            // Redeem the latest claim through the operator surface -- no
-            // claim in the request body, unlike `POST /channels/:id/redeem`.
-            let redeem_latest_path = format!("/channels/{}/redeem-latest", channel_id.0);
-            let response = app
-                .clone()
-                .oneshot(signed_post(&keypair, &redeem_latest_path, Vec::new()))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            let redeemed: ChannelView = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(redeemed.redeemed, 400);
-
-            // A fresher claim arrives, then a single cooperative-close
-            // write redeems it and closes in one step -- no separate
-            // dispute window to wait out.
-            assert_eq!(
-                connector.handle_peer_claim(sign_claim(2, 900)),
-                connector_runtime::ClaimAckOutcome::Accepted
-            );
-            let cooperative_close_path = format!("/channels/{}/cooperative-close", channel_id.0);
-            let response = app
-                .clone()
-                .oneshot(signed_post(&keypair, &cooperative_close_path, Vec::new()))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            let closed: ChannelView = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(closed.redeemed, 900);
-            assert_eq!(closed.status, ChannelViewStatus::Closed);
-
-            // Redeeming a channel this node never received a claim on is
-            // refused rather than reaching the settlement backend at all.
-            let no_claim_response = app
-                .oneshot(signed_post(
-                    &keypair,
-                    "/channels/no-such-channel/redeem-latest",
-                    Vec::new(),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(no_claim_response.status(), StatusCode::BAD_REQUEST);
-        }
-
-        /// The client-edge claim fixtures the two tests below share:
-        /// a genuine, payer-signed claim over a real on-chain channel id,
-        /// and a registry that declares that channel. Module-level rather
-        /// than nested inside one test because issue #1283's settle test
-        /// needs exactly the same pair.
-        fn client_claim_json(
-            signer: &LocalSigner,
-            channel_id_hex: &str,
-            nonce: u64,
-            transferred_amount: u128,
-            chain_id: u64,
-            token_network: [u8; 20],
-        ) -> String {
-            let mut on_chain_id = [0u8; 32];
-            let hex_digits = channel_id_hex.trim_start_matches("0x");
-            for (i, byte) in on_chain_id.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&hex_digits[i * 2..i * 2 + 2], 16)
-                    .expect("channel id is 0x-prefixed 64-hex");
-            }
-            let proof = EvmBalanceProof {
-                channel_id: on_chain_id,
-                nonce,
-                transferred_amount,
-                locked_amount: 0,
-                locks_root: [0u8; 32],
-                chain_id,
-                token_network_address: token_network,
-            };
-            let signature = signer.sign(&evm_balance_proof_digest(&proof)).unwrap();
-            let address = derive_evm_address(&signer.public_key().unwrap());
-            let signature_hex: String = signature
-                .to_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            format!(
-                r#"{{
-                    "version": "1.0",
-                    "blockchain": "evm",
-                    "messageId": "msg-{nonce}",
-                    "timestamp": "2026-02-02T12:00:00.000Z",
-                    "senderId": "client-edge-test-payer",
-                    "channelId": "{channel_id_hex}",
-                    "nonce": {nonce},
-                    "transferredAmount": "{transferred_amount}",
-                    "lockedAmount": "0",
-                    "locksRoot": "0x{zeros}",
-                    "signature": "0x{signature_hex}",
-                    "signerAddress": "{address}",
-                    "chainId": {chain_id},
-                    "tokenNetworkAddress": "{token_network_address}"
-                }}"#,
-                zeros = "0".repeat(64),
-                address = to_hex(&address),
-                token_network_address = to_hex(&token_network),
-            )
-        }
-
-        fn channels_recording(
-            channel_id: &str,
-            counterparty: connector_client_edge::EvmChannel,
-        ) -> ClientChannelRegistry {
-            let mut channels = ClientChannelRegistry::new();
-            channels
-                .record_evm(channel_id, counterparty)
-                .expect("a real on-chain channel id is a 32-byte hex identifier");
-            channels
-        }
-
-        /// Issue #1218, end to end against a real chain: money accepted at
-        /// the client edge -- never `Connector::handle_peer_claim`, which is
-        /// the peer-book path the test above already covers -- is what
-        /// `GET /claims`, `GET /channels` and `redeem-latest` could not see
-        /// before this ticket. Here it is verified, journaled by a real
-        /// [`ClientClaimGate`], accepted, and channel-verification-key-free:
-        /// this channel has no `[[peer_channels]]` row at all, so the peer
-        /// book (`Connector::peer_inbound_claim`) genuinely has nothing on
-        /// it and every read below can only be answering from the client
-        /// edge's own book.
-        #[tokio::test]
-        async fn a_client_edge_claim_is_redeemable_survives_a_restart_and_is_listed() {
-            if !require_anvil() {
-                return;
-            }
-
-            let anvil = Anvil::spawn().await;
-            let token = EvmSettlementBackend::deploy_mock_token(
-                &anvil.rpc_url,
-                DEPLOYER_PRIVATE_KEY,
-                1_000_000,
-            )
-            .await
-            .expect("deploy mock USDC");
-            let settlement = Arc::new(
-                EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-                    .await
-                    .expect("deploy a TokenNetwork through a fresh registry"),
-            );
-
-            let payer_signer = LocalSigner::generate("client-edge-payer");
-            let payer_address = derive_evm_address(&payer_signer.public_key().unwrap());
-            let channel_id = settlement
-                .open(payer_address.to_vec(), chrono::Duration::hours(1))
-                .await
-                .expect("open a real channel");
-            // The payer's own side -- what a claim the payer signs is
-            // redeemed out of (issue #1118). No `[[peer_channels]]` row and
-            // no `with_channel_verification_key` anywhere in this test: the
-            // peer book has no record of this channel at all.
-            settlement
-                .fund_counterparty(&channel_id, 1_000)
-                .await
-                .expect("fund the payer's own side with real ERC-20 value");
-
-            let evm_channel = connector_client_edge::EvmChannel {
-                counterparty: payer_address,
-                chain_id: settlement.chain_id(),
-                token_network_address: settlement.address().to_fixed_bytes(),
-                deposit_floor: connector_client_edge::DepositFloor::Unknown,
-            };
-
-            let journal_dir = tempfile::tempdir().expect("temp journal dir");
-            let journal_path = journal_dir.path().join("client-edge-claims.log");
-
-            let claim_json = client_claim_json(
-                &payer_signer,
-                &channel_id.0,
-                1,
-                1_000,
-                settlement.chain_id(),
-                settlement.address().to_fixed_bytes(),
-            );
-
-            // The claim is admitted directly through the gate rather than a
-            // real `POST /ilp` -- ADR 0058's peering flow (or an ordinary
-            // paying client) is what puts a claim through that endpoint in
-            // production, and `ClientClaimGate::ingest` is the exact
-            // boundary it crosses to do it; this test's subject is what the
-            // operator surface does with what lands there, not that wire.
-            // Deliberately NOT redeemed yet -- that happens only after the
-            // "restart" below, so the redemption there can only succeed if
-            // the replayed gate genuinely recovered this claim's signature,
-            // not a fresh one this test admitted a second time.
-            {
-                let gate = ClientClaimGate::restore(
-                    channels_recording(&channel_id.0, evm_channel),
-                    Arc::new(connector_runtime::FileJournal::open(&journal_path).unwrap()),
-                )
-                .expect("a fresh journal has nothing to replay");
-                gate.ingest(&claim_json, 0)
-                    .await
-                    .expect("a genuine, on-chain-covered claim is accepted");
-
-                let connector = Arc::new(
-                    Connector::new(
-                        vec![],
-                        vec![],
-                        Arc::new(FakeAppClient::new()),
-                        Arc::new(InProcessPeerTransport::new()),
-                        Arc::new(TestClock::new(chrono::Utc::now())),
-                    )
-                    .with_settlement(SettlementChain::Evm, settlement.clone()),
-                );
-                assert_eq!(
-                    connector.peer_inbound_claim(&channel_id.0),
-                    None,
-                    "this channel has no peer-book record at all -- every read below can only \
-                     be answering from the client edge's own book"
-                );
-                // What `connector-client-edge`'s own `POST /ilp` handler
-                // does the instant a claim clears this gate (issue #548) --
-                // done by hand here since the claim above was admitted
-                // directly through the gate, not through that wire.
-                connector.recognize_channel(&channel_id.0);
-                let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
-                let app = router(
-                    connector,
-                    Arc::new(gate),
-                    signer,
-                    "correct-token".to_string(),
-                    vec![],
-                    None,
-                );
-
-                // `GET /claims` sees the client-edge claim, tagged as such.
-                let claims_response = app
-                    .clone()
-                    .oneshot(
-                        Request::builder()
-                            .method("GET")
-                            .uri("/claims")
-                            .header(header::AUTHORIZATION, "Bearer correct-token")
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(claims_response.status(), StatusCode::OK);
-                let bytes = hyper::body::to_bytes(claims_response.into_body())
-                    .await
-                    .unwrap();
-                let claims: Vec<ClaimView> = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(claims.len(), 1);
-                assert_eq!(claims[0].book, ClaimBookKind::Client);
-                assert_eq!(claims[0].direction, ClaimDirection::Inbound);
-                assert_eq!(claims[0].nonce, 1);
-                assert_eq!(claims[0].cumulative_amount, 1_000);
-
-                // `GET /channels` lists it too, even though this node never
-                // itself opened it -- it only recognized it, the moment the
-                // claim above cleared this gate.
-                let channels_response = app
-                    .oneshot(
-                        Request::builder()
-                            .method("GET")
-                            .uri("/channels")
-                            .header(header::AUTHORIZATION, "Bearer correct-token")
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(channels_response.status(), StatusCode::OK);
-                let bytes = hyper::body::to_bytes(channels_response.into_body())
-                    .await
-                    .unwrap();
-                let channels: Vec<ChannelView> = serde_json::from_slice(&bytes).unwrap();
-                assert!(
-                    channels.iter().any(|view| view.id == channel_id.0),
-                    "the client channel must be listed even though this node never opened it: \
-                     {channels:?}"
-                );
-            }
-
-            // Same claim, after a restart: a brand-new `ClientClaimGate`,
-            // built only by replaying `journal_path` -- never `ingest`ed
-            // into directly -- still redeems it (issue #1218's AC2). Before
-            // this ticket the gate's in-memory watermark dropped the
-            // signature on replay, so this redemption is exactly the case
-            // that could not have worked.
-            let gate = ClientClaimGate::restore(
-                channels_recording(&channel_id.0, evm_channel),
-                Arc::new(connector_runtime::FileJournal::open(&journal_path).unwrap()),
-            )
-            .expect("replays the claim admitted above");
-            let connector = Arc::new(
-                Connector::new(
-                    vec![],
-                    vec![],
-                    Arc::new(FakeAppClient::new()),
-                    Arc::new(InProcessPeerTransport::new()),
-                    Arc::new(TestClock::new(chrono::Utc::now())),
-                )
-                .with_settlement(SettlementChain::Evm, settlement.clone()),
-            );
-            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
-            let keypair = keypair();
-            let app = router(
-                connector,
-                Arc::new(gate),
-                signer,
-                "correct-token".to_string(),
-                vec![keypair.public.to_bytes()],
-                None,
-            );
-
-            let redeem_path = format!("/channels/{}/redeem-latest", channel_id.0);
-            let response = app
-                .oneshot(signed_post(&keypair, &redeem_path, Vec::new()))
-                .await
-                .unwrap();
-            let status = response.status();
-            let body_bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            assert_eq!(
-                status,
-                StatusCode::OK,
-                "a freshly restarted gate, replaying only the journal file, still redeems"
-            );
-            let redeemed: ChannelView = serde_json::from_slice(&body_bytes).unwrap();
-            assert_eq!(redeemed.redeemed, 1_000);
-        }
-
-        /// Issue #1257, against a real chain: one channel, both books.
-        ///
-        /// The shape a live mainnet node reached by migrating a config-file
-        /// peering to a `POST /peers` one while keeping `state_dir`, as the
-        /// state-volume doctrine requires: the peer book still holds the old
-        /// peering's claim, already redeemed on chain, and the client edge's
-        /// book holds the newer claim the same payer signed after the
-        /// migration. Before this fix `redeem-latest` took the peer book's
-        /// row because it existed, and the chain refused it as not
-        /// superseding what it had already paid -- so the newest accepted
-        /// claim on the node could not be redeemed at all. The claim the
-        /// chain would actually pay out on is the one with the higher
-        /// cumulative amount, whichever book it is in.
-        #[tokio::test]
-        async fn a_client_edge_claim_that_supersedes_a_redeemed_peer_book_claim_is_the_one_redeemed(
-        ) {
-            if !require_anvil() {
-                return;
-            }
-
-            let anvil = Anvil::spawn().await;
-            let token = EvmSettlementBackend::deploy_mock_token(
-                &anvil.rpc_url,
-                DEPLOYER_PRIVATE_KEY,
-                1_000_000,
-            )
-            .await
-            .expect("deploy mock USDC");
-            let settlement = Arc::new(
-                EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-                    .await
-                    .expect("deploy a TokenNetwork through a fresh registry"),
-            );
-            let domain = ChannelDomain {
-                chain_id: settlement.chain_id(),
-                token_network_address: settlement.address().to_fixed_bytes(),
-            };
-
-            let payer_signer = LocalSigner::generate("migrated-peer-payer");
-            let payer_address = derive_evm_address(&payer_signer.public_key().unwrap());
-            let channel_id = settlement
-                .open(payer_address.to_vec(), chrono::Duration::hours(1))
-                .await
-                .expect("open a real channel");
-            settlement
-                .fund_counterparty(&channel_id, 5_000)
-                .await
-                .expect("fund the payer's own side");
-
-            // The peer binding the old config-file peering left behind.
-            let connector = Arc::new(
-                Connector::new(
-                    vec![],
-                    vec![],
-                    Arc::new(FakeAppClient::new()),
-                    Arc::new(InProcessPeerTransport::new()),
-                    Arc::new(TestClock::new(chrono::Utc::now())),
-                )
-                .with_settlement(
-                    SettlementChain::Evm,
-                    Arc::clone(&settlement) as Arc<dyn connector_settlement::SettlementBackend>,
-                )
-                .with_channel_verification_key(channel_id.0.clone(), payer_address)
-                .with_channel_domain(channel_id.0.clone(), domain)
-                .unwrap(),
-            );
-
-            // The client edge's book, where the migrated peering's claims
-            // now land.
-            let gate = Arc::new(
-                ClientClaimGate::restore(
-                    channels_recording(
-                        &channel_id.0,
-                        connector_client_edge::EvmChannel {
-                            counterparty: payer_address,
-                            chain_id: domain.chain_id,
-                            token_network_address: domain.token_network_address,
-                            deposit_floor: connector_client_edge::DepositFloor::Unknown,
-                        },
-                    ),
+        impl Node {
+            async fn new() -> Node {
+                let chain = InMemoryBatchChain::new(PayerExit::Withdrawal);
+                let this = Arc::new(InMemoryBatchSettlement::on(
+                    Arc::clone(&chain),
+                    0x01,
+                    ONE_DAY,
+                ));
+                let counterparty = Arc::new(InMemoryBatchSettlement::on(
+                    Arc::clone(&chain),
+                    0x02,
+                    ONE_DAY,
+                ));
+                this.fund(10_000);
+                counterparty.fund(10_000);
+                let outbound = OutboundChannels::restore(
                     Arc::new(InMemoryJournal::new()),
+                    vec![(
+                        SettlementChain::Evm,
+                        Arc::clone(&this) as Arc<dyn BatchSettlementPayer>,
+                    )],
                 )
-                .expect("a fresh in-memory journal has nothing to replay"),
-            );
-
-            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
-            let keypair = keypair();
-            let app = router(
-                connector.clone(),
-                Arc::clone(&gate),
-                signer,
-                "correct-token".to_string(),
-                vec![keypair.public.to_bytes()],
-                None,
-            );
-            let redeem_latest_path = format!("/channels/{}/redeem-latest", channel_id.0);
-
-            // Before the migration: a peer-book claim, redeemed on chain.
-            let peer_claim_json = client_claim_json(
-                &payer_signer,
-                &channel_id.0,
-                8,
-                2_427,
-                domain.chain_id,
-                domain.token_network_address,
-            );
-            let parsed: serde_json::Value = serde_json::from_str(&peer_claim_json).unwrap();
-            let signature_hex = parsed["signature"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches("0x");
-            let signature_bytes: Vec<u8> = (0..signature_hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&signature_hex[i..i + 2], 16).unwrap())
-                .collect();
-            assert_eq!(
-                connector.handle_peer_claim(WireClaim {
-                    channel_id: channel_id.0.clone(),
-                    nonce: 8,
-                    cumulative_amount: 2_427,
-                    signature: connector_runtime::ClaimSignature::Evm(
-                        connector_signer::Signature::from_bytes(&signature_bytes)
-                            .expect("65 bytes"),
-                    ),
-                }),
-                connector_runtime::ClaimAckOutcome::Accepted
-            );
-            let response = app
-                .clone()
-                .oneshot(signed_post(&keypair, &redeem_latest_path, Vec::new()))
                 .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            let redeemed: ChannelView = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(redeemed.redeemed, 2_427);
-
-            // After it: the same payer's next claim, accepted at the client
-            // edge. The peer book's row is still there, already redeemed.
-            gate.ingest(
-                &client_claim_json(
-                    &payer_signer,
-                    &channel_id.0,
-                    9,
-                    2_436,
-                    domain.chain_id,
-                    domain.token_network_address,
-                ),
-                0,
-            )
-            .await
-            .expect("the migrated peering's next claim is accepted at the client edge");
-            assert!(
-                connector.peer_inbound_claim(&channel_id.0).is_some(),
-                "the precondition #1257 needs: the stale peer-book row is still present"
-            );
-
-            // A second write to the same path: `signed_post` stamps a fixed
-            // `created`, and the operator surface refuses a replayed
-            // signature, so this one is signed a second later.
-            let (sig_input, sig, digest) = sign_request(
-                &keypair,
-                "POST",
-                &redeem_latest_path,
-                &[],
-                1_001,
-                Some(9_999_999_999),
-            );
-            let second_redeem = Request::builder()
-                .method("POST")
-                .uri(&redeem_latest_path)
-                .header("signature-input", sig_input)
-                .header("signature", sig)
-                .header("content-digest", digest)
-                .body(Body::empty())
-                .unwrap();
-            let response = app.oneshot(second_redeem).await.unwrap();
-            let status = response.status();
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            assert_eq!(
-                status,
-                StatusCode::OK,
-                "the client edge's newer claim must be the one redeemed, not the peer book's \
-                 already-redeemed one: {}",
-                String::from_utf8_lossy(&bytes)
-            );
-            let redeemed: ChannelView = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(redeemed.redeemed, 2_436);
-        }
-
-        /// Issue #1283, against a real chain: settling a channel retires
-        /// the client edge's watermark for it, in the same request.
-        ///
-        /// The bug this closes is a Solana one -- a channel PDA is
-        /// `find_program_address` over the sorted participants and the
-        /// mint with no epoch in the seeds, so a payer who reopens after a
-        /// settle lands back on the very address their settled channel's
-        /// watermark is filed under, and every claim they can sign is then
-        /// either a replay or a demand for money already paid out. But the
-        /// *handler's* half of the fix is chain-agnostic (it retires
-        /// whatever key the settled id maps to), and what has to be proved
-        /// here is the wiring: that a settle which actually succeeded on a
-        /// real chain reaches the gate. `anvil` provides that; the
-        /// chain-specific reasoning about which reopens are detectable at
-        /// all lives in `ClientClaimGate`'s own tests.
-        ///
-        /// The challenge period is waited out by advancing `anvil`'s own
-        /// chain clock rather than by sleeping: `TokenNetwork` refuses any
-        /// `settlementTimeout` below its one-hour `MIN_SETTLEMENT_TIMEOUT`
-        /// (`InvalidSettlementTimeout`), so unlike the Solana leg of
-        /// `connector-cli/tests/settlement_lifecycle.rs` this cannot simply
-        /// open with a zero-length one.
-        #[tokio::test]
-        async fn settling_a_channel_retires_the_client_edges_watermark_for_it() {
-            if !require_anvil() {
-                return;
-            }
-
-            let anvil = Anvil::spawn().await;
-            let token = EvmSettlementBackend::deploy_mock_token(
-                &anvil.rpc_url,
-                DEPLOYER_PRIVATE_KEY,
-                1_000_000,
-            )
-            .await
-            .expect("deploy mock USDC");
-            let settlement = Arc::new(
-                EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-                    .await
-                    .expect("deploy a TokenNetwork through a fresh registry"),
-            );
-
-            let payer_signer = LocalSigner::generate("client-edge-payer");
-            let payer_address = derive_evm_address(&payer_signer.public_key().unwrap());
-            let channel_id = settlement
-                .open(payer_address.to_vec(), chrono::Duration::seconds(3_600))
-                .await
-                .expect("open a real channel");
-
-            let evm_channel = connector_client_edge::EvmChannel {
-                counterparty: payer_address,
-                chain_id: settlement.chain_id(),
-                token_network_address: settlement.address().to_fixed_bytes(),
-                deposit_floor: connector_client_edge::DepositFloor::Unknown,
-            };
-            let journal_dir = tempfile::tempdir().expect("temp journal dir");
-            let journal_path = journal_dir.path().join("client-edge-claims.log");
-            let gate = Arc::new(
-                ClientClaimGate::restore(
-                    channels_recording(&channel_id.0, evm_channel),
-                    Arc::new(connector_runtime::FileJournal::open(&journal_path).unwrap()),
-                )
-                .expect("a fresh journal has nothing to replay"),
-            );
-            gate.ingest(
-                &client_claim_json(
-                    &payer_signer,
-                    &channel_id.0,
-                    98,
-                    6_028_510,
-                    settlement.chain_id(),
-                    settlement.address().to_fixed_bytes(),
-                ),
-                0,
-            )
-            .await
-            .expect("a genuine payer-signed claim is accepted");
-
-            let watermark_key = format!("evm:{}", channel_id.0);
-            assert!(
-                gate.watermark(&watermark_key).is_some(),
-                "the gate must actually hold a watermark for this channel, or the assertion \
-                 after the settle proves nothing"
-            );
-
-            let connector = Arc::new(
-                Connector::new(
+                .expect("an empty journal replays");
+                let held = Arc::new(RwLock::new(Vec::new()));
+                let batch = Arc::new(BatchChannels::new(
+                    Arc::new(outbound),
+                    vec![(
+                        SettlementChain::Evm,
+                        Arc::clone(&this) as Arc<dyn BatchSettlementBackend>,
+                    )],
+                    Arc::clone(&held) as Arc<dyn connector_settlement::batch::HeldVouchers>,
+                    Vec::new(),
+                ));
+                let operator = Keypair::generate(&mut OsRng);
+                let connector = Arc::new(Connector::new(
                     vec![],
                     vec![],
                     Arc::new(FakeAppClient::new()),
                     Arc::new(InProcessPeerTransport::new()),
                     Arc::new(TestClock::new(chrono::Utc::now())),
+                ));
+                let app = router_with_batch_channels(
+                    connector,
+                    empty_claim_gate(),
+                    Arc::new(LocalSigner::generate("operator-test-key")),
+                    "correct-token".to_string(),
+                    vec![operator.public.to_bytes()],
+                    None,
+                    Some(Arc::clone(&batch)),
+                );
+                Node {
+                    app,
+                    operator,
+                    created: AtomicU64::new(1_000),
+                    batch,
+                    chain,
+                    this,
+                    counterparty,
+                    held,
+                }
+            }
+
+            /// A write signed by this node's operator key. Each is signed
+            /// at a fresh `created`, so a repeated write is a new request and
+            /// not a replay.
+            async fn write(
+                &self,
+                path: &str,
+                body: serde_json::Value,
+            ) -> (StatusCode, serde_json::Value) {
+                let body = if body.is_null() {
+                    Vec::new()
+                } else {
+                    serde_json::to_vec(&body).unwrap()
+                };
+                let created = self.created.fetch_add(1, Ordering::SeqCst);
+                let (sig_input, sig, digest) = sign_request(
+                    &self.operator,
+                    "POST",
+                    path,
+                    &body,
+                    created,
+                    Some(9_999_999_999),
+                );
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("signature-input", sig_input)
+                    .header("signature", sig)
+                    .header("content-digest", digest)
+                    .body(Body::from(body))
+                    .unwrap();
+                read_json(self.app.clone().oneshot(request).await.unwrap()).await
+            }
+
+            async fn read(&self, path: &str) -> serde_json::Value {
+                let (status, body) =
+                    read_json(get(self.app.clone(), path, Some("correct-token")).await).await;
+                assert_eq!(status, StatusCode::OK);
+                body
+            }
+        }
+
+        async fn read_json(response: Response) -> (StatusCode, serde_json::Value) {
+            let status = response.status();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&bytes).into())
+            });
+            (status, body)
+        }
+
+        /// The counterparty's `batchSettlements` entry, as its
+        /// self-description publishes it.
+        fn counterparty_terms() -> serde_json::Value {
+            let address = format!("0x{}", "02".repeat(20));
+            serde_json::json!({
+                "network": "eip155:31337",
+                "asset": format!("0x{}", "70".repeat(20)),
+                "payTo": address,
+                "receiverAuthorizer": address,
+                "withdrawDelay": ONE_DAY,
+                "name": "USDC",
+                "version": "2",
+            })
+        }
+
+        fn channel_writes(id: &str) -> [(String, serde_json::Value); 4] {
+            [
+                (
+                    "/channels".to_string(),
+                    serde_json::json!({ "terms": counterparty_terms(), "deposit": 1_000 }),
+                ),
+                (
+                    format!("/channels/{id}/fund"),
+                    serde_json::json!({ "amount": 1 }),
+                ),
+                (format!("/channels/{id}/withdraw"), serde_json::Value::Null),
+                (format!("/channels/{id}/land"), serde_json::Value::Null),
+            ]
+        }
+
+        /// ADR 0008 for every channel write: no signature, the read token,
+        /// or a signature from a key not on `write_keys` each buys a `401`,
+        /// and nothing moves.
+        #[tokio::test]
+        async fn every_channel_write_needs_an_allowlisted_signature_and_a_bearer_token_is_not_one()
+        {
+            let node = Node::new().await;
+            let stranger = Keypair::generate(&mut OsRng);
+            for (path, body) in channel_writes(&format!("0x{}", "ab".repeat(32))) {
+                let body = if body.is_null() {
+                    Vec::new()
+                } else {
+                    serde_json::to_vec(&body).unwrap()
+                };
+                let unsigned = Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .body(Body::from(body.clone()))
+                    .unwrap();
+                let bearer = Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header(header::AUTHORIZATION, "Bearer correct-token")
+                    .body(Body::from(body.clone()))
+                    .unwrap();
+                let (sig_input, sig, digest) =
+                    sign_request(&stranger, "POST", &path, &body, 1_000, Some(9_999_999_999));
+                let foreign = Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header("signature-input", sig_input)
+                    .header("signature", sig)
+                    .header("content-digest", digest)
+                    .body(Body::from(body))
+                    .unwrap();
+                for request in [unsigned, bearer, foreign] {
+                    let response = node.app.clone().oneshot(request).await.unwrap();
+                    assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+                }
+            }
+            assert_eq!(node.this.balance(), 10_000, "nothing moved");
+        }
+
+        /// ADR 0075 decision 11's removals: the five `toon-channel` writes
+        /// are gone, not refused -- there is no route to reach.
+        #[tokio::test]
+        async fn the_retired_toon_channel_writes_are_gone() {
+            let node = Node::new().await;
+            for step in [
+                "redeem",
+                "redeem-latest",
+                "settle",
+                "close",
+                "cooperative-close",
+            ] {
+                let (status, _) = node
+                    .write(
+                        &format!("/channels/0x{}/{step}", "ab".repeat(32)),
+                        serde_json::Value::Null,
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{step}");
+            }
+        }
+
+        /// Open, fund, list and withdraw an outbound channel, every step a
+        /// signed write, every figure read back over the surface.
+        #[tokio::test]
+        async fn an_outbound_channel_is_opened_funded_listed_and_withdrawn() {
+            let node = Node::new().await;
+            let (status, opened) = node
+                .write(
+                    "/channels",
+                    serde_json::json!({ "terms": counterparty_terms(), "deposit": 1_000 }),
                 )
-                .with_settlement(SettlementChain::Evm, settlement.clone()),
+                .await;
+            assert_eq!(status, StatusCode::OK, "{opened}");
+            assert_eq!(opened["scheme"], "batch-settlement");
+            assert_eq!(opened["direction"], "outbound");
+            assert_eq!(opened["status"], "open");
+            assert_eq!(opened["collateral"], 1_000);
+            assert_eq!(opened["counterparty"], format!("0x{}", "02".repeat(20)));
+            assert_eq!(opened["resumed"], false);
+            assert_eq!(node.this.balance(), 9_000);
+            let id = opened["id"].as_str().expect("an id").to_string();
+
+            let (status, funded) = node
+                .write(
+                    &format!("/channels/{id}/fund"),
+                    serde_json::json!({ "amount": 500 }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{funded}");
+            assert_eq!(funded["collateral"], 1_500);
+            let (status, _) = node
+                .write(
+                    &format!("/channels/{id}/fund"),
+                    serde_json::json!({ "total": 2_000 }),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "an x402 channel takes an increment, never a total"
             );
-            connector.recognize_channel(&channel_id.0);
-            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
-            let keypair = keypair();
+
+            let listed = node.read("/channels").await;
+            let row = listed
+                .as_array()
+                .expect("a list")
+                .iter()
+                .find(|row| row["id"] == id.as_str())
+                .expect("the channel is listed");
+            assert_eq!(row["direction"], "outbound");
+            assert_eq!(row["collateral"], 1_500);
+            assert_eq!(row["watermark"], 0);
+
+            let (status, started) = node
+                .write(&format!("/channels/{id}/withdraw"), serde_json::Value::Null)
+                .await;
+            assert_eq!(status, StatusCode::OK, "{started}");
+            assert_eq!(started["step"], "started");
+            assert_eq!(started["status"], "withdrawing");
+            let (status, early) = node
+                .write(&format!("/channels/{id}/withdraw"), serde_json::Value::Null)
+                .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{early}");
+            node.chain.advance_time(ONE_DAY);
+            let (status, finished) = node
+                .write(&format!("/channels/{id}/withdraw"), serde_json::Value::Null)
+                .await;
+            assert_eq!(status, StatusCode::OK, "{finished}");
+            assert_eq!(finished["step"], "finished");
+            assert_eq!(node.this.balance(), 10_000);
+        }
+
+        /// Land the held latest voucher on an inbound channel; landing it
+        /// again is a `409` by name, and a channel with none held a `404`.
+        #[tokio::test]
+        async fn the_held_voucher_on_an_inbound_channel_lands_over_the_surface() {
+            let node = Node::new().await;
+            let opened = node
+                .counterparty
+                .open(node.this.published_terms(), 1_000)
+                .await
+                .expect("the counterparty opens toward this node");
+            let channel = opened.presentation.channel().clone();
+            let voucher = node
+                .counterparty
+                .sign_voucher(&channel, 300)
+                .await
+                .expect("sign");
+            node.held.write().unwrap().push(HeldVoucher {
+                presentation: opened.presentation,
+                voucher,
+            });
+
+            let listed = node.read("/channels").await;
+            let row = listed
+                .as_array()
+                .expect("a list")
+                .iter()
+                .find(|row| row["id"] == channel.0.as_str())
+                .expect("the inbound channel is listed");
+            assert_eq!(row["direction"], "inbound");
+            assert_eq!(row["watermark"], 300);
+            assert_eq!(row["landed"], 0);
+
+            let path = format!("/channels/{}/land", channel.0);
+            let (status, landed) = node.write(&path, serde_json::Value::Null).await;
+            assert_eq!(status, StatusCode::OK, "{landed}");
+            assert_eq!(landed["landed"], 300);
+            let (status, _) = node.write(&path, serde_json::Value::Null).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            let (status, _) = node
+                .write(
+                    &format!("/channels/0x{}/land", "cd".repeat(32)),
+                    serde_json::Value::Null,
+                )
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        /// `GET /claims` shows vouchers signed, with their direction and
+        /// scheme.
+        #[tokio::test]
+        async fn claims_show_the_vouchers_this_node_signed() {
+            let node = Node::new().await;
+            let (_, opened) = node
+                .write(
+                    "/channels",
+                    serde_json::json!({ "terms": counterparty_terms(), "deposit": 1_000 }),
+                )
+                .await;
+            let id = opened["id"].as_str().expect("an id").to_string();
+            node.batch
+                .outbound()
+                .sign_voucher(&id, 250)
+                .await
+                .expect("sign");
+            let claims: Vec<ClaimView> =
+                serde_json::from_value(node.read("/claims").await).unwrap();
+            let [claim] = claims.as_slice() else {
+                panic!("one claim, got {claims:?}");
+            };
+            assert_eq!(claim.direction, ClaimDirection::Outbound);
+            assert_eq!(claim.scheme, ClaimScheme::BatchSettlement);
+            assert_eq!(claim.book, ClaimBookKind::Outbound);
+            assert_eq!(claim.channel_id, format!("evm:{id}"));
+            assert_eq!(claim.cumulative_amount, 250);
+        }
+
+        /// A node with no x402 backend answers every x402 channel write
+        /// with `503`, the same as a node with no settlement backend.
+        #[tokio::test]
+        async fn a_node_with_no_x402_backend_answers_503() {
+            let keypair = Keypair::generate(&mut OsRng);
             let app = router(
-                connector,
-                Arc::clone(&gate),
-                signer,
+                Arc::new(Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(TestClock::new(chrono::Utc::now())),
+                )),
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
                 "correct-token".to_string(),
                 vec![keypair.public.to_bytes()],
                 None,
             );
-
-            // Close, which starts the challenge period. The watermark must
-            // survive it: a channel that is merely closed still owes its
-            // counterparty this replay defence, and its last claim is still
-            // what a redemption submits. (Only one settle is attempted
-            // below -- `WriteAuth`'s replay tracking refuses a second,
-            // byte-identical signed request, so a pre-close settle refusal
-            // cannot be asserted here as well; the lifecycle test above
-            // already covers it.)
-            let close_path = format!("/channels/{}/close", channel_id.0);
-            let response = app
-                .clone()
-                .oneshot(signed_post(&keypair, &close_path, Vec::new()))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert!(
-                gate.watermark(&watermark_key).is_some(),
-                "closing a channel must not retire its watermark -- the challenge period is \
-                 exactly when that claim still matters"
-            );
-
-            // Wait out the challenge period on the chain's own clock.
+            for (created, (path, body)) in
+                (1_000..).zip(channel_writes(&format!("0x{}", "ab".repeat(32))))
             {
-                use ethers::providers::{Http, Provider};
-                let provider =
-                    Provider::<Http>::try_from(anvil.rpc_url.as_str()).expect("build provider");
-                let _: serde_json::Value = provider
-                    .request("evm_increaseTime", [3_601])
-                    .await
-                    .expect("evm_increaseTime");
-                let _: serde_json::Value =
-                    provider.request("evm_mine", ()).await.expect("evm_mine");
+                if path.ends_with("/fund") {
+                    continue;
+                }
+                let body = if body.is_null() {
+                    Vec::new()
+                } else {
+                    serde_json::to_vec(&body).unwrap()
+                };
+                let (sig_input, sig, digest) =
+                    sign_request(&keypair, "POST", &path, &body, created, Some(9_999_999_999));
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header("signature-input", sig_input)
+                    .header("signature", sig)
+                    .header("content-digest", digest)
+                    .body(Body::from(body))
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
             }
-
-            let settle_path = format!("/channels/{}/settle", channel_id.0);
-            let response = app
-                .oneshot(signed_post(&keypair, &settle_path, Vec::new()))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            let settled: ChannelView = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(settled.status, ChannelViewStatus::Settled);
-
-            assert_eq!(
-                gate.watermark(&watermark_key),
-                None,
-                "the settle retires the watermark in the same request, so a channel reopened \
-                 at this address -- which on Solana is the *same* address -- starts clean \
-                 instead of inheriting a spend the chain has already paid out"
-            );
         }
     }
 }

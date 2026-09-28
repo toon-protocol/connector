@@ -1194,21 +1194,25 @@ reach `/metrics` on that box: on the fleet, an SSH tunnel to `client_edge_addr`.
 
 ### Writes
 
-| Endpoint                               | Does                                                                      |
-| -------------------------------------- | ------------------------------------------------------------------------- |
-| `POST /packets`                        | Originate a packet from this node.                                        |
-| `POST /peers`                          | Establish a peering from a URL. `DELETE /peers/:id` removes it.           |
-| `POST /routes/peers`                   | Write a durable runtime route. `DELETE /routes/peers/:prefix` removes it. |
-| `POST /routes/leased`                  | Push a TTL-bound route that lapses on its own.                            |
-| `POST /channels`                       | Open a payment channel.                                                   |
-| `POST /channels/:id/fund`              | **Self-deposit** — put your own collateral behind your own claims.        |
-| `POST /channels/:id/redeem`            | Redeem a specific claim on chain.                                         |
-| `POST /channels/:id/redeem-latest`     | Redeem the latest claim — **this is how you get paid**.                   |
-| `POST /channels/:id/settle`            | Settle the channel.                                                       |
-| `POST /channels/:id/close`             | Close it. `cooperative-close` is the agreed variant.                      |
-| `POST /channels/:id/cooperative-close` | Close by agreement with the counterparty.                                 |
+| Endpoint                      | Does                                                                             |
+| ----------------------------- | -------------------------------------------------------------------------------- |
+| `POST /packets`               | Originate a packet from this node.                                               |
+| `POST /peers`                 | Establish a peering from a URL. `DELETE /peers/:id` removes it.                  |
+| `POST /routes/peers`          | Write a durable runtime route. `DELETE /routes/peers/:prefix` removes it.        |
+| `POST /routes/leased`         | Push a TTL-bound route that lapses on its own.                                   |
+| `POST /channels`              | Open an **outbound** x402 channel toward a counterparty, on its published terms. |
+| `POST /channels/:id/fund`     | **Top up** an outbound channel by an increment.                                  |
+| `POST /channels/:id/withdraw` | Start a withdrawal (EVM) or close (Solana); call again once due to finish.       |
+| `POST /channels/:id/land`     | Land the latest voucher held on an **inbound** channel now.                      |
 
-Channel operations answer **503** when no `[settlement]` backend is configured.
+The watchers land your inbound vouchers on their own; `land` is the lever for
+planned maintenance. `POST /channels` journals the channel before it spends, so a
+retry after an error resumes that channel rather than opening a second
+(ADR 0075). The `toon-channel` writes `redeem`, `redeem-latest`, `settle`,
+`close` and `cooperative-close` are gone; a node draining live TOON channels does
+so on the last release that has them.
+
+Channel operations answer **503** when no x402 batch-settlement backend is configured.
 
 `POST`/`DELETE` on `/peers*` and `/routes/peers*` are the durable runtime table.
 Unlike a leased route, they survive a restart — and they are **refused outright**,

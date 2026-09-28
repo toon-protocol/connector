@@ -128,7 +128,10 @@ every other infra-touching ticket in this repo's history records when it applies
    a peering — before it is trusted with a peer claim from the apex.
 
 7. **Channel open.** Open a payment channel from the apex's settlement identity to the relay's, via
-   the apex's operator surface (ADR 0008, issue #459):
+   the apex's operator surface (ADR 0008, issue #459). **Stale since #1376:** the `"chain":"evm"`
+   `toon-channel` open below is refused by name (ADR 0075); an EVM peering's channel is opened by
+   `POST /peers`, and an x402 channel by `POST /channels { terms, deposit }`
+   ([`operator-spec.md` §2.2](../protocol/operator-spec.md)).
 
    ```sh
    curl -X POST https://proxy.devnet.toonprotocol.dev/channels \

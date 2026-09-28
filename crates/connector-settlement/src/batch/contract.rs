@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use super::port::{
     AdmissionRefusal, BatchChannelStatus, BatchSettlementBackend, BatchSettlementError,
-    BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, ReceiverTerms,
-    SolanaReceiverTerms, Voucher, VoucherSigner,
+    BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, OutboundChannelRecord,
+    ReceiverTerms, SolanaReceiverTerms, Voucher, VoucherSigner,
 };
 use crate::port::ChannelId;
 
@@ -400,7 +400,16 @@ pub struct PayingContractFixture {
     pub let_delay_pass: LetDelayPassFn,
     /// A channel, in this chain's spelling, that the payer did not open.
     pub not_outbound: ChannelId,
+    /// The payer after a restart: a **fresh** instance of the same
+    /// implementation, over the same chain and the same settlement key,
+    /// remembering nothing the earlier ones did. Each call is another
+    /// restart. The suite never uses an earlier instance again once it has
+    /// restarted, as a process that crashed never runs again.
+    pub restart: RestartFn,
 }
+
+/// The shape of [`PayingContractFixture::restart`].
+pub type RestartFn = Box<dyn Fn() -> BoxFuture<'static, Arc<dyn BatchSettlementPayer>> + Send>;
 
 /// `terms`, naming a token no node settles in.
 fn in_another_token(terms: &ReceiverTerms) -> ReceiverTerms {
@@ -458,6 +467,7 @@ where
         payer_settlement_key,
         let_delay_pass,
         not_outbound,
+        restart,
     } = build().await;
     if let ReceiverTerms::Solana(solana) = &terms {
         assert!(
@@ -717,6 +727,210 @@ where
         payer.finish_withdrawal(&not_outbound).await.unwrap_err(),
         not_outbound_error
     );
+
+    // -- Surviving a crash and a restart (ADR 0075 decision 8) --
+
+    // Preparing builds the channel and sends nothing: nothing is spent, and
+    // the channel is not this node's to pay on until it is opened. Two
+    // preparations are two channels.
+    let before = payer_balance().await;
+    assert_eq!(
+        payer
+            .prepare_open(in_another_token(&terms), 1_000)
+            .await
+            .unwrap_err(),
+        BatchSettlementError::TokenNotShared
+    );
+    let record = payer
+        .prepare_open(terms.clone(), 1_000)
+        .await
+        .expect("prepare an open");
+    let journaled = record.channel().clone();
+    assert_eq!(record.chain(), terms.chain());
+    assert_eq!(record.deposit(), 1_000);
+    assert_ne!(
+        payer
+            .prepare_open(terms.clone(), 1_000)
+            .await
+            .expect("prepare another")
+            .channel(),
+        &journaled,
+        "two preparations are two channels"
+    );
+    assert_eq!(payer_balance().await, before, "preparing spends nothing");
+    assert_eq!(
+        payer.outbound_state(&journaled).await.unwrap_err(),
+        BatchSettlementError::NotOutbound(journaled.clone()),
+        "a prepared channel is not open"
+    );
+
+    // Crash one: the record was journaled and the node died before sending
+    // it. There is nothing on chain to restore; the node that restarts
+    // opens exactly the journaled channel, not another.
+    let restarted = restart().await;
+    assert_eq!(
+        restarted.restore_outbound(&record, 0).await.unwrap_err(),
+        BatchSettlementError::ChannelNotFound(journaled.clone()),
+        "an open never sent is not on chain to restore"
+    );
+    let opened = restarted
+        .open_prepared(&record)
+        .await
+        .expect("the journaled open, sent after a restart");
+    assert_eq!(opened.presentation.channel(), &journaled);
+    assert_eq!(opened.presentation, record.presentation());
+    assert_eq!(opened.voucher_signer, payer_settlement_key);
+    assert_eq!(payer_balance().await, before - 1_000);
+    receiver
+        .admit(opened.presentation.clone())
+        .await
+        .expect("the receiver admits the channel the journal named");
+
+    // Crash two: the open was sent and landed, and the journal never
+    // learned it. Opening the same record again finds the channel on chain
+    // and adopts it: no second channel, and no second deposit.
+    let restarted = restart().await;
+    let again = restarted
+        .open_prepared(&record)
+        .await
+        .expect("a retried open of a channel already on chain");
+    assert_eq!(again.presentation.channel(), &journaled);
+    assert_eq!(
+        payer_balance().await,
+        before - 1_000,
+        "a retried open never deposits twice"
+    );
+    let first = restarted
+        .sign_voucher(&journaled, 250)
+        .await
+        .expect("sign on the adopted channel");
+    receiver
+        .land(&journaled, first)
+        .await
+        .expect("a voucher signed on the adopted channel lands");
+
+    // A restart: the node knows nothing it is not told, and is told the
+    // record and the highest amount it journaled a voucher for, 300 --
+    // more than the receiver has landed. Its watermark comes back there,
+    // not lower, so it never signs a voucher that fails to advance.
+    let node = restart().await;
+    assert_eq!(
+        node.sign_voucher(&journaled, 300).await.unwrap_err(),
+        BatchSettlementError::NotOutbound(journaled.clone()),
+        "a restarted node pays on nothing it has not restored"
+    );
+    let restored = node
+        .restore_outbound(&record, 300)
+        .await
+        .expect("restore the journaled channel");
+    assert_eq!(restored.on_chain.id, journaled);
+    assert_eq!(restored.on_chain.landed, 250);
+    assert_eq!(restored.on_chain.collateral, 750);
+    assert_eq!(restored.on_chain.voucher_signer, payer_settlement_key);
+    assert_eq!(restored.signed, 300);
+    assert_eq!(
+        node.sign_voucher(&journaled, 300).await.unwrap_err(),
+        BatchSettlementError::VoucherNotAdvancing {
+            amount: 300,
+            signed: 300,
+        },
+        "the signed watermark does not go backwards across a restart"
+    );
+    let state = node
+        .top_up(&journaled, 100)
+        .await
+        .expect("a restored channel tops up");
+    assert_eq!(state.on_chain.collateral, 850);
+    assert_eq!(payer_balance().await, before - 1_100);
+    let voucher = node
+        .sign_voucher(&journaled, 400)
+        .await
+        .expect("a restored channel signs above its watermark");
+    assert_eq!(
+        receiver
+            .land(&journaled, voucher)
+            .await
+            .expect("and what it signs lands")
+            .landed,
+        400
+    );
+
+    // A journal behind the chain: told a watermark below what the receiver
+    // has landed, the node restores to what was landed. The chain is a
+    // lower bound on what this node signed (ADR 0075 decision 6).
+    let node = restart().await;
+    let restored = node
+        .restore_outbound(&record, 0)
+        .await
+        .expect("restore from a stale journal");
+    assert_eq!(restored.signed, 400);
+    assert_eq!(
+        node.sign_voucher(&journaled, 400).await.unwrap_err(),
+        BatchSettlementError::VoucherNotAdvancing {
+            amount: 400,
+            signed: 400,
+        }
+    );
+    assert_eq!(
+        node.restore_outbound(&record, 450)
+            .await
+            .expect("restoring again")
+            .signed,
+        450,
+        "restoring a known channel raises its watermark and never lowers it"
+    );
+    assert_eq!(
+        node.restore_outbound(&record, 10)
+            .await
+            .expect("restoring again")
+            .signed,
+        450
+    );
+
+    // ...and winds down like any other.
+    let state = node
+        .start_withdrawal(&journaled)
+        .await
+        .expect("a restored channel withdraws");
+    assert_eq!(state.on_chain.collateral, 0);
+
+    // A record for another chain is not this node's to restore.
+    let foreign = record_for_the_other_chain(&record);
+    assert_eq!(
+        node.restore_outbound(&foreign, 0).await.unwrap_err(),
+        BatchSettlementError::WrongChain {
+            presented: foreign.chain(),
+            backend: record.chain(),
+        }
+    );
+}
+
+/// A record, for the chain `record` is not for, naming nothing real.
+fn record_for_the_other_chain(record: &OutboundChannelRecord) -> OutboundChannelRecord {
+    match record {
+        OutboundChannelRecord::Evm { .. } => OutboundChannelRecord::Solana {
+            channel: ChannelId("elsewhere".to_string()),
+            receiver: [0x5a; 32],
+            sponsor_endpoint: "https://elsewhere.example/ilp/batch-settlement/solana/open"
+                .to_string(),
+            deposit: 1_000,
+            transaction: Vec::new(),
+            last_valid_block_height: 0,
+        },
+        OutboundChannelRecord::Solana { .. } => OutboundChannelRecord::Evm {
+            channel: ChannelId(format!("0x{}", "5a".repeat(32))),
+            config: super::port::EvmChannelConfig {
+                payer: [0x5a; 20],
+                payer_authorizer: [0x5a; 20],
+                receiver: [0x5b; 20],
+                receiver_authorizer: [0x5b; 20],
+                token: [0x5c; 20],
+                withdraw_delay: 86_400,
+                salt: [0x5d; 32],
+            },
+            deposit: 1_000,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -815,11 +1029,23 @@ mod tests {
                 PayerExit::Withdrawal => VoucherSigner::Evm([0x01; 20]),
                 PayerExit::Close => VoucherSigner::Solana([0x01; 32]),
             },
-            let_delay_pass: Box::new(move || {
+            let_delay_pass: {
                 let chain = Arc::clone(&chain);
-                Box::pin(async move { chain.advance_time(ONE_DAY) })
-            }),
+                Box::new(move || {
+                    let chain = Arc::clone(&chain);
+                    Box::pin(async move { chain.advance_time(ONE_DAY) })
+                })
+            },
             not_outbound,
+            // The same party on the same chain, remembering nothing: the
+            // fake's balances and channels are the chain's, not the node's.
+            restart: Box::new(move || {
+                let chain = Arc::clone(&chain);
+                Box::pin(async move {
+                    Arc::new(InMemoryBatchSettlement::on(chain, 0x01, ONE_DAY))
+                        as Arc<dyn BatchSettlementPayer>
+                })
+            }),
         }
     }
 

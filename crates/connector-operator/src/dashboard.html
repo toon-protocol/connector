@@ -274,7 +274,8 @@
         color: var(--muted);
       }
       input,
-      select {
+      select,
+      textarea {
         font: inherit;
         padding: 7px 9px;
         border: 1px solid var(--line);
@@ -283,8 +284,14 @@
         color: var(--ink);
         width: 100%;
       }
+      textarea {
+        font-family: ui-monospace, monospace;
+        font-size: 0.8rem;
+        resize: vertical;
+      }
       input:focus,
-      select:focus {
+      select:focus,
+      textarea:focus {
         outline: 2px solid var(--gold);
         outline-offset: 1px;
       }
@@ -551,7 +558,28 @@
           (ADR 0034). A peering's fee changes only by editing the file and restarting.
         </p>
         <div class="table-wrap"><table id="peers-table"></table></div>
-        <h3>Channels</h3>
+        <h3>x402 channels</h3>
+        <p class="lede">
+          Every channel is an x402 batch-settlement channel, and moves value one way (ADR 0075).
+          <strong>Outbound</strong> ones pay a counterparty: top one up, or withdraw — the one
+          button starts a withdrawal and, once the counterparty's delay has run, finishes it.
+          <strong>Inbound</strong> ones pay this node: land the latest voucher now; the watchers
+          land it on their own otherwise.
+        </p>
+        <div class="table-wrap"><table id="batch-channels-table"></table></div>
+        <h3>Open an outbound channel</h3>
+        <p class="lede">
+          Paste the counterparty's <code>batchSettlements</code> entry for one chain, from its
+          self-description. The channel is journaled before it is opened, so a retry after an
+          error resumes it rather than opening a second — the answer says <code>resumed</code>.
+        </p>
+        <form class="inline" id="channel-form">
+          <label class="field">terms (JSON)<textarea name="terms" required rows="4" placeholder='{"network": "eip155:…", "payTo": "0x…", …}'></textarea></label>
+          <label class="field">deposit (base units)<input name="deposit" type="number" min="1" required /></label>
+          <label class="field">counterparty url (Solana)<input name="url" type="url" placeholder="https://…/ilp" /></label>
+          <button class="primary write" type="submit">Open</button>
+        </form>
+        <h3>toon-channel channels</h3>
         <div class="table-wrap"><table id="channels-table"></table></div>
         <h3>Establish a peering from a URL</h3>
         <p class="lede">
@@ -912,11 +940,12 @@
         const claimRow = (c) => [
           td(c.peer_id || el('span', { class: 'badge' }, 'client edge')),
           td(el('code', { title: c.channel_id }, short(c.channel_id, 8))),
-          td(String(c.nonce), 'num'),
+          td(c.scheme === 'batch-settlement' ? badge('voucher', 'runtime') : badge('toon-channel', '')),
+          td(c.scheme === 'batch-settlement' ? '—' : String(c.nonce), 'num'),
           amountCell(c.cumulative_amount),
           td(c.pending ? badge('pending', 'config') : badge('acked', 'runtime')),
         ];
-        const headers = [{ label: 'peer' }, { label: 'channel' }, { label: 'nonce', num: true }, { label: 'cumulative', num: true }, { label: 'state' }];
+        const headers = [{ label: 'peer' }, { label: 'channel' }, { label: 'scheme' }, { label: 'nonce', num: true }, { label: 'cumulative', num: true }, { label: 'state' }];
         table(document.getElementById('claims-in-table'), headers, inbound.map(claimRow), 'no inbound claims');
         table(document.getElementById('claims-out-table'), headers, outbound.map(claimRow), 'no outbound claims');
       }
@@ -967,10 +996,47 @@
           ]),
           'no peerings',
         );
+        const vouchered = channels.filter((c) => c.scheme === 'batch-settlement');
+        const channelPath = (c, step) => `/channels/${encodeURIComponent(c.id)}/${step}`;
+        const channelActions = (c) => {
+          if (c.direction === 'inbound') {
+            return el('button', { class: 'small write', onclick: () => write('POST', channelPath(c, 'land'), undefined, `land the latest voucher on ${short(c.id, 8)}`) }, 'Land');
+          }
+          if (c.status === 'opening') {
+            return el('span', { class: 'sub', title: 'journaled and not yet seen on chain: open toward the same receiver again to resume it' }, 'resume by opening again');
+          }
+          const topUp = () => {
+            const amount = prompt(`Top up ${short(c.id, 8)} by how many base units?`);
+            if (amount && Number(amount) > 0) write('POST', channelPath(c, 'fund'), { amount: Number(amount) }, `top up ${short(c.id, 8)} by ${amount}`);
+          };
+          const withdraw = () =>
+            confirm(`Withdraw from ${short(c.id, 8)}? Starting stops it backing new vouchers; the counterparty then has its delay to land what it holds.`) &&
+            write('POST', channelPath(c, 'withdraw'), undefined, `withdraw from ${short(c.id, 8)}`);
+          return el('span', null, [
+            el('button', { class: 'small write', onclick: topUp }, 'Top up'),
+            el('button', { class: 'small write', onclick: withdraw }, c.status === 'open' ? 'Withdraw' : 'Finish withdrawal'),
+          ]);
+        };
+        table(
+          document.getElementById('batch-channels-table'),
+          [{ label: 'channel' }, { label: 'chain' }, { label: 'direction' }, { label: 'counterparty' }, { label: 'status' }, { label: 'collateral', num: true }, { label: 'landed', num: true }, { label: 'watermark', num: true }, { label: '' }],
+          vouchered.map((c) => [
+            td(el('code', { title: c.id }, short(c.id, 8))),
+            td(c.chain),
+            td(badge(c.direction, c.direction === 'inbound' ? 'runtime' : 'config')),
+            td(el('code', { title: c.counterparty }, short(c.counterparty, 8))),
+            td(badge(c.status, c.status === 'open' ? 'runtime' : c.status === 'unreadable' ? 'err' : ''), c.detail ? 'wrap' : ''),
+            c.collateral === null ? td('—', 'num') : amountCell(c.collateral),
+            c.landed === null ? td('—', 'num') : amountCell(c.landed),
+            amountCell(c.watermark),
+            td(channelActions(c)),
+          ]),
+          'no x402 channels — a node with no batch-settlement backend has none',
+        );
         table(
           document.getElementById('channels-table'),
           [{ label: 'channel' }, { label: 'counterparty' }, { label: 'status' }, { label: 'deposited', num: true }, { label: 'own deposited', num: true }, { label: 'redeemed', num: true }],
-          channels.map((c) => [
+          channels.filter((c) => c.scheme !== 'batch-settlement').map((c) => [
             td(el('code', { title: c.id }, short(c.id, 8))),
             td(el('code', { title: c.counterparty }, short(c.counterparty, 8))),
             td(badge(c.status, c.status === 'open' ? 'runtime' : '')),
@@ -978,7 +1044,7 @@
             amountCell(c.own_deposited),
             amountCell(c.redeemed),
           ]),
-          'no channels — a node with no settlement backend has none',
+          'no toon-channel channels',
         );
         // Suggestions, not a constraint: the node is the judge of whether a
         // peer id names a peering, and says so in the write's answer.
@@ -1215,6 +1281,20 @@
         const body = { id: v.id.trim(), url: v.url.trim(), fee: Number(v.fee) || 0, max_packet_amount: Number(v.max_packet_amount) || 0 };
         if (v.chain) body.chain = v.chain;
         write('POST', '/peers', body, `peer with ${body.id}`);
+      });
+      $('channel-form').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const v = formValues(e.target);
+        let terms;
+        try {
+          terms = JSON.parse(v.terms);
+        } catch (error) {
+          notice('err', `open a channel — the terms are not JSON: ${error.message}`);
+          return;
+        }
+        const body = { terms, deposit: Number(v.deposit) };
+        if (v.url.trim()) body.url = v.url.trim();
+        write('POST', '/channels', body, `open a channel toward ${terms.payTo || 'the counterparty'}`);
       });
       $('route-form').addEventListener('submit', (e) => {
         e.preventDefault();

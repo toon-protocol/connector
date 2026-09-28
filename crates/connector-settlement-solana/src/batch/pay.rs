@@ -36,10 +36,19 @@
 //! **What it remembers.** Which channels it opened, the counterparty's
 //! receiver on each (`distribute` must re-present the distribution `open`
 //! committed to, and only its hash is on chain), the highest amount signed on
-//! each, and what each still backs -- for the process lifetime. Journaling
-//! that, and restoring the signed watermark from the receiver's
-//! `POST /ilp/claim-state` after a restart, are the operator surface's and
-//! the peering's (ADR 0075 decisions 6 and 8; issues #1376, #1378).
+//! each, and what each still backs -- for the process lifetime.
+//!
+//! **Across a crash (ADR 0075 decision 8).** `prepare_open` builds and signs
+//! the `open` and posts nothing; the caller journals the record, signed
+//! transaction and all; `open_prepared` posts it. Posting the same signed
+//! bytes again after a crash can make no second channel -- a signature lands
+//! once -- and a channel the chain already holds is adopted without posting.
+//! Once the transaction's blockhash has expired with nothing on chain, the
+//! open never will land, and the record says so (`OpenLapsed`), so the
+//! caller can abandon it. `restore_outbound` brings a journaled channel back
+//! with its journaled watermark, never below the chain's `settled`.
+//! Restoring the watermark from the receiver's `POST /ilp/claim-state`, for
+//! a node that lost its journal, is the peering's (issue #1378).
 //!
 //! **Not yet through `socks_proxy`.** The sponsor endpoint is a peer's, so a
 //! counterparty on an onion endpoint (ADR 0070) needs its post dialed
@@ -58,7 +67,8 @@ use base64::Engine as _;
 use connector_chain_rpc::retry_read;
 use connector_settlement::batch::{
     BatchChannelState, BatchSettlementError, BatchSettlementPayer, ChannelPresentation,
-    OpenedChannel, OutboundChannelState, ReceiverTerms, Voucher, VoucherSigner,
+    OpenedChannel, OutboundChannelRecord, OutboundChannelState, ReceiverTerms, Voucher,
+    VoucherSigner,
 };
 use connector_settlement::ChannelId;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -204,14 +214,15 @@ impl SolanaBatchSettlement {
     }
 
     /// `open`, as a transaction whose fee payer is the counterparty's
-    /// `sponsor` and which this node has signed as payer, base64 of its wire
-    /// bytes: exactly what a stock x402 client posts to a sponsor endpoint.
+    /// `sponsor` and which this node has signed as payer: its wire bytes,
+    /// exactly what a stock x402 client posts (base64) to a sponsor
+    /// endpoint, and the last block height its blockhash is valid at.
     async fn payer_signed_open(
         &self,
         open: &wire::OpenChannel,
         sponsor: &Pubkey,
-    ) -> Result<String, BatchSettlementError> {
-        let (blockhash, _) = retry_read(|| {
+    ) -> Result<(Vec<u8>, u64), BatchSettlementError> {
+        let (blockhash, last_valid_block_height) = retry_read(|| {
             self.rpc
                 .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
         })
@@ -243,7 +254,51 @@ impl SolanaBatchSettlement {
             message,
         };
         let bytes = bincode::serialize(&transaction).map_err(backend_error)?;
-        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+        Ok((bytes, last_valid_block_height))
+    }
+
+    /// The channel a Solana `record` names, as an address and in the port's
+    /// spelling, once it is shown to be for this chain.
+    fn record_address(
+        record: &OutboundChannelRecord,
+    ) -> Result<(ChannelId, Pubkey), BatchSettlementError> {
+        let OutboundChannelRecord::Solana { channel, .. } = record else {
+            return Err(BatchSettlementError::WrongChain {
+                presented: record.chain(),
+                backend: CHAIN,
+            });
+        };
+        let address = Pubkey::from_str(&channel.0)
+            .map_err(|_| BatchSettlementError::ChannelNotFound(channel.clone()))?;
+        Ok((channel.clone(), address))
+    }
+
+    /// Whether `account` is the channel this node's `record` built: its own
+    /// address, this node's settlement key as payer and voucher signer, the
+    /// record's receiver as the one recipient, and at least the record's
+    /// deposit. What an open landed as, or what a crash left on chain to
+    /// adopt.
+    ///
+    /// The counterparty's `payee` seat is checked too, by the address: the
+    /// PDA's seeds include `payee`, so an account at the address the record
+    /// derived names the payee this node built the open with. `rent_payer`
+    /// is not a seed and is not checked; it is the counterparty's own
+    /// concern, not this node's money. The deposit is at least, not exactly,
+    /// the record's, since an adopted channel may have been topped up.
+    fn built_as_recorded(
+        &self,
+        address: &Pubkey,
+        account: &wire::ChannelAccount,
+        receiver: &Pubkey,
+        deposit: u64,
+    ) -> bool {
+        let own = self.settlement_key();
+        account.derive_address(&self.program_id) == *address
+            && account.payer == own
+            && account.authorized_signer == own
+            && account.mint == self.mint
+            && account.deposit >= deposit
+            && account.distribution_hash == wire::distribution_hash(&wire::sole_recipient(receiver))
     }
 
     /// Post `transaction` to `endpoint` and read back the channel the
@@ -318,20 +373,15 @@ impl SolanaBatchSettlement {
 
 #[async_trait]
 impl BatchSettlementPayer for SolanaBatchSettlement {
-    /// Build the `open` ADR 0075 decision 3 describes, sign it as payer and
-    /// post it to the counterparty's sponsor endpoint, which co-signs,
-    /// submits and admits it. The deposit comes from this node's own
-    /// associated token account; the rent and the fee are the sponsor's.
-    ///
-    /// The channel is remembered as this node's **before** the post, and
-    /// forgotten only if the chain shows nothing was opened: a sponsor that
-    /// submits and then fails to answer may still have made the channel,
-    /// with this node's deposit in it.
-    async fn open(
+    /// Build the `open` ADR 0075 decision 3 describes and sign it as payer,
+    /// posting nothing. The record carries the signed transaction, so the
+    /// open that is sent -- now, or after a crash -- is this one, byte for
+    /// byte, and can land once.
+    async fn prepare_open(
         &self,
         terms: ReceiverTerms,
         deposit: u128,
-    ) -> Result<OpenedChannel, BatchSettlementError> {
+    ) -> Result<OutboundChannelRecord, BatchSettlementError> {
         let presented = terms.chain();
         let ReceiverTerms::Solana(terms) = terms else {
             return Err(BatchSettlementError::WrongChain {
@@ -376,28 +426,107 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
             recipients: wire::sole_recipient(&receiver).to_vec(),
         };
         let channel = open.channel(&self.program_id);
-        let id = ChannelId(channel.to_string());
+        let (transaction, last_valid_block_height) =
+            self.payer_signed_open(&open, &sponsor).await?;
+        Ok(OutboundChannelRecord::Solana {
+            channel: ChannelId(channel.to_string()),
+            receiver: receiver.to_bytes(),
+            sponsor_endpoint: terms.sponsor_endpoint,
+            deposit,
+            transaction,
+            last_valid_block_height,
+        })
+    }
 
-        let transaction = self.payer_signed_open(&open, &sponsor).await?;
-        self.outbound().insert(
-            channel,
-            Outbound {
-                receiver,
-                signed: 0,
-                backed: deposit,
-                finished: None,
+    /// Post the record's signed `open` to the counterparty's sponsor
+    /// endpoint, which co-signs, submits and admits it. The deposit comes
+    /// from this node's own associated token account; the rent and the fee
+    /// are the sponsor's.
+    ///
+    /// A channel the chain already holds -- an open posted before a crash
+    /// that landed -- is adopted without posting. One the chain does not
+    /// hold, once the transaction's blockhash has expired, never will be:
+    /// [`OpenLapsed`](BatchSettlementError::OpenLapsed). Otherwise the same
+    /// signed bytes are posted, which can land once however often they are
+    /// sent.
+    ///
+    /// The channel is remembered as this node's **before** the post, and
+    /// forgotten only if the chain shows nothing was opened: a sponsor that
+    /// submits and then fails to answer may still have made the channel,
+    /// with this node's deposit in it.
+    async fn open_prepared(
+        &self,
+        record: &OutboundChannelRecord,
+    ) -> Result<OpenedChannel, BatchSettlementError> {
+        let (id, channel) = Self::record_address(record)?;
+        let OutboundChannelRecord::Solana {
+            receiver,
+            sponsor_endpoint,
+            deposit,
+            transaction,
+            last_valid_block_height,
+            ..
+        } = record
+        else {
+            unreachable!("record_address admits only a Solana record");
+        };
+        let receiver = Pubkey::new_from_array(*receiver);
+        let deposit_units = u64::try_from(*deposit).map_err(|_| {
+            BatchSettlementError::Backend(format!(
+                "a deposit of {deposit} does not fit payment-channels' u64"
+            ))
+        })?;
+        let opened = |account: &wire::ChannelAccount| OpenedChannel {
+            presentation: ChannelPresentation::Solana {
+                channel: id.clone(),
             },
-        );
+            voucher_signer: VoucherSigner::Solana(account.authorized_signer.to_bytes()),
+        };
+        let not_as_built = |account: &wire::ChannelAccount| {
+            BatchSettlementError::Backend(format!(
+                "channel {channel} is on chain, but not as this node built its open: {account:?}"
+            ))
+        };
+        self.outbound().entry(channel).or_insert(Outbound {
+            receiver,
+            signed: 0,
+            backed: *deposit,
+            finished: None,
+        });
+
+        // The height is read **before** the account. Read after it, an open
+        // that landed between the two reads could be judged lapsed while
+        // the chain holds it with this node's deposit in it -- and a lapsed
+        // record is abandoned. Read first, a height past the blockhash's
+        // last valid one means nothing can land after it, so an account
+        // absent at the later read is absent for good.
+        let height = retry_read(|| {
+            self.rpc
+                .get_block_height_with_commitment(CommitmentConfig::confirmed())
+        })
+        .await
+        .map_err(backend_error)?;
+        if let Some(account) = self.read(&channel).await? {
+            if !self.built_as_recorded(&channel, &account, &receiver, deposit_units) {
+                return Err(not_as_built(&account));
+            }
+            self.set_backed(&channel, state_of(&id, &account).voucher_ceiling());
+            return Ok(opened(&account));
+        }
+        if height > *last_valid_block_height {
+            self.outbound().remove(&channel);
+            return Err(BatchSettlementError::OpenLapsed(id));
+        }
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(transaction);
         let mut posted = self
-            .post_to_sponsor(&terms.sponsor_endpoint, transaction.clone())
+            .post_to_sponsor(sponsor_endpoint, encoded.clone())
             .await;
         if matches!(&posted, Err(SponsorFailure::Refused { name, .. }) if name == RENT_SHORT) {
             // The sponsor accepted everything else, and named the one thing
             // this node can put right; the same signed open, sent again.
             self.prefund_channel_rent(&channel).await?;
-            posted = self
-                .post_to_sponsor(&terms.sponsor_endpoint, transaction)
-                .await;
+            posted = self.post_to_sponsor(sponsor_endpoint, encoded).await;
         }
         match posted {
             Ok(answered) if answered == channel => {}
@@ -412,22 +541,50 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
         }
 
         let account = self.read_existing(&id, &channel).await?;
-        let as_built = account.derive_address(&self.program_id) == channel
-            && account.payer == payer
-            && account.authorized_signer == payer
-            && account.payee == sponsor
-            && account.rent_payer == sponsor
-            && account.mint == self.mint
-            && account.deposit == deposit_units
-            && account.distribution_hash == wire::distribution_hash(&open.recipients);
-        if !as_built {
-            return Err(BatchSettlementError::Backend(format!(
-                "channel {channel} is on chain, but not as this node built its open: {account:?}"
-            )));
+        if !self.built_as_recorded(&channel, &account, &receiver, deposit_units) {
+            return Err(not_as_built(&account));
         }
-        Ok(OpenedChannel {
-            presentation: ChannelPresentation::Solana { channel: id },
-            voucher_signer: VoucherSigner::Solana(account.authorized_signer.to_bytes()),
+        Ok(opened(&account))
+    }
+
+    async fn restore_outbound(
+        &self,
+        record: &OutboundChannelRecord,
+        signed: u128,
+    ) -> Result<OutboundChannelState, BatchSettlementError> {
+        let (id, channel) = Self::record_address(record)?;
+        let OutboundChannelRecord::Solana { receiver, .. } = record else {
+            unreachable!("record_address admits only a Solana record");
+        };
+        let account = self
+            .read(&channel)
+            .await?
+            .ok_or_else(|| BatchSettlementError::ChannelNotFound(id.clone()))?;
+        let own = self.settlement_key();
+        if account.derive_address(&self.program_id) != channel
+            || account.payer != own
+            || account.authorized_signer != own
+        {
+            return Err(BatchSettlementError::NotOutbound(id));
+        }
+        let on_chain = state_of(&id, &account);
+        let watermark = {
+            let mut outbound = self.outbound();
+            let entry = outbound.entry(channel).or_insert(Outbound {
+                receiver: Pubkey::new_from_array(*receiver),
+                signed: 0,
+                backed: 0,
+                finished: None,
+            });
+            // Never backwards, and never below what the receiver has
+            // already landed, which this node must have signed.
+            entry.signed = entry.signed.max(signed).max(u128::from(account.settled));
+            entry.backed = on_chain.voucher_ceiling();
+            entry.signed
+        };
+        Ok(OutboundChannelState {
+            on_chain,
+            signed: watermark,
         })
     }
 

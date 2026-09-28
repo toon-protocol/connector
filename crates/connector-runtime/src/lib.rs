@@ -2,6 +2,7 @@
 
 mod app_client;
 mod attribution;
+mod batch_channels;
 mod claim;
 mod clock;
 mod connector;
@@ -32,6 +33,10 @@ pub use app_client::{AppClient, AppOutcome, Delivery, FakeAppClient, HttpAppClie
 // a test, an operator tool or a second implementation names them from one
 // place rather than retyping a string literal.
 pub use attribution::{AMOUNT_HEADER, CHAIN_HEADER, PAYER_HEADER};
+pub use batch_channels::{
+    receiver_terms, BatchChannelError, BatchChannelView, BatchChannelViewStatus, BatchChannels,
+    ChannelDirection, OutboundChannels, WithdrawStep,
+};
 pub use claim::{
     ChannelDomain, ClaimAckOutcome, ClaimBook, ClaimRejectReason, ClaimSignature, InvalidChannelId,
     InvalidSolanaChannel, SolanaChannel, WireClaim,
@@ -49,9 +54,9 @@ pub use connector_config::{SettlementChain, UnknownSettlementChain};
 pub use journal::{FileJournal, InMemoryJournal, Journal, JournalError};
 pub use metrics::Metrics;
 pub use operator_view::{
-    ChannelView, ChannelViewStatus, ClaimBookKind, ClaimDirection, ClaimView, DeclaredRates,
-    LeasedRouteView, PeerRouteView, PeerView, RateView, RateViewState, RefusedRefreshView,
-    RouteSource, RouteView,
+    ChannelView, ChannelViewStatus, ClaimBookKind, ClaimDirection, ClaimScheme, ClaimView,
+    DeclaredRates, LeasedRouteView, PeerRouteView, PeerView, RateView, RateViewState,
+    RefusedRefreshView, RouteSource, RouteView,
 };
 // The OUTBOUND client ledger (issue #873) -- what this node signs to pay a
 // next hop, deliberately a different book from `ClaimBook`'s inbound

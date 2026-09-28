@@ -228,52 +228,92 @@ outside it in fact.
 | a route's price, a peering's fee, a handler URL | **edit the file and restart** — reload is a restart               |
 | a leased route                                  | pushed by a **controller**, expires unless renewed, never durable |
 | a runtime peer or peer route                    | written through the operator surface, **durable** across restarts |
-| a channel: open, fund, redeem, close            | the operator surface, against a settlement backend                |
+| a channel: open, fund, withdraw, land           | the operator surface, against a settlement backend (§2.2)         |
 | originating a packet outward                    | the operator surface                                              |
-
-**`fund` is a self-deposit, on both chains.** It raises `own_deposited` — this node's own
-collateral, behind the claims this node signs and its counterparty redeems — and every one of
-`open`, `fund`, `redeem` and `close` reaches both backends. The reach of this row does not depend
-on the chain.
-
-It reads that way because of Solana, not in spite of it. `packages/solana-program`'s `Deposit`
-credits strictly by signer (`processor.rs`, `InvalidParticipant` otherwise), so only the payer's own
-node can put the payer's collateral behind the payer's claims. That restriction is the **correct**
-rule rather than an obstacle to work around: a node paying for its counterparty's collateral is not
-a shape production should ever have. Defining the port around the delegate deposit only
-`TokenNetwork.setTotalDeposit` offers — it names the participant to credit separately from the
-caller whose tokens are pulled — left `fund` unconditionally broken on the other chain, which is
-what issue #1118 corrected.
-
-The delegate deposit still exists on the EVM backend, as `fund_counterparty`, and that is
-deliberately a **different method** from the port's `fund`: it is reached by the contract suite, not
-by the operator surface, and an implementation whose chain can delegate a deposit still must not do
-it under `fund`. One asymmetry survives below the port rather than at it: `fund` takes an
-**increment** on both chains, but `TokenNetwork.setTotalDeposit` wants an absolute total, so the EVM
-backend adds the increment to the channel's current `own_deposited` before submitting. Solana's
-`Deposit` is already an increment and needs no such conversion.
-
-**`fund` also takes a total, and that form is the one to retry.** An increment runs again when it is
-retried, and `fund` is the one channel write whose repeat the chain accepts rather than refuses (a
-stale claim, a second `open` or `close`, are all refused). So after an outcome the caller did not see
-(a timeout, a lost answer), a retried increment deposits twice. `POST /channels/:id/fund` therefore
-takes exactly one of `amount` (the increment, as before) or `total`: this node's own deposit to
-reach, and no further. A total already reached deposits nothing and answers the channel as it stands,
-which is what the retry of a call that took effect should see. On EVM the total goes straight to
-`setTotalDeposit`, which computes the difference on chain; on Solana the backend reads the deposit
-and deposits the difference under one lock
-([ADR 0073](../adr/0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md)
-decision 5; the port's `fund_to`).
 
 **A runtime row can never take a key the configuration file owns.** A colliding write is refused
 outright, and on the next boot a runtime row whose key the file has since claimed is **deleted**, not
 shadowed — ownership is permanent rather than a precedence that flips back
 ([ADR 0034](../adr/0034-a-runtime-peer-route-table-never-shadows-the-config-file.md)).
 
-### 2.2 What an operator can see
+### 2.2 Channels
+
+Every channel is an x402 `batch-settlement` channel, and a channel moves value **one way**
+([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)). A node is the
+payer on its **outbound** channels and the receiver on its **inbound** ones, and the surface treats
+the two differently: an operator opens, funds and withdraws from what it pays on, and lands what it is
+paid on. There are four writes (decision 11), each RFC 9421-signed like every other; a bearer token
+performs none of them.
+
+- **`POST /channels { terms, deposit, url? }`** opens an outbound channel. `terms` is the
+  counterparty's `batchSettlements` entry for one chain, exactly as its self-description publishes it;
+  `deposit` is the opening deposit in base units; `url` is the counterparty's URL, which a Solana
+  `sponsorEndpoint` published as a path is resolved against. The node builds a channel the counterparty
+  admits by its own published rules — its settlement key as payer and voucher signer, the counterparty
+  in every receiving seat, the counterparty's minimum delay, a fresh salt — and deposits from its own
+  settlement account: on EVM a `deposit` it sends itself, on Solana an `open` it signs and posts to the
+  counterparty's sponsor endpoint. Terms on a network other than this node's, or naming a
+  `receiverAuthorizer` other than `payTo`, are refused `400` before anything is built.
+- **`POST /channels/:id/fund { amount }`** tops an outbound channel up by an **increment**, never a
+  total.
+- **`POST /channels/:id/withdraw`** winds an outbound channel down. It is one lever with two steps,
+  and the chain decides which: on an open channel it **starts** (EVM `initiateWithdraw`, Solana
+  `request_close`), and once due it **finishes** (EVM `finalizeWithdraw`, Solana `distribute`),
+  answering `step: "started" | "finished"`. Between the two the counterparty has the channel's delay —
+  one day by default — to land the latest voucher it holds, and whatever it lands is its own. Called
+  before it is due, it answers `409` with the seconds left.
+- **`POST /channels/:id/land`** lands the latest voucher this node holds on an inbound channel now: EVM
+  `claim`, Solana `settle`, or `settle_and_seal` on a channel its payer is closing. The watchers and
+  sweeps land vouchers on their own; this is the lever for planned maintenance. The voucher landed is
+  the one the client edge accepted and journaled, never one the caller supplies, and landing it twice
+  is a `409`.
+
+**An open is journaled before it spends, and that is what makes it safe to retry**
+([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 8). The
+node writes the channel's record — on EVM the whole `ChannelConfig`, `salt` included; on Solana the
+payer-signed `open` — to `outbound-channels.log` under `state_dir` before its opening transaction is
+sent, and every voucher it signs before the voucher leaves the process. So:
+
+| the node stopped between                      | on the next attempt                                                                                                  |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| journaling the channel and sending its open   | a `POST /channels` toward the same receiver, for the same deposit, sends **that** channel's open, and says `resumed` |
+| sending the open and seeing it confirm        | boot adopts the channel if it landed; a retry re-sends a form that can land only once                                |
+| the open confirming and the journal saying so | boot finds it on chain and records that it opened                                                                    |
+| signing a voucher and journaling it           | the voucher never left the node, so the watermark restored is still an honest one                                    |
+
+"A form that can land only once": on EVM the opening deposit's authorisation is derived from the
+channel's own salt, and the token spends an authorisation once; on Solana the journaled bytes are the
+signed `open` itself, and a signature lands once. However often a journaled open is sent, it makes
+**one** channel with **one** opening deposit. A Solana open whose blockhash expired with nothing on
+chain never will land; the retry records it abandoned and opens a fresh channel. After a restart the
+node knows every outbound channel it journaled and signs on each only above the highest voucher it
+journaled — never below what the chain shows landed — so its watermark never goes backwards. While a
+channel's open is unconfirmed it is listed `opening`, and funding or withdrawing it answers `409`.
+
+**The `toon-channel` writes are gone.** `redeem`, `redeem-latest`, `settle`, `close` and
+`cooperative-close` are deleted (#1376), and so is the EVM `toon-channel` open through `POST
+/channels`, which answers `400` by name. **This build no longer lands a `toon-channel` claim on chain
+at all**: nothing on it redeemed one but these writes (#1376 found no automatic path, though the issue
+assumed one). A node draining live TOON channels does so on the last release that still has these
+writes (ADR 0075, "Draining a node with live TOON channels"). **Two `toon-channel` branches remain.**
+A body carrying `counterparty_hex` with `"chain": "solana"` still opens a Solana `toon-channel`,
+because `local/keys.sh`'s `solana-channels` stage opens its channels through it until #1383 moves the
+local stack to x402. And `/fund` still funds a `toon-channel` on either chain, by `amount` or by
+`total`: on Solana for the same stage, and on EVM because a `POST /peers` peering, whose channel that
+write opens, is collateralised through it until #1378 moves the peering to x402.
+
+### 2.3 What an operator can see
 
 Reads are gated by a bearer token and nothing else: peers, routes (config, leased and runtime, each
 labelled by source), channels, claims, node identity, the write audit log, and metrics.
+
+`GET /channels` lists every x402 channel, inbound and outbound, each with its `direction`,
+`collateral` (what still backs a new voucher, read from the chain now), `landed`, `watermark` (the
+highest voucher signed, outbound, or accepted, inbound) and `status` (`opening`, `open`,
+`withdrawing`, `closing`, `sealed`, or `unreadable` with a `detail`), marked `scheme:
+"batch-settlement"`. Any `toon-channel` rows follow in their older shape. `GET /claims` shows vouchers
+received and vouchers signed, each row with its `direction` and its `scheme`; a signed voucher's row
+comes from the outbound channels' own book (`book: "outbound"`).
 
 The audit log is the one worth knowing about: **every accepted write is retained as its own
 signature**, not as a log line asserting that something happened.
@@ -282,7 +322,7 @@ signature**, not as a log line asserting that something happened.
 can be made at runtime, signed in the operator's browser
 ([ADR 0066](../adr/0066-the-operator-dashboard-is-a-page-the-surface-serves-and-signs-in-the-browser.md)). It needs no credential to load and confers none.
 
-### 2.3 Key rotation
+### 2.4 Key rotation
 
 Rotating the identity key **invalidates every condition already minted against the old one**. A packet
 in flight, sealed to the old key, cannot be opened after the rotation and will be refused. Rotation is
@@ -331,8 +371,7 @@ response to anything arriving over the network.
 **Writes** — RFC 9421 HTTP Message Signature from a key on an operator allowlist, with RFC 9530
 Content-Digest binding the signature to the body: `POST /packets` · `POST|DELETE /peers` ·
 `POST /routes/leased` · `POST|DELETE /routes/peers` · `POST /channels` · `/channels/:id/fund` ·
-`/channels/:id/redeem` · `/channels/:id/redeem-latest` · `/channels/:id/close` ·
-`/channels/:id/settle` · `/channels/:id/cooperative-close`
+`/channels/:id/withdraw` · `/channels/:id/land`
 
 **Page** — no authentication: `GET /dashboard`, the operator dashboard, which reads and writes
 through exactly the lines above from the operator's browser
@@ -356,8 +395,10 @@ Uses exactly the vocabulary of [`CONTEXT.md`](../../CONTEXT.md) and implements
 [ADR 0050](../adr/0050-a-connectors-url-resolves-to-its-self-description.md),
 [ADR 0058](../adr/0058-a-peering-is-established-from-a-url.md),
 [ADR 0059](../adr/0059-a-channel-is-derived-from-its-participants.md),
-[ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) and
-[ADR 0066](../adr/0066-the-operator-dashboard-is-a-page-the-surface-serves-and-signs-in-the-browser.md).
+[ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md),
+[ADR 0066](../adr/0066-the-operator-dashboard-is-a-page-the-surface-serves-and-signs-in-the-browser.md)
+and [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (§2.2, amended
+with its decision 11 in #1376).
 
 **Coverage:** none of OP-01 – OP-07 is vectored and none will be. The operator surface is not a wire
 surface; per [ADR 0045](../adr/0045-a-behavioural-rule-is-normative-prose-until-its-vector-lands.md)

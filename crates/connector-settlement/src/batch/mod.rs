@@ -25,8 +25,8 @@ pub use in_memory::{ChannelTerms, InMemoryBatchChain, InMemoryBatchSettlement, P
 pub use port::{
     AdmissionRefusal, BatchChannelState, BatchChannelStatus, BatchSettlementBackend,
     BatchSettlementError, BatchSettlementPayer, ChannelPresentation, EvmChannelConfig,
-    EvmReceiverTerms, OpenedChannel, OutboundChannelState, ReceiverTerms, SolanaReceiverTerms,
-    Voucher, VoucherSigner,
+    EvmReceiverTerms, OpenedChannel, OutboundChannelRecord, OutboundChannelState, ReceiverTerms,
+    SolanaReceiverTerms, Voucher, VoucherSigner,
 };
 
 #[cfg(any(test, feature = "test-util"))]

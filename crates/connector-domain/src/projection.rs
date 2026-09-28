@@ -118,6 +118,38 @@ pub enum JournalEntry {
         channel_id: String,
         presentation: Vec<u8>,
     },
+    /// This node built an outbound x402 `batch-settlement` channel toward a
+    /// counterparty, and is about to send its opening transaction (ADR 0075
+    /// decision 8). `channel_id` is the canonical `evm:0x…` or `solana:…`
+    /// key; `record` is the settlement port's `OutboundChannelRecord`, as
+    /// its own bytes: on EVM the whole `ChannelConfig`, `salt` included, and
+    /// on Solana the payer-signed `open`. Nothing else can rebuild either.
+    ///
+    /// Written **before** the opening transaction is sent, so a crash
+    /// between the two leaves a record a retried open resumes rather than a
+    /// channel with this node's deposit in it that it no longer knows it
+    /// holds. Neither signed by a counterparty nor irreversible, and
+    /// journaled anyway, for the reason `BatchChannelAdmitted` is.
+    ///
+    /// Written only by `connector_runtime::OutboundChannels`, into its own
+    /// journal file. Folds into nothing here, like the client-edge kinds.
+    OutboundChannelOpening { channel_id: String, record: Vec<u8> },
+    /// The outbound channel `channel_id` is on chain: its opening
+    /// transaction landed, or a retried open found that it had.
+    OutboundChannelOpened { channel_id: String },
+    /// The outbound channel `channel_id` was never opened and never will
+    /// be: on Solana, its `open`'s blockhash expired with nothing on chain.
+    /// A later open toward the same counterparty builds a fresh channel.
+    OutboundChannelAbandoned { channel_id: String },
+    /// This node signed a voucher for `cumulative_amount` on its outbound
+    /// channel `channel_id`, and journaled it before handing it to anyone
+    /// (ADR 0005: what is signed is what the journal keeps). Superseding,
+    /// like the voucher: the highest is this node's watermark on the
+    /// channel, which a restart must never let go backwards.
+    OutboundVoucherSigned {
+        channel_id: String,
+        cumulative_amount: u128,
+    },
 }
 
 /// Balances, derived in memory by folding a journal (ADR 0005). Never a
@@ -183,6 +215,12 @@ impl Projection {
             // Written only to the client edge's own journal, never this
             // one (ADR 0074) -- see the variant's own doc.
             JournalEntry::BatchChannelAdmitted { .. } => {}
+            // Written only to the outbound channels' own journal, never this
+            // one (ADR 0075 decision 8) -- see the variants' own doc.
+            JournalEntry::OutboundChannelOpening { .. }
+            | JournalEntry::OutboundChannelOpened { .. }
+            | JournalEntry::OutboundChannelAbandoned { .. }
+            | JournalEntry::OutboundVoucherSigned { .. } => {}
         }
     }
 
