@@ -608,6 +608,10 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
         // there now. A refusal before sending can still be followed by a
         // balance: an earlier sending of the same authorisation landed
         // meanwhile, which is exactly why the second one was refused.
+        // Another node's sending still in flight is not a refusal here:
+        // the Sender re-reads `pending` past it on a nonce conflict, so
+        // this one is sent behind it on the same key, mines after it and
+        // reverts (`Sent`), and the reading below adopts the channel.
         let after = self.snapshot(id).await;
         match (sent, after) {
             (_, Ok(after)) if exists(&after) => {
