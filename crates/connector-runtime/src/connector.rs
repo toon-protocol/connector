@@ -1129,11 +1129,55 @@ impl Connector {
         outgoing_peer_id: &str,
     ) -> Option<(&AssetId, &AssetId)> {
         let incoming = match arrived? {
-            Arrival::Peer(peer_id) => self.peering_assets.asset(peer_id)?,
+            Arrival::Peer(peer_id) => self.peer_asset(peer_id)?,
             Arrival::ClientChannel(channel_key) => self.client_channel_assets.asset(channel_key)?,
         };
-        self.peering_assets
-            .boundary_from(incoming, outgoing_peer_id)
+        let outgoing = self.peer_asset(outgoing_peer_id)?;
+        (incoming != outgoing).then_some((incoming, outgoing))
+    }
+
+    /// The declared token `peer_id`'s channels hold (ADR 0071 decision 1),
+    /// for either shape a peering can be in.
+    ///
+    /// **Config-declared first** (unchanged): [`Self::peering_assets`],
+    /// resolved once at boot from `[[peer_channels]]`/`[[pay_channels]]`
+    /// against the `[settlement.<chain>]` table those rows name -- this
+    /// still serves config-declared TOON peerings, and stays exactly as it
+    /// did before this method existed (issue #1380 is what retires it, not
+    /// this one).
+    ///
+    /// **A runtime x402 peering, otherwise** (ADR 0075 decision 4, issue
+    /// #1382): such a peering has no `[[peers]]` row for
+    /// [`Self::peering_assets`] to have resolved, so its token is read off
+    /// its own channel binding instead -- on EVM the `ChannelConfig`'s
+    /// token, on Solana the channel's mint. Neither is read a second time
+    /// here: the settlement port admits and opens only this node's
+    /// declared token on any channel it holds (`WrongToken`), so a
+    /// channel's *chain* already names its token, and that is exactly the
+    /// fact [`Self::client_channel_assets`] resolves a client channel's
+    /// token from -- reused here rather than read a second way, so a peer
+    /// arrival and a client arrival on the same chain can never disagree
+    /// about what it is denominated in.
+    ///
+    /// `None` for a peering with no config row and no runtime channel, for
+    /// one whose one channel is a refused pre-ADR-0075 `toon-channel`
+    /// binding, and for every peer id on a node that declares no
+    /// `[[tokens]]` -- the same "empty is a whole answer" rule
+    /// `peering_assets` and `client_channel_assets` both keep, since
+    /// `client_channel_assets` is what this falls through to.
+    fn peer_asset(&self, peer_id: &str) -> Option<&AssetId> {
+        if let Some(asset) = self.peering_assets.asset(peer_id) {
+            return Some(asset);
+        }
+        let runtime_peers = self.runtime_peers_snapshot();
+        let binding = runtime_peers.get(peer_id)?.channels.first()?;
+        let chain = match binding {
+            RuntimePeerChannel::EvmVoucher { .. } => SettlementChain::Evm,
+            RuntimePeerChannel::SolanaVoucher { .. } => SettlementChain::Solana,
+            RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::Solana { .. } => return None,
+        };
+        self.client_channel_assets
+            .asset(&format!("{}:{}", chain.name(), binding.channel()))
     }
 
     /// Reserve every peer id this node's config file names (issue #884):
@@ -10901,6 +10945,94 @@ mod tests {
 
             connector.handle_prepare(prepare(110)).await;
             assert_eq!(voucher_amount(&next_hop.covered.lock().unwrap()[0]), 100);
+        }
+
+        /// ADR 0071 decision 1 and ADR 0075 decision 4, together (issue
+        /// #1382, "Seam 2"): a forward that arrives on a runtime x402 EVM
+        /// peering and leaves on a runtime x402 Solana peering still
+        /// crosses the denomination boundary at the rate this node
+        /// declared, even though **neither** leg has a `[[peers]]` row for
+        /// `PeeringAssets` to have resolved -- `Connector::peer_asset`
+        /// reads each one off its own channel's chain instead. What lands
+        /// on the wire is a real Solana voucher, read back and checked
+        /// against the CONVERTED figure, never merely "a claim exists".
+        #[tokio::test]
+        async fn a_runtime_x402_peering_deals_across_evm_and_solana() {
+            let (connector, next_hop, _receiver, outbound, channel) =
+                peered_on(PayerExit::Close).await;
+            // The outgoing leg: `peered_on` already opened this node's real
+            // outbound Solana channel toward "next-hop" and wired its
+            // voucher hop; binding it into the runtime peer table is what
+            // `POST /peers` would have done, and is what `peer_asset` reads.
+            connector
+                .upsert_runtime_peer(
+                    "next-hop",
+                    RuntimePeering {
+                        channels: vec![RuntimePeerChannel::SolanaVoucher {
+                            outbound_channel_id: channel.clone(),
+                            voucher_signer: bs58::encode([0x02; 32]).into_string(),
+                            network: "solana:test".to_string(),
+                        }],
+                        ..RuntimePeering::default()
+                    },
+                )
+                .expect("the outgoing peering's runtime row");
+            // The incoming leg: an x402 EVM peering this node never opened
+            // an outbound channel toward in this test -- only the chain its
+            // binding names matters for denomination, exactly as `UPSTREAM`
+            // in `dealing_hop` needs no channel of its own either.
+            connector
+                .upsert_runtime_peer(
+                    "up-evm",
+                    RuntimePeering {
+                        channels: vec![RuntimePeerChannel::EvmVoucher {
+                            outbound_channel_id: format!("0x{}", "aa".repeat(32)),
+                            voucher_signer: format!("0x{}", "bb".repeat(20)),
+                            network: "eip155:31337".to_string(),
+                        }],
+                        ..RuntimePeering::default()
+                    },
+                )
+                .expect("the incoming peering's runtime row");
+            let connector = connector
+                .with_client_channel_assets(
+                    [
+                        (SettlementChain::Evm, asset(USDC)),
+                        (SettlementChain::Solana, asset(USDC_SOLANA)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+                .with_rate_table(declaring(USDC, USDC_SOLANA, 1_000, 1));
+
+            let (response, _ack) = connector
+                .handle_peer_prepare(Some("up-evm"), prepare(7), None)
+                .await;
+            assert!(
+                matches!(response, PacketResponse::Fulfill(_)),
+                "{response:?}"
+            );
+
+            let covered = next_hop.covered.lock().unwrap().clone();
+            assert_eq!(covered.len(), 1, "the packet was forwarded");
+            let Covering::Voucher(json) = &covered[0] else {
+                panic!("expected a voucher, got {:?}", covered[0]);
+            };
+            let voucher: serde_json::Value = serde_json::from_str(json).expect("json");
+            assert_eq!(voucher["blockchain"], "solana");
+            assert_eq!(voucher["channelId"], channel.as_str());
+            let signed: u64 = voucher["maxClaimableAmount"]
+                .as_str()
+                .and_then(|amount| amount.parse().ok())
+                .expect("an amount");
+            // floor(7 * 1000/1) - FEE(10) = 6_990: the CONVERTED figure, not
+            // the 7 that arrived and not an unconverted pass-through.
+            assert_eq!(signed, 6_990);
+            assert_eq!(
+                outbound.signed(&channel),
+                Some(6_990),
+                "journaled as signed"
+            );
         }
     }
 }
