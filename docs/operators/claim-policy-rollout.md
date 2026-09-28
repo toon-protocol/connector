@@ -168,8 +168,12 @@ forwarded_claim_enforcement = "enforce"   # default, if omitted: "observe"
   write `"enforce"` on that one peering. Never fleet-wide in one edit.
 
   `local/mixed-chain`'s `a-b` row is the worked example, and the only place in the repository this
-  setting does anything: A holds a `[[pay_channels]]` row covering `amount_after_fee(1200, 100)`,
-  and B enforces on the 1100 that arrives.
+  setting does anything: B declares the peering in config — `[[peers]]` with `"enforce"`, and a
+  `[[peer_channels]]` row naming A's voucher signer — and A covers each forward with a voucher on its
+  own outbound x402 channel toward B for `amount_after_fee(1200, 100)`, so B enforces on the 1100
+  that arrives. Since ADR 0075 (issue #1380) the covering claim on a forward is always such a
+  voucher, and a `[[pay_channels]]` row names that outbound channel rather than a shared
+  `toon-channel`.
 
 - A mistyped value is refused at config load by name
   (`ConfigError::InvalidForwardedClaimEnforcement`). The stakes are the mirror image of the
@@ -187,8 +191,8 @@ None of the fleet's three peerings carry **live, real-channel** peer traffic tod
 
 - **apex↔store** (`apex-store`): the real peer channel `0x0bfd0b88…` has zero deposit on the
   store side, so a claim against it fails `InsufficientHeadroom`
-  (`crates/connector-runtime/src/outbound_client.rs:165` for the error, `:444-450` for the
-  headroom check that raises it) and the store box pays box 1 **as a client**
+  (`crates/connector-runtime/src/outbound_client.rs`, deleted since by ADR 0075's issue #1380 with
+  the `toon-channel` peer claim it signed) and the store box pays box 1 **as a client**
   instead — a client-edge claim, not a peer one. The committed `[[peer_channels]]` row is a
   documented placeholder (`0xdead…`, `docs/operators/peer-channel-migration.md`, issue #822),
   pending that migration.

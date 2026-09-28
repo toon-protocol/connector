@@ -95,7 +95,8 @@ impl EvmClientChannelConfig {
 /// `program_id` is a field of this value but **not** of the config row it
 /// came from: #1082 removed the per-row declaration under #981's "no second
 /// declaration" rule, and issue #1138 finishes the job the same way #1128
-/// did for [`crate::SolanaPeerChannelConfig`] -- the value is copied in
+/// did for the `toon-channel` `[[peer_channels]]` row ADR 0075 retired
+/// (#1380) -- the value is copied in
 /// from `[settlement.solana]` during resolution, so every Solana client
 /// channel a loaded `Config` holds names the program this node settles
 /// under, by construction. Before this it was looked up again in

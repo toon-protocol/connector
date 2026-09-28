@@ -234,12 +234,11 @@ pub enum ClaimDirection {
 }
 
 /// Which claim book a [`ClaimView`] was read out of (issue #1218): the
-/// peer semantics's own `crate::ClaimBook`, journaled to
-/// `peer-claims.log`, or the client edge's
-/// `connector_client_edge::ClientClaimGate`, journaled separately to
-/// `client-edge-claims.log`. The two never merge (`two_ledgers_never_merge.rs`);
-/// this field says which one a given row answers for, since `GET /claims`
-/// now reads both.
+/// peer semantics's own `crate::ClaimBook` -- since ADR 0075 (#1380) only
+/// the replay of a `peer-claims.log` an older build wrote -- or the client
+/// edge's `connector_client_edge::ClientClaimGate`, journaled separately to
+/// `client-edge-claims.log`. The two never merge; this field says which one
+/// a given row answers for, since `GET /claims` reads both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClaimBookKind {

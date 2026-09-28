@@ -8,8 +8,7 @@
 //! `settlement`: nothing in the runtime tracks on-chain redemption yet
 //! (issue #425). `exposure`: kept at its decided name for scrape-config
 //! stability, but the thing it named is gone -- the credit-window
-//! accounting issue #424 added (`ClaimBook::exposure_views`, `GET
-//! /exposure`) is retired (ADR 0031, ADR 0033, issue #882): every peer
+//! accounting issue #424 added (and its `GET /exposure` view) is retired (ADR 0031, ADR 0033, issue #882): every peer
 //! PREPARE now carries its own covering claim, so there is no trailing
 //! exposure left to report. This gauge has no producer and never will.
 

@@ -7,7 +7,7 @@
 //! written down.
 //!
 //! A whole-table JSON snapshot, not an append-only log like
-//! [`crate::Journal`] or `OutboundClientLedger`: this table supports
+//! [`crate::Journal`] or [`crate::OutboundChannels`]: this table supports
 //! removal, which an append-only log cannot express without a compaction
 //! pass it has no use for anywhere else. Every write here is on the rare,
 //! operator-initiated path (ADR 0015's cold-path exception, not the

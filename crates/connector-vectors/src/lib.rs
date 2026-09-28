@@ -14,8 +14,6 @@
 //! non-secret bytes chosen only so this crate compiles to the same output
 //! every time it runs -- never a real operator's key.
 
-use std::collections::HashMap;
-
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use connector_btp::{
@@ -30,15 +28,13 @@ use connector_domain::{
     validate_voucher, ClaimError, EnvelopeError, EnvelopeRequest, EnvelopeResponse, Fulfill,
     Prepare, Price, Reject, RejectCode, VoucherAdmission, VoucherWatermark,
 };
-use connector_peer_btp::{ack, claim_json, fields, AcceptedClaims, PeerClaimDomain};
+use connector_peer_btp::{ack, claim_json, fields, PeerClaimDomain};
 use connector_peer_http::headers::{
     accumulated_cost as http_accumulated_cost, claim_ack as http_claim_ack, claim_ack_header_value,
     claim_header_value, claim_json as http_claim_json, flush_requested as http_flush_requested,
     Headers,
 };
-use connector_runtime::{
-    ChannelDomain, ClaimAckOutcome, ClaimBook, ClaimRejectReason, ClaimSignature, WireClaim,
-};
+use connector_runtime::{ClaimAckOutcome, ClaimRejectReason, ClaimSignature, WireClaim};
 use connector_signer::giftwrap::{
     derive_fulfillment, open_request, open_response, seal_request_with_randomness,
     seal_response_with_randomness,
@@ -264,7 +260,7 @@ pub struct ClaimVectors {
 }
 
 /// A signed EIP-712 `BalanceProof` (ADR 0024, issue #575): the same struct
-/// and digest both a peer claim (`ClaimBook::accept_inbound`) and a
+/// and digest both a peer claim (before ADR 0075 retired it, #1380) and a
 /// client-edge claim (`client-edge-spec.md` §1.3 step 4) are checked
 /// against -- `connector_signer::claim_signature` has exactly one such
 /// scheme, shared by both wires, so one vector section covers both.
@@ -272,7 +268,7 @@ pub struct ClaimVectors {
 pub struct ClaimCase {
     pub name: &'static str,
     /// The EIP-712 domain's `chainId` -- configured per channel
-    /// (`ClaimBook::set_channel_domain`), never a global default, since a
+    /// (as a `[[client_channels]]` row does), never a global default, since a
     /// vector hardcoding one real chain would be unusable against another.
     pub chain_id: u64,
     /// The EIP-712 domain's `verifyingContract` -- the `TokenNetwork`
@@ -1395,12 +1391,16 @@ fn generate_flush_case(evm_claim: &PeerClaimCase) -> PeerFlushCase {
     }
 }
 
-/// Items 15 and 16: §6.3's idempotent re-ack and its boundary, exercised
-/// against the *real* gate a carriage checks -- [`AcceptedClaims`] first
-/// (in-process, per relation), falling through to [`ClaimBook`]'s
-/// strictly-advancing rule exactly as `connector-peer-btp`'s and
-/// `connector-peer-http`'s own accept paths do (`accept.rs`'s
-/// `judge_claim`).
+/// Items 15 and 16: §6.3's idempotent re-ack and its boundary, for a
+/// `toon-channel` peer claim.
+///
+/// No carriage judges one any more (ADR 0075, #1380): the accept paths'
+/// `judge_claim` and the `ClaimBook` it fell through to are deleted, and
+/// #1384 drops these cases with the rest of the `toon-channel` sections at
+/// `schema_version` 7. Until then the vectors are unchanged, and what the
+/// two deleted gates decided is restated here from the domain's own rule
+/// (`connector_domain::validate_claim`) and the claim's own signature, so the
+/// fixtures still say what they always said.
 fn generate_retransmit_cases() -> (PeerRetransmitCase, PeerRetransmitCase) {
     let signer =
         LocalSigner::from_secret_bytes("vector-fixture-retransmit-key", seq_bytes::<32>(0xb1))
@@ -1451,11 +1451,10 @@ fn generate_retransmit_cases() -> (PeerRetransmitCase, PeerRetransmitCase) {
     let first = sign(11, 800_000);
     let first_json = render(&first);
 
-    let watermark = AcceptedClaims::new();
-    assert!(!watermark.is_at_watermark("peer-b", &first));
-    watermark.record("peer-b", &first);
-    assert!(
-        watermark.is_at_watermark("peer-b", &first),
+    // The re-ack: the claim at the watermark, byte for byte.
+    let at_watermark = first.clone();
+    assert_eq!(
+        at_watermark, first,
         "a byte-identical retransmission must be recognised at the watermark"
     );
 
@@ -1469,28 +1468,42 @@ fn generate_retransmit_cases() -> (PeerRetransmitCase, PeerRetransmitCase) {
     };
 
     // Item 16: a genuinely different, validly signed claim at the *same*
-    // nonce is not the one at the watermark, and falls through to
-    // `ClaimBook`'s own strictly-advancing rule -- exactly as the carriage
-    // falls through once `is_at_watermark` says no.
+    // nonce is not the one at the watermark, and falls through to the
+    // strictly-advancing rule: its signature verifies, and its nonce does
+    // not advance past the first's.
     let different = sign(11, 950_000);
-    assert!(!watermark.is_at_watermark("peer-b", &different));
-
-    let mut counterparties = HashMap::new();
-    counterparties.insert(first.channel_id.clone(), signer_address);
-    let book = ClaimBook::new(None, HashMap::new(), counterparties);
-    book.set_channel_domain(
-        &first.channel_id,
-        ChannelDomain {
-            chain_id,
-            token_network_address,
-        },
-    )
-    .expect("a fixed on-chain channel id is always valid");
-    assert_eq!(book.accept_inbound(&first), ClaimAckOutcome::Accepted);
-    assert_eq!(
-        book.accept_inbound(&different),
-        ClaimAckOutcome::Rejected(ClaimRejectReason::NonceNotAdvancing)
-    );
+    assert_ne!(at_watermark, different);
+    let verifies = |claim: &WireClaim| {
+        let ClaimSignature::Evm(signature) = claim.signature else {
+            unreachable!("an EVM fixture");
+        };
+        connector_signer::verify_evm_balance_proof(
+            &EvmBalanceProof {
+                channel_id,
+                nonce: claim.nonce,
+                transferred_amount: u128::from(claim.cumulative_amount),
+                locked_amount: 0,
+                locks_root: [0u8; 32],
+                chain_id,
+                token_network_address,
+            },
+            &signature.to_bytes(),
+            &signer_address,
+        )
+    };
+    assert!(verifies(&first) && verifies(&different));
+    assert!(connector_domain::validate_claim(None, first.nonce, first.cumulative_amount).is_ok());
+    assert!(matches!(
+        connector_domain::validate_claim(
+            Some(connector_domain::advance_watermark(
+                first.nonce,
+                first.cumulative_amount
+            )),
+            different.nonce,
+            different.cumulative_amount,
+        ),
+        Err(connector_domain::ClaimError::NonceNotAdvancing { .. })
+    ));
 
     let different_bytes = PeerRetransmitCase {
         name: "peer_claim_same_nonce_different_bytes",

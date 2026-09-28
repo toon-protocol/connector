@@ -17,7 +17,7 @@ connector-domain = { path = "../connector-domain" }
 connector-peer-auth = { path = "../connector-peer-auth" }
 # The BTP carriage (issue #727), for the parts of it that are **not** BTP:
 # the claim JSON codec, the one refusal taxonomy, the canonical channel-id
-# form and the per-relation `AcceptedClaims` ledger. See this crate's
+# form, the role gate and the price gate. See this crate's
 # `lib.rs` for why a shared crate is not carved out yet.
 connector-peer-btp = { path = "../connector-peer-btp" }
 connector-runtime = { path = "../connector-runtime" }

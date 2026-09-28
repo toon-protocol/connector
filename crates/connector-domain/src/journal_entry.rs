@@ -26,7 +26,8 @@ pub enum JournalEntry {
     },
     /// A signed claim on `channel_id` was verified and accepted, advancing
     /// that channel's watermark to `nonce`/`cumulative_amount`
-    /// (`ClaimBook::accept_inbound`, peer-semantics-pre-868.md §3.4). `signature` is
+    /// (peer-semantics-pre-868.md §3.4; replayed by `ClaimBook` and written
+    /// by the client edge's claim gate). `signature` is
     /// carried through opaque (chain- and scheme-specific verification
     /// already happened before this entry is ever appended) and durably
     /// retained rather than discarded once accepted: on-chain redemption

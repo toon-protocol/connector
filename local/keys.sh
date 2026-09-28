@@ -56,13 +56,14 @@
 #     RANDOM. None appears in a committed file.
 #
 #   * `settlement.key` and `settlement-solana.key` are DERIVED, per node, from
-#     anvil's own published test mnemonic at a fixed index. No committed file
-#     names the addresses any more -- a peering binds the other side's channel
-#     by the voucher signer its self-description publishes, so there is no
-#     `counterparty_key` to write down -- but a settlement address that is the
-#     same on every machine and every run is still one fewer thing to
-#     disambiguate when a log names it, and the `channels` stage checks every
-#     channel's counterparty against it.
+#     anvil's own published test mnemonic at a fixed index. A runtime peering
+#     binds the other side's channel by the voucher signer its
+#     self-description publishes, so almost no committed file names one of
+#     these addresses; the exception is `mixed-chain`'s B, whose A peering is
+#     config-declared and names A's EVM address as its `voucher_signer` --
+#     which only works because the address is the same on every machine and
+#     every run, and which the `channels` stage holds to the derivation. The
+#     same stage checks every channel's counterparty against these too.
 #
 # The mnemonic is public knowledge -- anvil prints it on every start -- so
 # deriving from it introduces no secret that did not already exist. EVM and
@@ -385,8 +386,9 @@ derived_key() {
   cast wallet private-key --mnemonic "$ANVIL_MNEMONIC" --mnemonic-index "$1" | sed 's/^0x//'
 }
 
-# Assert `$2` (a committed config) names `$1` -- the drift guard for the one
-# derived address still committed here, the dealing topology's mint.
+# Assert `$2` (a committed config) names `$1` -- the drift guard for the
+# derived addresses still committed here: the dealing topology's mint, and the
+# voucher signer of `mixed-chain`'s one config-declared peering.
 config_must_name() {
   local value="$1" config="$2" what="$3"
   if ! grep -qF "$value" "$config"; then
@@ -397,6 +399,12 @@ config_must_name() {
     echo "       stale -- update it to the value above rather than editing this script." >&2
     exit 1
   fi
+}
+
+# Whether node `$1`'s committed config declares peering `$2` itself -- a
+# `[[peers]]` row whose `id` is `$2` -- rather than leaving it to `POST /peers`.
+config_declares_peering() {
+  grep -qx "id = \"$2\"" "$(node_config "$1")"
 }
 
 # A node's settlement identities, derived by the binary that signs with them:
@@ -748,7 +756,26 @@ establish_peerings() {
     # the payer's voucher signer to the peering, so every voucher the payer
     # then sends arrives in the PEER role. Its own channel toward the payer is
     # the other half of the peering, opened and never paid on here.
-    establish "$payee" "$payer" "$chain" 0 0 "$id" >/dev/null
+    #
+    # Unless the payee's committed config already declares the peering: a
+    # `[[peers]]` row with this id and a `[[peer_channels]]` row naming the
+    # payer's voucher signer (ADR 0075 decision 9, issue #1380). That binding is
+    # made at boot, so there is nothing for a write to add -- and a second,
+    # runtime peering under the same id would be a conflict, not a no-op. The
+    # signer the row names is this script's own derived address, so it is held
+    # to it here rather than trusted.
+    if config_declares_peering "$payee" "$id"; then
+      if [[ "$chain" == "evm" ]]; then
+        config_must_name "$(evm_settlement_address "$payer")" "$(node_config "$payee")" \
+          "$payer's EVM voucher signer, bound to '$id' by its [[peer_channels]] row"
+      else
+        config_must_name "$(solana_settlement_address "$payer")" "$(node_config "$payee")" \
+          "$payer's Solana voucher signer, bound to '$id' by its [[peer_channels]] row"
+      fi
+      echo "'$id': $payee declares the peering in its config; no POST /peers on that end" >&2
+    else
+      establish "$payee" "$payer" "$chain" 0 0 "$id" >/dev/null
+    fi
     local channel
     channel="$(establish "$payer" "$payee" "$chain" "$fee" "$cap" "$id")"
 

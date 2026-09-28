@@ -40,7 +40,7 @@
 //! happen at the proxy, and a local lookup of one is the bug this design
 //! exists to avoid.
 //!
-//! Only the entry point differs. Both paths end in [`start_session`], so
+//! Only the entry point differs. Both paths end in `start_session`, so
 //! the frames, the one writer, the correlation table and §2.3's symmetry
 //! rule are the same code on a proxied session as on a direct one.
 //!

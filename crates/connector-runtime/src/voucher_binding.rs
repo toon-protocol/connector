@@ -31,15 +31,23 @@
 //! signer already bound to a different peer, by name, rather than
 //! re-pointing it.
 //!
-//! # A runtime operation, and its two sources come later
+//! # A runtime operation, and its two sources
 //!
 //! This module is the operation and nothing else. Its callers are the
 //! sources ADR 0075 names: the key a peer's self-description publishes,
 //! bound when `POST /peers` establishes the peering (#1378, #1379), and the
-//! key a `[[peer_channels]]` row names (#1380). Removing a runtime peering
-//! unbinds its signers (`Connector::remove_runtime_peer`), because
-//! `DELETE /peers` is ADR 0060's kill switch and a switch that left the
-//! peer role reachable would not be one.
+//! key a `[[peer_channels]]` row names, bound at boot (#1380). Removing a
+//! runtime peering unbinds its signers (`Connector::remove_runtime_peer`),
+//! because `DELETE /peers` is ADR 0060's kill switch and a switch that left
+//! the peer role reachable would not be one.
+//!
+//! # A signer pinned to one channel
+//!
+//! A `[[peer_channels]]` row may also name the one `inbound_channel` its
+//! signer proves the peering on ([`VoucherSignerBindings::bind_on_channel`]):
+//! decision 9's "an inbound channel id with its voucher signer". Such a
+//! signer proves nothing on any other channel, even one whose vouchers it
+//! genuinely signs -- a voucher on that other channel is a client's.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -68,7 +76,15 @@ pub enum VoucherBindingError {
 /// is a plain lock over a small map.
 #[derive(Debug, Default)]
 pub struct VoucherSignerBindings {
-    by_signer: RwLock<HashMap<VoucherSigner, String>>,
+    by_signer: RwLock<HashMap<VoucherSigner, Binding>>,
+}
+
+/// The peering a signer proves, and the one channel it proves it on when a
+/// row pinned one.
+#[derive(Debug, Clone)]
+struct Binding {
+    peer_id: String,
+    channel: Option<String>,
 }
 
 impl VoucherSignerBindings {
@@ -85,20 +101,53 @@ impl VoucherSignerBindings {
     /// [`VoucherBindingError::SignerBoundElsewhere`] when `signer` already
     /// proves a different peering.
     pub fn bind(&self, peer_id: &str, signer: VoucherSigner) -> Result<(), VoucherBindingError> {
+        self.insert(peer_id, signer, None)
+    }
+
+    /// Bind `signer` to `peer_id` on `channel` only -- an EVM channel id as
+    /// lower-case `0x` hex, a Solana channel account in base58, the spelling
+    /// [`Self::peer_for_channel`] is asked in. Refused exactly as
+    /// [`Self::bind`] is.
+    ///
+    /// # Errors
+    ///
+    /// [`VoucherBindingError::SignerBoundElsewhere`] when `signer` already
+    /// proves a different peering.
+    pub fn bind_on_channel(
+        &self,
+        peer_id: &str,
+        signer: VoucherSigner,
+        channel: &str,
+    ) -> Result<(), VoucherBindingError> {
+        self.insert(peer_id, signer, Some(channel.to_string()))
+    }
+
+    fn insert(
+        &self,
+        peer_id: &str,
+        signer: VoucherSigner,
+        channel: Option<String>,
+    ) -> Result<(), VoucherBindingError> {
         let mut by_signer = self
             .by_signer
             .write()
             .expect("voucher signer bindings lock poisoned");
         match by_signer.get(&signer) {
-            Some(bound_to) if bound_to != peer_id => {
+            Some(bound) if bound.peer_id != peer_id => {
                 Err(VoucherBindingError::SignerBoundElsewhere {
                     signer: describe(&signer),
-                    bound_to: bound_to.clone(),
+                    bound_to: bound.peer_id.clone(),
                 })
             }
             Some(_) => Ok(()),
             None => {
-                by_signer.insert(signer, peer_id.to_string());
+                by_signer.insert(
+                    signer,
+                    Binding {
+                        peer_id: peer_id.to_string(),
+                        channel,
+                    },
+                );
                 Ok(())
             }
         }
@@ -109,17 +158,46 @@ impl VoucherSignerBindings {
         self.by_signer
             .write()
             .expect("voucher signer bindings lock poisoned")
-            .retain(|_, bound_to| bound_to != peer_id);
+            .retain(|_, bound| bound.peer_id != peer_id);
     }
 
-    /// The peering `signer` is bound to, if any.
+    /// The peering `signer` is bound to, if any, on whichever channel.
     #[must_use]
     pub fn peer_for(&self, signer: &VoucherSigner) -> Option<String> {
         self.by_signer
             .read()
             .expect("voucher signer bindings lock poisoned")
             .get(signer)
-            .cloned()
+            .map(|bound| bound.peer_id.clone())
+    }
+
+    /// The peering `signer` proves on `channel`: [`Self::peer_for`], unless
+    /// the signer is pinned to another channel, when it proves none.
+    #[must_use]
+    pub fn peer_for_channel(&self, signer: &VoucherSigner, channel: &str) -> Option<String> {
+        self.by_signer
+            .read()
+            .expect("voucher signer bindings lock poisoned")
+            .get(signer)
+            .filter(|bound| {
+                bound
+                    .channel
+                    .as_deref()
+                    .is_none_or(|pinned| pinned == channel)
+            })
+            .map(|bound| bound.peer_id.clone())
+    }
+
+    /// Every signer bound to `peer_id`, in no particular order.
+    #[must_use]
+    pub fn signers_of(&self, peer_id: &str) -> Vec<VoucherSigner> {
+        self.by_signer
+            .read()
+            .expect("voucher signer bindings lock poisoned")
+            .iter()
+            .filter(|(_, bound)| bound.peer_id == peer_id)
+            .map(|(signer, _)| *signer)
+            .collect()
     }
 
     /// Whether no signer is bound at all -- every node before its first
@@ -201,6 +279,31 @@ mod tests {
             })
         );
         assert_eq!(bindings.peer_for(&EVM).as_deref(), Some("store"));
+    }
+
+    /// A signer a `[[peer_channels]]` row pinned to one channel proves the
+    /// peering on that channel and on no other, while an unpinned signer
+    /// proves it on any.
+    #[test]
+    fn a_pinned_signer_proves_its_peer_on_its_channel_only() {
+        let bindings = VoucherSignerBindings::new();
+        bindings.bind_on_channel("store", EVM, "0xaa").unwrap();
+        bindings.bind("relay", SOLANA).unwrap();
+
+        assert_eq!(
+            bindings.peer_for_channel(&EVM, "0xaa").as_deref(),
+            Some("store")
+        );
+        assert_eq!(bindings.peer_for_channel(&EVM, "0xbb"), None);
+        assert_eq!(bindings.peer_for(&EVM).as_deref(), Some("store"));
+        assert_eq!(
+            bindings.peer_for_channel(&SOLANA, "any").as_deref(),
+            Some("relay")
+        );
+        assert!(matches!(
+            bindings.bind_on_channel("relay", EVM, "0xaa"),
+            Err(VoucherBindingError::SignerBoundElsewhere { .. })
+        ));
     }
 
     #[test]

@@ -12,10 +12,10 @@ use crate::settlement::{SettlementChain, SettlementConfig};
 ///
 /// A packet's amount has no unit of its own -- it is denominated by the
 /// channel it rides -- so the question "is this forward a conversion" is
-/// really "do these two peerings hold different tokens". Nothing could
-/// answer it before this table existed: an EVM `[[peer_channels]]` row
-/// names a per-token `TokenNetwork` and a Solana row names no token at
-/// all, and neither surfaces as an asset anything can compare.
+/// really "do these two peerings hold different tokens". No row names a
+/// token: a `[[peer_channels]]` row names a voucher signer and a
+/// `[[pay_channels]]` row an x402 channel (ADR 0075), and neither surfaces
+/// as an asset anything can compare -- only their chain does.
 ///
 /// **Empty is the default and is a whole answer.** A node that declares no
 /// `[[tokens]]` resolves no peering, holds the default value here, and
@@ -151,10 +151,10 @@ impl FromIterator<(String, AssetId)> for PeeringAssets {
 /// ([`SettlementConfig::asset`], issue #1290).
 ///
 /// Derived from that table and never declared a second time, which is the
-/// point: an EVM `[[peer_channels]]` row's `token_network` is a per-token
-/// contract whose token only a chain read could name, and a Solana row
-/// names no token at all -- so the one place a node's answer can come from
-/// without asking a chain is the table whose key signs the redemption.
+/// point: the settlement port admits and opens x402 channels only in the
+/// token its chain's table names (ADR 0075, issue #1382), so a channel's
+/// chain already determines its token, and the one place a node's answer
+/// can come from without asking a chain is that table.
 ///
 /// `None` is a channel on a chain with no settlement table, which no file
 /// that reached this point has: `resolve_peer_channels` and

@@ -312,35 +312,108 @@ pub enum ConfigError {
     PeerCredentialRemoved { id: String },
 
     #[error(
-        "peer '{id}' has no '[[peer_channels]]' entry: a peer role needs a channel binding \
-         and a verified claim on one of its channels (peer-carriage-spec.md §1.2 P2/P3), so \
-         without one this peering can never take the peer role and its claims would be judged \
-         as a stranger's. \
-         This is the surface whose absence made ADR 0024 inert (issue #620); see \
-         docs/operators/btp-peer-transport-bringup.md"
+        "peer '{id}' has no '[[peer_channels]]' entry: a peer role is proven by a voucher on a \
+         channel whose voucher signer is bound to the peering, or by the claim-state challenge \
+         that signer signs (peer-carriage-spec.md §1.2, ADR 0075 decision 5), and a \
+         config-declared peering's signer is named by its '[[peer_channels]]' row -- so without \
+         one this peering can never take the peer role and its vouchers would be judged as a \
+         stranger's. Add:\n\
+         \n\
+             [[peer_channels]]\n\
+             peer_id = \"{id}\"\n\
+             voucher_signer = \"<the peer's settlement address (EVM) or key (Solana)>\"\n\
+         \n\
+         see docs/protocol/configuration-spec.md"
     )]
     PeerChannelUnbound { id: String },
 
     #[error(
         "'[[peer_channels]]' names peer_id '{peer_id}', which no '[[peers]]' entry configures \
-         -- a channel bound to a peering that does not exist binds nothing; see \
-         docs/operators/btp-peer-transport-bringup.md"
+         -- a voucher signer bound to a peering that does not exist binds nothing"
     )]
     PeerChannelOrphaned { peer_id: String },
 
+    /// A `[[peer_channels]]` row still writes a field of the `toon-channel`
+    /// row shape (ADR 0075 decision 9, issue #1380): `channel_id` (the EVM
+    /// channel ADR 0059 derived), `channel_account` (a Solana channel in its
+    /// TOON meaning, a PDA of TOON's own program), `chain_id` or
+    /// `token_network` (the EIP-712 domain ADR 0024 signed under),
+    /// `counterparty_key` (what a `toon-channel` claim was verified against)
+    /// or `program_id`. Parsed only so it is refused by name (ADR 0009).
     #[error(
-        "channel '{value}' is configured in both '[[peer_channels]]' and \
-         '[[client_channels]]': peer and client claim watermarks are separate records, so one \
-         channel in both namespaces lets the same money be counted as credit twice \
-         (peer-carriage-spec.md §1.8). Keep the namespaces disjoint -- see \
-         docs/operators/btp-peer-transport-bringup.md"
+        "peer '{peer_id}' writes '{field}' on a '[[peer_channels]]' row, a field of the \
+         'toon-channel' row shape ADR 0075 retired (issue #1380): every channel is an x402 \
+         channel now, and a peering's inbound channel is admitted by its voucher signer rather \
+         than configured by a TOON channel id, domain and counterparty key. Replace the row \
+         with:\n\
+         \n\
+             [[peer_channels]]\n\
+             peer_id = \"{peer_id}\"\n\
+             voucher_signer = \"<the peer's settlement address (EVM) or key (Solana)>\"\n\
+             # inbound_channel = \"<optional: the one x402 channel it pays this node on>\"\n\
+         \n\
+         A node still holding live TOON channels drains them on the last TOON-capable release \
+         first (ADR 0075, 'Draining a node with live TOON channels')"
     )]
-    ChannelInBothNamespaces { value: String },
+    PeerChannelToonFieldRemoved {
+        peer_id: String,
+        field: &'static str,
+    },
 
-    // -- `[[pay_channels]]` (ADR 0042 item 2, issue #881): the channel this
-    // node PAYS a next hop from, as an ordinary client of it. See
-    // `crate::pay_channel`'s module header for why this is a third table
-    // rather than a row in either of the two above.
+    #[error(
+        "'[[peer_channels]]' for peer '{peer_id}' names no 'voucher_signer': the row's whole \
+         job is to name the key whose vouchers prove this peering -- the peer's EVM settlement \
+         address, or its Solana settlement key (ADR 0075 decisions 3 and 4)"
+    )]
+    PeerChannelVoucherSignerMissing { peer_id: String },
+
+    #[error(
+        "'[[peer_channels]]' for peer '{peer_id}' has voucher_signer '{value}', which is \
+         neither a '0x'-prefixed 20-byte EVM address nor a base58 32-byte Solana key"
+    )]
+    PeerChannelInvalidVoucherSigner { peer_id: String, value: String },
+
+    #[error(
+        "'[[peer_channels]]' for peer '{peer_id}' has inbound_channel '{value}', which is not \
+         an x402 channel on {chain}, the chain its voucher_signer is on: an EVM channel is a \
+         '0x'-prefixed 32-byte id, a Solana one a base58 32-byte channel account"
+    )]
+    PeerChannelInvalidInboundChannel {
+        peer_id: String,
+        value: String,
+        chain: &'static str,
+    },
+
+    #[error(
+        "'[[peer_channels]]' for peer '{peer_id}' names a voucher signer on {chain}, but this \
+         node takes no x402 voucher there: '[settlement.{chain}]' has no 'batch_settlement' \
+         sub-table (ADR 0074), so no channel the peer opens toward this node could ever be \
+         admitted. Add the sub-table, or peer over a chain this node takes vouchers on"
+    )]
+    PeerChannelWithoutX402 {
+        peer_id: String,
+        chain: &'static str,
+    },
+
+    #[error(
+        "'{value}' is named by two '[[peer_channels]]' rows: one voucher signer, or one inbound \
+         channel, proves exactly one peering, and a second row would leave which one to file \
+         order"
+    )]
+    PeerChannelDuplicate { value: String },
+
+    #[error(
+        "'[[peer_channels]]' is configured but 'state_dir' is not: the vouchers a peer pays this \
+         node with are journaled beside a client's, and their watermark is the replay defence -- \
+         kept only in memory, every voucher a peer has already spent becomes spendable again the \
+         next time this process restarts (issue #605). Set a top-level state_dir to a directory \
+         this node can write, and mount it so it outlives the container"
+    )]
+    PeerChannelsWithoutStateDir,
+
+    // -- `[[pay_channels]]` (ADR 0042 item 2, as ADR 0075 decision 6 amends
+    // it): this node's own outbound x402 channel toward a next hop. See
+    // `crate::pay_channel`'s module header.
     #[error(
         "'[[pay_channels]]' names peer_id '{peer_id}', which no '[[peers]]' entry configures -- \
          a channel that pays a peering that does not exist pays nobody. This table is how this \
@@ -349,30 +422,58 @@ pub enum ConfigError {
     )]
     PayChannelOrphaned { peer_id: String },
 
+    /// A `[[pay_channels]]` row still writes a field of the `toon-channel`
+    /// shapes (ADR 0075 decision 9, issue #1380). See
+    /// [`ConfigError::PeerChannelToonFieldRemoved`] for the fields.
     #[error(
-        "'[[pay_channels]]' for peer '{peer_id}' names channel '{value}', which is not a \
-         32-byte on-chain channel id: it must be 64 hex characters, optionally '0x'-prefixed. \
-         This is the channel this node PAYS that hop from as an ordinary client of it"
+        "peer '{peer_id}' writes '{field}' on a '[[pay_channels]]' row, a field of the \
+         'toon-channel' row shapes ADR 0075 retired (issue #1380): a forward is covered by a \
+         voucher on this node's own outbound x402 channel toward the hop, not by a claim on a \
+         TOON channel under a configured domain. Open that channel with 'POST /channels' and \
+         replace the row with:\n\
+         \n\
+             [[pay_channels]]\n\
+             peer_id = \"{peer_id}\"\n\
+             outbound_channel = \"<the x402 channel id (EVM) or account (Solana) it opened>\"\n\
+             client_edge_url = \"<that hop's own POST /ilp endpoint>\"\n\
+         \n\
+         A node still holding live TOON channels drains them on the last TOON-capable release \
+         first (ADR 0075, 'Draining a node with live TOON channels')"
     )]
-    PayChannelInvalidId { peer_id: String, value: String },
-
-    #[error(
-        "'[[pay_channels]]' for peer '{peer_id}' has an invalid {field} '{value}': it must be a \
-         20-byte EVM address, optionally '0x'-prefixed. It is half of the EIP-712 domain the \
-         covering claim is signed under, and a claim signed under the wrong domain recovers to \
-         a different address and is refused at the far gate"
-    )]
-    PayChannelInvalidAddress {
+    PayChannelToonFieldRemoved {
         peer_id: String,
         field: &'static str,
-        value: String,
+    },
+
+    #[error(
+        "'[[pay_channels]]' for peer '{peer_id}' names no 'outbound_channel': the row's whole \
+         job is to name which of this node's own x402 channels pays that hop (ADR 0075 \
+         decisions 4 and 6)"
+    )]
+    PayChannelOutboundChannelMissing { peer_id: String },
+
+    #[error(
+        "'[[pay_channels]]' for peer '{peer_id}' has outbound_channel '{value}', which is \
+         neither a '0x'-prefixed 32-byte x402 channel id (EVM) nor a base58 32-byte channel \
+         account (Solana)"
+    )]
+    PayChannelInvalidOutboundChannel { peer_id: String, value: String },
+
+    #[error(
+        "'[[pay_channels]]' for peer '{peer_id}' names an outbound channel on {chain}, but this \
+         node pays no x402 channel there: '[settlement.{chain}]' has no 'batch_settlement' \
+         sub-table (ADR 0074), so there is no paying half to sign a voucher with. Add the \
+         sub-table, or pay over a chain this node settles x402 on"
+    )]
+    PayChannelWithoutX402 {
+        peer_id: String,
+        chain: &'static str,
     },
 
     #[error(
         "'[[pay_channels]]' for peer '{peer_id}' has an unusable client_edge_url '{value}': \
-         {source}. It is that hop's own 'POST /ilp' endpoint -- where this node arrives as an \
-         ordinary buyer, and where 'POST /ilp/claim-state' (issue #693) answers where this \
-         node's claims on the channel stand"
+         {source}. It is that hop's own 'POST /ilp' endpoint -- where 'POST /ilp/claim-state' \
+         answers where this node's vouchers on the channel stand"
     )]
     PayChannelInvalidClientEdgeUrl {
         peer_id: String,
@@ -385,11 +486,10 @@ pub enum ConfigError {
         "'[[pay_channels]]' for peer '{peer_id}' has client_edge_url '{value}', whose scheme \
          '{scheme}' is not one this node may ask a channel's claim state over: it must be \
          'https://' (or 'http://' with peer_allow_plaintext_endpoints, which is a loopback and \
-         test setting). The ask carries a signed challenge -- an EIP-712 digest on EVM, an ed25519 \
-         message on Solana, and on either chain a capability to read a channel's state -- so it is \
-         TLS-only by default. A peering's own 'wss://' endpoint is \
-         not this URL and is never turned into it by swapping scheme and appending a path \
-         (ADR 0030)"
+         test setting). The ask carries a signed challenge -- on either chain a capability to \
+         read a channel's state -- so it is TLS-only by default. A peering's own 'wss://' \
+         endpoint is not this URL and is never turned into it by swapping scheme and appending \
+         a path (ADR 0030)"
     )]
     PayChannelClientEdgeUrlScheme {
         peer_id: String,
@@ -398,112 +498,63 @@ pub enum ConfigError {
     },
 
     #[error(
-        "'[[pay_channels]]' names peer '{peer_id}' twice: the outbound client ledger keeps one \
-         nonce line per next hop, so a second row would be a second channel for one line and \
-         which one signed would depend on file order"
+        "'[[pay_channels]]' names peer '{peer_id}' twice: every forward to a hop is signed on \
+         the one outbound channel registered for it, so a second row would leave which channel \
+         paid to file order"
     )]
     PayChannelDuplicatePeer { peer_id: String },
 
     #[error(
-        "channel '{value}' is named by two '[[pay_channels]]' rows: one channel paid from by \
-         two next hops is one channel carrying two nonce lines, and the far gate resolves that \
-         by refusing one of them as a replay"
+        "channel '{value}' is named by two '[[pay_channels]]' rows: an x402 channel pays exactly \
+         one receiver, so one channel paying two hops cannot be"
     )]
     PayChannelDuplicate { value: String },
 
     #[error(
-        "channel '{value}' is configured in both '[[pay_channels]]' and '[[client_channels]]': \
-         '[[client_channels]]' is channels this node RECEIVES claims on and '[[pay_channels]]' \
-         is one it PAYS from, so one channel in both roles is the same double-count \
-         'ChannelInBothNamespaces' refuses between the peer and client books (ADR 0030, \
-         peer-carriage-spec.md §1.8)"
+        "channel '{value}' is both a '[[peer_channels]]' inbound_channel and a \
+         '[[pay_channels]]' outbound_channel: an x402 channel moves value one way, so this node \
+         is either its payer or its receiver, never both (ADR 0075)"
     )]
-    PayChannelIsAlsoAClientChannel { value: String },
+    ChannelInBothDirections { value: String },
 
+    /// A `[[peer_channels]]` `inbound_channel` or a `[[pay_channels]]`
+    /// `outbound_channel` that a `[[client_channels]]` row also names
+    /// (configuration-spec.md CF-22). The two kinds of channel live in
+    /// different contracts, so the only way to write one is to paste a client
+    /// channel's id into a peering row -- refused rather than left to decide
+    /// which book's watermark the value is read against.
     #[error(
-        "'[[pay_channels]]' names peer '{peer_id}' but this node has no '[settlement.evm]' \
-         table: a covering claim is an EIP-712 balance proof signed by the channel's on-chain \
-         participant, which IS this node's settlement address -- the same key ADR 0024's \
-         outbound peer claims use. There is no second key to configure and none is invented \
-         (ADR 0030)"
+        "channel '{value}' is named by a '[[client_channels]]' row and by the '{table}' row of \
+         peer '{peer_id}': one channel in two books is one channel counted twice \
+         (configuration-spec.md CF-22). A peering's channels are x402 channels its own rows \
+         name; a '[[client_channels]]' row is a channel a client pays this node on"
     )]
-    PayChannelWithoutEvmSettlement { peer_id: String },
-
-    #[error(
-        "'[[pay_channels]]' for peer '{peer_id}' has an invalid {field} '{value}': it must be a \
-         base58-encoded 32-byte Solana address. It is the channel account every covering claim \
-         on this row signs over (ADR 0053), and one that does not decode is a claim the far \
-         gate verifies against a different account"
-    )]
-    PayChannelInvalidSolanaAccount {
-        peer_id: String,
-        field: &'static str,
+    ChannelAlsoAClientChannel {
         value: String,
+        table: &'static str,
+        peer_id: String,
     },
-
-    #[error(
-        "'[[pay_channels]]' for peer '{peer_id}' names a 'program_id', which this table does \
-         not declare: the settlement program a covering claim is signed under is \
-         '[settlement.solana] program_id' and nothing else -- the one program this node can \
-         redeem through, and since ADR 0053 part of what every claim signs. Remove the key \
-         (issue #1128's rule, and the same one '[[peer_channels]]' and '[[client_channels]]' \
-         already hold)"
-    )]
-    PayChannelProgramIdNotDeclared { peer_id: String },
-
-    #[error(
-        "'[[pay_channels]]' names a Solana channel for peer '{peer_id}' but this node has no \
-         '[settlement.solana]' table: a covering claim on Solana is an ed25519 balance proof \
-         signed by the channel's on-chain participant -- '[settlement.solana.key]'s key -- \
-         under '[settlement.solana] program_id', and neither exists to read. There is no \
-         second key to configure and none is invented (ADR 0030)"
-    )]
-    PayChannelWithoutSolanaSettlement { peer_id: String },
-
-    #[error(
-        "'[[pay_channels]]' names a Solana channel for peer '{peer_id}', but '[settlement.solana] \
-         program_id' is '{value}', which is not a base58-encoded 32-byte address. ADR 0053 signs \
-         that program id into every claim on the channel, so it has to be a real address before \
-         a claim can be minted at all -- not only when the settlement backend first dials a chain"
-    )]
-    PayChannelSolanaSettlementProgramIdInvalid { peer_id: String, value: String },
-
-    #[error(
-        "'[[pay_channels]]' names Solana channel '{value}' for peer '{peer_id}', which has no \
-         Solana '[[peer_channels]]' row for that same peering. Unlike an EVM claim's optional \
-         EIP-712 domain, a Solana claim's 'programId' is a REQUIRED wire field, and the peer \
-         carriage renders it from that peering's Solana peer-channel row -- so this row would \
-         mint claims that could not be put on the wire at all. Holding one channel in both \
-         roles with one hop is the deployed shape (the peer role for what arrives, the client \
-         role for what this node sends); add the matching '[[peer_channels]]' row"
-    )]
-    PayChannelSolanaWithoutPeerChannel { peer_id: String, value: String },
 
     #[error(
         "peer '{peer_id}' is the next hop of route '{prefix}' but has no '[[pay_channels]]' \
          entry: a connector covers every PREPARE it sends (ADR 0042), so a peering this node \
-         FORWARDS to must name the channel it pays that hop from. There is no postpay \
-         fallback any more -- ADR 0004's 'the claim covering crossing n rides crossing n + 1' \
-         was deleted in issue #1145 -- so without this row every packet on that route would be \
-         refused at packet time. Add:\n\
+         FORWARDS to must name the channel it pays that hop on. Open one with 'POST /channels' \
+         and add:\n\
          \n\
              [[pay_channels]]\n\
              peer_id = \"{peer_id}\"\n\
-             # EVM:    channel_id / chain_id / token_network\n\
-             # Solana: channel_account (and a Solana '[[peer_channels]]' row for the same \
-         channel)\n\
+             outbound_channel = \"<the x402 channel id (EVM) or account (Solana) it opened>\"\n\
              client_edge_url = \"<that hop's own POST /ilp endpoint>\"\n\
          \n\
-         This key is newly REQUIRED, which by ADR 0009 makes it a breaking deploy: land the \
-         config before moving the image tag, never the other way round"
+         This key is REQUIRED, which by ADR 0009 makes it a breaking deploy: land the config \
+         before moving the image tag, never the other way round"
     )]
     PayChannelUnbound { prefix: String, peer_id: String },
 
     #[error(
-        "'[[pay_channels]]' is configured but 'state_dir' is not: the outbound client ledger \
-         keeps the highest nonce it has ever ISSUED to each next hop, and it has to outlive the \
-         process -- a restart that reissued a nonce would fork this node's own outbound nonce \
-         line and the far gate would refuse one of the two claims as a replay"
+        "'[[pay_channels]]' is configured but 'state_dir' is not: the channel a row names is \
+         held in this node's outbound-channel journal under state_dir, which is also where every \
+         voucher signed on it is recorded before it is handed out (ADR 0075 decision 8)"
     )]
     PayChannelsWithoutStateDir,
 
@@ -524,132 +575,6 @@ pub enum ConfigError {
          carriage for it to dial; see docs/operators/btp-peer-transport-bringup.md"
     )]
     PeerUndialable { id: String },
-
-    #[error(
-        "invalid [[peer_channels]] channel_id '{value}': must be 64 hex characters \
-         (an on-chain 32-byte channel identifier), optionally '0x'-prefixed"
-    )]
-    PeerChannelInvalidId { value: String },
-
-    #[error(
-        "invalid [[peer_channels]] {field} '{value}': must be 40 hex characters \
-         (a 20-byte EVM address), optionally '0x'-prefixed"
-    )]
-    PeerChannelInvalidAddress { field: &'static str, value: String },
-
-    #[error("[[peer_channels]] names channel '{value}' more than once")]
-    PeerChannelDuplicate { value: String },
-
-    /// An EVM `[[peer_channels]]` row on a node with no `[settlement.evm]`
-    /// table (issue #1138) -- the EVM twin of
-    /// [`ConfigError::PeerChannelWithoutSolanaSettlement`], under the one
-    /// rule `crate::settlement::SettlementTables` states for all four
-    /// channel tables.
-    ///
-    /// Not the same missing input the Solana row has: an EVM row declares
-    /// its own EIP-712 domain, so the config is *complete* and the node
-    /// happily verified inbound peer claims on it. What is missing is the
-    /// node's EVM identity. `[settlement.evm.key]` is the address a
-    /// channel names as this node's participant, and
-    /// `TokenNetwork.claimFromChannel` refuses any caller that is not one
-    /// -- so without the table there is no address this node could ever
-    /// redeem the claim as, from this process or any other. It also signs
-    /// no outbound covering claim (ADR 0024's peer claim identity is that
-    /// same key), so the peering could only ever take and never pay.
-    ///
-    /// Refused rather than left loading, for the reason #1134 gave:
-    /// `Config::load` already requires every peering to carry a row
-    /// ([`ConfigError::PeerChannelUnbound`]), so a row that binds nothing
-    /// leaves the peering bound on paper and unredeemable in fact.
-    #[error(
-        "peer '{peer_id}' names an EVM '[[peer_channels]]' row but this node has no \
-         '[settlement.evm]' table: that table is where this node's EVM address comes from, and \
-         a channel's claims are redeemed by its on-chain participant \
-         ('TokenNetwork.claimFromChannel' reverts 'InvalidParticipant' for anyone else). With \
-         no table there is no address to be that participant, so this node would verify the \
-         peer's inbound claims, render carriage for them and never be able to collect -- and it \
-         would sign no covering claim outbound either, since ADR 0024's peer claim is signed by \
-         that same settlement key. Add '[settlement.evm]', or delete the row and peer over a \
-         chain this node settles on"
-    )]
-    PeerChannelWithoutEvmSettlement { peer_id: String },
-
-    #[error(
-        "invalid [[peer_channels]] {field} '{value}': must be base58 encoding a 32-byte \
-         Solana account"
-    )]
-    PeerChannelInvalidSolanaAccount { field: &'static str, value: String },
-
-    /// The removed-key rejection for `[[peer_channels]] program_id` (issue
-    /// #1128), in the shape [`ConfigError::PeerCeilingRemoved`] and
-    /// [`ConfigError::PeerSaleRemoved`] already take: the key is still
-    /// parsed, purely so it can be refused **by name** rather than silently
-    /// ignored or lost in `#[serde(untagged)]`'s "matched no variant".
-    ///
-    /// It was a second declaration of a fact `[settlement.solana]` already
-    /// states, and since ADR 0053 bound the settlement program into a
-    /// Solana claim's signed message the two disagreeing is not a typo with
-    /// a cosmetic symptom: the node verifies inbound peer claims under the
-    /// row's program while its settlement backend redeems under
-    /// `[settlement.solana]`'s, so it renders carriage for claims it can
-    /// never cash. Removing the key is what makes that state unwritable --
-    /// the same "no second declaration" rule #981/#1082 applied to
-    /// `[[client_channels]]`.
-    #[error(
-        "peer '{peer_id}' sets 'program_id' on a Solana '[[peer_channels]]' row, which was \
-         removed (issue #1128): a peer channel's settlement program is read from \
-         '[settlement.solana] program_id', the one program this node can actually redeem a \
-         claim under. Since ADR 0053 that program id is bound into a Solana claim's signed \
-         message, so a row naming a different one made this node accept peer claims it could \
-         never settle. Delete the key rather than replace it -- the value it should have held \
-         is already in '[settlement.solana]'"
-    )]
-    PeerChannelProgramIdRemoved { peer_id: String },
-
-    /// A Solana `[[peer_channels]]` row on a node with no
-    /// `[settlement.solana]` table (issue #1128). The sibling of
-    /// [`ConfigError::PayChannelWithoutEvmSettlement`], and refused for the
-    /// same reason: with the per-row `program_id` gone there is no other
-    /// place a program id could come from, and a node that cannot settle on
-    /// Solana at all cannot redeem a Solana peer claim however correctly it
-    /// was signed.
-    ///
-    /// Refused rather than skipped-with-a-warning (which is what the client
-    /// edge does for the same shape today): `Config::load` already requires
-    /// every peering to carry a `[[peer_channels]]` row
-    /// ([`ConfigError::PeerChannelUnbound`]), so skipping this one would
-    /// leave the peering bound on paper and unverifiable in fact.
-    #[error(
-        "peer '{peer_id}' names a Solana '[[peer_channels]]' row but this node has no \
-         '[settlement.solana]' table: a peer claim on that channel is signed against the \
-         settlement program's id (ADR 0053) and redeemed through that same program, and \
-         without the table there is neither. Add '[settlement.solana]', or delete the row and \
-         peer over a chain this node settles on"
-    )]
-    PeerChannelWithoutSolanaSettlement { peer_id: String },
-
-    /// `[settlement.solana] program_id` is checked only for non-emptiness
-    /// where it is resolved; a Solana `[[peer_channels]]` row now takes its
-    /// program id from there, so the value has to be a real 32-byte address
-    /// before any claim can be judged against it (issue #1128). Named
-    /// against the row that needs it *and* the table that holds it, because
-    /// the fix is in the table and the symptom is on the row.
-    #[error(
-        "peer '{peer_id}' names a Solana '[[peer_channels]]' row, whose settlement program is \
-         read from '[settlement.solana] program_id' -- but that is '{value}', which is not \
-         base58 encoding a 32-byte Solana program address. Since ADR 0053 a claim on this \
-         channel signs that program id, so it must name a real deployed program"
-    )]
-    PeerChannelSolanaSettlementProgramIdInvalid { peer_id: String, value: String },
-
-    #[error(
-        "[[peer_channels]] is configured but 'state_dir' is not: this node would accept peer \
-         claims and keep their replay watermarks only in memory, so every claim a peer has \
-         already spent becomes spendable again the next time this process restarts (issue \
-         #605). Set a top-level state_dir to a directory this node can write, and mount it so \
-         it outlives the container"
-    )]
-    PeerChannelsWithoutStateDir,
 
     #[error(
         "peer '{id}' sets 'addr', which was removed with the raw-TCP transport (ADR 0027, \
@@ -682,6 +607,18 @@ pub enum ConfigError {
          docs/operators/btp-peer-transport-bringup.md"
     )]
     PeerFlushIntervalRemoved { id: String },
+
+    /// `claim_ack_timeout_ms` (ADR 0075, issue #1380): it bounded how long a
+    /// flushed claim waited for its acknowledgement, and the flush is gone.
+    /// A peering's voucher rides the packet it covers, and its verdict rides
+    /// that packet's answer, bounded by `peer_answer_timeout_ms`.
+    #[error(
+        "peer '{id}' sets 'claim_ack_timeout_ms', which was removed with the flush it bounded \
+         (ADR 0075, issue #1380): a peering's voucher rides the packet it covers and is \
+         acknowledged on that packet's answer, which 'peer_answer_timeout_ms' already bounds. \
+         Delete the key rather than replace it"
+    )]
+    PeerClaimAckTimeoutRemoved { id: String },
 
     /// §11's removed-field row, `claim_enforcement` (ADR 0042 item 4, issue
     /// #1077): the issue #883 migration ramp is gone, so `"observe"` names
@@ -894,7 +831,7 @@ pub enum ConfigError {
     /// claim is redeemed by the channel's on-chain participant and this
     /// node's EVM participant address IS `[settlement.evm.key]`
     /// (ADR 0030's "no second key ... and none is invented", the same
-    /// sentence [`ConfigError::PayChannelWithoutEvmSettlement`] makes).
+    /// sentence the retired `toon-channel` pay-channel refusal made).
     /// With no table there is no such address, so the row names a channel
     /// this node is not in and every write it buys is given away. That is
     /// a fact about the chain with exactly one answer -- the category
@@ -922,7 +859,7 @@ pub enum ConfigError {
     /// A Solana `[[client_channels]]` row on a node with no
     /// `[settlement.solana]` table (issue #1138), the twin of
     /// [`ConfigError::ClientChannelWithoutEvmSettlement`] and of
-    /// [`ConfigError::PeerChannelWithoutSolanaSettlement`].
+    /// the retired `toon-channel` peer-channel refusal on Solana.
     ///
     /// Over-determined here, as it is on the peer table: besides having no
     /// Solana identity to be the channel's participant, the node has no
@@ -949,7 +886,7 @@ pub enum ConfigError {
     /// carries it (issue #1138) exactly as the peer table has since #1128
     /// -- so the value has to be a real 32-byte address before any claim
     /// can be judged against it. The client-edge twin of
-    /// [`ConfigError::PeerChannelSolanaSettlementProgramIdInvalid`], and
+    /// the retired `toon-channel` peer-channel refusal of the same value, and
     /// it closes a real crash: `ClientChannelRegistry::record_solana`
     /// base58-decodes the program id and `connector-cli` `expect`s that
     /// decode, so a malformed one used to panic the boot with a message

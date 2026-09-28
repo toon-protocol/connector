@@ -260,17 +260,11 @@ fn payee_document(
 /// The payer's carriage: ILP-over-HTTP to the payee, as a peering's
 /// registrar would dial it.
 fn transport_to(payee: std::net::SocketAddr) -> Arc<dyn PeerTransport> {
-    let transport = HttpPeerTransport::new(
-        Arc::new(ReqwestPeerClient::new(reqwest::Client::new())),
-        [0u8; 20],
-        Arc::new(SystemClock),
-    );
+    let transport =
+        HttpPeerTransport::new(Arc::new(ReqwestPeerClient::new(reqwest::Client::new())));
     transport.add_peer(PeerRelation::new(
         PEER_ID,
         Url::parse(&format!("http://{payee}/ilp")).expect("url"),
-        HashMap::new(),
-        HashMap::new(),
-        std::time::Duration::from_secs(10),
         std::time::Duration::from_secs(10),
     ));
     Arc::new(transport)

@@ -15,8 +15,8 @@
 #
 # The packet is originated at A's operator surface and terminates at C's app,
 # and the money changes chain at B. Nothing in this repository covers that
-# shape: `two_ledgers_never_merge.rs` proves the two backends stay separate
-# in-process, `local/solo` boots one node with both attached, and
+# shape: `a_both_chains_config_attaches_and_routes_both_backends` proves the two
+# backends stay separate in-process, `local/solo` boots one node with both attached, and
 # `peering_from_a_url.rs` and `solana_peering_from_a_url.rs` each peer two
 # nodes on ONE chain -- none of them has a second node on the far side of the
 # OTHER chain. Both peerings are x402 ones, established by `local/keys.sh

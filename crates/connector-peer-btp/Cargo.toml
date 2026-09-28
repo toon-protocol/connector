@@ -73,12 +73,6 @@ tokio = { version = "1", features = [
     "io-util",
 ] }
 libsecp256k1 = "0.6"
-# A genuinely signed Solana balance proof, for the tests that hold what
-# this carriage does with a peer claim's declared `programId`
-# (`tests/a_peer_claims_declared_program_is_not_consulted.rs`). The same
-# ed25519-dalek `connector-signer` verifies with, so a test cannot pass
-# against a second implementation of the signature.
-ed25519-dalek = "1"
 # `Config::load` reads a file, so the two config-driven carriage tests
 # write a real TOML and a real key file rather than hand-building a value.
 tempfile = "3"

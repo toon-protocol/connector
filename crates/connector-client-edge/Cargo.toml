@@ -51,6 +51,9 @@ sha2 = "0.10"
 
 [dev-dependencies]
 chrono = "0.4"
+# `test-support` for `covering_fake`: a payable hop for every test here that
+# forwards to a peer (ADR 0042, ADR 0075 decision 6).
+connector-runtime = { path = "../connector-runtime", features = ["test-support"] }
 connector-settlement = { path = "../connector-settlement" }
 connector-settlement-evm = { path = "../connector-settlement-evm", features = ["test-util"] }
 ethers = { version = "2", default-features = false, features = ["rustls"] }

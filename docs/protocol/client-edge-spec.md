@@ -1065,11 +1065,13 @@ over BTP is indistinguishable downstream from one that arrived over HTTP.
 
 **Peer sessions (ADR 0027).** This section previously stated that peers do not use this transport,
 so every BTP session was a client session by construction (ADR 0026). ADR 0027 reverses that: the
-raw-TCP transport is deleted and connectors peer over BTP on the same codec. A session is a **peer**
-session only while a frame it carries presents a claim on a channel one of that peering's
-`[[peer_channels]]` rows configures, whose signature verifies against the counterparty key that row
-configures ([ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md),
-issue #1157; `peer-carriage-spec.md` §1.2); anything else is a client session, with no fallthrough,
+raw-TCP transport is deleted and connectors peer over BTP on the same codec. A frame is a **peer**
+frame only while it presents a voucher — or, on a packet that moves no value, a claim-state
+challenge — on a channel whose voucher signer is bound to that peering, by a `[[peer_channels]]` row
+or by `POST /peers` ([ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md),
+issue #1157, as [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+decision 5 amends it, issue #1380; `peer-carriage-spec.md` §1.2). A `toon-channel` claim never
+makes one, whatever channel it names. Anything else is a client frame, with no fallthrough,
 and everything below in this section describes client sessions exactly as before. **There is no
 peering credential**, and nothing replaced it: opening this transport is permissionless, a session
 that proves no peering is accepted and stays a client, and role attaches to a frame's own evidence
@@ -1085,9 +1087,10 @@ retired with the field, [ADR 0057](../adr/0057-minimum-delivery-is-retired-a-cla
 > credential **and** has a `[[peer_channels]]` entry — role by authentication, not by transport
 > or port. (_The credential half was deleted by
 > [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (issue
-> #1157) and not replaced: role is the `[[peer_channels]]` binding plus a verified claim on one of
-> that peering's channels, decided per frame. ADR 0027's point here — role by authentication, not
-> by transport or port — is unchanged._) "Every BTP session is a client session by construction"
+> #1157) and not replaced: role was the `[[peer_channels]]` binding plus a verified claim on one of
+> that peering's channels, decided per frame — and since ADR 0075 (issue #1380) a verified voucher
+> or challenge from a bound voucher signer. ADR 0027's point here — role by authentication, not by
+> transport or port — is unchanged._) "Every BTP session is a client session by construction"
 > no longer holds, and the classification it replaces is code, which is why it is a named
 > stop-ship regression test on both carriages. Everything else in this section — one gate, one
 > journal, one refusal taxonomy, indistinguishable downstream — is what ADR 0027 extends to peers
@@ -1427,17 +1430,20 @@ endpoint reports, not a hypothetical one.
   available/nonce figures beside it remain exact across a restart regardless, since those still
   come from the durable watermark.
 
-**Which book answers (issue #1102).** A connector keeps two inbound books — this edge's own, and the
-peer semantics's `ClaimBook` — and the watermark reported above is the one belonging to the book that
-actually judges claims on that channel. Which book that is is a property of the **channel**, never of
-who is asking: a channel this node holds as a `[[peer_channels]]` row is judged by the peer book and
-MUST be reported from it; every other channel is this edge's and is reported from here. The two sets
-cannot overlap, because a channel named in both `[[peer_channels]]` and `[[client_channels]]` is a
-load-time refusal. This matters because a `[[pay_channels]]` payer (ADR 0042 item 2) asks this endpoint
-about a channel it holds with its next hop in both roles at once, and signs its next claim from the
-answer: answered out of the wrong book, it re-signs one cumulative amount at a fresh nonce forever.
-`lastClaimTime` is the one field that does not follow — the peer book records no timestamp for an
-accepted claim, so a peer channel reports `null` there, within the best-effort licence above.
+**One book answers** (amended by
+[ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md), issue #1380).
+Every channel this endpoint reports is judged by this edge's own claim gate, and is reported from it.
+A peer's vouchers are judged there too, against the channel's one watermark whichever role they
+arrive under (`peer-carriage-spec.md` §1.8), so a `[[pay_channels]]` payer restoring its outbound
+watermark from here is told exactly where its channel stands.
+
+> _Superseded by #1380 — which book answered (issue #1102)._ A connector kept two inbound books —
+> this edge's own, and the peer semantics's `ClaimBook`, which judged a `toon-channel` claim on a
+> `[[peer_channels]]` channel — and a channel held as a `[[peer_channels]]` row MUST be reported
+> from the peer book, since a `[[pay_channels]]` payer held that one channel with its next hop in
+> both roles at once and, answered out of the wrong book, re-signed one cumulative amount at a fresh
+> nonce forever. No peering pays on a `toon-channel` now, `ClaimBook` advances no peer's watermark,
+> and the two-book answer is gone.
 
 **An x402 `batch-settlement` channel (issue #1364).** An entry MAY carry `scheme`, spelled as a
 claim's own discriminator (§1.3, ADR 0074 decision 4): absent or `"toon-channel"` asks about a
@@ -1511,13 +1517,15 @@ A verified voucher channel is answered in its own shape, with no `nonce`:
 
 - `cumulativeClaimed` — the amount watermark: the highest cumulative amount the connector has
   accepted a voucher for on this channel, `"0"` for none. The next voucher must strictly exceed it
-  (ADR 0074 decision 3). It is the higher of this edge's book and the peer book, as a
-  `toon-channel` entry's already is: since [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
-  decision 5 a voucher proves the peer role on a channel whose voucher signer is bound to a
-  peering, and decision 6 makes this endpoint the watermark a paying peer restores from, so a
-  peer-bound channel is answered exactly as a client's is and never below where the channel stands
-  (issue #1377). _Before #1377 this read "a voucher is never a peer claim, so only this edge's book
-  is consulted" (ADR 0074 decision 1, superseded there by ADR 0075)._
+  (ADR 0074 decision 3). It is this edge's book's, which judges a peer's vouchers too: since
+  [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 5
+  a voucher proves the peer role on a channel whose voucher signer is bound to a peering, it is
+  judged against the channel's one watermark whichever role it arrives under, and decision 6 makes
+  this endpoint the watermark a paying peer restores from, so a peer-bound channel is answered
+  exactly as a client's is and never below where the channel stands. _Before #1377 this read "a
+  voucher is never a peer claim, so only this edge's book is consulted" (ADR 0074 decision 1,
+  superseded there by ADR 0075); from #1377 to #1380 it was the higher of this edge's book and the
+  peer book, which #1380 retired._
 - `maxCumulative` — the highest cumulative amount a voucher may name and be accepted, as §1.3 step
   5 reads it now: the amount landed on chain plus what still backs a voucher above it, which is
   `balance − pendingWithdrawal` on EVM and `deposit` on an Open Solana channel (ADR 0074 decision 5).

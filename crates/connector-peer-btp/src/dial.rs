@@ -23,21 +23,18 @@
 //! named, and packets routed to that peer reject **`T01`** -- never `T00`,
 //! and never a silent drop.
 //!
-//! # Byte-identical retransmission (§6.3)
+//! # What rides a forwarded PREPARE (ADR 0075 decisions 5 and 6)
 //!
-//! A payer whose claim went unacknowledged must retransmit the latest
-//! pending claim, **byte-identical if nothing has changed**, because a
-//! payee is required to answer such a retransmission `accepted` rather
-//! than `nonce_not_advancing`. The claim JSON of §4 carries a `timestamp`,
-//! so re-rendering it with a fresh `now` would make every retransmission a
-//! *different* claim at the same nonce -- which §6.3 says a payee MUST
-//! refuse. This transport therefore caches the exact string it emitted for
-//! a `(channel, nonce, cumulative, signature)` and reuses it until that
-//! claim is acknowledged or superseded.
+//! A voucher on this node's own outbound x402 channel, or -- for a packet
+//! that moves no value -- the peer-role challenge. Both arrive rendered, from
+//! `Connector::cover_forward`, and ride their slots verbatim: a voucher's
+//! freshness is its amount, so a resend is recognised by its signature
+//! rather than its bytes (ADR 0074 decision 3), and this transport caches
+//! nothing. No `toon-channel` claim is rendered or sent here any more
+//! (#1380), and the claim-only FLUSH went with it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -46,13 +43,13 @@ use connector_btp::{
     BtpFrame, BtpSessionHandle, OriginateError, ProtocolData, BTP_ERROR, CONTENT_TYPE_TEXT,
     PEER_CHALLENGE_PROTOCOL,
 };
-use connector_config::{PeerCarriage, PeerChannelConfig, PeerConfig};
+use connector_config::{PeerCarriage, PeerConfig};
 use connector_domain::x402::{GreetingError, X402PaymentRequired};
 use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
-use connector_runtime::{ClaimAckOutcome, Clock, Covering, PeerForward, PeerTransport, WireClaim};
+use connector_runtime::{ClaimAckOutcome, Covering, PeerForward, PeerTransport};
 use url::Url;
 
-use crate::claim_json::{self, PeerClaimDomain};
+use crate::claim_json;
 use crate::{ack, fields};
 
 /// Why a peer could not be reached. Carries the peer id and the endpoint
@@ -78,9 +75,9 @@ impl std::fmt::Display for DialError {
 /// Establishes the websocket underneath a dialed peering.
 ///
 /// A port of its own so the carriage's *behaviour* -- the frames, the
-/// timeouts, the ack handling, the retransmission cache -- is provable
-/// without TLS, a listener or a port number, and so the socket library is
-/// swappable without touching any of it. The implementation returns the
+/// timeouts, the ack handling -- is provable without TLS, a listener or a
+/// port number, and so the socket library is swappable without touching
+/// any of it. The implementation returns the
 /// [`BtpSessionHandle`] the session's read loop resolves answers through;
 /// it owns the pump in both directions and nothing above it reads a socket.
 #[async_trait]
@@ -90,30 +87,19 @@ pub trait PeerDialer: Send + Sync {
 
 /// One peering relation, as the dial side needs it.
 ///
-/// Per **relation**, never per connection (§2.5): the timeouts and the
-/// claim domains belong to the relation, and splitting them per connection
-/// is a double-spend surface.
+/// Per **relation**, never per connection (§2.5): the timeouts belong to
+/// the relation.
 ///
 /// There is nothing here to present on the way in. ADR 0060 deleted the
 /// `{peerId, secret}` credential this used to carry and dial with: what
-/// proves the peering at the far end is the claim covering each packet,
-/// which this transport already renders and sends.
+/// proves the peering at the far end is the voucher covering each packet,
+/// or the peer-role challenge on one that moves no value (ADR 0075 decision
+/// 5), which arrive rendered with the packet.
 #[derive(Debug, Clone)]
 pub struct PeerRelation {
     peer_id: String,
     endpoint: Url,
-    /// Canonical EVM channel id → the EIP-712 domain its claims are signed
-    /// under, from that peering's EVM-shaped `[[peer_channels]]` rows.
-    domains: HashMap<String, PeerClaimDomain>,
-    /// Solana channel account → the program id its claims render under
-    /// (issue #759), from that peering's Solana-shaped `[[peer_channels]]`
-    /// rows. Never canonicalized the way an EVM channel id is --
-    /// `claim_json::canonical_evm_channel_id` is a no-op on a base58
-    /// account (it only rewrites 66-char `0x`-hex), so a Solana claim's
-    /// `channel_id` is used as the lookup key verbatim.
-    solana_program_ids: HashMap<String, String>,
     peer_answer_timeout: Duration,
-    claim_ack_timeout: Duration,
 }
 
 impl PeerRelation {
@@ -121,43 +107,14 @@ impl PeerRelation {
     /// dial it over BTP -- an accept-only peering (no endpoint) or one
     /// whose endpoint's scheme selects the HTTP carriage (§2.1).
     #[must_use]
-    pub fn from_config(peer: &PeerConfig, channels: &[PeerChannelConfig]) -> Option<PeerRelation> {
+    pub fn from_config(peer: &PeerConfig) -> Option<PeerRelation> {
         if peer.dial() != Some(PeerCarriage::Btp) {
             return None;
         }
-        let endpoint = peer.endpoint()?.clone();
-        let mine = channels
-            .iter()
-            .filter(|channel| channel.peer_id() == peer.id());
-        let domains = mine
-            .clone()
-            .filter_map(|channel| match channel {
-                PeerChannelConfig::Evm(evm) => Some((
-                    claim_json::canonical_evm_channel_id(evm.channel_id()),
-                    PeerClaimDomain {
-                        chain_id: evm.chain_id(),
-                        token_network: evm.token_network(),
-                    },
-                )),
-                PeerChannelConfig::Solana(_) => None,
-            })
-            .collect();
-        let solana_program_ids = mine
-            .filter_map(|channel| match channel {
-                PeerChannelConfig::Solana(solana) => Some((
-                    solana.channel_account().to_string(),
-                    solana.program_id().to_string(),
-                )),
-                PeerChannelConfig::Evm(_) => None,
-            })
-            .collect();
         Some(PeerRelation {
             peer_id: peer.id().to_string(),
-            endpoint,
-            domains,
-            solana_program_ids,
+            endpoint: peer.endpoint()?.clone(),
             peer_answer_timeout: Duration::from_millis(peer.peer_answer_timeout_ms()),
-            claim_ack_timeout: Duration::from_millis(peer.claim_ack_timeout_ms()),
         })
     }
 
@@ -167,28 +124,14 @@ impl PeerRelation {
     pub fn new(
         peer_id: impl Into<String>,
         endpoint: Url,
-        domains: HashMap<String, PeerClaimDomain>,
-        solana_program_ids: HashMap<String, String>,
         peer_answer_timeout: Duration,
-        claim_ack_timeout: Duration,
     ) -> PeerRelation {
         PeerRelation {
             peer_id: peer_id.into(),
             endpoint,
-            solana_program_ids,
-            domains,
             peer_answer_timeout,
-            claim_ack_timeout,
         }
     }
-}
-
-/// What a relation's claim exchange remembers between frames.
-#[derive(Default)]
-struct Pending {
-    /// Canonical channel id → the claim last emitted on it and the exact
-    /// JSON string it went out as (§6.3's byte-identical retransmission).
-    emitted: HashMap<String, (WireClaim, String)>,
 }
 
 struct RelationState {
@@ -198,31 +141,12 @@ struct RelationState {
     /// `await`, and holding it across that await is exactly what stops
     /// eight concurrent forwards opening eight sessions to one peer.
     session: tokio::sync::Mutex<Option<BtpSessionHandle>>,
-    pending: Mutex<Pending>,
 }
 
 /// The BTP peer carriage's dial side: one [`PeerTransport`] over however
 /// many `wss://` peerings this connector dials.
 pub struct BtpPeerTransport {
     dialer: Arc<dyn PeerDialer>,
-    /// This connector's own EVM address -- the `senderId`/`signerAddress`
-    /// of every claim it emits (§4). One per node, because a claim's
-    /// signer is `ClaimBook`'s signer.
-    signer_address: [u8; 20],
-    /// This connector's own ed25519 public key -- the Solana counterpart
-    /// of `signer_address` (issue #742), rendered as `senderId`/
-    /// `signerPublicKey` on a claim `ClaimBook` signed through its
-    /// `solana_signer`. `None` until something configures one with
-    /// [`Self::set_solana_signer_public_key`], which
-    /// `connector-cli::peer_transport::build_peer_transport` does from the
-    /// `[settlement.solana]` key -- the same key `ClaimBook` signs a Solana
-    /// peer claim with (issue #998) -- so this is `None` on exactly the
-    /// nodes that have no such table. That mirrors
-    /// `ClaimBook::solana_signer`'s own "unconfigured means no claim"
-    /// contract at the transport's edge of it: a claim this connector never
-    /// had a Solana identity to sign never had one to render either.
-    solana_signer_public_key: Option<[u8; 32]>,
-    clock: Arc<dyn Clock>,
     /// Peer id → that peering's relation and its claim-exchange state.
     ///
     /// Copy-on-write behind an [`ArcSwap`] since ADR 0058: a peering
@@ -234,33 +158,17 @@ pub struct BtpPeerTransport {
     ///
     /// Each entry is an [`Arc`] so a forward already in flight keeps the
     /// state it started on even if the peering is deregistered underneath
-    /// it -- the alternative is a claim's pending set vanishing mid-request.
+    /// it.
     relations: ArcSwap<HashMap<String, Arc<RelationState>>>,
 }
 
 impl BtpPeerTransport {
     #[must_use]
-    pub fn new(
-        dialer: Arc<dyn PeerDialer>,
-        signer_address: [u8; 20],
-        clock: Arc<dyn Clock>,
-    ) -> Self {
+    pub fn new(dialer: Arc<dyn PeerDialer>) -> Self {
         BtpPeerTransport {
             dialer,
-            signer_address,
-            solana_signer_public_key: None,
-            clock,
             relations: ArcSwap::from_pointee(HashMap::new()),
         }
-    }
-
-    /// Configure this connector's own ed25519 identity for rendering an
-    /// outbound Solana peer claim (issue #742) -- the Solana counterpart
-    /// of the `signer_address` [`Self::new`] takes for EVM. Call before any
-    /// packet reaches this transport; nothing here re-renders a claim
-    /// already cached in [`Pending`].
-    pub fn set_solana_signer_public_key(&mut self, public_key: [u8; 32]) {
-        self.solana_signer_public_key = Some(public_key);
     }
 
     /// Register a peering this connector dials over `wss://`, replacing
@@ -276,7 +184,6 @@ impl BtpPeerTransport {
                 Arc::new(RelationState {
                     relation,
                     session: tokio::sync::Mutex::new(None),
-                    pending: Mutex::new(Pending::default()),
                 }),
             );
         });
@@ -309,10 +216,10 @@ impl BtpPeerTransport {
         self.relations.load().get(peer_id).cloned()
     }
 
-    /// Every `wss://` peering in a loaded config, with its channels.
-    pub fn add_peers_from_config(&self, peers: &[PeerConfig], channels: &[PeerChannelConfig]) {
+    /// Every `wss://` peering in a loaded config.
+    pub fn add_peers_from_config(&self, peers: &[PeerConfig]) {
         for peer in peers {
-            if let Some(relation) = PeerRelation::from_config(peer, channels) {
+            if let Some(relation) = PeerRelation::from_config(peer) {
                 self.add_peer(relation);
             }
         }
@@ -369,18 +276,15 @@ impl BtpPeerTransport {
     /// redialling and sending **once** more if the session turns out to
     /// have died under the send.
     ///
-    /// `None` is "no answer": the caller turns that into `T01` for a packet
-    /// and into `NotSent` for a flush.
+    /// `None` is "no answer": the caller turns that into `T01`.
     ///
     /// The retry is deliberately narrow. [`OriginateError::SessionGone`] is
     /// raised by the writer channel refusing the frame, so the frame was
     /// **never written** -- sending it again on a fresh session is the same
     /// packet reaching the peer once, not a second packet. A *timeout* is
     /// the opposite case: the frame is on the wire and the peer may be
-    /// acting on it, so that one is never retried, only reported. A claim
-    /// riding the retry is byte-identical to the one that did not go, since
-    /// nothing acknowledged it and [`Self::claim_entry`] serves it from
-    /// §6.3's cache.
+    /// acting on it, so that one is never retried, only reported. A voucher
+    /// riding the retry is the one that did not go, byte for byte.
     async fn answered<F, Fut>(
         &self,
         state: &RelationState,
@@ -410,7 +314,7 @@ impl BtpPeerTransport {
                         "peer session was gone under a send; redialling and sending once more"
                     );
                 }
-                // §6.3 on expiry: nothing here decides the claim rode or
+                // §6.3 on expiry: nothing here decides the voucher rode or
                 // did not -- the caller does. Forgetting the session is
                 // what stops the next frame being written into a socket
                 // nobody reads.
@@ -427,58 +331,6 @@ impl BtpPeerTransport {
     /// one rather than writing into a socket nobody reads.
     async fn drop_session(&self, state: &RelationState) {
         *state.session.lock().await = None;
-    }
-
-    /// The claim entry for `claim`, reusing the exact bytes already
-    /// emitted for it if this is a retransmission (§6.3).
-    fn claim_entry(&self, state: &RelationState, claim: &WireClaim) -> ProtocolData {
-        let channel_id = claim_json::canonical_evm_channel_id(&claim.channel_id);
-        let mut pending = state.pending.lock().expect("pending claims lock poisoned");
-        if let Some((emitted, json)) = pending.emitted.get(&channel_id) {
-            if emitted == claim {
-                return claim_json::protocol_data(json);
-            }
-        }
-        // A channel with no `[[peer_channels]]` row here rides without a
-        // domain: the fields are optional, and a *zero* domain would be a
-        // structurally invalid claim the peer could not even read a verdict
-        // out of. Omitted, the peer judges it against its own record and
-        // answers `unknown_channel`, which is the right answer to a channel
-        // neither end has bound.
-        let domain = state.relation.domains.get(&channel_id).copied();
-        // Unlike `domain`, a Solana channel with no matching row has no
-        // "ride without it" fallback -- `programId` is a required wire
-        // field (`encode`'s own doc), so a Solana claim reaching here for
-        // an unconfigured channel is a caller bug `encode` panics on,
-        // exactly as it does for a missing signing identity.
-        let solana_program_id = state.relation.solana_program_ids.get(&channel_id);
-        let json = claim_json::encode(
-            claim,
-            &self.signer_address,
-            self.solana_signer_public_key.as_ref(),
-            solana_program_id.map(String::as_str),
-            domain,
-            &format!("{channel_id}:{}", claim.nonce),
-            &self
-                .clock
-                .now()
-                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                .to_string(),
-        );
-        let entry = claim_json::protocol_data(&json);
-        pending.emitted.insert(channel_id, (claim.clone(), json));
-        entry
-    }
-
-    /// An acknowledged claim is no longer pending, so the next claim on
-    /// that channel is rendered fresh rather than retransmitted.
-    fn claim_acknowledged(&self, state: &RelationState, claim: &WireClaim) {
-        state
-            .pending
-            .lock()
-            .expect("pending claims lock poisoned")
-            .emitted
-            .remove(&claim_json::canonical_evm_channel_id(&claim.channel_id));
     }
 }
 
@@ -608,21 +460,16 @@ impl PeerTransport for BtpPeerTransport {
         };
         let state = state.as_ref();
 
-        // A `toon-channel` claim is rendered here, and cached for §6.3's
-        // byte-identical retransmission. A voucher arrives rendered, and
-        // rides the same slot verbatim: a voucher's freshness is its amount,
-        // so a resend is recognised by its signature rather than its bytes
-        // (ADR 0074 decision 3). A challenge rides a slot of its own
-        // (§1.4), because it is not a claim.
+        // A voucher arrives rendered and rides the claim slot verbatim: a
+        // voucher's freshness is its amount, so a resend is recognised by
+        // its signature rather than its bytes (ADR 0074 decision 3). A
+        // challenge rides a slot of its own (§1.4), because it is not a
+        // claim.
         let mut entries = Vec::new();
-        let (claim, voucher) = match covering {
-            Some(Covering::Claim(claim)) => {
-                entries.push(self.claim_entry(state, &claim));
-                (Some(claim), false)
-            }
+        let voucher = match covering {
             Some(Covering::Voucher(json)) => {
                 entries.push(claim_json::protocol_data(&json));
-                (None, true)
+                true
             }
             Some(Covering::Challenge(json)) => {
                 entries.push(ProtocolData {
@@ -630,9 +477,9 @@ impl PeerTransport for BtpPeerTransport {
                     content_type: CONTENT_TYPE_TEXT,
                     data: json.into_bytes(),
                 });
-                (None, false)
+                false
             }
-            None => (None, false),
+            None => false,
         };
         // §8.1: `data` rides byte-for-byte unchanged. `Prepare::encode` is
         // the same OER encoding every other carriage puts on a wire, and
@@ -663,11 +510,14 @@ impl PeerTransport for BtpPeerTransport {
             return unreachable_at(peer_id, &state.relation.endpoint);
         }
 
+        // §6.1/§6.2: the ack answers the voucher, independently of whatever
+        // the `ilpPacket` said about the packet. Absence and malformation
+        // both mean not acknowledged, and an ack on a response to a frame
+        // that carried no voucher is ignored.
         let ack = if voucher {
-            // §6.1: a voucher's verdict rides back exactly as a claim's.
             ack::from_protocol_data(&frame.protocol_data).unwrap_or(ClaimAckOutcome::NotSent)
         } else {
-            self.read_ack(state, claim.as_ref(), &frame)
+            ClaimAckOutcome::NotSent
         };
         match decode_answer(&frame) {
             // The terms are read and REPORTED here, not acted on: turning a
@@ -707,60 +557,6 @@ impl PeerTransport for BtpPeerTransport {
                 PeerForward::undecodable(peer_id, ack)
             }
         }
-    }
-
-    async fn flush(&self, peer_id: &str, claim: WireClaim) -> ClaimAckOutcome {
-        let Some(state) = self.relation(peer_id) else {
-            return ClaimAckOutcome::NotSent;
-        };
-        let state = state.as_ref();
-
-        // FLUSH (§3): a **TRANSFER (type 7)** whose `amount` is the
-        // claim's new cumulative, carrying the claim in
-        // `payment-channel-claim` and **no `ilpPacket`**.
-        let entries = [self.claim_entry(state, &claim)];
-        let (entries, cumulative) = (&entries, claim.cumulative_amount);
-        let answered = self
-            .answered(
-                state,
-                state.relation.claim_ack_timeout,
-                move |handle| async move { handle.send_transfer(cumulative, entries).await },
-            )
-            .await;
-
-        // §6.3 on expiry: the claim is **not acknowledged**. The peering is
-        // not torn down, no new claim is minted at a higher nonce for the
-        // same cumulative, and the packet's value stays in this connector's
-        // owed projection.
-        let Some(frame) = answered else {
-            return ClaimAckOutcome::NotSent;
-        };
-        if frame.frame_type == BTP_ERROR {
-            return ClaimAckOutcome::NotSent;
-        }
-        self.read_ack(state, Some(&claim), &frame)
-    }
-}
-
-impl BtpPeerTransport {
-    /// §6.2/§6.3: the ack answers the claim, independently of whatever the
-    /// `ilpPacket` said about the packet. **Absence and malformation both
-    /// mean not acknowledged**, and an ack on a response answering a frame
-    /// that carried no claim is ignored.
-    fn read_ack(
-        &self,
-        state: &RelationState,
-        claim: Option<&WireClaim>,
-        frame: &BtpFrame,
-    ) -> ClaimAckOutcome {
-        let Some(claim) = claim else {
-            return ClaimAckOutcome::NotSent;
-        };
-        let ack = ack::from_protocol_data(&frame.protocol_data).unwrap_or(ClaimAckOutcome::NotSent);
-        if ack == ClaimAckOutcome::Accepted {
-            self.claim_acknowledged(state, claim);
-        }
-        ack
     }
 }
 

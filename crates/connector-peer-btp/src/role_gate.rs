@@ -8,26 +8,26 @@
 //! over the other, and a rule written twice is a rule that drifts.
 //!
 //! What lives here is only the **join**. §1.2's rule itself is
-//! [`connector_peer_auth::decide_role`]'s and
-//! [`connector_peer_auth::decide_voucher_role`]'s, which see a verdict and
+//! [`connector_peer_auth::decide_voucher_role`]'s, which sees a verdict and
 //! the binding it resolves to and nothing else (§1.3). This is the bridge
-//! between them and the two places a verdict comes from, and it exists so
-//! neither side has to grow a dependency on the other.
+//! between it and the place a verdict comes from, and it exists so neither
+//! side has to grow a dependency on the other.
 //!
-//! # Two proofs, until #1380
+//! # One proof
 //!
 //! ADR 0075 decision 5 makes the peer role's proof **a voucher on an x402
 //! channel bound to that peer**, or -- for a packet that moves no value --
 //! **the voucher claim-state challenge** signed by such a channel's voucher
 //! signer. Both are resolved by the receiving half ([`VoucherEvidence`]):
 //! the channel is found and its signer read from the chain, never from the
-//! evidence, and that signer is looked up in this node's runtime bindings
-//! ([`Connector::voucher_signer_peer`]).
+//! evidence, and that signer is looked up in this node's bindings
+//! ([`Connector::voucher_signer_peer_on`]) -- the key a runtime peering's
+//! self-description published, or the one a `[[peer_channels]]` row names.
 //!
-//! The `toon-channel` claim still proves the peer role too, verified against
-//! the counterparty key `[[peer_channels]]` configures
-//! ([`connector_runtime::ClaimBook`]): config-declared peerings still prove
-//! themselves that way, and #1380 deletes it once the last one has moved.
+//! **A `toon-channel` claim never decides the role** (#1380). It is still
+//! read off the claim slot -- a client may still pay with one until #1384 --
+//! but a frame carrying one is a client frame on either carriage, whatever
+//! its signature does.
 //!
 //! # Judging a peer's voucher (ADR 0075 decision 6, issue #1378)
 //!
@@ -45,10 +45,9 @@ use connector_domain::client_claim::ClientClaim;
 use connector_domain::{Watermark, VOUCHER_WATERMARK_NONCE};
 use connector_peer_auth::SessionRole;
 use connector_peer_auth::{
-    decide_role, decide_voucher_role, ClaimVerification, PeerAuthPolicy, PresentedClaim,
-    PresentedVoucher, RoleDecision, VoucherVerification,
+    decide_voucher_role, PresentedVoucher, RoleDecision, VoucherVerification,
 };
-use connector_runtime::{ClaimAckOutcome, ClaimRejectReason, Connector, VoucherSigner, WireClaim};
+use connector_runtime::{ClaimAckOutcome, Connector, VoucherSigner};
 
 use crate::challenge_json::PeerRoleChallenge;
 use crate::claim_json::PresentedPeerClaim;
@@ -169,7 +168,8 @@ pub async fn judge_voucher(
 /// refused, never resolved), so at most one of the two decides.
 #[derive(Debug, Clone, Default)]
 pub struct FrameEvidence {
-    /// The claim slot, decoded: a `toon-channel` claim or a voucher.
+    /// The claim slot, decoded: a voucher, or a `toon-channel` claim that
+    /// proves nothing about the role.
     pub claim: Option<PresentedPeerClaim>,
     /// The `peer-role-challenge` slot, decoded.
     pub challenge: Option<PeerRoleChallenge>,
@@ -187,17 +187,6 @@ impl FrameEvidence {
         match &self.claim {
             Some(PresentedPeerClaim::Voucher(voucher)) => Some(voucher),
             Some(PresentedPeerClaim::Channel(_)) | None => None,
-        }
-    }
-
-    /// The `toon-channel` claim, if that is what the claim slot held: the
-    /// one kind of evidence `ClaimBook` judges below the role. A voucher is
-    /// judged by the receiving half instead ([`judge_voucher`]).
-    #[must_use]
-    pub fn into_channel_claim(self) -> Option<WireClaim> {
-        match self.claim {
-            Some(PresentedPeerClaim::Channel(claim)) => Some(claim),
-            Some(PresentedPeerClaim::Voucher(_)) | None => None,
         }
     }
 }
@@ -291,43 +280,10 @@ pub fn decode_claim(raw: &[u8]) -> Option<PresentedPeerClaim> {
         .ok()
 }
 
-/// The role of one frame, from the `toon-channel` claim that frame carries.
-///
-/// `claim` is `None` for a frame carrying none, which is a client frame:
-/// under owner decision #868 a peer PREPARE with no covering claim is not
-/// admitted at all, so there is no claimless peer frame for anything else
-/// to carry the role on.
-///
-/// **Nothing is accepted, advanced or journaled here.** The claim is
-/// verified against this node's own record of its channel and no more;
-/// judging it — the watermark, the ledger, the ack — is
-/// `Connector::handle_peer_claim`'s, downstream of the role, exactly as
-/// §1.5 requires ("role MUST still be fixed before the packet is routed,
-/// before a fee is taken … and before any watermark is advanced or anything
-/// is journaled").
-#[must_use]
-pub fn decide(
-    connector: &Connector,
-    policy: &PeerAuthPolicy,
-    claim: Option<&WireClaim>,
-) -> RoleDecision {
-    let presented = claim.map(|claim| {
-        let verification = match connector.verify_peer_claim(claim) {
-            Ok(()) => ClaimVerification::Verified,
-            Err(ClaimRejectReason::UnknownChannel) => ClaimVerification::UnknownChannel,
-            // `verify_signature` answers only those two, and a third would
-            // be a signature this node could not vouch for either way --
-            // which is `SignatureInvalid`'s meaning, not `Verified`'s.
-            Err(_) => ClaimVerification::SignatureInvalid,
-        };
-        PresentedClaim::new(&claim.channel_id, verification)
-    });
-    decide_role(presented, policy)
-}
-
 /// The role of one frame, from everything it presents (§1.2 as amended by
-/// ADR 0075 decision 5): a `toon-channel` claim, a voucher, or -- for a
-/// packet that moves no value -- a peer-role challenge.
+/// ADR 0075 decision 5): a voucher, or -- for a packet that moves no value --
+/// a peer-role challenge. A `toon-channel` claim presents nothing and the
+/// frame is a client's (#1380).
 ///
 /// `vouchers` is `None` on a carriage built without the receiving half, on
 /// which a voucher or a challenge proves nothing and the frame is a client's.
@@ -339,32 +295,53 @@ pub fn decide(
 /// Nothing is admitted, advanced or journaled here, on any branch.
 pub async fn decide_frame(
     connector: &Connector,
-    policy: &PeerAuthPolicy,
     vouchers: Option<&dyn VoucherEvidence>,
     evidence: &FrameEvidence,
 ) -> RoleDecision {
     let vouchers = vouchers.filter(|_| connector.has_voucher_bindings());
     match &evidence.claim {
-        Some(PresentedPeerClaim::Channel(claim)) => decide(connector, policy, Some(claim)),
+        // A `toon-channel` claim proves nothing (ADR 0075, #1380): it is a
+        // client's to pay with until #1384, and the frame is a client frame
+        // whatever its signature does. Not an event either -- §1.6's is owed
+        // to an assertion of a configured peering, and no peering is
+        // configured by a TOON channel any more.
+        Some(PresentedPeerClaim::Channel(_)) => decide_voucher_role(None),
         Some(PresentedPeerClaim::Voucher(voucher)) => {
             let Some(vouchers) = vouchers else {
                 return decide_voucher_role(None);
             };
             let check = vouchers.check_voucher(voucher).await;
-            decide_voucher_role(presented(connector, check, true).as_ref().map(as_presented))
+            decide_voucher_role(
+                presented(connector, check, &voucher_channel(voucher), true)
+                    .as_ref()
+                    .map(as_presented),
+            )
         }
         None => match (&evidence.challenge, vouchers) {
             (Some(challenge), Some(vouchers)) if evidence.moves_no_value => {
                 let check = vouchers.check_challenge(challenge).await;
                 let in_window = challenge_in_window(challenge.expires(), connector.now_unix());
                 decide_voucher_role(
-                    presented(connector, check, in_window)
+                    presented(connector, check, &challenge.channel(), in_window)
                         .as_ref()
                         .map(as_presented),
                 )
             }
-            _ => decide(connector, policy, None),
+            _ => decide_voucher_role(None),
         },
+    }
+}
+
+/// The channel a voucher names, in the spelling a `[[peer_channels]]`
+/// row's `inbound_channel` is canonicalized to: an EVM channel id as
+/// lower-case `0x` hex, a Solana channel account in base58 as written.
+fn voucher_channel(voucher: &ClientClaim) -> String {
+    match voucher {
+        ClientClaim::EvmVoucher(voucher) => voucher.channel_id.to_ascii_lowercase(),
+        ClientClaim::SolanaVoucher(voucher) => voucher.channel_id.clone(),
+        // Not a voucher: `PresentedPeerClaim::Voucher` holds only the two
+        // above, so no channel here could be bound.
+        ClientClaim::Evm(_) | ClientClaim::Solana(_) => String::new(),
     }
 }
 
@@ -398,11 +375,12 @@ pub fn challenge_in_window(expires: u64, now: u64) -> bool {
     expires > now && expires - now <= MAX_PEER_CHALLENGE_LIFETIME_SECS
 }
 
-/// A check, as the peering its signer is bound to and a verdict. `None` for
-/// a channel the receiving half could not resolve.
+/// A check, as the peering its signer is bound to on `channel` and a
+/// verdict. `None` for a channel the receiving half could not resolve.
 fn presented(
     connector: &Connector,
     check: VoucherCheck,
+    channel: &str,
     in_window: bool,
 ) -> Option<(Option<String>, VoucherVerification)> {
     let (signer, verification) = match check {
@@ -411,7 +389,10 @@ fn presented(
         VoucherCheck::SignatureInvalid(signer) => (signer, VoucherVerification::SignatureInvalid),
         VoucherCheck::Unresolved => return None,
     };
-    Some((connector.voucher_signer_peer(&signer), verification))
+    Some((
+        connector.voucher_signer_peer_on(&signer, channel),
+        verification,
+    ))
 }
 
 fn as_presented(

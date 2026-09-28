@@ -1250,9 +1250,6 @@ dependencies = [
 [[package]]
 name = "connector-peer-auth"
 version = "0.1.0"
-dependencies = [
- "connector-config",
-]
 
 [[package]]
 name = "connector-peer-btp"
@@ -1269,7 +1266,6 @@ dependencies = [
  "connector-peer-auth",
  "connector-runtime",
  "connector-signer",
- "ed25519-dalek",
  "futures-util",
  "hex",
  "libsecp256k1",

@@ -1,9 +1,9 @@
 //! Verifying a payment claim's own cryptographic signature -- for the
 //! client edge, the last, deliberately most expensive stage of the claim
-//! gate (`docs/protocol/client-edge-spec.md` §1.3 step 4, issue #506); for
-//! the peer semantics, the whole of `ClaimBook::accept_inbound`'s crypto check
-//! (issue #575, ADR 0024). Both are signed by the counterparty's own key,
-//! in that chain's native scheme, over a chain-specific balance proof this
+//! gate (`docs/protocol/client-edge-spec.md` §1.3 step 4, issue #506). It
+//! was also the peer semantics' crypto check (issue #575, ADR 0024) until
+//! ADR 0075 moved peers onto vouchers (issue #1380). A claim is signed by
+//! the counterparty's own key, in that chain's native scheme, over a chain-specific balance proof this
 //! module reconstructs independently -- distinct from [`crate::verify`],
 //! the `Signer` contract suite's own "a signature recovers to its signer's
 //! own public key" check, which no claim-verification path calls.

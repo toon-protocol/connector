@@ -52,12 +52,9 @@
 //! signature over a domain-separated challenge, distinct from a real
 //! claim's signature. Also purely a read against existing state
 //! ([`ClientClaimGate::watermark`], [`ClientClaimGate::channels`],
-//! [`ClientClaimGate::last_claim_time`] -- plus, for a channel this node
-//! holds as a `[[peer_channels]]` row,
-//! [`connector_runtime::Connector::peer_channel_watermark`], because that
-//! is the book judging claims on it, issue #1102); it never calls
-//! `ingest`/`admit`,
-//! so it adds nothing to the packet admission path #686/#688/#690 spent
+//! [`ClientClaimGate::last_claim_time`] -- the one book since ADR 0075
+//! moved every peering onto x402 vouchers, #1380); it never calls
+//! `ingest`/`admit`, so it adds nothing to the packet admission path #686/#688/#690 spent
 //! this edge's history keeping cheap.
 
 use std::num::NonZeroU32;
@@ -363,7 +360,7 @@ pub fn router_with_gate_terms_and_btp_window(
 /// this node's own listeners"*). A peer PREPARE is the same OER encoding
 /// `POST /ilp` already carries (`peer-carriage-spec.md` §3.1), and what
 /// tells a peer interaction from a client one is
-/// [`connector_peer_auth::decide_role`] -- never the carriage, the
+/// [`connector_peer_auth::decide_voucher_role`] -- never the carriage, the
 /// listener, the port or the bind address (§1.3).
 #[allow(clippy::too_many_arguments)]
 pub fn router_with_peer_carriages(
@@ -1609,70 +1606,13 @@ mod tests {
         }
     }
 
-    /// A fixed EIP-712 domain for this module's one peer claim test
-    /// (issue #575/#566) -- an arbitrary but consistent chain id and
-    /// `TokenNetwork` address.
-    pub(crate) fn test_channel_domain() -> connector_runtime::ChannelDomain {
-        connector_runtime::ChannelDomain {
-            chain_id: 84_532,
-            token_network_address: [0x1E; 20],
-        }
-    }
-
-    /// A valid on-chain `bytes32` peer channel id for tests (issue
-    /// #575's AC4).
-    pub(crate) fn channel_a() -> String {
-        format!("0x{:064x}", 1)
-    }
-
-    /// A next hop reporting where this node's claims on a channel stand --
-    /// the authority every covering claim is priced off (see
-    /// `connector_runtime::outbound_client`'s header). A fake upholding the
-    /// port's contract rather than a stub with expectations (ADR 0007).
-    struct ReportsAWatermark;
-
-    #[async_trait::async_trait]
-    impl connector_runtime::ClaimStateSource for ReportsAWatermark {
-        async fn watermark(
-            &self,
-            _channel: &[u8; 32],
-            _domain: &connector_runtime::ClaimStateDomain,
-        ) -> Result<connector_runtime::ClaimWatermark, connector_runtime::OutboundClientError>
-        {
-            Ok(connector_runtime::ClaimWatermark {
-                nonce: 0,
-                cumulative: 0,
-                available: Some(u128::MAX),
-            })
-        }
-    }
-
-    /// Give `connector` the `[[pay_channels]]` half of a peering: ADR 0042
-    /// requires a connector to cover every PREPARE it sends, so since issue
-    /// #1145 a forward to a hop with no channel to pay it from is refused
-    /// outright rather than carried on ADR 0004's postpay convention. Every
-    /// test here that forwards to a peer needs this, and a fixture without
-    /// it is one no configuration could produce
-    /// (`ConfigError::PayChannelUnbound`).
+    /// Give `connector` a channel to pay `peer_id` on (ADR 0042, ADR 0075
+    /// decision 6): since issue #1145 a forward to a hop with nothing to pay
+    /// it on is refused outright, so every test here that forwards to a peer
+    /// needs this, and a fixture without it is one no configuration could
+    /// produce (`ConfigError::PayChannelUnbound`).
     pub(crate) fn covering(connector: Connector, peer_id: &str) -> Connector {
-        connector
-            // The settlement key the covering claim is signed with. A test
-            // that cares which key that is calls `with_signer` again after
-            // this, which is the same setter.
-            .with_signer(Arc::new(LocalSigner::generate("covering-settlement")))
-            .with_outbound_client_ledger(Arc::new(
-                connector_runtime::OutboundClientLedger::in_memory(),
-            ))
-            .with_outbound_client_hop(
-                peer_id,
-                channel_a(),
-                connector_runtime::EvmDomain {
-                    chain_id: test_channel_domain().chain_id,
-                    token_network: test_channel_domain().token_network_address,
-                },
-                Arc::new(ReportsAWatermark),
-            )
-            .expect("channel_a() is a valid on-chain channel id")
+        connector_runtime::covering_fake::covering(connector, peer_id)
     }
 
     fn test_signer() -> Arc<dyn Signer> {
@@ -1975,17 +1915,12 @@ mod tests {
     /// exactly like a real client -- observes the discounted amount.
     #[tokio::test]
     async fn a_client_packet_forwarded_to_a_peer_is_charged_that_relations_flat_fee() {
-        use connector_signer::{LocalSigner, Signer};
-
         let second_hop_route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
         let second_hop_app_client = Arc::new(FakeAppClient::new());
         second_hop_app_client.respond(
             second_hop_route.handler_url(),
             answered(b"delivered by the second connector"),
         );
-        let payer_signer = LocalSigner::generate("payer-claim-key");
-        let payer_address =
-            connector_signer::derive_evm_address(&payer_signer.public_key().unwrap());
         let second_hop_identity = test_signer();
         let second_hop = Arc::new(
             Connector::new(
@@ -1995,33 +1930,25 @@ mod tests {
                 Arc::new(InProcessPeerTransport::new()),
                 test_clock(),
             )
-            .with_channel_verification_key(channel_a(), payer_address)
-            .with_channel_domain(channel_a(), test_channel_domain())
-            .unwrap()
             .with_identity_signer(second_hop_identity.clone()),
         );
-        let second_hop_claims = Arc::clone(&second_hop);
-        let mut peer_transport = InProcessPeerTransport::new();
-        peer_transport.add_peer("second-hop", second_hop);
-        let first_hop = Arc::new(
-            covering(
-                Connector::new(
-                    vec![],
-                    vec![PeerRoute::new("g.example.app", "second-hop")],
-                    Arc::new(FakeAppClient::new()),
-                    Arc::new(peer_transport),
-                    test_clock(),
-                )
-                .with_peer_fees([("second-hop".to_string(), 3)])
-                .with_channel_domain(channel_a(), test_channel_domain())
-                .unwrap(),
-                "second-hop",
+        let mut in_process = InProcessPeerTransport::new();
+        in_process.add_peer("second-hop", second_hop);
+        let wire = Arc::new(RecordsCoverings {
+            inner: in_process,
+            covered: std::sync::Mutex::new(Vec::new()),
+        });
+        let first_hop = Arc::new(covering(
+            Connector::new(
+                vec![],
+                vec![PeerRoute::new("g.example.app", "second-hop")],
+                Arc::new(FakeAppClient::new()),
+                Arc::clone(&wire) as Arc<dyn connector_runtime::PeerTransport>,
+                test_clock(),
             )
-            // After `covering`, so this is the key the covering claim is
-            // actually signed with -- and therefore the one the second hop
-            // has registered as its counterparty.
-            .with_signer(Arc::new(payer_signer)),
-        );
+            .with_peer_fees([("second-hop".to_string(), 3)]),
+            "second-hop",
+        ));
         let (prepare, _shared_secret) = sealed_sample_prepare_with_amount(
             "g.example.app",
             50,
@@ -2041,16 +1968,38 @@ mod tests {
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         Fulfill::decode(&bytes).expect("decode fulfill");
         // The port never sees a `Prepare` (issue #521), so the forwarded
-        // amount is asserted through the covering claim that rode it --
-        // 50 minus this peer relationship's flat fee of 3. Read off the
-        // SECOND hop, which verified and watermarked it: since issue #1145
-        // the claim is minted before the packet is sent and its watermark
-        // authority is the receiver, so the payer's own peer book records
-        // nothing at all.
-        assert!(first_hop.claims().is_empty());
-        let accepted = second_hop_claims.claims();
-        assert_eq!(accepted.len(), 1);
-        assert_eq!(accepted[0].cumulative_amount, 47);
+        // amount is asserted through the covering voucher that rode it -- 50
+        // minus this peer relationship's flat fee of 3 (ADR 0042, ADR 0075
+        // decision 6).
+        let covered = wire.covered.lock().unwrap().clone();
+        assert_eq!(covered.len(), 1);
+        assert_eq!(
+            connector_runtime::covering_fake::voucher_amount(&covered[0]),
+            47
+        );
+    }
+
+    /// The wire between two in-process hops, remembering what covered each
+    /// forward -- a fake that answers exactly as the in-process transport
+    /// under it does and asserts nothing about being called (ADR 0007).
+    struct RecordsCoverings {
+        inner: InProcessPeerTransport,
+        covered: std::sync::Mutex<Vec<connector_runtime::Covering>>,
+    }
+
+    #[async_trait::async_trait]
+    impl connector_runtime::PeerTransport for RecordsCoverings {
+        async fn forward(
+            &self,
+            peer_id: &str,
+            prepare: Prepare,
+            covering: Option<connector_runtime::Covering>,
+        ) -> connector_runtime::PeerForward {
+            if let Some(covering) = &covering {
+                self.covered.lock().unwrap().push(covering.clone());
+            }
+            self.inner.forward(peer_id, prepare, covering).await
+        }
     }
 
     /// A packet forwarded to a second connector that has no route for it is

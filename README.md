@@ -677,17 +677,20 @@ price a paid request would be charged.
 it takes the carriage away with the row, so it is immediate and needs no restart.
 A peering still referenced by a runtime route is refused until the route goes.
 
-> A peering committed to a **config file** is the same object, recorded
-> differently: it needs `[[peers]]`, `[[peer_channels]]` and — for a peering you
-> forward to — `[[pay_channels]]`, with the channel id and the counterparty's
-> settlement address derived by hand beforehand. `local/two-hop/` is a worked pair
-> of those files. Config always wins a collision: it refuses the runtime write
-> outright rather than shadowing it.
+> A peering committed to a **config file** is the same two channels, recorded
+> differently: `[[peers]]`; a `[[peer_channels]]` row naming the key the peer
+> signs its vouchers with (its settlement address on EVM, its settlement key on
+> Solana), which binds its channel toward you at boot; and — for a peering you
+> forward to — a `[[pay_channels]]` row naming the outbound x402 channel you
+> opened toward it beforehand with `POST /channels`, and its client edge's URL.
+> Config always wins a collision: it refuses the runtime write outright rather
+> than shadowing it.
 >
-> It also changes what the far side sends back. Only a node whose **own** config
-> declares those tables mounts a peer carriage, so a runtime peering is answered
-> by the counterparty's ordinary client edge — which is why the refusals quoted
-> below are `402` and `F03` rather than the peer carriage's `F06`
+> What the far side sends back depends on whether it has bound **your** key. Until
+> it has — by its own `POST /peers` naming your URL, or a `[[peer_channels]]` row
+> naming your signer — your packets reach its ordinary client edge, which is why
+> the refusal quoted above is `F03` (and a packet with no claim a `402`) rather
+> than the peer carriage's `F06`
 > ([`peer-carriage-spec.md`](docs/protocol/peer-carriage-spec.md) §3.1).
 
 ### Try it locally: two connectors, one packet, one chain

@@ -43,7 +43,7 @@ use connector_domain::{PacketResponse, Prepare};
 use connector_peer_http::{
     Headers, HttpPeerTransport, PeerHttpClient, PeerRelation, PeerRequest, ReqwestPeerClient,
 };
-use connector_runtime::{PeerForward, PeerTransport, Socks5TestServer, SystemClock};
+use connector_runtime::{PeerForward, PeerTransport, Socks5TestServer};
 
 /// A v3 onion address's shape -- 56 base32 characters -- so the host under
 /// test is one an operator could actually have copied out of a
@@ -373,17 +373,10 @@ async fn an_onion_peer_with_no_proxy_is_answered_t01_naming_the_peer_and_the_end
 
     // `ReqwestPeerClient::default()` is exactly what `build_peer_transport`
     // constructs for a node whose `socks_proxy` is `None`.
-    let transport = HttpPeerTransport::new(
-        Arc::new(ReqwestPeerClient::default()),
-        [0u8; 20],
-        Arc::new(SystemClock),
-    );
+    let transport = HttpPeerTransport::new(Arc::new(ReqwestPeerClient::default()));
     transport.add_peer(PeerRelation::new(
         peer.id(),
         endpoint.clone(),
-        HashMap::new(),
-        HashMap::new(),
-        Duration::from_secs(2),
         Duration::from_secs(2),
     ));
 
@@ -458,16 +451,17 @@ decimals = 6
 [settlement.evm.key]
 key_file = "{key_file}"
 
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+
 [[peers]]
 id = "onion-peer"
 endpoint = "http://{ONION_HOST}/ilp"
 
 [[peer_channels]]
 peer_id = "onion-peer"
-channel_id = "0x1111111111111111111111111111111111111111111111111111111111111111"
-counterparty_key = "0x2222222222222222222222222222222222222222"
-chain_id = 31337
-token_network = "0x3333333333333333333333333333333333333333"
+voucher_signer = "0x2222222222222222222222222222222222222222"
 "#,
         state_dir = state_dir.path().display(),
         key_file = key_file.path().display(),

@@ -212,9 +212,10 @@ write_keys = ["REPLACE-WITH-A-64-HEX-CHARACTER-ED25519-PUBLIC-KEY-SEE-README-STE
 # There is NO peer port. A node that exposes a carriage serves it on the
 # paths its client edge already serves, on `client_edge_addr`:
 # BTP on `GET /ilp/btp`, ILP-over-HTTP on `POST /ilp`. Role is decided by a
-# verified claim signature on a configured `[[peer_channels]]` row, never by
-# the listener and never by a shared secret (ADR 0060) -- so there is
-# nothing extra to open and nothing extra to firewall.
+# verified x402 voucher (or a zero-value claim-state challenge) whose signer
+# a `[[peer_channels]]` row names, never by the listener and never by a
+# shared secret (ADR 0060, ADR 0075) -- so there is nothing extra to open and
+# nothing extra to firewall.
 #
 # NOTE: uncommenting this block gives you a live peering as of issue #678 --
 # the dial side is built from these lines and the accept side rides the
@@ -234,7 +235,7 @@ write_keys = ["REPLACE-WITH-A-64-HEX-CHARACTER-ED25519-PUBLIC-KEY-SEE-README-STE
 # # [[peer_channels]] and [[pay_channels]] rows below. Nothing puts it on
 # # the wire and the counterparty's file need not spell it the same way --
 # # the accepting side reads the peer id off the [[peer_channels]] row the
-# # claim's channel resolves to, never off the interaction (ADR 0060).
+# # voucher's signer resolves to, never off the interaction (ADR 0060).
 # id = "store"
 #
 # # The URL this node dials to reach the peer. The SCHEME selects the
@@ -267,9 +268,9 @@ write_keys = ["REPLACE-WITH-A-64-HEX-CHARACTER-ED25519-PUBLIC-KEY-SEE-README-STE
 # # today -- no devnet box charges a fee at all.
 # fee = 3
 #
-# # How long this node waits for a claim's acknowledgement and for an
-# # answer. Both default to 30000 ms each.
-# claim_ack_timeout_ms = 30000
+# # How long this node waits for the peer's answer to a packet, and for
+# # its `POST /ilp/claim-state` answer when covering a forward. Defaults to
+# # 30000 ms.
 # peer_answer_timeout_ms = 30000
 #
 # # `claim_enforcement` used to be set here -- issue #883's migration ramp
@@ -292,43 +293,38 @@ write_keys = ["REPLACE-WITH-A-64-HEX-CHARACTER-ED25519-PUBLIC-KEY-SEE-README-STE
 # # A mistyped value is a named load-time error, not a silent default.
 # # forwarded_claim_enforcement = "enforce"
 #
-# # Every peering needs at least one channel binding, or it can never take
-# # the peer role at all: the role rule needs BOTH this channel binding and
-# # a claim signature that verifies against it (ADR 0060). This is the
-# # table whose absence left ADR 0024's peer-claim verification wired to
-# # nothing (issue #620).
+# # Every peering needs a voucher signer, or it can never take the peer
+# # role at all: an arrival is this peer when it carries an x402 voucher --
+# # or answers a zero-value claim-state challenge -- signed by the key named
+# # here (ADR 0060, ADR 0075). Peerings made at runtime (`POST /peers`) are
+# # admitted by the key the peer publishes instead; this row is the durable
+# # alternative for a peer whose key this node already knows.
 # #
-# # A channel id here must NOT also appear in [[client_channels]]: peer and
-# # client claim watermarks are separate records, and one channel in both
-# # namespaces would let the same money be counted as credit twice.
+# # voucher_signer is the key that signs the peer's vouchers on the channel
+# # it pays this node from: on EVM its settlement ADDRESS (`0x` and 40 hex),
+# # which x402BatchSettlement calls the channel's payerAuthorizer; on Solana
+# # its settlement PUBLIC KEY (base58), the channel's authorized_signer. The
+# # spelling says which chain the row is on -- there is no `chain` key.
 # #
-# # chain_id/token_network are the channel's EIP-712 domain (ADR 0024): what
-# # an inbound peer claim's signature is recovered against, and what an
-# # outbound one is signed under. They are declared here because
-# # [settlement.evm] names a TokenNetworkRegistry, not a TokenNetwork -- the
-# # verifying contract is whatever getTokenNetwork(token_address) resolves to
-# # on that registry, and no line in this file states it.
+# # inbound_channel is optional: the x402 channel id (EVM, `0x` and 64 hex)
+# # or channel account (Solana, base58) the peer pays this node on. Set it to
+# # pin the peering to that one channel; omit it and a voucher by this signer
+# # proves the peering on whichever channel it rides.
 # #
-# # They are CHECKED against that answer at startup (issue #1136), the same
-# # way [settlement.evm] decimals is checked against the token's own
-# # decimals() (#564): a row naming a different TokenNetwork, or a different
-# # chain id, is a refusal to start that names both contracts. Get the value
-# # from the deployment, not from memory -- `cast call <contract_address>
-# # "getTokenNetwork(address)(address)" <token_address>`.
+# # A channel here must NOT also be named in [[client_channels]] or as a
+# # [[pay_channels]] outbound_channel: a peering is two one-way channels, and
+# # one channel in two roles would let the same money be counted twice.
 # #
-# # An EVM row here REQUIRES [settlement.evm], and a Solana row requires
-# # [settlement.solana] (issue #1138). That table is where this node's
-# # address on the chain comes from, and a claim is redeemed by the
-# # channel's on-chain participant -- so without it there is no address to
-# # be that participant, and the peering would verify inbound claims it
-# # could never collect and sign no covering claim outbound. Refused by
-# # name at load, per chain: a Solana-only node still loads its Solana rows.
+# # A row REQUIRES that chain's [settlement.<chain>.batch_settlement] table:
+# # that is what makes this node accept x402 channels at all. Refused by name
+# # at load, per chain.
+# #
+# # The toon-channel row shape (channel_id, counterparty_key, chain_id,
+# # token_network, channel_account) is retired (ADR 0075, issue #1380): each
+# # of those keys is a named load-time error, not a value read.
 # [[peer_channels]]
 # peer_id = "store"
-# channel_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
-# counterparty_key = "0x0000000000000000000000000000000000000000"
-# chain_id = 31337
-# token_network = "0x0000000000000000000000000000000000000000"
+# voucher_signer = "0x0000000000000000000000000000000000000001"
 #
 # # A route forwarding over the peering. `price` is required (ADR 0028):
 # # what THIS node's client edge charges a client for a packet to this
@@ -355,58 +351,44 @@ write_keys = ["REPLACE-WITH-A-64-HEX-CHARACTER-ED25519-PUBLIC-KEY-SEE-README-STE
 #
 # # The channel this node PAYS that peer from, as an ordinary client of it
 # # (ADR 0042, "a connector covers every PREPARE it sends"; issue #881).
-# # Every packet forwarded to `peer_id` carries a covering claim, signed
-# # before the packet is sent, worth exactly what the packet forwards.
+# # Every packet forwarded to `peer_id` carries a covering x402 voucher on
+# # this node's own OUTBOUND channel, signed by this node's settlement key
+# # before the packet is sent, worth exactly what the packet forwards (ADR
+# # 0075).
 # #
 # # REQUIRED, since issue #1145, of any peering a [[routes]] entry FORWARDS
 # # to. A route naming a peer with no row here is refused at load by name
 # # (`peer '<id>' is the next hop of route '<prefix>' but has no
-# # '[[pay_channels]]' entry`) -- the node does not start. It used to be
-# # optional, and a peering without one fell back to ADR 0004's postpay
-# # convention: the claim covering crossing n was signed once crossing n
-# # fulfilled and rode crossing n + 1. That path is deleted, so there is
-# # nothing left for an uncovered forward to fall back to.
-# #
-# # THIS IS A BREAKING DEPLOY (ADR 0009). A newly required key means the
-# # binary and this file are a matched pair in both directions: land the
-# # config that carries this row FIRST, then move the image tag. The other
-# # order is a node that will not boot. No config on this fleet forwards to
-# # a peering today -- neither box has an uncommented [[peers]] table at all
-# # (issue #872) -- so nothing deployed is affected right now; the ordering
-# # rule does not depend on that staying true.
+# # '[[pay_channels]]' entry`) -- the node does not start.
 # #
 # # A peering this node only ever RECEIVES on needs no row: the requirement
 # # is keyed on the route, not on the peering.
 # #
+# # outbound_channel is an x402 channel THIS node opened toward the peer --
+# # `POST /channels` opens one and journals it -- named by its channel id
+# # (EVM) or channel account (Solana). It must be one this node's outbound
+# # channel journal holds, or the node refuses to start: a channel it never
+# # opened is one it holds no terms for and could sign nothing on.
+# #
 # # Three tables name channels and they are not interchangeable:
-# #   [[peer_channels]]   -- the channel a peering's claims are JUDGED against
+# #   [[peer_channels]]   -- whose vouchers prove a peering (and, pinned,
+# #                          the channel the peer pays this node on)
 # #   [[client_channels]] -- a channel this node RECEIVES claims on
-# #   [[pay_channels]]    -- a channel this node PAYS from
-# # A channel here may NOT also appear in [[client_channels]] (it would be
-# # received on and paid from at once); it MAY be the same channel as this
-# # peering's own [[peer_channels]] row, which is the ordinary shape -- one
-# # on-chain channel, one role in each direction.
+# #   [[pay_channels]]    -- the channel this node PAYS the peer from
+# # No channel may appear in two of them.
 # #
 # # client_edge_url is that peer's own `POST /ilp` endpoint: where this node
 # # arrives as a buyer, and where `POST /ilp/claim-state` says where its
-# # claims on the channel stand. The RECEIVER is the authority on its own
-# # watermark, so it is asked on every packet and never guessed or
-# # remembered. It is NOT derived from the peering's `endpoint` -- a `wss://`
-# # peer endpoint is not an HTTP client edge, and guessing one from the other
-# # is the class of mistake ADR 0030 refuses. `https://` only, unless
-# # peer_allow_plaintext_endpoints is set for a loopback test.
+# # vouchers on the channel stand. The RECEIVER is the authority on its own
+# # watermark, so a node that lost its journal restores from that answer
+# # rather than guessing. It is NOT derived from the peering's `endpoint` --
+# # a `wss://` peer endpoint is not an HTTP client edge, and guessing one
+# # from the other is the class of mistake ADR 0030 refuses. `https://`
+# # only, unless peer_allow_plaintext_endpoints is set for a loopback test.
 # #
-# # chain_id/token_network are the channel's EIP-712 domain -- the same two
-# # facts its [[peer_channels]] row carries, because both roles sign against
-# # the very same on-chain channel. The signing key is [settlement.evm]'s;
-# # there is no second key and none is invented (ADR 0030). They are held
-# # against the resolved TokenNetwork at startup exactly as that row's are
-# # (issue #1136), and the failure here is the loud one: a covering claim
-# # signed under a contract the channel does not live in is one the next hop
-# # refuses, with the PREPARE already sent.
+# # The toon-channel shape (channel_id, chain_id, token_network,
+# # channel_account) is retired (ADR 0075, issue #1380) and refused by name.
 # [[pay_channels]]
 # peer_id = "store"
-# channel_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
-# chain_id = 31337
-# token_network = "0x0000000000000000000000000000000000000000"
+# outbound_channel = "0x0000000000000000000000000000000000000000000000000000000000000001"
 # client_edge_url = "https://store.example/ilp"

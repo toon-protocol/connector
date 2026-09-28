@@ -31,6 +31,9 @@ url = "2"
 
 [dev-dependencies]
 connector-config = { path = "../connector-config" }
+# `test-support` for `covering_fake`: a payable hop for a test that forwards
+# (ADR 0042, ADR 0075 decision 6).
+connector-runtime = { path = "../connector-runtime", features = ["test-support"] }
 connector-settlement-evm = { path = "../connector-settlement-evm", features = ["test-util"] }
 ethers = { version = "2", default-features = false, features = ["rustls"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

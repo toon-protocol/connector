@@ -21,19 +21,16 @@
 //! ## What each half of the production path this exercises actually is
 //!
 //! - **Sign**: [`connector_signer::LocalSigner::sign`] over
-//!   [`connector_signer::evm_balance_proof_digest`] -- the exact call
-//!   `connector_runtime::ClaimBook::record_fulfillment` makes when it signs
-//!   an outbound claim (`connector-runtime/src/claim.rs:881`), not a
-//!   hand-rolled digest.
+//!   [`connector_signer::evm_balance_proof_digest`] -- the call a
+//!   `toon-channel` claim's signer made (the outbound signing path itself is
+//!   retired by ADR 0075), not a hand-rolled digest.
 //! - **Wire**: [`connector_runtime::WireClaim::encode`]/`decode` -- the
 //!   exact peer-role byte shape (peer-semantics-pre-868.md §3.5), round-tripped
 //!   before anything is submitted, so a bug in the wire codec would show up
 //!   here as a decode failure rather than being silently bypassed.
 //! - **Verify**: [`connector_signer::verify_evm_balance_proof`] -- the
-//!   exact check `ClaimBook::verify_signature`
-//!   (`connector-runtime/src/claim.rs:1020`) runs -- the first thing
-//!   `accept_inbound_inner` does -- before a claim is ever handed to
-//!   settlement.
+//!   check a `toon-channel` claim's signature is held to before it is ever
+//!   handed to settlement (the client edge's claim gate runs it today).
 //! - **Redeem**: [`connector_settlement_evm::EvmSettlementBackend::redeem`]
 //!   -- which normalises the wire's raw libsecp256k1 `{0,1}` recovery id to
 //!   the `{27,28}` range `TokenNetwork`'s `ECDSA.recover` requires (issue
@@ -209,8 +206,8 @@ async fn receiver_backend(rpc: &str) -> EvmSettlementBackend {
     .expect("connect through the TokenNetworkRegistry")
 }
 
-/// Sign `proof` through the exact production path
-/// `ClaimBook::record_fulfillment` uses -- deliberately no `+27` anywhere in
+/// Sign `proof` the way a `toon-channel` claim is signed -- deliberately no
+/// `+27` anywhere in
 /// this file, so the wire's raw `{0,1}` recovery id and
 /// `EvmSettlementBackend::redeem`'s own normalisation (issue #590/#591) are
 /// what get proven, not a test helper standing in for them.
@@ -222,9 +219,7 @@ fn production_signature(
 }
 
 /// Round-trip `proof`/`signature` through the real peer-role codec and hand
-/// back the on-chain redemption `Claim` the decoded side would submit --
-/// the same construction `ClaimBook::latest_inbound_claim` performs
-/// (`connector-runtime/src/claim.rs:798-802`).
+/// back the on-chain redemption `Claim` the decoded side would submit.
 fn wire_round_trip(
     channel_id: &str,
     proof: &EvmBalanceProof,
@@ -410,7 +405,7 @@ async fn a_production_signed_claim_redeems_on_the_deployed_token_network_and_a_w
     let claim = wire_round_trip(&channel.0, &proof, signature);
     assert!(
         verify_evm_balance_proof(&proof, &claim.signature, &payer_address),
-        "the exact check ClaimBook::accept_inbound_inner runs must accept this claim"
+        "the signature check a toon-channel claim is held to must accept this claim"
     );
 
     let provider = Provider::<Http>::try_from(rpc.as_str()).expect("provider");

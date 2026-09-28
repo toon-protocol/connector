@@ -22,11 +22,10 @@ use std::path::Path;
 use connector_config::Config;
 use connector_peer_http::dial::PeerRelation;
 
-const CHANNEL: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
-const OTHER_CHANNEL: &str = "0x2222222222222222222222222222222222222222222222222222222222222222";
-const THIRD_CHANNEL: &str = "0x3333333333333333333333333333333333333333333333333333333333333333";
+/// Each peering's voucher signer (ADR 0075): one signer proves one peering.
 const KEY: &str = "0x2222222222222222222222222222222222222222";
-const TOKEN_NETWORK: &str = "0x3333333333333333333333333333333333333333";
+const OTHER_KEY: &str = "0x3333333333333333333333333333333333333333";
+const THIRD_KEY: &str = "0x4444444444444444444444444444444444444444";
 
 /// One connector that dials one peer over HTTP, one over BTP, and accepts a
 /// third -- the three shapes §2.1 distinguishes, in one file.
@@ -53,28 +52,19 @@ id = "accept-only"
 
 [[peer_channels]]
 peer_id = "over-http"
-channel_id = "{CHANNEL}"
-counterparty_key = "{KEY}"
-chain_id = 31337
-token_network = "{TOKEN_NETWORK}"
+voucher_signer = "{KEY}"
 
 [[peer_channels]]
 peer_id = "over-btp"
-channel_id = "{OTHER_CHANNEL}"
-counterparty_key = "{KEY}"
-chain_id = 31337
-token_network = "{TOKEN_NETWORK}"
+voucher_signer = "{OTHER_KEY}"
 
 [[peer_channels]]
 peer_id = "accept-only"
-channel_id = "{THIRD_CHANNEL}"
-counterparty_key = "{KEY}"
-chain_id = 31337
-token_network = "{TOKEN_NETWORK}"
+voucher_signer = "{THIRD_KEY}"
 
-# An EVM `[[peer_channels]]` row needs `[settlement.evm]` (issue #1138):
-# a peer claim is redeemed by the channel's on-chain participant, and that
-# address is this table's key.
+# An EVM `[[peer_channels]]` row needs `[settlement.evm]` with its x402
+# `batch_settlement` sub-table (ADR 0075, issue #1380): the peer's vouchers
+# are admitted by that table's receiving half.
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
 contract_address = "0x1234567890123456789012345678901234567890"
@@ -83,6 +73,10 @@ decimals = 6
 
 [settlement.evm.key]
 key_file = "{key_file}"
+
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 "#,
         state_dir = state_dir.display(),
         key_file = key_path.display(),
@@ -110,7 +104,7 @@ fn only_an_https_endpoint_selects_this_carriage() {
     let dialed: Vec<&str> = config
         .peers()
         .iter()
-        .filter(|peer| PeerRelation::from_config(peer, config.peer_channels()).is_some())
+        .filter(|peer| PeerRelation::from_config(peer).is_some())
         .map(connector_config::PeerConfig::id)
         .collect();
 

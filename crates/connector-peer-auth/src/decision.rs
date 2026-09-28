@@ -3,106 +3,30 @@
 
 use std::collections::BTreeMap;
 
-use crate::policy::PeerAuthPolicy;
 use crate::role::SessionRole;
 
 /// The name of the operator-visible event §1.6 requires, declared once so
 /// a log line, a metric label and a test cannot each spell it differently.
 pub const PEER_AUTH_REFUSED_EVENT: &str = "peer_auth_refused";
 
-/// What this connector's **own record** of a channel says about a claim's
-/// signature.
+/// Which of §1.2's requirements an assertion failed to meet.
 ///
-/// Computed by the carriage, out of `ClaimBook`'s `verify_signature`, and
-/// handed here as a verdict rather than as key material: verifying a
-/// secp256k1 or ed25519 signature needs the counterparty key the
-/// `[[peer_channels]]` row configures, which lives in the runtime's claim
-/// book, and this crate deliberately depends on no runtime at all (§1.3,
-/// and [`crate::tests::the_decision_crate_cannot_name_a_transport`]). The
-/// three variants are exactly `verify_signature`'s three outcomes, so
-/// nothing is collapsed on the way here — §1.6 needs the two failures apart
-/// to tell an operator which one they have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ClaimVerification {
-    /// The signature recovered to the counterparty key the channel's
-    /// `[[peer_channels]]` row configures — never to anything the claim
-    /// declares about itself.
-    Verified,
-    /// This connector holds no record of the channel to verify against.
-    UnknownChannel,
-    /// A record exists and the signature did not recover to its key.
-    SignatureInvalid,
-}
-
-/// The claim an interaction presented, as the role decision sees it: which
-/// channel it names, and what this connector's own record made of its
-/// signature.
+/// Carried on the operator event because each has a different fix, and
+/// "peering configured, nothing peers, no error anywhere" is the symptom
+/// §1.6 exists to prevent.
 ///
-/// It carries those two facts and nothing else. That is not minimalism: it
-/// is §1.3 made structural. A value of this type cannot carry the carriage
-/// it arrived on, the port it hit, its source address or its TLS name, so
-/// the decision that consumes it cannot weight one. It carries no nonce and
-/// no amount either — what a claim is *worth* is `ClaimBook`'s question,
-/// downstream of the role, and answering it here would put claim state in
-/// the decision path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PresentedClaim<'a> {
-    channel_id: &'a str,
-    verification: ClaimVerification,
-}
-
-impl<'a> PresentedClaim<'a> {
-    /// The claim on this frame: the channel it names, and this connector's
-    /// verdict on its signature.
-    #[must_use]
-    pub fn new(channel_id: &'a str, verification: ClaimVerification) -> Self {
-        PresentedClaim {
-            channel_id,
-            verification,
-        }
-    }
-
-    /// The channel this claim *names*. Naming is all it does: nothing
-    /// downstream may treat it as identifying a peering until
-    /// [`decide_role`] has resolved it against `[[peer_channels]]`.
-    #[must_use]
-    pub fn channel_id(&self) -> &str {
-        self.channel_id
-    }
-
-    /// What this connector's own record made of the signature.
-    #[must_use]
-    pub fn verification(&self) -> ClaimVerification {
-        self.verification
-    }
-}
-
-/// Which of §1.2's two requirements an assertion failed to meet.
-///
-/// Carried on the operator event because the two have completely different
-/// fixes — a channel this node holds no record of and a signature that
-/// recovers to the wrong key look identical from the outside, and "peering
-/// configured, nothing peers, no error anywhere" is the symptom §1.6 exists
-/// to prevent.
+/// There is no P2 any more (ADR 0075, issue #1380). It was a `toon-channel`
+/// claim naming a `[[peer_channels]]` channel this node held no record of --
+/// a wiring fault between config and the retired claim book. A voucher's
+/// channel is read from the chain, so there is no second record to
+/// disagree with the first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UnmetRequirement {
-    /// **P2** — the claim names a channel a `[[peer_channels]]` row
-    /// configures, but this connector holds no record to verify it
-    /// against: `verify_signature` answered
-    /// [`ClaimVerification::UnknownChannel`]. Config and the claim book
-    /// disagree, which is a wiring fault rather than a caller's, and it is
-    /// exactly the shape that presents as a peering that never peers.
-    ChannelBinding,
-    /// **P3** — a record exists and the signature did not recover to the
-    /// counterparty key that row configures
-    /// ([`ClaimVerification::SignatureInvalid`]). A rotated key on one side
-    /// only, or a claim signed by somebody else entirely.
-    ///
-    /// Also a voucher, or a peer-role challenge, on a channel whose voucher
-    /// signer is bound to a peering, whose signature does not recover to
-    /// that signer ([`VoucherVerification::SignatureInvalid`], ADR 0075
-    /// decision 5): the same fix, a key that is not the one the chain
-    /// records for the channel.
+    /// **P3** — a voucher, or a peer-role challenge, on a channel whose
+    /// voucher signer is bound to a peering, whose signature does not
+    /// recover to that signer ([`VoucherVerification::SignatureInvalid`],
+    /// ADR 0075 decision 5): a key that is not the one the chain records for
+    /// the channel.
     ClaimSignature,
     /// A peer-role challenge (ADR 0075 decision 5) signed by a bound
     /// channel's voucher signer, but outside its window: `expires` has
@@ -118,7 +42,6 @@ impl UnmetRequirement {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            UnmetRequirement::ChannelBinding => "P2",
             UnmetRequirement::ClaimSignature => "P3",
             UnmetRequirement::ChallengeExpiry => "P3-expires",
         }
@@ -141,17 +64,18 @@ pub struct PeerAuthRefusal {
 impl PeerAuthRefusal {
     /// The **configured** peer id whose channel was named.
     ///
-    /// It comes from the `[[peer_channels]]` row, never from the
-    /// interaction — the claim names a channel and config names the
-    /// peering, so an attacker-chosen string never reaches this log line.
-    /// A claim naming a channel this connector binds to no peering
-    /// produces no refusal to carry one (see [`decide_role`]).
+    /// It comes from this node's own voucher-signer binding, never from the
+    /// interaction — the evidence names a channel, the chain names its
+    /// signer, and the binding names the peering, so an attacker-chosen
+    /// string never reaches this log line. Evidence whose signer is bound
+    /// to no peering produces no refusal to carry one (see
+    /// [`decide_voucher_role`]).
     #[must_use]
     pub fn peer_id(&self) -> &str {
         &self.peer_id
     }
 
-    /// Which of P2/P3 failed.
+    /// Which requirement failed.
     #[must_use]
     pub fn unmet(&self) -> UnmetRequirement {
         self.unmet
@@ -218,103 +142,16 @@ impl RoleDecision {
     }
 }
 
-/// **The decision** (§1.2): `peer` if and only if P2 and P3 both hold,
-/// `client` otherwise.
-///
-/// ```text
-/// (the frame's verified claim, the configured channel bindings) -> role
-/// ```
-///
-/// Those are the only two inputs, and that is the security property. There
-/// is no third parameter for the carriage, the listener, the port, the
-/// bind address, the source address, the TLS SNI name, a client
-/// certificate, the `btp` subprotocol, an endpoint from `[[peers]]`, the
-/// shape of what was sent, or anything this or another interaction did
-/// earlier — §1.3's list, absent by construction rather than by
-/// convention. A caller who wanted to weight one would have to change this
-/// signature, and changing it is a reviewable act in a way that adding a
-/// branch is not.
-///
-/// There is no bearer credential in that list either, and there is not
-/// meant to be: ADR 0060 deleted the `{peerId, secret}` shared secret
-/// outright, and did not replace it — not renamed, not demoted to a label,
-/// not kept as an optional discriminator. A signature over ADR 0024's
-/// balance proof proves control of the key the channel was actually opened
-/// against, which is strictly stronger than possession of a string both
-/// operators wrote into their own config files, and it is present on every
-/// packet rather than once per session.
-///
-/// It is a free function rather than a method for the same reason: a
-/// method on a session, a listener or a connection would have a `self`
-/// with fields, and every one of those fields is something §1.3 forbids
-/// consulting.
-///
-/// # Branches
-///
-/// | The frame's claim | Outcome |
-/// | ----------------- | ------- |
-/// | none | `client`, no event — the ordinary client interaction |
-/// | on a channel no `[[peer_channels]]` row binds | `client`, no event (see below) |
-/// | on a bound channel, no record to verify against | `client` + `peer_auth_refused` (P2) |
-/// | on a bound channel, signature does not recover | `client` + `peer_auth_refused` (P3) |
-/// | on a bound channel, signature verifies | `peer`, as that row's relation |
-///
-/// A claim on an **unbound** channel produces no event, and that is §1.6
-/// read literally: an assertion is one that names a configured peering and
-/// fails. The reason it matters here is concrete rather than pedantic —
-/// every ordinary client covers every packet with a claim of its own, on a
-/// `[[client_channels]]` channel this policy does not hold. Emitting on an
-/// unbound channel would fire `peer_auth_refused` on essentially every
-/// client packet, which is both noise and a log-volume lever any anonymous
-/// caller could pull. The cost is real and worth stating: a peering that
-/// pays from a channel its counterparty never configured presents as an
-/// ordinary client with nothing logged. A configured channel whose claims
-/// do not verify — the far likelier mistake, and the one §1.6 names — is
-/// loud.
-#[must_use]
-pub fn decide_role(claim: Option<PresentedClaim<'_>>, policy: &PeerAuthPolicy) -> RoleDecision {
-    // No claim: a client, and not an event. Under owner decision #868 a
-    // peer PREPARE carrying no covering claim is not admitted at all -- it
-    // gets the same 402 greeting the client edge gives -- so there is no
-    // claimless peer frame left for anything else to carry the role.
-    let Some(claim) = claim else {
-        return RoleDecision::client();
-    };
-
-    // P2. The claim names a channel, the channel names at most one
-    // `[[peer_channels]]` row, and that row names exactly one peering
-    // (`PeerChannelDuplicate`, `ChannelInBothNamespaces`). One channel,
-    // one row, one relation -- nothing for a caller to resolve.
-    let Some(binding) = policy.binding(claim.channel_id()) else {
-        return RoleDecision::client();
-    };
-
-    match claim.verification() {
-        // P3. The peer id is config's, not the interaction's: the claim
-        // named a channel, and config named the relation.
-        ClaimVerification::Verified => RoleDecision::peer(&binding.peer_id),
-        // Config binds the channel and the claim book has no record of it.
-        // The two are built from the same table, so this is a wiring fault
-        // -- and it is silent everywhere else, which is the whole reason
-        // §1.6 exists.
-        ClaimVerification::UnknownChannel => {
-            RoleDecision::refused(&binding.peer_id, UnmetRequirement::ChannelBinding)
-        }
-        ClaimVerification::SignatureInvalid => {
-            RoleDecision::refused(&binding.peer_id, UnmetRequirement::ClaimSignature)
-        }
-    }
-}
-
 /// What this connector's receiving half made of a **voucher**, or of a
 /// **peer-role challenge**, presented as evidence of the peer role (ADR 0075
 /// decision 5, issue #1377).
 ///
 /// Computed by the carriage, out of the x402 channel the evidence names, and
-/// handed here as a verdict for the reason [`ClaimVerification`] is: the
-/// signer a voucher is checked against is the one the **chain** records for
-/// its channel (EVM `payerAuthorizer`, Solana `authorized_signer`), read by
-/// a settlement backend this crate does not and must not depend on.
+/// handed here as a verdict: the signer a voucher is checked against is the
+/// one the **chain** records for its channel (EVM `payerAuthorizer`, Solana
+/// `authorized_signer`), read by a settlement backend this crate does not
+/// and must not depend on (§1.3, and
+/// `crate::tests::the_decision_crate_cannot_name_a_transport`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VoucherVerification {
     /// The signature recovered to the channel's chain-recorded voucher
@@ -344,8 +181,9 @@ pub enum VoucherVerification {
 /// not resolve has no chain-recorded signer to resolve a binding from, so
 /// it arrives here as unbound.
 ///
-/// Like [`PresentedClaim`] it carries nothing a carriage could weight: no
-/// amount, no carriage, no address (§1.3).
+/// It carries nothing a carriage could weight: no amount, no carriage, no
+/// address (§1.3). What a voucher is *worth* is the receiving half's
+/// question, downstream of the role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentedVoucher<'a> {
     bound_peer: Option<&'a str>,
@@ -384,7 +222,17 @@ impl<'a> PresentedVoucher<'a> {
 ///
 /// Whether a challenge may count at all (the packet moves no value) is the
 /// carriage's to establish before it presents one: this function sees only
-/// the evidence and its verdict, as [`decide_role`] does.
+/// the evidence and its verdict.
+///
+/// Those are the only inputs, and that is the security property. There is
+/// no parameter for the carriage, the listener, the port, the bind address,
+/// the source address, the TLS SNI name, a client certificate, the `btp`
+/// subprotocol, an endpoint from `[[peers]]`, the shape of what was sent,
+/// or anything this or another interaction did earlier — §1.3's list,
+/// absent by construction rather than by convention. It is a free function
+/// for the same reason: a method on a session would have a `self` with
+/// fields, and every one of those fields is something §1.3 forbids
+/// consulting.
 ///
 /// # Branches
 ///
@@ -396,9 +244,11 @@ impl<'a> PresentedVoucher<'a> {
 /// | bound, signature does not recover to the signer | `client` + `peer_auth_refused` (P3) |
 /// | bound, a challenge outside its window | `client` + `peer_auth_refused` (P3-expires) |
 ///
-/// An unbound channel is silent for [`decide_role`]'s reason: every client
+/// An unbound channel produces no event, and that is §1.6 read literally: an
+/// assertion is one that names a configured peering and fails. Every client
 /// paying with a voucher presents one, so an event there would fire on
-/// every client packet.
+/// every client packet -- both noise and a log-volume lever any anonymous
+/// caller could pull.
 #[must_use]
 pub fn decide_voucher_role(voucher: Option<PresentedVoucher<'_>>) -> RoleDecision {
     let Some(voucher) = voucher else {
@@ -427,7 +277,7 @@ pub struct PeerAuthRefusalReport {
     pub event: &'static str,
     /// The configured peer id whose channel was named.
     pub peer_id: String,
-    /// Which of P2/P3 failed.
+    /// Which requirement failed.
     pub unmet: UnmetRequirement,
     /// How many identical refusals were suppressed since the last report
     /// for this peer id and requirement. A peering whose claims do not
@@ -441,7 +291,7 @@ pub struct PeerAuthRefusalReport {
 ///
 /// One report per (peer id, unmet requirement) per window, carrying the
 /// number suppressed since the last one. Rate limiting is *not* folded
-/// into [`decide_role`]: a limiter has state and a notion of time, and the
+/// into [`decide_voucher_role`]: a limiter has state and a notion of time, and the
 /// decision must have neither. This owns both, and takes `now_ms` as an
 /// argument rather than reading a clock — so its whole behaviour is
 /// testable by advancing a `u64`, with no fake clock and no sleeping test
@@ -543,33 +393,6 @@ impl PeerAuthRefusalLog {
 mod tests {
     use super::*;
 
-    const CHANNEL: &str = "0xd1d2d3";
-    const CLIENT_CHANNEL: &str = "0xc1c2c3";
-
-    /// A connector with one fully configured peering: a `[[peers]]` entry
-    /// and a `[[peer_channels]]` row binding one channel to it. The only
-    /// shape that can produce a `peer`.
-    fn policy_with_a_bound_peer() -> PeerAuthPolicy {
-        PeerAuthPolicy::new(vec!["store-box"], vec![(CHANNEL, "store-box")])
-    }
-
-    fn presented(channel_id: &str, verification: ClaimVerification) -> PresentedClaim<'_> {
-        PresentedClaim::new(channel_id, verification)
-    }
-
-    #[test]
-    fn a_verified_claim_on_a_bound_channel_is_a_peer() {
-        let policy = policy_with_a_bound_peer();
-
-        let decision = decide_role(
-            Some(presented(CHANNEL, ClaimVerification::Verified)),
-            &policy,
-        );
-
-        assert_eq!(decision.role(), &SessionRole::peer("store-box"));
-        assert_eq!(decision.refusal(), None);
-    }
-
     // ---------------------------------------------------------------
     // §1.9, the named regression. `toon-sandbox` admitted an anonymous
     // BTP session with `btp_auth … success:true mode:"no-auth"` and then
@@ -577,172 +400,6 @@ mod tests {
     // spec names, asserted at the decision. The carriages owe the same
     // four end-to-end, over their own frames (issues #727 and #728).
     // ---------------------------------------------------------------
-
-    /// §1.9(1): no claim at all — the anonymous session itself.
-    #[test]
-    fn named_regression_no_claim_is_a_client() {
-        let decision = decide_role(None, &policy_with_a_bound_peer());
-
-        assert_eq!(decision.role(), &SessionRole::Client);
-        assert_eq!(decision.refusal(), None);
-    }
-
-    /// §1.9(2): a claim on a channel this connector binds to no peering —
-    /// every ordinary client's claim, and the reason this branch must be
-    /// silent.
-    #[test]
-    fn named_regression_a_claim_on_an_unbound_channel_is_a_client() {
-        for verification in [
-            ClaimVerification::Verified,
-            ClaimVerification::UnknownChannel,
-            ClaimVerification::SignatureInvalid,
-        ] {
-            let decision = decide_role(
-                Some(presented(CLIENT_CHANNEL, verification)),
-                &policy_with_a_bound_peer(),
-            );
-
-            assert_eq!(decision.role(), &SessionRole::Client);
-            assert_eq!(
-                decision.refusal(),
-                None,
-                "a claim on an unbound channel must not fire peer_auth_refused: every client \
-                 covers every packet with a claim of its own, so emitting here is both noise \
-                 and a log-volume lever an anonymous caller can pull"
-            );
-        }
-    }
-
-    /// §1.9(3): a claim on a configured peer channel whose signature does
-    /// not recover to the counterparty key that row configures. P3 alone
-    /// failing — and loud, because it is a real peering that is not
-    /// peering.
-    #[test]
-    fn named_regression_a_signature_that_does_not_verify_is_a_client() {
-        let decision = decide_role(
-            Some(presented(CHANNEL, ClaimVerification::SignatureInvalid)),
-            &policy_with_a_bound_peer(),
-        );
-
-        assert_eq!(decision.role(), &SessionRole::Client);
-        assert_eq!(
-            decision.refusal().map(PeerAuthRefusal::unmet),
-            Some(UnmetRequirement::ClaimSignature)
-        );
-    }
-
-    /// §1.9(4): P2 alone failing — config binds the channel and the claim
-    /// book holds no record of it, so there is nothing to verify against.
-    #[test]
-    fn named_regression_a_bound_channel_with_no_record_is_a_client() {
-        let decision = decide_role(
-            Some(presented(CHANNEL, ClaimVerification::UnknownChannel)),
-            &policy_with_a_bound_peer(),
-        );
-
-        assert_eq!(decision.role(), &SessionRole::Client);
-        assert_eq!(
-            decision.refusal().map(PeerAuthRefusal::unmet),
-            Some(UnmetRequirement::ChannelBinding)
-        );
-    }
-
-    /// A `[[peer_channels]]` row naming a peer no `[[peers]]` entry
-    /// configures binds nothing, so even a verified claim on it takes no
-    /// role. `Config::load` refuses that shape
-    /// (`ConfigError::PeerChannelOrphaned`); this is the second lock.
-    #[test]
-    fn a_channel_bound_to_no_configured_peering_is_a_client() {
-        let policy = PeerAuthPolicy::new(Vec::<&str>::new(), vec![(CHANNEL, "store-box")]);
-
-        let decision = decide_role(
-            Some(presented(CHANNEL, ClaimVerification::Verified)),
-            &policy,
-        );
-
-        assert_eq!(decision.role(), &SessionRole::Client);
-        assert_eq!(decision.refusal(), None);
-    }
-
-    /// A connector that configures no peerings at all — the fleet's
-    /// ordinary shape today. Nothing can be a peer, whatever it presents.
-    #[test]
-    fn an_empty_policy_admits_no_peer() {
-        let policy = PeerAuthPolicy::default();
-
-        let decision = decide_role(
-            Some(presented(CHANNEL, ClaimVerification::Verified)),
-            &policy,
-        );
-
-        assert_eq!(decision.role(), &SessionRole::Client);
-        assert_eq!(decision.refusal(), None);
-    }
-
-    /// The structural invariant behind §1.6: a refusal *is* a downgrade.
-    /// No branch may return one beside a `peer` role.
-    #[test]
-    fn a_refusal_never_accompanies_a_peer_role() {
-        let policy = PeerAuthPolicy::new(
-            vec!["bound-box", "unbound-box"],
-            vec![(CHANNEL, "bound-box"), ("0xbeef", "ghost-box")],
-        );
-
-        for channel in [CHANNEL, "0xbeef", CLIENT_CHANNEL] {
-            for verification in [
-                ClaimVerification::Verified,
-                ClaimVerification::UnknownChannel,
-                ClaimVerification::SignatureInvalid,
-            ] {
-                let decision = decide_role(Some(presented(channel, verification)), &policy);
-
-                if decision.refusal().is_some() {
-                    assert_eq!(
-                        decision.role(),
-                        &SessionRole::Client,
-                        "{channel}/{verification:?}: a refusal must accompany a downgrade"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The same inputs always give the same verdict. The decision reads no
-    /// clock, no socket and no counter, so there is nothing for a second
-    /// call to differ on — and a future branch that reached for one would
-    /// have to break this.
-    #[test]
-    fn the_decision_is_a_pure_function_of_its_two_arguments() {
-        let policy = policy_with_a_bound_peer();
-        let claim = presented(CHANNEL, ClaimVerification::SignatureInvalid);
-
-        assert_eq!(
-            decide_role(Some(claim), &policy),
-            decide_role(Some(claim), &policy)
-        );
-    }
-
-    /// §1.3, as far as the type system can put it: the only things a
-    /// presented claim carries are a channel id and a verification
-    /// verdict, so two interactions differing in *anything else* --
-    /// carriage, port, source address, SNI, client certificate,
-    /// subprotocol, history -- are the same input and get the same answer,
-    /// because there is no way to express the difference.
-    #[test]
-    fn a_presented_claim_carries_nothing_a_carriage_could_weight() {
-        let policy = policy_with_a_bound_peer();
-
-        // The two carriages decode their own bytes -- raw JSON on BTP,
-        // base64 in a header on HTTP -- into one `WireClaim`, and this is
-        // all that survives of it here.
-        let over_btp = presented(CHANNEL, ClaimVerification::Verified);
-        let over_http = presented(CHANNEL, ClaimVerification::Verified);
-
-        assert_eq!(
-            decide_role(Some(over_btp), &policy),
-            decide_role(Some(over_http), &policy)
-        );
-    }
 
     // ---------------------------------------------------------------
     // ADR 0075 decision 5: a voucher, or a challenge for a packet that
@@ -768,7 +425,7 @@ mod tests {
     }
 
     /// A voucher on a channel bound to no peering is an ordinary client's,
-    /// whatever its signature does: silent, for `decide_role`'s reason.
+    /// whatever its signature does: silent (§1.6).
     #[test]
     fn a_voucher_on_an_unbound_channel_is_a_client_and_no_event() {
         for verification in [
@@ -808,40 +465,44 @@ mod tests {
         }
     }
 
+    /// A voucher whose signature does not verify on a bound channel
+    /// downgrades silently on the wire and loudly to the operator: the
+    /// pairing §1.6 asks for, and the reason the two halves live in one
+    /// returned value.
+    #[test]
+    fn an_asserted_role_downgrades_silently_and_reports_loudly() {
+        let mut log = PeerAuthRefusalLog::default();
+
+        for (verification, expected) in [
+            (VoucherVerification::SignatureInvalid, "P3"),
+            (VoucherVerification::Expired, "P3-expires"),
+        ] {
+            let decision = decide_voucher_role(Some(voucher(Some("store-box"), verification)));
+            let (role, refusal) = decision.into_parts();
+            let report = refusal.as_ref().and_then(|refusal| log.observe(refusal, 0));
+
+            assert_eq!(
+                role,
+                SessionRole::Client,
+                "refusing on the wire would make the check a peering oracle (§1.6)"
+            );
+            assert_eq!(
+                refusal.as_ref().map(PeerAuthRefusal::peer_id),
+                Some("store-box"),
+                "the refused peer id is the bound one"
+            );
+            assert_eq!(
+                report.map(|report| (report.event, report.unmet.name())),
+                Some((PEER_AUTH_REFUSED_EVENT, expected))
+            );
+        }
+    }
+
     #[test]
     fn a_requirement_names_itself_as_the_spec_does() {
-        assert_eq!(UnmetRequirement::ChannelBinding.name(), "P2");
         assert_eq!(UnmetRequirement::ClaimSignature.name(), "P3");
         assert_eq!(UnmetRequirement::ChallengeExpiry.name(), "P3-expires");
         assert_eq!(PEER_AUTH_REFUSED_EVENT, "peer_auth_refused");
-    }
-
-    #[test]
-    fn the_refused_peer_id_is_the_configured_one() {
-        let decision = decide_role(
-            Some(presented(CHANNEL, ClaimVerification::SignatureInvalid)),
-            &policy_with_a_bound_peer(),
-        );
-
-        assert_eq!(
-            decision.refusal().map(PeerAuthRefusal::peer_id),
-            Some("store-box")
-        );
-    }
-
-    #[test]
-    fn a_decision_can_be_split_into_its_role_and_its_event() {
-        let (role, refusal) = decide_role(
-            Some(presented(CHANNEL, ClaimVerification::SignatureInvalid)),
-            &policy_with_a_bound_peer(),
-        )
-        .into_parts();
-
-        assert_eq!(role, SessionRole::Client);
-        assert_eq!(
-            refusal.map(|r| r.unmet()),
-            Some(UnmetRequirement::ClaimSignature)
-        );
     }
 
     // ---------------------------------------------------------------
@@ -888,8 +549,8 @@ mod tests {
 
     /// Two different mistakes on two different peerings are two different
     /// operator problems, and one must not silence the other. The two
-    /// `verify_signature` outcomes ride the same limiter and keep their own
-    /// windows, so an unknown channel does not hide a bad signature.
+    /// refusals ride the same limiter and keep their own
+    /// windows, so an expired challenge does not hide a bad signature.
     #[test]
     fn the_window_is_per_peer_and_per_requirement() {
         let mut log = PeerAuthRefusalLog::new(60_000);
@@ -898,7 +559,7 @@ mod tests {
             .observe(&refusal("store-box", UnmetRequirement::ClaimSignature), 0)
             .is_some());
         assert!(log
-            .observe(&refusal("store-box", UnmetRequirement::ChannelBinding), 0)
+            .observe(&refusal("store-box", UnmetRequirement::ChallengeExpiry), 0)
             .is_some());
         assert!(log
             .observe(&refusal("relay-box", UnmetRequirement::ClaimSignature), 0)
@@ -916,36 +577,5 @@ mod tests {
         assert!(log.observe(&refusal, 10_000).is_some());
         assert!(log.observe(&refusal, 10_001).is_none());
         assert!(log.observe(&refusal, 5_000).is_some());
-    }
-
-    /// End to end: a claim that does not verify downgrades silently on the
-    /// wire and loudly to the operator. This is the pairing §1.6 asks for,
-    /// and the reason the two halves live in one returned value.
-    #[test]
-    fn an_asserted_role_downgrades_silently_and_reports_loudly() {
-        let policy = policy_with_a_bound_peer();
-        let mut log = PeerAuthRefusalLog::default();
-
-        for (verification, expected) in [
-            (ClaimVerification::SignatureInvalid, "P3"),
-            (ClaimVerification::UnknownChannel, "P2"),
-        ] {
-            let decision = decide_role(Some(presented(CHANNEL, verification)), &policy);
-            let report = decision
-                .refusal()
-                .and_then(|refusal| log.observe(refusal, 0));
-
-            assert_eq!(
-                decision.role(),
-                &SessionRole::Client,
-                "refusing on the wire would make the check a peering oracle (§1.6)"
-            );
-            assert_eq!(
-                report.map(|report| (report.event, report.unmet.name())),
-                Some((PEER_AUTH_REFUSED_EVENT, expected)),
-                "a peering whose claims do not verify must not present as 'peering \
-                 configured, nothing peers, no error anywhere' (§1.6)"
-            );
-        }
     }
 }

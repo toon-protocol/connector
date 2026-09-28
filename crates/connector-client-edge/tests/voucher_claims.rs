@@ -748,13 +748,11 @@ mod claim_state {
     use chrono::{TimeZone, Utc};
     use connector_client_edge::router_with_gate;
     use connector_runtime::{
-        ChannelDomain, ClaimAckOutcome, ClaimSignature, Connector, FakeAppClient,
-        InProcessPeerTransport, TestClock, VoucherSigner, WireClaim,
+        Connector, FakeAppClient, InProcessPeerTransport, TestClock, VoucherSigner,
     };
     use connector_signer::{
-        evm_balance_proof_digest, evm_claim_state_challenge_digest,
-        evm_voucher_claim_state_challenge_digest, solana_voucher_claim_state_challenge_message,
-        EvmBalanceProof, EvmClaimStateChallenge, LocalSigner, Signer as _,
+        evm_claim_state_challenge_digest, evm_voucher_claim_state_challenge_digest,
+        solana_voucher_claim_state_challenge_message, EvmClaimStateChallenge, LocalSigner,
     };
     use tower::ServiceExt;
 
@@ -1149,74 +1147,5 @@ mod claim_state {
         let solana = claim_state_on(connector, gate, solana_entry(&solana_signer())).await;
         assert_eq!(solana["ok"], true, "{solana}");
         assert_eq!(solana["cumulativeClaimed"], "70");
-    }
-
-    /// Widened to the peer book, as ADR 0075's Prerequisites require: the
-    /// answer is the higher of the two books' watermarks, never the client
-    /// edge's alone, so a payer restoring from it is never told less than
-    /// its channel stands at.
-    #[tokio::test]
-    async fn a_voucher_channels_watermark_is_the_higher_of_the_two_books() {
-        let backend = Arc::new(FakeBatchSettlement::new(1_000));
-        let (gate, _journal) = gate_with(&backend);
-        gate.ingest(&signed_evm_voucher(100), 100)
-            .await
-            .expect("accepted");
-
-        // The peer book holds the same channel id at 400.
-        let channel_hex = format!("0x{}", hex::encode(channel_id()));
-        let token_network = [0x42; 20];
-        let key = LocalSigner::generate("peer-book");
-        let connector = Connector::new(
-            vec![],
-            vec![],
-            Arc::new(FakeAppClient::new()),
-            Arc::new(InProcessPeerTransport::new()),
-            Arc::new(TestClock::new(
-                Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap(),
-            )),
-        )
-        .with_config_peer_ids([PEER_ID.to_string()])
-        .with_channel_verification_key(
-            channel_hex.clone(),
-            derive_evm_address(&key.public_key().unwrap()),
-        )
-        .with_channel_domain(
-            channel_hex.clone(),
-            ChannelDomain {
-                chain_id: CHAIN_ID,
-                token_network_address: token_network,
-            },
-        )
-        .expect("a bytes32 channel id");
-        let digest = evm_balance_proof_digest(&EvmBalanceProof {
-            channel_id: channel_id(),
-            nonce: 1,
-            transferred_amount: 400,
-            locked_amount: 0,
-            locks_root: [0u8; 32],
-            chain_id: CHAIN_ID,
-            token_network_address: token_network,
-        });
-        assert_eq!(
-            connector.handle_peer_claim(WireClaim {
-                channel_id: channel_hex,
-                nonce: 1,
-                cumulative_amount: 400,
-                signature: ClaimSignature::Evm(key.sign(&digest).unwrap()),
-            }),
-            ClaimAckOutcome::Accepted
-        );
-
-        let entry = claim_state_on(
-            bind_peer(connector),
-            gate,
-            evm_entry(evm_challenge(&authorizer(), channel_id()), None),
-        )
-        .await;
-
-        assert_eq!(entry["ok"], true, "{entry}");
-        assert_eq!(entry["cumulativeClaimed"], "400");
-        assert_eq!(entry["available"], "600");
     }
 }

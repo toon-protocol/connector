@@ -81,6 +81,25 @@ pub enum PeerRoleChallenge {
 }
 
 impl PeerRoleChallenge {
+    /// The channel this challenge names: an EVM channel id as lower-case
+    /// `0x` hex, a Solana channel account in base58 -- the spelling a
+    /// `[[peer_channels]]` row's `inbound_channel` is canonicalized to.
+    #[must_use]
+    pub fn channel(&self) -> String {
+        match self {
+            PeerRoleChallenge::Evm { channel_id, .. } => format!(
+                "0x{}",
+                channel_id
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ),
+            PeerRoleChallenge::Solana {
+                channel_account, ..
+            } => bs58::encode(channel_account).into_string(),
+        }
+    }
+
     /// The unix second after which this challenge proves nothing.
     #[must_use]
     pub fn expires(&self) -> u64 {

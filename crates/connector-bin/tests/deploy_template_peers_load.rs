@@ -11,8 +11,9 @@
 //! This test takes the template's commented peering block verbatim -- only
 //! the leading `# ` comment markers come off -- and supplies the two things
 //! the template itself deliberately leaves unconfigured: real (if
-//! content-free) key files, and a `[settlement.evm]` table, which the
-//! example's EVM `[[peer_channels]]` row requires since issue #1138 and
+//! content-free) key files, and a `[settlement.evm]` table with its
+//! `batch_settlement` sub-table, which the example's EVM `[[peer_channels]]`
+//! row requires (issues #1138 and #1380) and
 //! which is out of this example's scope to teach. If a future edit
 //! reintroduces a removed key -- a credential, a `ceiling`, a
 //! `claim_enforcement` -- `Config::load` refuses it by name and this test
@@ -133,7 +134,8 @@ fn the_templates_peering_example_loads() {
     );
 
     // Not part of the template: the example's EVM `[[peer_channels]]` row
-    // requires a `[settlement.evm]` table to bind against (issue #1138),
+    // requires a `[settlement.evm]` table with x402 batch settlement switched
+    // on to bind against (issue #1138, issue #1380),
     // and the template names no settlement chain at all -- rightly, since
     // which chain an operator settles on is theirs to pick. Supplied here
     // so this test proves the PEERING example loads, not that the template
@@ -144,6 +146,10 @@ fn the_templates_peering_example_loads() {
          contract_address = \"0x1234567890123456789012345678901234567890\"\n\
          token_address = \"0x49beE1Bca5d15Fb0963117923403F9498119a9Ce\"\n\
          decimals = 6\n\
+         \n\
+         [settlement.evm.batch_settlement]\n\
+         asset_eip712_name = \"USD Coin\"\n\
+         asset_eip712_version = \"2\"\n\
          \n\
          [settlement.evm.key]\n\
          key_file = \"{}\"\n",

@@ -211,23 +211,32 @@ ILP address and handler URL, or delete the block if this node only peers.
 `price` is required on a terminated route — write `price = 0` if free is
 deliberate, because it is never silently free.
 
-To peer, set `peer_expose` (which peer carriages this node accepts _peer_
+To peer, the simplest path is at runtime: `POST /peers` naming the other
+node's URL opens and funds this node's own outbound x402 channel toward it and
+binds the other's channel by the voucher signer its self-description
+publishes, with no config edit (ADR 0058, ADR 0075; the operator's guide in
+the repository `README.md` walks it). To commit a peering to this file
+instead, set `peer_expose` (which peer carriages this node accepts _peer_
 traffic on — it opens no port, and a node that leaves it at its `neither`
 default still serves clients over BTP exactly as before), add a `[[peers]]`
-entry with a `wss://` or `https://` `endpoint` and a `credential`, a
-`[[peer_channels]]` row binding it to a channel, and a
-`[[routes]]` entry that names the peer's `id` instead of a `handler_url`.
-The template's commented peering block annotates every field. ADR 0027
-deleted the raw-TCP transport that preceded this (issue #679), along with
-`peer_wire_addr` and the `SocketAddr`-shaped `[[peers]].addr`; a config
-still setting either now fails config load by name.
+entry with a `wss://` or `https://` `endpoint`, a `[[peer_channels]]` row
+naming the peer's `voucher_signer` (its settlement address on EVM, its
+settlement key on Solana), and a `[[routes]]` entry that names the peer's `id`
+instead of a `handler_url`. The template's commented peering block annotates
+every field. ADR 0027 deleted the raw-TCP transport that preceded this (issue
+#679), along with `peer_wire_addr` and the `SocketAddr`-shaped
+`[[peers]].addr`; a config still setting either now fails config load by name.
 
 **A `[[routes]]` entry naming a peer also needs a `[[pay_channels]]` row for
-that peer** (issue #1145). A connector covers every PREPARE it sends (ADR
-0042), and there is no longer an uncovered path for a forward to take, so a
-route to a peering with no channel to pay it from is refused at config load
-by name — the node does not start. A peering this node only _accepts_ on
-needs no such row; the requirement is keyed on the route.
+that peer** (issue #1145). A connector covers every PREPARE it sends (ADR 0042) — with a voucher on its own outbound x402 channel toward that peer
+(ADR 0075, issue #1380) — and there is no longer an uncovered path for a
+forward to take, so a route to a peering with no channel to pay it from is
+refused at config load by name — the node does not start. The row names that
+outbound channel (open it first with `POST /channels`; a row naming a channel
+this node did not open stops the node at boot) and the peer's `POST /ilp`
+URL. A peering this node only _accepts_ on needs no such row; the requirement
+is keyed on the route. Both rows need the chain's
+`[settlement.<chain>.batch_settlement]` sub-table and `state_dir`.
 
 That key became required rather than optional, which by ADR 0009 makes it a
 **breaking deploy**: land the config carrying the row first, then move the
@@ -235,43 +244,25 @@ image tag. Neither box on this fleet forwards to a peering today (issue
 #872 removed both peerings), so nothing deployed is affected — but the
 ordering rule holds the moment one is added back.
 
-Write the credential as a **`secret_file`**, not a literal:
+**There is no peer credential.** ADR 0060 deleted the `{peerId, secret}`
+shared secret, and a `[[peers]]` entry that still sets `credential` — in any
+spelling — stops the node by name (`PeerCredentialRemoved`); delete it and
+the `*.secret` file it named. Two things to get right, both of which fail
+silently rather than loudly:
 
-```toml
-credential = { secret_file = "/app/data/store-peer.secret" }
-```
-
-```sh
-openssl rand -hex 32 > /app/data/store-peer.secret   # both sides need the same bytes
-chmod 600 /app/data/store-peer.secret
-```
-
-That keeps the peering itself in a config you can commit while the secret
-stays on the box — the same shape `[signer] key_file` and the settlement
-keys already use, and `deploy/connector-rust/*.secret` is gitignored for it.
-The path is resolved the way `key_file` is, so make it absolute and make it
-a path _inside_ the container. It is read at startup and trimmed of trailing
-whitespace; missing, unreadable or empty stops the node by name
-(`PeerSecretFileNotFound` / `PeerSecretFileUnreadable` /
-`PeerSecretFileEmpty`). A literal `secret` still works and is fine for a
-config nobody commits; setting both is `PeerCredentialAmbiguous`.
-
-Two things to get right, both of which fail silently rather than loudly:
-
-- **`[[peers]].id` is one string both operators write.** It is the `peerId`
-  the dialing side presents, and the accepting side proves it against its
-  own `[[peers]]` table — so an id the far side does not have is admitted
-  as an ordinary client, with nothing in the log.
+- **`voucher_signer` must be the key the peer actually signs with.** Read it
+  from the `voucherSigners` entry of the peer's own self-description
+  (`GET /ilp`). A wrong key binds nothing the peer signs, so its vouchers
+  arrive as an ordinary client's, with nothing in the log. `[[peers]].id` is
+  only this node's local label and need not match the far side's.
 - **There is no peer port.** A peer's `endpoint` is
   `wss://<host>/ilp/btp` or `https://<host>/ilp` — this node's own client
   edge — because peer carriages ride the listener it already serves and
-  role is decided by the credential, not by the port. Those are the same
-  two URLs an ordinary client uses, and a client uses them **without a
-  credential**: `GET /ilp/btp` accepts a session that presents none (or an
-  empty `secret`) and keeps it a client, and what pays for a write is the
+  role is decided by a verified voucher, not by the port. Those are the same
+  two URLs an ordinary client uses: `GET /ilp/btp` accepts a session that
+  presents nothing and keeps it a client, and what pays for a write is the
   signed claim on each frame, never the session
-  (`docs/protocol/client-edge-spec.md` §1.9 step 1). The `credential` here
-  buys peer role, not entry.
+  (`docs/protocol/client-edge-spec.md` §1.9 step 1).
 
 A packet routed to a peer this node cannot dial is still answered
 `T01 peer unreachable`, never dropped. See

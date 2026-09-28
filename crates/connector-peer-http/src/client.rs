@@ -2,7 +2,7 @@
 //! `reqwest`.
 //!
 //! Everything the carriage *decides* -- which headers ride, what an absent
-//! ack means, when a claim may be retransmitted, §7.2's in-flight rule --
+//! ack means, §7.2's in-flight rule --
 //! is above this file and provable without it. What is here is TLS, a
 //! connection pool, a byte copy, and -- since ADR 0070 -- **which of two
 //! sockets the bytes leave on**.
@@ -16,9 +16,7 @@ use crate::dial::{HttpDialError, PeerHttpClient};
 use crate::headers::{Headers, PeerRequest, PeerResponse};
 
 /// The content type an OER ILP packet rides under, the same one the client
-/// edge's `POST /ilp` uses (`client-edge-spec.md` §1.1). A FLUSH's body is
-/// empty and carries it too: the shape is "a POST with an empty ILP body",
-/// not a differently typed request.
+/// edge's `POST /ilp` uses (`client-edge-spec.md` §1.1).
 const OCTET_STREAM: &str = "application/octet-stream";
 
 /// A [`PeerHttpClient`] backed by `reqwest`, rustls only.
@@ -55,7 +53,7 @@ pub struct ReqwestPeerClient {
 impl ReqwestPeerClient {
     /// A client over `client`, so a caller that already tunes timeouts,
     /// pools or roots keeps them. The carriage's own deadlines
-    /// (`peerAnswerTimeoutMs`, `claimAckTimeoutMs` -- §6.3) are applied
+    /// (`peerAnswerTimeoutMs` -- §6.3) are applied
     /// above this, per peering relation, and are not this client's.
     ///
     /// No proxy: a node that configured none dials every endpoint direct,

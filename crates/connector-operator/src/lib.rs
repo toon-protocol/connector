@@ -122,8 +122,9 @@ struct OperatorState {
     /// the client edge's own journal held the claim. Reads and redeems
     /// below now consult whichever book is the channel's actual authority
     /// -- peer book first, this one otherwise -- the same doctrine
-    /// `Connector::peer_channel_watermark` already established for
-    /// `POST /ilp/claim-state` (issue #1102/#1103).
+    /// `POST /ilp/claim-state` established (issue #1102/#1103). Since ADR
+    /// 0075 (#1380) the peer book is only the replay of a journal an older
+    /// build wrote.
     claim_gate: Arc<ClientClaimGate>,
     signer: Arc<dyn Signer>,
     bearer_token: Arc<str>,
@@ -1165,54 +1166,18 @@ mod tests {
     use connector_client_edge::ClientChannelRegistry;
     use connector_config::StaticRoute;
     use connector_runtime::{
-        ClaimStateDomain, ClaimStateSource, ClaimWatermark, EvmDomain, FakeAppClient,
-        InMemoryJournal, InProcessPeerTransport, OutboundClientError, OutboundClientLedger,
-        RouteSource, TestClock,
+        FakeAppClient, InMemoryJournal, InProcessPeerTransport, RouteSource, TestClock,
     };
     use connector_signer::LocalSigner;
     use tower::ServiceExt;
 
-    /// A next hop reporting where this node's claims on a channel stand --
-    /// the authority every covering claim is priced off (see
-    /// `connector_runtime::outbound_client`'s header). A fake upholding the
-    /// port's contract, not a stub with expectations (ADR 0007).
-    struct ReportsAWatermark;
-
-    #[axum::async_trait]
-    impl ClaimStateSource for ReportsAWatermark {
-        async fn watermark(
-            &self,
-            _channel: &[u8; 32],
-            _domain: &ClaimStateDomain,
-        ) -> Result<ClaimWatermark, OutboundClientError> {
-            Ok(ClaimWatermark {
-                nonce: 0,
-                cumulative: 0,
-                available: Some(u128::MAX),
-            })
-        }
-    }
-
     /// The `[[pay_channels]]` half of a peering, which ADR 0042 requires of
     /// every peering a node forwards to and issue #1145 made unavoidable: a
     /// forward this node cannot cover is refused `T00` before the transport
-    /// is reached at all. A fixture that forwards to a peer without this is
-    /// not a simpler fixture, it is one no config can produce
-    /// (`ConfigError::PayChannelUnbound`).
+    /// is reached at all. Since ADR 0075 the covering is a voucher on this
+    /// node's own outbound x402 channel.
     fn covering(connector: Connector, peer_id: &str) -> Connector {
-        connector
-            .with_signer(Arc::new(LocalSigner::generate("operator-test-settlement")))
-            .with_outbound_client_ledger(Arc::new(OutboundClientLedger::in_memory()))
-            .with_outbound_client_hop(
-                peer_id,
-                format!("0x{:064x}", 1),
-                EvmDomain {
-                    chain_id: 84_532,
-                    token_network: [0x1E; 20],
-                },
-                Arc::new(ReportsAWatermark),
-            )
-            .expect("a valid on-chain channel id")
+        connector_runtime::covering_fake::covering(connector, peer_id)
     }
 
     /// A client-edge claim book over no declared channels, journaling

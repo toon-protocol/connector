@@ -290,7 +290,8 @@ The authority of one interaction — `peer` or `client`. Decided by a signature,
 listener the bytes arrived on and never by a shared secret: an interaction is a `peer` only if it
 carries a voucher on a channel bound to that peering, or — for a packet that moves no value — a
 claim-state challenge signed by such a channel's voucher signer (ADR 0075). A channel is bound to a
-peering when its voucher signer is the key the peer publishes or a config row names. **The evidence
+peering when its voucher signer is the key the peer publishes or a `[[peer_channels]]` row names;
+a `toon-channel` claim never decides the role (#1380). **The evidence
 names its own peering** — a channel belongs to at most one — so nothing has to be asserted alongside
 it and nothing weaker is consulted first.
 There is no third role, no unroled state, and no fallthrough — anything that is not a proven peer is
@@ -332,7 +333,8 @@ _Avoid_: channel (when ambiguous with a route or a stream)
 A signed statement of a payment channel's cumulative state, handed from payer to payee.
 Each claim supersedes the last, so a lost claim costs nothing and a replayed claim gains
 nothing. Every claim is a **voucher** ([ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)). Until #1371's implementing steps land, the binary
-still also speaks `toon-channel` claims, the scheme ADR 0075 retires.
+still also speaks `toon-channel` claims, the scheme ADR 0075 retires — since #1380 only at the client
+edge, from a client, until #1384; no peering sends or is proven by one.
 _Avoid_: receipt, payment, balance proof; `toon-channel` (retired, ADR 0075)
 
 **Voucher**:
@@ -393,8 +395,9 @@ _Avoid_: ceiling, limit, liquidity bound
 **Flush** _(retired term, ADR 0033, issue #882)_:
 Sending a claim that would otherwise have waited to travel with the next packet to that peer.
 Bounded how long a payee's trailing exposure could persist when traffic stopped; retired along
-with exposure, above. Not to be confused with `peer-carriage-spec.md` §6.4's still-live
-`Toon-Flush-Requested` hint, which prompts a payer but binds nothing.
+with exposure, above. The FLUSH frame that carried such a claim and `peer-carriage-spec.md` §6.4's
+`Toon-Flush-Requested` hint outlived it until ADR 0075 (#1380): a voucher rides the packet it
+covers, so no peering sends either now.
 
 **In flight**:
 The state of a packet that has been forwarded but has neither fulfilled nor been rejected nor

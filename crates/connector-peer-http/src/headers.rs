@@ -202,7 +202,7 @@ pub fn payment_required_header_value(terms: &[u8]) -> String {
 ///
 /// **First-wins, and only safe once §1.5's ambiguity check has run.** More
 /// than one claim header on one request is refused (`400`, no ILP body) by
-/// [`connector_peer_http::PeerHttpState::handle`] before this is reached,
+/// [`crate::PeerHttpState::handle`] before this is reached,
 /// the twin of the BTP carriage's
 /// [`connector_peer_btp::claim_json::present_from_protocol_data`]; a caller
 /// reaching for this without that check answers "which claim did we
@@ -275,6 +275,12 @@ pub fn accumulated_cost(headers: &Headers) -> u64 {
 /// named channel, or that does not recognise it, ignores it, and a payer
 /// that ignores every hint is not in violation of the specification. It is
 /// never answered, acknowledged, or errored on.
+///
+/// No carriage in this connector emits the header any more: it prompted a
+/// flush of a pending `toon-channel` claim, and since ADR 0075 (#1380) a
+/// peer pays with a voucher riding the PREPARE it covers. The parser stays
+/// because the `peer_carriage` wire vectors (`connector-vectors`) still
+/// pin the header's shape.
 #[must_use]
 pub fn flush_requested(headers: &Headers) -> Vec<String> {
     headers
