@@ -365,8 +365,8 @@ mod tests {
     #[test]
     fn a_row_on_a_chain_without_x402_is_refused_per_chain() {
         let rows = || vec![parse(&row(EVM_SIGNER))];
-        let error = resolve_peer_channels(rows(), SettlementTables::for_tests(false, true))
-            .unwrap_err();
+        let error =
+            resolve_peer_channels(rows(), SettlementTables::for_tests(false, true)).unwrap_err();
         assert!(matches!(
             error,
             ConfigError::PeerChannelWithoutX402 { chain: "evm", .. }

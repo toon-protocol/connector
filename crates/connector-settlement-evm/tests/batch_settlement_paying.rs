@@ -25,9 +25,7 @@ use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
-use connector_settlement_evm::{
-    DepositRoute, EvmBatchSettlementBackend, RpcTransport,
-};
+use connector_settlement_evm::{DepositRoute, EvmBatchSettlementBackend, RpcTransport};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, Signature, H256};
 

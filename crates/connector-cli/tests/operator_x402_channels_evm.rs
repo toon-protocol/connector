@@ -29,7 +29,6 @@ use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
-use connector_settlement_evm::EvmSettlementBackend;
 use ed25519_dalek::Keypair;
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::Address;
@@ -71,7 +70,6 @@ fn node_files(
     settlement_key_hex: &str,
     signer_seed: u8,
     rpc_url: &str,
-    registry: Address,
     token: Address,
     operator: &Keypair,
     route: Option<&str>,
@@ -191,10 +189,6 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
     let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
     let mut x402 = X402Chain::place(&anvil.rpc_url).await;
     let token = x402.deploy_fiat_token().await;
-    let registry = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("a TokenNetwork registry for the settlement table")
-        .registry_address();
     let payer = address_of(DEPLOYER_PRIVATE_KEY);
     x402.mint(token, payer, FUNDED).await;
 
@@ -204,7 +198,6 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
         DEPLOYER_PRIVATE_KEY,
         0x0a,
         &anvil.rpc_url,
-        registry,
         token,
         &operator,
         None,
@@ -213,7 +206,6 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
         COUNTERPARTY_PRIVATE_KEY,
         0x0b,
         &anvil.rpc_url,
-        registry,
         token,
         &operator,
         Some(&app_addr),

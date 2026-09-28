@@ -56,7 +56,6 @@ use connector_settlement_solana::batch::wire::{
 };
 use connector_settlement_solana::test_support::{
     create_mint, fund, mint_to, require_solana_test_validator, SolanaValidator,
-    LOCAL_TEST_PROGRAM_ID,
 };
 use connector_signer::giftwrap::{open_response, seal_request};
 use connector_signer::PublicKeyBytes;
@@ -165,10 +164,9 @@ fn sealed_prepare(
     )
 }
 
-/// One validator for the whole test, with `payment-channels` at `CHNLx…`,
-/// TOON's own program at [`LOCAL_TEST_PROGRAM_ID`] (which `[settlement.solana]`
-/// still names until #1382), a fresh 6-decimal mint, and both nodes'
-/// settlement keys holding SOL and [`FUNDED`] tokens.
+/// One validator for the whole test, with `payment-channels` at `CHNLx…`, a
+/// fresh 6-decimal mint, and both nodes' settlement keys holding SOL and
+/// [`FUNDED`] tokens.
 struct Chain {
     validator: SolanaValidator,
     mint: Pubkey,
@@ -207,17 +205,6 @@ impl Chain {
             "the channel is a payment-channels (x402) channel"
         );
         ChannelAccount::parse(&account.data).expect("a payment-channels channel account")
-    }
-
-    /// Every account TOON's own payment-channel program owns: what `POST
-    /// /peers` opened on Solana before ADR 0075, and must not now.
-    async fn toon_program_accounts(&self) -> usize {
-        let program = Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("the TOON program id");
-        self.rpc()
-            .get_program_accounts(&program)
-            .await
-            .expect("list the TOON program's accounts")
-            .len()
     }
 
     async fn token_balance(&self, owner: &Pubkey) -> u64 {
@@ -682,11 +669,6 @@ async fn two_nodes_peer_over_two_solana_channels(
             node.name
         );
     }
-    assert_eq!(
-        chain.toon_program_accounts().await,
-        0,
-        "POST /peers on Solana no longer opens a channel on TOON's own program"
-    );
     b.route_to(&a).await;
     a.route_to(&b).await;
 

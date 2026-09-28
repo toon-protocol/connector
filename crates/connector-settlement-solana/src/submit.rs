@@ -42,7 +42,6 @@ use solana_sdk::signature::Signature;
 use solana_sdk::transaction::TransactionError;
 use solana_transaction_status_client_types::UiTransactionEncoding;
 
-
 /// How [`send_and_confirm`] paces itself.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ConfirmPolicy {

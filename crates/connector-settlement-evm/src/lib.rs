@@ -58,10 +58,7 @@ struct BuiltClient {
 /// The read client, the sender and the chain id, from `transport` and
 /// `private_key`. The chain id is read once (retried, since it is boot's
 /// first call) and bound into the key, so every signature carries it.
-async fn build_client(
-    transport: &RpcTransport,
-    private_key: &str,
-) -> Result<BuiltClient, String> {
+async fn build_client(transport: &RpcTransport, private_key: &str) -> Result<BuiltClient, String> {
     let client = Arc::new(EvmRpc::provider(transport.clone()));
     let chain_id = retry_read(|| client.get_chainid())
         .await

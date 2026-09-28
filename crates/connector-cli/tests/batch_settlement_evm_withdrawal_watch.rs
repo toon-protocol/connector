@@ -23,7 +23,6 @@ use connector_domain::{Fulfill, Reject};
 use connector_settlement::batch::EvmChannelConfig;
 use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
-use connector_settlement_evm::EvmSettlementBackend;
 use ethers::signers::{LocalWallet, Signer};
 
 use support::{evm_voucher, paid_prepare, post_ilp, spawn_recording_app};
@@ -45,12 +44,11 @@ async fn a_withdrawal_begun_by_the_payer_is_answered_by_the_node_claiming_its_la
     let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
     let mut x402 = X402Chain::place(&anvil.rpc_url).await;
     let token = x402.deploy_fiat_token().await;
-    let settlement = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("a TokenNetwork over the FiatToken");
-    let registry = settlement.registry_address();
-    let node = settlement.own_address().to_fixed_bytes();
-    drop(settlement);
+    let node = DEPLOYER_PRIVATE_KEY
+        .parse::<LocalWallet>()
+        .expect("the node's settlement key")
+        .address()
+        .to_fixed_bytes();
 
     let payer = LocalWallet::from_bytes(&[0x81; 32]).expect("key");
     let session = LocalWallet::from_bytes(&[0x82; 32]).expect("key");
@@ -189,12 +187,11 @@ async fn a_voucher_accepted_before_a_restart_that_tightened_admission_is_still_c
     let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
     let mut x402 = X402Chain::place(&anvil.rpc_url).await;
     let token = x402.deploy_fiat_token().await;
-    let settlement = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("a TokenNetwork over the FiatToken");
-    let registry = settlement.registry_address();
-    let node = settlement.own_address().to_fixed_bytes();
-    drop(settlement);
+    let node = DEPLOYER_PRIVATE_KEY
+        .parse::<LocalWallet>()
+        .expect("the node's settlement key")
+        .address()
+        .to_fixed_bytes();
 
     let payer = LocalWallet::from_bytes(&[0x83; 32]).expect("key");
     let session = LocalWallet::from_bytes(&[0x84; 32]).expect("key");

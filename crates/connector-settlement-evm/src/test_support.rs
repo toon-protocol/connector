@@ -78,7 +78,11 @@ pub fn require_anvil() -> bool {
 /// (`contracts/MockERC20.sol`) from `private_key`, minting
 /// `mint_to_deployer` of it to that key's own address, and return its
 /// address. Never used against a real chain.
-pub async fn deploy_plain_token(rpc_url: &str, private_key: &str, mint_to_deployer: u128) -> Address {
+pub async fn deploy_plain_token(
+    rpc_url: &str,
+    private_key: &str,
+    mint_to_deployer: u128,
+) -> Address {
     let provider = Provider::<Http>::try_from(rpc_url).expect("provider");
     let chain_id = provider.get_chainid().await.expect("chain id").as_u64();
     let wallet: LocalWallet = private_key.parse().expect("key");
@@ -107,7 +111,13 @@ pub async fn deploy_plain_token(rpc_url: &str, private_key: &str, mint_to_deploy
 
 /// Mint `amount` of a [`deploy_plain_token`] token to `owner`, signed by
 /// any funded key (the mock's `mint` is ungated).
-pub async fn mint_plain_token(rpc_url: &str, private_key: &str, token: Address, owner: Address, amount: u128) {
+pub async fn mint_plain_token(
+    rpc_url: &str,
+    private_key: &str,
+    token: Address,
+    owner: Address,
+    amount: u128,
+) {
     let provider = Provider::<Http>::try_from(rpc_url).expect("provider");
     let chain_id = provider.get_chainid().await.expect("chain id").as_u64();
     let wallet: LocalWallet = private_key.parse().expect("key");

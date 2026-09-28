@@ -28,9 +28,9 @@
 //! assumes this file provides, and the only case that catches a committed
 //! config which cannot start. Exactly that happened: a `[settlement]`
 //! section naming the zero address made both files exit 1 on startup,
-//! because `EvmSettlementBackend::connect` resolves a `TokenNetwork`
-//! through the configured `TokenNetworkRegistry` and there is no contract
-//! at that one (issue #542, issue #576).
+//! because boot resolved a contract that was not there (issue #542, issue
+//! #576). Since ADR 0075 a node boots only where `x402BatchSettlement` is
+//! deployed (issue #1385).
 //!
 //! One more substitution joined that list when the store file's
 //! `[settlement]` section went LIVE against Base Sepolia when the store box
@@ -46,9 +46,8 @@
 //! node became a counterparty rather than a terminus: it accepts client-edge
 //! claims of its own, on whichever chain the buyer chose, so an EVM-only
 //! node would refuse every Solana-paid write. Its section is asserted to
-//! name the SAME registry, program and mint the relay names, because a
-//! buyer's channel lives on one deployment and a node pointed elsewhere
-//! cannot resolve it.
+//! name the SAME token and mint the relay names, because a buyer's channel
+//! is in one token and a node settling in another cannot take it.
 //!
 //! Since #645 both files carry issue #628's KEYED per-chain shape --
 //! `[settlement.evm]` + `[settlement.evm.key]` and `[settlement.solana]` +
@@ -81,17 +80,15 @@
 //! alongside the rest for the verbatim case and stripped again for the
 //! anvil case, which boots the EVM leg only. There is no local `anvil`
 //! equivalent standing by here: the committed leg names public Solana
-//! devnet (`https://api.devnet.solana.com`) and a program deployed on that
-//! cluster, and `SolanaSettlementBackend::connect` does not merely read --
-//! it fetches the program and mint accounts, refuses a payer with no
-//! lamports, and on a key's first start submits a transaction
-//! (`ensure_own_ata_exists`), so booting it would make this test suite
-//! depend on public-internet reachability, on a third party's rate limits,
-//! and on a FUNDED devnet account whose key this sandbox cannot have. A
-//! chain-backed Solana case would need a `solana-test-validator` with
-//! `packages/solana-program` deployed into it (the shape
+//! devnet (`https://api.devnet.solana.com`), and the Solana backend's
+//! connect does not merely read -- it fetches the program and mint accounts
+//! and refuses a key with no lamports, so booting it would make this test
+//! suite depend on public-internet reachability, on a third party's rate
+//! limits, and on a FUNDED devnet account whose key this sandbox cannot
+//! have. A chain-backed Solana case would need a `solana-test-validator`
+//! with `payment-channels` in genesis (the shape
 //! `connector-settlement-solana`'s own tests use) and a retargeted
-//! `program_id`/`token_address`; that is a different, heavier test than
+//! `token_address`; that is a different, heavier test than
 //! this module's "the committed file starts" question, and it is not
 //! written here. Both files' Solana identity is still checked, just more
 //! weakly and in fewer places than the EVM leg's: a substring `.contains`
@@ -112,8 +109,7 @@ use connector_config::{Config, SettlementConfig, TransportPolicy};
 use connector_domain::{
     agreed_required_transport, published_required_transport, EnvelopeRequest, Prepare,
 };
-use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
-use connector_settlement_evm::EvmSettlementBackend;
+use connector_settlement_evm::test_support::{require_anvil, Anvil};
 
 mod support;
 use support::{parse_json_log_addr, write_config, write_raw_key_file};
@@ -527,30 +523,23 @@ fn without_live_settlement(raw: &str) -> String {
     stripped
 }
 
-/// Point an uncommented `[settlement.evm]` block at a real, disposable,
-/// freshly deployed local chain. `decimals` and the key location stay the
-/// literal committed content.
+/// Point an uncommented `[settlement.evm]` block at a real, disposable local
+/// chain with x402 placed. `decimals`, the EIP-712 domain and the key
+/// location stay the literal committed content.
 ///
-/// The committed values it looks for are the same [`FLEET_LIVE_REGISTRY`] and
-/// [`EXPECTED_SETTLEMENT_TOKEN_ADDRESS`] constants the identity test asserts,
-/// rather than per-call arguments: every fleet file names that one pair, and
-/// reading both off one constant apiece is what keeps the substitution and
+/// The committed token it looks for is the same
+/// [`EXPECTED_SETTLEMENT_TOKEN_ADDRESS`] constant the identity test asserts,
+/// rather than a per-call argument, which is what keeps the substitution and
 /// the identity check from drifting apart.
 fn with_anvil_settlement(
     raw: &str,
     anvil_rpc_url: &str,
-    contract_address: ethers::types::Address,
     token_address: ethers::types::Address,
 ) -> String {
     let replaced = replace_expecting_a_match(
         raw,
         "rpc_url = \"https://base-sepolia-rpc.publicnode.com\"",
         &format!("rpc_url = \"{anvil_rpc_url}\""),
-    );
-    let replaced = replace_expecting_a_match(
-        &replaced,
-        &format!("contract_address = \"{FLEET_LIVE_REGISTRY}\""),
-        &format!("contract_address = \"{contract_address:?}\""),
     );
     replace_expecting_a_match(
         &replaced,
@@ -1181,48 +1170,35 @@ async fn the_relay_route_is_btp_only_and_the_store_routes_accept_both() {
     );
 }
 
-/// Deploy a fresh `TokenNetworkRegistry`, a `TokenNetwork` through it, and
-/// its mock USDC on a disposable local chain. The returned [`Anvil`] must
-/// stay alive for as long as the addresses beside it are used.
-async fn deploy_settlement_on_anvil() -> (Anvil, ethers::types::Address, ethers::types::Address) {
+/// Place x402 and deploy a FiatToken USDC on a disposable local chain: what
+/// a node settling on EVM needs to boot (ADR 0075 decision 1). The returned
+/// [`Anvil`] must stay alive for as long as the address beside it is used.
+async fn deploy_settlement_on_anvil() -> (Anvil, ethers::types::Address) {
     let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
-    let token =
-        EvmSettlementBackend::deploy_mock_token(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, 1_000_000)
-            .await
-            .expect("deploy mock USDC");
-    let settlement = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("deploy a TokenNetwork through a fresh registry");
-    let registry_address = settlement.registry_address();
-    drop(settlement);
-    (anvil, registry_address, token)
+    let mut x402 =
+        connector_settlement_evm::test_support::x402::X402Chain::place(&anvil.rpc_url).await;
+    let token = x402.deploy_fiat_token().await;
+    (anvil, token)
 }
 
-/// The registry every fleet file's LIVE `[settlement.evm]` section names --
-/// the deployed Base Sepolia `TokenNetworkRegistry` (#576, #577), repointed
-/// here by the ERC-2771 cutover (#695/#811, broadcast 2026-08-06,
-/// `docs/evm-deployment.md`). The anvil cases replace exactly this committed
-/// value, so they double as the guard that the committed sections keep
-/// naming it; [`every_fleet_configs_settlement_evm_leg_matches_the_live_identity`]
-/// below asserts it directly, as parsed, for both surviving files.
+/// The deployed Base Sepolia `TokenNetworkRegistry` (#576, #577, repointed by
+/// the ERC-2771 cutover #695/#811) that the devnet's other services -- the
+/// swap maker and the public endpoints document -- still name. No connector
+/// config does since ADR 0075 (#1385): `contract_address` is refused by name.
 const FLEET_LIVE_REGISTRY: &str = "0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5";
 
 /// The retired pre-ERC-2771 `TokenNetworkRegistry` [`FLEET_LIVE_REGISTRY`]
-/// replaced -- `docs/evm-deployment.md`'s "Current live deployment
-/// (pre-cutover)" table and its "Rollback: one step" section, which names
-/// this exact address as what a rollback reverts `contract_address` to. Not
-/// itself asserted against any committed file; named only so a regression
-/// back to it is called out by address in the identity test's failure
-/// message, not left for a reader to recognise on sight.
+/// replaced -- `docs/evm-deployment.md`'s "Rollback: one step" target. Named
+/// so the public endpoints document is held not to advertise it.
 const SETTLEMENT_CONTRACT_ADDRESS_ROLLBACK_TARGET: &str =
     "0xcC9079adE929b168B54145f6d25262b64FAB9D5b";
 
-/// Both fleet files' Solana leg (`https://api.devnet.solana.com`) and the
-/// deployed `payment-channel` program they settle through, wired in #633 --
-/// asserted as literals here, exactly like [`FLEET_LIVE_REGISTRY`] and
-/// [`EXPECTED_STORE_PRICE`], so that reading the expected values back out of the
-/// file under test cannot make this pass on a file that drifted.
-const FLEET_SOLANA_PROGRAM_ID: &str = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip";
+/// Both fleet files' Solana leg (`https://api.devnet.solana.com`) settles in
+/// this mint, asserted as a literal here, exactly like
+/// [`EXPECTED_SETTLEMENT_TOKEN_ADDRESS`] and [`EXPECTED_STORE_PRICE`], so that
+/// reading the expected value back out of the file under test cannot make
+/// this pass on a file that drifted.
+///
 /// The mint moved on 2026-08-27, and the reason is worth keeping next to the
 /// literal. The 2026-07-18 mint (`xyc5J8Mg...`) is still on chain and still
 /// holds its supply, but its MINT AUTHORITY was a key that lived outside the
@@ -1259,9 +1235,8 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 /// Every fleet config's `[settlement.evm]` leg -- store and relay alike --
-/// must name the identical registry, asset and precision: a claim or
-/// channel a buyer opened against one `TokenNetworkRegistry`/token is
-/// unresolvable by a box pointed at a different one. The boot tests below
+/// must name the identical asset and precision: a channel a buyer opened in
+/// one token is no use to a box settling in a different one. The boot tests below
 /// assert the same property for store/relay with a substring `.contains`
 /// check against the committed text; this asserts it as PARSED, typed
 /// values against literal constants instead, which is what actually catches
@@ -1274,10 +1249,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// cases, which are skipped there.
 ///
 /// Failure messages name both the expected literal and the value actually
-/// found, per issue #852 -- including calling out
-/// [`SETTLEMENT_CONTRACT_ADDRESS_ROLLBACK_TARGET`] by address, so a silent
-/// revert to the retired pre-ERC-2771 registry is named rather than just
-/// failed.
+/// found, per issue #852.
 #[test]
 fn every_fleet_configs_settlement_evm_leg_matches_the_live_identity() {
     for (label, raw) in [("store", STORE_CONFIG), ("relay", RELAY_CONFIG)] {
@@ -1298,16 +1270,6 @@ fn every_fleet_configs_settlement_evm_leg_matches_the_live_identity() {
                 SettlementConfig::Solana(_) => None,
             })
             .unwrap_or_else(|| panic!("the {label} config must carry a live [settlement.evm] leg"));
-
-        let contract_address = format!("0x{}", hex_lower(evm.contract_address().as_slice()));
-        assert_eq!(
-            contract_address.to_lowercase(),
-            FLEET_LIVE_REGISTRY.to_lowercase(),
-            "the {label} config's [settlement.evm] contract_address must be the live \
-             TokenNetworkRegistry {FLEET_LIVE_REGISTRY} (expected), found {contract_address} -- \
-             {SETTLEMENT_CONTRACT_ADDRESS_ROLLBACK_TARGET} is the retired pre-ERC-2771 registry \
-             and must not be accepted silently"
-        );
 
         let token_address = format!("0x{}", hex_lower(evm.token_address().as_slice()));
         assert_eq!(
@@ -1338,7 +1300,7 @@ async fn the_store_devnet_settlement_section_boots_against_a_deployed_contract()
     if !require_anvil() {
         return;
     }
-    let (anvil, contract_address, token) = deploy_settlement_on_anvil().await;
+    let (anvil, token) = deploy_settlement_on_anvil().await;
 
     let key_file = write_raw_key_file(9);
     let state_dir = tempfile::tempdir().expect("temp state dir");
@@ -1368,22 +1330,16 @@ async fn the_store_devnet_settlement_section_boots_against_a_deployed_contract()
          names its chain by its own key"
     );
     assert!(
-        STORE_CONFIG.contains(FLEET_LIVE_REGISTRY),
-        "the store leg must name the fleet's deployed TokenNetworkRegistry \
-         ({FLEET_LIVE_REGISTRY}) -- a buyer's channel lives on one \
-         deployment, and a node pointed elsewhere cannot resolve it"
-    );
-    assert!(
-        STORE_CONFIG.contains(FLEET_SOLANA_PROGRAM_ID)
+        STORE_CONFIG.contains(EXPECTED_SETTLEMENT_TOKEN_ADDRESS)
             && STORE_CONFIG.contains(FLEET_SOLANA_USDC_MINT),
-        "the store leg must name the fleet's Solana payment-channel program \
-         and mint, for the same reason"
+        "the store leg must name the fleet's token and mint -- a buyer's \
+         channel is in one token, and a node settling in another cannot take it"
     );
 
     // Anvil stands in for Base Sepolia; the Solana leg is stripped because
     // there is no local validator in this test (see the module docs).
     let text = without_sections(STORE_CONFIG, SOLANA_SETTLEMENT_SECTIONS);
-    let text = with_anvil_settlement(&text, &anvil.rpc_url, contract_address, token);
+    let text = with_anvil_settlement(&text, &anvil.rpc_url, token);
     let text = replace_expecting_a_match(
         &text,
         "key_file = \"/app/data/settlement.key\"",
@@ -1407,7 +1363,7 @@ async fn the_relay_devnet_settlement_section_boots_against_a_deployed_contract()
     if !require_anvil() {
         return;
     }
-    let (anvil, contract_address, token) = deploy_settlement_on_anvil().await;
+    let (anvil, token) = deploy_settlement_on_anvil().await;
 
     let key_file = write_raw_key_file(9);
     let state_dir = tempfile::tempdir().expect("temp state dir");
@@ -1421,22 +1377,16 @@ async fn the_relay_devnet_settlement_section_boots_against_a_deployed_contract()
          `[settlement.<chain>]` shape (issue #628), like the store"
     );
     assert!(
-        RELAY_CONFIG.contains(FLEET_LIVE_REGISTRY),
-        "the relay leg must name the same deployed TokenNetworkRegistry as \
-         the store ({FLEET_LIVE_REGISTRY}) -- a buyer's channel lives on one \
-         deployment, and a node pointed elsewhere cannot resolve it"
-    );
-    assert!(
-        RELAY_CONFIG.contains(FLEET_SOLANA_PROGRAM_ID)
+        RELAY_CONFIG.contains(EXPECTED_SETTLEMENT_TOKEN_ADDRESS)
             && RELAY_CONFIG.contains(FLEET_SOLANA_USDC_MINT),
-        "the relay leg must name the same Solana payment-channel program and \
-         mint as the store, for the same reason"
+        "the relay leg must name the same token and mint as the store, for the \
+         same reason"
     );
 
     // Anvil stands in for Base Sepolia; the Solana leg is stripped for the
     // same reason the store's is -- there is no local validator in this test.
     let text = without_sections(RELAY_CONFIG, SOLANA_SETTLEMENT_SECTIONS);
-    let text = with_anvil_settlement(&text, &anvil.rpc_url, contract_address, token);
+    let text = with_anvil_settlement(&text, &anvil.rpc_url, token);
     let text = replace_expecting_a_match(
         &text,
         "key_file = \"/app/data/settlement.key\"",

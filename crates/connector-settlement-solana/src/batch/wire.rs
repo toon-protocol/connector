@@ -629,7 +629,6 @@ pub fn reclaim_instruction(
     }
 }
 
-
 /// The Ed25519-precompile instruction a voucher's `settle` or
 /// `settle_and_seal` is preceded by, from a signature this node was handed
 /// rather than one it produces itself.

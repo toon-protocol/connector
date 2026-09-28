@@ -295,7 +295,7 @@ mod tests {
         let channel = evm();
         let key = channel.channel_key();
         let entries = vec![
-            channel.clone().to_entry(),
+            channel.to_entry(),
             JournalEntry::InboundClaimAccepted {
                 channel_id: key.clone(),
                 nonce: connector_domain::VOUCHER_WATERMARK_NONCE,
@@ -345,7 +345,7 @@ mod tests {
                 amount: 7,
             },
         ] {
-            let entries = vec![voucher.clone().to_entry(), entry.clone()];
+            let entries = vec![voucher.to_entry(), entry.clone()];
             assert_eq!(
                 first_toon_channel_entry(&entries),
                 Some(toon.clone()),

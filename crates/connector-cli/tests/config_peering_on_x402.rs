@@ -49,7 +49,6 @@ use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
-use connector_settlement_evm::EvmSettlementBackend;
 use connector_signer::giftwrap::{open_response, seal_request};
 use connector_signer::PublicKeyBytes;
 use ed25519_dalek::Keypair;
@@ -169,14 +168,12 @@ fn sealed_prepare(
     )
 }
 
-/// One chain: anvil, x402 placed, a FiatToken USDC, the `TokenNetwork`
-/// registry `[settlement.evm]` still boots through until #1385, and both
-/// settlement accounts holding [`FUNDED`] USDC.
+/// One chain: anvil, x402 placed, a FiatToken USDC, and both settlement
+/// accounts holding [`FUNDED`] USDC.
 struct Chain {
     anvil: Anvil,
     x402: X402Chain,
     token: Address,
-    registry: Address,
 }
 
 impl Chain {
@@ -184,38 +181,10 @@ impl Chain {
         let anvil = Anvil::spawn(ANVIL_BASE_PORT + offset).await;
         let mut x402 = X402Chain::place(&anvil.rpc_url).await;
         let token = x402.deploy_fiat_token().await;
-        let registry = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-            .await
-            .expect("a TokenNetwork registry for the settlement table")
-            .registry_address();
         for key in [DEPLOYER_PRIVATE_KEY, COUNTERPARTY_PRIVATE_KEY] {
             x402.mint(token, address_of(key), FUNDED).await;
         }
-        Chain {
-            anvil,
-            x402,
-            token,
-            registry,
-        }
-    }
-
-    /// Whether `TokenNetwork` holds a channel between the two keys: what a
-    /// config-declared peering opened before ADR 0075, and must not now.
-    async fn token_network_channel_between_the_nodes(&self) -> bool {
-        EvmSettlementBackend::connect(
-            &connector_settlement_evm::RpcTransport::direct(&self.anvil.rpc_url)
-                .expect("rpc transport"),
-            COUNTERPARTY_PRIVATE_KEY,
-            self.registry,
-            self.token,
-            6,
-        )
-        .await
-        .expect("a TokenNetwork reader")
-        .channel_with(address_of(DEPLOYER_PRIVATE_KEY))
-        .await
-        .expect("ask TokenNetwork")
-        .is_some()
+        Chain { anvil, x402, token }
     }
 }
 
@@ -364,7 +333,6 @@ key_file = "{settlement_key}"
             settlement_key = self.settlement_key_file.path().display(),
             write_key = write_key_hex(&self.operator),
             rpc_url = chain.anvil.rpc_url,
-            registry = chain.registry,
             token = chain.token,
         )
     }
@@ -627,10 +595,6 @@ async fn a_config_declared_peering_pays_both_ways(carriage: Carriage, offset: u1
             deposit
         );
     }
-    assert!(
-        !chain.token_network_channel_between_the_nodes().await,
-        "a config-declared peering opens no TokenNetwork channel"
-    );
 
     // ── B's journal loses its vouchers: claim-state recovers it ──────────
     // Over HTTP, where each request reaches whichever process holds the

@@ -44,8 +44,8 @@ pub use batch_channels::{
 pub use claim::{ClaimAckOutcome, ClaimRejectReason, Covering};
 pub use clock::{Clock, SystemClock, TestClock};
 pub use connector::{
-    ClientRouteFacts, ClientRouteKind, ClientRoutePrice, ConfigPeeringError,
-    Connector, LeaseRouteError, PeerRouteTableError, ProbeDenied,
+    ClientRouteFacts, ClientRouteKind, ClientRoutePrice, ConfigPeeringError, Connector,
+    LeaseRouteError, PeerRouteTableError, ProbeDenied,
 };
 // Re-exported for callers that hold a `Connector` but not a config-crate
 // dependency of their own (`connector-operator`): the chain key an x402
@@ -54,9 +54,8 @@ pub use connector_config::{SettlementChain, UnknownSettlementChain};
 pub use journal::{FileJournal, InMemoryJournal, Journal, JournalError};
 pub use metrics::Metrics;
 pub use operator_view::{
-    ClaimBookKind, ClaimDirection, ClaimScheme, ClaimView,
-    DeclaredRates, LeasedRouteView, PeerRouteView, PeerView, RateView, RateViewState,
-    RefusedRefreshView, RouteSource, RouteView,
+    ClaimBookKind, ClaimDirection, ClaimScheme, ClaimView, DeclaredRates, LeasedRouteView,
+    PeerRouteView, PeerView, RateView, RateViewState, RefusedRefreshView, RouteSource, RouteView,
 };
 // What this node puts on a peer carriage when it pays over one of its own
 // x402 channels (ADR 0075 decisions 5 and 6), and how it asks the receiver

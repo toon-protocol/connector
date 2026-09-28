@@ -1,36 +1,81 @@
-//! Issue #630: `SolanaSettlementBackend::connect`'s fail-closed identity
-//! checks. `deploy` and the contract suite already prove program-reachable
-//! and mint-owned-by-SPL-Token (issue #567); these are the "fuller" checks
-//! `connect`'s own doc deferred to this later issue -- the configured
-//! `decimals` must agree with the mint's own `decimals` field (the same
-//! `#564` rule `EvmSettlementBackend::connect` already enforces for its
-//! ERC-20's `decimals()`), and the configured `program_id` must actually
-//! behave like the deployed payment-channel program, not merely be
-//! executable (`verify_program_identity`, this issue's review finding 2).
-
-use std::str::FromStr;
+//! `SolanaBatchSettlement::connect`'s fail-closed boot checks (ADR 0075
+//! decision 1, issue #1385; the `#564` decimals rule, issue #630; the
+//! genesis-hash network, issue #1131; ADR 0073 decision 5's retried reads):
+//! a chain without `payment-channels` is refused by name, a mint must be
+//! the SPL Token program's and agree with the configured `decimals`, and
+//! the network is read off the chain's own genesis hash.
 
 use connector_chain_rpc::{FakeRpc, RpcReply};
-use connector_settlement_solana::SolanaSettlementBackend;
+use connector_settlement::batch::BatchSettlementError;
+use connector_settlement_solana::batch::SolanaBatchSettlement;
+use connector_settlement_solana::RpcTransport;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signer;
+use solana_sdk::signature::{Keypair, Signer};
 
 use connector_settlement_solana::test_support::{
-    fund, require_solana_test_validator, SolanaValidator, LOCAL_TEST_PROGRAM_ID,
+    create_mint, fund, require_solana_test_validator, SolanaValidator,
 };
 
-/// A funded ed25519 seed [`SolanaSettlementBackend::connect`] can sign
-/// transactions with -- `connect` submits one on a key's first start
-/// (`ensure_own_ata_exists`, when the token account is missing), and refuses
-/// an unfunded payer by name, so the identity it binds to needs real
-/// lamports, exactly as a freshly generated production signer would on a
-/// real cluster.
+const ONE_DAY: u64 = 86_400;
+
+/// A funded ed25519 seed: `connect` refuses a key holding no lamports by
+/// name, so the identity it binds to needs real lamports, exactly as a
+/// freshly generated production signer would on a real cluster.
 async fn funded_seed(rpc: &RpcClient, seed: [u8; 32]) -> [u8; 32] {
     let payer = solana_sdk::signer::keypair::keypair_from_seed(&seed).expect("derive keypair");
     fund(rpc, &payer.pubkey()).await;
     seed
+}
+
+async fn connect(
+    rpc_url: &str,
+    seed: &[u8; 32],
+    mint: Pubkey,
+    decimals: u8,
+) -> Result<SolanaBatchSettlement, BatchSettlementError> {
+    SolanaBatchSettlement::connect(
+        &RpcTransport::direct(rpc_url).expect("rpc transport"),
+        seed,
+        mint,
+        decimals,
+        ONE_DAY,
+        1,
+    )
+    .await
+}
+
+/// A validator, an RPC client on it, and a 6-decimal SPL mint.
+async fn chain() -> (SolanaValidator, RpcClient, Pubkey) {
+    let validator = SolanaValidator::spawn().await;
+    let rpc =
+        RpcClient::new_with_commitment(validator.rpc_url.clone(), CommitmentConfig::confirmed());
+    let authority = Keypair::new();
+    fund(&rpc, &authority.pubkey()).await;
+    let mint = create_mint(&rpc, &authority, 6).await;
+    (validator, rpc, mint)
+}
+
+/// ADR 0075 decision 1: a chain `payment-channels` has not deployed to is
+/// refused by name, not bound to admit nothing and say nothing.
+#[tokio::test]
+async fn connect_refuses_a_chain_without_payment_channels_by_name() {
+    if !require_solana_test_validator() {
+        return;
+    }
+    let validator = SolanaValidator::spawn_without_payment_channels().await;
+    let rpc =
+        RpcClient::new_with_commitment(validator.rpc_url.clone(), CommitmentConfig::confirmed());
+    let seed = funded_seed(&rpc, [4u8; 32]).await;
+
+    let Err(error) = connect(&validator.rpc_url, &seed, Pubkey::new_unique(), 6).await else {
+        panic!("bound on a chain without payment-channels");
+    };
+    assert!(
+        matches!(&error, BatchSettlementError::NotDeployed(what) if what.contains("payment-channels")),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -38,238 +83,75 @@ async fn connect_refuses_a_decimals_mismatch_naming_both_values() {
     if !require_solana_test_validator() {
         return;
     }
+    let (validator, rpc, mint) = chain().await;
+    let seed = funded_seed(&rpc, [5u8; 32]).await;
 
-    let validator = SolanaValidator::spawn().await;
-    let program_id = Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
-    // `deploy` creates a fresh 6-decimal mint (see its own doc/body).
-    let deployed = SolanaSettlementBackend::deploy(&validator.rpc_url, program_id)
-        .await
-        .expect("bind to the genesis-loaded payment-channel program");
-    let token_mint = deployed.token_mint();
-
-    let rpc =
-        RpcClient::new_with_commitment(validator.rpc_url.clone(), CommitmentConfig::confirmed());
-    let seed = funded_seed(&rpc, [3u8; 32]).await;
-
-    let Err(error) = SolanaSettlementBackend::connect(
-        &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
-            .expect("rpc transport"),
-        &seed,
-        program_id,
-        token_mint,
-        9,
-    )
-    .await
-    else {
-        panic!("a decimals the mint disagrees with must refuse to connect");
+    let Err(error) = connect(&validator.rpc_url, &seed, mint, 9).await else {
+        panic!("bound over a decimals the mint disagrees with");
     };
     let message = error.to_string();
     assert!(
-        message.contains("decimals is 9") && message.contains("decimals = 6"),
-        "the failure must name both the configured and the on-chain decimals: {message}"
+        message.contains('9') && message.contains('6'),
+        "the refusal names both values: {message}"
     );
 }
 
+/// Token-2022 stays refused (ADR 0075 decision 1): a mint any program but
+/// SPL Token owns is refused at boot.
 #[tokio::test]
-async fn connect_succeeds_when_decimals_agree() {
+async fn connect_refuses_a_mint_the_spl_token_program_does_not_own() {
     if !require_solana_test_validator() {
         return;
     }
-
     let validator = SolanaValidator::spawn().await;
-    let program_id = Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
-    let deployed = SolanaSettlementBackend::deploy(&validator.rpc_url, program_id)
-        .await
-        .expect("bind to the genesis-loaded payment-channel program");
-    let token_mint = deployed.token_mint();
-
-    let rpc =
-        RpcClient::new_with_commitment(validator.rpc_url.clone(), CommitmentConfig::confirmed());
-    let seed = funded_seed(&rpc, [4u8; 32]).await;
-
-    SolanaSettlementBackend::connect(
-        &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
-            .expect("rpc transport"),
-        &seed,
-        program_id,
-        token_mint,
-        6,
-    )
-    .await
-    .expect("decimals agree with the mint, connect should succeed");
-}
-
-/// Issue #630's review, finding 2: existing-and-executable is not
-/// identity. A `program_id` naming a real, executable program that is not
-/// the payment-channel program -- SPL Token itself here, executable on
-/// every cluster including a fresh test validator -- must refuse to
-/// connect, naming the configured program id, rather than pass the coarse
-/// executability check and fail lazily at the first settle. The passing
-/// twin is `connect_succeeds_when_decimals_agree` above: the same probe
-/// runs there against the real program and lets connect through.
-#[tokio::test]
-async fn connect_refuses_a_program_id_naming_some_other_executable_program() {
-    if !require_solana_test_validator() {
-        return;
-    }
-
-    let validator = SolanaValidator::spawn().await;
-    let program_id = Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
-    let deployed = SolanaSettlementBackend::deploy(&validator.rpc_url, program_id)
-        .await
-        .expect("bind to the genesis-loaded payment-channel program");
-    let token_mint = deployed.token_mint();
-
     let rpc =
         RpcClient::new_with_commitment(validator.rpc_url.clone(), CommitmentConfig::confirmed());
     let seed = funded_seed(&rpc, [6u8; 32]).await;
+    // A system-owned account: funded, so it exists, and not a mint.
+    let not_a_mint = Keypair::new().pubkey();
+    fund(&rpc, &not_a_mint).await;
 
-    // The canonical SPL Token program id -- deliberately spelled out
-    // rather than taken from the `spl-token` crate, which is not a
-    // dev-dependency of this crate's integration tests.
-    let wrong_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-        .expect("the canonical SPL Token program id");
-    let Err(error) = SolanaSettlementBackend::connect(
-        &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
-            .expect("rpc transport"),
-        &seed,
-        wrong_program_id,
-        token_mint,
-        6,
-    )
-    .await
-    else {
-        panic!("a program_id naming some other executable program must refuse to connect");
+    let Err(error) = connect(&validator.rpc_url, &seed, not_a_mint, 6).await else {
+        panic!("bound over a mint SPL Token does not own");
     };
-    let message = error.to_string();
     assert!(
-        message.contains(&wrong_program_id.to_string()),
-        "the failure must name the configured program id: {message}"
+        error.to_string().contains("SPL Token"),
+        "the refusal names the owner it wanted: {error}"
     );
 }
 
-/// Issue #1131: `connect` reads the chain's genesis hash to learn which
-/// cluster it is on, and a `solana-test-validator` mints a fresh genesis on
-/// every run -- so it matches no published cluster hash and can never match
-/// one.
-///
-/// The load-bearing assertion is that `connect` still *succeeds*. Every
-/// `local/` topology runs against exactly this validator, so a genesis read
-/// that refused an unrecognised chain would take `make local-verify` and all
-/// three CI topologies down; `cluster()` answering `None` is the same "this
-/// node cannot say where it is, so it compares nothing" that
-/// `SolanaSettlementConfig::cluster_hint` already answers for the
-/// `solana-validator:8899` hostname those topologies configure.
+/// Issue #1131 and ADR 0074 decision 8: a `solana-test-validator` mints a
+/// fresh genesis on every run, so it names no public cluster -- and still
+/// connects, with a CAIP-2 network of its own, which every `local/`
+/// topology depends on.
 #[tokio::test]
 async fn a_test_validators_fresh_genesis_names_no_cluster_and_still_connects() {
     if !require_solana_test_validator() {
         return;
     }
-
-    let validator = SolanaValidator::spawn().await;
-    let program_id = Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
-    let deployed = SolanaSettlementBackend::deploy(&validator.rpc_url, program_id)
-        .await
-        .expect("bind to the genesis-loaded payment-channel program");
-    let token_mint = deployed.token_mint();
-
-    let rpc =
-        RpcClient::new_with_commitment(validator.rpc_url.clone(), CommitmentConfig::confirmed());
+    let (validator, rpc, mint) = chain().await;
     let seed = funded_seed(&rpc, [7u8; 32]).await;
 
-    let backend = SolanaSettlementBackend::connect(
-        &connector_settlement_solana::RpcTransport::direct(&validator.rpc_url)
-            .expect("rpc transport"),
-        &seed,
-        program_id,
-        token_mint,
-        6,
-    )
-    .await
-    .expect("a chain this connector cannot name must still be connectable");
-    assert_eq!(
-        backend.cluster(),
-        None,
-        "a fresh test-validator genesis matches no published cluster hash, so this node \
-         must record that it cannot name its cluster rather than guess one"
-    );
-
-    // And the genesis the validator actually reports really is one of the
-    // unnameable ones -- otherwise the assertion above would pass for a
-    // backend that never read the chain at all.
-    let genesis_hash = rpc
-        .get_genesis_hash()
+    let backend = connect(&validator.rpc_url, &seed, mint, 6)
         .await
-        .expect("a running validator answers getGenesisHash");
+        .expect("an unnamed chain is recorded as unnamed, never refused");
+    assert_eq!(backend.cluster(), None);
+    let genesis_hash = rpc.get_genesis_hash().await.expect("genesis hash");
     assert_eq!(
-        connector_settlement_solana::cluster_for_genesis_hash(&genesis_hash),
-        None,
-        "the validator's own genesis hash {genesis_hash} must be one no public cluster published"
+        backend.caip2_network(),
+        connector_settlement_solana::caip2_solana_network(&genesis_hash)
     );
+    assert_eq!(backend.token_program(), spl_token::id());
 }
 
 #[tokio::test]
 async fn connect_refuses_an_unreachable_rpc_endpoint() {
     // No validator spawned at all -- this must not hang or panic, just
-    // report the RPC failure through `SettlementError::Backend`.
-    let program_id = Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
-    let seed = [5u8; 32];
-    let result = SolanaSettlementBackend::connect(
-        &connector_settlement_solana::RpcTransport::direct("http://127.0.0.1:1")
-            .expect("rpc transport"),
-        &seed,
-        program_id,
-        Pubkey::new_unique(),
-        6,
-    )
-    .await;
+    // report the RPC failure.
+    let result = connect("http://127.0.0.1:1", &[5u8; 32], Pubkey::new_unique(), 6).await;
     assert!(
         result.is_err(),
         "an unreachable RPC endpoint must refuse to connect"
-    );
-}
-
-/// ADR 0073 decision 5: boot reads before it transacts. A key whose token
-/// account already exists starts without sending anything, where it used to
-/// submit the create on every start.
-#[tokio::test]
-async fn a_restart_reads_its_token_account_and_sends_no_transaction() {
-    if !require_solana_test_validator() {
-        return;
-    }
-
-    let validator = SolanaValidator::spawn().await;
-    let program_id = Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
-    let deployed = SolanaSettlementBackend::deploy(&validator.rpc_url, program_id)
-        .await
-        .expect("bind to the genesis-loaded payment-channel program");
-    let token_mint = deployed.token_mint();
-    let rpc =
-        RpcClient::new_with_commitment(validator.rpc_url.clone(), CommitmentConfig::confirmed());
-    let seed = funded_seed(&rpc, [8u8; 32]).await;
-    let transport =
-        connector_settlement_solana::RpcTransport::direct(&validator.rpc_url).expect("transport");
-
-    // First start: the token account is missing, and is created.
-    SolanaSettlementBackend::connect(&transport, &seed, program_id, token_mint, 6)
-        .await
-        .expect("first start");
-
-    // Second start, watched: the traffic is the subject here.
-    let watched = FakeRpc::spawn_in_front_of(&validator.rpc_url, |_| RpcReply::Forward).await;
-    SolanaSettlementBackend::connect(
-        &connector_settlement_solana::RpcTransport::direct(&watched.url()).expect("transport"),
-        &seed,
-        program_id,
-        token_mint,
-        6,
-    )
-    .await
-    .expect("second start");
-    assert_eq!(
-        watched.count("sendTransaction"),
-        0,
-        "a token account that exists is read, not created again"
     );
 }
 
@@ -281,31 +163,18 @@ async fn a_boot_that_loses_a_round_trip_on_every_read_still_starts() {
     if !require_solana_test_validator() {
         return;
     }
-
-    let validator = SolanaValidator::spawn().await;
-    let program_id = Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
-    let deployed = SolanaSettlementBackend::deploy(&validator.rpc_url, program_id)
-        .await
-        .expect("bind to the genesis-loaded payment-channel program");
-    let rpc =
-        RpcClient::new_with_commitment(validator.rpc_url.clone(), CommitmentConfig::confirmed());
+    let (validator, rpc, mint) = chain().await;
     let seed = funded_seed(&rpc, [9u8; 32]).await;
 
     let flaky = FakeRpc::spawn_in_front_of(&validator.rpc_url, |call| {
-        if call.nth == 0 && call.method != "sendTransaction" {
+        if call.nth == 0 {
             RpcReply::Drop
         } else {
             RpcReply::Forward
         }
     })
     .await;
-    SolanaSettlementBackend::connect(
-        &connector_settlement_solana::RpcTransport::direct(&flaky.url()).expect("transport"),
-        &seed,
-        program_id,
-        deployed.token_mint(),
-        6,
-    )
-    .await
-    .expect("every boot read is retried, so one lost round trip each is survivable");
+    connect(&flaky.url(), &seed, mint, 6)
+        .await
+        .expect("every boot read is retried, so one lost round trip each is survivable");
 }

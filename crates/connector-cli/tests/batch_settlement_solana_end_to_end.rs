@@ -22,7 +22,6 @@ use connector_settlement::ChannelId;
 use connector_settlement_solana::batch::wire::PAYMENT_CHANNELS_PROGRAM_ID;
 use connector_settlement_solana::test_support::{
     create_mint, fund, mint_to, require_solana_test_validator, BatchPayer, SolanaValidator,
-    LOCAL_TEST_PROGRAM_ID,
 };
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;

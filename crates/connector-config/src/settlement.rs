@@ -675,7 +675,6 @@ fn resolve_rpc_url(rpc_url: String) -> Result<String, ConfigError> {
     Ok(rpc_url)
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -762,8 +761,11 @@ key_file = "{key}"
     fn a_complete_evm_table_resolves_with_its_x402_terms() {
         let key_file = temp_key_file();
         let evm = single_evm(
-            resolve(&evm_table("min_withdraw_delay_secs = 3600", key_file.path()))
-                .expect("resolve"),
+            resolve(&evm_table(
+                "min_withdraw_delay_secs = 3600",
+                key_file.path(),
+            ))
+            .expect("resolve"),
         );
 
         assert_eq!(evm.rpc_url(), "http://127.0.0.1:8545");
@@ -784,8 +786,11 @@ key_file = "{key}"
     fn a_complete_solana_table_resolves_with_its_x402_terms() {
         let key_file = temp_key_file();
         let solana = single_solana(
-            resolve(&solana_table("min_grace_period_secs = 1800", key_file.path()))
-                .expect("resolve"),
+            resolve(&solana_table(
+                "min_grace_period_secs = 1800",
+                key_file.path(),
+            ))
+            .expect("resolve"),
         );
 
         assert_eq!(solana.rpc_url(), "http://127.0.0.1:8899");
@@ -896,7 +901,9 @@ key_file = "{key}"
             evm,
             ConfigError::SettlementBatchSubTableRemoved { table: "evm" }
         ));
-        assert!(evm.to_string().contains("[settlement.evm.batch_settlement]"));
+        assert!(evm
+            .to_string()
+            .contains("[settlement.evm.batch_settlement]"));
 
         let solana = resolve(&format!(
             "{}\n[solana.batch_settlement]\nmin_sponsored_deposit = 5\n",
@@ -1040,10 +1047,8 @@ key_file = "{key}"
     #[test]
     fn rejects_a_settlement_key_naming_neither_location() {
         let key_file = temp_key_file();
-        let body = evm_table("", key_file.path()).replace(
-            &format!("key_file = \"{}\"", key_file.path().display()),
-            "",
-        );
+        let body = evm_table("", key_file.path())
+            .replace(&format!("key_file = \"{}\"", key_file.path().display()), "");
         assert!(matches!(
             resolve(&body),
             Err(ConfigError::SettlementKeyLocationAmbiguous { .. })

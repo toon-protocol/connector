@@ -41,7 +41,6 @@ use connector_settlement_solana::batch::wire::{
 };
 use connector_settlement_solana::test_support::{
     create_mint, fund, mint_to, require_solana_test_validator, send, BatchPayer, SolanaValidator,
-    LOCAL_TEST_PROGRAM_ID,
 };
 use connector_signer::PublicKeyBytes;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;

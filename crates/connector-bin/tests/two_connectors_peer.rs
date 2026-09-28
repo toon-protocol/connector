@@ -74,7 +74,6 @@ use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
-use connector_settlement_evm::EvmSettlementBackend;
 use connector_signer::PublicKeyBytes;
 
 mod support;
@@ -202,7 +201,6 @@ struct Chain {
     anvil: Anvil,
     x402: X402Chain,
     token: Address,
-    registry: Address,
 }
 
 impl Chain {
@@ -215,16 +213,7 @@ impl Chain {
         let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
         let mut x402 = X402Chain::place(&anvil.rpc_url).await;
         let token = x402.deploy_fiat_token().await;
-        let registry = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-            .await
-            .expect("a TokenNetwork registry for the settlement table")
-            .registry_address();
-        Some(Chain {
-            anvil,
-            x402,
-            token,
-            registry,
-        })
+        Some(Chain { anvil, x402, token })
     }
 
     /// `[settlement.evm]`, keyed, with its x402 batch-settlement table, for
@@ -244,7 +233,6 @@ key_file = "{key_file}"
 
 "#,
             rpc_url = self.anvil.rpc_url,
-            registry = self.registry,
             token = self.token,
             key_file = key_file.display(),
         )
@@ -261,17 +249,14 @@ key_file = "{key_file}"
         receiver: Address,
         deposit: u128,
     ) -> (String, ChannelPresentation) {
-        let payer = EvmSettlementBackend::connect(
+        let payer = connector_settlement_evm::EvmBatchSettlementBackend::connect(
             &connector_settlement_evm::RpcTransport::direct(&self.anvil.rpc_url)
                 .expect("rpc transport"),
             payer_key,
-            self.registry,
             self.token,
             6,
+            WITHDRAW_DELAY_SECS,
         )
-        .await
-        .expect("connect the payer's settlement key")
-        .batch_settlement(WITHDRAW_DELAY_SECS)
         .await
         .expect("the payer's x402 half");
         let outbound = OutboundChannels::restore(

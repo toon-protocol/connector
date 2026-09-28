@@ -30,7 +30,6 @@ use connector_runtime::BatchChannelError;
 use connector_settlement::batch::BatchSettlementError;
 use connector_settlement_solana::test_support::{
     create_mint, fund, mint_to, require_solana_test_validator, SolanaValidator,
-    LOCAL_TEST_PROGRAM_ID,
 };
 use ed25519_dalek::Keypair;
 use rand::rngs::OsRng;

@@ -54,7 +54,6 @@ const SOLANA_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const PEER_VOUCHER_SIGNER: &str = "0x2222222222222222222222222222222222222222";
 /// The Solana peer's voucher signer: its settlement public key.
 const SOLANA_VOUCHER_SIGNER: &str = "8pM1DN3RiT8vbom5u1sNryaNT1nyL8CTTW3b5PwWXRBH";
-const SOLANA_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 fn run(config_path: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_connector"))

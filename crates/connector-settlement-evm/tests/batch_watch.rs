@@ -15,9 +15,7 @@ use connector_settlement::batch::{
 };
 use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
-use connector_settlement_evm::{
-    Claimed, EvmBatchSettlementBackend, EvmBatchWatcher, RpcTransport,
-};
+use connector_settlement_evm::{Claimed, EvmBatchSettlementBackend, EvmBatchWatcher, RpcTransport};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::Address;
 

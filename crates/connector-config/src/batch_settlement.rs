@@ -352,5 +352,4 @@ mod tests {
             solana("min_sponsored_deposit = 1\nmin_grace_period_secs = 31536000").expect("a year");
         assert_eq!(config.min_grace_period_secs(), 31_536_000);
     }
-
 }

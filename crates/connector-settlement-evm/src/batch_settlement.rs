@@ -75,9 +75,9 @@ use crate::bindings::x402_batch_settlement::{
     ChannelConfig, ChannelsCall, ChannelsReturn, PendingWithdrawalsCall, PendingWithdrawalsReturn,
     Voucher as X402Voucher, VoucherClaim, X402BatchSettlement,
 };
+use crate::bindings::Erc20;
 use crate::channel_id::format_channel_id;
 use crate::send::{confirm, ConfirmPolicy, Sender};
-use crate::bindings::Erc20;
 use crate::{build_client, EvmClient, RpcTransport};
 use ethers::middleware::Middleware;
 
@@ -168,7 +168,10 @@ impl EvmBatchSettlementBackend {
             )));
         }
         let on_chain_decimals = connector_chain_rpc::retry_read(|| async {
-            Erc20::new(token, Arc::clone(&client)).decimals().call().await
+            Erc20::new(token, Arc::clone(&client))
+                .decimals()
+                .call()
+                .await
         })
         .await
         .map_err(backend_error)?;

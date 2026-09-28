@@ -432,6 +432,17 @@ impl SolanaValidator {
     /// `solana-test-validator`'s arguments: `["--warp-slot", "10000"]`, say,
     /// for a test that needs a slot a fresh ledger has not reached.
     pub async fn spawn_with_args(extra: &[&str]) -> Self {
+        Self::spawn_loading(extra, true).await
+    }
+
+    /// A validator whose genesis holds no `payment-channels` at all: the
+    /// chain x402 has not deployed to that a node must refuse, by name,
+    /// to boot on (ADR 0075 decision 1). p-token is loaded as always.
+    pub async fn spawn_without_payment_channels() -> Self {
+        Self::spawn_loading(&[], false).await
+    }
+
+    async fn spawn_loading(extra: &[&str], payment_channels: bool) -> Self {
         let offset = NEXT_PORT_OFFSET.fetch_add(1, Ordering::SeqCst);
         let rpc_port = 19_900u16
             .wrapping_add((std::process::id() as u16) % 500)
@@ -448,11 +459,15 @@ impl SolanaValidator {
                 "--dynamic-port-range",
                 &format!("{}-{}", rpc_port + 2, rpc_port + 40),
             ])
-            .args([
-                "--bpf-program",
-                crate::batch::wire::PAYMENT_CHANNELS_PROGRAM_ID,
-            ])
-            .arg(payment_channels_fixture())
+            .args(if payment_channels {
+                vec![
+                    "--bpf-program".into(),
+                    crate::batch::wire::PAYMENT_CHANNELS_PROGRAM_ID.into(),
+                    payment_channels_fixture().into_os_string(),
+                ]
+            } else {
+                Vec::<std::ffi::OsString>::new()
+            })
             .args(["--bpf-program", &spl_token::id().to_string()])
             .arg(token_program_fixture())
             .args(["--reset", "--quiet"])
