@@ -81,20 +81,18 @@ fails HTTP-01 and falls back to a self-signed cert; re-run `init-letsencrypt.sh`
 ### 3. Install the Solana CLI
 
 `bootstrap.sh` installs docker, git, jq, gettext-base, openssl, ufw, curl and iptables — no Solana
-CLI. Steps 4 and 5 need one. Install **v3.1.12**, not `stable` and not a package manager's build:
+CLI. Steps 4 and 5 need one. Install **v2.1.21**, not `stable` and not a package manager's build:
 
 ```sh
-sh -c "$(curl -sSfL https://release.anza.xyz/v3.1.12/install)"
+sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.21/install)"
 export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
 ```
 
-That version is a choice, not a default. This repository installs exactly two Solana CLIs and
-`crates/connector-settlement-solana/tests/solana_cli_pins.rs` records both with their reasons; a
-case there fails the build if this line names a third. The other pin, v2.1.21, is held to the 2.1
-line by `solana-test-validator`'s io_uring requirement and the workspace's `=2.1.0` crate pins —
-neither of which exists on this box. It runs no validator and compiles no Rust: the faucet reaches
-Solana through `@solana/web3.js` inside its container and never shells out. The CLI is a bringup
-tool only, and nothing needs it again after step 5.
+That version is a choice, not a default: it is the one Solana CLI this repository installs
+anywhere, and `crates/connector-settlement-solana/tests/solana_cli_pins.rs` records why and fails
+the build if this line names a different one. This box runs no validator and compiles no Rust: the
+faucet reaches Solana through `@solana/web3.js` inside its container and never shells out. The CLI
+is a bringup tool only, and nothing needs it again after step 5.
 
 ### 4. The treasury key
 

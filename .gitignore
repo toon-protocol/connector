@@ -48,14 +48,6 @@ coverage/
 # Deployer wallet (NEVER commit private keys)
 deployer-wallet.json
 
-# Solana deployment output (environment-specific).
-# deploy.sh writes program-id.json and overwrites it on every deploy, so
-# operators who run against more than one cluster keep per-network copies
-# beside it (program-id.mainnet.json and so on). Those are the same artifact
-# and want the same rule -- match them rather than let the next one show up
-# untracked.
-tools/solana/program-id*.json
-
 # Testnet wallets (contains private keys for testing)
 testnet-wallets.json
 

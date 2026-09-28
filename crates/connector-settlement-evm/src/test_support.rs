@@ -26,9 +26,8 @@ mod mock_erc20 {
     ethers::contract::abigen!(MockErc20, "./contracts/MockERC20.json");
 }
 
-/// Anvil's first well-known dev account -- the same one
-/// `packages/contracts/script/DeployLocal.s.sol` already uses as its
-/// deployer, so this test harness's choice of key is not a new
+/// Anvil's first well-known dev account -- the same one `infra/anvil/seed.sh`
+/// uses as its deployer, so this test harness's choice of key is not a new
 /// convention.
 pub const DEPLOYER_PRIVATE_KEY: &str =
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";

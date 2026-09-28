@@ -5,16 +5,13 @@
     "init_hook": [
       "rustup default stable 2>/dev/null || true",
       "rustup component add rustfmt clippy 2>/dev/null || true",
-      "rustup target add bpfel-unknown-unknown 2>/dev/null || true",
       "export PATH=\"$HOME/.local/share/solana/install/active_release/bin:$PATH\"",
-      "command -v solana >/dev/null 2>&1 || sh -c \"$(curl -sSfL https://release.anza.xyz/v3.1.12/install)\""
+      "command -v solana >/dev/null 2>&1 || sh -c \"$(curl -sSfL https://release.anza.xyz/v2.1.21/install)\""
     ],
     "scripts": {
       "build": "npm ci && npm run build",
       "lint": "npm run lint",
-      "test": "make test",
-      "solana-build": "cd packages/solana-program && cargo build-sbf --tools-version v1.52",
-      "forge-build": "cd packages/contracts && forge build"
+      "test": "make test"
     }
   }
 }

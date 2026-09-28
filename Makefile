@@ -1,16 +1,14 @@
 # Development workflow commands for Connector
 # Run 'make help' to see all available commands
 
-.PHONY: help build test lint contracts-libs local-build local-preflight local-up local-down local-logs local-rehearse local-verify rust-build rust-test anvil-up anvil-down anvil-logs solana-up solana-down solana-logs solana-mint-usdc solana-build solana-test solana-deploy-devnet infra-up infra-down
+.PHONY: help build test lint local-build local-preflight local-up local-down local-logs local-rehearse local-verify rust-build rust-test anvil-up anvil-down anvil-logs solana-up solana-down solana-logs solana-mint-usdc infra-up infra-down
 
-# Who the `anvil` compose service runs as. That service bind-mounts
-# ./packages/contracts READ-WRITE and forge writes out/, cache/, broadcast/ and
-# — on a checkout whose submodules are not initialized — lib/ into it, so the
-# container's uid decides who owns the developer's source tree afterwards. As
-# root it left artefacts the developer could not rebuild or even delete, which
-# surfaced later and elsewhere as a failing `cargo test` (`abi_provenance`
-# reruns `forge build`). Exported so every `docker compose` this Makefile runs
-# picks it up; see the `user:` key in docker-compose.yml for the long version.
+# Exported so every `docker compose` this Makefile runs picks it up. The
+# anvil service used to bind-mount ./packages/contracts READ-WRITE, which is
+# what this pair originally kept host-owned; that package, and the git
+# submodules it vendored, left the repository in issue #1386, and the anvil
+# service now mounts its inputs read-only (infra/anvil, and
+# crates/connector-settlement-evm/contracts for the committed x402 bytecode).
 export HOST_UID := $(shell id -u)
 export HOST_GID := $(shell id -g)
 
@@ -47,11 +45,6 @@ help:
 	@echo "  make infra-up             Start every chain the connector settles on (EVM + Solana)"
 	@echo "  make infra-down           Stop them (volumes preserved)"
 	@echo ""
-	@echo "Solana Program:"
-	@echo "  make solana-build         Build Solana payment channel program"
-	@echo "  make solana-test          Run Solana program tests"
-	@echo "  make solana-deploy-devnet Deploy Solana program to devnet"
-	@echo ""
 	@echo "Local topologies (the shipped image against real chains):"
 	@echo "  make local-up             Build the image, start the chains, provision keys, run it"
 	@echo "  make local-rehearse       Send a real packet through it; non-zero unless fulfilled"
@@ -71,7 +64,7 @@ rust-build:
 
 # Run the Rust workspace tests, matching ci.yml's Rust Workspace Gate.
 rust-test:
-	cargo test --workspace --exclude payment-channel
+	cargo test --workspace
 
 # Build the surviving npm workspaces (devnet faucet tooling).
 build:
@@ -88,17 +81,6 @@ test:
 # Run linter
 lint:
 	npm run lint
-
-# packages/contracts' two git submodules, at the revisions this repository
-# pins, before anything compiles them -- which is now only a host-side
-# `forge build`, `abi_provenance` above all (issue #1121). No local chain
-# compiles them any more: the `anvil` service places committed x402 bytecode
-# (infra/anvil/seed.sh, ADR 0075), so no target that starts it needs this.
-#
-# Cheap and quiet when the tree is already right (~20ms), and it declines
-# rather than fails where there is no git checkout to read a pin out of.
-contracts-libs:
-	@./tools/contracts/init-libs.sh
 
 # Local Blockchain — EVM (Anvil + Faucet)
 anvil-up:
@@ -372,54 +354,3 @@ local-verify: local-preflight
 	$(MAKE) local-down; \
 	exit $$status
 
-# Solana Payment Channel Program
-# Prepend the Solana CLI bin dir (ships `cargo-build-sbf`) to PATH so the build
-# works even when that dir isn't on the caller's PATH (issue #238). Harmless if
-# already present or absent.
-SOLANA_BIN := $(HOME)/.local/share/solana/install/active_release/bin
-# Via tools/solana/build-sbf.sh rather than `cargo build-sbf` directly: on a
-# machine (or runner) whose $HOME/.cache/solana does not exist yet, the pinned
-# build panics before it reaches the network. The script's header has the
-# details; it is what makes `make solana-build` -- and so `make local-up` and
-# the local-topologies workflow -- bootstrap from cold instead of depending on
-# a CI cache entry having been written by some other job.
-solana-build:
-	cd packages/solana-program && PATH="$(SOLANA_BIN):$$PATH" $(CURDIR)/tools/solana/build-sbf.sh
-
-# Asked of the script that applies it rather than written out again, so this
-# target and tools/solana/build-sbf.sh cannot name different lines. Recursively
-# expanded (`=`, not `:=`) so `make help` does not shell out for it.
-PLATFORM_TOOLS_VERSION = $(shell $(CURDIR)/tools/solana/build-sbf.sh --print-tools-version)
-# Pinned, and after solana-build, for two reasons that are easy to miss because
-# `cargo test-sbf` looks like it only runs tests.
-#
-# It BUILDS: solana-program's tests call `ProgramTest::new`, which loads
-# target/deploy/payment_channel.so when one is there instead of running the
-# processor natively -- which is the whole reason this target is test-sbf and
-# not `cargo test`. Bare, it built that .so with whatever line the installed
-# CLI defaults to (v1.43 on the 2.1 line this repository installs to RUN the
-# program), so the on-chain program's own gate ran against a binary CI never
-# tests: ci.yml's solana-program job passes --tools-version v1.52. A local gate
-# on a different toolchain than the gate is not the gate.
-#
-# It also WRITES target/deploy/payment_channel.so, which
-# connector-settlement-solana's validator harness and infra/solana/entrypoint.sh
-# both load. Leaving a v1.43 binary there was this repository's one reachable
-# way to get two platform-tools lines into one cargo target directory -- see
-# reason (4) in tools/solana/build-sbf.sh's header for what that used to do.
-#
-# The solana-build dependency is not just ordering: a bare pinned
-# `cargo test-sbf` on a cold $HOME/.cache/solana hits exactly the panic
-# build-sbf.sh exists to prevent. Running it first bootstraps the cache and
-# installs the pinned line, after which the version check short-circuits
-# offline and this cannot flake.
-solana-test: solana-build
-	cd packages/solana-program && PATH="$(SOLANA_BIN):$$PATH" cargo test-sbf --tools-version $(PLATFORM_TOOLS_VERSION)
-
-solana-deploy-devnet:
-ifndef DEPLOYER_KEYPAIR
-	$(error DEPLOYER_KEYPAIR is not set. Usage: make solana-deploy-devnet DEPLOYER_KEYPAIR=path/to/keypair.json [UPGRADE_AUTHORITY=path/to/authority.json] [PROGRAM_ID=<pubkey>])
-endif
-	./tools/solana/deploy.sh --network devnet --keypair $(DEPLOYER_KEYPAIR) \
-		$(if $(UPGRADE_AUTHORITY),--upgrade-authority $(UPGRADE_AUTHORITY)) \
-		$(if $(PROGRAM_ID),--program-id $(PROGRAM_ID))

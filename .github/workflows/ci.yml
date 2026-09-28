@@ -56,11 +56,10 @@ jobs:
   # plus README.md, CONTEXT.md and CLAUDE.md; record_numbers_are_taken_once.rs
   # reads docs/adr's filenames and its index; vendored_rfcs_are_unmodified.rs
   # diffs docs/rfcs/; documented_config_keys.rs reads
-  # docs/protocol/configuration-spec.md; solana_program_ids.rs walks every
-  # tracked file. So a docs-only PR runs exactly those harnesses in
-  # `docs-gate` below, with no chain binary installed, instead of the whole
-  # workspace. Anything that is not Markdown -- a workflow, a TOML, a key
-  # file, a Makefile -- is code and gets the full gate.
+  # docs/protocol/configuration-spec.md. So a docs-only PR runs exactly those
+  # harnesses in `docs-gate` below, with no chain binary installed, instead of
+  # the whole workspace. Anything that is not Markdown -- a workflow, a TOML, a
+  # key file, a Makefile -- is code and gets the full gate.
   #
   # A `push` to main is never docs-only: the post-merge signal stays whole.
   changes:
@@ -238,12 +237,11 @@ jobs:
         with:
           sarif_file: snyk.sarif
 
-  # Gate for the Cargo workspace (crates/*, packages/solana-program) — the
-  # connector itself. Runs unconditionally, so a newly added crate is covered by
-  # build/test/clippy/fmt without editing this job. payment-channel
-  # (packages/solana-program) is excluded from test/clippy: it needs the Solana
-  # SBF toolchain to test meaningfully (covered by the solana-program job below)
-  # and pre-dates this gate's warnings-denied clippy policy.
+  # Gate for the Cargo workspace (crates/*) — the connector itself. Runs
+  # unconditionally, so a newly added crate is covered by build/test/clippy/fmt
+  # without editing this job. TOON's packages/solana-program and
+  # packages/contracts, and the CI jobs that built them, left the repository
+  # in issue #1386; this is now the whole gate.
   rust-gate:
     name: Rust Workspace Gate
     runs-on: ubuntu-latest
@@ -251,15 +249,10 @@ jobs:
     if: needs.changes.outputs.code == 'true'
 
     steps:
-      # `submodules: recursive` (matching contracts.yml): connector-settlement-evm's
-      # abi_provenance test (issue #572) runs a real `forge build` of packages/contracts,
-      # which needs its lib/openzeppelin-contracts and lib/forge-std submodules checked out.
-      # Without this, forge build fails on unresolved imports and the gate reports a false
-      # failure that has nothing to do with the Rust code it's meant to be testing.
+      # No submodules: packages/contracts, the one thing in this repository
+      # that vendored git submodules, left with it (issue #1386).
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -288,15 +281,14 @@ jobs:
           # against anvil 1.7.1 (contract suite 1.01s, gas/nonce 0.60s), so the
           # gate installs that exact version rather than whatever nightly is on
           # the day. A gate that exists to prove chain code works should not be
-          # able to break from an upstream build we never ran against.
-          # contracts.yml is pinned to the same version (was `nightly` until
-          # the 2026-08-14 1.8.0-nightly fork-test regression proved this
-          # comment's point).
+          # able to break from an upstream build we never ran against (the
+          # 2026-08-14 1.8.0-nightly fork-test regression this repository hit
+          # is exactly why).
           version: v1.7.1
         env:
           # foundryup curls api.github.com unauthenticated and gets 403 when the runner IP is
-          # rate-limited (same fix as contracts.yml). Exporting the workflow's
-          # auto-provisioned GITHUB_TOKEN bumps the limit from 60 -> 5000 req/hr.
+          # rate-limited. Exporting the workflow's auto-provisioned GITHUB_TOKEN bumps the
+          # limit from 60 -> 5000 req/hr.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # solana-test-validator on PATH for connector-settlement-solana's tests (issue #428), the
@@ -304,30 +296,18 @@ jobs:
       # test would silently skip and report `passed` -- exactly the defect #471 closed for
       # anvil, see crates/connector-settlement-solana/tests/support/mod.rs.
       #
-      # Pinned to v2.1.21, NOT the v3.1.12 the `solana-program` jobs below install. This
-      # repository installs two Solana CLIs on purpose and they are not interchangeable;
-      # crates/connector-settlement-solana/tests/solana_cli_pins.rs records which goes where,
-      # why, and what would have to be true to change either, and fails the build if this
-      # literal drifts from it. In short: v3's solana-test-validator hard-requires io_uring,
-      # which the agent sandbox's seccomp profile does not permit, and v2.1.21 matches the
-      # `=2.1.0` Solana crate pins the workspace compiles the program against.
-      # `.sandcastle/Dockerfile` installs this exact version for the same reason Foundry is
-      # pinned identically in both places: an agent that passes locally on a different
-      # toolchain than the gate has learned nothing.
+      # Pinned to v2.1.21, the one Solana CLI this repository installs anywhere.
+      # crates/connector-settlement-solana/tests/solana_cli_pins.rs records why, and fails the
+      # build if this literal drifts from it. In short: v3's solana-test-validator hard-requires
+      # io_uring, which the agent sandbox's seccomp profile does not permit, and v2.1.21 matches
+      # the `=2.1.0` Solana crate pins the workspace compiles against. `.sandcastle/Dockerfile`
+      # installs this exact version for the same reason Foundry is pinned identically in both
+      # places: an agent that passes locally on a different toolchain than the gate has learned
+      # nothing.
       - name: Install Solana CLI tools
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.21/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-
-      # A speed-up only, and since #1385 an unused one for this job: the test harness
-      # no longer builds or loads packages/solana-program (its validator loads the
-      # committed payment-channels and p-token fixtures). The step stays until #1386
-      # removes the program and the jobs that build it.
-      - name: Cache Solana platform-tools
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/solana
-          key: solana-platform-tools-${{ runner.os }}-v1.52
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -352,7 +332,7 @@ jobs:
         # (#471) while a test failure actually fails the job. Do not drop it, and do
         # not "simplify" this back to a bare `run:` with a pipe.
         shell: bash
-        run: cargo test --workspace --exclude payment-channel 2>&1 | tee /tmp/cargo-test.log
+        run: cargo test --workspace 2>&1 | tee /tmp/cargo-test.log
 
       - name: Assert no integration-test harness executed zero tests
         # A `tests/*.rs` integration binary exists specifically to hold tests. Unlike a crate's
@@ -369,7 +349,7 @@ jobs:
           ' /tmp/cargo-test.log
 
       - name: Clippy (warnings denied)
-        run: cargo clippy --workspace --exclude payment-channel --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   # The docs-only half of the gate (see `changes` above): the harnesses that
   # read Markdown, and only those. No Foundry, no Solana CLI, no submodules --
@@ -412,8 +392,6 @@ jobs:
             --test vendored_rfcs_are_unmodified \
             --test documented_config_keys \
             --test production_skeleton_is_inert 2>&1 | tee /tmp/cargo-test.log
-          cargo test -p connector-settlement-solana \
-            --test solana_program_ids 2>&1 | tee -a /tmp/cargo-test.log
 
       - name: Assert no harness executed zero tests
         # Same check as rust-gate (issue #471): a harness reporting
@@ -425,180 +403,6 @@ jobs:
             /^running [0-9]/ { harness = "" }
             END { if (found) exit 1 }
           ' /tmp/cargo-test.log
-
-  # Solana program tests (Rust/BPF) — packages/solana-program is the Cargo
-  # crate `payment-channel`, a Cargo workspace member, not a TypeScript package.
-  solana-program:
-    name: Solana Program Tests (Rust)
-    runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      # v3.1.12, NOT the v2.1.21 the rust-gate above installs -- the two are deliberate and
-      # not interchangeable. This job builds the program, and the deploy runbook
-      # (docs/solana-deployment.md) requires a CLI >= 3.1.12, so `cargo test-sbf` here runs
-      # the same toolchain driver the deploy path does. See
-      # crates/connector-settlement-solana/tests/solana_cli_pins.rs, which records both pins
-      # and fails the build if this literal drifts from them.
-      - name: Install Solana CLI tools
-        run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/v3.1.12/install)"
-          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-
-      # Caching the platform-tools dir keyed on the tools-version avoids the
-      # flaky network resolution panic (issue #105).
-      - name: Cache Solana platform-tools
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/solana
-          key: solana-platform-tools-${{ runner.os }}-v1.52
-
-      # `cargo test-sbf` is cargo-build-sbf underneath, and that reads
-      # $HOME/.cache/solana before creating it -- a cold cache is a panic, not a
-      # download (tools/solana/build-sbf.sh's header). This job cannot go through
-      # that script (it runs test-sbf, not build-sbf), so it pre-creates the
-      # directory the same way the reproducibility job below does. A no-op once
-      # the cache restores.
-      - name: Ensure platform-tools cache directory exists
-        run: mkdir -p ~/.cache/solana
-
-      - name: Cache Solana program build
-        uses: actions/cache@v4
-        with:
-          path: |
-            target
-          key: solana-program-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            solana-program-${{ runner.os }}-
-
-      - name: Run Solana program tests
-        working-directory: packages/solana-program
-        # Retry on the flaky platform-tools version-resolution panic (issue #105):
-        # the first run on a cold platform-tools cache still hits the network and
-        # can panic ("unexpected character 'l' while parsing major version").
-        run: |
-          n=0
-          until cargo test-sbf --tools-version v1.52; do
-            n=$((n + 1))
-            if [ "$n" -ge 3 ]; then
-              echo "cargo test-sbf failed after $n attempts"
-              exit 1
-            fi
-            echo "cargo test-sbf attempt $n failed (likely flaky tools-version resolution) — retrying in 5s..."
-            sleep 5
-          done
-
-  # Build-reproducibility check for the mainnet deploy path (issue #954, the
-  # no-broadcast part of #834). Builds packages/solana-program TWICE, from clean,
-  # with the same pinned v1.52 platform-tools line the live devnet program was built
-  # from (packages/solana-program/deployments/devnet-public.md, "Reproducible-build
-  # comparison" -- that line matches the live bytes exactly in size and 99.66%
-  # byte-identically; a zero-diff against the live program would additionally need the
-  # deploy-time lockfile and build path, which were not preserved), and asserts the two
-  # artifacts hash identically. No deploy and no key material; the only network traffic
-  # is fetching the toolchain and the crate dependencies (this job restores no ~/.cargo
-  # cache, so build #1 resolves the dependency tree from crates.io against the pinned
-  # workspace Cargo.lock) -- this proves the SOURCE rebuilds bit-for-bit from a clean
-  # SBF target, which is what the mainnet runbook's human deploy step relies on being
-  # true before it ever runs.
-  solana-program-reproducibility:
-    name: Solana Program Build Reproducibility (mainnet deploy path)
-    runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      # v3.1.12, and here the choice is load-bearing rather than merely consistent: with
-      # --tools-version v1.52 fixed on both sides, the CLI driving the build still changes the
-      # .so's bytes, so this job blesses the bytes of whichever CLI it installs. It has to be
-      # the one docs/solana-deployment.md tells a human to deploy with (>= 3.1.12). The
-      # measurement, and the two pins' full rationale, are in
-      # crates/connector-settlement-solana/tests/solana_cli_pins.rs, which also fails the build
-      # if this literal drifts.
-      - name: Install Solana CLI tools
-        run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/v3.1.12/install)"
-          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-
-      # Purely a speed-up now: both builds below go through
-      # tools/solana/build-sbf.sh, which creates $HOME/.cache/solana itself (the
-      # cold-cache panic this step's `mkdir -p` used to hand-patch) and retries
-      # the flaky version resolution (issue #105). A miss here costs a download,
-      # not a red job.
-      - name: Cache Solana platform-tools
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/solana
-          key: solana-platform-tools-${{ runner.os }}-v1.52
-
-      # Quoted: an unquoted YAML scalar treats " #1 (clean)" as a comment, which
-      # collapsed these four step names to "Build"/"Hash build" in the run log and
-      # hid which of the two builds a failure came from.
-      - name: "Build #1 (clean)"
-        working-directory: packages/solana-program
-        run: ../../tools/solana/build-sbf.sh
-
-      # No working-directory here on purpose: packages/solana-program is a member of
-      # the root Cargo workspace, so cargo build-sbf writes to the workspace-root
-      # target/, the same path tools/solana/deploy.sh reads. Removing target/deploy
-      # and the SBF target dir makes build #2 recompile the program from source
-      # instead of re-copying build #1's artifact; host-side build artifacts are left
-      # alone because nothing from them lands in the .so.
-      - name: "Hash build #1 and reset build output"
-        run: |
-          sha256sum target/deploy/payment_channel.so | awk '{print $1}' > /tmp/build1.sha256
-          echo "Build #1 sha256: $(cat /tmp/build1.sha256)"
-          # build-sbf.sh builds in a cargo target directory of the pinned
-          # platform-tools line's own — see reason (4) in its header — so the
-          # directory to reset is now named, not guessed. It used to be
-          # guessed: cargo-build-sbf's own target triple is the CLI's
-          # (rust_target_triple() in Agave), sbf-solana-solana on the 2.1 line
-          # and sbpf-solana-solana on 3.x, so this step had to try both.
-          # FAIL if it is not there, because rm'ing a nonexistent dir is
-          # exactly how this gate was once a tautology: build #2 recompiled
-          # nothing and the two hashes were equal by construction.
-          line_dir="target/sbf-tools-$(tools/solana/build-sbf.sh --print-tools-version)"
-          if [ ! -d "$line_dir" ]; then
-            echo "::error::$line_dir does not exist — build #1 did not build where this step"
-            echo "::error::resets, so build #2 would recompile nothing and this job would"
-            echo "::error::assert reproducibility by construction. Reconcile this with"
-            echo "::error::tools/solana/build-sbf.sh's --target-dir."
-            exit 1
-          fi
-          rm -rf "$line_dir"
-          echo "Reset $line_dir"
-          rm -rf target/deploy
-
-      - name: "Build #2 (clean)"
-        working-directory: packages/solana-program
-        run: ../../tools/solana/build-sbf.sh
-
-      - name: "Hash build #2 and assert reproducibility"
-        run: |
-          sha256sum target/deploy/payment_channel.so | awk '{print $1}' > /tmp/build2.sha256
-          echo "Build #2 sha256: $(cat /tmp/build2.sha256)"
-          if ! diff -q /tmp/build1.sha256 /tmp/build2.sha256 > /dev/null; then
-            echo "::error::Two clean builds of packages/solana-program with the pinned v1.52"
-            echo "::error::toolchain produced DIFFERENT artifact hashes. The mainnet deploy"
-            echo "::error::runbook (docs/solana-deployment.md) depends on this build being"
-            echo "::error::reproducible -- investigate before deploying anything built from"
-            echo "::error::this commit."
-            exit 1
-          fi
-          echo "Reproducible: both clean builds hash identically ($(cat /tmp/build1.sha256))."
 
   # Summary job to provide clear CI status -- and the ONLY status branch
   # protection requires, which is why it runs on every PR (`if: always()`)
@@ -615,8 +419,6 @@ jobs:
         rust-gate,
         docs-gate,
         security,
-        solana-program,
-        solana-program-reproducibility,
         devbox-validate,
         tracked-secrets,
       ]
@@ -637,9 +439,6 @@ jobs:
           echo "  Tracked Key Guard: ${{ needs.tracked-secrets.result }}"
           echo "  Rust Workspace Gate: ${{ needs.rust-gate.result }}"
           echo "  Docs Gate: ${{ needs.docs-gate.result }}"
-          echo "  EVM Contracts: see Contracts workflow (.github/workflows/contracts.yml)"
-          echo "  Solana Program: ${{ needs.solana-program.result }}"
-          echo "  Solana Build Reproducibility: ${{ needs.solana-program-reproducibility.result }}"
           echo "  Devbox Validation: ${{ needs.devbox-validate.result }}"
           echo "  Security: ${{ needs.security.result }} (advisory)"
           echo ""
@@ -671,8 +470,6 @@ jobs:
           always "Lint & Format" "${{ needs.lint-and-format.result }}"
           always "Tracked Key Guard" "${{ needs.tracked-secrets.result }}"
           heavy "Rust Workspace Gate" "${{ needs.rust-gate.result }}"
-          heavy "Solana Program" "${{ needs.solana-program.result }}"
-          heavy "Solana Build Reproducibility" "${{ needs.solana-program-reproducibility.result }}"
           heavy "Devbox Validation" "${{ needs.devbox-validate.result }}"
           if [[ "$CODE" == "false" ]]; then
             always "Docs Gate" "${{ needs.docs-gate.result }}"
@@ -706,7 +503,7 @@ jobs:
           enable-cache: true
 
       # Cache the Solana CLI binary installed by the devbox init_hook
-      # (written to ~/.local/share/solana by release.anza.xyz/v3.1.12/install).
+      # (written to ~/.local/share/solana by release.anza.xyz/v2.1.21/install).
       # Without this, every cold devbox-validate run re-downloads the CLI.
       # Note: platform-tools (~/.cache/solana) are not cached here because this
       # job never runs cargo build-sbf and therefore never downloads them.
@@ -714,7 +511,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.local/share/solana
-          key: solana-cli-${{ runner.os }}-v3.1.12
+          key: solana-cli-${{ runner.os }}-v2.1.21
 
       - name: Assert tool versions
         run: |
@@ -737,7 +534,7 @@ jobs:
           cast --version
           anvil --version
           jq --version | grep -E '^jq-1\.7\.'
-          solana --version | grep -E '^solana-cli 3\.1\.12'
+          solana --version | grep -E '^solana-cli 2\.1\.21'
           ASSERT
           devbox run -- bash "${RUNNER_TEMP:-/tmp}/assert-versions.sh"
           echo "✅ All devbox tools resolved at expected versions"

@@ -1,187 +1,110 @@
-//! THE record of which Solana CLI this repository installs where, and why
-//! there are two of them.
+//! THE record of which Solana CLI this repository installs, and why.
 //!
 //! Every `release.anza.xyz/<version>/install` in this repository resolves to
-//! one of the two constants below, and the cases in this file are what makes
-//! that true. GitHub Actions cannot share an `env:` across workflow files,
+//! the one constant below, and the cases in this file are what makes that
+//! true. GitHub Actions cannot share an `env:` across workflow files,
 //! `.sandcastle/Dockerfile` and `devbox.json` cannot read one at all, and a
 //! runbook a human pastes from has to spell the command out, so the literal is
 //! necessarily repeated at each install site. The single source is
-//! therefore this file plus the guard: the pins live here with their reasons,
+//! therefore this file plus the guard: the pin lives here with its reasons,
 //! the consumers carry a one-line pointer back, and
-//! [`every_installed_solana_cli_is_one_of_the_two_recorded_pins`] fails the
-//! build the moment a workflow, the image or the docs name a version this file
-//! does not.
+//! [`every_installed_solana_cli_is_the_recorded_pin`] fails the build the
+//! moment a workflow, the image or the docs name a version this file does
+//! not.
 //!
-//! # Why two
+//! # Why one
 //!
-//! Because the two versions are load-bearing in opposite directions and no
-//! single version satisfies both.
+//! Until issue #1386, this repository installed two Solana CLI versions on
+//! purpose: [`RUST_GATE_CLI`] wherever the program that
+//! `solana-test-validator` runs was RUN, and a second, newer line wherever
+//! `packages/solana-program` -- TOON's own on-chain program -- was BUILT for
+//! deploy. #1386 removed `packages/solana-program` from this repository, with
+//! the CI jobs and scripts that built and deployed it
+//! (`tools/solana/build-sbf.sh`, `tools/solana/deploy.sh`,
+//! `ci.yml`'s `solana-program` and `solana-program-reproducibility` jobs), so
+//! the second pin's whole reason to exist went with it. What is left installs
+//! a Solana CLI for exactly one purpose: giving `solana-test-validator` to
+//! whatever spawns it.
 //!
 //! ## [`RUST_GATE_CLI`] -- the CLI that runs the program
 //!
-//! Installed by `ci.yml`'s `rust-gate`, `local-topologies.yml` and
-//! `.sandcastle/Dockerfile`. All three want the same thing: a
+//! Installed by `ci.yml`'s `rust-gate`, `local-topologies.yml`,
+//! `.sandcastle/Dockerfile` and `devbox.json`. All four want the same thing: a
 //! `solana-test-validator` this crate's integration tier can spawn (ADR 0007 --
 //! the tier spawns its own disposable chain, so the binary has to be present),
-//! driving a program built against the release line the workspace compiles
-//! against.
+//! loading the committed `payment-channels` and p-token fixtures
+//! (`crates/connector-settlement-solana/fixtures/`) into genesis rather than
+//! building anything.
 //!
 //! Two independent reasons, either one sufficient:
 //!
 //! 1. **v3's `solana-test-validator` hard-requires io_uring.** Verified against
-//!    the binaries: `strings` on v3.1.12's `solana-test-validator` contains
+//!    the binaries: `strings` on a v3.1.12 `solana-test-validator` contains
 //!    `assertion failed: io_uring_supported()` (agave `fs/src/dirs.rs`), while
 //!    the 2.1 line's contains no io_uring reference at all. The agent
 //!    container's seccomp profile does not permit it, so a v3 validator panics
 //!    there even though the host kernel supports io_uring.
 //! 2. **The workspace pins the Solana crates to `=2.1.0`** -- `solana-sdk` and
-//!    `solana-rpc-client` in `crates/connector-settlement-solana/Cargo.toml`,
-//!    `solana-program`, `solana-program-test` and `solana-sdk` in
-//!    `packages/solana-program/Cargo.toml`. The CLI that deploys and drives the
-//!    program is then the same release line the program is built against.
+//!    `solana-rpc-client` in `crates/connector-settlement-solana/Cargo.toml`.
 //!    [`the_workspace_pins_the_solana_crates_to_the_rust_gate_line`] holds the
-//!    pin and the crates together, so bumping one surfaces the other.
+//!    pin and the CLI together, so bumping one surfaces the other.
 //!
 //! To change it: those crate pins would have to move off the 2.1 line **and**
 //! v3's validator would have to stop requiring io_uring (or the sandbox start
 //! permitting it). One without the other is not enough.
 //!
-//! ## [`DEPLOY_PATH_CLI`] -- the CLI that builds what gets deployed
+//! ## The install sites aimed at a person
 //!
-//! Installed by `ci.yml`'s `solana-program` and `solana-program-reproducibility`
-//! jobs, and by `devbox.json`'s `init_hook`. This is the CLI the deploy path
-//! mandates: `docs/solana-deployment.md`'s prerequisites and
-//! `tools/solana/deploy.sh`'s header both require Solana CLI >= 3.1.12, and
-//! `solana-program-reproducibility` exists to gate that path -- so it has to
-//! build with the CLI a human following the runbook will build with.
+//! `CONTRIBUTING.md`'s chain-binary table is the one place here that tells a
+//! *human* to install this CLI with a command. It was the README's until
+//! issue #1173 moved it: the README is an operator's guide now, and which CLI
+//! a contributor installs to run the gate is not something an operator needs.
 //!
-//! That is not cosmetic. With `--tools-version v1.52` fixed on both sides, the
-//! CLI driving the build still changes the artifact. Measured on this source on
-//! 2026-08-22, same platform-tools line, same lockfile, same machine:
+//! (`CLAUDE.md`'s "Install the Solana CLI to run the full gate locally" is a
+//! second mention and is deliberately left unversioned: it is a one-line
+//! orientation sentence that gives no command and points at the table for the
+//! how. Pinning it would put a second copy of the same literal in a file
+//! nobody installs from. If it ever grows an actual command, it becomes a
+//! site and belongs in the walk like the rest.)
 //!
-//! | CLI     | `payment_channel.so` | sha256      |
-//! | ------- | -------------------- | ----------- |
-//! | 2.1.0   | 109,400 bytes        | `ae2e9148…` |
-//! | 3.1.12  | 109,400 bytes        | `5e34f188…` |
-//!
-//! Each is reproducible under its own CLI -- rebuilding under 2.1.0 returned
-//! `ae2e9148…` again -- so `solana-program-reproducibility` is not measuring
-//! noise; it is blessing the bytes of whichever CLI it installs. Installing the
-//! other one would make it bless bytes nobody deploys.
-//!
-//! To change it: the runbook's floor would have to move, and whoever moves it
-//! has to re-establish provenance against the live devnet program. Note what
-//! that record does and does not say.
-//! `packages/solana-program/deployments/devnet-public.md`'s reproducible-build
-//! table reports a v1.52 build matching the live bytes exactly in size and
-//! 99.66% byte-identically -- and its third row is labelled "v2.1.0 CLI default
-//! tools", so that whole comparison was made with a **2.1.x** CLI, not with
-//! this pin. It is evidence about the platform-tools v1.52 line, not about
-//! [`DEPLOY_PATH_CLI`]. Nothing in CI compares a build against those recorded
-//! bytes: `solana-program-reproducibility` compares two clean builds to each
-//! other. Do not read it as a provenance check against devnet.
-//!
-//! ## The two install sites aimed at a person
-//!
-//! `CONTRIBUTING.md`'s chain-binary table and
-//! `docs/operators/faucet-box-bringup.md` step 4 -- the two places here that
-//! tell a *human* to install this CLI with a command, and one lands on each
-//! pin. The table was the README's until issue #1173 moved it: the README is
-//! an operator's guide now, and which CLI a contributor installs to run the
-//! gate is not something an operator needs.
-//!
-//! (`CLAUDE.md`'s "Install Foundry and the Solana CLI to run the full gate
-//! locally" is a third mention and is deliberately left unversioned: it is a
-//! one-line orientation sentence that gives no command and points at the
-//! table for the how. Pinning it would put a second copy of the same literal
-//! in a file nobody installs from. If it ever grows an actual command, it
-//! becomes a site and belongs in the walk like the rest.)
-//!
-//! The `CONTRIBUTING.md` row is [`RUST_GATE_CLI`], straightforwardly: it
-//! exists so a contributor can run `connector-settlement-solana`'s integration
-//! tier, which spawns `solana-test-validator`. That is [`RUST_GATE_CLI`]'s own
-//! definition, io_uring reason and all, and a local gate running a different
-//! CLI than `ci.yml`'s `rust-gate` is not the gate.
+//! The `CONTRIBUTING.md` row exists so a contributor can run
+//! `connector-settlement-solana`'s integration tier, which spawns
+//! `solana-test-validator`. A local gate running a different CLI than
+//! `ci.yml`'s `rust-gate` is not the gate.
 //! [`the_readme_tells_a_contributor_to_install_the_cli_that_runs_the_program`]
 //! holds it there.
 //!
-//! The faucet runbook is the interesting one. The faucet box's
-//! `bootstrap.sh` installs no Solana CLI, so bringing that box up means a human
-//! typing an install command before running
-//! `infra/linode-faucet/generate-solana-treasury.sh`, which generates and
-//! airdrops the treasury key that box's Solana USDC leg spends from.
-//!
-//! That step used to read "install the Solana CLI" with no version, which this
-//! guard could not see: there was no literal to walk, only English. The fix was
-//! to make the runbook give the command, not to teach the walk to read English.
-//! A doc that hands an operator a copy-pasteable
-//! `release.anza.xyz/<version>/install` is both a better runbook and an ordinary
-//! consumer of this file, covered by
-//! [`every_installed_solana_cli_is_one_of_the_two_recorded_pins`] with no new
-//! machinery. Prose a scanner would have to interpret stays invisible on
-//! purpose -- a case that greps documentation for the word "install" would spend
-//! its life on false positives and be deleted, which is the failure this file's
-//! own allowlist comment warns about. The answer is to stop writing prose where
-//! a command belongs, and
-//! [`the_faucet_box_runbook_names_the_cli_it_tells_an_operator_to_install`] is
-//! the case that keeps this one from sliding back.
-//!
-//! It is pinned to [`DEPLOY_PATH_CLI`], even though that box builds nothing that
-//! gets deployed. Neither of [`RUST_GATE_CLI`]'s two reasons reaches it: no
-//! `solana-test-validator` runs there, and it compiles no Rust -- the faucet
-//! service reaches Solana through `@solana/web3.js` and `@solana/spl-token`
-//! inside its container and never shells out to the CLI, so the CLI is a bringup
-//! tool that stops being used after step 4. What is left is the weaker but real
-//! half of [`DEPLOY_PATH_CLI`]'s category: it is the version a human following a
-//! runbook in this repository installs, the same one `docs/solana-deployment.md`
-//! and `devbox.json` already put on a person's PATH. Holding a fresh box to the
-//! 2.1 line instead would import a CI workaround for a problem that box does not
-//! have, and would move that box's instructions every time the workspace's crate
-//! pins moved for reasons of their own. A third pin was rejected for want of an
-//! argument: `solana-keygen new` and `solana airdrop` are the only two commands
-//! that box runs, they behave the same on both lines, and a third version whose
-//! reason is "neither of the other two quite fits" is exactly the unexplained pin
-//! this file exists to prevent.
-//!
-//! # The asymmetry that cost a day
-//!
-//! Which of the two a job installs also decides whether it can bootstrap the
-//! SBF toolchain from cold at all, because `cargo build-sbf`'s version check
-//! early-returns when the requested platform-tools version equals the CLI's
-//! built-in one. [`RUST_GATE_CLI`]'s built-in is v1.43 and
-//! [`DEPLOY_PATH_CLI`]'s is v1.52, which is the line this repository pins -- so
-//! the v3 jobs take the early return and the v2 jobs take the path that panics
-//! on a missing `$HOME/.cache/solana`. `tools/solana/build-sbf.sh`'s header has
-//! the full analysis; connector#1110 fixed the panic itself. It is recorded
-//! here only because "which CLI does this job have" is the question that
-//! explains why half the jobs survived a cold cache and half did not.
+//! The faucet box's runbook (`docs/operators/faucet-box-bringup.md` step 3)
+//! is the other one. The faucet box's `bootstrap.sh` installs no Solana CLI,
+//! so bringing that box up means a human typing an install command before
+//! running `infra/linode-faucet/generate-solana-treasury.sh`, which generates
+//! and airdrops the treasury key that box's Solana USDC leg spends from. That
+//! box runs no validator and compiles no Rust -- the faucet service reaches
+//! Solana through `@solana/web3.js` and `@solana/spl-token` inside its
+//! container and never shells out to the CLI, so the version genuinely does
+//! not matter there -- but a third, unexplained pin for a box that could use
+//! either is exactly the drift this file exists to prevent, so it names
+//! [`RUST_GATE_CLI`] too:
+//! [`the_faucet_box_runbook_names_the_cli_it_tells_an_operator_to_install`]
+//! holds it there.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// The CLI every job that *runs* the program installs. See the module header
-/// before changing it.
-const RUST_GATE_CLI: &str = "v2.1.21";
-
-/// The CLI every job that *builds what gets deployed* installs. See the module
+/// The one Solana CLI this repository installs anywhere. See the module
 /// header before changing it.
-const DEPLOY_PATH_CLI: &str = "v3.1.12";
+const RUST_GATE_CLI: &str = "v2.1.21";
 
 const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
 const LOCAL_TOPOLOGIES_WORKFLOW: &str =
     include_str!("../../../.github/workflows/local-topologies.yml");
 const SANDCASTLE_DOCKERFILE: &str = include_str!("../../../.sandcastle/Dockerfile");
 const DEVBOX_JSON: &str = include_str!("../../../devbox.json");
-const DEPLOY_SCRIPT: &str = include_str!("../../../tools/solana/deploy.sh");
-const DEPLOY_RUNBOOK: &str = include_str!("../../../docs/solana-deployment.md");
 const CONTRIBUTING: &str = include_str!("../../../CONTRIBUTING.md");
 const FAUCET_RUNBOOK: &str = include_str!("../../../docs/operators/faucet-box-bringup.md");
 const FAUCET_TREASURY_SCRIPT: &str =
     include_str!("../../../infra/linode-faucet/generate-solana-treasury.sh");
-const BUILD_SBF: &str = include_str!("../../../tools/solana/build-sbf.sh");
 const SETTLEMENT_MANIFEST: &str = include_str!("../Cargo.toml");
-const PROGRAM_MANIFEST: &str = include_str!("../../../packages/solana-program/Cargo.toml");
 
 /// Installs this guard deliberately does not hold to a pin, each with the
 /// reason -- the same shape as `tools/ci/check-tracked-secrets.sh`'s
@@ -239,8 +162,9 @@ fn installed_versions(raw: &str) -> BTreeSet<String> {
 ///
 /// A walk rather than a fixed list of `include_str!`s, because the failure this
 /// guards against includes *a new consumer* -- a workflow or an image added
-/// later that quietly picks a third version. A guard keyed only on the files
-/// that exist today would pass while the repository disagreed with itself.
+/// later that quietly picks a different version. A guard keyed only on the
+/// files that exist today would pass while the repository disagreed with
+/// itself.
 fn solana_cli_installs() -> BTreeMap<String, BTreeSet<String>> {
     let root = repo_root();
     let mut installs = BTreeMap::new();
@@ -314,8 +238,7 @@ fn ci_job(name: &str) -> String {
 }
 
 #[test]
-fn every_installed_solana_cli_is_one_of_the_two_recorded_pins() {
-    let recorded = BTreeSet::from([RUST_GATE_CLI.to_string(), DEPLOY_PATH_CLI.to_string()]);
+fn every_installed_solana_cli_is_the_recorded_pin() {
     let mut drifted = Vec::new();
 
     for (file, versions) in solana_cli_installs() {
@@ -323,7 +246,7 @@ fn every_installed_solana_cli_is_one_of_the_two_recorded_pins() {
             continue;
         }
         for version in versions {
-            if !recorded.contains(&version) {
+            if version != RUST_GATE_CLI {
                 drifted.push(format!("{file} installs {version}"));
             }
         }
@@ -331,11 +254,11 @@ fn every_installed_solana_cli_is_one_of_the_two_recorded_pins() {
 
     assert!(
         drifted.is_empty(),
-        "a Solana CLI version in this repository is not one this file records:\n  {}\n\nThis \
-         repository installs exactly two, deliberately: {RUST_GATE_CLI} where the program is RUN \
-         and {DEPLOY_PATH_CLI} where the deployed artifact is BUILT. Neither is interchangeable \
-         with the other -- read this file's header, and if the new version really is right, \
-         change the constant here and say why, so the next reader is not left guessing again.",
+        "a Solana CLI version in this repository is not the one this file records:\n  {}\n\nThis \
+         repository installs exactly one, deliberately: {RUST_GATE_CLI}, wherever \
+         solana-test-validator is RUN. Read this file's header, and if the new version really is \
+         right, change the constant here and say why, so the next reader is not left guessing \
+         again.",
         drifted.join("\n  ")
     );
 }
@@ -346,10 +269,10 @@ fn the_repository_installs_the_solana_cli_from_exactly_the_known_places() {
         ".github/workflows/ci.yml",
         ".github/workflows/local-topologies.yml",
         ".sandcastle/Dockerfile",
-        // The contributor-facing copy of the run-side pin. It was the
-        // README's until issue #1173 made that file an operator's guide;
-        // the table moved rather than being deleted, and moved WITH its
-        // pin, which is the whole reason this set is asserted by name.
+        // The contributor-facing copy of the pin. It was the README's until
+        // issue #1173 made that file an operator's guide; the table moved
+        // rather than being deleted, and moved WITH its pin, which is the
+        // whole reason this set is asserted by name.
         "CONTRIBUTING.md",
         "devbox.json",
         "docs/operators/faucet-box-bringup.md",
@@ -360,9 +283,8 @@ fn the_repository_installs_the_solana_cli_from_exactly_the_known_places() {
     assert_eq!(
         actual, expected,
         "the set of files installing a Solana CLI changed. A new one is not forbidden -- it just \
-         has to be a deliberate choice between the two pins this file records, and named here so \
-         the next drift is still visible. A removed one means a consumer this file claims to \
-         cover no longer exists."
+         has to install {RUST_GATE_CLI} and be named here so the next drift is still visible. A \
+         removed one means a consumer this file claims to cover no longer exists."
     );
 }
 
@@ -394,35 +316,6 @@ fn the_container_topologies_and_the_agent_image_install_the_cli_that_runs_the_pr
 }
 
 #[test]
-fn the_program_jobs_install_the_cli_the_deploy_path_mandates() {
-    for job in ["solana-program", "solana-program-reproducibility"] {
-        assert_eq!(
-            installed_versions(&ci_job(job)),
-            BTreeSet::from([DEPLOY_PATH_CLI.to_string()]),
-            "ci.yml's {job} job must install {DEPLOY_PATH_CLI}. It builds the artifact the \
-             deploy runbook describes, and the CLI changes those bytes even with platform-tools \
-             pinned -- see this file's header."
-        );
-    }
-}
-
-#[test]
-fn the_deploy_runbook_and_the_deploy_script_name_the_deploy_path_cli() {
-    let bare = DEPLOY_PATH_CLI.trim_start_matches('v');
-    for (name, raw) in [
-        ("docs/solana-deployment.md", DEPLOY_RUNBOOK),
-        ("tools/solana/deploy.sh", DEPLOY_SCRIPT),
-    ] {
-        assert!(
-            raw.contains(&format!("Solana CLI >= {bare}")),
-            "{name} no longer states `Solana CLI >= {bare}`. That floor is the whole reason \
-             ci.yml's program jobs install {DEPLOY_PATH_CLI} rather than {RUST_GATE_CLI}; if the \
-             runbook moves, the gate builds bytes nobody deploys."
-        );
-    }
-}
-
-#[test]
 fn contributing_tells_a_contributor_to_install_the_cli_that_runs_the_program() {
     assert_eq!(
         installed_versions(CONTRIBUTING),
@@ -441,17 +334,17 @@ fn contributing_tells_a_contributor_to_install_the_cli_that_runs_the_program() {
 fn the_faucet_box_runbook_names_the_cli_it_tells_an_operator_to_install() {
     assert_eq!(
         installed_versions(FAUCET_RUNBOOK),
-        BTreeSet::from([DEPLOY_PATH_CLI.to_string()]),
-        "docs/operators/faucet-box-bringup.md step 4 must hand the operator a {DEPLOY_PATH_CLI} \
-         install command. The faucet box's bootstrap.sh installs no Solana CLI, and step 4 is \
+        BTreeSet::from([RUST_GATE_CLI.to_string()]),
+        "docs/operators/faucet-box-bringup.md step 3 must hand the operator a {RUST_GATE_CLI} \
+         install command. The faucet box's bootstrap.sh installs no Solana CLI, and that step is \
          where a human puts one on a box that then holds a devnet USDC treasury. It said `install \
          the Solana CLI` with no version once, and this guard could not see it -- prose has no \
          literal to walk. Write the command, not the instruction."
     );
     assert!(
-        FAUCET_TREASURY_SCRIPT.contains("docs/operators/faucet-box-bringup.md step 4 names"),
+        FAUCET_TREASURY_SCRIPT.contains("docs/operators/faucet-box-bringup.md step 3 names"),
         "infra/linode-faucet/generate-solana-treasury.sh no longer points at \
-         docs/operators/faucet-box-bringup.md step 4 for which Solana CLI to install. It \
+         docs/operators/faucet-box-bringup.md step 3 for which Solana CLI to install. It \
          deliberately carries no version literal of its own so the two cannot drift; a pointer \
          that stops resolving turns back into the unversioned `install it on the box` this case \
          exists to prevent."
@@ -459,26 +352,24 @@ fn the_faucet_box_runbook_names_the_cli_it_tells_an_operator_to_install() {
 }
 
 #[test]
-fn devbox_installs_and_asserts_the_deploy_path_cli() {
-    let bare = DEPLOY_PATH_CLI.trim_start_matches('v');
+fn devbox_installs_the_cli_that_runs_the_program() {
+    let bare = RUST_GATE_CLI.trim_start_matches('v');
     assert_eq!(
         installed_versions(DEVBOX_JSON),
-        BTreeSet::from([DEPLOY_PATH_CLI.to_string()]),
-        "devbox.json's init_hook must install {DEPLOY_PATH_CLI} -- a devbox shell is where the \
-         deploy runbook's commands get run by hand."
+        BTreeSet::from([RUST_GATE_CLI.to_string()]),
+        "devbox.json's init_hook must install {RUST_GATE_CLI} -- a devbox shell is where a \
+         contributor runs connector-settlement-solana's integration tier by hand."
     );
     let devbox_job = ci_job("devbox-validate");
     assert!(
         devbox_job.contains(&format!("solana-cli {}", bare.replace('.', "\\."))),
         "ci.yml's devbox-validate job no longer asserts `solana-cli {bare}`, so devbox.json could \
-         drift from {DEPLOY_PATH_CLI} without failing anything."
+         drift from {RUST_GATE_CLI} without failing anything."
     );
     assert!(
-        devbox_job.contains(&format!(
-            "solana-cli-${{{{ runner.os }}}}-{DEPLOY_PATH_CLI}"
-        )),
-        "ci.yml's devbox-validate cache key no longer names {DEPLOY_PATH_CLI}, so a version bump \
-         would silently restore the previous CLI from cache."
+        devbox_job.contains(&format!("solana-cli-${{{{ runner.os }}}}-{RUST_GATE_CLI}")),
+        "ci.yml's devbox-validate cache key no longer names {RUST_GATE_CLI}, so a version bump \
+         would silently restore a stale CLI from cache."
     );
 }
 
@@ -491,39 +382,14 @@ fn the_workspace_pins_the_solana_crates_to_the_rust_gate_line() {
         .0;
     let pin = format!("\"={line}.0\"");
 
-    for (name, manifest, crates) in [
-        (
-            "crates/connector-settlement-solana/Cargo.toml",
-            SETTLEMENT_MANIFEST,
-            &["solana-rpc-client", "solana-sdk"][..],
-        ),
-        (
-            "packages/solana-program/Cargo.toml",
-            PROGRAM_MANIFEST,
-            &["solana-program", "solana-program-test", "solana-sdk"][..],
-        ),
-    ] {
-        for krate in crates {
-            assert!(
-                manifest.contains(&format!("{krate} = {pin}")),
-                "{name} no longer pins {krate} to {pin}. Half the reason ci.yml, \
-                 local-topologies.yml and .sandcastle/Dockerfile install Solana CLI \
-                 {RUST_GATE_CLI} is that the CLI driving the program matches the release line the \
-                 program is compiled against. Moving the crates off the {line} line means \
-                 revisiting that pin -- see this file's header for the other half (io_uring)."
-            );
-        }
+    for krate in ["solana-rpc-client", "solana-sdk"] {
+        assert!(
+            SETTLEMENT_MANIFEST.contains(&format!("{krate} = {pin}")),
+            "crates/connector-settlement-solana/Cargo.toml no longer pins {krate} to {pin}. Half \
+             the reason ci.yml, local-topologies.yml, .sandcastle/Dockerfile and devbox.json \
+             install Solana CLI {RUST_GATE_CLI} is that the CLI driving the validator matches the \
+             release line this crate compiles against. Moving the crate off the {line} line means \
+             revisiting that pin -- see this file's header for the other half (io_uring)."
+        );
     }
-}
-
-#[test]
-fn build_sbf_records_which_cli_reaches_the_cold_bootstrap_path() {
-    assert!(
-        BUILD_SBF.contains(RUST_GATE_CLI) && BUILD_SBF.contains(DEPLOY_PATH_CLI),
-        "tools/solana/build-sbf.sh's header no longer names both {RUST_GATE_CLI} and \
-         {DEPLOY_PATH_CLI}. Its cold-cache analysis only makes sense against a specific CLI's \
-         built-in platform-tools version, and the fact that one of this repository's two CLIs \
-         reaches the failing path and the other does not is the single most confusing thing about \
-         having two -- connector#1110 took a day partly because nothing said it."
-    );
 }

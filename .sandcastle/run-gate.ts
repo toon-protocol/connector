@@ -48,16 +48,17 @@ const MAX_OUTPUT_CHARS = 12_000;
  * Rust gate — the exact steps of ci.yml's `Rust Workspace Gate`, in the same
  * order, so passing here means the same thing as passing there.
  *
- * `--exclude payment-channel` matches ci.yml. Foundry (anvil) is in the agent
+ * No `--exclude` (issue #1386 removed `packages/solana-program`, the
+ * `payment-channel` crate it excluded). Foundry (anvil) is in the agent
  * image, so the chain tests genuinely run rather than skipping (#471).
  */
 const RUST_STEPS: readonly GateStep[] = [
   { name: 'cargo fmt', command: 'cargo fmt --all -- --check' },
   { name: 'cargo build', command: 'cargo build --workspace' },
-  { name: 'cargo test', command: 'cargo test --workspace --exclude payment-channel' },
+  { name: 'cargo test', command: 'cargo test --workspace' },
   {
     name: 'cargo clippy',
-    command: 'cargo clippy --workspace --exclude payment-channel --all-targets -- -D warnings',
+    command: 'cargo clippy --workspace --all-targets -- -D warnings',
   },
 ];
 

@@ -1,11 +1,6 @@
-# A self-contained forge project for one test fixture, deliberately separate
-# from packages/contracts: nothing here is ever deployed outside a test's
-# disposable `anvil`, and a cross-package path dependency would make the
-# fixture look like a shipped contract. `crates/connector-settlement-evm`'s
+# A self-contained forge project for one test fixture: nothing here is ever
+# deployed outside a test's disposable `anvil`. `crates/connector-settlement-evm`'s
 # own `contracts/` directory is the same arrangement.
-#
-# `solc_version` matches packages/contracts so a CI runner downloads one
-# compiler rather than two.
 [profile.default]
 src = "src"
 out = "out"

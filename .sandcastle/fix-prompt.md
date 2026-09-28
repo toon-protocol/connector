@@ -37,16 +37,15 @@ say so plainly in your final output instead of guessing.
 # FAILING CHECKS
 
 This is **connector** — a Rust workspace (`crates/*`, the connector itself) plus an
-npm-workspaces monorepo (`packages/*`, devnet tooling) and a Solana program. Reproduce
-the side that failed:
+npm-workspaces monorepo (`packages/*`, devnet tooling). Reproduce the side that failed:
 
 **Rust** (CI's `Rust Workspace Gate`), from the repo root:
 
 - format: `cargo fmt --all -- --check` (the FIRST step — a formatting slip fails the
   gate before your tests ever run)
 - build: `cargo build --workspace`
-- test: `cargo test --workspace --exclude payment-channel`
-- lint: `cargo clippy --workspace --exclude payment-channel --all-targets -- -D warnings`
+- test: `cargo test --workspace`
+- lint: `cargo clippy --workspace --all-targets -- -D warnings`
   (`-D warnings` with `--all-targets` makes dead code a hard error; a shared
   `tests/support/mod.rs` used by several test binaries needs `#![allow(dead_code)]`)
 
@@ -62,9 +61,8 @@ TS2307 errors from unresolved project references:
 - typecheck: `npm run typecheck`
 - test: `npm run test --workspaces --if-present`
 
-Other PR checks: `CI / lint-and-format` (`npm run lint`, `npm run format:check`),
-`Contracts` (only on PRs touching `packages/contracts/**`), and `Agent image` (only on
-PRs touching `.sandcastle/**`).
+Other PR checks: `CI / lint-and-format` (`npm run lint`, `npm run format:check`) and
+`Agent image` (only on PRs touching `.sandcastle/**`).
 
 Fix the ROOT CAUSE of the failure, not the symptom — do not weaken, skip, delete or
 `#[ignore]` a test to get green, and do not loosen a lint threshold. If a failing check

@@ -81,54 +81,6 @@
 # to be got wrong. `channel-status` prints both sides so the operator can see
 # which slot moved.
 #
-# ── `deploy-rolling-swap-channel` (connector#973) ───────────────────────────
-# `RollingSwapChannel` (`packages/contracts/src/RollingSwapChannel.sol`) is
-# merged and has never been deployed anywhere — no address for it exists in
-# this repo's infra tree. connector#973 asks for a devnet deploy via THIS
-# workflow rather than a credential handed to an agent, for the same reason
-# every other write here does: the deployer key is derived from
-# `E2E_DEV_MNEMONIC` on a reviewed runner, never inside a sandbox running
-# agent-authored code.
-#
-# This is a devnet-only broadcast (Base Sepolia, chain 84532) with a devnet
-# mock USDC token — it is NOT the mainnet policy in `packages/contracts/
-# README.md` (issues #388/#405: mainnet broadcasts stay human-only, no
-# funded deployer key ever reaches CI). That policy is scoped to real funds;
-# this one spends devnet ETH/USDC the same `E2E_DEV_MNEMONIC` already spends
-# via `deposit`/`open-channel` above.
-#
-# The already-committed, reviewed `packages/contracts/script/
-# DeployRollingSwapChannel.s.sol` is reused verbatim rather than
-# reimplemented as a second bytecode-deploy path in ethers — one deploy
-# script, one place its two constructor args (`TOKEN_ADDRESS`,
-# `CHALLENGE_PERIOD`) can drift. `apply: false` runs `forge script` with no
-# `--broadcast`, which simulates against live chain state and sends nothing
-# — the same dry-run contract every other verb here honours. `apply: true`
-# adds `--broadcast`, then the job reads the deployed address back out of
-# the script's own `broadcast/…/run-latest.json` (never out of console text)
-# and — per this file's own rule that a receipt is never the authority
-# (connector#907) — calls the LIVE deployment three ways before calling the
-# job green:
-#   * `domainSeparator()` must equal an INDEPENDENTLY computed EIP-712 domain
-#     hash for `(name="RollingSwapChannel", version="2", chainId=84532,
-#     verifyingContract=<the deployed address>)` — proving the domain is
-#     bound to what was actually deployed, not merely what the constructor
-#     was asked to bind (connector#973 AC3).
-#   * `claimDigest(...)` for the exact sample the golden vector in
-#     `docs/rolling-swap-v2-digest-spec.md` uses (channelId=0x5b,
-#     cumulativeAmount=24_000_000, nonce=24, recipient=0x…DEADBEEF) must
-#     equal the same struct hashed off-chain by ethers' `TypedDataEncoder`
-#     for that SAME real `(chainId, address)` pair — connector#973 AC5. This
-#     is not the golden vector's own pinned digest (that fixture is deployed
-#     at a synthetic address on chainId 8453 in
-#     `packages/contracts/test/RollingSwapChannel.t.sol`, unrelated to any
-#     real devnet address); it is the same algorithm cross-checked against
-#     THIS deployment.
-#   * `updateBalance(...)` is called (a static call, no state change) against
-#     a channel id that cannot exist and must revert with the contract's own
-#     `InvalidChannelState()` — proving the entrypoint is live on-chain, not
-#     merely present in the compiled ABI (connector#973 AC4).
-#
 # ── SAFETY ──────────────────────────────────────────────────────────────────
 #   * `apply` defaults to false. A dry run reads chain state, prints exactly
 #     what it would send, and writes nothing.
@@ -146,11 +98,11 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: 'whoami (read) | channel-status (read) | deposit (write) | open-channel (write) | deploy-rolling-swap-channel (write)'
+        description: 'whoami (read) | channel-status (read) | deposit (write) | open-channel (write)'
         type: choice
         required: true
         default: whoami
-        options: [whoami, channel-status, deposit, open-channel, deploy-rolling-swap-channel]
+        options: [whoami, channel-status, deposit, open-channel]
       account_index:
         description: "NIP-06 account index to act as (m/44'/1237'/0'/0/i)"
         type: string
@@ -186,11 +138,6 @@ on:
         type: string
         required: false
         default: ''
-      challenge_period:
-        description: 'deploy-rolling-swap-channel: unilateral-close challenge window in seconds (contract floors at 86400 = 1 day)'
-        type: string
-        required: false
-        default: '86400'
       apply:
         description: 'Perform the write. false = dry run, reads and prints only.'
         type: boolean
@@ -222,28 +169,10 @@ jobs:
       DECIMALS: '6'
 
     steps:
+      # No submodules and no Foundry: every verb here is pure ethers and never
+      # reads packages/contracts' tree, which no longer exists (issue #1386).
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          # Only deploy-rolling-swap-channel needs packages/contracts' forge-std
-          # / openzeppelin-contracts submodules (to `forge build`/`forge script`
-          # it); every other verb here is pure ethers and never reads that tree.
-          submodules: ${{ inputs.operation == 'deploy-rolling-swap-channel' && 'recursive' || 'false' }}
-
-      - name: Install Foundry
-        if: ${{ inputs.operation == 'deploy-rolling-swap-channel' }}
-        uses: foundry-rs/foundry-toolchain@v1
-        with:
-          # Pinned, matching contracts.yml's own pin (connector#961): forge
-          # 1.8.0-nightly broke a fork test that v1.7.1 passes identically, so
-          # a workflow that broadcasts a real deploy must not float onto an
-          # upstream build this repo never ran the deploy script against.
-          version: v1.7.1
-        env:
-          # foundryup curls api.github.com unauthenticated and gets 403 when the
-          # runner IP is rate-limited; the workflow's own GITHUB_TOKEN bumps the
-          # limit from 60 to 5000 req/hr (same workaround as contracts.yml).
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-node@v4
         with:
@@ -263,8 +192,8 @@ jobs:
           cat > "$RUNNER_TEMP/ops/ops.mjs" <<'SCRIPT'
           import { fromMnemonicFull } from '@toon-protocol/sdk';
           import {
-            Contract, HDNodeWallet, JsonRpcProvider, Mnemonic, TypedDataEncoder, Wallet,
-            formatUnits, getAddress,
+            Contract, HDNodeWallet, JsonRpcProvider, Mnemonic, Wallet,
+            formatUnits,
           } from 'ethers';
 
           const fail = (m) => { console.error(`::error::${m}`); process.exit(1); };
@@ -275,7 +204,7 @@ jobs:
           const {
             E2E_DEV_MNEMONIC: MNEMONIC, RPC_URL, CHAIN_ID, REGISTRY, TOKEN, DECIMALS,
             OPERATION, ACCOUNT_INDEX, SCAN_COUNT, CHANNEL_ID, PARTICIPANT,
-            COUNTERPARTY, SETTLEMENT_TIMEOUT, TOTAL_BASE_UNITS, CHALLENGE_PERIOD, APPLY,
+            COUNTERPARTY, SETTLEMENT_TIMEOUT, TOTAL_BASE_UNITS, APPLY,
           } = process.env;
 
           if (!MNEMONIC || !MNEMONIC.trim()) {
@@ -334,9 +263,7 @@ jobs:
           // The only path from the mnemonic to something that can sign.
           // fromMnemonicFull exposes no evmPrivateKey field: the 32-byte
           // NIP-06 `secretKey` IS the EVM key (id.evmAddress is derived from
-          // it) — the address cross-check here proves it every run. Returns
-          // the raw key too, for the one caller (deploy-rolling-swap-channel)
-          // that hands it to `forge script` rather than signing in-process.
+          // it) — the address cross-check here proves it every run.
           const signerFor = async (i) => {
             const id = await derive(i);
             const sk = id.secretKey;
@@ -584,218 +511,6 @@ jobs:
               say('run `deposit` once per participant. See this file\'s header on which');
               say('slot a deposit lands in.');
             }
-          }
-
-          // ── deploy-rolling-swap-channel ─────────────────────────────────
-          // Broadcasts packages/contracts/script/DeployRollingSwapChannel.s.sol
-          // via forge itself rather than re-deploying its bytecode through a
-          // second, ethers-only path — one script stays the single source of
-          // truth for the constructor args. See this file's header for why
-          // this is devnet-only and what "verified against the live
-          // deployment" (connector#973) means concretely.
-          else if (OPERATION === 'deploy-rolling-swap-channel') {
-            let challengePeriod;
-            try { challengePeriod = BigInt(CHALLENGE_PERIOD || '86400'); } catch { challengePeriod = null; }
-            if (challengePeriod === null || challengePeriod < 86400n) {
-              fail(`challenge_period must be >= 86400s (1 day; the contract's own floor), got: ${CHALLENGE_PERIOD}`);
-            }
-
-            const idx = accountIndex();
-            const { wallet: deployer, privateKey: pk } = await signerFor(idx);
-
-            say(`## Deploy RollingSwapChannel — ${apply ? 'APPLY' : 'DRY RUN'}`);
-            say('');
-            say(`| | |`);
-            say(`|---|---|`);
-            say(`| deployer (account index ${idx}) | \`${deployer.address}\` |`);
-            say(`| token (TOKEN_ADDRESS) | \`${TOKEN}\` |`);
-            say(`| challengePeriod | ${challengePeriod}s |`);
-            say(`| rpc / chain | \`${RPC_URL}\` / ${CHAIN_ID} |`);
-            say('');
-            const gasBalance = await provider.getBalance(deployer.address);
-            say(`Deployer holds ${formatUnits(gasBalance, 18)} ETH for gas.`);
-            if (apply && gasBalance === 0n) {
-              fail(`Deployer ${deployer.address} holds 0 ETH — an apply run would fail on gas.`);
-            }
-            say('');
-
-            const { execFileSync } = await import('node:child_process');
-            const { readFileSync } = await import('node:fs');
-            const workspace = process.env.GITHUB_WORKSPACE;
-            if (!workspace) fail('GITHUB_WORKSPACE is not set; cannot locate packages/contracts.');
-            const contractsDir = `${workspace}/packages/contracts`;
-
-            const forgeArgs = [
-              'script', 'script/DeployRollingSwapChannel.s.sol',
-              '--rpc-url', RPC_URL,
-            ];
-            if (apply) forgeArgs.push('--broadcast');
-
-            say(apply
-              ? 'Running `forge script … --broadcast`…'
-              : 'Running `forge script` (no `--broadcast` — simulates only, sends nothing)…');
-            let forgeOut;
-            try {
-              forgeOut = execFileSync('forge', forgeArgs, {
-                cwd: contractsDir,
-                env: {
-                  ...process.env,
-                  PRIVATE_KEY: pk,
-                  TOKEN_ADDRESS: TOKEN,
-                  CHALLENGE_PERIOD: challengePeriod.toString(),
-                },
-                encoding: 'utf8',
-                maxBuffer: 1024 * 1024 * 32,
-              });
-            } catch (e) {
-              const detail = (e.stdout || '') + (e.stderr || e.message || '');
-              fail(`forge script failed:\n${detail}`);
-            }
-            say('');
-            say('<details><summary>forge script output</summary>');
-            say('');
-            say('```');
-            say(forgeOut.trim());
-            say('```');
-            say('</details>');
-
-            if (!apply) {
-              say('');
-              say('Dry run: nothing was broadcast. Re-run with `apply: true` to deploy.');
-            } else {
-              const runPath = `${contractsDir}/broadcast/DeployRollingSwapChannel.s.sol/${CHAIN_ID}/run-latest.json`;
-              let run;
-              try {
-                run = JSON.parse(readFileSync(runPath, 'utf8'));
-              } catch (e) {
-                fail(`Could not read broadcast artifact at ${runPath}: ${e.message}`);
-              }
-              const createTx = (run.transactions || []).find(
-                (t) => t.transactionType === 'CREATE' && t.contractName === 'RollingSwapChannel',
-              );
-              if (!createTx || !createTx.contractAddress) {
-                fail(`No RollingSwapChannel CREATE transaction found in ${runPath}.`);
-              }
-              const address = getAddress(createTx.contractAddress);
-              say('');
-              say(`Deployed to: \`${address}\` (tx \`${createTx.hash}\`)`);
-
-              // Post-write verification against the LIVE deployment — never
-              // trusting the receipt/console output (connector#907's rule).
-              const rsc = new Contract(address, [
-                'function token() view returns (address)',
-                'function challengePeriod() view returns (uint256)',
-                'function domainSeparator() view returns (bytes32)',
-                'function claimDigest(bytes32,uint256,uint256,address) view returns (bytes32)',
-                'function updateBalance(bytes32,uint256,uint256,address,bytes)',
-                'error InvalidChannelState()',
-              ], provider);
-
-              const [onChainToken, onChainChallenge, onChainDomainSep] = await Promise.all([
-                rsc.token(), rsc.challengePeriod(), rsc.domainSeparator(),
-              ]);
-              if (onChainToken.toLowerCase() !== TOKEN.toLowerCase()) {
-                fail(`Deployed contract's token() = ${onChainToken}, expected ${TOKEN}.`);
-              }
-              if (onChainChallenge !== challengePeriod) {
-                fail(`Deployed contract's challengePeriod() = ${onChainChallenge}, expected ${challengePeriod}.`);
-              }
-
-              // The one EIP-712 domain both checks below hash against: the
-              // spec's (name, version) bound to the pair that ACTUALLY exists
-              // on chain. Declared once so the domain-separator check and the
-              // digest check can never drift apart.
-              const domain = {
-                name: 'RollingSwapChannel', version: '2', chainId: Number(CHAIN_ID), verifyingContract: address,
-              };
-
-              // AC3: domainSeparator() must match an independently-computed
-              // EIP-712 domain hash for the pair this contract actually
-              // deployed at — not merely the constructor's request.
-              const expectedDomainSep = TypedDataEncoder.hashDomain(domain);
-              if (onChainDomainSep.toLowerCase() !== expectedDomainSep.toLowerCase()) {
-                fail(`domainSeparator() mismatch: chain says ${onChainDomainSep}, off-chain computes `
-                  + `${expectedDomainSep} for (chainId=${CHAIN_ID}, verifyingContract=${address}).`);
-              }
-              say(`Verified: \`domainSeparator()\` == the independently-computed EIP-712 domain hash `
-                + `for (chainId=${CHAIN_ID}, verifyingContract=${address}).`);
-
-              // AC5: the docs/rolling-swap-v2-digest-spec.md golden vector's
-              // OWN sample inputs (channelId=0x5b, cumulative=24_000_000,
-              // nonce=24, recipient=0x…DEADBEEF), hashed against THIS real
-              // (chainId, address) pair rather than the spec's synthetic one.
-              const sample = {
-                channelId: '0x' + (0x5bn).toString(16).padStart(64, '0'),
-                cumulativeAmount: 24_000_000n,
-                nonce: 24n,
-                recipient: '0x00000000000000000000000000000000DEADBEEF',
-              };
-              const onChainDigest = await rsc.claimDigest(
-                sample.channelId, sample.cumulativeAmount, sample.nonce, sample.recipient,
-              );
-              const offChainDigest = TypedDataEncoder.hash(
-                domain,
-                { ClaimBalanceProof: [
-                  { name: 'channelId', type: 'bytes32' },
-                  { name: 'cumulativeAmount', type: 'uint256' },
-                  { name: 'nonce', type: 'uint256' },
-                  { name: 'recipient', type: 'address' },
-                ] },
-                sample,
-              );
-              if (onChainDigest.toLowerCase() !== offChainDigest.toLowerCase()) {
-                fail(`claimDigest() mismatch: chain says ${onChainDigest}, off-chain computes ${offChainDigest} `
-                  + `for the same (chainId, verifyingContract) pair.`);
-              }
-              say(`Verified: \`claimDigest(...)\` for the spec's golden-vector sample == the same struct `
-                + `hashed off-chain for this deployment's real (chainId, address) pair (connector#973 AC5).`);
-
-              // AC4: updateBalance must be LIVE on chain, not merely present
-              // in the compiled ABI. A channel id that was never opened hits
-              // ch.state == NonExistent, which fails the Open/Closing gate
-              // and reverts InvalidChannelState() — proving the entrypoint
-              // executes real contract code, not "no matching function".
-              const neverOpenedChannelId = '0x' + 'ee'.repeat(32);
-              let liveCallVerified = false;
-              try {
-                await rsc.updateBalance.staticCall(
-                  neverOpenedChannelId, 1n, 1n, '0x' + '11'.repeat(20), '0x' + '00'.repeat(65),
-                );
-              } catch (e) {
-                const data = e?.data ?? e?.info?.error?.data ?? e?.error?.data;
-                if (data) {
-                  try {
-                    const parsed = rsc.interface.parseError(data);
-                    if (parsed?.name === 'InvalidChannelState') liveCallVerified = true;
-                  } catch { /* not decodable against this ABI */ }
-                }
-                if (!liveCallVerified) {
-                  fail(`updateBalance() against an unopened channel did not revert with InvalidChannelState() `
-                    + `as expected: ${e?.shortMessage || e?.message || e}`);
-                }
-              }
-              if (!liveCallVerified) {
-                fail('updateBalance() unexpectedly succeeded against a channel that was never opened.');
-              }
-              say(`Verified: \`updateBalance(...)\` is live on-chain — a call against an unopened channel `
-                + `reverts \`InvalidChannelState()\`, not "no matching function" (connector#973 AC4).`);
-
-              say('');
-              say('✅ RollingSwapChannel deployed and verified against the live contract.');
-              say('');
-              say(`| | |`);
-              say(`|---|---|`);
-              say(`| address | \`${address}\` |`);
-              say(`| deploy tx | \`${createTx.hash}\` |`);
-              say(`| chain | evm:${CHAIN_ID} (Base Sepolia) |`);
-              say(`| token | \`${TOKEN}\` |`);
-              say(`| challengePeriod | ${challengePeriod}s |`);
-              say('');
-              say('**Next (not done by this workflow):** record this address in `packages/contracts/');
-              say('deployments.json`, `packages/contracts/deployments/base-sepolia.md`, and a devnet');
-              say('runbook doc, the same way `docs/evm-deployment.md` records the `TokenNetwork` cutover —');
-              say('see `docs/rolling-swap-channel-deployment.md`.');
-            }
           } else {
             fail(`Unknown operation: ${OPERATION}`);
           }
@@ -818,7 +533,6 @@ jobs:
           SETTLEMENT_TIMEOUT: ${{ inputs.settlement_timeout }}
           PARTICIPANT: ${{ inputs.participant }}
           TOTAL_BASE_UNITS: ${{ inputs.total_base_units }}
-          CHALLENGE_PERIOD: ${{ inputs.challenge_period }}
           APPLY: ${{ inputs.apply }}
         run: |
           cd "$RUNNER_TEMP/ops"

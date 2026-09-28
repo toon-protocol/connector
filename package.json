@@ -2,7 +2,7 @@
   "name": "connector",
   "version": "3.3.0",
   "private": true,
-  "description": "Rust connector — plus the devnet faucet tooling and Solidity contracts it is exercised against",
+  "description": "Rust connector — plus the devnet faucet and fund-peers tooling around it",
   "workspaces": [
     "packages/announcer",
     "packages/faucet",

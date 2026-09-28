@@ -48,7 +48,6 @@ on:
       - "Agent image"
       - "agent:review"
       - "CI"
-      - "Contracts"
     types: [completed]
 
 permissions:

@@ -27,7 +27,6 @@ on:
   pull_request:
     paths:
       - 'crates/**'
-      - 'packages/solana-program/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'deploy/connector-rust/Dockerfile'
@@ -68,9 +67,9 @@ jobs:
       matrix:
         topology: [solo, two-hop, mixed-chain, dealing]
     steps:
-      # No submodules: nothing here compiles packages/contracts any more. The
-      # anvil service places committed x402 bytecode (infra/anvil/seed.sh, ADR
-      # 0075), so the Solidity libs are not an input to this job.
+      # No submodules: packages/contracts is gone (issue #1386), and nothing
+      # here ever compiled it -- the anvil service places committed x402
+      # bytecode (infra/anvil/seed.sh, ADR 0075).
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -85,35 +84,17 @@ jobs:
         with:
           version: v1.7.1
 
-      # `solana`, `solana-keygen`, `spl-token` and `cargo-build-sbf` all ship
-      # in this one bundle. Same pinned release ci.yml's rust-gate installs --
-      # and NOT the v3.1.12 ci.yml's program jobs install, which is a separate
-      # deliberate pin. Both are recorded, with their reasons, in
+      # `solana`, `solana-keygen` and `spl-token` all ship in this one bundle.
+      # Same pinned release ci.yml's rust-gate installs -- the only Solana CLI
+      # this repository installs anywhere (issue #1386 removed
+      # packages/solana-program and the separate v3.1.12 its build/deploy path
+      # used to need). Recorded, with its reasons, in
       # crates/connector-settlement-solana/tests/solana_cli_pins.rs; that guard
       # fails the build if this literal drifts from what it records.
       - name: Install Solana CLI tools
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.21/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-
-      # Since #1385 `make local-up` builds no SBF program at all -- the local
-      # validator loads only the committed payment-channels and p-token
-      # fixtures -- so this cache is unused here; it stays until #1386
-      # removes the program.
-      #
-      # It was not always only that, and the difference is the whole point of
-      # the change that added this comment: this step's real job used to be
-      # creating that directory as a side effect of restoring it, because a
-      # pinned `cargo build-sbf` panics outright when it is absent. Cache
-      # entries are branch-scoped and a failed job saves nothing, so the day
-      # main's entry was evicted all three topologies went red on every open PR
-      # at once -- docs-only ones included -- and main had no way to write
-      # itself a new entry.
-      - name: Cache Solana platform-tools
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/solana
-          key: solana-platform-tools-${{ runner.os }}-v1.52
 
       - name: Cache Cargo registry and workspace target
         uses: actions/cache@v4

@@ -15,11 +15,6 @@ disagree, the ADR wins too (`docs/adr/`).
 The connector is the Rust workspace under `crates/`, built as the `connector`
 binary. Nothing else in this repository is the connector:
 
-- `packages/contracts` — TOON's retired Solidity `TokenNetwork` / `TokenNetworkRegistry`.
-  The connector no longer binds to them (ADR 0075, #1385); #1386 removes them.
-- `packages/solana-program` — TOON's retired payment-channel program, likewise unused by
-  the connector. A Cargo workspace member, excluded from the workspace test gate; it has
-  its own `cargo test-sbf` job until #1386.
 - `packages/faucet`, `packages/announcer` — devnet tooling and a standalone
   announcer sidecar. These are the only reason npm and `package.json` still exist
   here. `npm test` runs them; it does not test the connector.
@@ -41,8 +36,7 @@ Do not use "terminator", "BLS", or "agent runtime"; all three are retired names.
 
 ```bash
 make rust-build     # cargo build --workspace
-make rust-test      # cargo test --workspace --exclude payment-channel  (the gate)
-make solana-test    # cargo test-sbf, the on-chain program
+make rust-test      # cargo test --workspace  (the gate)
 make test           # npm: the faucet and the announcer — NOT the connector
 make lint           # ESLint only. CI also runs cargo fmt --check and clippy -D warnings.
 
@@ -50,10 +44,14 @@ make local-verify   # the shipped IMAGE against real chains: up, send a packet, 
 ```
 
 CI's Rust gate is `cargo fmt --all -- --check`, `cargo build --workspace`,
-`cargo test --workspace --exclude payment-channel`, an assertion that no integration
-harness executed zero tests, and `cargo clippy --workspace --exclude payment-channel
---all-targets -- -D warnings`. `packages/contracts` has a separate Foundry job
-(`forge test`) that no make target currently runs.
+`cargo test --workspace`, an assertion that no integration harness executed zero tests,
+and `cargo clippy --workspace --all-targets -- -D warnings`. `packages/contracts` and
+`packages/solana-program` — TOON's own Solidity contracts and payment-channel program,
+neither of which the connector has bound to since ADR 0075 (#1385) — left the repository
+in #1386, with the Foundry and `cargo test-sbf` CI jobs that built them and the
+`make solana-test` target that ran the latter. `--exclude payment-channel` is gone from
+every command above for the same reason: `payment-channel` was `packages/solana-program`'s
+crate name, the one thing the workspace gate ever excluded.
 
 ## Testing
 
@@ -256,9 +254,11 @@ before 2026-08, killing that leg with no repair path. The faucet is a separate
 service and is not part of the connector.
 
 **Mainnet.** TOON's contracts are live on Base mainnet (2026-09-01,
-`packages/contracts/deployments/base-mainnet.md`) and its payment-channel program on
-Solana mainnet-beta (2026-08-14, `packages/solana-program/deployments/mainnet-beta.md`),
-both against Circle's native USDC and both deployed by hand. One third-party operator's
+`docs/deployments/base-mainnet.md`) and its payment-channel program on
+Solana mainnet-beta (2026-08-14, `docs/deployments/mainnet-beta.md`),
+both against Circle's native USDC and both deployed by hand. Those records moved out of
+`packages/contracts` and `packages/solana-program` when #1386 removed the packages
+themselves; the contracts stay on chain regardless. One third-party operator's
 node — Drew Pierson's — uses them; this repository's fleet does not. This build no longer
 settles on them (ADR 0075): such a node drains its TOON channels on the last TOON-capable
 release before upgrading, and a journal still holding them is refused at boot by name. Nothing here funds

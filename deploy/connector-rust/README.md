@@ -31,9 +31,9 @@ that happens.
 
 `.github/workflows/publish-connector-rust-image.yml` publishes this image to
 `ghcr.io/toon-protocol/connector` on every push to `main` that touches
-`crates/**`, `Cargo.toml`/`Cargo.lock`, `packages/solana-program/**`, or this
-Dockerfile (also runnable manually via `workflow_dispatch`). The package is
-public, so no registry login is required to pull it.
+`crates/**`, `Cargo.toml`/`Cargo.lock`, or this Dockerfile (also runnable
+manually via `workflow_dispatch`). The package is public, so no registry
+login is required to pull it.
 
 It shares the `connector` package with the retired TypeScript node (last tag
 `4.0.0`, no longer published); the `rust-` tag prefix keeps the two disjoint.

@@ -128,8 +128,8 @@ from the repo root. They are exactly what CI's `Rust Workspace Gate` runs:
 
 - format: `cargo fmt --all -- --check`
 - build: `cargo build --workspace`
-- test: `cargo test --workspace --exclude payment-channel`
-- lint: `cargo clippy --workspace --exclude payment-channel --all-targets -- -D warnings`
+- test: `cargo test --workspace`
+- lint: `cargo clippy --workspace --all-targets -- -D warnings`
 
 `anvil` and `cast` (Foundry v1.7.1) are installed in this container, so the EVM
 settlement tests bring up a real local chain and genuinely run. Per ADR 0007 that
