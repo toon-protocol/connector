@@ -204,6 +204,23 @@ impl VoucherStateSource for HttpVoucherState {
     }
 }
 
+/// A receiver this node has no route to ask -- an onion client edge on a
+/// node with no usable `socks_proxy` (ADR 0070) -- refused by name without
+/// a dial, so an onion name never reaches the local resolver.
+pub(crate) struct UnreachableVoucherState(pub(crate) String);
+
+#[async_trait]
+impl VoucherStateSource for UnreachableVoucherState {
+    async fn watermark(
+        &self,
+        _presentation: &ChannelPresentation,
+        _expires: u64,
+        _signature: &[u8],
+    ) -> Result<u128, String> {
+        Err(self.0.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

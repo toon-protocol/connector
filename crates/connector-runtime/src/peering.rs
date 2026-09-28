@@ -336,8 +336,8 @@ impl Connector {
             chain: chain.to_string(),
             value: value.to_string(),
         };
-        let signer = parse_voucher_signer(chain, published_signer)
-            .ok_or_else(|| unreadable(published_signer))?;
+        let signer =
+            parse_chain_key(chain, published_signer).ok_or_else(|| unreadable(published_signer))?;
         // One signer, one relation: refused before a channel is opened for
         // a peering that could then never be bound.
         if let Some(bound_to) = self.voucher_signer_peer(&signer) {
@@ -350,7 +350,7 @@ impl Connector {
             }
         }
         let pay_to = shared.pay_to();
-        let receiver = parse_voucher_signer(chain, pay_to).ok_or_else(|| unreadable(pay_to))?;
+        let receiver = parse_chain_key(chain, pay_to).ok_or_else(|| unreadable(pay_to))?;
         let outbound = self
             .outbound_channels()
             .ok_or(BatchChannelError::NoBackend(chain))?;
@@ -488,7 +488,7 @@ pub(crate) fn parse_solana_key(value: &str) -> Option<[u8; 32]> {
 
 /// A key or address in `chain`'s own shape, as the [`VoucherSigner`] a
 /// channel names it by: a voucher signer, or the receiver a channel pays.
-pub(crate) fn parse_voucher_signer(chain: SettlementChain, value: &str) -> Option<VoucherSigner> {
+pub(crate) fn parse_chain_key(chain: SettlementChain, value: &str) -> Option<VoucherSigner> {
     match chain {
         SettlementChain::Evm => parse_evm_address(value).map(VoucherSigner::Evm),
         SettlementChain::Solana => parse_solana_key(value).map(VoucherSigner::Solana),
@@ -509,18 +509,16 @@ pub(crate) fn shared_settlement_of(
         .batch_settlements
         .iter()
         .map(|terms| {
-            let network = match terms {
-                X402BatchSettlementTerms::Evm(evm) => &evm.network,
-                X402BatchSettlementTerms::Solana(solana) => &solana.network,
-            };
-            SharedSettlement {
-                voucher_signer: document
-                    .voucher_signers
-                    .iter()
-                    .find(|signer| &signer.network == network)
-                    .map(|signer| signer.signer.clone()),
+            let mut entry = SharedSettlement {
                 terms: terms.clone(),
-            }
+                voucher_signer: None,
+            };
+            entry.voucher_signer = document
+                .voucher_signers
+                .iter()
+                .find(|signer| signer.network == entry.network())
+                .map(|signer| signer.signer.clone());
+            entry
         })
         .filter(|entry| pays_on(entry.chain()))
         .collect();
@@ -786,7 +784,7 @@ mod tests {
     #[test]
     fn a_voucher_signer_is_read_in_its_own_chains_shape_or_refused() {
         assert_eq!(
-            parse_voucher_signer(
+            parse_chain_key(
                 SettlementChain::Solana,
                 "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
             )
@@ -794,14 +792,14 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            parse_voucher_signer(
+            parse_chain_key(
                 SettlementChain::Solana,
                 "0x00000000000000000000000000000000000000aa"
             ),
             None
         );
         assert_eq!(
-            parse_voucher_signer(
+            parse_chain_key(
                 SettlementChain::Evm,
                 "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
             ),

@@ -476,12 +476,10 @@ pub struct ClaimBook {
     /// `peer_id` -> the channel this connector claims against when it owes
     /// that peer.
     ///
-    /// Copy-on-write behind an [`ArcSwap`], like the three binding maps
-    /// below: a peering established at runtime (ADR 0058) binds its channel
-    /// while the process is serving, and the packet path reads these on
-    /// every claim. See [`ClaimBook::rebind`] for what a write costs and
-    /// why that is the right trade here.
-    outbound_channels: ArcSwap<HashMap<String, String>>,
+    /// Fixed at construction, from the config file: a runtime peering pays
+    /// over its own x402 channel since ADR 0075 (#1378, #1379) and binds no
+    /// `toon-channel` here while the process is serving.
+    outbound_channels: HashMap<String, String>,
     /// `channel_id` -> its parsed on-chain `bytes32` and the EIP-712 domain
     /// its claims are verified under (issue #575/#566): `accept_inbound`
     /// builds the [`EvmBalanceProof`] a claim's signature must recover
@@ -532,7 +530,7 @@ impl ClaimBook {
         ClaimBook {
             signer,
             solana_signer: None,
-            outbound_channels: ArcSwap::from_pointee(outbound_channels),
+            outbound_channels,
             channel_domains: ArcSwap::from_pointee(HashMap::new()),
             counterparties: ArcSwap::from_pointee(counterparties),
             solana_channels: ArcSwap::from_pointee(HashMap::new()),
@@ -581,14 +579,6 @@ impl ClaimBook {
     /// builder-chain contract.
     pub fn set_solana_signer(&mut self, signer: Arc<dyn Ed25519Signer>) {
         self.solana_signer = Some(signer);
-    }
-
-    /// Configure the channel this connector claims against when it owes
-    /// `peer_id`.
-    pub fn set_outbound_channel(&self, peer_id: impl Into<String>, channel_id: impl Into<String>) {
-        Self::rebind(&self.outbound_channels, |map| {
-            map.insert(peer_id.into(), channel_id.into());
-        });
     }
 
     /// Replace one of this book's channel-binding maps with a copy that
@@ -804,7 +794,7 @@ impl ClaimBook {
     /// outgoing frame to `peer_id` is claimed against, independent of
     /// whether a claim happens to be pending right now).
     pub fn outbound_channel_id(&self, peer_id: &str) -> Option<String> {
-        self.outbound_channels.load().get(peer_id).cloned()
+        self.outbound_channels.get(peer_id).cloned()
     }
 
     /// Whether `claim`'s signature is genuine, for the chain the signature
@@ -1489,8 +1479,11 @@ mod tests {
 
     #[test]
     fn outbound_channel_id_reports_the_configured_channel_for_a_peer() {
-        let book = ClaimBook::new(None, HashMap::new(), HashMap::new());
-        book.set_outbound_channel("peer-b", channel_id(1));
+        let book = ClaimBook::new(
+            None,
+            HashMap::from([("peer-b".to_string(), channel_id(1))]),
+            HashMap::new(),
+        );
 
         assert_eq!(book.outbound_channel_id("peer-b"), Some(channel_id(1)));
         assert_eq!(book.outbound_channel_id("peer-nowhere"), None);

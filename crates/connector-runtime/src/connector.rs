@@ -44,7 +44,8 @@ use crate::outbound_client::{
     ClaimStateSource, EvmDomain, OutboundClaimBinding, OutboundClientLedger, SolanaDomain,
 };
 use crate::outbound_voucher::{
-    challenge_entry, voucher_json, HttpVoucherState, VoucherStateSource, PEER_CHALLENGE_TTL_SECS,
+    challenge_entry, voucher_json, HttpVoucherState, UnreachableVoucherState, VoucherStateSource,
+    PEER_CHALLENGE_TTL_SECS,
 };
 use crate::peer_route_store::{
     PeerRouteStore, PeerRouteStoreError, RuntimePeerChannel, RuntimePeering, RuntimePeers,
@@ -1264,9 +1265,9 @@ impl Connector {
     /// `connector_config::is_onion_endpoint` -- the same rule that decides
     /// the peering's carriage and its self-description fetch -- so a peer
     /// reachable only over a circuit can still be asked where its channel
-    /// stands. An onion client edge on a node with no proxy gets a direct
-    /// client, which fails at the dial like every other onion dial without
-    /// one, and the journaled watermark stands.
+    /// stands. An onion client edge on a node with no usable proxy is never
+    /// dialed: its ask is refused by name, and the journaled watermark
+    /// stands.
     pub(crate) fn register_voucher_hop(
         &self,
         peer_id: &str,
@@ -1284,24 +1285,39 @@ impl Connector {
         else {
             return;
         };
-        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_millis(
+        let builder = reqwest::Client::builder().timeout(std::time::Duration::from_millis(
             connector_config::DEFAULT_PEER_TIMEOUT_MS,
         ));
         let onion = url::Url::parse(client_edge_url)
             .is_ok_and(|url| connector_config::is_onion_endpoint(&url));
-        if let (true, Some(proxy)) = (onion, self.socks_proxy.as_ref()) {
-            match reqwest::Proxy::all(proxy.as_str()) {
-                Ok(proxy) => builder = builder.proxy(proxy),
-                Err(error) => tracing::warn!(
-                    peer_id,
-                    %error,
-                    "socks_proxy could not be used for the peer's claim-state"
-                ),
+        let client = if onion {
+            // Fail closed: an onion name must never reach the local
+            // resolver, so with no usable proxy the ask is refused by name
+            // before any dial, and the journaled watermark stands.
+            let proxied = match self.socks_proxy.as_ref() {
+                None => Err(crate::peer_transport::NO_SOCKS_PROXY.to_string()),
+                Some(proxy) => reqwest::Proxy::all(proxy.as_str())
+                    .and_then(|socks| builder.proxy(socks).build())
+                    .map_err(|error| format!("socks_proxy '{proxy}' could not be used: {error}")),
+            };
+            match proxied {
+                Ok(client) => client,
+                Err(reason) => {
+                    self.insert_voucher_hop(
+                        peer_id,
+                        outbound_channel_id,
+                        Arc::new(UnreachableVoucherState(format!(
+                            "{client_edge_url} is an onion host: {reason}"
+                        ))),
+                    );
+                    return;
+                }
             }
-        }
-        let client = builder
-            .build()
-            .expect("a reqwest client with a timeout and a SOCKS proxy always builds");
+        } else {
+            builder
+                .build()
+                .expect("a reqwest client with only a timeout set always builds")
+        };
         self.insert_voucher_hop(
             peer_id,
             outbound_channel_id,
@@ -1351,7 +1367,7 @@ impl Connector {
             }
             RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::Solana { .. } => return Ok(()),
         };
-        let Some(signer) = crate::peering::parse_voucher_signer(chain, voucher_signer) else {
+        let Some(signer) = crate::peering::parse_chain_key(chain, voucher_signer) else {
             tracing::warn!(
                 peer_id,
                 voucher_signer,
@@ -10849,6 +10865,42 @@ mod tests {
                 "signed above the watermark the onion peer reported"
             );
             assert_eq!(outbound.signed(&channel), Some(7_100));
+        }
+
+        /// ADR 0070, failing closed: an onion client edge on a node with no
+        /// `socks_proxy` is never dialed -- an onion name must not reach the
+        /// local resolver -- so the claim-state ask is refused by name and
+        /// the forward is signed above the journaled watermark, which is
+        /// never behind what this node signed.
+        #[tokio::test]
+        async fn an_onion_peers_claim_state_is_never_dialed_without_a_proxy() {
+            const ONION: &str = "toonexampleconnectoraddress234567abcdefghijklmnopqrstuvw.onion";
+            let (connector, next_hop, _receiver, outbound, channel) = peered().await;
+            connector.register_voucher_hop(
+                "next-hop",
+                &RuntimePeerChannel::EvmVoucher {
+                    outbound_channel_id: channel.clone(),
+                    voucher_signer: format!("0x{}", "02".repeat(20)),
+                    network: "eip155:31337".to_string(),
+                },
+                &format!("http://{ONION}/ilp"),
+            );
+            let hop = connector
+                .outbound_voucher_hops
+                .load()
+                .get("next-hop")
+                .cloned()
+                .expect("the hop");
+            let presentation = outbound.presentation(&channel).expect("the channel");
+            let refused = hop
+                .claim_state
+                .watermark(&presentation, 0, &[1])
+                .await
+                .expect_err("no proxy, no dial");
+            assert!(refused.contains("socks_proxy"), "{refused}");
+
+            connector.handle_prepare(prepare(110)).await;
+            assert_eq!(voucher_amount(&next_hop.covered.lock().unwrap()[0]), 100);
         }
     }
 }

@@ -706,7 +706,8 @@ fee)`, ADR 0042). The voucher is signed by the settlement key (`payerAuthorizer 
   any voucher the receiver did not accept, and only ever raises its signed watermark to the answer; a
   receiver that cannot be asked leaves the journaled watermark (never behind what was signed) standing,
   and is asked again on the next forward. The ask leaves on `socks_proxy` when the peer's client edge
-  is an onion host, by the same host rule as the carriage.
+  is an onion host, by the same host rule as the carriage; with no usable proxy it is refused by
+  name and never dialed.
 - **On ILP-over-HTTP, at most one voucher-bearing request is in flight per relation** (§7.2's rule,
   applied to a peering's one outbound channel), so two cumulative vouchers cannot overtake each other.
 - **Removing the peering** (`DELETE /peers/:id`) unbinds the peer's signer and stops signing on the
