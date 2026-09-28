@@ -177,9 +177,9 @@ A node reads these:
 
 ADR 0075 (accepted, partly built — #1371) makes each chain's settlement key the signer of every
 voucher on that chain and leaves `[signer]` as identity only, with no spending authority. Client
-payouts already follow it (#1381): they are vouchers signed by the chain's settlement key. Until the
-remaining steps land, peer claims are still `toon-channel` claims, signed by the settlement keys as
-the table says.
+payouts (#1381) and peer claims (#1378, #1379, #1380) already follow it: both are vouchers signed by
+the chain's settlement key. Until #1384 lands, a client may still present a `toon-channel` claim at
+the client edge.
 
 `[announce]` is gone (ADR 0046 / #1074): the section is now `[node]`, holding only `addresses`,
 `http_endpoint` and `btp_endpoint` — the facts a node cannot introspect about itself — and no key of
@@ -207,8 +207,10 @@ channel), tops the payer's channel up with `POST /channels/:id/fund` (an
 **increment**, so it reads the collateral first and funds the shortfall), points
 the forwarding prefix at the peering with `POST /routes/peers`, and reads every
 channel back off the chain it lives on. The peering figures — each `fee`, cap
-and route `price` — live in that script's topology table, not in any committed
-config.
+and route `price` — live in that script's topology table, except where a
+topology declares a peering in its committed config instead (`mixed-chain`'s B
+declares its A peering, to prove `forwarded_claim_enforcement = "enforce"`),
+which the stage checks and does not `POST /peers`.
 
 In a container, `state_dir` must be a mounted volume: the image runs as uid 10001
 and creates `/app/state` owned by that uid precisely so a fresh named volume
