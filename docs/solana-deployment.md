@@ -154,7 +154,7 @@ rent_lamports = (binary_bytes + 45-byte ProgramData header + 128-byte loader ove
 `6,960` lamports/byte is the 2-year rent-exemption rate (`3,480` lamports/byte-year, times two).
 
 This reconciles exactly against our own measured public-devnet deploy
-(`packages/solana-program/deployments/devnet-public.md`): its 105,128-byte binary cost
+(`docs/deployments/devnet-public.md`): its 105,128-byte binary cost
 
 ```
 (105,128 + 45 + 128) x 6,960 = 732,894,960 lamports  (~0.733 SOL)
@@ -571,8 +571,8 @@ upgrade authority you recorded above (or no authority at all, once and only once
 deliberate, separate `--final` step has been run). `tools/solana/program-id.mainnet.json`
 records the program id, the token mint this deploy expects channels to settle in, the
 binary size, and the `max_len` allocated -- keep it, and consider committing a
-deployment record under `packages/solana-program/deployments/` mirroring
-`devnet-public.md`'s format once the broadcast has happened.
+deployment record under `docs/deployments/` mirroring `devnet-public.md`'s format once
+the broadcast has happened.
 
 ### What This Runbook Does Not Cover
 

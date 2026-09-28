@@ -231,7 +231,7 @@ forwarder (`:191-199`), so `_msgSender()` resolves through a relayer to the user
 `ForwardRequest`. A meta-transactional deposit is already contractually supported. An
 `ERC2771Forwarder` is deployed on Base Sepolia (`docs/evm-deployment.md`), and — a caveat worth
 carrying — **`trustedForwarder == address(0)` on Base mainnet**
-(`packages/contracts/deployments/base-mainnet.md`), i.e. meta-transactions are off in production.
+(`docs/deployments/base-mainnet.md`), i.e. meta-transactions are off in production.
 
 **Solana: deposit is not delegatable at all.** `process_deposit` requires `depositor.is_signer`
 (`packages/solana-program/src/processor.rs:309-311`) and decides the credited side purely from the
@@ -459,7 +459,7 @@ needs the SPL tokens in their own ATA.
   the `batch-settlement` scheme; whether a third party's network binding can be registered with it
   is not stated anywhere I could find — **unverified**.
 - **Does `ERC2771Forwarder` need to be re-enabled on Base mainnet?** `trustedForwarder ==
-address(0)` there (`packages/contracts/deployments/base-mainnet.md`), which turns off the whole
+address(0)` there (`docs/deployments/base-mainnet.md`), which turns off the whole
   meta-transaction path in production. Whether that was a deliberate mainnet posture or an
   oversight — **not answered by any record I found**.
 - **Does the gas station's refusal to relay `openChannel` survive contact with a real on-ramp?**

@@ -30,7 +30,7 @@ demand, so an operational reset, not a loss.
 
 **The record:**
 
-- the deployment: `packages/contracts/deployments/base-sepolia.md`, "Devnet USDC cutover";
+- the deployment: `docs/deployments/base-sepolia.md`, "Devnet USDC cutover";
 - the repoint checklist: issue #1337;
 - the keys: `/root/keys/devnet-usdc-{owner,proxy-admin}.key` on the devnet box.
 
@@ -76,7 +76,7 @@ restarted, and the live kind:10032 announce advertises the new `TokenNetwork` as
 | TokenNetwork (USDC)  | `0xa79C3b1dbcEA00a6d84735a134395D8eF6D6a478` |
 
 Full record, transaction hashes and post-broadcast on-chain verification:
-`packages/contracts/deployments/base-sepolia.md`. The tables below describing the
+`docs/deployments/base-sepolia.md`. The tables below describing the
 _pre-cutover_ deployment and the rollback target are kept as written -- the old registry is
 deliberately untouched and is exactly what a rollback points back at.
 
@@ -88,7 +88,7 @@ deliberately untouched and is exactly what a rollback points back at.
 > Every in-repo item of the repoint checklist below is ticked in the same change that flipped this
 > line; the node-repo and on-box items are ticked as they land. The full record — addresses,
 > transaction hashes, on-chain verification, bytecode provenance — is
-> `packages/contracts/deployments/base-sepolia.md`, "ADR 0059 cutover deployment (2026-08-28)".
+> `docs/deployments/base-sepolia.md`, "ADR 0059 cutover deployment (2026-08-28)".
 >
 > | Contract             | Address                                      |
 > | -------------------- | -------------------------------------------- |
@@ -244,7 +244,7 @@ value merely stale instead of missing.
 
 **Bookkeeping — the record of what is deployed.**
 
-- [x] `packages/contracts/deployments/base-sepolia.md` → a new section in the shape of the existing
+- [x] `docs/deployments/base-sepolia.md` → a new section in the shape of the existing
       "ERC-2771 cutover deployment (2026-08-06)" one: network, RPC, date, deployer, block, script,
       the three addresses with their deploy tx hashes, the `setTrustedForwarder` tx, and the
       post-broadcast on-chain verification actually run — including `channelEpoch(address,address)`
@@ -341,7 +341,7 @@ exactly where they always did (AC4).
 
 ## The 2026-07-18 deployment, which #695 cut over from
 
-From `packages/contracts/deployments/base-sepolia.md`, deployed 2026-07-18:
+From `docs/deployments/base-sepolia.md`, deployed 2026-07-18:
 
 | Contract               | Address                                      |
 | ---------------------- | -------------------------------------------- |
@@ -475,7 +475,7 @@ note above warns about:
 
 **Records of the deploy, which gain the new addresses without losing the old:**
 
-- **`packages/contracts/deployments.json`** and **`packages/contracts/deployments/base-sepolia.md`**
+- **`packages/contracts/deployments.json`** and **`docs/deployments/base-sepolia.md`**
   -- add the new forwarder/registry/TokenNetwork addresses, transaction hashes, and deploy date,
   the same way the pre-cutover deployment is recorded there today.
 - **`crates/connector-settlement-evm/contracts/BYTECODE-PROVENANCE.md`** -- its own text says "If

@@ -1,3 +1,11 @@
+# NOTE on Cargo.lock (issue #567, revisited by #1386): blake3 (1.5.5), zeroize (1.8.1),
+# zeroize_derive (1.4.2), proc-macro-crate (3.1.0) and indexmap (2.11.4) are still held
+# back at the versions issue #567 pinned. The reason recorded there no longer applies --
+# it was packages/solana-program's frozen `cargo build-sbf` toolchain (Rust's 2024
+# edition, which that `cargo 1.79.0` could not parse), and that package left the
+# workspace in #1386 -- but nothing here has re-run `cargo update` to check whether
+# floating them forward is now safe. Treat that as an open question, not a green light:
+# do it as its own reviewed change, not as a side effect of an unrelated edit.
 [workspace]
 resolver = "2"
 members = [

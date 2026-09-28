@@ -171,7 +171,7 @@ USDC. They keep settling and closing where they are; nothing new should open the
 
 ## ADR 0059 cutover deployment (2026-08-28) — registry CURRENT, token superseded 2026-09-25
 
-[ADR 0059](../../../docs/adr/0059-a-channel-is-derived-from-its-participants.md): a channel id is
+[ADR 0059](../adr/0059-a-channel-is-derived-from-its-participants.md): a channel id is
 derived from its two participants and a per-pair epoch, never from a global counter, because a
 peering established from a URL (ADR 0058) has no channel id to be told and must compute one.
 `TokenNetwork` is not upgradeable, so this is the same shape as the 2026-08-06 cutover — a fresh

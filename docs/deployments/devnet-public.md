@@ -104,16 +104,21 @@ node's `TOON_MNEMONIC` at boot; `SOLANA_PRIVATE_KEY` env may also supply the raw
 
 ## Reproduce / redeploy
 
-Keypairs used for this deploy live outside the repo (scratchpad, not committed). To redeploy
-or upgrade:
+**No longer runnable from this repository.** `packages/solana-program`, `tools/solana/build-sbf.sh`,
+`tools/solana/deploy.sh` and `make solana-deploy-devnet` — everything the block below names — left
+the repository in issue #1386: this project does not build or deploy the program any more (ADR 0075).
+The commands are kept here as a record of how this deploy was done at the time, not as a runbook.
+
+Keypairs used for this deploy live outside the repo (scratchpad, not committed). At the time, to
+redeploy or upgrade:
 
 ```bash
-# ../../../tools/solana/build-sbf.sh, never a bare `cargo build-sbf`: the bare
+# tools/solana/build-sbf.sh, never a bare `cargo build-sbf`: the bare
 # form takes the CLI's default platform-tools line, which is the 112,513-byte
 # binary the comparison table below calls the wrong one. `make
 # solana-deploy-devnet` (tools/solana/deploy.sh) does this whole block pinned
 # and is the supported path; these commands are what it runs.
-cd packages/solana-program && ../../../tools/solana/build-sbf.sh
+cd packages/solana-program && ../../tools/solana/build-sbf.sh
 solana program deploy target/deploy/payment_channel.so \
   --program-id <program-keypair.json> \
   --upgrade-authority <deployer.json> \
@@ -224,7 +229,7 @@ The lost key is also this program's **upgrade authority** (see "On-chain address
 `Upgrade authority: AEPoA5x… (deployer)`). So any change to `packages/solana-program/src` —
 [#1036](https://github.com/toon-protocol/connector/issues/1036)'s lock, preimage release and
 expiry refund among them — is a **fresh deploy at a new program id**, not an upgrade of this one.
-That is not a small consequence: [ADR 0053](../../../docs/adr/0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md)
+That is not a small consequence: [ADR 0053](../adr/0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md)
 binds the settlement program into a claim's signed message, so a new program id is a new claim
 domain and every open channel on the old one has to be drained or abandoned first. Plan that
 deploy as a migration, not as a release.

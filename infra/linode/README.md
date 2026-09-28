@@ -62,12 +62,14 @@ labels that no longer resolve, named the deleted self-hosted chains and their
 mock tokens, the retired `proxy.store.` edge, and — the reason it was finally
 found — a **Solana payment-channel program id that has never been deployed to
 public devnet**, disagreeing with the `solana.programId` above and with both
-box configs. It is deleted, and
-`crates/connector-settlement-solana/tests/solana_program_ids.rs` now fails the
-build if any committed file names a Solana program id that is neither the
-public-devnet deploy nor the disposable local validator's. Since ADR 0053 binds
-the program id into a claim's signed message, a stale one here is not a
-mislabelling for long.
+box configs. It is deleted. `crates/connector-settlement-solana/tests/solana_program_ids.rs`
+was the guard that caught it, failing the build if any committed file named a
+Solana program id that was neither the public-devnet deploy nor the disposable
+local validator's; ADR 0075 (#1385) retired it along with TOON's own
+program-id config, which is what it guarded — a program id is a constant of
+the binary now, on every chain, so there is no longer a config value it could
+disagree with. Since ADR 0053 binds the program id into a claim's signed
+message, a stale one here would not have been a mislabelling for long.
 
 The EVM half of this file drifted the same way and was caught the same way, a
 month later. `tokenNetworkUsdc` is **derived**: it is whatever

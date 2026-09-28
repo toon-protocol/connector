@@ -73,7 +73,7 @@ Not done: a byte-for-byte match of either runtime bytecode against a local `forg
 
 The operator's node (`g.drew`) moved `[settlement.evm]` from Base Sepolia to this registry the same
 afternoon and retired its Sepolia leg, making it the first connector settling on two mainnets
-(its Solana leg is `packages/solana-program/deployments/mainnet-beta.md`).
+(its Solana leg is `docs/deployments/mainnet-beta.md`).
 
 | Step             | Value                                                                                                                                                                                                                                                                       |
 | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
