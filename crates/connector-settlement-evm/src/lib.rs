@@ -23,6 +23,7 @@
 //! [`connector_settlement::ChannelState`] is derived from that two-sided
 //! shape.
 
+mod batch_payer;
 mod batch_settlement;
 mod batch_watch;
 mod bindings;
@@ -38,6 +39,10 @@ mod send;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support;
 
+pub use batch_payer::{
+    DepositRoute, ERC3009_DEPOSIT_COLLECTOR_ADDRESS, PERMIT2_ADDRESS,
+    PERMIT2_DEPOSIT_COLLECTOR_ADDRESS,
+};
 pub use batch_settlement::EvmBatchSettlementBackend;
 pub use batch_watch::{
     claim_target, settle_due, Claimed, EvmBatchWatcher, SweepReport, BATCH_SWEEP_INTERVAL,

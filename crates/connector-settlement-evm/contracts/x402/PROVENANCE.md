@@ -15,8 +15,30 @@ byte-identical to that sandbox's `sandbox/artifacts/evm/` copies, which its
 | `x402BatchSettlement.runtime.hex`     | RUNTIME bytecode, 11175 bytes                                                     | `eth_getCode` at `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003` on Base Sepolia                                                |
 | `ERC3009DepositCollector.runtime.hex` | RUNTIME bytecode of the ERC-3009 deposit collector, 1150 bytes                    | `eth_getCode` at `0x4020806089470a89826cB9fB1f4059150b550004` on Base Sepolia                                                |
 | `SignatureChecker.runtime.hex`        | RUNTIME bytecode of Circle's `SignatureChecker` library, 1741 bytes               | `eth_getCode` at `0xbA3b60c21e28C41df4bABd90f228e1D368627DA6` on Base Sepolia                                                |
+| `Permit2DepositCollector.runtime.hex` | RUNTIME bytecode of the Permit2 deposit collector, 2467 bytes                     | `eth_getCode` at `0x4020425FAf3B746C082C2f942b4E5159887B0005` on Base Sepolia                                                |
+| `Permit2.runtime.hex`                 | RUNTIME bytecode of Uniswap's Permit2, 9152 bytes                                 | `eth_getCode` at `0x000000000022D473030F116dDEE9F6B43aC78BA3` on Base Sepolia                                                |
 | `FiatTokenV2_2.creation.hex`          | CREATION bytecode of the FiatToken v2.2 implementation                            | the input of Base Sepolia tx `0x6dbb9d759e3388911863490b3bde0e8fa3c22a8e70f48f758302592b7dc52fe1`                            |
 | `FiatTokenProxy.creation.hex`         | CREATION bytecode of `FiatTokenProxy`, with its one constructor argument stripped | the input of Base Sepolia tx `0xd835c0abef5b7988ba6230f92da809391716b8dc5e6cd4e430263b52d3bf69f3`, less its last 32 bytes    |
+
+## The Permit2 route, added on 2026-09-27
+
+Issue #1374 (ADR 0075 decision 3). A node deposits a token with no EIP-3009 through
+`Permit2DepositCollector`, so the tier-3 tests place it and Permit2 as well. Both files
+are `cast code <address> --rpc-url https://sepolia.base.org`, read on 2026-09-27.
+
+- **The collector.** Read on the same RPC, its `PERMIT2()` is
+  `0x000000000022D473030F116dDEE9F6B43aC78BA3` and its `x402BatchSettlement()` is
+  `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003`. Its two immutables are the canonical
+  addresses, so its runtime is correct wherever those two sit, and it is byte-identical on
+  Base mainnet. Its `DEPOSIT_WITNESS_TYPE_STRING()` answers
+  `DepositWitness witness)DepositWitness(bytes32 channelId)TokenPermissions(address token,uint256 amount)`,
+  the type string the backend signs under.
+- **Permit2.** Its code differs between Base Sepolia and Base mainnet only because it
+  caches its chain id and EIP-712 separator as immutables. Like `x402BatchSettlement`, it
+  rebuilds the separator when `block.chainid` differs, so `anvil`'s chain gets its own.
+
+`tests/x402_provenance.rs` checks offline that each runtime dispatches the selectors the
+deposit calls.
 
 ## Checked on 2026-09-25
 

@@ -4,12 +4,14 @@
 //! in `contracts/x402/` (`contracts/x402/PROVENANCE.md` says where each file
 //! came from).
 //!
-//! - `x402BatchSettlement` and `ERC3009DepositCollector` go to their
-//!   canonical CREATE2 addresses by `anvil_setCode`. Both are Base Sepolia's
-//!   runtime code, and neither needs storage: the contract's only
-//!   constructor state is OpenZeppelin `EIP712`'s, which rebuilds its
-//!   separator when `block.chainid` differs from the one it cached, and the
-//!   collector's one immutable is the contract's canonical address.
+//! - `x402BatchSettlement`, `ERC3009DepositCollector` and
+//!   `Permit2DepositCollector` go to their canonical CREATE2 addresses, and
+//!   Uniswap's Permit2 to its own, by `anvil_setCode`. All four are Base
+//!   Sepolia's runtime code, and none needs storage: the contract's and
+//!   Permit2's only constructor state is an EIP-712 separator each rebuilds
+//!   when `block.chainid` differs from the one it cached, and the
+//!   collectors' immutables are the contract's and Permit2's canonical
+//!   addresses.
 //! - USDC is Circle's FiatToken v2.2, **deployed** from Base Sepolia's own
 //!   creation code (implementation, then proxy) and initialised, because a
 //!   FiatToken's initialisers write the state that makes it work. It is what
@@ -19,8 +21,9 @@
 //!   there first: the library's call guard compares its own address to that
 //!   one.
 //!
-//! This is the **client's** side of a channel, which is why it is a fixture
-//! and not the backend: the backend never opens, funds or withdraws.
+//! What this drives is the **client's** side of a channel, a payer that is
+//! not a connector. A connector's own paying half (ADR 0075, issue #1374) is
+//! the backend's, and is tested against the same placed contracts.
 
 use std::sync::Arc;
 
@@ -66,9 +69,22 @@ pub fn signature_checker_address() -> Address {
 
 /// `ERC3009DepositCollector` at `0x4020806089470a89826cB9fB1f4059150b550004`.
 pub fn erc3009_deposit_collector_address() -> Address {
-    "0x4020806089470a89826cB9fB1f4059150b550004"
-        .parse()
-        .expect("a literal address")
+    Address::from(crate::ERC3009_DEPOSIT_COLLECTOR_ADDRESS)
+}
+
+/// `Permit2DepositCollector` at `0x4020425FAf3B746C082C2f942b4E5159887B0005`.
+pub fn permit2_deposit_collector_address() -> Address {
+    Address::from(crate::PERMIT2_DEPOSIT_COLLECTOR_ADDRESS)
+}
+
+/// Uniswap's Permit2 at `0x000000000022D473030F116dDEE9F6B43aC78BA3`.
+pub fn permit2_address() -> Address {
+    Address::from(crate::PERMIT2_ADDRESS)
+}
+
+/// A channel id's 32 bytes, from the spelling the backend reports it in.
+pub fn parse_channel(channel: &ChannelId) -> [u8; 32] {
+    crate::channel_id::parse_channel_id(channel).expect("a channel id")
 }
 
 /// `x402BatchSettlement` at its canonical address.
@@ -80,6 +96,9 @@ const BATCH_SETTLEMENT_RUNTIME: &str =
     include_str!("../../contracts/x402/x402BatchSettlement.runtime.hex");
 const ERC3009_DEPOSIT_COLLECTOR_RUNTIME: &str =
     include_str!("../../contracts/x402/ERC3009DepositCollector.runtime.hex");
+const PERMIT2_DEPOSIT_COLLECTOR_RUNTIME: &str =
+    include_str!("../../contracts/x402/Permit2DepositCollector.runtime.hex");
+const PERMIT2_RUNTIME: &str = include_str!("../../contracts/x402/Permit2.runtime.hex");
 const SIGNATURE_CHECKER_RUNTIME: &str =
     include_str!("../../contracts/x402/SignatureChecker.runtime.hex");
 const FIAT_TOKEN_V2_2_CREATION: &str =
@@ -164,6 +183,13 @@ impl X402Chain {
                 ERC3009_DEPOSIT_COLLECTOR_RUNTIME,
             )
             .await;
+        chain
+            .set_code(
+                permit2_deposit_collector_address(),
+                PERMIT2_DEPOSIT_COLLECTOR_RUNTIME,
+            )
+            .await;
+        chain.set_code(permit2_address(), PERMIT2_RUNTIME).await;
         chain
     }
 

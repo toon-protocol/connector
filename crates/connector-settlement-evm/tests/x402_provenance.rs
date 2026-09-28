@@ -72,3 +72,23 @@ fn claim_is_the_selector_forge_reported_at_the_pin() {
         [0x29, 0x23, 0x7b, 0x0c]
     ));
 }
+
+/// The paying half's deposit route through Permit2 (ADR 0075 decision 3,
+/// issue #1374) calls two contracts this crate binds no ABI for:
+/// `Permit2DepositCollector`, which `x402BatchSettlement.deposit` calls
+/// `collect` on, and Permit2, whose `permitWitnessTransferFrom` the
+/// collector calls and whose `DOMAIN_SEPARATOR` the backend signs under.
+/// Their committed runtimes dispatch those selectors.
+#[test]
+fn the_permit2_route_is_dispatched_by_the_committed_bytecode() {
+    // collect(address,address,uint256,bytes32,bytes)
+    assert!(dispatches(
+        &runtime("Permit2DepositCollector"),
+        [0xe4, 0x16, 0xd8, 0xd3]
+    ));
+    let permit2 = runtime("Permit2");
+    // permitWitnessTransferFrom(((address,uint256),uint256,uint256),(address,uint256),address,bytes32,string,bytes)
+    assert!(dispatches(&permit2, [0x13, 0x7c, 0x29, 0xfe]));
+    // DOMAIN_SEPARATOR()
+    assert!(dispatches(&permit2, [0x36, 0x44, 0xe5, 0x15]));
+}

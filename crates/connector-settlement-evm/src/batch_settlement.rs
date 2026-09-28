@@ -1,7 +1,9 @@
-//! The EVM implementation of the receive-only batch-settlement port (ADR
-//! 0074 decisions 2 and 5, issue #1342): a client's x402 `batch-settlement`
+//! The EVM implementation of the batch-settlement port's receiving half (ADR
+//! 0074 decisions 2 and 5, issue #1342): a payer's x402 `batch-settlement`
 //! channel in `x402BatchSettlement`, which this node admits, reads and
-//! `claim`s on, and never opens, funds or signs for.
+//! `claim`s on. The same backend is the paying half too (ADR 0075 decision
+//! 2, issue #1374), on the channels this node opens itself; that half is
+//! [`crate::batch_payer`].
 //!
 //! # Admission
 //!
@@ -31,9 +33,10 @@
 //!
 //! # What is remembered
 //!
-//! Admission is the only place a channel's config is learned, and `claim`
-//! needs the whole config, so this backend keeps it -- in memory, for the
-//! process lifetime. Nothing else is cached: every figure a
+//! Admission is the only place an inbound channel's config is learned, and
+//! `claim` needs the whole config, so this backend keeps it -- in memory, for
+//! the process lifetime. Nothing else is cached on the receiving side (the
+//! paying half keeps its own record; see [`crate::batch_payer`]): every figure a
 //! [`BatchChannelState`] reports is read from the chain when asked, because
 //! collateral **falls** when a payer initiates a withdrawal (decision 5).
 //! After a restart a channel must be presented again before it can be landed
@@ -76,12 +79,16 @@ use crate::channel_id::format_channel_id;
 use crate::send::{confirm, ConfirmPolicy, Sender};
 use crate::{EvmClient, EvmSettlementBackend};
 
-/// The receive-only [`BatchSettlementBackend`] over `x402BatchSettlement`
-/// (ADR 0074). Built from the node's [`EvmSettlementBackend`] by
+/// Both halves of the batch-settlement port over `x402BatchSettlement`:
+/// [`BatchSettlementBackend`] (ADR 0074) and, in [`crate::batch_payer`],
+/// [`BatchSettlementPayer`](connector_settlement::batch::BatchSettlementPayer)
+/// (ADR 0075). Built from the node's [`EvmSettlementBackend`] by
 /// [`EvmSettlementBackend::batch_settlement`], and sharing its RPC client,
 /// its settlement key and that key's nonce count: this node's receiving
 /// identity on a batch-settlement channel is its settlement address, and
-/// `claim` is sent from it as the channel's `receiverAuthorizer`.
+/// `claim` is sent from it as the channel's `receiverAuthorizer`. As payer
+/// it is the same address, as both `payer` and `payerAuthorizer`, and the
+/// same key signs its deposits, its withdrawals and its vouchers.
 pub struct EvmBatchSettlementBackend {
     pub(crate) contract: X402BatchSettlement<EvmClient>,
     /// The EIP-712 domain every channel id and voucher digest is computed
@@ -101,11 +108,21 @@ pub struct EvmBatchSettlementBackend {
     /// config it was presented under. See the module doc for why this is
     /// the one thing kept.
     admitted: Mutex<HashMap<ChannelId, EvmChannelConfig>>,
+    /// The paying half's own record ([`crate::batch_payer`]): every channel
+    /// this node opened as payer, with its config and its watermark.
+    pub(crate) outbound: Mutex<HashMap<ChannelId, crate::batch_payer::Outbound>>,
+    /// How this node's deposits reach the contract, learned from the token
+    /// on the first deposit and kept: a token does not gain or lose
+    /// ERC-3009.
+    pub(crate) deposit_route: tokio::sync::OnceCell<crate::batch_payer::DepositRoute>,
+    /// Orders the paying half's writes against each other, so the backing
+    /// each records is never overwritten by an older reading.
+    pub(crate) paying: tokio::sync::Mutex<()>,
 }
 
 impl EvmSettlementBackend {
-    /// This node's receive-only backend for x402 `batch-settlement`
-    /// channels (ADR 0074), over `x402BatchSettlement` at the one address
+    /// This node's backend for x402 `batch-settlement` channels, both
+    /// halves (ADR 0074, ADR 0075), over `x402BatchSettlement` at the one address
     /// the record fixes ([`X402_BATCH_SETTLEMENT_ADDRESS`]), admitting
     /// channels whose `withdrawDelay` is at least `min_withdraw_delay_secs`:
     /// what `[settlement.evm.batch_settlement]` holds. Everything else a
@@ -165,17 +182,23 @@ impl EvmSettlementBackend {
             sender: Arc::clone(&self.sender),
             confirm: self.confirm,
             admitted: Mutex::new(HashMap::new()),
+            outbound: Mutex::new(HashMap::new()),
+            deposit_route: tokio::sync::OnceCell::new(),
+            paying: tokio::sync::Mutex::new(()),
         })
     }
 }
 
 /// One consistent reading of a channel: `channels(id)` and
 /// `pendingWithdrawals(id)` from the same block.
-struct Snapshot {
-    balance: u128,
-    total_claimed: u128,
-    pending_withdrawal: u128,
-    withdrawal_pending: bool,
+pub(crate) struct Snapshot {
+    pub(crate) balance: u128,
+    pub(crate) total_claimed: u128,
+    pub(crate) pending_withdrawal: u128,
+    pub(crate) withdrawal_pending: bool,
+    /// When the pending withdrawal was initiated, in the chain's seconds;
+    /// zero when none is.
+    pub(crate) initiated_at: u64,
 }
 
 impl EvmBatchSettlementBackend {
@@ -220,7 +243,7 @@ impl EvmBatchSettlementBackend {
 
     /// `channels(id)` and `pendingWithdrawals(id)` in one `eth_call`, through
     /// the contract's own `multicall`. See the module doc for why.
-    async fn snapshot(&self, id: [u8; 32]) -> Result<Snapshot, BatchSettlementError> {
+    pub(crate) async fn snapshot(&self, id: [u8; 32]) -> Result<Snapshot, BatchSettlementError> {
         let calls = vec![
             Bytes::from(ChannelsCall { channel_id: id }.encode()),
             Bytes::from(PendingWithdrawalsCall { channel_id: id }.encode()),
@@ -244,10 +267,11 @@ impl EvmBatchSettlementBackend {
             total_claimed: channel.total_claimed,
             pending_withdrawal: pending.amount,
             withdrawal_pending: pending.initiated_at != 0,
+            initiated_at: pending.initiated_at,
         })
     }
 
-    fn state(
+    pub(crate) fn state(
         &self,
         channel: &ChannelId,
         config: &EvmChannelConfig,
@@ -485,7 +509,7 @@ pub(crate) fn parse_id(channel: &ChannelId) -> Option<[u8; 32]> {
 
 /// An admitted channel's id: admission stores only canonical ids, so this
 /// parses by construction.
-fn admitted_id(channel: &ChannelId) -> Result<[u8; 32], BatchSettlementError> {
+pub(crate) fn admitted_id(channel: &ChannelId) -> Result<[u8; 32], BatchSettlementError> {
     parse_id(channel).ok_or_else(|| BatchSettlementError::ChannelNotAdmitted(channel.clone()))
 }
 
