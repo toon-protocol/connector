@@ -2369,12 +2369,11 @@ key_file = "{key_path}"
         assert!(matches!(error, RuntimeError::JournalUnreplayable { .. }));
     }
 
-    /// The peer semantics's own journal is armed off the same `state_dir`
-    /// (issue #605, #556's "Journal" row): one answer for both surfaces,
-    /// not a fix for the client edge and the same bug left standing on the
-    /// wire between connectors.
+    /// Nothing writes the peer claim journal since ADR 0075 (#1380, #1385):
+    /// a node built on a fresh `state_dir` does not create one. An older
+    /// build's is only read, to be refused if it holds `toon-channel` claims.
     #[tokio::test]
-    async fn a_configured_state_dir_also_arms_the_peer_claim_journal() {
+    async fn a_fresh_state_dir_gets_no_peer_claim_journal() {
         let state_dir = tempfile::tempdir().expect("temp state dir");
         let (config, _key_path) = config_with_raw_key_file(|key_path| {
             format!(
@@ -2391,7 +2390,7 @@ key_file = "{key_path}"
         });
 
         let _runtime = build(&config).await.expect("build");
-        assert!(state_dir.path().join(PEER_CLAIM_JOURNAL).exists());
+        assert!(!state_dir.path().join(PEER_CLAIM_JOURNAL).exists());
     }
 
     /// A node with no `state_dir` still builds -- config load has already

@@ -207,7 +207,7 @@ async fn a_voucher_accepted_before_a_restart_that_tightened_admission_is_still_c
     settlement_key
         .write_all(DEPLOYER_PRIVATE_KEY.as_bytes())
         .expect("write");
-    // `extra` is written into `[settlement.evm.batch_settlement]`.
+    // `extra` is written into `[settlement.evm]`.
     let config_text = |extra: &str| {
         format!(
             r#"
@@ -223,11 +223,10 @@ token_address = "{token:?}"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
+{extra}
 
 [settlement.evm.key]
 key_file = "{settlement_key}"
-
-{extra}
 
 [[routes]]
 prefix = "{ROUTE}"
