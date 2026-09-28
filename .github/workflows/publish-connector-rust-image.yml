@@ -67,7 +67,6 @@ on:
       - main
     paths:
       - 'crates/**'
-      - 'packages/solana-program/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'deploy/connector-rust/Dockerfile'

@@ -79,9 +79,9 @@ RUN curl -fsSL https://foundry.paradigm.xyz | bash \
 # the implementer cannot run this crate's tests locally and only finds out they're broken
 # once CI does.
 #
-# Pinned to v2.1.21, NOT the v3.1.12 ci.yml's `solana-program` jobs install. This repository
-# installs two Solana CLI versions on purpose and they are not interchangeable; the reason for
-# each, and what would have to be true to change it, is recorded once in
+# Pinned to v2.1.21, the one Solana CLI this repository installs anywhere (issue #1386 removed
+# packages/solana-program and the separate v3.1.12 its build/deploy path used to need). The
+# reason for the pin, and what would have to be true to change it, is recorded once in
 # crates/connector-settlement-solana/tests/solana_cli_pins.rs. That guard reads THIS file and
 # fails the build if the literal below drifts from it — a Dockerfile cannot read a workflow
 # variable, so the literal has to be repeated here and the guard is what keeps it honest.

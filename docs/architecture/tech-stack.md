@@ -9,9 +9,9 @@ describes it — for what it used, read this file's history.
 
 - **Language:** Rust, edition 2021, stable toolchain (CI pins nothing tighter than
   `dtolnay/rust-toolchain@stable`).
-- **Workspace:** one Cargo workspace, `crates/*` plus `packages/solana-program`
-  ([ADR 0001](../adr/0001-rust-workspace-library-first.md) — library-first: the binary is a thin
-  shell over crates that are usable and testable without it).
+- **Workspace:** one Cargo workspace, `crates/*` alone (issue #1386 removed the one other
+  member, `packages/solana-program`) ([ADR 0001](../adr/0001-rust-workspace-library-first.md) —
+  library-first: the binary is a thin shell over crates that are usable and testable without it).
 - **Async runtime:** `tokio` 1.x. Each crate enables only the features it needs; only
   `connector-bin` takes `rt-multi-thread`.
 - **Errors:** `thiserror` 2 — every crate defines its own typed error enum. No `anyhow` anywhere.
@@ -42,9 +42,11 @@ All of it lives in `connector-signer`; no other crate takes a crypto dependency 
 
 ## Chains
 
-- **EVM:** `ethers` 2 (`rustls`, no OpenSSL), bound to `packages/contracts`' `TokenNetwork` via
-  `TokenNetworkRegistry`. Local chain: `anvil`; contracts built with `forge` (Foundry, pinned to
-  `v1.7.1` in CI).
+- **EVM:** `ethers` 2 (`rustls`, no OpenSSL), bound to x402's `x402BatchSettlement`
+  ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)) — a
+  constant of the binary, not a contract this repository builds or deploys. Local chain:
+  `anvil`, seeded with committed bytecode; `forge` (Foundry, pinned to `v1.7.1` in CI) is still
+  used to build `connector-rate-source-evm`'s TWAP test fixture.
 - **Solana:** `solana-client` / `solana-sdk`, both pinned to `=2.1.0`. Local chain:
   `solana-test-validator`.
 - **Mina:** not supported ([ADR 0002](../adr/0002-drop-mina-from-the-rust-connector.md)).

@@ -64,9 +64,11 @@
 # copy of it simply outlived that decision in a second file.
 # `infra/linode/endpoints.json` is the hand-maintained record; read it, or
 # `./devnet-manage.sh ips` for the boxes' current addresses.
-# `crates/connector-settlement-solana/tests/solana_program_ids.rs` is what now
-# fails the build if any committed file names a program id that is neither of
-# the two this repository records.
+# `crates/connector-settlement-solana/tests/solana_program_ids.rs` was the
+# guard that failed the build if any committed file named a program id that
+# was neither of the two this repository recorded. ADR 0075 (#1385) retired
+# it along with the config value it guarded -- a program id is a constant of
+# the binary now, not something a committed file can disagree about.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

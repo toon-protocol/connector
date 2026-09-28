@@ -27,7 +27,7 @@
 # ADR 0002 dropped from this rewrite and ADR 0065 removed from the repository).
 #
 # Build (single platform, from the repository root so the build context
-# includes crates/ and packages/solana-program/):
+# includes crates/):
 #   docker build -f deploy/connector-rust/Dockerfile -t connector-rust .
 #
 # Build for both target platforms (per this ticket's AC):
@@ -81,7 +81,6 @@ FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY packages/solana-program ./packages/solana-program
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -109,14 +108,12 @@ COPY --from=planner /workspace/recipe.json recipe.json
 RUN cargo chef cook --release --locked -p connector --recipe-path recipe.json
 
 # The workspace root and every crate the connector binary's dependency
-# closure can reach. `packages/solana-program` (the `payment-channel`
-# crate) is a workspace member too -- Cargo needs its manifest present to
-# resolve the workspace graph -- but `-p connector` below never adds it to
-# the build plan, so the separate Solana BPF toolchain it needs is never
-# installed in this image.
+# closure can reach. Issue #1386 removed `packages/solana-program` (the
+# `payment-channel` crate) from the workspace entirely, so it is no longer a
+# member whose manifest Cargo needs present to resolve the graph -- `crates/`
+# is now the whole workspace.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY packages/solana-program ./packages/solana-program
 
 RUN cargo build --release --locked -p connector
 

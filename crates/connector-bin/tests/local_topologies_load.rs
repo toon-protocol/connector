@@ -34,7 +34,6 @@
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use connector_config::{Config, PeerExposure, SettlementChain, SettlementConfig, TransportPolicy};
 use connector_domain::{amount_after_rate_and_fee, AssetId, Price};
@@ -112,10 +111,6 @@ const ANVIL_ENTRYPOINT: &str = include_str!("../../../infra/anvil/entrypoint.sh"
 const ANVIL_SEED: &str = include_str!("../../../infra/anvil/seed.sh");
 const SOLANA_ENTRYPOINT: &str = include_str!("../../../infra/solana/entrypoint.sh");
 const MAKEFILE: &str = include_str!("../../../Makefile");
-
-/// The revisions `packages/contracts/lib` is pinned to, as `forge` itself
-/// records them (issue #1121).
-const FOUNDRY_LOCK: &str = include_str!("../../../packages/contracts/foundry.lock");
 
 /// Every committed config under `local/` that `LOCAL_TOPOLOGY` runs, with the
 /// path a failure should name. Written out rather than globbed so a new
@@ -2005,66 +2000,5 @@ fn every_local_target_names_one_compose_project() {
     ));
     for guarded in ["local-up: local-preflight", "local-verify: local-preflight"] {
         assert!(MAKEFILE.contains(guarded), "`{guarded}` must hold");
-    }
-}
-
-// ─── packages/contracts' pins ────────────────────────────────────────────────
-
-/// `packages/contracts/foundry.lock`'s revisions are the committed
-/// submodules'. No local chain compiles those contracts any more (the anvil
-/// service places committed bytecode), but the host-side `forge build`
-/// `abi_provenance` runs still does, against the libs
-/// `tools/contracts/init-libs.sh` pins, until #1386 removes the package -- so
-/// the lockfile must still name what the tree commits (issue #1121).
-#[test]
-fn the_lockfile_names_the_committed_submodule_revisions() {
-    let Some(root) = git_checkout_root() else {
-        return;
-    };
-
-    for lib in ["lib/forge-std", "lib/openzeppelin-contracts"] {
-        let path = format!("packages/contracts/{lib}");
-        let listed = Command::new("git")
-            .args(["ls-tree", "HEAD", "--", &path])
-            .current_dir(&root)
-            .output()
-            .expect("run git ls-tree");
-        let listed = String::from_utf8(listed.stdout).expect("git ls-tree output is utf-8");
-        let committed = listed
-            .split_whitespace()
-            .nth(2)
-            .unwrap_or_else(|| panic!("git ls-tree names no submodule at {path}: {listed:?}"))
-            .to_owned();
-        assert_eq!(committed, locked_revision(lib), "{lib}");
-    }
-}
-
-fn locked_revision(lib: &str) -> String {
-    let lock: serde_json::Value =
-        serde_json::from_str(FOUNDRY_LOCK).expect("packages/contracts/foundry.lock is JSON");
-    lock[lib]["tag"]["rev"]
-        .as_str()
-        .unwrap_or_else(|| panic!("packages/contracts/foundry.lock records no revision for {lib}"))
-        .to_owned()
-}
-
-/// The repository root, when this is a git checkout with git on PATH. Panics
-/// under `CI` rather than skipping: the gate runs against a clone.
-fn git_checkout_root() -> Option<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let toplevel = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(&root)
-        .output();
-    match toplevel {
-        Ok(output) if output.status.success() => Some(root),
-        _ => {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "this is not a git checkout (or git is not on PATH), but CI is set"
-            );
-            eprintln!("skipping: not a git checkout -- this test only skips outside CI");
-            None
-        }
     }
 }

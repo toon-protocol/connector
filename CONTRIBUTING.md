@@ -60,16 +60,13 @@ After reading the documentation above:
 ### Initial Setup
 
 1. Fork the repository on GitHub
-2. Clone your fork locally, **with submodules**:
+2. Clone your fork locally:
    ```bash
-   git clone --recurse-submodules https://github.com/YOUR_USERNAME/connector.git
+   git clone https://github.com/YOUR_USERNAME/connector.git
    cd connector
    ```
-   `packages/contracts` vendors OpenZeppelin and forge-std as git submodules, and
-   `connector-settlement-evm`'s `abi_provenance` test shells out to a real `forge build` of
-   them — without the submodules that build fails on unresolved imports and the Rust gate
-   reports a failure that has nothing to do with the Rust code. An existing clone catches up
-   with `git submodule update --init --recursive`.
+   No submodules: `packages/contracts`, the one thing in this repository that ever vendored
+   one, left with issue #1386.
 3. Add upstream remote:
    ```bash
    git remote add upstream https://github.com/toon-protocol/connector.git
@@ -312,8 +309,8 @@ All pull requests must pass:
 
 - ✅ `cargo fmt --all -- --check`
 - ✅ `cargo build --workspace`
-- ✅ `cargo test --workspace --exclude payment-channel`
-- ✅ `cargo clippy --workspace --exclude payment-channel --all-targets -- -D warnings`
+- ✅ `cargo test --workspace`
+- ✅ `cargo clippy --workspace --all-targets -- -D warnings`
 - ✅ ESLint + Prettier over the remaining npm workspaces (devnet tooling)
 
 That is the order CI runs them in, and it is worth running locally in the same order — a
@@ -387,40 +384,39 @@ and reports `passed` in `0.00s` is worse than a missing test, which is what issu
 | Needs                   | Get it with                                                      | Tests                                                                                                       |
 | ----------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `anvil` (Foundry)       | `curl -L https://foundry.paradigm.xyz \| bash`                   | `connector-settlement-evm`, `connector-operator`, `connector-cli`, `connector-client-edge`, `connector-bin` |
-| `forge`                 | same                                                             | `connector-settlement-evm`'s `abi_provenance`, which rebuilds the contracts and diffs the committed ABI     |
+| `forge`                 | same                                                             | `connector-rate-source-evm`, which builds `OracleMockPool.sol` for its TWAP tests                           |
 | `solana-test-validator` | `sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.21/install)"` | `connector-settlement-solana`, `connector-cli`, `connector-bin`                                             |
 
-**That Solana version is not `stable` and not arbitrary.** This repository installs exactly two
-Solana CLIs, for opposite reasons, and `crates/connector-settlement-solana/tests/solana_cli_pins.rs`
-records both with the evidence behind them and fails the build if either literal drifts: **v2.1.21
-wherever the program is run**, because v3's `solana-test-validator` hard-requires io_uring and
-because the workspace pins the Solana crates to `=2.1.0`; **v3.1.12 wherever a deployed artifact is
-built**. The row above is the run side, so it is the same CLI `ci.yml`'s `rust-gate` installs — a
-local gate on a different one is not the gate.
+**That Solana version is not `stable` and not arbitrary.** It is the one Solana CLI this
+repository installs anywhere (issue #1386 removed `packages/solana-program` and the separate
+CLI its build/deploy path used to need), and `crates/connector-settlement-solana/tests/solana_cli_pins.rs`
+records the evidence behind it and fails the build if the literal drifts: **v2.1.21**, because
+v3's `solana-test-validator` hard-requires io_uring and because the workspace pins the Solana
+crates to `=2.1.0`. It is the same CLI `ci.yml`'s `rust-gate` installs — a local gate on a
+different one is not the gate.
 
 **`cargo test` spawns its own chain.** This is the thing most often gotten wrong here. Every
 chain-backed test forks a **disposable** node of its own on its own port and tears it down on drop
 — `connector_settlement_evm::test_support::Anvil::spawn` for `anvil`, and
 `connector_settlement_solana::test_support::SolanaValidator::spawn` for `solana-test-validator`,
-which also loads `payment_channel.so` into genesis at a fixed program id, and the committed
-`payment-channels` binary (`crates/connector-settlement-solana/fixtures/`, ADR 0074) at its
-canonical one, and mainnet-beta's Token program (p-token, from the same directory) at the SPL
-Token id, since the validator's bundled SPL Token refuses the `Batch` a two-payout `distribute`
-sends (#1358). Nothing under `crates/`
+which loads the committed `payment-channels` binary
+(`crates/connector-settlement-solana/fixtures/`, ADR 0074) into genesis at its canonical program
+id, and mainnet-beta's Token program (p-token, from the same directory) at the SPL Token id, since
+the validator's bundled SPL Token refuses the `Batch` a two-payout `distribute` sends (#1358).
+Nothing is built first: TOON's own `payment_channel.so` is no longer loaded (#1385), and TOON's
+program left the repository outright in #1386. Nothing under `crates/`
 dials `localhost:8545` or `localhost:8899`, so running `make anvil-up` or `make solana-up` before
 `cargo test` changes nothing. The Docker chain profiles exist for running a node by hand, and for
 `local/` — not for the test gate.
 
 ### What the workspace gate does not cover
 
-`cargo test --workspace --exclude payment-channel` is the connector's gate and nothing else's.
-Four things sit outside it:
+`cargo test --workspace` is the connector's gate and nothing else's. Two things sit outside it —
+down from four before issue #1386 removed `packages/contracts` and `packages/solana-program`, TOON's
+own Solidity contracts and payment-channel program, with the separate Foundry job (`forge test`,
+`.github/workflows/contracts.yml`) and `cargo test-sbf` job that built them and the `make
+solana-test` target that ran the latter:
 
-- **`packages/solana-program`** — the on-chain `payment-channel` crate, a Cargo workspace member
-  and the thing `--exclude payment-channel` excludes. It has its own `cargo test-sbf` job in CI,
-  and `make solana-test` locally.
-- **`packages/contracts`** — a separate Foundry job (`forge test`, `.github/workflows/contracts.yml`).
-  No make target runs it.
 - **`npm test`** (and `make test`) — the surviving npm workspaces, which are devnet tooling only:
   the faucet and the announcer sidecar. It does **not** test the connector.
 - **[`local/`](local/README.md)** — the shipped **image**, as uid 10001, on a mounted config,

@@ -8,12 +8,6 @@ package-lock.json
 .claude
 rfc-skills-packages
 **/lib/**
-packages/contracts/out
-packages/contracts/cache
-packages/contracts/broadcast
-# Machine-generated anvil --dump-state snapshot (see regen-anvil-state.sh);
-# its format is owned by anvil, so it must not be hand-/prettier-reformatted.
-packages/contracts/anvil-state.json
 _bmad-output
 target
 data

@@ -13,8 +13,8 @@ blocking:
 ```bash
 cargo fmt --all -- --check
 cargo build --workspace
-cargo test --workspace --exclude payment-channel
-cargo clippy --workspace --exclude payment-channel --all-targets -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 There is no `rustfmt.toml` and no `clippy.toml`: both tools run on their defaults, so formatting

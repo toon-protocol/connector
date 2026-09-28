@@ -1561,7 +1561,7 @@ fn toon_channel_refused_case(
 /// The devnet deploy of TOON's retired Solana payment-channel program: what
 /// the refused Solana `toon-channel` claim below names as its `programId`,
 /// so the refusal is pinned against the claim a straggling devnet payer
-/// actually sends. `packages/solana-program/deployments/devnet-public.md` records it.
+/// actually sends. `docs/deployments/devnet-public.md` records it.
 const SOLANA_SETTLEMENT_PROGRAM_ID: &str = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip";
 
 fn generate_toon_channel_refused_vectors() -> ToonChannelRefusedVectors {

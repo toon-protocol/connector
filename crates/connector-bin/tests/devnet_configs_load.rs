@@ -1207,7 +1207,7 @@ const SETTLEMENT_CONTRACT_ADDRESS_ROLLBACK_TARGET: &str =
 /// dead with no repair path. This mint's authority is the faucet box's own
 /// treasury (`infra/linode-faucet/create-devnet-usdc-mint.sh`), so the faucet
 /// mints per drip and there is no irreplaceable key anywhere in the design.
-/// See `packages/solana-program/deployments/devnet-public.md`'s mint amendment.
+/// See `docs/deployments/devnet-public.md`'s mint amendment.
 const FLEET_SOLANA_USDC_MINT: &str = "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU";
 
 /// The settlement asset's scale on every chain this fleet settles on: ADR
@@ -1743,7 +1743,7 @@ fn upstream_url_literals(raw: &str) -> Vec<&str> {
 const RELAY_SWAP_CONFIG: &str = include_str!("../../../infra/linode-relay/swap.config.json");
 
 /// The deployed `TokenNetwork` for USDC on Base Sepolia
-/// (`packages/contracts/deployments.json`, docs/evm-deployment.md), resolved
+/// (`docs/deployments/base-sepolia.md`, docs/evm-deployment.md), resolved
 /// from [`FLEET_LIVE_REGISTRY`]. A literal here for the same reason every
 /// other `FLEET_*` address is one.
 const FLEET_LIVE_TOKEN_NETWORK: &str = "0x1B4606218ceE5Bf02B546e416905F4D3FC8a0249";

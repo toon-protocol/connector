@@ -30,12 +30,12 @@
 # Requires solana-keygen + solana on PATH. The faucet box's bootstrap.sh does
 # NOT install the Solana CLI (it installs docker, git, jq, gettext-base,
 # openssl, ufw, curl, iptables) -- install it on the box before running this.
-# Install the version docs/operators/faucet-box-bringup.md step 4 names, with
-# the command it gives, rather than `stable` or a package manager's build: this
-# repository installs exactly two Solana CLIs on purpose and
-# crates/connector-settlement-solana/tests/solana_cli_pins.rs records both with
-# their reasons. Deliberately no version literal here -- the runbook holds the
-# single copy so the two cannot drift apart.
+# Install the version docs/operators/faucet-box-bringup.md step 3 names, with
+# the command it gives, rather than `stable` or a package manager's build: it
+# is the one Solana CLI this repository installs anywhere, and
+# crates/connector-settlement-solana/tests/solana_cli_pins.rs records why.
+# Deliberately no version literal here -- the runbook holds the single copy so
+# the two cannot drift apart.
 set -euo pipefail
 
 OUT_PATH="${1:-/root/keys/solana-usdc-treasury.json}"

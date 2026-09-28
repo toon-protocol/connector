@@ -8,10 +8,9 @@
 # whatever `make local-up` created, from wherever it is run -- but it means the
 # second `up` no longer gets a private stack it can silently half-start. It
 # would ADOPT the first one: compose matches services by name within a project,
-# so the anvil already running for another checkout is reused with that
-# checkout's packages/contracts bind-mounted into it, and a topology's own
-# connectors come up beside a different topology's, each still holding the
-# ports and the state volumes the other cannot see.
+# so the anvil already running for another checkout is reused, and a
+# topology's own connectors come up beside a different topology's, each still
+# holding the ports and the state volumes the other cannot see.
 #
 # One stack per machine is what the machine can hold anyway -- every topology
 # publishes 8545, 8899 and its connectors' client edges -- so the collision is
@@ -49,8 +48,7 @@ if [ -n "$owners" ]; then
     echo "         $owner_dir"
     echo "       This one is $here."
     echo "       Both would be the same compose project, so this run would adopt those"
-    echo "       containers -- including an anvil with the OTHER checkout's"
-    echo "       packages/contracts mounted into it."
+    echo "       containers -- including an anvil already seeded for the OTHER checkout."
     echo ""
     echo "       'make local-down' now reaches that stack from here (the project name no"
     echo "       longer follows the directory). Run it, then try again."

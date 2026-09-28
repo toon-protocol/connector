@@ -122,7 +122,7 @@ update all three together:
    entry under `networks.base-sepolia.contracts`, in the same shape as the
    entries beside it (`address`, `deployer`, `deployTxHash`, `blockNumber`,
    `deployedAt`, a free-text `note` naming the token and challenge period).
-2. **`packages/contracts/deployments/base-sepolia.md`** -- the dated
+2. **`docs/deployments/base-sepolia.md`** -- the dated
    "RollingSwapChannel deployment" section, mirroring the "ERC-2771 cutover
    deployment" section's shape (network, RPC, deployer, block, script, a
    table of the deployed address and its deploy tx, and the on-chain

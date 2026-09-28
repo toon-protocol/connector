@@ -42,14 +42,12 @@ interface TestnetWallets {
       network: string;
       chainId: number;
       rpcUrl: string;
-      tokenNetworkRegistry: string;
       token: {
         name: string;
         symbol: string;
         address: string;
         decimals: number;
       };
-      tokenNetwork: string;
     };
   };
 }

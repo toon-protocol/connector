@@ -13,14 +13,15 @@ TypeScript prototype — [ADR 0017](../adr/0017-the-typescript-connector-is-a-pr
 ```
 connector/
   crates/          the connector — eighteen crates producing the `connector` binary
-  packages/        not the connector: Solidity contracts, the Solana program, devnet tooling
-  tools/           scripts: CI guards, contract and chain helpers, the RFC vendoring script
+  packages/        not the connector: devnet tooling (the faucet and the announcer sidecar)
+  tools/           scripts: CI guards, chain helpers, the RFC vendoring script
   local/           the shipped image run against real containerised chains
   infra/           the devnet boxes and local chain provisioning
   deploy/          the image and the deployment recipe
-  docs/            ADRs, protocol specs, operator runbooks, vendored RFCs
+  docs/            ADRs, protocol specs, operator runbooks, vendored RFCs, deployment records
   vectors/         wire-vectors.json, the normative cross-repo contract (ADR 0021)
-  Cargo.toml       the workspace manifest — crates/* plus packages/solana-program
+  Cargo.toml       the workspace manifest — crates/* alone (issue #1386 removed the one
+                   packages/ member, packages/solana-program)
 ```
 
 ## `crates/` — the connector
@@ -96,9 +97,13 @@ connector-settlement             the chain-agnostic settlement port + its contra
                                   each implementing both halves; and held.rs: where the
                                   watchers read the latest voucher. The EVM backend
                                   implements both halves; Solana's paying half is #1375
-connector-settlement-evm         real EVM backend: TokenNetworkRegistry → TokenNetwork,
-                                  holding no local channel state; every method reads the
-                                  chain fresh
+connector-settlement-evm         real EVM backend: the batch-settlement port over x402's
+                                  x402BatchSettlement, the one contract every EVM channel
+                                  lives in (ADR 0075); holds no local channel state, every
+                                  method reads the chain fresh. TOON's own
+                                  `EvmSettlementBackend` over `TokenNetwork`, its
+                                  channel-id derivation and its ABI are deleted (ADR 0075
+                                  decision 12, #1385)
   ├─ batch_settlement.rs         the batch-settlement port's receiving half over x402's
   │                               x402BatchSettlement (ADR 0074): admits a presented
   │                               ChannelConfig, `claim`s from the settlement key.
@@ -111,9 +116,10 @@ connector-settlement-evm         real EVM backend: TokenNetworkRegistry → Toke
   └─ batch_watch.rs              its watcher and sweep (ADR 0074 decision 5): claims at
                                   once on a WithdrawInitiated, and periodically claims
                                   every channel in one `claim`, then `settle`s
-connector-settlement-solana      real Solana backend, speaking packages/solana-program's
-                                  own wire directly (that crate builds for SBF only and
-                                  exports no client SDK)
+connector-settlement-solana      real Solana backend, speaking solana-foundation's
+                                  payment-channels wire directly (ADR 0075). TOON's own
+                                  program, which this crate's wire bound to before that
+                                  record, left the repository outright in #1386
   ├─ batch/                      the batch-settlement port on solana-foundation's
   │                               payment-channels (ADR 0074): admission, settle and
   │                               settle_and_seal, that program's own wire, and the
@@ -221,12 +227,21 @@ There is no separate test tree for unit tests. Following Rust convention:
 
 ### `packages/`
 
-| Directory        | What it is                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `contracts`      | Solidity, Foundry. `TokenNetwork`, `TokenNetworkRegistry`, `RollingSwapChannel` — what `connector-settlement-evm` binds to. Its own `forge test` job (`.github/workflows/contracts.yml`); no `make` target runs it. The repository's only git submodules (OpenZeppelin, forge-std) live here.                                                                                                                          |
-| `solana-program` | The SPL-token, PDA-addressed payment-channel program `connector-settlement-solana` drives. Crate name `payment-channel`; a Cargo workspace member **excluded** from the workspace test gate, with its own `cargo test-sbf` CI job and a separate build-reproducibility job.                                                                                                                                            |
-| `faucet`         | Devnet token faucet service (plain JavaScript).                                                                                                                                                                                                                                                                                                                                                                        |
-| `announcer`      | A standalone `kind:10032` announcer sidecar. It is not the connector and never was: it never links against connector crates, never reads connector config and never runs in the connector process. It only asks the client edge's already-public answers and republishes them ([ADR 0022](../adr/0022-a-connector-answers-it-does-not-announce.md), [ADR 0006](../adr/0006-the-connector-is-mechanism-not-policy.md)). |
+| Directory   | What it is                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `faucet`    | Devnet token faucet service (plain JavaScript).                                                                                                                                                                                                                                                                                                                                                                        |
+| `announcer` | A standalone `kind:10032` announcer sidecar. It is not the connector and never was: it never links against connector crates, never reads connector config and never runs in the connector process. It only asks the client edge's already-public answers and republishes them ([ADR 0022](../adr/0022-a-connector-answers-it-does-not-announce.md), [ADR 0006](../adr/0006-the-connector-is-mechanism-not-policy.md)). |
+
+**TOON's contracts and Solana program are not in this repository either, any more.**
+`contracts` held the Solidity `TokenNetwork`, `TokenNetworkRegistry` and `RollingSwapChannel`
+TOON's `EvmSettlementBackend` used to bind to, with the repository's only git submodules
+(OpenZeppelin, forge-std) and a separate `forge test` job. `solana-program` held the
+`payment-channel` crate, a Cargo workspace member excluded from the workspace test gate, with its
+own `cargo test-sbf` job and a build-reproducibility job. Neither has been part of the connector's
+settlement path since [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+(#1385), and both — with the CI jobs and `make` targets that built them — left the repository
+outright in #1386. The contracts and program stay on chain; their deployment records moved to
+[`docs/deployments/`](../deployments/).
 
 **Mina is not in this repository at all.**
 [ADR 0002](../adr/0002-drop-mina-from-the-rust-connector.md) dropped it as a settlement chain —
@@ -243,9 +258,6 @@ Scripts, none of them part of the binary.
 
 - `ci/check-tracked-secrets.sh` — the tracked-key guard, by filename **and** by content
   (a Solana keypair is a bare 64-byte JSON array and can be called anything).
-- `contracts/init-libs.sh` — the Foundry submodules.
-- `solana/build-sbf.sh`, `solana/deploy.sh` — building and deploying the payment-channel
-  program.
 - `fund-peers/` — devnet peer funding tooling (TypeScript).
 - `bench/peer-claim-journal-fsyncs.sh` — a one-off measurement script.
 - `vendor-rfc.sh` — re-vendors an Interledger RFC into `docs/rfcs/`
@@ -258,7 +270,7 @@ Scripts, none of them part of the binary.
 repository. **`npm test` does not test the connector** — it runs those packages, each with its
 own runner (`node --test` for the faucet, `tsx --test` for the announcer; the one Jest project
 went with `packages/mina-zkapp`, [ADR 0065](../adr/0065-mina-leaves-the-repository.md)). The
-connector's gate is `cargo test --workspace --exclude payment-channel`.
+connector's gate is `cargo test --workspace`.
 
 ## `local/` — the shipped image against real chains
 
@@ -322,14 +334,15 @@ there".
 
 ## `docs/`
 
-| Directory       | What it is                                                                                                                                                                                                                                                 |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `adr/`          | The numbered decisions, and the tiebreaker for everything else in this repository. `README.md` is the index — grouped by scope, with each record's own `**Status:**` line as the authority for whether it is live. Numbers are permanent and never reused. |
-| `protocol/`     | The wire specs the ADRs are implemented against: `client-edge-spec.md`, `peer-carriage-spec.md`, `operator-spec.md`, `configuration-spec.md`, `packet-flow-spec.md`, `payment-spec.md`, `self-description-spec.md`, `wire-vectors.md`.                     |
-| `rfcs/`         | The Interledger RFCs this connector implements — see below.                                                                                                                                                                                                |
-| `operators/`    | Runbooks: box bringup, key rotation, fleet release and health, peer-channel migration, BTP peer bringup, onion-endpoint bringup, the claim-policy rollout, box reconciliation.                                                                             |
-| `agents/`       | Conventions for agents working here: the issue tracker, triage labels, how to consume the domain docs.                                                                                                                                                     |
-| `architecture/` | This page, plus [`tech-stack.md`](tech-stack.md) (languages, runtimes, pinned versions) and [`coding-standards.md`](coding-standards.md) (what the gate enforces, in the order it enforces it).                                                            |
+| Directory       | What it is                                                                                                                                                                                                                                                                                                 |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `adr/`          | The numbered decisions, and the tiebreaker for everything else in this repository. `README.md` is the index — grouped by scope, with each record's own `**Status:**` line as the authority for whether it is live. Numbers are permanent and never reused.                                                 |
+| `protocol/`     | The wire specs the ADRs are implemented against: `client-edge-spec.md`, `peer-carriage-spec.md`, `operator-spec.md`, `configuration-spec.md`, `packet-flow-spec.md`, `payment-spec.md`, `self-description-spec.md`, `wire-vectors.md`.                                                                     |
+| `rfcs/`         | The Interledger RFCs this connector implements — see below.                                                                                                                                                                                                                                                |
+| `deployments/`  | Where TOON's contracts and Solana program are deployed — Base Sepolia/mainnet and Solana devnet/mainnet-beta. Moved here from `packages/contracts/deployments/` and `packages/solana-program/deployments/` when those packages left the repository (issue #1386); the contracts and program stay on chain. |
+| `operators/`    | Runbooks: box bringup, key rotation, fleet release and health, peer-channel migration, BTP peer bringup, onion-endpoint bringup, the claim-policy rollout, box reconciliation.                                                                                                                             |
+| `agents/`       | Conventions for agents working here: the issue tracker, triage labels, how to consume the domain docs.                                                                                                                                                                                                     |
+| `architecture/` | This page, plus [`tech-stack.md`](tech-stack.md) (languages, runtimes, pinned versions) and [`coding-standards.md`](coding-standards.md) (what the gate enforces, in the order it enforces it).                                                                                                            |
 
 Loose files under `docs/` are chain-deployment notes and one-off design records
 (`evm-deployment.md`, `solana-deployment.md`, `devnet-pricing.md` and similar). They are point-in-time; the ADRs are not.

@@ -102,11 +102,10 @@ docker compose up -d
 
 ### From source
 
-For changing the connector rather than running it. Rust stable, and clone with
-submodules — `packages/contracts` vendors OpenZeppelin and forge-std:
+For changing the connector rather than running it. Rust stable:
 
 ```bash
-git clone --recurse-submodules https://github.com/toon-protocol/connector.git
+git clone https://github.com/toon-protocol/connector.git
 cd connector && cargo build --workspace
 ./target/debug/connector path/to/connector.toml
 ```
@@ -271,15 +270,15 @@ same one.
 | Channels live in | [`0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5`](https://sepolia.basescan.org/address/0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5) — `TokenNetworkRegistry`                              | [`2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip`](https://explorer.solana.com/address/2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip?cluster=devnet) — the payment-channel program |
 | Token            | [`0x0C996d7c934c79a6255254875607Fe69df25C0E1`](https://sepolia.basescan.org/address/0x0C996d7c934c79a6255254875607Fe69df25C0E1) — devnet USDC (Circle FiatToken v2.2, ERC-3009), 6 dp | [`34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU`](https://explorer.solana.com/address/34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU?cluster=devnet) — mock USDC mint, 6 dp        |
 | Funding the key  | Base Sepolia ETH for gas; devnet USDC from the [devnet faucet](https://faucet.devnet.toonprotocol.dev)                                                                                | devnet SOL (`solana airdrop 1 <address> -u devnet`); mock USDC from the same faucet                                                                                             |
-| Full record      | [`packages/contracts/deployments/base-sepolia.md`](packages/contracts/deployments/base-sepolia.md)                                                                                    | [`packages/solana-program/deployments/devnet-public.md`](packages/solana-program/deployments/devnet-public.md)                                                                  |
+| Full record      | [`docs/deployments/base-sepolia.md`](docs/deployments/base-sepolia.md)                                                                                                                | [`docs/deployments/devnet-public.md`](docs/deployments/devnet-public.md)                                                                                                        |
 
 There is no Solana _testnet_ deployment: the program is on devnet and on
 mainnet-beta, nowhere else. **Mainnet exists on both chains**, deployed by hand
 and used by one third-party operator's node, not by this repository's fleet:
 the Base mainnet contracts
-([`packages/contracts/deployments/base-mainnet.md`](packages/contracts/deployments/base-mainnet.md),
+([`docs/deployments/base-mainnet.md`](docs/deployments/base-mainnet.md),
 2026-09-01) and the Solana mainnet-beta program
-([`packages/solana-program/deployments/mainnet-beta.md`](packages/solana-program/deployments/mainnet-beta.md),
+([`docs/deployments/mainnet-beta.md`](docs/deployments/mainnet-beta.md),
 2026-08-14, upgraded in place 2026-08-29). The devnet table above is what the
 fleet and the faucet serve; a node on mainnet funds itself. Because a Solana
 claim's signed message binds the settlement program, a node pointing
