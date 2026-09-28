@@ -69,9 +69,7 @@ pub fn signature_checker_address() -> Address {
 
 /// `ERC3009DepositCollector` at `0x4020806089470a89826cB9fB1f4059150b550004`.
 pub fn erc3009_deposit_collector_address() -> Address {
-    "0x4020806089470a89826cB9fB1f4059150b550004"
-        .parse()
-        .expect("a literal address")
+    Address::from(crate::ERC3009_DEPOSIT_COLLECTOR_ADDRESS)
 }
 
 /// `Permit2DepositCollector` at `0x4020425FAf3B746C082C2f942b4E5159887B0005`.

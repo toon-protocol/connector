@@ -139,6 +139,24 @@ fn backing(snapshot: &Snapshot) -> u128 {
     snapshot.balance.saturating_sub(snapshot.pending_withdrawal)
 }
 
+/// Why [`EvmBatchSettlementBackend::deposit`] failed, split by whether the
+/// deposit transaction was ever sent.
+enum DepositFailure {
+    /// Nothing was sent: the deposit cannot land.
+    NotSent(BatchSettlementError),
+    /// It was sent, and did not confirm. It may have reverted, or it may
+    /// still land: its authorisation never expires.
+    Sent(BatchSettlementError),
+}
+
+impl DepositFailure {
+    fn into_error(self) -> BatchSettlementError {
+        match self {
+            DepositFailure::NotSent(error) | DepositFailure::Sent(error) => error,
+        }
+    }
+}
+
 /// A deposit of nothing, which `x402BatchSettlement` reverts on: refused
 /// here, before anything is signed or sent.
 fn zero_deposit() -> BatchSettlementError {
@@ -148,8 +166,10 @@ fn zero_deposit() -> BatchSettlementError {
 impl EvmBatchSettlementBackend {
     /// Which collector this node's deposits go through, asked of the token
     /// once. A revert on `authorizationState` is the answer "no EIP-3009";
-    /// any other failure is the chain not answering, and is an error rather
-    /// than a guess.
+    /// any other failure -- the chain not answering, or a token whose
+    /// fallback answers with bytes that are not a `bool` -- is an error
+    /// rather than a guess, and nothing is cached, so the next deposit asks
+    /// again.
     pub async fn deposit_route(&self) -> Result<DepositRoute, BatchSettlementError> {
         self.deposit_route
             .get_or_try_init(|| async {
@@ -236,19 +256,33 @@ impl EvmBatchSettlementBackend {
         }
     }
 
-    /// Read `channel` now, record what it backs, and report it.
+    /// Read `channel` now, record what it backs, and report it. Only this
+    /// node's own writes call this, under the `paying` lock: a plain read
+    /// taken while a withdrawal is still confirming would record the
+    /// backing the withdrawal is about to take.
     async fn read_outbound(
         &self,
         channel: &ChannelId,
         config: &EvmChannelConfig,
     ) -> Result<OutboundChannelState, BatchSettlementError> {
-        let snapshot = self.snapshot(admitted_id(channel)?).await?;
+        let (snapshot, state) = self.observe_outbound(channel, config).await?;
         self.record_backing(channel, backing(&snapshot));
+        Ok(state)
+    }
+
+    /// Read `channel` now and report it, recording nothing.
+    async fn observe_outbound(
+        &self,
+        channel: &ChannelId,
+        config: &EvmChannelConfig,
+    ) -> Result<(Snapshot, OutboundChannelState), BatchSettlementError> {
+        let snapshot = self.snapshot(admitted_id(channel)?).await?;
         let signed = self.require_outbound(channel)?.signed;
-        Ok(OutboundChannelState {
+        let state = OutboundChannelState {
             on_chain: self.state(channel, config, &snapshot),
             signed,
-        })
+        };
+        Ok((snapshot, state))
     }
 
     /// Send `transaction` from the settlement key and wait for it to land.
@@ -265,26 +299,38 @@ impl EvmBatchSettlementBackend {
 
     /// `deposit(config, amount, collector, collectorData)`, sent and paid
     /// for by this node, through whichever collector the token takes.
-    async fn deposit(
-        &self,
-        config: &EvmChannelConfig,
-        amount: u128,
-    ) -> Result<(), BatchSettlementError> {
+    /// Says, when it fails, whether the deposit itself was ever sent: the
+    /// [`Sender`](crate::send::Sender) sends nothing on a refusal, and once
+    /// it has handed over a hash the deposit may land however the wait for
+    /// it ends.
+    async fn deposit(&self, config: &EvmChannelConfig, amount: u128) -> Result<(), DepositFailure> {
         if amount == 0 {
-            return Err(zero_deposit());
+            return Err(DepositFailure::NotSent(zero_deposit()));
         }
         let channel_id =
             connector_signer::evm_batch_channel_id(&self.domain(), &signer_config(config));
-        let (collector, collector_data) = match self.deposit_route().await? {
-            DepositRoute::Erc3009 => self.erc3009_authorization(channel_id, amount).await?,
-            DepositRoute::Permit2 => self.permit2_transfer(channel_id, amount).await?,
-        };
-        self.transact(
-            self.contract
-                .deposit(chain_config(config), amount, collector, collector_data)
-                .tx,
-        )
-        .await
+        let route = self
+            .deposit_route()
+            .await
+            .map_err(DepositFailure::NotSent)?;
+        let (collector, collector_data) = match route {
+            DepositRoute::Erc3009 => self.erc3009_authorization(channel_id, amount).await,
+            DepositRoute::Permit2 => self.permit2_transfer(channel_id, amount).await,
+        }
+        .map_err(DepositFailure::NotSent)?;
+        let hash = self
+            .sender
+            .send(
+                self.contract
+                    .deposit(chain_config(config), amount, collector, collector_data)
+                    .tx,
+            )
+            .await
+            .map_err(|error| DepositFailure::NotSent(backend_error(error)))?;
+        confirm(&self.client, hash, self.confirm)
+            .await
+            .map_err(|error| DepositFailure::Sent(backend_error(error)))?;
+        Ok(())
     }
 
     /// `ERC3009DepositCollector`'s `collectorData`: a
@@ -440,28 +486,31 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
                 backed: 0,
             },
         );
-        let deposited = self.deposit(&config, deposit).await;
-        match (deposited, self.snapshot(id).await) {
-            // Landed, whatever the confirmation said: the salt is fresh, so
-            // nothing but this deposit can have put a balance there.
-            (_, Ok(snapshot)) if snapshot.balance > 0 => {
-                self.record_backing(&channel, backing(&snapshot));
-            }
-            (Err(error), Ok(_)) => {
+        match self.deposit(&config, deposit).await {
+            // Never sent, so it cannot land: the channel is not this node's.
+            Err(DepositFailure::NotSent(error)) => {
                 self.outbound_record().remove(&channel);
                 return Err(error);
             }
-            (Ok(()), Ok(_)) => {
-                return Err(BatchSettlementError::Backend(format!(
-                    "the opening deposit into '{channel}' was confirmed, but the channel \
-                     holds nothing"
-                )));
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => {
-                return Err(BatchSettlementError::Backend(format!(
-                    "whether the opening deposit into '{channel}' landed is unknown; this \
-                     node keeps it as its own channel, so its state can be read again: {error}"
-                )));
+            // Sent: kept either way. If the chain already shows a balance it
+            // landed, whatever the wait said -- the salt is fresh, so nothing
+            // but this deposit can have put one there. If not, it may still
+            // land later, and forgetting the config would strand it.
+            Err(DepositFailure::Sent(error)) => match self.snapshot(id).await {
+                Ok(snapshot) if snapshot.balance > 0 => {
+                    self.record_backing(&channel, backing(&snapshot));
+                }
+                _ => {
+                    return Err(BatchSettlementError::Backend(format!(
+                        "the opening deposit into '{channel}' was sent and not confirmed; \
+                         this node keeps the channel as its own, so it can be read again \
+                         once the deposit lands or is known not to: {error}"
+                    )));
+                }
+            },
+            Ok(()) => {
+                let snapshot = self.snapshot(id).await?;
+                self.record_backing(&channel, backing(&snapshot));
             }
         }
         Ok(OpenedChannel {
@@ -477,7 +526,9 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
     ) -> Result<OutboundChannelState, BatchSettlementError> {
         let config = self.require_outbound(channel)?.config;
         let _paying = self.paying.lock().await;
-        self.deposit(&config, increment).await?;
+        self.deposit(&config, increment)
+            .await
+            .map_err(DepositFailure::into_error)?;
         self.read_outbound(channel, &config).await
     }
 
@@ -489,11 +540,11 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
         channel: &ChannelId,
         cumulative_amount: u128,
     ) -> Result<Voucher, BatchSettlementError> {
-        let id = admitted_id(channel)?;
         let mut record = self.outbound_record();
         let outbound = record
             .get_mut(channel)
             .ok_or_else(|| BatchSettlementError::NotOutbound(channel.clone()))?;
+        let id = admitted_id(channel)?;
         if cumulative_amount <= outbound.signed {
             return Err(BatchSettlementError::VoucherNotAdvancing {
                 amount: cumulative_amount,
@@ -525,10 +576,19 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
     ) -> Result<OutboundChannelState, BatchSettlementError> {
         let config = self.require_outbound(channel)?.config;
         let _paying = self.paying.lock().await;
-        let before = self.snapshot(admitted_id(channel)?).await?;
+        // Nothing is signed from here until the chain is read again at the
+        // end: the reading below sizes the withdrawal, and a voucher signed
+        // after it would be backed by exactly what the withdrawal takes.
+        self.record_backing(channel, 0);
+        let before = match self.snapshot(admitted_id(channel)?).await {
+            Ok(before) => before,
+            Err(error) => {
+                self.read_outbound(channel, &config).await?;
+                return Err(error);
+            }
+        };
         let unlanded = before.balance.saturating_sub(before.total_claimed);
         if !before.withdrawal_pending && unlanded > 0 {
-            self.record_backing(channel, before.total_claimed);
             let sent = self
                 .transact(
                     self.contract
@@ -576,7 +636,8 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
         channel: &ChannelId,
     ) -> Result<OutboundChannelState, BatchSettlementError> {
         let config = self.require_outbound(channel)?.config;
-        self.read_outbound(channel, &config).await
+        let (_, state) = self.observe_outbound(channel, &config).await?;
+        Ok(state)
     }
 }
 
