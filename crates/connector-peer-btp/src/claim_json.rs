@@ -63,12 +63,13 @@ pub enum ClaimDecodeError {
     /// (`connector_client_edge::claim_gate`), since I4 means one codec
     /// serves both edges.
     Signature,
-    /// An x402 `batch-settlement` **voucher** (ADR 0074 decision 1). A
-    /// voucher is client edge only: it is never a peer claim and can never
-    /// decide the role `peer`, so every peer carriage refuses one here,
-    /// structurally, before anything about it is judged. It is reported by
-    /// name rather than as [`ClaimDecodeError::Structural`] because nothing
-    /// is wrong with its shape -- it is on the wrong edge.
+    /// An x402 `batch-settlement` **voucher**, handed to [`parse`], which
+    /// reads only `toon-channel` claims into the [`WireClaim`] `ClaimBook`
+    /// judges. A voucher is not structurally wrong and, since ADR 0075
+    /// decision 5, not on the wrong edge either: it proves the peer role on
+    /// a bound channel, and [`parse_presented`] keeps it for the role gate.
+    /// Reported by name rather than as [`ClaimDecodeError::Structural`] for
+    /// that reason.
     Voucher,
 }
 
@@ -88,8 +89,8 @@ impl std::fmt::Display for ClaimDecodeError {
                  or base64 of 64 ed25519 bytes for a solana one",
             ),
             ClaimDecodeError::Voucher => f.write_str(
-                "a 'batch-settlement' voucher is not a peer claim: vouchers are accepted at the \
-                 client edge only (ADR 0074)",
+                "a 'batch-settlement' voucher is not a 'toon-channel' claim: it proves the peer \
+                 role on a bound channel (ADR 0075) and is judged by the receiving half",
             ),
         }
     }
@@ -326,18 +327,48 @@ pub fn present_from_protocol_data(
 /// The channel id is canonicalised here, before the caller can reach a
 /// watermark with it (§4.1).
 pub fn parse(raw: &[u8]) -> Result<WireClaim, ClaimDecodeError> {
+    match parse_presented(raw)? {
+        PresentedPeerClaim::Channel(claim) => Ok(claim),
+        PresentedPeerClaim::Voucher(_) => Err(ClaimDecodeError::Voucher),
+    }
+}
+
+/// What a claim slot presents, as the role gate reads it (ADR 0075 decision
+/// 5): a `toon-channel` claim, or an x402 `batch-settlement` voucher.
+///
+/// Both prove the peer role on a channel bound to that peer; only the first
+/// is judged below the port today. A voucher's channel, signer and
+/// signature are the receiving half's to resolve and verify
+/// ([`crate::role_gate::VoucherEvidence`]), which this crate cannot reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PresentedPeerClaim {
+    /// A `toon-channel` claim, in the in-process shape `ClaimBook` judges.
+    Channel(WireClaim),
+    /// A voucher, as the client edge's own parser read it: always
+    /// [`ClientClaim::EvmVoucher`] or [`ClientClaim::SolanaVoucher`].
+    Voucher(ClientClaim),
+}
+
+/// Parse a claim slot through the client edge's own structural validator
+/// (I4), keeping a voucher rather than refusing it: what the role gate
+/// reads.
+///
+/// # Errors
+///
+/// As [`parse`], except that a well-formed voucher is not an error here.
+pub fn parse_presented(raw: &[u8]) -> Result<PresentedPeerClaim, ClaimDecodeError> {
     let json = std::str::from_utf8(raw).map_err(|_| ClaimDecodeError::NotUtf8)?;
     let claim = parse_client_claim(json).map_err(|error| match error {
         ClientClaimError::Mina => ClaimDecodeError::UnsupportedChain("mina"),
         other => ClaimDecodeError::Structural(other.to_string()),
     })?;
-    match claim {
-        ClientClaim::Evm(claim) => Ok(WireClaim {
+    let channel = match claim {
+        ClientClaim::Evm(claim) => WireClaim {
             channel_id: canonical_evm_channel_id(&claim.channel_id),
             nonce: claim.nonce,
             cumulative_amount: claim.transferred_amount,
             signature: ClaimSignature::Evm(parse_evm_signature(&claim.signature)?),
-        }),
+        },
         // The channel id is the base58 `channelAccount`, uncanonicalised
         // and deliberately so: base58 of an exact 32-byte decode has one
         // spelling, so unlike EVM hex there is no second spelling a
@@ -378,19 +409,22 @@ pub fn parse(raw: &[u8]) -> Result<WireClaim, ClaimDecodeError> {
         // the price of one would be an authority-free field on `WireClaim`.
         // `tests/a_peer_claims_declared_program_is_not_consulted.rs` holds
         // both halves of that.
-        ClientClaim::Solana(claim) => Ok(WireClaim {
+        ClientClaim::Solana(claim) => WireClaim {
             channel_id: claim.channel_account,
             nonce: claim.nonce,
             cumulative_amount: claim.transferred_amount,
             signature: ClaimSignature::Solana(parse_solana_signature(&claim.signature)?),
-        }),
-        // ADR 0074 decision 1: a voucher is never a peer claim. `WireClaim`
-        // has no voucher shape to put one in -- `ClaimSignature` carries no
-        // voucher variant -- so this is where both carriages refuse it.
-        ClientClaim::EvmVoucher(_) | ClientClaim::SolanaVoucher(_) => {
-            Err(ClaimDecodeError::Voucher)
+        },
+        // ADR 0075 decision 5 supersedes ADR 0074 decision 1's "a voucher
+        // is never a peer claim": it proves the peer role on a bound
+        // channel. `WireClaim` still has no voucher shape -- `ClaimSignature`
+        // carries no voucher variant -- so it is kept as the client edge's
+        // parser read it, for the role gate to resolve.
+        voucher @ (ClientClaim::EvmVoucher(_) | ClientClaim::SolanaVoucher(_)) => {
+            return Ok(PresentedPeerClaim::Voucher(voucher));
         }
-    }
+    };
+    Ok(PresentedPeerClaim::Channel(channel))
 }
 
 /// §4.2: 65 bytes `r ‖ s ‖ v`, with `v` as libsecp256k1 emits it
@@ -481,12 +515,13 @@ mod tests {
         }
     }
 
-    /// ADR 0074 decision 1: a well-formed voucher -- on either chain -- is
-    /// refused by every peer carriage, by name, and so can never become a
-    /// `WireClaim` or decide the role `peer`. Both carriages decode through
-    /// this one function (`accept::decode_claim`, `claim_on`).
+    /// A well-formed voucher -- on either chain -- never becomes a
+    /// `WireClaim`: [`parse`] refuses it by name, so `ClaimBook` never
+    /// judges one. Since ADR 0075 decision 5 it is not discarded, though:
+    /// [`parse_presented`] keeps it, for the role gate to resolve against a
+    /// bound channel.
     #[test]
-    fn a_voucher_on_a_peer_carriage_is_refused_by_name() {
+    fn a_voucher_is_never_a_wire_claim_and_is_kept_for_the_role_gate() {
         let evm = serde_json::json!({
             "version": "1.0",
             "blockchain": "evm",
@@ -516,10 +551,17 @@ mod tests {
                 Err(ClaimDecodeError::Voucher),
                 "{voucher}"
             );
+            assert!(
+                matches!(
+                    parse_presented(voucher.to_string().as_bytes()),
+                    Ok(PresentedPeerClaim::Voucher(
+                        ClientClaim::EvmVoucher(_) | ClientClaim::SolanaVoucher(_)
+                    ))
+                ),
+                "{voucher}"
+            );
         }
-        assert!(ClaimDecodeError::Voucher
-            .to_string()
-            .contains("client edge only"));
+        assert!(ClaimDecodeError::Voucher.to_string().contains("ADR 0075"));
     }
 
     /// I4, mechanically: what the peer carriage emits is what the *client

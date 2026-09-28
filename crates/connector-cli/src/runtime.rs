@@ -2847,6 +2847,11 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
             config.peers(),
             config.peer_channels(),
             config.peer_expose(),
+            // ADR 0075 decision 5 (issue #1377): a voucher, or a peer-role
+            // challenge, proves the peer role once its channel's voucher
+            // signer is bound to a peering, and the claim gate is what
+            // resolves the channel and reads that signer off the chain.
+            Some(claim_gate.clone() as Arc<dyn connector_peer_btp::VoucherEvidence>),
         ),
         // Issue #502: every `[[client_identities]]` entry, as the
         // `id`/`secret` pair `resolve_identity` authenticates an

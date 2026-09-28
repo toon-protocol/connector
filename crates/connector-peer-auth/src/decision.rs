@@ -97,7 +97,20 @@ pub enum UnmetRequirement {
     /// counterparty key that row configures
     /// ([`ClaimVerification::SignatureInvalid`]). A rotated key on one side
     /// only, or a claim signed by somebody else entirely.
+    ///
+    /// Also a voucher, or a peer-role challenge, on a channel whose voucher
+    /// signer is bound to a peering, whose signature does not recover to
+    /// that signer ([`VoucherVerification::SignatureInvalid`], ADR 0075
+    /// decision 5): the same fix, a key that is not the one the chain
+    /// records for the channel.
     ClaimSignature,
+    /// A peer-role challenge (ADR 0075 decision 5) signed by a bound
+    /// channel's voucher signer, but outside its window: `expires` has
+    /// passed, or lies further ahead than this node accepts
+    /// ([`VoucherVerification::Expired`]). The key is right and the clock or
+    /// the challenge's lifetime is not -- a different fix from
+    /// [`UnmetRequirement::ClaimSignature`]'s, so a different event.
+    ChallengeExpiry,
 }
 
 impl UnmetRequirement {
@@ -107,6 +120,7 @@ impl UnmetRequirement {
         match self {
             UnmetRequirement::ChannelBinding => "P2",
             UnmetRequirement::ClaimSignature => "P3",
+            UnmetRequirement::ChallengeExpiry => "P3-expires",
         }
     }
 }
@@ -288,6 +302,118 @@ pub fn decide_role(claim: Option<PresentedClaim<'_>>, policy: &PeerAuthPolicy) -
         }
         ClaimVerification::SignatureInvalid => {
             RoleDecision::refused(&binding.peer_id, UnmetRequirement::ClaimSignature)
+        }
+    }
+}
+
+/// What this connector's receiving half made of a **voucher**, or of a
+/// **peer-role challenge**, presented as evidence of the peer role (ADR 0075
+/// decision 5, issue #1377).
+///
+/// Computed by the carriage, out of the x402 channel the evidence names, and
+/// handed here as a verdict for the reason [`ClaimVerification`] is: the
+/// signer a voucher is checked against is the one the **chain** records for
+/// its channel (EVM `payerAuthorizer`, Solana `authorized_signer`), read by
+/// a settlement backend this crate does not and must not depend on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VoucherVerification {
+    /// The signature recovered to the channel's chain-recorded voucher
+    /// signer, and -- for a challenge -- `expires` is inside this node's
+    /// window.
+    Verified,
+    /// The channel was found and the signature did not recover to its
+    /// voucher signer. This is also what a challenge presented in a
+    /// voucher's place, or a voucher in a challenge's, becomes: the two sign
+    /// different messages (`connector_signer`'s separation tests), so
+    /// neither ever verifies as the other.
+    SignatureInvalid,
+    /// A challenge whose signature verified and whose `expires` is outside
+    /// this node's window. Never a voucher's verdict: a voucher does not
+    /// expire (`expiresAt` is zero, ADR 0074 decision 3).
+    Expired,
+}
+
+/// A voucher or a peer-role challenge, as the role decision sees it: the
+/// peering its channel's voucher signer is bound to, if any, and what this
+/// node made of its signature.
+///
+/// `bound_peer` is resolved by the carriage from the signer the **chain**
+/// records for the channel and a runtime binding this node holds
+/// (`connector_runtime::Connector::voucher_signer_peer`) -- never from
+/// anything the evidence declares about itself. A channel this node could
+/// not resolve has no chain-recorded signer to resolve a binding from, so
+/// it arrives here as unbound.
+///
+/// Like [`PresentedClaim`] it carries nothing a carriage could weight: no
+/// amount, no carriage, no address (§1.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentedVoucher<'a> {
+    bound_peer: Option<&'a str>,
+    verification: VoucherVerification,
+}
+
+impl<'a> PresentedVoucher<'a> {
+    /// A voucher or challenge whose channel's voucher signer is bound to
+    /// `bound_peer` (or to nothing), with this connector's verdict on it.
+    #[must_use]
+    pub fn new(bound_peer: Option<&'a str>, verification: VoucherVerification) -> Self {
+        PresentedVoucher {
+            bound_peer,
+            verification,
+        }
+    }
+
+    /// The peering the channel's voucher signer is bound to, if any.
+    #[must_use]
+    pub fn bound_peer(&self) -> Option<&str> {
+        self.bound_peer
+    }
+
+    /// What this connector made of the signature and the window.
+    #[must_use]
+    pub fn verification(&self) -> VoucherVerification {
+        self.verification
+    }
+}
+
+/// **The decision for x402 evidence** (§1.2 as amended by ADR 0075 decision
+/// 5): `peer` if and only if the frame carries a voucher, or -- for a packet
+/// that moves no value -- a claim-state challenge, whose channel's voucher
+/// signer is bound to a peering and whose signature verifies against that
+/// signer; `client` otherwise.
+///
+/// Whether a challenge may count at all (the packet moves no value) is the
+/// carriage's to establish before it presents one: this function sees only
+/// the evidence and its verdict, as [`decide_role`] does.
+///
+/// # Branches
+///
+/// | The frame's evidence | Outcome |
+/// | -------------------- | ------- |
+/// | none | `client`, no event |
+/// | on a channel whose signer is bound to no peering | `client`, no event |
+/// | bound, signature verifies (and a challenge is in window) | `peer`, as the bound relation |
+/// | bound, signature does not recover to the signer | `client` + `peer_auth_refused` (P3) |
+/// | bound, a challenge outside its window | `client` + `peer_auth_refused` (P3-expires) |
+///
+/// An unbound channel is silent for [`decide_role`]'s reason: every client
+/// paying with a voucher presents one, so an event there would fire on
+/// every client packet.
+#[must_use]
+pub fn decide_voucher_role(voucher: Option<PresentedVoucher<'_>>) -> RoleDecision {
+    let Some(voucher) = voucher else {
+        return RoleDecision::client();
+    };
+    let Some(peer_id) = voucher.bound_peer() else {
+        return RoleDecision::client();
+    };
+    match voucher.verification() {
+        VoucherVerification::Verified => RoleDecision::peer(peer_id),
+        VoucherVerification::SignatureInvalid => {
+            RoleDecision::refused(peer_id, UnmetRequirement::ClaimSignature)
+        }
+        VoucherVerification::Expired => {
+            RoleDecision::refused(peer_id, UnmetRequirement::ChallengeExpiry)
         }
     }
 }
@@ -618,10 +744,75 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------
+    // ADR 0075 decision 5: a voucher, or a challenge for a packet that
+    // moves no value, from a bound channel's voucher signer.
+    // ---------------------------------------------------------------
+
+    fn voucher(
+        bound_peer: Option<&str>,
+        verification: VoucherVerification,
+    ) -> PresentedVoucher<'_> {
+        PresentedVoucher::new(bound_peer, verification)
+    }
+
+    #[test]
+    fn a_verified_voucher_on_a_bound_channel_is_that_peer() {
+        let decision = decide_voucher_role(Some(voucher(
+            Some("store-box"),
+            VoucherVerification::Verified,
+        )));
+
+        assert_eq!(decision.role(), &SessionRole::peer("store-box"));
+        assert_eq!(decision.refusal(), None);
+    }
+
+    /// A voucher on a channel bound to no peering is an ordinary client's,
+    /// whatever its signature does: silent, for `decide_role`'s reason.
+    #[test]
+    fn a_voucher_on_an_unbound_channel_is_a_client_and_no_event() {
+        for verification in [
+            VoucherVerification::Verified,
+            VoucherVerification::SignatureInvalid,
+            VoucherVerification::Expired,
+        ] {
+            let decision = decide_voucher_role(Some(voucher(None, verification)));
+
+            assert_eq!(decision.role(), &SessionRole::Client);
+            assert_eq!(decision.refusal(), None, "{verification:?}");
+        }
+        assert_eq!(decide_voucher_role(None).role(), &SessionRole::Client);
+    }
+
+    #[test]
+    fn a_bound_channels_bad_signature_or_expired_challenge_is_a_loud_client() {
+        for (verification, unmet) in [
+            (
+                VoucherVerification::SignatureInvalid,
+                UnmetRequirement::ClaimSignature,
+            ),
+            (
+                VoucherVerification::Expired,
+                UnmetRequirement::ChallengeExpiry,
+            ),
+        ] {
+            let decision = decide_voucher_role(Some(voucher(Some("store-box"), verification)));
+
+            assert_eq!(decision.role(), &SessionRole::Client);
+            assert_eq!(
+                decision
+                    .refusal()
+                    .map(|refusal| (refusal.peer_id(), refusal.unmet())),
+                Some(("store-box", unmet))
+            );
+        }
+    }
+
     #[test]
     fn a_requirement_names_itself_as_the_spec_does() {
         assert_eq!(UnmetRequirement::ChannelBinding.name(), "P2");
         assert_eq!(UnmetRequirement::ClaimSignature.name(), "P3");
+        assert_eq!(UnmetRequirement::ChallengeExpiry.name(), "P3-expires");
         assert_eq!(PEER_AUTH_REFUSED_EVENT, "peer_auth_refused");
     }
 

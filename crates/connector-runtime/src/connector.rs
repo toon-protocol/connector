@@ -49,6 +49,7 @@ use crate::peer_transport::{PeerRegistrar, PeerTransport};
 use crate::rate_table::SharedRateTable;
 use crate::route::{LeasedRoute, PeerRoute};
 use crate::self_description::{SelfDescriptionSource, UnreachableSelfDescription};
+use crate::voucher_binding::{VoucherBindingError, VoucherSigner, VoucherSignerBindings};
 
 /// A reject this connector originates before a gift wrap's shared secret
 /// could be recovered -- no identity key configured, or the wrap itself
@@ -584,6 +585,10 @@ pub struct Connector {
     /// (`config_peer_ids`) never appears here at all: config always wins,
     /// by refusing the runtime write (ADR 0034).
     runtime_peers: ArcSwap<RuntimePeers>,
+    /// The voucher signers bound to a peering (ADR 0075 decision 4, issue
+    /// #1377): what makes an inbound x402 channel a peer's rather than a
+    /// client's. See [`crate::voucher_binding`].
+    voucher_bindings: VoucherSignerBindings,
     /// Peer-forwarding routes added at runtime over the operator surface
     /// (issue #884), keyed by prefix like `leased_routes` -- but durable,
     /// and stored as a plain [`PeerRoute`] with no expiry of its own: an
@@ -834,6 +839,7 @@ impl Connector {
             outbound_client_hops: ArcSwap::from_pointee(HashMap::new()),
             config_peer_ids: HashSet::new(),
             runtime_peers: ArcSwap::from_pointee(RuntimePeers::new()),
+            voucher_bindings: VoucherSignerBindings::new(),
             runtime_peer_routes: ArcSwap::from_pointee(HashMap::new()),
             runtime_table_lock: Mutex::new(()),
             runtime_store: None,
@@ -1739,6 +1745,10 @@ impl Connector {
         next_peers.remove(id);
         self.persist_runtime_table(&next_peers, &routes)?;
         self.runtime_peers.store(Arc::new(next_peers));
+        // The same kill switch covers the peer role an x402 peering proves
+        // with its vouchers (ADR 0075 decision 5): a signer left bound would
+        // keep deciding `peer` for a relation that no longer exists.
+        self.voucher_bindings.unbind_peer(id);
         // ADR 0060 named `DELETE /peers` as the kill switch that replaced
         // revoking a shared secret: "immediate, does not require a
         // restart". It is only immediate if the carriage goes with the row.
@@ -1746,6 +1756,54 @@ impl Connector {
             registrar.deregister(id);
         }
         Ok(())
+    }
+
+    /// Bind an inbound x402 channel's voucher signer to the peering
+    /// `peer_id` (ADR 0075 decisions 4 and 5, issue #1377): from here on, a
+    /// voucher on any channel whose chain-recorded signer is `signer`, or a
+    /// claim-state challenge that signer signs for a packet that moves no
+    /// value, proves the peer role as `peer_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`VoucherBindingError::UnknownPeer`] when neither the config file nor
+    /// the runtime table holds `peer_id`, and
+    /// [`VoucherBindingError::SignerBoundElsewhere`] when `signer` already
+    /// proves another peering.
+    pub fn bind_voucher_signer(
+        &self,
+        peer_id: &str,
+        signer: VoucherSigner,
+    ) -> Result<(), VoucherBindingError> {
+        if !self.config_peer_ids.contains(peer_id)
+            && !self.runtime_peers_snapshot().contains_key(peer_id)
+        {
+            return Err(VoucherBindingError::UnknownPeer(peer_id.to_string()));
+        }
+        self.voucher_bindings.bind(peer_id, signer)
+    }
+
+    /// The peering `signer` proves, if it is bound to one. The signer must
+    /// be the one the chain records for a channel, never one a voucher or a
+    /// challenge declares about itself.
+    #[must_use]
+    pub fn voucher_signer_peer(&self, signer: &VoucherSigner) -> Option<String> {
+        self.voucher_bindings.peer_for(signer)
+    }
+
+    /// Whether any voucher signer is bound at all. `false` on every node
+    /// before its first x402 peering, where a voucher can prove nothing but
+    /// a client and the role gate need not look its channel up.
+    #[must_use]
+    pub fn has_voucher_bindings(&self) -> bool {
+        !self.voucher_bindings.is_empty()
+    }
+
+    /// The current time, in unix seconds, by this node's clock: what a
+    /// claim-state challenge's `expires` is judged against.
+    #[must_use]
+    pub fn now_unix(&self) -> u64 {
+        u64::try_from(self.clock.now().timestamp()).unwrap_or(0)
     }
 
     /// Whether `prefix` is defined by the config file, as either an app
@@ -10252,6 +10310,46 @@ mod tests {
             connector
                 .remove_runtime_peer("runtime-hop")
                 .expect("no longer referenced, now removable");
+        }
+
+        /// ADR 0075 decision 5 (issue #1377): a runtime peering's voucher
+        /// signer proves the peer role while the peering exists, and
+        /// `DELETE /peers` -- ADR 0060's kill switch -- unbinds it with the
+        /// row, so the role goes when the relation does.
+        #[test]
+        fn removing_a_runtime_peer_unbinds_its_voucher_signers() {
+            let connector = covering(
+                Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    test_clock(),
+                ),
+                "runtime-hop",
+            );
+            let signer = VoucherSigner::Evm([0x42; 20]);
+            assert_eq!(
+                connector.bind_voucher_signer("runtime-hop", signer),
+                Err(VoucherBindingError::UnknownPeer("runtime-hop".to_string())),
+                "a signer binds only to a peering that exists"
+            );
+            connector
+                .upsert_runtime_peer("runtime-hop", peering(0))
+                .unwrap();
+            connector
+                .bind_voucher_signer("runtime-hop", signer)
+                .expect("the peering exists now");
+            assert_eq!(
+                connector.voucher_signer_peer(&signer).as_deref(),
+                Some("runtime-hop")
+            );
+            assert!(connector.has_voucher_bindings());
+
+            connector.remove_runtime_peer("runtime-hop").unwrap();
+
+            assert_eq!(connector.voucher_signer_peer(&signer), None);
+            assert!(!connector.has_voucher_bindings());
         }
 
         /// Priority ordering (issue #884): a runtime peer route is durable

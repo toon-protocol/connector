@@ -69,6 +69,7 @@
 
 pub mod accept;
 pub mod ack;
+pub mod challenge_json;
 pub mod claim_json;
 pub mod dial;
 pub mod fields;
@@ -77,8 +78,10 @@ pub mod role_gate;
 pub mod ws;
 
 pub use accept::{AcceptedClaims, PeerAcceptPolicy, PeerCarriageState, PeerSession};
-pub use claim_json::{ClaimDecodeError, PeerClaimDomain};
+pub use challenge_json::{ChallengeDecodeError, PeerRoleChallenge};
+pub use claim_json::{ClaimDecodeError, PeerClaimDomain, PresentedPeerClaim};
 pub use dial::{decode_answer, BtpPeerTransport, DialError, PeerAnswer, PeerDialer, PeerRelation};
 pub use price_gate::{ClaimEnforcementPolicy, PaymentRequired};
 pub use role_gate::decide as decide_frame_role;
+pub use role_gate::{FrameEvidence, VoucherCheck, VoucherEvidence};
 pub use ws::TungsteniteDialer;
