@@ -1411,6 +1411,8 @@ dependencies = [
  "connector-settlement-solana",
  "connector-signer",
  "proptest",
+ "rand 0.8.7",
+ "reqwest",
  "serde_json",
  "solana-account-decoder-client-types",
  "solana-rpc-client",

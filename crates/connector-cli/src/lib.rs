@@ -44,6 +44,12 @@ use url::Url;
 // decision 3 puts a token's pools on that token's own chain (issue #1302).
 pub use runtime::{build, router, spawn_rate_pollers, Runtime, RuntimeError};
 
+// The Solana sponsor endpoint on its own (ADR 0074 decision 9), for a test
+// that stands a counterparty up with nothing but it: the Solana paying half
+// opens its channels through exactly this endpoint of another node (ADR 0075
+// decision 3, issue #1375), and its contract suite runs against the real one.
+pub use sponsor::{router as sponsor_router, SPONSOR_PATH};
+
 /// Everything that can stop the connector from producing a validated,
 /// running node.
 #[derive(Debug)]

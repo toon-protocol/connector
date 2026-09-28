@@ -24,6 +24,13 @@ async-trait = "0.1"
 base64 = "0.22"
 bincode = "1"
 chrono = "0.4"
+# A fresh `salt` for every `open` this node pays for (ADR 0075 decision 3).
+rand = "0.8"
+# The paying half posts its payer-signed `open` to a counterparty's sponsor
+# endpoint (ADR 0074 decision 9, ADR 0075 decision 3) and reads the JSON it
+# answers with. The same line and TLS stack the rest of the workspace uses.
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
+serde_json = "1"
 thiserror = "2"
 # solana-rpc-client, NOT the solana-client meta-crate: this backend only does
 # JSON-RPC over HTTP plus local transaction building/signing, and the meta-crate
@@ -51,7 +58,6 @@ proptest = "1"
 # `FakeRpc`: the confirm loop is tested against an endpoint that stalls,
 # refuses and drops, which no local validator can be made to do.
 connector-chain-rpc = { path = "../connector-chain-rpc", features = ["solana", "test-support"] }
-serde_json = "1"
 # This crate itself, with `test-util` on, so the integration tests reuse
 # the one `solana-test-validator` harness `src/test_support.rs` already
 # ships to downstream crates (`connector-cli`) instead of carrying a
