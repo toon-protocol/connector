@@ -966,6 +966,11 @@ mod tests {
 
     use crate::outbound_ledger::test_ledger_paying as ledger_paying;
 
+    /// The committed cross-repo wire vectors (issue #1408): this module's
+    /// own `client_auth_channel_challenge` cases, read back and checked
+    /// against the real parser below.
+    const WIRE_VECTORS: &str = include_str!("../../../vectors/wire-vectors.json");
+
     /// ADR 0075 decision 7: a payout rides a TRANSFER's protocolData as the
     /// payout voucher's JSON, spelled as a client spells its own voucher,
     /// with everything the client needs to land it: on EVM the config.
@@ -1289,6 +1294,65 @@ mod tests {
             assert!(text.contains("auth_channel_proof"), "{text}");
             assert!(text.contains("ADR 0075"), "{text}");
             assert!(text.contains("channelChallenge"), "{text}");
+        }
+    }
+
+    /// Issue #1408: the committed `client_auth_channel_challenge` vectors
+    /// (`vectors/wire-vectors.json`) are read by this module's own
+    /// [`auth_channel_challenge`] -- the function [`handle_frame`] calls on
+    /// every `auth` entry -- and judged by [`challenge_in_window`] exactly
+    /// as [`verify_and_record_declared_channel`] does: extraction succeeds
+    /// whether or not a challenge is within its window (only the window
+    /// decides `accepted`, never whether the JSON parses), and each case's
+    /// `accepted` is that check's verdict alone -- one already ahead but
+    /// expired, one signed too far ahead of `now` to be a bearer proof yet.
+    /// Checked both from the bare `channelChallenge` JSON and from the
+    /// pinned BTP MESSAGE frame's own `auth` entry, so the wire bytes and
+    /// the object they carry are proven to agree.
+    #[test]
+    fn the_committed_client_auth_channel_challenge_vectors_match_the_real_parser() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(WIRE_VECTORS).expect("the committed vectors parse");
+        for chain in ["evm", "solana"] {
+            let cases = vectors["client_auth_channel_challenge"][chain]
+                .as_array()
+                .unwrap_or_else(|| panic!("client_auth_channel_challenge.{chain} is an array"));
+            assert!(
+                !cases.is_empty(),
+                "client_auth_channel_challenge.{chain} has cases"
+            );
+            for case in cases {
+                let name = case["name"].as_str().expect("a name");
+                let now = case["now"].as_u64().expect("a now");
+                let expires = case["expires"].as_u64().expect("an expires");
+                let accepted = case["accepted"].as_bool().expect("an accepted flag");
+                let auth_entry_json = case["auth_entry_json"].as_str().expect("auth_entry_json");
+                let btp_message_hex = case["btp_message_hex"].as_str().expect("btp_message_hex");
+
+                let challenge = auth_channel_challenge(auth_entry_json.as_bytes())
+                    .unwrap_or_else(|| panic!("{name}: the real parser must read this challenge"));
+                assert_eq!(challenge.expires(), expires, "{name}");
+                assert_eq!(
+                    challenge_in_window(challenge.expires(), now),
+                    accepted,
+                    "{name}: the real window check must agree with the vector"
+                );
+
+                let bytes = hex::decode(btp_message_hex).expect("the vector's hex decodes");
+                let frame = decode_frame(&bytes).expect("the connector's own decoder");
+                assert_eq!(frame.frame_type, BTP_MESSAGE, "{name}");
+                let entry = frame
+                    .protocol_data
+                    .iter()
+                    .find(|pd| pd.name == AUTH_PROTOCOL)
+                    .unwrap_or_else(|| panic!("{name}: the frame carries an auth entry"));
+                assert_eq!(entry.data, auth_entry_json.as_bytes(), "{name}");
+                let challenge_from_frame =
+                    auth_channel_challenge(&entry.data).unwrap_or_else(|| {
+                        panic!("{name}: the real parser must read the frame's auth entry")
+                    });
+                assert_eq!(challenge_from_frame, challenge, "{name}");
+            }
         }
     }
 

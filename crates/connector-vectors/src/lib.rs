@@ -18,8 +18,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use connector_btp::{
     decode_frame, encode_error, encode_message, encode_response, encode_transfer, ProtocolData,
-    ACCUMULATED_COST_HEADER, CLAIM_ACK_HEADER, CLAIM_ACK_PROTOCOL, CLAIM_HEADER, CONTENT_TYPE_TEXT,
-    PAYOUT_CLAIM_PROTOCOL, PEER_CHALLENGE_HEADER, PEER_CHALLENGE_PROTOCOL,
+    ACCUMULATED_COST_HEADER, AUTH_PROTOCOL, BTP_MESSAGE, CLAIM_ACK_HEADER, CLAIM_ACK_PROTOCOL,
+    CLAIM_HEADER, CONTENT_TYPE_TEXT, PAYOUT_CLAIM_PROTOCOL, PEER_CHALLENGE_HEADER,
+    PEER_CHALLENGE_PROTOCOL,
 };
 use connector_domain::client_claim::{
     self, ClientClaim, ClientClaimError, SCHEME_BATCH_SETTLEMENT,
@@ -196,6 +197,8 @@ pub struct WireVectors {
     pub voucher_claim_state_challenge: VoucherClaimStateChallengeVectors,
     pub toon_channel_refused: ToonChannelRefusedVectors,
     pub payout_voucher: PayoutVoucherVectors,
+    pub client_auth_channel_challenge: ClientAuthChannelChallengeVectors,
+    pub claim_state_toon_channel_refused: ClaimStateToonChannelRefusedVectors,
 }
 
 #[derive(Debug, Serialize)]
@@ -2630,6 +2633,378 @@ fn generate_voucher_claim_state_challenge_vectors() -> VoucherClaimStateChalleng
     VoucherClaimStateChallengeVectors { evm, solana }
 }
 
+// ---------------------------------------------------------------------
+// Client BTP auth's `channelChallenge` (ADR 0075 decision 5, issue #1384;
+// issue #1408)
+// ---------------------------------------------------------------------
+//
+// The client BTP `auth` entry's `channelChallenge` field declares a channel
+// before its session has ever paid: exactly the voucher claim-state
+// challenge object `voucher_claim_state_challenge` and
+// `peer_carriage.zero_value_challenge` also carry, `scheme:
+// "batch-settlement"` required, riding beside `peerId`/`secret`
+// (`client-edge-spec.md` §1.9 step 1, `connector_client_edge::btp`'s
+// `auth_channel_challenge`). It is read the same way regardless of whether
+// it verifies: extraction only depends on the JSON shape, so every case
+// below parses. What decides "accepted" is the same bound a peer's
+// challenge is held to (`connector_peer_btp::role_gate::
+// MAX_PEER_CHALLENGE_LIFETIME_SECS`, 300 seconds): `expires` must be ahead
+// of the connector's clock and no more than that many seconds ahead --
+// checked by `connector_peer_btp::role_gate::challenge_in_window`, the
+// exact function the client edge's auth handler calls before ever
+// resolving the channel or checking the signature. An expired challenge and
+// one signed too far ahead both fail this bound and are refused the same
+// way: quietly, so the session still binds and simply learns no payee at
+// auth.
+
+/// The connector's clock every case below is judged against.
+const AUTH_CHALLENGE_NOW: u64 = 2_000_000_000;
+
+/// The `peerId` every case's `auth` entry declares.
+const AUTH_CHALLENGE_PEER_ID: &str = "g.toon.agent";
+
+#[derive(Debug, Serialize)]
+pub struct ClientAuthChannelChallengeCase {
+    pub name: &'static str,
+    pub blockchain: &'static str,
+    /// The connector's clock at evaluation (Unix seconds) -- also
+    /// [`ClientAuthChannelChallengeVectors::now`], repeated per case so a
+    /// case is self-contained.
+    pub now: u64,
+    /// Unix seconds the `channelChallenge` is valid until -- ahead of `now`
+    /// for an accepted case, in the past or too far ahead for a refused one.
+    pub expires: u64,
+    /// `challenge_in_window(expires, now)`: whether `expires` is ahead of
+    /// `now` and no more than
+    /// `MAX_PEER_CHALLENGE_LIFETIME_SECS` (300) ahead of it.
+    pub accepted: bool,
+    /// The `channelChallenge` value alone, genuinely signed by the
+    /// channel's voucher signer in every case -- only the window differs.
+    pub challenge_json: String,
+    /// The full `auth` entry: `{"peerId", "secret", "channelChallenge"}`.
+    pub auth_entry_json: String,
+    /// The BTP MESSAGE frame carrying `auth_entry_json` as its `auth`
+    /// protocolData entry.
+    pub btp_message_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClientAuthChannelChallengeVectors {
+    pub now: u64,
+    pub max_lifetime_secs: u64,
+    pub evm: Vec<ClientAuthChannelChallengeCase>,
+    pub solana: Vec<ClientAuthChannelChallengeCase>,
+}
+
+fn client_auth_channel_challenge_frame(request_id: u32, auth_entry: &serde_json::Value) -> Vec<u8> {
+    let btp = encode_message(
+        request_id,
+        &[ProtocolData {
+            name: AUTH_PROTOCOL.to_string(),
+            content_type: CONTENT_TYPE_TEXT,
+            data: auth_entry.to_string().into_bytes(),
+        }],
+        &[],
+    );
+    let decoded = decode_frame(&btp).expect("self-generated frame decodes");
+    assert_eq!(decoded.frame_type, BTP_MESSAGE);
+    btp
+}
+
+fn client_auth_channel_challenge_evm_case(
+    name: &'static str,
+    request_id: u32,
+    expires: u64,
+    accepted: bool,
+) -> ClientAuthChannelChallengeCase {
+    let domain = BatchSettlementDomain::x402(VOUCHER_EVM_CHAIN_ID);
+    let config = voucher_evm_fixture_config();
+    let channel_id = evm_batch_channel_id(&domain, &config);
+    let voucher_signer = evm_voucher_signer(&config);
+    let signer_secret = hex_bytes::<32>(VOUCHER_EVM_AUTHORIZER_SECRET);
+    let signer = LocalSigner::from_secret_bytes(name, signer_secret)
+        .expect("fixture secret is a valid secp256k1 scalar");
+    let digest = evm_voucher_claim_state_challenge_digest(&domain, &channel_id, expires);
+    let mut signature = signer
+        .sign(&digest)
+        .expect("fixture signer signs its own digest")
+        .to_bytes();
+    signature[64] += 27;
+    assert!(
+        verify_evm_voucher_claim_state_challenge(
+            &domain,
+            &channel_id,
+            expires,
+            &signature,
+            &voucher_signer,
+        ),
+        "vector {name}'s challenge must genuinely verify against the channel's voucher signer"
+    );
+
+    let in_window = role_gate::challenge_in_window(expires, AUTH_CHALLENGE_NOW);
+    assert_eq!(
+        in_window, accepted,
+        "vector {name} computed the wrong window verdict"
+    );
+
+    let presentation = ChannelPresentation::Evm {
+        channel: SettlementChannelId(format!("0x{}", hex_of(&channel_id))),
+        config: to_settlement_config(&config),
+    };
+    let challenge = challenge_entry(&presentation, expires, &signature);
+    let parsed = challenge_json::parse(challenge.to_string().as_bytes())
+        .expect("the channelChallenge parses through the real peer-carriage reader");
+    assert_eq!(parsed.expires(), expires);
+    assert_eq!(parsed.channel(), format!("0x{}", hex_of(&channel_id)));
+
+    let auth_entry = serde_json::json!({
+        "peerId": AUTH_CHALLENGE_PEER_ID,
+        "secret": "",
+        "channelChallenge": challenge,
+    });
+    let btp_message_hex = hex_of(&client_auth_channel_challenge_frame(
+        request_id,
+        &auth_entry,
+    ));
+
+    ClientAuthChannelChallengeCase {
+        name,
+        blockchain: "evm",
+        now: AUTH_CHALLENGE_NOW,
+        expires,
+        accepted,
+        challenge_json: challenge.to_string(),
+        auth_entry_json: auth_entry.to_string(),
+        btp_message_hex,
+    }
+}
+
+fn client_auth_channel_challenge_solana_case(
+    name: &'static str,
+    request_id: u32,
+    expires: u64,
+    accepted: bool,
+) -> ClientAuthChannelChallengeCase {
+    let channel_account: [u8; 32] = [0xc3; 32];
+    let seed = seq_bytes::<32>(0xa1);
+    let signer = LocalEd25519Signer::from_secret_bytes(seed).expect("fixture seed is 32 bytes");
+    let authorized_signer = signer.public_key();
+    let message = solana_voucher_claim_state_challenge_message(&channel_account, expires);
+    let signature = signer.sign(&message);
+    assert!(
+        verify_solana_voucher_claim_state_challenge(
+            &channel_account,
+            expires,
+            &signature,
+            &authorized_signer,
+        ),
+        "vector {name}'s challenge must genuinely verify against the channel's authorized_signer"
+    );
+
+    let in_window = role_gate::challenge_in_window(expires, AUTH_CHALLENGE_NOW);
+    assert_eq!(
+        in_window, accepted,
+        "vector {name} computed the wrong window verdict"
+    );
+
+    let presentation = ChannelPresentation::Solana {
+        channel: SettlementChannelId(bs58::encode(channel_account).into_string()),
+    };
+    let challenge = challenge_entry(&presentation, expires, &signature);
+    let parsed = challenge_json::parse(challenge.to_string().as_bytes())
+        .expect("the channelChallenge parses through the real peer-carriage reader");
+    assert_eq!(parsed.expires(), expires);
+    assert_eq!(
+        parsed.channel(),
+        bs58::encode(channel_account).into_string()
+    );
+
+    let auth_entry = serde_json::json!({
+        "peerId": AUTH_CHALLENGE_PEER_ID,
+        "secret": "",
+        "channelChallenge": challenge,
+    });
+    let btp_message_hex = hex_of(&client_auth_channel_challenge_frame(
+        request_id,
+        &auth_entry,
+    ));
+
+    ClientAuthChannelChallengeCase {
+        name,
+        blockchain: "solana",
+        now: AUTH_CHALLENGE_NOW,
+        expires,
+        accepted,
+        challenge_json: challenge.to_string(),
+        auth_entry_json: auth_entry.to_string(),
+        btp_message_hex,
+    }
+}
+
+fn generate_client_auth_channel_challenge_vectors() -> ClientAuthChannelChallengeVectors {
+    let evm = vec![
+        client_auth_channel_challenge_evm_case(
+            "client_auth_channel_challenge_evm_accepted",
+            9_601,
+            AUTH_CHALLENGE_NOW + 60,
+            true,
+        ),
+        client_auth_channel_challenge_evm_case(
+            "client_auth_channel_challenge_evm_refused_expired",
+            9_602,
+            AUTH_CHALLENGE_NOW - 1,
+            false,
+        ),
+        client_auth_channel_challenge_evm_case(
+            "client_auth_channel_challenge_evm_refused_too_far_ahead",
+            9_603,
+            AUTH_CHALLENGE_NOW + role_gate::MAX_PEER_CHALLENGE_LIFETIME_SECS + 1,
+            false,
+        ),
+    ];
+    let solana = vec![
+        client_auth_channel_challenge_solana_case(
+            "client_auth_channel_challenge_solana_accepted",
+            9_604,
+            AUTH_CHALLENGE_NOW + 60,
+            true,
+        ),
+        client_auth_channel_challenge_solana_case(
+            "client_auth_channel_challenge_solana_refused_expired",
+            9_605,
+            AUTH_CHALLENGE_NOW - 1,
+            false,
+        ),
+        client_auth_channel_challenge_solana_case(
+            "client_auth_channel_challenge_solana_refused_too_far_ahead",
+            9_606,
+            AUTH_CHALLENGE_NOW + role_gate::MAX_PEER_CHALLENGE_LIFETIME_SECS + 1,
+            false,
+        ),
+    ];
+    ClientAuthChannelChallengeVectors {
+        now: AUTH_CHALLENGE_NOW,
+        max_lifetime_secs: role_gate::MAX_PEER_CHALLENGE_LIFETIME_SECS,
+        evm,
+        solana,
+    }
+}
+
+// ---------------------------------------------------------------------
+// `POST /ilp/claim-state`'s `"toon-channel-refused"` answer (ADR 0075
+// decision 8, issue #1384; issue #1408)
+// ---------------------------------------------------------------------
+//
+// A claim-state entry's `scheme` is required exactly as a claim's is
+// (invariant 5, `connector_domain::client_claim::declared_scheme` --
+// `claim_state.rs`'s own branch on it). An entry with no `scheme`, or with
+// `scheme: "toon-channel"`, asks about the retired `toon-channel` channel
+// and is answered `"toon-channel-refused"` by name, on both chains, before
+// the settlement backend is ever asked. The response's channel field is
+// always `channelId`, even for a Solana entry -- `claim_state.rs`'s one
+// `UnverifiedChannelState` shape has no separate `channelAccount` field, so
+// a Solana refusal's `channelId` carries the base58 channel account text.
+
+/// The claim-state endpoint's own name for this refusal
+/// (`claim_state.rs`'s private `TOON_CHANNEL_REFUSED`).
+const CLAIM_STATE_TOON_CHANNEL_REFUSED: &str = "toon-channel-refused";
+
+#[derive(Debug, Serialize)]
+pub struct ClaimStateToonChannelRefusedCase {
+    pub name: &'static str,
+    pub blockchain: &'static str,
+    /// The entry exactly as it rides in the request's `channels[]`.
+    pub request_entry_json: String,
+    /// The answer: `{"blockchain", "channelId", "ok": false, "error":
+    /// "toon-channel-refused"}` -- `channelId` even on Solana.
+    pub response_entry_json: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClaimStateToonChannelRefusedVectors {
+    pub cases: Vec<ClaimStateToonChannelRefusedCase>,
+}
+
+fn claim_state_toon_channel_refused_case(
+    name: &'static str,
+    blockchain: &'static str,
+    scheme: Option<&str>,
+) -> ClaimStateToonChannelRefusedCase {
+    assert_eq!(
+        client_claim::declared_scheme(scheme),
+        client_claim::DeclaredScheme::ToonChannel,
+        "vector {name} must name a scheme the endpoint reads as toon-channel"
+    );
+
+    let expires = VOUCHER_CLAIM_STATE_EXPIRES;
+    let mut entry = if blockchain == "evm" {
+        serde_json::json!({
+            "blockchain": "evm",
+            "channelId": format!("0x{}", hex_of(&seq_bytes::<32>(0xd0))),
+            "expires": expires,
+            "signature": format!("0x{}", hex_of(&seq_bytes::<65>(0x21))),
+        })
+    } else {
+        serde_json::json!({
+            "blockchain": "solana",
+            "channelAccount": bs58::encode(seq_bytes::<32>(0xd0)).into_string(),
+            "expires": expires,
+            "signature": BASE64.encode(seq_bytes::<64>(0x21)),
+        })
+    };
+    if let Some(scheme) = scheme {
+        entry["scheme"] = scheme.into();
+    }
+    let channel_id_field = entry
+        .get(if blockchain == "evm" {
+            "channelId"
+        } else {
+            "channelAccount"
+        })
+        .expect("the entry names its channel")
+        .clone();
+    let response = serde_json::json!({
+        "blockchain": blockchain,
+        "channelId": channel_id_field,
+        "ok": false,
+        "error": CLAIM_STATE_TOON_CHANNEL_REFUSED,
+    });
+
+    ClaimStateToonChannelRefusedCase {
+        name,
+        blockchain,
+        request_entry_json: entry.to_string(),
+        response_entry_json: response.to_string(),
+    }
+}
+
+fn generate_claim_state_toon_channel_refused_vectors() -> ClaimStateToonChannelRefusedVectors {
+    ClaimStateToonChannelRefusedVectors {
+        cases: vec![
+            claim_state_toon_channel_refused_case(
+                "claim_state_evm_no_scheme_is_toon_channel_refused",
+                "evm",
+                None,
+            ),
+            claim_state_toon_channel_refused_case(
+                "claim_state_evm_explicit_toon_channel_scheme_is_refused",
+                "evm",
+                Some("toon-channel"),
+            ),
+            claim_state_toon_channel_refused_case(
+                "claim_state_solana_no_scheme_is_toon_channel_refused",
+                "solana",
+                None,
+            ),
+            claim_state_toon_channel_refused_case(
+                "claim_state_solana_explicit_toon_channel_scheme_is_refused",
+                "solana",
+                Some("toon-channel"),
+            ),
+        ],
+    }
+}
+
 /// Build the full committed vector set. See the module docs for what
 /// "generated from the properties" means here, and
 /// `docs/protocol/wire-vectors.md` for the invariant each section pins.
@@ -2643,6 +3018,8 @@ pub fn generate() -> WireVectors {
     let voucher_claim_state_challenge = generate_voucher_claim_state_challenge_vectors();
     let toon_channel_refused = generate_toon_channel_refused_vectors();
     let payout_voucher = generate_payout_voucher_vectors();
+    let client_auth_channel_challenge = generate_client_auth_channel_challenge_vectors();
+    let claim_state_toon_channel_refused = generate_claim_state_toon_channel_refused_vectors();
 
     WireVectors {
         schema_version: SCHEMA_VERSION,
@@ -2655,6 +3032,8 @@ pub fn generate() -> WireVectors {
         voucher_claim_state_challenge,
         toon_channel_refused,
         payout_voucher,
+        client_auth_channel_challenge,
+        claim_state_toon_channel_refused,
     }
 }
 
