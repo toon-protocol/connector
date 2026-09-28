@@ -61,8 +61,9 @@ bearer_token_file = "/app/data/operator-bearer-token"
 write_keys_file = "/app/data/operator-write-keys"
 
 # ── Settlement: BOTH chains, live at once ────────────────────────────────────
-# Deliberately both. `two_ledgers_never_merge.rs` is named for this concern and
-# proves it in-process; nothing else stands a node up with an EVM and a Solana
+# Deliberately both. `connector-cli`'s
+# `a_both_chains_config_attaches_and_routes_both_backends` proves this concern
+# in-process; nothing else stands a node up with an EVM and a Solana
 # backend attached simultaneously and boots it. A present-but-unsatisfiable
 # settlement block is a hard startup failure, so this section coming up at all
 # is itself the assertion.

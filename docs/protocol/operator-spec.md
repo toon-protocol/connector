@@ -178,9 +178,12 @@ channel this build cannot sign on, and the node refuses to boot on it, by name, 
 earlier bring-up had to hand over by hand are gone rather than merely documented. No **channel** id
 is copied between operators: each node opens its own and binds the other's by a published key
 (ADR 0075). The **peer credential** that had to be byte-identical in both data dirs is
-**deleted, with nothing replacing it**: a peer's role is proved per frame by its `[[peer_channels]]`
-binding and its claim signature
-([ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)).
+**deleted, with nothing replacing it**: a peer's role is proved per frame by a voucher (or, on a
+packet that moves no value, a claim-state challenge) signed by the voucher signer bound to the
+peering — the one its self-description publishes, or the one a `[[peer_channels]]` row names
+([ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md), as
+[ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 5
+amends it, issue #1380).
 `[[peers]].credential` is a tombstone, so a configuration copied from an older runbook is refused by
 name at boot rather than quietly ignored.
 

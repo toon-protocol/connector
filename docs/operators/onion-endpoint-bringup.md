@@ -113,9 +113,11 @@ decision 7), not a gap — see "The operator writes the address down", below.
   in place. `deploy/connector-rust/README.md` is that path; this runbook changes where the node is
   reachable, not what it is.
 - The peering surface configured on both sides as `btp-peer-transport-bringup.md` describes:
-  `[[peers]]`, `[[peer_channels]]`, and `[[pay_channels]]` on the side that pays. **Since ADR 0060
-  a peering is proven by a verified claim**, so the channel rows are the whole of peer
-  authentication — the circuit authenticates the endpoint, never the peer.
+  `[[peers]]`, `[[peer_channels]]`, and `[[pay_channels]]` on the side that pays — or a runtime
+  peering made with `POST /peers`, which needs none of the three. **Since ADR 0060 a peering is
+  proven by a verified claim** — since ADR 0075 (issue #1380) a voucher from the voucher signer the
+  `[[peer_channels]]` row or the peer's self-description binds — so that binding is the whole of
+  peer authentication — the circuit authenticates the endpoint, never the peer.
 - An onion-routing daemon available to run **beside** the connector, not inside it. Anyone
   Protocol's `anon` is a Tor fork — binary `anon`, config `anonrc`, SOCKS on 9050 — and plain Tor
   works identically: the connector's whole surface is a `socks5h://` URL and a hidden-service
@@ -271,15 +273,17 @@ id       = "onionpeer"
 endpoint = "ws://<56-char-address>.anyone/ilp/btp"  # or http://…/ilp for ILP-over-HTTP
 
 [[pay_channels]]
-peer_id         = "onionpeer"
-client_edge_url = "http://<56-char-address>.anyone/ilp"
-# channel_id, chain_id and token_network as they would be on any peering
+peer_id          = "onionpeer"
+outbound_channel = "0x…"   # the x402 channel this node opened toward the peer (POST /channels)
+client_edge_url  = "http://<56-char-address>.anyone/ilp"
 ```
 
 The `client_edge_url` is easy to forget and fails confusingly. A covering payer asks the payee where
-its claims stand on **every** covered PREPARE (issue #1102), so if that URL is a clearnet one, or
-missing, the packet is refused for want of a covering claim long before the carriage is asked to
-carry anything. Both surfaces are behind the same onion address because they are the same listener.
+its vouchers stand once per process and again after any voucher the payee did not accept
+(`peer-carriage-spec.md` §1.11). If that URL points somewhere the payer cannot reach — a clearnet
+URL for a node that has none — the ask fails and the payer signs on from its own journaled
+watermark: correct for as long as that journal survives, and vouchers refused
+`amount_not_advancing` once it does not, with nothing left to restore the watermark from. Both surfaces are behind the same onion address because they are the same listener.
 
 A node with **no** `socks_proxy` dials everything direct, which is every existing config in this
 repository and the right default. On such a node an onion dial fails as an ordinary unreachable

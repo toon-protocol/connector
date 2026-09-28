@@ -11,8 +11,8 @@
 //! a difference. The two carriages differ only in how the refusal is
 //! *shaped* -- protocolData on a RESPONSE (BTP) or a response header (HTTP)
 //! -- so that is all each of them keeps. It sits in this crate for the same
-//! reason [`crate::claim_json`], [`crate::ack`] and
-//! [`crate::AcceptedClaims`] do: `connector-peer-http` depends on this
+//! reason [`crate::claim_json`], [`crate::ack`] and [`crate::role_gate`]
+//! do: `connector-peer-http` depends on this
 //! crate, and the peering semantics are not BTP's.
 //!
 //! # What it is scoped to
@@ -82,10 +82,10 @@ use connector_runtime::{ClaimAckOutcome, ClientRouteKind, Connector};
 /// (ADR 0042 item 4, issue #1077); a terminated arrival is now enforced
 /// unconditionally and asks this type nothing.
 ///
-/// Deliberately as narrow as [`connector_peer_auth::PeerAuthPolicy`]: this
-/// is not the role decision and holds nothing that is (`peer.rs`'s own
-/// narrowness note) -- one fact per peer, read only by [`payment_required`],
-/// built once from configuration and shared by every interaction.
+/// Deliberately narrow: this is not the role decision and holds nothing
+/// that is (`peer.rs`'s own narrowness note) -- one fact per peer, read
+/// only by [`payment_required`], built once from configuration and shared
+/// by every interaction.
 #[derive(Debug, Clone, Default)]
 pub struct ClaimEnforcementPolicy {
     by_peer: BTreeMap<String, ForwardedClaimEnforcement>,
@@ -160,18 +160,17 @@ pub struct PaymentRequired {
 /// advance rather than the zero advance past the watermark it just became.
 /// Both rules measure that advance the same way, through [`validate_price`].
 ///
-/// It MUST also be read from the book that judges the evidence -- for a
-/// `toon-channel` claim [`Connector::peer_channel_watermark`], which is
-/// [`connector_runtime::ClaimBook`]'s own durable inbound watermark, keyed
-/// by channel; for a voucher the channel's one amount watermark the
-/// receiving half judged it against (ADR 0075, `peer-carriage-spec.md`
-/// §1.8). A watermark from any per-process record disagrees with the
-/// judgement across a restart, and the disagreement is money: the book
-/// replays its journal, the record starts empty, and the first priced peer
-/// PREPARE after a restart is measured against zero and so credited with
-/// its claim's whole cumulative amount (issue #1104).
+/// It MUST also be read from where the evidence is judged -- the x402
+/// channel's one amount watermark the receiving half judged the voucher
+/// against (ADR 0075, `peer-carriage-spec.md` §1.8). A `toon-channel` claim
+/// never reaches here: it never decides the peer role (#1380). A watermark
+/// from any per-process record disagrees with the judgement across a
+/// restart, and the disagreement is money: the journal is replayed, the
+/// record starts empty, and the first priced peer PREPARE after a restart
+/// is measured against zero and so credited with its voucher's whole
+/// cumulative amount (issue #1104).
 ///
-/// Coverage requires the claim book's own verdict to be
+/// Coverage requires the receiving half's own verdict to be
 /// [`ClaimAckOutcome::Accepted`], not merely that a claim decoded: a forged
 /// signature or a replayed nonce still decodes and can still declare any
 /// `cumulative_amount` it likes, so judging off that declared amount would

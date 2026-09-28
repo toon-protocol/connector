@@ -13,15 +13,9 @@ use std::sync::{Arc, OnceLock};
 
 use connector_domain::{EnvelopeRequest, EnvelopeResponse};
 use connector_signer::giftwrap::{derive_fulfillment, open_response, seal_request};
-use connector_signer::{evm_balance_proof_digest, Address, LocalSigner, Signer};
+use connector_signer::{LocalSigner, Signer};
 
 use crate::app_client::AppOutcome;
-use crate::claim::{evm_proof, parse_channel_id, ChannelDomain, WireClaim};
-use crate::connector::Connector;
-use crate::outbound_client::{
-    ClaimStateDomain, ClaimStateSource, ClaimWatermark, EvmDomain, OutboundClientError,
-    OutboundClientLedger,
-};
 
 /// This crate's one shared "this connector's own identity" fixture: every
 /// [`envelope_request_data`]/[`sealed_envelope_request_data`] call seals to
@@ -136,117 +130,6 @@ pub(crate) fn fulfill_envelope_with_status(status: u16, body: &[u8]) -> Envelope
     }
 }
 
-/// A fixed EIP-712 domain every peer-role test channel in this crate's own
-/// test modules shares (issue #575/#566) -- an arbitrary but consistent
-/// chain id and `TokenNetwork` address; nothing in these tests depends on
-/// their real-world provenance, only that signing and verifying a claim use
-/// the same domain a channel was registered with.
-pub(crate) fn test_channel_domain() -> ChannelDomain {
-    ChannelDomain {
-        chain_id: 84_532,
-        token_network_address: [0x1E; 20],
-    }
-}
-
-/// A valid on-chain `bytes32` peer channel id for tests -- `0x`
-/// followed by `n` left-padded to 64 hex characters (issue #575's AC4: a
-/// peer claim's channel id must already be a real bytes32, never an
-/// arbitrary label like the `"channel-a"` placeholders this crate's tests
-/// used before this issue).
-pub(crate) fn test_channel_id(n: u8) -> String {
-    format!("0x{n:064x}")
-}
-
-/// Register `n`'s channel on `connector`: `counterparty`'s address as the
-/// key an inbound claim on it must recover to, and [`test_channel_domain`]
-/// as its EIP-712 signing domain -- the pairing [`ClaimBook::accept_inbound`]
-/// requires before a channel can accept a claim at all (issue #575's AC3).
-pub(crate) fn with_test_channel(connector: Connector, n: u8, counterparty: Address) -> Connector {
-    connector
-        .with_channel_verification_key(test_channel_id(n), counterparty)
-        .with_channel_domain(test_channel_id(n), test_channel_domain())
-        .expect("test_channel_id(n) is a valid on-chain channel id")
-}
-
-/// Sign a [`WireClaim`] for channel `n`'s `nonce`/`cumulative_amount` under
-/// [`test_channel_domain`] -- exactly the digest a peer signs and
-/// [`ClaimBook::accept_inbound`] verifies.
-pub(crate) fn sign_wire_claim(
-    signer: &dyn Signer,
-    n: u8,
-    nonce: u64,
-    cumulative_amount: u64,
-) -> WireClaim {
-    let channel_id = test_channel_id(n);
-    let on_chain_id = parse_channel_id(&channel_id).expect("test_channel_id(n) is valid");
-    let proof = evm_proof(on_chain_id, test_channel_domain(), nonce, cumulative_amount);
-    WireClaim {
-        channel_id,
-        nonce,
-        cumulative_amount,
-        signature: crate::claim::ClaimSignature::Evm(
-            signer
-                .sign(&evm_balance_proof_digest(&proof))
-                .expect("sign"),
-        ),
-    }
-}
-
-/// A next hop that answers where this node's claims on a channel stand --
-/// the authority the outbound client ledger prices every covering claim off
-/// (see [`crate::outbound_client`]'s header). A fake upholding the port's
-/// contract, not a stub with expectations (ADR 0007): it reports a
-/// watermark, which is the whole of what the port is for.
-struct AlwaysReportsAWatermark;
-
-#[async_trait::async_trait]
-impl ClaimStateSource for AlwaysReportsAWatermark {
-    async fn watermark(
-        &self,
-        _channel: &[u8; 32],
-        _domain: &ClaimStateDomain,
-    ) -> Result<ClaimWatermark, OutboundClientError> {
-        Ok(ClaimWatermark {
-            nonce: 0,
-            cumulative: 0,
-            available: Some(u64::MAX.into()),
-        })
-    }
-}
-
-/// Give `connector` what ADR 0042 requires of **any** peering it forwards
-/// to: a channel to pay `peer_id` from, and a ledger to sign the covering
-/// claim out of.
-///
-/// Every test in this crate that forwards a packet to a peer needs this,
-/// and that is the point of issue #1145. Before it, a peering with no
-/// client-role config fell through to ADR 0004's postpay convention and
-/// the packet went out uncovered; now `Connector::forward_via_peer_route`
-/// refuses it outright, and `Config::load` refuses the file that would
-/// have produced it (`ConfigError::PayChannelUnbound`). A fixture that
-/// forwards without this is not a simpler fixture -- it is one no
-/// configuration can produce.
-///
-/// The channel is [`test_channel_id`]`(1)` and the ledger is in-memory,
-/// which is right for a test but never for a serving node: a restart that
-/// reissued a nonce would fork its own outbound nonce line, which is why
-/// `OutboundClientLedger::open` is what `connector-cli` wires.
-pub(crate) fn covering(connector: Connector, peer_id: &str) -> Connector {
-    let connector = if connector.claims.signer().is_some() {
-        connector
-    } else {
-        connector.with_signer(Arc::new(LocalSigner::generate("test-support-settlement")))
-    };
-    connector
-        .with_outbound_client_ledger(Arc::new(OutboundClientLedger::in_memory()))
-        .with_outbound_client_hop(
-            peer_id,
-            test_channel_id(1),
-            EvmDomain {
-                chain_id: test_channel_domain().chain_id,
-                token_network: test_channel_domain().token_network_address,
-            },
-            Arc::new(AlwaysReportsAWatermark),
-        )
-        .expect("test_channel_id(1) is a valid on-chain channel id")
-}
+/// Give `connector` a channel to pay `peer_id` on (ADR 0042, ADR 0075
+/// decision 6). See [`crate::covering_fake`].
+pub(crate) use crate::covering_fake::{covering, voucher_amount};

@@ -989,9 +989,84 @@ endpoint = "wss://store.example/btp"
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("no '[[peer_channels]]' entry")
-            && stderr.contains("docs/operators/btp-peer-transport-bringup.md"),
-        "expected a named unbound-peering error pointing at the bring-up doc, got: {stderr}"
+            && stderr.contains("voucher_signer")
+            && stderr.contains("docs/protocol/configuration-spec.md"),
+        "expected a named unbound-peering error naming the row to add, got: {stderr}"
     );
+}
+
+/// ADR 0075 decision 9, issue #1380, against the compiled binary: a
+/// `[[peer_channels]]` or `[[pay_channels]]` row still written in its
+/// `toon-channel` shape stops the node **by name** (ADR 0009) -- naming the
+/// field, the peering, and the x402 row to write instead -- rather than
+/// failing the row's shape or loading with a field ignored. The shape every
+/// devnet box and `local/` topology wrote before ADR 0075.
+#[test]
+fn exits_non_zero_naming_a_toon_channel_peering_row() {
+    let key_file = write_raw_key_file();
+    for (table, row) in [
+        (
+            "[[peer_channels]]",
+            "[[peer_channels]]\npeer_id = \"store\"\n\
+             channel_id = \"0x1111111111111111111111111111111111111111111111111111111111111111\"\n\
+             counterparty_key = \"0x2222222222222222222222222222222222222222\"\n\
+             chain_id = 31337\n\
+             token_network = \"0x3333333333333333333333333333333333333333\"\n",
+        ),
+        (
+            "[[pay_channels]]",
+            "[[peer_channels]]\npeer_id = \"store\"\n\
+             voucher_signer = \"0x2222222222222222222222222222222222222222\"\n\n\
+             [[pay_channels]]\npeer_id = \"store\"\n\
+             channel_account = \"4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi\"\n\
+             client_edge_url = \"https://store.example/ilp\"\n",
+        ),
+    ] {
+        let config_file = write_config(&format!(
+            r#"
+client_edge_addr = "127.0.0.1:0"
+peer_expose = "btp"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement.evm]
+rpc_url = "http://127.0.0.1:8545"
+contract_address = "0x1234567890123456789012345678901234567890"
+token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
+decimals = 6
+
+[settlement.evm.key]
+key_file = "{key_file}"
+
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+
+[[peers]]
+id = "store"
+endpoint = "wss://store.example/btp"
+
+{row}"#,
+            state_dir = std::env::temp_dir()
+                .join("connector-refuses-a-toon-peering-row")
+                .display(),
+            key_file = key_file.path().display(),
+        ));
+
+        let output = run(Some(config_file.path()));
+
+        assert!(!output.status.success(), "{table}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(table)
+                && stderr.contains("'toon-channel'")
+                && stderr.contains("ADR 0075")
+                && stderr.contains("store"),
+            "{table}: expected the removed field named, got: {stderr}"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

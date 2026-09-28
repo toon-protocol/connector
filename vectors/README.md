@@ -382,7 +382,10 @@ reason }` (`reason` only when `result` is `"rejected"`). `http_status` is always
 http_body_hex }`: `btp_transfer_hex` is a complete BTP TRANSFER frame whose `amount` equals
   `transfer_amount` (the claim's own cumulative amount -- the generator asserts this equality, not
   just a reader) and carries the claim entry with **no** `ilpPacket`. `http_body_hex` is empty; the
-  claim rides the `ILP-Payment-Channel-Claim` header alone.
+  claim rides the `ILP-Payment-Channel-Claim` header alone. The shape is still pinned at this
+  `schema_version`, but since ADR 0075 (issue #1380) no peer carriage sends a FLUSH: a peer pays with
+  a voucher riding the PREPARE it covers, and an arriving BTP TRANSFER is answered with an empty
+  RESPONSE carrying no ack (`docs/protocol/peer-carriage-spec.md` §3).
 - **`claim_retransmit`**, **`claim_same_nonce_different_bytes`** (items 15, 16) -- `{ name,
 first_claim_json, second_claim_json, first_ack, second_ack, second_ack_reason }`: §6.3's
   idempotent re-ack and its boundary. In `claim_retransmit`, `second_claim_json` is
@@ -393,7 +396,9 @@ first_claim_json, second_claim_json, first_ack, second_ack, second_ack_reason }`
 "nonce_not_advancing"`.
 - **`flush_requested`** (item 17) -- `{ name, channel_id, http_header_value, note }`. **HTTP
   only**: `note` records that BTP has no counterpart (§6.4) -- on BTP the payee can originate a
-  request of its own, so the hint has nothing to ride.
+  request of its own, so the hint has nothing to ride. Still pinned, and no longer emitted by either
+  peer carriage since ADR 0075 (issue #1380): it prompted a flush of a pending `toon-channel` claim,
+  and a voucher is never pending.
 - ~~**`minimum_delivery_absent`**, **`minimum_delivery_malformed`** (items 18, 19)~~ -- **deleted**
   in `schema_version` 3 (issue #1143). Minimum delivery is retired
   ([ADR 0057](../docs/adr/0057-minimum-delivery-is-retired-a-claim-bounds-erosion.md)): no packet

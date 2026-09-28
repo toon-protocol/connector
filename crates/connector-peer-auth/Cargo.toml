@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# The configured side of the decision: `[[peers]]` and `[[peer_channels]]`,
-# which is the whole of what `decide_role` may consult (ADR 0060 deleted
-# the shared secret that used to sit beside them). No transport, no
-# runtime, no clock -- see the guard in `lib.rs`.
-connector-config = { path = "../connector-config" }
+# None. The decision reads a verdict on the frame's voucher and the peering
+# its signer is bound to, both computed by the carriage (ADR 0075 decision
+# 5); the `[[peer_channels]]` table it used to read is the runtime's
+# voucher-signer binding now. No transport, no runtime, no clock -- see the
+# guard in `lib.rs`.

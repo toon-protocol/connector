@@ -19,10 +19,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{TimeZone, Utc};
 use connector_domain::{Prepare, Reject};
-use connector_runtime::{
-    ClaimStateDomain, ClaimStateSource, ClaimWatermark, Connector, EvmDomain, FakeAppClient,
-    InProcessPeerTransport, OutboundClientError, OutboundClientLedger, PeerRoute, TestClock,
-};
+use connector_runtime::{Connector, FakeAppClient, InProcessPeerTransport, PeerRoute, TestClock};
 use connector_signer::{LocalSigner, Signer};
 use tower::ServiceExt;
 
@@ -38,43 +35,12 @@ fn test_signer() -> Arc<dyn Signer> {
     Arc::new(LocalSigner::generate("cost-header-test-signer"))
 }
 
-/// A next hop reporting where this node's claims on a channel stand -- the
-/// authority a covering claim is priced off.
-struct ReportsAWatermark;
-
-#[async_trait::async_trait]
-impl ClaimStateSource for ReportsAWatermark {
-    async fn watermark(
-        &self,
-        _channel: &[u8; 32],
-        _domain: &ClaimStateDomain,
-    ) -> Result<ClaimWatermark, OutboundClientError> {
-        Ok(ClaimWatermark {
-            nonce: 0,
-            cumulative: 0,
-            available: Some(u128::MAX),
-        })
-    }
-}
-
 /// The `[[pay_channels]]` half of a peering. ADR 0042 has a connector cover
-/// every PREPARE it sends, and since issue #1145 a forward it cannot cover
-/// is refused rather than carried -- so a hop that forwards at all needs
-/// this, and a fixture without it is one no config could produce.
+/// every PREPARE it sends -- with a voucher on its own outbound x402 channel
+/// since ADR 0075 -- and since issue #1145 a forward it cannot cover is
+/// refused rather than carried, so a hop that forwards at all needs this.
 fn covering(connector: Connector, peer_id: &str) -> Connector {
-    connector
-        .with_signer(Arc::new(LocalSigner::generate("cost-header-settlement")))
-        .with_outbound_client_ledger(Arc::new(OutboundClientLedger::in_memory()))
-        .with_outbound_client_hop(
-            peer_id,
-            format!("0x{:064x}", 1),
-            EvmDomain {
-                chain_id: 84_532,
-                token_network: [0x1E; 20],
-            },
-            Arc::new(ReportsAWatermark),
-        )
-        .expect("a valid on-chain channel id")
+    connector_runtime::covering_fake::covering(connector, peer_id)
 }
 
 /// A PREPARE bound for `destination`, carrying nothing a termination could

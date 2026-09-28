@@ -214,7 +214,7 @@ impl std::str::FromStr for SettlementChain {
     }
 }
 
-/// A chain name [`SettlementChain::from_str`] does not recognize. Unlike
+/// A chain name `SettlementChain::from_str` does not recognize. Unlike
 /// the legacy flat table's [`ConfigError::SettlementUnknownChain`] (frozen
 /// at `"evm"` by design, issue #628), this names every chain the keyed
 /// config shape -- and therefore the rest of the fleet -- recognizes.
@@ -554,6 +554,11 @@ pub(crate) fn check_settlement_rpc_routes(
 pub(crate) struct SettlementTables<'a> {
     evm: bool,
     solana_program_id: Option<&'a str>,
+    /// Whether each chain's table carries its x402 `batch_settlement`
+    /// sub-table (ADR 0074): the receiving and paying halves every x402
+    /// channel row needs (ADR 0075, issue #1380).
+    evm_batch: bool,
+    solana_batch: bool,
 }
 
 impl<'a> SettlementTables<'a> {
@@ -569,6 +574,15 @@ impl<'a> SettlementTables<'a> {
                 SettlementConfig::Solana(solana) => Some(solana.program_id()),
                 SettlementConfig::Evm(_) => None,
             }),
+            evm_batch: settlements.iter().any(|settlement| {
+                matches!(settlement, SettlementConfig::Evm(evm) if evm.batch_settlement().is_some())
+            }),
+            solana_batch: settlements.iter().any(|settlement| {
+                matches!(
+                    settlement,
+                    SettlementConfig::Solana(solana) if solana.batch_settlement().is_some()
+                )
+            }),
         }
     }
 
@@ -580,6 +594,33 @@ impl<'a> SettlementTables<'a> {
         SettlementTables {
             evm,
             solana_program_id,
+            evm_batch: evm,
+            solana_batch: solana_program_id.is_some(),
+        }
+    }
+
+    /// Both settlement tables, with each chain's x402 sub-table stated
+    /// apart from the table it sits in -- for a row test about a chain
+    /// that declares no `batch_settlement`.
+    #[cfg(test)]
+    pub(crate) fn for_x402_tests(evm_batch: bool, solana_batch: bool) -> Self {
+        SettlementTables {
+            evm: true,
+            solana_program_id: Some("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+            evm_batch,
+            solana_batch,
+        }
+    }
+
+    /// Whether this node pays and is paid on x402 channels on `chain`: its
+    /// `[settlement.<chain>]` table carries a `batch_settlement` sub-table
+    /// (ADR 0074). An x402 channel row on a chain without one names a
+    /// channel this node can neither admit a voucher on nor sign one on
+    /// (ADR 0075, issue #1380).
+    pub(crate) fn x402(&self, chain: SettlementChain) -> bool {
+        match chain {
+            SettlementChain::Evm => self.evm_batch,
+            SettlementChain::Solana => self.solana_batch,
         }
     }
 

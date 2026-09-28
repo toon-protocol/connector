@@ -24,8 +24,8 @@ use crate::peering_asset::{resolve_peering_assets, PeeringAssets};
 use crate::route::{resolve_routes, PeerRouteConfig, RawChild, RawRoute, StaticRoute};
 use crate::secret::{RawSignerConfig, SecretLocation};
 use crate::settlement::{
-    check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettlementConfig,
-    SettlementTables,
+    check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettlementChain,
+    SettlementConfig, SettlementTables,
 };
 
 /// The config file's shape exactly as written -- convenience forms
@@ -128,21 +128,17 @@ struct RawConfig {
     /// 0027) -- or no endpoint at all, for a peering that dials in.
     #[serde(default)]
     peers: Vec<RawPeer>,
-    /// The payment channels each peering relation's claims are judged
-    /// against, and the EIP-712 domain they are signed under (issue #677,
-    /// ADR 0024). This is the table whose absence made ADR 0024's
-    /// peer-claim mechanism inert (#620 gap 3): a peering with no row here
-    /// can never take the peer role at all.
+    /// The inbound half of each config-declared peering: the voucher
+    /// signer whose vouchers, on the x402 channel the peer opens toward this
+    /// node, prove the peering (ADR 0075 decisions 4, 5 and 9, issue #1380).
+    /// A peering with no row here can never take the peer role at all.
     #[serde(default)]
     peer_channels: Vec<RawPeerChannel>,
-    /// The channels this node **pays** each next hop from, as an ordinary
-    /// client of that hop (ADR 0042 item 2, issue #881). Absent -- the
-    /// default, and every config that predates this table -- means this
-    /// node covers no forward proactively and every peering keeps riding
-    /// ADR 0004's postpay `pending_claim` exactly as before, which is why
-    /// the table is additive rather than a migration. See
-    /// [`crate::PayChannelConfig`] for where each part of the claim it
-    /// configures comes from.
+    /// The outbound half: this node's own x402 channel toward each next hop,
+    /// which every forward to that hop is covered by a voucher on (ADR 0042
+    /// item 2, as ADR 0075 decision 6 amends it). See
+    /// [`crate::PayChannelConfig`] for where each part of a voucher comes
+    /// from.
     #[serde(default)]
     pay_channels: Vec<RawPayChannel>,
     /// Removed with purchasable peering (ADR 0043): a peering cannot be
@@ -453,46 +449,10 @@ impl Config {
         let node = resolve_node(raw.node, peer_expose)?;
         let client_channels = resolve_client_channels(raw.client_channels, settlement_tables)?;
         let client_identities = resolve_client_identities(raw.client_identities)?;
-        // Namespace disjointness (`peer-carriage-spec.md` §1.8). Peer and
-        // client watermarks are separate records by design, which is only
-        // safe while no channel is in both: two namespaces over one
-        // channel would let the same claim be counted as credit twice.
-        // Compared within its own chain only -- an EVM `channel_id`
-        // against an EVM `channel_id` (both canonicalized lowercase `0x`
-        // hex), a Solana `channel_account` against a Solana
-        // `channel_account` (both base58) -- each side canonicalized by
-        // its own resolver, so this compares like with like.
-        for peer_channel in &peer_channels {
-            let (collides, value) = match peer_channel {
-                PeerChannelConfig::Evm(evm_peer) => (
-                    client_channels.iter().any(|client_channel| {
-                        matches!(
-                            client_channel,
-                            ClientChannelConfig::Evm(evm_client)
-                                if evm_client.channel_id() == evm_peer.channel_id()
-                        )
-                    }),
-                    evm_peer.channel_id().to_string(),
-                ),
-                PeerChannelConfig::Solana(solana_peer) => (
-                    client_channels.iter().any(|client_channel| {
-                        matches!(
-                            client_channel,
-                            ClientChannelConfig::Solana(solana_client)
-                                if solana_client.channel_account() == solana_peer.channel_account()
-                        )
-                    }),
-                    solana_peer.channel_account().to_string(),
-                ),
-            };
-            if collides {
-                return Err(ConfigError::ChannelInBothNamespaces { value });
-            }
-        }
-        // `[[pay_channels]]` (ADR 0042 item 2, issue #881): the channels
-        // this node PAYS a next hop from. Three cross-table rules, each
-        // refusing at load what would otherwise be a packet-time surprise
-        // on the money path (ADR 0009).
+        // `[[pay_channels]]` (ADR 0042 item 2, as ADR 0075 decision 6
+        // amends it): this node's own outbound x402 channel toward each next
+        // hop. Two cross-table rules, each refusing at load what would
+        // otherwise be a packet-time surprise on the money path (ADR 0009).
         let pay_channels = resolve_pay_channels(
             raw.pay_channels,
             peer_allow_plaintext_endpoints,
@@ -507,84 +467,51 @@ impl Config {
                     peer_id: pay_channel.peer_id().to_string(),
                 });
             }
-            // ADR 0030, said of `[announce] pay_channel` and just as true
-            // here: "that table is channels this node receives on, and this
-            // is one it pays from. One channel in two roles is the same
-            // collision `Config::load` already refuses between the peer and
-            // client books." Compared within its own chain only -- EVM hex
-            // against EVM hex, Solana base58 against Solana base58 -- each
-            // side canonicalized by its own resolver, exactly as the
-            // peer/client namespace check above does.
-            //
-            // Deliberately NOT compared against `[[peer_channels]]`: one
-            // channel carrying both roles with one hop is the deployed
-            // shape (the peer role for what arrives, the client role for
-            // what this node sends), and `forward_via_peer_route` is built
-            // for it -- a covered packet is not owed a second time on the
-            // peer ledger, so exactly one book ever signs per packet.
-            let collides_with_client = match pay_channel {
-                PayChannelConfig::Evm(evm_pay) => client_channels.iter().any(|client_channel| {
-                    matches!(
-                        client_channel,
-                        ClientChannelConfig::Evm(evm_client)
-                            if evm_client.channel_id() == evm_pay.channel_id()
-                    )
-                }),
-                PayChannelConfig::Solana(solana_pay) => {
-                    client_channels.iter().any(|client_channel| {
-                        matches!(
-                            client_channel,
-                            ClientChannelConfig::Solana(solana_client)
-                                if solana_client.channel_account()
-                                    == solana_pay.channel_account()
-                        )
-                    })
-                }
-            };
-            if collides_with_client {
-                // On Solana this is reached only if the rule immediately
-                // below is ever relaxed: a Solana pay row must name a
-                // channel the peering also binds as a `[[peer_channels]]`
-                // row, and the peer/client namespace check above -- which
-                // says the same thing about the same channel -- therefore
-                // gets there first. Kept per chain anyway, because the
-                // comparison has to be like-with-like either way and a
-                // half-written rule is worse than a redundant one.
-                return Err(ConfigError::PayChannelIsAlsoAClientChannel {
-                    value: pay_channel.channel().to_string(),
+            // An x402 channel moves value one way (ADR 0075): a channel this
+            // node pays on cannot also be one a peer pays it on. The two
+            // spellings are canonicalized by the same parser, so this
+            // compares like with like.
+            if peer_channels
+                .iter()
+                .any(|channel| channel.inbound_channel() == Some(pay_channel.outbound_channel()))
+            {
+                return Err(ConfigError::ChannelInBothDirections {
+                    value: pay_channel.outbound_channel().to_string(),
                 });
             }
-            // A Solana row's claims cannot be RENDERED without the peer
-            // channel row beside them (issue #1146). `programId` is a
-            // required field of the Solana claim wire, unlike an EVM
-            // claim's optional EIP-712 domain, and both peer carriages read
-            // it from that peering's Solana `[[peer_channels]]` row
-            // (`connector_peer_http::dial::PeerRelation::solana_program_ids`)
-            // -- a covering claim for a channel with no such row reaches
-            // `claim_json::encode` with nothing to write there, which that
-            // function calls a caller bug and panics on. Refused here, by
-            // name and naming the peer, rather than discovered on the
-            // packet path.
-            //
-            // It is not an extra burden in practice: paying a hop from a
-            // channel this node holds with that hop is the deployed shape,
-            // and the peer row is what binds the counterparty key the same
-            // channel's inbound claims are judged against.
-            if let PayChannelConfig::Solana(solana_pay) = pay_channel {
-                let bound_as_a_peer_channel = peer_channels.iter().any(|peer_channel| {
-                    matches!(
-                        peer_channel,
-                        PeerChannelConfig::Solana(solana_peer)
-                            if solana_peer.peer_id() == solana_pay.peer_id()
-                                && solana_peer.channel_account() == solana_pay.channel_account()
-                    )
-                });
-                if !bound_as_a_peer_channel {
-                    return Err(ConfigError::PayChannelSolanaWithoutPeerChannel {
-                        peer_id: solana_pay.peer_id().to_string(),
-                        value: solana_pay.channel_account().to_string(),
-                    });
+        }
+        // CF-22: no channel in two books. A client row names its channel in
+        // the same canonical spelling the peering rows do, so a pasted id is
+        // caught whichever way it was cased.
+        let peering_channels = peer_channels
+            .iter()
+            .filter_map(|row| {
+                row.inbound_channel()
+                    .map(|channel| (row.chain(), channel, "[[peer_channels]]", row.peer_id()))
+            })
+            .chain(pay_channels.iter().map(|row| {
+                (
+                    row.chain(),
+                    row.outbound_channel(),
+                    "[[pay_channels]]",
+                    row.peer_id(),
+                )
+            }));
+        for (chain, channel, table, peer_id) in peering_channels {
+            let named_by_a_client = client_channels.iter().any(|client| match client {
+                ClientChannelConfig::Evm(evm) => {
+                    chain == SettlementChain::Evm && evm.channel_id() == channel
                 }
+                ClientChannelConfig::Solana(solana) => {
+                    chain == SettlementChain::Solana && solana.channel_account() == channel
+                }
+            });
+            if named_by_a_client {
+                return Err(ConfigError::ChannelAlsoAClientChannel {
+                    value: channel.to_string(),
+                    table,
+                    peer_id: peer_id.to_string(),
+                });
             }
         }
         // ADR 0042, and the load-time half of issue #1145: **a connector
@@ -810,19 +737,18 @@ impl Config {
         } else if !client_channels.is_empty() {
             return Err(ConfigError::ClientChannelsWithoutStateDir);
         } else if !peer_channels.is_empty() {
-            // The peer half of the same rule: a peer claim's watermark is
-            // no less a replay defence than a client claim's, and ADR
-            // 0024's ledger is the record that has to outlive the process.
+            // The peer half of the same rule: a peer's voucher watermark
+            // is no less a replay defence than a client's, and it is the
+            // same journal (ADR 0075: one watermark per channel).
             return Err(ConfigError::PeerChannelsWithoutStateDir);
         } else if !pay_channels.is_empty() {
-            // The outbound half of the same rule (issue #881). Unreachable
-            // through a loadable file today -- a `[[pay_channels]]` row
-            // needs a peering, a peering needs a `[[peer_channels]]` row,
-            // and that already demands a `state_dir` two arms above -- and
-            // written out anyway, because what it protects is different in
-            // kind: the outbound client ledger's nonce floor is the one
-            // number that stops a RESTART reissuing a nonce this node has
-            // already signed against a different cumulative amount.
+            // The outbound half of the same rule. Unreachable through a
+            // loadable file today -- a `[[pay_channels]]` row needs a
+            // peering, a peering needs a `[[peer_channels]]` row, and that
+            // already demands a `state_dir` two arms above -- and written
+            // out anyway, because what it protects is different in kind:
+            // the outbound-channel journal is the only record of the
+            // channel the row names, and of every voucher signed on it.
             return Err(ConfigError::PayChannelsWithoutStateDir);
         } else if !settlements.is_empty() {
             // Last, deliberately. Every channel book already requires a
@@ -1054,11 +980,12 @@ impl Config {
         self.socks_proxy.as_ref()
     }
 
-    /// The payment channels this node judges peer claims against (ADR
-    /// 0024). Every row names a configured peer, no channel appears twice,
-    /// and none of them appears in [`Config::client_channels`] either --
-    /// the peer and client watermark namespaces are disjoint by
-    /// construction (`peer-carriage-spec.md` §1.8).
+    /// The voucher signers that prove a config-declared peering (ADR 0075
+    /// decisions 5 and 9, issue #1380), each optionally pinned to the x402
+    /// channel the peer pays this node on. Every row names a configured peer,
+    /// and no pinned channel is also a [`Config::pay_channels`] outbound
+    /// channel or a [`Config::client_channels`] row (configuration-spec.md
+    /// CF-22).
     pub fn peer_channels(&self) -> &[PeerChannelConfig] {
         &self.peer_channels
     }
@@ -1074,18 +1001,18 @@ impl Config {
             .filter(move |channel| channel.peer_id() == peer_id)
     }
 
-    /// The channels this node **pays** a next hop from, as an ordinary
-    /// client of that hop (ADR 0042 item 2, issue #881) -- what
-    /// `Connector::with_outbound_client_hop` is configured from. Every row
+    /// The x402 channels this node **pays** a next hop from (ADR 0042 item
+    /// 2, as ADR 0075 decisions 4, 6 and 9 amend it; issue #1380) -- what
+    /// `Connector::with_config_pay_channel` is configured from. Every row
     /// names a configured peer at most once, no channel appears twice, none
-    /// of them appears in [`Config::client_channels`] (that table is
-    /// channels this node *receives* on, ADR 0030), and this node has a
-    /// `[settlement.evm]` key to sign a claim with -- [`Config::load`]
-    /// refuses to return a value where any of those does not hold.
+    /// of them is also a `[[peer_channels]]` inbound channel (an x402
+    /// channel moves value one way), and every peering a `[[routes]]` entry
+    /// forwards to has one -- [`Config::load`] refuses to return a value
+    /// where any of those does not hold.
     ///
-    /// **Empty is the default and means default-off**: a peering with no
-    /// row here forwards exactly as it did before this table existed,
-    /// riding ADR 0004's postpay `pending_claim`.
+    /// **Empty is the default** only for a node that forwards to no peer:
+    /// the postpay `pending_claim` a routed peering once fell back to is
+    /// gone, so a routed peering with no row is `PayChannelUnbound` at load.
     pub fn pay_channels(&self) -> &[PayChannelConfig] {
         &self.pay_channels
     }
@@ -1113,7 +1040,8 @@ impl Config {
     /// one chain. Empty means no backend is constructed at startup and every
     /// channel operation answers `ChannelOperationError::NoSettlementBackend`
     /// -- the same "not started at all" degradation an absent `[operator]`
-    /// section already has. At most one entry per [`SettlementChain`].
+    /// section already has. At most one entry per
+    /// [`SettlementChain`](crate::SettlementChain).
     pub fn settlements(&self) -> &[SettlementConfig] {
         &self.settlements
     }
@@ -1206,7 +1134,6 @@ mod tests {
     use super::*;
     use crate::peer::{PeerCarriage, DEFAULT_MAX_PACKET_AMOUNT};
     use crate::route::TransportPolicy;
-    use crate::settlement::SettlementChain;
     use connector_domain::{AssetId, Price};
     use std::io::Write;
     use std::path::PathBuf;
@@ -1558,8 +1485,11 @@ handler_url = "http://localhost:5000"
     // -- The peer carriage config surface (issue #677,
     // `peer-carriage-spec.md` §11) --
 
+    /// The x402 channel the peer pays this node on, when a row pins it.
     const PEER_CHANNEL: &str = "0xaaaabbbbccccddddeeeeffff00001111aaaabbbbccccddddeeeeffff00001111";
+    /// The peer's EVM settlement address: its voucher signer (ADR 0075).
     const PEER_KEY: &str = "0x2222222222222222222222222222222222222222";
+    /// The `TokenNetwork` a `[[client_channels]]` row still names until #1384.
     const PEER_TOKEN_NETWORK: &str = "0x3333333333333333333333333333333333333333";
 
     /// An `[settlement.evm]` table and its key, in the shape a channel row
@@ -1579,6 +1509,10 @@ decimals = 6
 
 [settlement.evm.key]
 key_file = "{key_file}"
+
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 "#,
             key_file = key_path.display(),
         )
@@ -1589,18 +1523,15 @@ key_file = "{key_file}"
     /// spoils exactly one thing about it, so what each error is *about* is
     /// the diff between it and this.
     ///
-    /// It carries `[settlement.evm]` because since issue #1138 an EVM
-    /// channel row without one does not load: a peer claim is redeemed by
-    /// the channel's on-chain participant and that address is this table's
-    /// key, so a peering bound to an EVM channel on a node with no EVM
-    /// settlement is bound on paper only.
+    /// It carries `[settlement.evm]` with its `batch_settlement` sub-table
+    /// because an x402 channel row on a chain this node takes no voucher on
+    /// does not load (ADR 0075, issue #1380).
     ///
     /// And it carries `[[pay_channels]]` because since issue #1145 a
     /// peering a `[[routes]]` entry FORWARDS to does not load without one:
-    /// a connector covers every PREPARE it sends (ADR 0042), and there is
-    /// no postpay path left for an uncovered forward to fall back to. One
-    /// channel in both roles with one hop is the deployed shape, so it is
-    /// the peer row's own channel.
+    /// a connector covers every PREPARE it sends (ADR 0042). Under ADR 0075
+    /// a peering is two channels, so the pay row names this node's OWN
+    /// outbound channel, never the peer's.
     fn peering_config(key_path: &Path, state_dir: &Path, spoil: &str) -> String {
         let base = format!(
             r#"
@@ -1618,10 +1549,8 @@ fee = 3
 
 [[peer_channels]]
 peer_id = "store"
-channel_id = "{PEER_CHANNEL}"
-counterparty_key = "{PEER_KEY}"
-chain_id = 31337
-token_network = "{PEER_TOKEN_NETWORK}"
+voucher_signer = "{PEER_KEY}"
+inbound_channel = "{PEER_CHANNEL}"
 
 [[routes]]
 prefix = "g.example.store"
@@ -1630,9 +1559,7 @@ price = 1000
 
 [[pay_channels]]
 peer_id = "store"
-channel_id = "{PEER_CHANNEL}"
-chain_id = 31337
-token_network = "{PEER_TOKEN_NETWORK}"
+outbound_channel = "{PAY_CHANNEL}"
 client_edge_url = "https://store.example/ilp"
 "#,
             state_dir = state_dir.display(),
@@ -1691,13 +1618,9 @@ client_edge_url = "https://store.example/ilp"
         assert_eq!(config.peer_channels().len(), 1);
         let channel = &config.peer_channels()[0];
         assert_eq!(channel.peer_id(), "store");
-        let PeerChannelConfig::Evm(evm) = channel else {
-            panic!("expected an EVM peer channel");
-        };
-        assert_eq!(evm.channel_id(), PEER_CHANNEL);
-        assert_eq!(evm.counterparty_key(), [0x22u8; 20]);
-        assert_eq!(evm.chain_id(), 31_337);
-        assert_eq!(evm.token_network(), [0x33u8; 20]);
+        assert_eq!(channel.chain(), SettlementChain::Evm);
+        assert_eq!(channel.voucher_signer(), PEER_KEY);
+        assert_eq!(channel.inbound_channel(), Some(PEER_CHANNEL));
         assert_eq!(config.peer_channels_for("store").count(), 1);
         assert_eq!(config.peer_channels_for("nobody").count(), 0);
 
@@ -2252,7 +2175,7 @@ key_file = "{key}"
             |error| matches!(error, ConfigError::PeerChannelUnbound { id } if id == "store"),
         );
         assert!(
-            message.contains("a channel binding") && message.contains(BRINGUP_DOC),
+            message.contains("voucher_signer") && message.contains("ADR 0075"),
             "got: {message}"
         );
     }
@@ -2263,8 +2186,8 @@ key_file = "{key}"
     fn rejects_a_peer_channel_naming_an_unconfigured_peer() {
         let result = load_peering(|text| {
             text.replace(
-                "peer_id = \"store\"\nchannel_id",
-                "peer_id = \"ghost\"\nchannel_id",
+                "peer_id = \"store\"\nvoucher_signer",
+                "peer_id = \"ghost\"\nvoucher_signer",
             )
         });
 
@@ -2273,7 +2196,7 @@ key_file = "{key}"
             |error| matches!(error, ConfigError::PeerChannelOrphaned { peer_id } if peer_id == "ghost"),
         );
         assert!(
-            message.contains("no '[[peers]]' entry configures") && message.contains(BRINGUP_DOC),
+            message.contains("no '[[peers]]' entry configures"),
             "got: {message}"
         );
     }
@@ -2282,17 +2205,18 @@ key_file = "{key}"
     const SOLANA_COUNTERPARTY_KEY: &str = "8pM1DN3RiT8vbom5u1sNryaNT1nyL8CTTW3b5PwWXRBH";
     const SOLANA_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
-    /// A `[[peers]]`/Solana-shaped `[[peer_channels]]` pair, the Solana
-    /// counterpart of `peering_config` (issue #759).
+    /// A `[[peers]]`/Solana `[[peer_channels]]` pair, the Solana
+    /// counterpart of `peering_config`: the row names the peer's Solana
+    /// settlement key as its voucher signer (ADR 0075).
     ///
-    /// `program_id_line` is what a file that still writes the key removed by
-    /// issue #1128 looks like; `settlement_program_id` is the
-    /// `[settlement.solana]` table the row now takes its program from, and
-    /// `None` omits the table entirely.
+    /// `extra_line` is written into the row -- a removed `toon-channel`
+    /// field, when a test is about one; `settlement_program_id` is the
+    /// `[settlement.solana]` table, with its `batch_settlement` sub-table,
+    /// and `None` omits the table entirely.
     fn solana_peering_config(
         key_path: &Path,
         state_dir: &Path,
-        program_id_line: &str,
+        extra_line: &str,
         settlement_program_id: Option<&str>,
     ) -> String {
         let settlement = settlement_program_id.map_or_else(String::new, |program_id| {
@@ -2306,6 +2230,9 @@ decimals = 6
 
 [settlement.solana.key]
 key_file = "{key_file}"
+
+[settlement.solana.batch_settlement]
+min_sponsored_deposit = 1000000
 "#,
                 key_file = key_path.display(),
             )
@@ -2325,9 +2252,8 @@ endpoint = "wss://store.example:443/btp"
 
 [[peer_channels]]
 peer_id = "store"
-channel_account = "{SOLANA_CHANNEL_ACCOUNT}"
-counterparty_key = "{SOLANA_COUNTERPARTY_KEY}"
-{program_id_line}
+voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
+{extra_line}
 {settlement}
 "#,
             state_dir = state_dir.display(),
@@ -2335,14 +2261,14 @@ counterparty_key = "{SOLANA_COUNTERPARTY_KEY}"
         )
     }
 
-    /// The ordinary case: no per-row `program_id`, and a
+    /// The ordinary case: nothing extra on the row, and a
     /// `[settlement.solana]` naming [`SOLANA_PROGRAM_ID`].
-    fn load_solana_peering(program_id_line: &str) -> Result<Config, ConfigError> {
-        load_solana_peering_settling_under(program_id_line, Some(SOLANA_PROGRAM_ID))
+    fn load_solana_peering(extra_line: &str) -> Result<Config, ConfigError> {
+        load_solana_peering_settling_under(extra_line, Some(SOLANA_PROGRAM_ID))
     }
 
     fn load_solana_peering_settling_under(
-        program_id_line: &str,
+        extra_line: &str,
         settlement_program_id: Option<&str>,
     ) -> Result<Config, ConfigError> {
         let state_dir = tempfile::tempdir().expect("temp state dir");
@@ -2353,67 +2279,65 @@ counterparty_key = "{SOLANA_COUNTERPARTY_KEY}"
         let text = solana_peering_config(
             key_file.path(),
             state_dir.path(),
-            program_id_line,
+            extra_line,
             settlement_program_id,
         );
         Config::from_toml_str(&text, Path::new("test.toml"))
     }
 
-    /// Issue #759's AC as issue #1128 leaves it: a Solana
-    /// `[[peer_channels]]` row loads, is typed distinctly from an EVM one,
-    /// and carries the program id `[settlement.solana]` names -- at the
-    /// full `Config::load` level, which is where the two tables meet.
+    /// A Solana `[[peer_channels]]` row loads with its base58 voucher
+    /// signer, at the full `Config::load` level where the row and the
+    /// settlement table meet.
     #[test]
-    fn loads_a_solana_peer_channel_with_the_settlement_tables_program_id() {
+    fn loads_a_solana_peer_channel_naming_its_voucher_signer() {
         let config = load_solana_peering("").expect("load");
 
         assert_eq!(config.peer_channels().len(), 1);
-        let PeerChannelConfig::Solana(solana) = &config.peer_channels()[0] else {
-            panic!("expected a Solana peer channel");
-        };
-        assert_eq!(solana.peer_id(), "store");
-        assert_eq!(solana.channel_account(), SOLANA_CHANNEL_ACCOUNT);
-        assert_eq!(solana.counterparty_key(), SOLANA_COUNTERPARTY_KEY);
-        assert_eq!(solana.program_id(), SOLANA_PROGRAM_ID);
-        assert_eq!(config.peer_channels()[0].chain(), SettlementChain::Solana);
+        let row = &config.peer_channels()[0];
+        assert_eq!(row.peer_id(), "store");
+        assert_eq!(row.voucher_signer(), SOLANA_COUNTERPARTY_KEY);
+        assert_eq!(row.inbound_channel(), None);
+        assert_eq!(row.chain(), SettlementChain::Solana);
     }
 
-    /// Issue #1128, at the level an operator meets it: the config file that
-    /// used to produce a node verifying peer claims under one program while
-    /// settling under another does not load at all, and the message names
-    /// the key to delete.
+    /// Issue #1380: a Solana row written in its TOON shape -- a
+    /// `channel_account` of TOON's own program and the `counterparty_key`
+    /// its claims were verified against -- is refused naming the field, at
+    /// the level an operator meets it.
     #[test]
-    fn rejects_a_solana_peer_channel_that_still_declares_its_own_program_id() {
-        let result = load_solana_peering_settling_under(
-            r#"program_id = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM""#,
-            Some(SOLANA_PROGRAM_ID),
-        );
+    fn rejects_a_solana_peer_channel_still_written_in_its_toon_shape() {
+        let result = load_solana_peering(&format!(
+            "channel_account = \"{SOLANA_CHANNEL_ACCOUNT}\"\ncounterparty_key = \
+             \"{SOLANA_COUNTERPARTY_KEY}\""
+        ));
 
-        let message = expect_error(
-            result,
-            |error| matches!(error, ConfigError::PeerChannelProgramIdRemoved { peer_id } if peer_id == "store"),
-        );
+        let message = expect_error(result, |error| {
+            matches!(
+                error,
+                ConfigError::PeerChannelToonFieldRemoved { peer_id, field: "channel_account" }
+                    if peer_id == "store"
+            )
+        });
         assert!(
-            message.contains("program_id")
-                && message.contains("[settlement.solana] program_id")
-                && message.contains("never settle"),
+            message.contains("channel_account") && message.contains("voucher_signer"),
             "got: {message}"
         );
     }
 
-    /// The other half of #1128's refusal: no `[settlement.solana]` at all
-    /// means there is no program id anywhere, so the row cannot be bound --
-    /// and is refused rather than skipped, because `PeerChannelUnbound`
-    /// already guarantees every peering has a row and a skipped one would
-    /// leave the peering bound on paper only.
+    /// No `[settlement.solana]` at all means no x402 voucher can be
+    /// admitted on Solana, so the row is refused rather than left binding a
+    /// signer nothing could ever present.
     #[test]
     fn rejects_a_solana_peer_channel_on_a_node_that_does_not_settle_on_solana() {
         let result = load_solana_peering_settling_under("", None);
 
-        let message = expect_error(
-            result,
-            |error| matches!(error, ConfigError::PeerChannelWithoutSolanaSettlement { peer_id } if peer_id == "store"),
-        );
+        let message = expect_error(result, |error| {
+            matches!(
+                error,
+                ConfigError::PeerChannelWithoutX402 { peer_id, chain: "solana" }
+                    if peer_id == "store"
+            )
+        });
         assert!(message.contains("[settlement.solana]"), "got: {message}");
     }
 
@@ -2461,6 +2385,9 @@ decimals = 6
 
 [settlement.solana.key]
 key_file = "{key_file}"
+
+[settlement.solana.batch_settlement]
+min_sponsored_deposit = 1000000
 "#,
             evm = evm_settlement(key_path),
             key_file = key_path.display(),
@@ -2491,15 +2418,11 @@ endpoint = "wss://solana.example:443/btp"
 
 [[peer_channels]]
 peer_id = "from-evm"
-channel_id = "{PEER_CHANNEL}"
-counterparty_key = "{PEER_KEY}"
-chain_id = 31337
-token_network = "{PEER_TOKEN_NETWORK}"
+voucher_signer = "{PEER_KEY}"
 
 [[peer_channels]]
 peer_id = "to-solana"
-channel_account = "{SOLANA_CHANNEL_ACCOUNT}"
-counterparty_key = "{SOLANA_COUNTERPARTY_KEY}"
+voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
 {declaration}
 "#,
             state_dir = state_dir.display(),
@@ -2526,8 +2449,8 @@ counterparty_key = "{SOLANA_COUNTERPARTY_KEY}"
 
     /// The acceptance criterion itself: a config declaring tokens resolves
     /// every peering to exactly one of them, from loaded config alone --
-    /// the `TokenNetwork` its `[[peer_channels]]` row names is never read,
-    /// and no chain is asked.
+    /// the chain its rows' channels are on names the token, and no chain is
+    /// asked.
     #[test]
     fn a_peering_resolves_to_the_declared_token_its_channels_hold() {
         let config =
@@ -2855,12 +2778,14 @@ counterparty = "{SOLANA_COUNTERPARTY_KEY}"
             without
         });
 
-        let message = expect_error(
-            result,
-            |error| matches!(error, ConfigError::PeerChannelWithoutEvmSettlement { peer_id } if peer_id == "store"),
-        );
+        let message = expect_error(result, |error| {
+            matches!(
+                error,
+                ConfigError::PeerChannelWithoutX402 { peer_id, chain: "evm" } if peer_id == "store"
+            )
+        });
         assert!(
-            message.contains("[settlement.evm]") && message.contains("InvalidParticipant"),
+            message.contains("[settlement.evm]") && message.contains("batch_settlement"),
             "got: {message}"
         );
     }
@@ -2989,143 +2914,102 @@ counterparty = "{SOLANA_COUNTERPARTY_KEY}"
         );
     }
 
-    /// The Solana counterpart of `rejects_one_channel_configured_in_both_namespaces`:
-    /// the namespace-disjointness rule (§1.8) applies within the Solana
-    /// chain too, not just EVM.
+    /// An x402 channel moves value one way (ADR 0075), so a channel this
+    /// node names as the peer's channel toward it cannot also be the one it
+    /// pays on. Written in mixed case on one side to prove the comparison is
+    /// over the canonical form.
     #[test]
-    fn rejects_a_solana_channel_configured_in_both_namespaces() {
-        let state_dir = tempfile::tempdir().expect("temp state dir");
-        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
-        key_file
-            .write_all(b"not a real key")
-            .expect("write key file");
-        let text = format!(
-            "{}\n[[client_channels]]\nchannel_account = \"{SOLANA_CHANNEL_ACCOUNT}\"\ncounterparty = \"{SOLANA_COUNTERPARTY_KEY}\"\n",
-            solana_peering_config(
-                key_file.path(),
-                state_dir.path(),
-                "",
-                Some(SOLANA_PROGRAM_ID),
-            ),
-        );
-        let result = Config::from_toml_str(&text, Path::new("test.toml"));
-
-        let message = expect_error(
-            result,
-            |error| matches!(error, ConfigError::ChannelInBothNamespaces { value } if value == SOLANA_CHANNEL_ACCOUNT),
-        );
-        assert!(
-            message.contains("counted as credit twice"),
-            "got: {message}"
-        );
-    }
-
-    /// §11 `ChannelInBothNamespaces` (§1.8): the check that stops a peer
-    /// claim and a client claim describing the same money. Written in
-    /// mixed case on one side to prove the comparison is over the
-    /// canonical form, not the operator's spelling.
-    #[test]
-    fn rejects_one_channel_configured_in_both_namespaces() {
+    fn rejects_one_channel_named_in_both_directions() {
         let result = load_peering(|text| {
-            format!(
-                r#"{text}
-[[client_channels]]
-channel_id = "{}"
-counterparty = "{PEER_KEY}"
-chain_id = 31337
-token_network_address = "{PEER_TOKEN_NETWORK}"
-"#,
-                PEER_CHANNEL.to_uppercase().replace("0X", "0x"),
+            text.replace(
+                &format!("outbound_channel = \"{PAY_CHANNEL}\""),
+                &format!(
+                    "outbound_channel = \"{}\"",
+                    PEER_CHANNEL.to_uppercase().replace("0X", "0x")
+                ),
             )
         });
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::ChannelInBothNamespaces { value } if value == PEER_CHANNEL),
+            |error| matches!(error, ConfigError::ChannelInBothDirections { value } if value == PEER_CHANNEL),
         );
-        assert!(
-            message.contains("counted as credit twice") && message.contains(BRINGUP_DOC),
-            "got: {message}"
-        );
+        assert!(message.contains("one way"), "got: {message}");
     }
 
-    // -- `[[pay_channels]]` (ADR 0042 item 2, issue #881) ---------------
+    /// CF-22: a peering's channel pasted into `[[client_channels]]` as well
+    /// is refused, naming the table and peer it collides with -- for the
+    /// peer's pinned inbound channel and for this node's outbound one alike.
+    #[test]
+    fn rejects_a_peering_channel_a_client_row_also_names() {
+        for (channel, table) in [
+            (PEER_CHANNEL, "[[peer_channels]]"),
+            (PAY_CHANNEL, "[[pay_channels]]"),
+        ] {
+            let result = load_peering(|text| {
+                format!(
+                    "{text}\n[[client_channels]]\nchannel_id = \"{}\"\n\
+                     counterparty = \"0x00000000000000000000000000000000000000aa\"\n\
+                     chain_id = 31337\n\
+                     token_network_address = \"0x00000000000000000000000000000000000000bb\"\n",
+                    channel.to_uppercase().replace("0X", "0x")
+                )
+            });
+
+            let message = expect_error(result, |error| {
+                matches!(
+                    error,
+                    ConfigError::ChannelAlsoAClientChannel { value, table: named, peer_id }
+                        if value == channel && *named == table && peer_id == "store"
+                )
+            });
+            assert!(message.contains("CF-22"), "got: {message}");
+        }
+    }
+
+    // -- `[[pay_channels]]` (ADR 0042 item 2, as ADR 0075 decision 6 amends
+    // it) --------------------------------------------------------------
     //
     // The cross-table rules. The single-row shape is `pay_channel`'s own
-    // unit tests; these are the three things only `Config::load` can see.
+    // unit tests; these are the things only `Config::load` can see.
 
-    /// The peering of [`peering_config`], plus the `[settlement.evm]` key a
-    /// covering claim is signed with and the `[[pay_channels]]` row that
-    /// says which channel to sign on -- with `edit` applied to the whole
-    /// text, the same spoil-one-thing shape [`load_peering`] uses.
-    ///
-    /// No `[[client_channels]]` row: that is the collision one test below
-    /// adds on purpose.
-    fn load_pay_channel_config(edit: impl Fn(String) -> String) -> Result<Config, ConfigError> {
-        let state_dir = tempfile::tempdir().expect("temp state dir");
-        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
-        key_file
-            .write_all(b"not a real key")
-            .expect("write key file");
-        // `peering_config` already carries `[settlement.evm]` -- the table
-        // an EVM `[[peer_channels]]` row needs since issue #1138, and the
-        // same one a covering claim is signed with.
-        // The fixture's own row is removed and this one written in its
-        // place: `peering_config` has carried a `[[pay_channels]]` row
-        // since issue #1145 made it required of a routed peering, and two
-        // rows for one peering is `PayChannelDuplicatePeer` -- a different
-        // error from any of the ones below.
-        let base = without_pay_channel(peering_config(key_file.path(), state_dir.path(), ""));
-        let text = format!(
-            r#"{base}
-[[pay_channels]]
-peer_id = "store"
-channel_id = "{PAY_CHANNEL}"
-chain_id = 31337
-token_network = "{PEER_TOKEN_NETWORK}"
-client_edge_url = "https://store.example/ilp"
-"#
-        );
-        Config::from_toml_str(&edit(text), Path::new("test.toml"))
-    }
-
-    /// A channel that is NOT [`PEER_CHANNEL`]: the pay-from channel and the
-    /// peer-role channel may be the same one (that is the deployed shape),
-    /// but a test that used one string could not tell the two roles apart.
+    /// This node's own outbound x402 channel toward the hop -- deliberately
+    /// NOT [`PEER_CHANNEL`], the peer's channel toward this node: a peering
+    /// is two channels (ADR 0075 decision 4).
     const PAY_CHANNEL: &str = "0xccccddddeeeeffff00001111222233334444555566667777888899990000aaaa";
 
     /// The round trip, from a real TOML file: a `[[pay_channels]]` row
-    /// reaches [`Config::pay_channels`] with its channel id canonicalized
-    /// and its domain and client edge intact.
+    /// reaches [`Config::pay_channels`] with its channel canonicalized and
+    /// its client edge intact.
     #[test]
     fn loads_the_full_pay_channels_shape() {
-        let config = load_pay_channel_config(|text| text).expect("load");
+        let config = load_peering(|text| {
+            text.replace(
+                &format!("outbound_channel = \"{PAY_CHANNEL}\""),
+                &format!(
+                    "outbound_channel = \"{}\"",
+                    PAY_CHANNEL.to_uppercase().replace("0X", "0x")
+                ),
+            )
+        })
+        .expect("load");
 
         assert_eq!(config.pay_channels().len(), 1);
-        let PayChannelConfig::Evm(pay) = &config.pay_channels()[0] else {
-            panic!("an EVM-shaped row resolves to the EVM variant");
-        };
+        let pay = &config.pay_channels()[0];
         assert_eq!(pay.peer_id(), "store");
-        assert_eq!(pay.channel_id(), PAY_CHANNEL);
-        assert_eq!(pay.chain_id(), 31_337);
-        assert_eq!(pay.token_network(), [0x33u8; 20]);
+        assert_eq!(pay.chain(), SettlementChain::Evm);
+        assert_eq!(pay.outbound_channel(), PAY_CHANNEL);
         assert_eq!(pay.client_edge_url().as_str(), "https://store.example/ilp");
     }
 
-    /// **The row became required, and this is where that is decided**
-    /// (issue #1145). ADR 0042 item 2 shipped `[[pay_channels]]` as
-    /// additive -- "a peering with nothing configured behaves exactly as it
-    /// does now" -- which meant ADR 0004's postpay convention. That
-    /// convention is deleted, so the same peering with the table removed no
-    /// longer loads: without a channel to pay the hop from,
-    /// `forward_via_peer_route` would refuse every packet on that route at
-    /// packet time, and turning a runtime surprise into a startup refusal
-    /// is what ADR 0009 exists for.
+    /// **The row is required of a routed peering** (issue #1145): without a
+    /// channel to pay the hop on, `forward_via_peer_route` would refuse
+    /// every packet on that route at packet time, and turning a runtime
+    /// surprise into a startup refusal is what ADR 0009 exists for.
     ///
     /// Keyed on the ROUTE, so the message names both. A peering with no
     /// route to it -- every accept-only peering is one -- owes nothing and
-    /// is untouched; `an_accept_only_peering_loads_with_no_ceiling` is that
-    /// case and carries no row.
+    /// is untouched.
     #[test]
     fn a_peering_this_node_forwards_to_with_no_pay_channels_row_is_refused() {
         let error = load_peering(without_pay_channel)
@@ -3141,63 +3025,21 @@ client_edge_url = "https://store.example/ilp"
         );
         let message = error.to_string();
         assert!(
-            message.contains("[[pay_channels]]") && message.contains("breaking deploy"),
+            message.contains("[[pay_channels]]")
+                && message.contains("outbound_channel")
+                && message.contains("breaking deploy"),
             "the refusal must say what to add and that adding it is a breaking deploy: {message}"
         );
-    }
-
-    /// **The collision, by name** (ADR 0030): `[[client_channels]]` is
-    /// channels this node RECEIVES on and `[[pay_channels]]` is one it PAYS
-    /// from, so one channel in both is the same double-count
-    /// `ChannelInBothNamespaces` refuses between the peer and client books.
-    /// Written in mixed case on one side to prove the comparison is over
-    /// the canonical form rather than the operator's spelling.
-    #[test]
-    fn rejects_a_pay_channel_that_is_also_a_client_channel() {
-        let result = load_pay_channel_config(|text| {
-            format!(
-                r#"{text}
-[[client_channels]]
-channel_id = "{}"
-counterparty = "{PEER_KEY}"
-chain_id = 31337
-token_network_address = "{PEER_TOKEN_NETWORK}"
-"#,
-                PAY_CHANNEL.to_uppercase().replace("0X", "0x"),
-            )
-        });
-
-        let message = expect_error(
-            result,
-            |error| matches!(error, ConfigError::PayChannelIsAlsoAClientChannel { value } if value == PAY_CHANNEL),
-        );
-        assert!(
-            message.contains("RECEIVES") && message.contains("PAYS"),
-            "got: {message}"
-        );
-    }
-
-    /// The pay-from channel and the peer-role channel with the SAME hop may
-    /// be one channel, and this is the test that says so on purpose: the
-    /// peer role judges what arrives, the client role covers what this node
-    /// sends, and `forward_via_peer_route` never lets both books sign for
-    /// one packet.
-    #[test]
-    fn a_pay_channel_may_be_the_same_channel_as_that_peering_s_peer_channel() {
-        let config =
-            load_pay_channel_config(|text| text.replace(PAY_CHANNEL, PEER_CHANNEL)).expect("load");
-
-        assert_eq!(config.pay_channels()[0].channel(), PEER_CHANNEL);
     }
 
     /// A row for a peering that does not exist pays nobody -- the same
     /// typo `PeerChannelOrphaned` catches, on the other table.
     #[test]
     fn rejects_a_pay_channel_naming_an_unconfigured_peer() {
-        let result = load_pay_channel_config(|text| {
+        let result = load_peering(|text| {
             text.replace(
-                "peer_id = \"store\"\nchannel_id = \"0xcccc",
-                "peer_id = \"stroe\"\nchannel_id = \"0xcccc",
+                "peer_id = \"store\"\noutbound_channel",
+                "peer_id = \"stroe\"\noutbound_channel",
             )
         });
 
@@ -3207,26 +3049,67 @@ token_network_address = "{PEER_TOKEN_NETWORK}"
         );
     }
 
-    /// The signing key is `[settlement.evm]`'s and there is no second one
-    /// (ADR 0030's table), so a row with no table to sign under is refused
-    /// at load rather than failing every forward it was configured for.
-    ///
-    /// Built on the **Solana** peering rather than the EVM one, and that is
-    /// the shape of the rule rather than a convenience: since issue #1138
-    /// an EVM `[[peer_channels]]` row also needs `[settlement.evm]`, and
-    /// `PeerChannelUnbound` requires every peering to carry a channel row
-    /// -- so the only file that reaches this refusal is one peering over a
-    /// chain it does settle on while paying over one it does not.
+    /// Issue #1380's acceptance criterion at the `Config::load` level: the
+    /// EVM `toon-channel` `[[pay_channels]]` shape, exactly as a file
+    /// written before ADR 0075 holds it, is refused by name.
     #[test]
-    fn rejects_a_pay_channel_with_no_evm_settlement_table() {
+    fn rejects_the_toon_channel_evm_pay_channel_shape_by_name() {
+        let result = load_peering(|text| {
+            format!(
+                "{}\n[[pay_channels]]\npeer_id = \"store\"\nchannel_id = \"{PAY_CHANNEL}\"\n\
+                 chain_id = 31337\ntoken_network = \"{PEER_TOKEN_NETWORK}\"\n\
+                 client_edge_url = \"https://store.example/ilp\"\n",
+                without_pay_channel(text)
+            )
+        });
+
+        let message = expect_error(result, |error| {
+            matches!(
+                error,
+                ConfigError::PayChannelToonFieldRemoved { peer_id, field: "channel_id" }
+                    if peer_id == "store"
+            )
+        });
+        assert!(
+            message.contains("outbound_channel") && message.contains("ADR 0075"),
+            "got: {message}"
+        );
+    }
+
+    /// And the EVM `toon-channel` `[[peer_channels]]` shape, as the fleet
+    /// and `local/` wrote it before ADR 0075.
+    #[test]
+    fn rejects_the_toon_channel_evm_peer_channel_shape_by_name() {
+        let result = load_peering(|text| {
+            text.replace(
+                &format!("voucher_signer = \"{PEER_KEY}\"\ninbound_channel = \"{PEER_CHANNEL}\""),
+                &format!(
+                    "channel_id = \"{PEER_CHANNEL}\"\ncounterparty_key = \"{PEER_KEY}\"\n\
+                     chain_id = 31337\ntoken_network = \"{PEER_TOKEN_NETWORK}\""
+                ),
+            )
+        });
+
+        expect_error(result, |error| {
+            matches!(
+                error,
+                ConfigError::PeerChannelToonFieldRemoved { peer_id, field: "channel_id" }
+                    if peer_id == "store"
+            )
+        });
+    }
+
+    /// An EVM pay row on a node whose EVM table takes no x402 channel has
+    /// no paying half to sign a voucher with.
+    #[test]
+    fn rejects_a_pay_channel_on_a_chain_this_node_pays_no_x402_on() {
         let state_dir = tempfile::tempdir().expect("temp state dir");
         let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
         key_file
             .write_all(b"not a real key")
             .expect("write key file");
         let text = format!(
-            "{}\n[[pay_channels]]\npeer_id = \"store\"\nchannel_id = \"{PAY_CHANNEL}\"\n\
-             chain_id = 31337\ntoken_network = \"{PEER_TOKEN_NETWORK}\"\n\
+            "{}\n[[pay_channels]]\npeer_id = \"store\"\noutbound_channel = \"{PAY_CHANNEL}\"\n\
              client_edge_url = \"https://store.example/ilp\"\n",
             solana_peering_config(
                 key_file.path(),
@@ -3237,31 +3120,20 @@ token_network_address = "{PEER_TOKEN_NETWORK}"
         );
         let result = Config::from_toml_str(&text, Path::new("test.toml"));
 
-        let message = expect_error(
-            result,
-            |error| matches!(error, ConfigError::PayChannelWithoutEvmSettlement { peer_id } if peer_id == "store"),
-        );
-        assert!(message.contains("no second key"), "got: {message}");
+        let message = expect_error(result, |error| {
+            matches!(
+                error,
+                ConfigError::PayChannelWithoutX402 { peer_id, chain: "evm" } if peer_id == "store"
+            )
+        });
+        assert!(message.contains("batch_settlement"), "got: {message}");
     }
 
-    // -- `[[pay_channels]]`, Solana (issue #1146) -----------------------
-    //
-    // The table's second chain shape, and the cross-table rules only
-    // `Config::load` can see. Until this landed, a Solana peering could not
-    // be covered at all and was therefore payable only postpay -- the model
-    // ADR 0042 exists to retire.
-
-    /// A Solana peering plus the `[[pay_channels]]` row that pays it, with
-    /// `edit` applied to the whole text -- the Solana counterpart of
-    /// [`load_pay_channel_config`].
-    ///
-    /// The pay row names the SAME `channel_account` as the peering's
-    /// `[[peer_channels]]` row, which is both the deployed shape and, on
-    /// Solana, a load-time requirement: `programId` is a required field of
-    /// the claim wire and the peer carriage renders it from that row.
-    fn load_solana_pay_channel_config(
-        edit: impl Fn(String) -> String,
-    ) -> Result<Config, ConfigError> {
+    /// The Solana shapes: a Solana pay row names a channel account, and the
+    /// TOON Solana row -- a `channel_account` of TOON's own program -- is
+    /// refused by name.
+    #[test]
+    fn a_solana_pay_channel_names_an_account_and_its_toon_shape_is_refused() {
         let state_dir = tempfile::tempdir().expect("temp state dir");
         let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
         key_file
@@ -3273,135 +3145,28 @@ token_network_address = "{PEER_TOKEN_NETWORK}"
             "",
             Some(SOLANA_PROGRAM_ID),
         );
-        let text = format!(
-            r#"{base}
-[[pay_channels]]
-peer_id = "store"
-channel_account = "{SOLANA_CHANNEL_ACCOUNT}"
-client_edge_url = "https://store.example/ilp"
-"#
+        let x402 = format!(
+            "{base}\n[[pay_channels]]\npeer_id = \"store\"\noutbound_channel = \
+             \"{SOLANA_CHANNEL_ACCOUNT}\"\nclient_edge_url = \"https://store.example/ilp\"\n"
         );
-        Config::from_toml_str(&edit(text), Path::new("test.toml"))
-    }
-
-    /// The round trip, from a real TOML file: a Solana `[[pay_channels]]`
-    /// row reaches [`Config::pay_channels`] typed as such, carrying the
-    /// program id `[settlement.solana]` names rather than one it declared.
-    #[test]
-    fn loads_the_full_solana_pay_channels_shape() {
-        let config = load_solana_pay_channel_config(|text| text).expect("load");
-
-        assert_eq!(config.pay_channels().len(), 1);
-        let PayChannelConfig::Solana(pay) = &config.pay_channels()[0] else {
-            panic!("a Solana-shaped row resolves to the Solana variant");
-        };
-        assert_eq!(pay.peer_id(), "store");
-        assert_eq!(pay.channel_account(), SOLANA_CHANNEL_ACCOUNT);
-        assert_eq!(
-            pay.program_id(),
-            SOLANA_PROGRAM_ID,
-            "the program a covering claim is signed under is the one this node settles through \
-             (ADR 0053, issue #1128) -- never a second declaration that could drift"
-        );
-        assert_eq!(pay.client_edge_url().as_str(), "https://store.example/ilp");
+        let config = Config::from_toml_str(&x402, Path::new("test.toml")).expect("load");
         assert_eq!(config.pay_channels()[0].chain(), SettlementChain::Solana);
-    }
+        assert_eq!(
+            config.pay_channels()[0].outbound_channel(),
+            SOLANA_CHANNEL_ACCOUNT
+        );
 
-    /// A Solana pay row whose channel is not also bound as a
-    /// `[[peer_channels]]` row is refused **at load**, naming the peer.
-    ///
-    /// Not a preference: `programId` is a required field of the Solana
-    /// claim wire (unlike an EVM claim's optional EIP-712 domain, which
-    /// simply rides absent), and both peer carriages render it from that
-    /// peering's Solana peer-channel row. Without one, every covering claim
-    /// this row minted would reach `claim_json::encode` with nothing to
-    /// write there -- a caller bug it panics on, on the packet path, with
-    /// the money already committed.
-    #[test]
-    fn rejects_a_solana_pay_channel_that_is_not_also_a_peer_channel() {
-        let result = load_solana_pay_channel_config(|text| {
-            text.replace(
-                &format!("channel_account = \"{SOLANA_CHANNEL_ACCOUNT}\"\ncounterparty_key"),
-                &format!("channel_account = \"{SOLANA_COUNTERPARTY_KEY}\"\ncounterparty_key"),
-            )
-        });
-
-        let message = expect_error(result, |error| {
+        let toon = x402.replace("outbound_channel =", "channel_account =");
+        let result = Config::from_toml_str(&toon, Path::new("test.toml"));
+        expect_error(result, |error| {
             matches!(
                 error,
-                ConfigError::PayChannelSolanaWithoutPeerChannel { peer_id, value }
-                    if peer_id == "store" && value == SOLANA_CHANNEL_ACCOUNT
+                ConfigError::PayChannelToonFieldRemoved {
+                    field: "channel_account",
+                    ..
+                }
             )
         });
-        assert!(
-            message.contains("programId") && message.contains("[[peer_channels]]"),
-            "got: {message}"
-        );
-    }
-
-    /// The Solana half of `rejects_a_pay_channel_with_no_evm_settlement_table`:
-    /// no `[settlement.solana]` is both no ed25519 key to sign a covering
-    /// claim with and no program id to sign it under.
-    #[test]
-    fn rejects_a_solana_pay_channel_with_no_solana_settlement_table() {
-        let state_dir = tempfile::tempdir().expect("temp state dir");
-        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
-        key_file
-            .write_all(b"not a real key")
-            .expect("write key file");
-        let text = format!(
-            "{}\n[[pay_channels]]\npeer_id = \"store\"\n\
-             channel_account = \"{SOLANA_CHANNEL_ACCOUNT}\"\n\
-             client_edge_url = \"https://store.example/ilp\"\n",
-            peering_config(key_file.path(), state_dir.path(), ""),
-        );
-        let result = Config::from_toml_str(&text, Path::new("test.toml"));
-
-        let message = expect_error(result, |error| {
-            matches!(
-                error,
-                ConfigError::PayChannelWithoutSolanaSettlement { peer_id } if peer_id == "store"
-            )
-        });
-        assert!(message.contains("ADR 0030"), "got: {message}");
-    }
-
-    /// The namespace rule, on the other chain: `[[client_channels]]` is
-    /// channels this node RECEIVES on and `[[pay_channels]]` is one it PAYS
-    /// from, so one channel account in both is refused -- and on Solana it
-    /// is `ChannelInBothNamespaces` rather than
-    /// `PayChannelIsAlsoAClientChannel` that says so.
-    ///
-    /// That is a consequence of the rule above, not a gap. A Solana pay row
-    /// must name a channel the peering also binds as a `[[peer_channels]]`
-    /// row, so the peer/client namespace check -- which runs first, and
-    /// says the same thing about the same channel -- always gets there
-    /// first. Asserted rather than left to be discovered, because "which
-    /// error does an operator actually see" is the whole value of refusing
-    /// by name.
-    #[test]
-    fn a_solana_pay_channel_that_is_also_a_client_channel_is_refused_by_the_namespace_rule() {
-        let result = load_solana_pay_channel_config(|text| {
-            format!(
-                r#"{text}
-[[client_channels]]
-channel_account = "{SOLANA_CHANNEL_ACCOUNT}"
-counterparty = "{SOLANA_COUNTERPARTY_KEY}"
-"#
-            )
-        });
-
-        let message = expect_error(result, |error| {
-            matches!(
-                error,
-                ConfigError::ChannelInBothNamespaces { value }
-                    if value == SOLANA_CHANNEL_ACCOUNT
-            )
-        });
-        assert!(
-            message.contains("counted as credit twice"),
-            "got: {message}"
-        );
     }
 
     /// ADR 0031/ADR 0033, issue #882: an accept-only peering used to be
@@ -4427,10 +4192,8 @@ fee = 3
 
 [[peer_channels]]
 peer_id = "store"
-channel_id = "{PEER_CHANNEL}"
-counterparty_key = "{PEER_KEY}"
-chain_id = 31337
-token_network = "{PEER_TOKEN_NETWORK}"
+voucher_signer = "{PEER_KEY}"
+inbound_channel = "{PEER_CHANNEL}"
 
 [[routes]]
 prefix = "g.example.app"
@@ -4443,12 +4206,11 @@ peer_id = "store"
 price = 1000
 
 # Required of a peering this node forwards to since issue #1145: a
-# connector covers every PREPARE it sends (ADR 0042).
+# connector covers every PREPARE it sends (ADR 0042), with a voucher on this
+# node's own outbound x402 channel (ADR 0075).
 [[pay_channels]]
 peer_id = "store"
-channel_id = "{PEER_CHANNEL}"
-chain_id = 31337
-token_network = "{PEER_TOKEN_NETWORK}"
+outbound_channel = "{PAY_CHANNEL}"
 client_edge_url = "https://store.example/ilp"
 
 [[children]]

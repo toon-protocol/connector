@@ -57,10 +57,10 @@ const ANYONE: &str = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.a
 /// Both spellings, for the cases whose whole subject is the suffix.
 const HIDDEN_SERVICE_HOSTS: [&str; 2] = [ONION, ANYONE];
 
-const CHANNEL: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
-const OTHER_CHANNEL: &str = "0x2222222222222222222222222222222222222222222222222222222222222222";
+/// Each onion peer's voucher signer (ADR 0075): one signer proves one
+/// peering, so the two peers sign with two keys.
 const KEY: &str = "0x2222222222222222222222222222222222222222";
-const TOKEN_NETWORK: &str = "0x3333333333333333333333333333333333333333";
+const OTHER_KEY: &str = "0x3333333333333333333333333333333333333333";
 
 /// One node peering with two onion counterparties, one per carriage, on a
 /// config that **does not** set `peer_allow_plaintext_endpoints` -- which is
@@ -92,17 +92,11 @@ endpoint = "http://{host}/ilp"
 
 [[peer_channels]]
 peer_id = "onion-btp"
-channel_id = "{CHANNEL}"
-counterparty_key = "{KEY}"
-chain_id = 31337
-token_network = "{TOKEN_NETWORK}"
+voucher_signer = "{KEY}"
 
 [[peer_channels]]
 peer_id = "onion-http"
-channel_id = "{OTHER_CHANNEL}"
-counterparty_key = "{KEY}"
-chain_id = 31337
-token_network = "{TOKEN_NETWORK}"
+voucher_signer = "{OTHER_KEY}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
@@ -112,6 +106,10 @@ decimals = 6
 
 [settlement.evm.key]
 key_file = "{key_file}"
+
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 "#,
         state_dir = state_dir.display(),
         key_file = key_path.display(),

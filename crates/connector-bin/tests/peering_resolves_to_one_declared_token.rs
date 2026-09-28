@@ -6,9 +6,9 @@
 //! A packet's amount has no unit of its own -- it is denominated by the
 //! channel it rides -- so "is this forward a conversion" is really "do
 //! these two peerings hold different tokens". Nothing in this connector
-//! could answer that before: an EVM `[[peer_channels]]` row names a
-//! per-token `TokenNetwork` whose token only a chain read would give up,
-//! and a Solana row names no token at all. The answer comes instead from
+//! could answer that before, and a `[[peer_channels]]` row names no token
+//! either: it names a voucher signer, whose spelling says only which chain
+//! the peering settles on (ADR 0075). The answer comes instead from
 //! the `[settlement.<chain>]` table those channels settle through, which
 //! already states it -- so resolution is a pure function of loaded config,
 //! with no chain read and no I/O, which is what lets the forwarding path
@@ -50,11 +50,10 @@ const OTHER_TOKEN: &str = "evm:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 /// other side of a two-chain node's boundary.
 const SOLANA_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-const PEER_CHANNEL: &str = "0xaaaabbbbccccddddeeeeffff00001111aaaabbbbccccddddeeeeffff00001111";
-const PEER_KEY: &str = "0x2222222222222222222222222222222222222222";
-const PEER_TOKEN_NETWORK: &str = "0x3333333333333333333333333333333333333333";
-const SOLANA_CHANNEL_ACCOUNT: &str = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
-const SOLANA_COUNTERPARTY_KEY: &str = "8pM1DN3RiT8vbom5u1sNryaNT1nyL8CTTW3b5PwWXRBH";
+/// The EVM peer's voucher signer: its settlement address (ADR 0075).
+const PEER_VOUCHER_SIGNER: &str = "0x2222222222222222222222222222222222222222";
+/// The Solana peer's voucher signer: its settlement public key.
+const SOLANA_VOUCHER_SIGNER: &str = "8pM1DN3RiT8vbom5u1sNryaNT1nyL8CTTW3b5PwWXRBH";
 const SOLANA_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 fn run(config_path: &Path) -> std::process::Output {
@@ -93,10 +92,11 @@ fn declaring(assets: &[&str]) -> String {
 /// the smallest file in which a peering has a token at all. `declaration`
 /// is appended.
 ///
-/// The `[settlement.evm]` table is not decoration: since issue #1138 an EVM
-/// channel row does not load without one, because that table is where this
-/// node's on-chain identity comes from. It is also, since ADR 0071, where
-/// the peering's token comes from.
+/// The `[settlement.evm]` table is not decoration: an EVM `[[peer_channels]]`
+/// row does not load without it and its `batch_settlement` sub-table (issues
+/// #1138 and #1380), because that is what makes this node accept x402
+/// channels on the chain at all. It is also, since ADR 0071, where the
+/// peering's token comes from.
 fn one_evm_peering(key_file: &Path, state_dir: &Path, declaration: &str) -> String {
     format!(
         r#"
@@ -113,6 +113,10 @@ contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USD Coin"
+asset_eip712_version = "2"
+
 [settlement.evm.key]
 key_file = "{key_file}"
 
@@ -122,10 +126,7 @@ endpoint = "wss://store.example:443/btp"
 
 [[peer_channels]]
 peer_id = "store"
-channel_id = "{PEER_CHANNEL}"
-counterparty_key = "{PEER_KEY}"
-chain_id = 31337
-token_network = "{PEER_TOKEN_NETWORK}"
+voucher_signer = "{PEER_VOUCHER_SIGNER}"
 {declaration}
 "#,
         state_dir = state_dir.display(),
@@ -168,6 +169,10 @@ contract_address = "0x1234567890123456789012345678901234567890"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USD Coin"
+asset_eip712_version = "2"
+
 [settlement.evm.key]
 key_file = "{key_file}"
 
@@ -176,6 +181,9 @@ rpc_url = "https://api.devnet.solana.com"
 program_id = "{SOLANA_PROGRAM_ID}"
 token_address = "{SOLANA_MINT}"
 decimals = 6
+
+[settlement.solana.batch_settlement]
+min_sponsored_deposit = 1000000
 
 [settlement.solana.key]
 key_file = "{key_file}"
@@ -186,15 +194,11 @@ endpoint = "wss://evm.example:443/btp"
 {second_peering}
 [[peer_channels]]
 peer_id = "from-evm"
-channel_id = "{PEER_CHANNEL}"
-counterparty_key = "{PEER_KEY}"
-chain_id = 31337
-token_network = "{PEER_TOKEN_NETWORK}"
+voucher_signer = "{PEER_VOUCHER_SIGNER}"
 
 [[peer_channels]]
 peer_id = "{solana_peer}"
-channel_account = "{SOLANA_CHANNEL_ACCOUNT}"
-counterparty_key = "{SOLANA_COUNTERPARTY_KEY}"
+voucher_signer = "{SOLANA_VOUCHER_SIGNER}"
 {declaration}
 "#,
         state_dir = state_dir.display(),
@@ -203,10 +207,9 @@ counterparty_key = "{SOLANA_COUNTERPARTY_KEY}"
 }
 
 /// The acceptance criterion: a config declaring tokens resolves its peering
-/// to exactly one of them, out of loaded config alone. The
-/// `token_network` the channel row names is never consulted and no chain is
-/// asked -- the token is the one `[settlement.evm]` already says every
-/// channel it opens settles in.
+/// to exactly one of them, out of loaded config alone. No chain is asked --
+/// the token is the one `[settlement.evm]` already says every channel on it
+/// settles in, read off the chain the row's voucher signer is spelled for.
 #[test]
 fn a_declaring_node_resolves_its_peering_to_one_declared_token() {
     let key_file = write_raw_key_file();

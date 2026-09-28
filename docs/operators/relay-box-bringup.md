@@ -145,7 +145,11 @@ every other infra-touching ticket in this repo's history records when it applies
    packets do). Before a Solana leg can be funded, the box's `[settlement.solana]` address needs
    the SPL token itself, not just SOL for fees.
 
-8. **Peering flip.** A repo PR (#820), deployed in the same window it merges:
+8. **Peering flip.** A repo PR (#820), deployed in the same window it merges. _Since ADR 0075
+   (issue #1380) the `[[peer_channels]]` rows below are the config-declared alternative to step 7's
+   `POST /peers`, not a record of its channel: each names the **other** box's `voucher_signer` (its
+   settlement address on EVM), and the box that forwards also needs a `[[pay_channels]]` row naming
+   the outbound x402 channel it opened. A peering made with `POST /peers` needs neither row._
    - **Relay box.** Add `[[peers]]` (accept-only — no `endpoint`, since the apex dials in) and the
      matching `[[peer_channels]]` row from step 7 to `infra/linode-relay/connector-rust.toml`. (An
      explicit `ceiling` was required here per `AcceptOnlyPeerWithoutCeiling` before ADR 0033, issue
@@ -190,7 +194,10 @@ pair of boxes:
 - **(d) Claim exchange complete.** A FLUSH (TRANSFER) sent when traffic stops is acknowledged with a
   `claim-ack` entry on its RESPONSE; a deliberately stale-nonce claim comes back
   `{"result":"rejected","reason":"nonce_not_advancing"}` **without** rejecting the PREPARE it rode
-  on. The journaled claim verifies against the configured counterparty and is redeemable.
+  on. The journaled claim verifies against the configured counterparty and is redeemable. _(The
+  `toon-channel` gate. Since ADR 0075, issue #1380, no peering sends a FLUSH and a voucher has no
+  nonce: the equivalent check is a voucher at or below the channel's watermark coming back
+  `amount_not_advancing` without rejecting its PREPARE, `peer-carriage-spec.md` §1.11.)_
 - **(e) Discovery.** If and when discovery is repointed at the relay box directly (out of this
   runbook's scope — nothing in step 8 changes what `kind:10032` advertises), a `kind:10032` announce
   still resolves to a reachable endpoint for existing clients.

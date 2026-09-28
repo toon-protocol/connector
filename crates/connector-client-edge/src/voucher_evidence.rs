@@ -237,7 +237,8 @@ impl VoucherEvidence for ClientClaimGate {
                 )
                 .await
             }
-            // A `toon-channel` claim is `ClaimBook`'s to verify, never this.
+            // A `toon-channel` claim never proves the peer role (#1380):
+            // the role gate reads the frame carrying one as a client's.
             ClientClaim::Evm(_) | ClientClaim::Solana(_) => VoucherCheck::Unresolved,
         }
     }

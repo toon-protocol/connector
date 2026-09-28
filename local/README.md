@@ -107,8 +107,8 @@ healthy, with the reason in its log.
 | [`onion/`](onion/)             | 2     | The peering rides a **real onion network**: each node is reachable only at a `.anyone` address its `anon` sidecar generates, and the two connectors are on separate docker networks with **no route between them**, so a direct dial is impossible rather than merely unobserved. The only topology where an endpoint's HOST decides how it is dialed (ADR 0070). Not on the CI gate. |
 | [`anyone/`](anyone/)           | 1     | The **client edge** over the same overlay, with the real payer: [`toon-client`](https://github.com/toon-protocol/toon-client) discovering, pricing and paying this node over a circuit. Needs that repository built, so it is run by its own `run.sh` rather than by `LOCAL_TOPOLOGY`. Not on the CI gate.                                                                            |
 
-`two_ledgers_never_merge.rs` is named for the both-chains concern and proves it
-in-process; `solo` is the only place a node is actually stood up with an EVM and
+`connector-cli`'s `a_both_chains_config_attaches_and_routes_both_backends` proves
+the both-chains concern in-process; `solo` is the only place a node is actually stood up with an EVM and
 a Solana backend attached simultaneously.
 
 `two-hop` is the containerised counterpart of
@@ -136,9 +136,10 @@ ADR 0075: **a peering is two one-way x402 channels, one opened by each side.**
 A→B carries A's vouchers to B, B→A carries B's to A, and each node opens and
 funds only its own outbound channel. It is established from a URL (ADR 0058, as
 0075 decision 4 amends it), so **no committed config under `local/` holds a
-`[[peers]]`, `[[peer_channels]]` or `[[pay_channels]]` row** — there is no
-channel id for anybody to paste, because an x402 channel is opened with a fresh
-salt and its id is a fact of the run.
+`[[pay_channels]]` row, and only `mixed-chain`'s B holds `[[peers]]` and
+`[[peer_channels]]`** (for one peering, below) — there is no channel id for
+anybody to paste, because an x402 channel is opened with a fresh salt and its
+id is a fact of the run.
 
 `make local-up` runs `local/keys.sh <topology>` before the nodes start (keys and
 funding) and `local/keys.sh <topology> channels` after they are serving. The
@@ -217,16 +218,22 @@ there on the same channel. Reaching it proves A's channel is bound to the
 peering — the channel every one of B's vouchers arrived on — and B's journal is
 held to three vouchers of 1100 rather than two.
 
-### What a runtime peering cannot yet say
+### The one config-declared peering
 
-`mixed-chain`'s B used to hold A's peering at `forwarded_claim_enforcement =
-"enforce"` (ADR 0042 item 3), the only enforcing peering in the repository. A
-runtime peering has no such knob and **observes** — an uncovered forwarded
-arrival is forwarded and logged rather than refused `F06`. The rehearsal still
-catches an A that stopped covering, because B's journal must show exactly one
-1100 voucher per crossing; what no longer runs on a shipped image is the
-enforcing refusal itself. It comes back with config-declared x402 peerings
-(#1380).
+A runtime peering has no `forwarded_claim_enforcement` knob and **observes** —
+an uncovered forwarded arrival is forwarded and logged rather than refused
+`F06`. So `mixed-chain`'s B declares its A peering in its committed config
+instead (ADR 0075 decision 9, issue #1380): a `[[peers]]` row with the `a-b`
+id `keys.sh`'s table names, at `forwarded_claim_enforcement = "enforce"` (ADR
+0042 item 3), the only enforcing peering in the repository, and a
+`[[peer_channels]]` row naming A's EVM settlement address as its
+`voucher_signer`. That address is committed because it is derived — the same
+on every machine and every run — and the `channels` stage holds the row to the
+derivation before it skips B's end of `POST /peers` for that peering. A still
+opens and funds its own channel toward B with its `POST /peers`; B opens none
+toward A, since nothing is paid that way. The rehearsal's journal read is
+unchanged — B must show exactly one 1100 voucher per crossing — and now an A
+that stopped covering is also refused on the wire.
 
 ## The dealing topology
 

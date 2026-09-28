@@ -9,7 +9,6 @@ mod connector;
 mod journal;
 mod metrics;
 mod operator_view;
-mod outbound_client;
 mod outbound_voucher;
 mod peer_route_store;
 mod peer_transport;
@@ -25,6 +24,10 @@ mod voucher_binding;
 // must not carry it either. See the module's header.
 #[cfg(any(test, feature = "test-support"))]
 mod socks5_test_server;
+// A payable hop for a test that forwards (ADR 0042): a fake, so behind the
+// same feature as the SOCKS5 server above and for the same reason.
+#[cfg(any(test, feature = "test-support"))]
+pub mod covering_fake;
 #[cfg(test)]
 mod test_support;
 
@@ -39,13 +42,12 @@ pub use batch_channels::{
     ChannelDirection, OutboundChannels, WithdrawStep,
 };
 pub use claim::{
-    ChannelDomain, ClaimAckOutcome, ClaimBook, ClaimRejectReason, ClaimSignature, Covering,
-    InvalidChannelId, InvalidSolanaChannel, SolanaChannel, WireClaim,
+    ClaimAckOutcome, ClaimBook, ClaimRejectReason, ClaimSignature, Covering, WireClaim,
 };
 pub use clock::{Clock, SystemClock, TestClock};
 pub use connector::{
-    ChannelOperationError, ClientRouteFacts, ClientRouteKind, ClientRoutePrice, Connector,
-    LeaseRouteError, PeerRouteTableError, ProbeDenied,
+    ChannelOperationError, ClientRouteFacts, ClientRouteKind, ClientRoutePrice, ConfigPeeringError,
+    Connector, LeaseRouteError, PeerRouteTableError, ProbeDenied,
 };
 // Re-exported for callers that hold a `Connector` but not a config-crate
 // dependency of their own (`connector-operator`): the chain key
@@ -58,15 +60,6 @@ pub use operator_view::{
     ChannelView, ChannelViewStatus, ClaimBookKind, ClaimDirection, ClaimScheme, ClaimView,
     DeclaredRates, LeasedRouteView, PeerRouteView, PeerView, RateView, RateViewState,
     RefusedRefreshView, RouteSource, RouteView,
-};
-// The OUTBOUND client ledger (issue #873) -- what this node signs to pay a
-// next hop, deliberately a different book from `ClaimBook`'s inbound
-// journal above. See `outbound_client`'s header for the table of
-// differences and for why the two must never merge.
-pub use outbound_client::{
-    ClaimStateChallengeSigner, ClaimStateDomain, ClaimStateSource, ClaimWatermark, EvmDomain,
-    HttpClaimState, OutboundClaim, OutboundClaimBinding, OutboundClientError, OutboundClientLedger,
-    OwnedHttpClaimState, SolanaDomain,
 };
 // What this node puts on a peer carriage when it pays over one of its own
 // x402 channels (ADR 0075 decisions 5 and 6), and how it asks the receiver

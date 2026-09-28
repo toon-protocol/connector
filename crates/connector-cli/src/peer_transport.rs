@@ -37,12 +37,11 @@
 //! also a [`PeerRegistrar`]: a peering added while the process serves gets
 //! its carriage here, and a peering removed loses it.
 //!
-//! Two consequences follow, and both are deliberate. **Both carriages are
-//! always built**, because a runtime peering's endpoint may select the one
-//! this node's config never named. And a registered relation reads its
-//! claim bindings off the durable row rather than off `[[peer_channels]]`,
-//! which is the same two maps `PeerRelation::from_config` builds, from the
-//! other source.
+//! **Both carriages are always built**, deliberately, because a runtime
+//! peering's endpoint may select the one this node's config never named.
+//! Neither carriage holds any claim binding: every peering pays and is paid
+//! with vouchers that reach the carriage already rendered (ADR 0075,
+//! #1378-#1380).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,8 +54,7 @@ use connector_domain::Prepare;
 use connector_peer_btp::{BtpPeerTransport, TungsteniteDialer};
 use connector_peer_http::{HttpPeerTransport, ReqwestPeerClient};
 use connector_runtime::{
-    ClaimAckOutcome, Clock, Covering, InProcessPeerTransport, PeerForward, PeerRegistrar,
-    PeerTransport, RuntimePeering, WireClaim,
+    Covering, InProcessPeerTransport, PeerForward, PeerRegistrar, PeerTransport, RuntimePeering,
 };
 
 /// One [`PeerTransport`] over both carriages, dispatching by peer id --
@@ -82,28 +80,14 @@ pub(crate) struct ConfiguredPeerTransport {
 
 /// The transport a validated [`Config`] describes.
 ///
-/// `signer_address` is this node's own EVM address -- the `senderId` /
-/// `signerAddress` of every EVM claim it emits (§4). `signer_solana_public_key`
-/// is the Solana counterpart (issue #732/#998) -- the raw ed25519 public key
-/// rendered as `senderId`/`signerPublicKey` on a Solana claim -- `None` for a
-/// node with no `[settlement.solana]` table, exactly mirroring how
-/// `signer_address` is all-zero and unused on a node with no
-/// `[settlement.evm]` table, which never produces an EVM claim to render
-/// either. Without it, a dial side that DID sign a Solana claim
-/// (`ClaimBook::record_fulfillment`, once a `[[peer_channels]]` Solana row is
-/// wired) would panic trying to render one -- see `claim_json::encode`'s own
-/// doc. `clock` is the one the rest of the node reads, so a claim's
-/// `timestamp` and a fulfilment's agree.
+/// It renders no claim of its own: what covers a forward -- a voucher, or
+/// the peer-role challenge -- arrives rendered from the forwarding path
+/// (ADR 0075 decision 6), so the carriages need no signing identity.
 ///
 /// A node with no dialable peering registers no carriage at all, and every
 /// peer-routed packet falls through to the bare [`InProcessPeerTransport`]
 /// this holds: `T01 peer unreachable`, with the peer named.
-pub(crate) fn build_peer_transport(
-    config: &Config,
-    signer_address: [u8; 20],
-    signer_solana_public_key: Option<[u8; 32]>,
-    clock: Arc<dyn Clock>,
-) -> Arc<ConfiguredPeerTransport> {
+pub(crate) fn build_peer_transport(config: &Config) -> Arc<ConfiguredPeerTransport> {
     let mut carriage = HashMap::new();
     for peer in config.peers() {
         if let Some(dial) = peer.dial() {
@@ -132,22 +116,16 @@ pub(crate) fn build_peer_transport(
     // cannot yet do is serve a request the far side originates on it, which
     // no gate of issue #678 exercises -- the far side of a `wss://` peering
     // reaches this node on its own listener like everybody else.
-    let mut btp = BtpPeerTransport::new(
-        Arc::new(TungsteniteDialer::new().through_socks_proxy(socks_proxy)),
-        signer_address,
-        Arc::clone(&clock),
-    );
+    let btp = BtpPeerTransport::new(Arc::new(
+        TungsteniteDialer::new().through_socks_proxy(socks_proxy),
+    ));
     let http_client = match socks_proxy {
         Some(proxy) => ReqwestPeerClient::through_socks_proxy(proxy),
         None => ReqwestPeerClient::default(),
     };
-    let mut http = HttpPeerTransport::new(Arc::new(http_client), signer_address, clock);
-    if let Some(public_key) = signer_solana_public_key {
-        btp.set_solana_signer_public_key(public_key);
-        http.set_solana_signer_public_key(public_key);
-    }
-    btp.add_peers_from_config(config.peers(), config.peer_channels());
-    http.add_peers_from_config(config.peers(), config.peer_channels());
+    let http = HttpPeerTransport::new(Arc::new(http_client));
+    btp.add_peers_from_config(config.peers());
+    http.add_peers_from_config(config.peers());
 
     Arc::new(ConfiguredPeerTransport {
         btp,
@@ -213,25 +191,18 @@ impl PeerRegistrar for ConfiguredPeerTransport {
         };
         // A runtime peering pays and is paid with vouchers on its x402
         // channels on both chains (#1378, #1379), which reach the carriage
-        // already rendered: it binds no `toon-channel` EIP-712 domain and no
-        // TOON program, and a row naming a `toon-channel` is refused at boot.
-        let (domains, programs) = (HashMap::new(), HashMap::new());
+        // already rendered, and a row naming a `toon-channel` is refused at
+        // boot.
         let answer_timeout = Duration::from_millis(DEFAULT_PEER_TIMEOUT_MS);
         match carriage {
             PeerCarriage::Btp => self.btp.add_peer(connector_peer_btp::PeerRelation::new(
                 peer_id,
                 endpoint,
-                domains,
-                programs,
-                answer_timeout,
                 answer_timeout,
             )),
             PeerCarriage::Http => self.http.add_peer(connector_peer_http::PeerRelation::new(
                 peer_id,
                 endpoint,
-                domains,
-                programs,
-                answer_timeout,
                 answer_timeout,
             )),
         }
@@ -265,13 +236,6 @@ impl PeerTransport for ConfiguredPeerTransport {
             None => self.unreachable.forward(peer_id, prepare, covering).await,
         }
     }
-
-    async fn flush(&self, peer_id: &str, claim: WireClaim) -> ClaimAckOutcome {
-        match self.transport_for(peer_id) {
-            Some(transport) => transport.flush(peer_id, claim).await,
-            None => self.unreachable.flush(peer_id, claim).await,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -282,7 +246,7 @@ mod tests {
 
     use chrono::{TimeZone, Utc};
     use connector_domain::{PacketResponse, RejectCode};
-    use connector_runtime::SystemClock;
+    use connector_runtime::ClaimAckOutcome;
 
     /// A config with `top` (top-level keys, which TOML requires before any
     /// table) and `peers` spliced in, loaded through the real loader --
@@ -304,9 +268,9 @@ peer_allow_plaintext_endpoints = true
 [signer]
 key_file = "{key_file}"
 
-# An EVM `[[peer_channels]]` row needs `[settlement.evm]` (issue #1138):
-# that table is where this node's EVM address comes from, and a peer claim
-# is redeemed by the channel's on-chain participant.
+# An EVM `[[peer_channels]]` row needs `[settlement.evm]` with its x402
+# `batch_settlement` sub-table (ADR 0075, issue #1380): the peer's vouchers
+# are admitted by that table's receiving half.
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
 contract_address = "0x1234567890123456789012345678901234567890"
@@ -315,6 +279,10 @@ decimals = 6
 
 [settlement.evm.key]
 key_file = "{key_file}"
+
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 {peers}
 "#,
             state_dir = state_dir.path().display(),
@@ -325,8 +293,8 @@ key_file = "{key_file}"
         (config, state_dir, key_file)
     }
 
-    /// One peering, with a `channel_id` derived from `tag` so two peerings
-    /// in one config do not collide (`PeerChannelDuplicate`).
+    /// One peering, with a voucher signer derived from `tag` so two
+    /// peerings in one config do not collide (`PeerChannelDuplicate`).
     fn peer_block(id: &str, endpoint: &str, tag: &str) -> String {
         format!(
             r#"
@@ -337,12 +305,9 @@ endpoint = "{endpoint}"
 
 [[peer_channels]]
 peer_id = "{id}"
-channel_id = "0x{channel}"
-counterparty_key = "0x00000000000000000000000000000000000000aa"
-chain_id = 31337
-token_network = "0x00000000000000000000000000000000000000bb"
+voucher_signer = "0x{signer}"
 "#,
-            channel = tag.repeat(64),
+            signer = tag.repeat(40),
         )
     }
 
@@ -375,7 +340,7 @@ token_network = "0x00000000000000000000000000000000000000bb"
             ),
         );
 
-        let transport = build_peer_transport(&config, [0u8; 20], None, Arc::new(SystemClock));
+        let transport = build_peer_transport(&config);
 
         // Nothing is listening on port 1, so both answer §2.2's `T01` --
         // the point being that each was *dialed*, on its own carriage,
@@ -403,7 +368,7 @@ token_network = "0x00000000000000000000000000000000000000bb"
     async fn a_peer_this_connector_never_dials_is_still_answered_t01() {
         let (config, _state, _key) =
             config("", &peer_block("dialed", "ws://127.0.0.1:1/ilp/btp", "a"));
-        let transport = build_peer_transport(&config, [0u8; 20], None, Arc::new(SystemClock));
+        let transport = build_peer_transport(&config);
 
         let PeerForward {
             response,
@@ -440,14 +405,11 @@ id = "dials-in"
 
 [[peer_channels]]
 peer_id = "dials-in"
-channel_id = "0xaaaabbbbccccddddeeeeffff00001111aaaabbbbccccddddeeeeffff00001111"
-counterparty_key = "0x00000000000000000000000000000000000000aa"
-chain_id = 31337
-token_network = "0x00000000000000000000000000000000000000bb"
+voucher_signer = "0x00000000000000000000000000000000000000aa"
 "#,
         );
 
-        let transport = build_peer_transport(&config, [0u8; 20], None, Arc::new(SystemClock));
+        let transport = build_peer_transport(&config);
 
         let PeerForward {
             response,
@@ -534,7 +496,7 @@ token_network = "0x00000000000000000000000000000000000000bb"
         // A config with no `[[peers]]` at all: everything below is
         // established over the operator surface.
         let (config, _state, _key) = config("", "");
-        let transport = build_peer_transport(&config, [0u8; 20], None, Arc::new(SystemClock));
+        let transport = build_peer_transport(&config);
 
         let forward = |transport: Arc<ConfiguredPeerTransport>| async move {
             transport
@@ -576,7 +538,6 @@ token_network = "0x00000000000000000000000000000000000000bb"
             "added-at-runtime",
             &runtime_peering("ws://127.0.0.1:1/ilp/btp"),
         );
-        assert!(transport.http.flush_hints("added-at-runtime").is_empty());
 
         // Deregister -- the other half of ADR 0060's kill switch, which is
         // only "immediate" if the carriage goes with the durable row.
@@ -624,7 +585,7 @@ key_file = "{key_file}"
         let config = Config::load(config_file.path()).expect("load a node with no peering");
         assert!(!config.peer_allow_plaintext_endpoints());
 
-        let transport = build_peer_transport(&config, [0u8; 20], None, Arc::new(SystemClock));
+        let transport = build_peer_transport(&config);
         let (_, warnings) = warnings_while(|| {
             transport.register("plaintext", &runtime_peering("http://127.0.0.1:1/ilp"));
         });

@@ -149,7 +149,6 @@ connector-runtime                the packet plane and its ports
   │                               runtime-mutable peer/route table
   ├─ peering.rs, self_description.rs  establishing a peering from a URL (ADR 0058) by
   │                               reading the other node's self-description (ADR 0050)
-  ├─ outbound_client.rs          paying a next hop as an ordinary client of it
   ├─ batch_channels.rs           the x402 channels this node pays on, journaled (ADR 0075)
   ├─ outbound_voucher.rs         a voucher or peer-role challenge on this node's own
   │                               x402 channel, and the next hop's claim-state asked
@@ -168,10 +167,12 @@ connector-btp                    the BTP frame codec and session framing (RFC-00
                                   connector crate and knows nothing of claims, routes,
                                   prices or refusals
 connector-peer-auth              role-by-authentication: peer or client, decided from a
-                                  verified claim on a configured `[[peer_channels]]` row
-                                  and configuration alone. Two states, no `Unknown`
-                                  (ADR 0027's stop-ship invariant; ADR 0060 deleted the
-                                  shared secret that used to decide it)
+                                  verified voucher (or zero-value claim-state challenge)
+                                  whose signer is bound to a peering, and nothing else;
+                                  a `toon-channel` claim never decides it (ADR 0075,
+                                  #1380). Two states, no `Unknown` (ADR 0027's stop-ship
+                                  invariant; ADR 0060 deleted the shared secret that used
+                                  to decide it)
 connector-peer-btp               the BTP peer carriage: dial/accept a peering over wss://
 connector-peer-http              the ILP-over-HTTP peer carriage: dial/accept over https://
 

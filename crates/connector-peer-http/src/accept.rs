@@ -12,18 +12,19 @@
 //!
 //! What is called rather than re-derived:
 //!
-//! * [`connector_peer_btp::role_gate::decide`] joins §1.2's P2/P3 rule to
-//!   the claim book's verdict on a signature, and is the same call the BTP
-//!   carriage makes, so §0.1's one pipeline cannot admit over one carriage
-//!   what it refuses over the other. Its
+//! * [`connector_peer_btp::role_gate::decide_frame`] joins §1.2's P2/P3 rule to
+//!   the receiving half's verdict on a voucher or a peer-role challenge
+//!   (ADR 0075 decision 5, #1380), and is the same call the BTP carriage
+//!   makes, so §0.1's one pipeline cannot admit over one carriage what it
+//!   refuses over the other. Its
 //!   [`RoleDecision`](connector_peer_auth::RoleDecision) carries the role
 //!   and the `peer_auth_refused` event together, so the silent downgrade
 //!   cannot ship without the loud event;
-//! * the claim, its verdict and the per-relation watermark ledger are
-//!   `connector-peer-btp`'s ([`AcceptedClaims`]), because §2.5/I6 make them
-//!   per **peering relation**, never per carriage -- a peering with two paths
-//!   is still one relation, and a second ledger would be a double-spend
-//!   surface.
+//! * a peer's voucher is judged as payment by that same receiving half
+//!   ([`connector_peer_btp::role_gate::VoucherEvidence`]), against the
+//!   x402 channel's **one** amount watermark, because §2.5/I6 make it per
+//!   **channel**, never per carriage -- a peering with two paths is still
+//!   one channel, and a second ledger would be a double-spend surface.
 //!
 //! # This is not the client edge's `POST /ilp`, and must never become it
 //!
@@ -33,12 +34,12 @@
 //! `success:true mode:"no-auth"` and then treating it as a quasi-peer -- is
 //! what happens when the two audiences meet in one handler. Here a
 //! client-role request reaches no peer handling at all: its claim is not
-//! judged, no watermark moves, nothing is appended to the peer claim ledger,
-//! and no `Toon-Claim-Ack` is emitted. Falling a client-role request
+//! judged here, no watermark moves, nothing is journaled as a peer's, and
+//! no `Toon-Claim-Ack` is emitted. Falling a client-role request
 //! through to `connector-client-edge` instead of
 //! answering it `F02` is the bring-up wiring of issue #678; what §1 requires
-//! of *this* module is that role is decided by the request's verified claim
-//! and that a client can never reach peer handling, and that holds either
+//! of *this* module is that role is decided by the request's verified
+//! voucher or challenge and that a client can never reach peer handling, and that holds either
 //! way.
 //!
 //! # `Toon-Peer-Auth` is ignored, not refused
@@ -60,28 +61,23 @@
 //! PREPARE now carries its own covering claim regardless of which side can
 //! originate.
 //!
-//! What this module still owns is §6.4's prompt: a payee that cannot
-//! originate MAY ask a payer to flush, with [`FlushHints`]. It is a hint and
-//! only a hint -- it creates no obligation, and a payer that ignores every
-//! one of them is not in violation of the specification.
+//! §6.4's prompt -- `Toon-Flush-Requested`, a payee asking a payer to flush
+//! a pending `toon-channel` claim -- is gone with the peer claim it named:
+//! since ADR 0075 (#1380) a peer pays with a voucher that rides the PREPARE
+//! it covers, so there is nothing left pending to prompt for.
 
-use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::{Arc, RwLock};
 
 use connector_btp::{
-    ACCUMULATED_COST_HEADER, CLAIM_ACK_HEADER, CLAIM_HEADER, FLUSH_REQUESTED_HEADER,
-    PAYMENT_REQUIRED_HEADER, PEER_CHALLENGE_HEADER,
+    ACCUMULATED_COST_HEADER, CLAIM_ACK_HEADER, CLAIM_HEADER, PAYMENT_REQUIRED_HEADER,
+    PEER_CHALLENGE_HEADER,
 };
 use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
-use connector_peer_auth::{
-    claim_ack_to_emit, Capability, PeerAuthPolicy, PeerAuthRefusal, PeerAuthRefusalLog, SessionRole,
-};
-use connector_peer_btp::claim_json;
+use connector_peer_auth::{claim_ack_to_emit, PeerAuthRefusal, PeerAuthRefusalLog, SessionRole};
 use connector_peer_btp::price_gate::{self, ClaimEnforcementPolicy, PaymentRequired};
 use connector_peer_btp::role_gate::{self, AmbiguousEvidence, FrameEvidence, VoucherEvidence};
-use connector_peer_btp::AcceptedClaims;
-use connector_runtime::{ClaimAckOutcome, Connector, WireClaim};
+use connector_runtime::{ClaimAckOutcome, Connector};
 
 use crate::headers::{self, PeerRequest, PeerResponse};
 
@@ -89,7 +85,8 @@ use crate::headers::{self, PeerRequest, PeerResponse};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PeerHttpPolicy {
     /// §1.10's bounded escape hatch: a **dedicated peer listener with
-    /// mandatory authentication**. Role is *still* decided by P2 and P3 --
+    /// mandatory authentication**. Role is *still* decided by the request's
+    /// evidence --
     /// the listener is defence in depth and MUST NOT become the decider, so
     /// §1.3 holds in full either way. What changes is only what happens to a
     /// request that fails: on a dedicated listener it is refused outright
@@ -98,68 +95,21 @@ pub struct PeerHttpPolicy {
     /// downgrade to and no oracle to leak.
     ///
     /// `false` (the default) is the shared-listener reading: a request whose
-    /// claim does not verify is an ordinary client request, per §1.6's "MUST
-    /// NOT refuse it for the assertion alone".
+    /// evidence does not verify is an ordinary client request, per §1.6's
+    /// "MUST NOT refuse it for the assertion alone".
     pub mandatory_auth: bool,
 }
 
-/// §6.4's flush prompt, from the side that cannot originate.
-///
-/// A payee that cannot dial has no way to prompt a payer that has simply
-/// stopped sending, and unlike BTP it has no live session to read liveness
-/// from. `Toon-Flush-Requested` is the one thing it can do about that, and
-/// the specification is emphatic about how little it means: it creates no
-/// obligation, and a payer that ignores it is conforming.
-///
-/// A hint is *drained* when it is emitted. Repeating it on every response
-/// until the claim arrived would name a channel many times in one exchange
-/// for no gain; whoever knows a claim is still owed re-requests it.
-#[derive(Debug, Default)]
-pub struct FlushHints {
-    by_peer: RwLock<HashMap<String, HashSet<String>>>,
-}
-
-impl FlushHints {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Ask `peer_id` to flush its pending claim on `channel_id`, on the next
-    /// response this connector sends it.
-    pub fn request(&self, peer_id: &str, channel_id: &str) {
-        self.by_peer
-            .write()
-            .expect("flush hints lock poisoned")
-            .entry(peer_id.to_string())
-            .or_default()
-            .insert(claim_json::canonical_evm_channel_id(channel_id));
-    }
-
-    /// The channels to name on a response to `peer_id`, in a stable order,
-    /// removing them: **a payee SHOULD NOT name the same channel more than
-    /// once in one response** (§6.4).
-    #[must_use]
-    pub fn take(&self, peer_id: &str) -> Vec<String> {
-        let mut by_peer = self.by_peer.write().expect("flush hints lock poisoned");
-        let Some(channels) = by_peer.remove(peer_id) else {
-            return Vec::new();
-        };
-        let mut channels: Vec<String> = channels.into_iter().collect();
-        channels.sort();
-        channels
-    }
-}
-
 /// Everything an inbound peer request needs: the one pipeline below the
-/// port, the role policy, the per-relation ledger, the rate-limited
-/// `peer_auth_refused` log, and §6.4's prompt.
+/// port, the price-gate enforcement policy, the receiving half vouchers are
+/// judged by, and the rate-limited `peer_auth_refused` log.
+///
+/// There is no flush prompt any more. `Toon-Flush-Requested` asked a payer
+/// to FLUSH a pending `toon-channel` claim; no peering sends one since ADR
+/// 0075 (#1380), because a voucher rides the PREPARE it covers.
 pub struct PeerHttpState {
     connector: Arc<Connector>,
-    auth: Arc<PeerAuthPolicy>,
-    accepted: Arc<AcceptedClaims>,
     enforcement: Arc<ClaimEnforcementPolicy>,
-    hints: Arc<FlushHints>,
     refusals: Mutex<PeerAuthRefusalLog>,
     policy: PeerHttpPolicy,
     /// The receiving half a voucher or a peer-role challenge is resolved
@@ -169,27 +119,18 @@ pub struct PeerHttpState {
 }
 
 impl PeerHttpState {
-    /// `accepted` is deliberately shared with whatever other carriage serves
-    /// the same peerings (§2.5, I6): one peering relation has one set of
-    /// watermarks however many paths it has, and giving each carriage its own
-    /// would let one claim advance two independent watermarks. `enforcement`
-    /// (issue #883, child B6) is shared for the same reason `auth` is: one
-    /// peering has one migration state, whichever carriage it rides.
+    /// `enforcement` (issue #883, child B6) is deliberately shared with
+    /// whatever other carriage serves the same peerings: one peering has one
+    /// migration state, whichever carriage it rides.
     #[must_use]
     pub fn new(
         connector: Arc<Connector>,
-        auth: Arc<PeerAuthPolicy>,
-        accepted: Arc<AcceptedClaims>,
         enforcement: Arc<ClaimEnforcementPolicy>,
-        hints: Arc<FlushHints>,
         policy: PeerHttpPolicy,
     ) -> Self {
         PeerHttpState {
             connector,
-            auth,
-            accepted,
             enforcement,
-            hints,
             refusals: Mutex::new(PeerAuthRefusalLog::default()),
             policy,
             vouchers: None,
@@ -205,16 +146,11 @@ impl PeerHttpState {
         self
     }
 
-    /// §6.4: ask `peer_id` to flush `channel_id` on the next response.
-    pub fn request_flush(&self, peer_id: &str, channel_id: &str) {
-        self.hints.request(peer_id, channel_id);
-    }
-
     /// Answer one peer request.
     ///
     /// **Role is decided before anything else happens** (§1.5): before a
-    /// claim is decoded, before a watermark is consulted, before a packet is
-    /// routed, and before any fee or journal accounting.
+    /// voucher is judged, before a watermark is consulted, before a packet
+    /// is routed, and before any fee or journal accounting.
     pub async fn handle(&self, request: PeerRequest) -> PeerResponse {
         // §1.5's smuggling defence, counted before anything is parsed: more
         // than one claim header on one request is refused, not resolved --
@@ -232,20 +168,15 @@ impl PeerHttpState {
         // and verified before anything is judged, routed, charged or
         // journaled. Decoded once, here, and reused for the price-coverage
         // check further down.
-        let (role, refusal) = role_gate::decide_frame(
-            &self.connector,
-            &self.auth,
-            self.vouchers.as_deref(),
-            &evidence,
-        )
-        .await
-        .into_parts();
+        let (role, refusal) =
+            role_gate::decide_frame(&self.connector, self.vouchers.as_deref(), &evidence)
+                .await
+                .into_parts();
         self.report_refusal(refusal.as_ref());
-        // A voucher is judged by the receiving half and a `toon-channel`
-        // claim by `ClaimBook`, below the role (ADR 0075 decision 6); one
-        // request never carries both (§1.5).
+        // A voucher is judged by the receiving half, below the role (ADR
+        // 0075 decision 6). A `toon-channel` claim is judged by nothing here:
+        // it proved nothing, and a peering never pays with one (#1380).
         let voucher = evidence.voucher().cloned();
-        let claim = evidence.into_channel_claim();
 
         // §1.10: on a dedicated peer listener a failure is refused outright
         // rather than downgraded, because such a listener serves no clients.
@@ -253,39 +184,21 @@ impl PeerHttpState {
             return PeerResponse::refused(401);
         }
 
-        // The watermark is read *before* `judge_claim` below may advance
-        // it, so that check judges the claim's own advance past the
-        // watermark it rode in on, not the one it just became (issue #880).
-        //
-        // It is read from the book that is about to judge the claim --
-        // `ClaimBook`'s own durable inbound watermark, keyed by channel as
-        // that book keys it -- and never from `AcceptedClaims`, which is
-        // in-memory and per-process. Reading the per-process record made
-        // coverage disagree with the judgement across a restart: the book
-        // replays its journal and the record does not, so the first priced
-        // peer PREPARE after a restart was credited with its claim's whole
-        // cumulative amount as new payment (issue #1104).
+        // The voucher is judged **before** anything is routed, and its
+        // prior watermark is what the price-coverage check below measures its
+        // own advance from -- read from the durable book that judges it,
+        // never from a per-process record (issue #1104's rule).
         let (ack, claimed, prior_watermark) =
             match role_gate::judge_voucher(&role, self.vouchers.as_deref(), voucher.as_ref()).await
             {
                 Some(judged) => (judged.ack, judged.claimed, judged.prior),
-                None => {
-                    let prior_watermark = role
-                        .peer_id()
-                        .and(claim.as_ref())
-                        .and_then(|claim| self.connector.peer_channel_watermark(&claim.channel_id));
-                    let ack = self.judge_claim(&role, claim.as_ref());
-                    (
-                        ack,
-                        claim.as_ref().map(|claim| claim.cumulative_amount),
-                        prior_watermark,
-                    )
-                }
+                None => (ClaimAckOutcome::NotSent, None, None),
             };
 
-        // FLUSH (§3): a POST with an **empty ILP body** plus the claim
-        // header. The ack rides the response that already answers it -- HTTP
-        // always answers, which is what bounds the ack structurally (§6.3).
+        // A POST with an **empty ILP body**: once the `toon-channel` FLUSH
+        // (§3). A voucher standing alone is still answered, its ack riding
+        // the response -- HTTP always answers, which is what bounds the ack
+        // structurally (§6.3).
         if request.body.is_empty() {
             return self.finish(&role, PeerResponse::ok(Vec::new()), ack);
         }
@@ -339,22 +252,22 @@ impl PeerHttpState {
 
         // The one pipeline below the port (§0.1): a peer PREPARE that
         // arrived over HTTP is indistinguishable here from one that arrived
-        // over BTP. `handle_peer_prepare` is handed no claim -- this
+        // over BTP. `handle_peer_prepare` is handed no voucher -- this
         // request's was judged above, before anything was routed -- and IS
         // handed the peering it arrived over, which is the incoming half of
         // ADR 0071's denomination boundary (issue #1295): the request is
         // signature-authenticated, so this carriage knows whose unit the
         // amount on it is denominated in.
-        let (response, _) = self
+        let response = self
             .connector
-            .handle_peer_prepare(Some(&peer_id), prepare, None)
+            .handle_peer_prepare(Some(&peer_id), prepare)
             .await;
         self.finish(&role, packet_response(response), ack)
     }
 
-    /// §1.6's loud half. A claim naming a configured peer channel that
-    /// fails P2 or P3 is an *assertion*; the request is a client request and
-    /// is not refused for the assertion alone -- refusing would make the
+    /// §1.6's loud half. A voucher or challenge from a bound signer's channel
+    /// that does not verify is an *assertion*; the request is a client
+    /// request and is not refused for the assertion alone -- refusing would make the
     /// check an oracle for which peerings this connector has configured --
     /// but a silent downgrade would present to an operator as "peering
     /// configured, nothing peers, no error anywhere". The rate-limited event
@@ -374,42 +287,13 @@ impl PeerHttpState {
                 peer_id = %report.peer_id,
                 unmet = report.unmet.name(),
                 suppressed = report.suppressed,
-                "a peer channel's claim did not verify; the request is a client request"
+                "a peer channel's voucher did not verify; the request is a client request"
             );
         }
     }
 
-    /// A claim's verdict, or [`ClaimAckOutcome::NotSent`] when there was no
-    /// readable claim to judge or the request was a client's.
-    fn judge_claim(&self, role: &SessionRole, claim: Option<&WireClaim>) -> ClaimAckOutcome {
-        // §1.5: a client's claim is not judged here at all -- the peer
-        // namespace is not reachable from a client interaction (§1.8). A
-        // request whose claim did not verify *is* a client request, so this
-        // is also what keeps a bad signature from touching a watermark.
-        let (Some(peer_id), Some(claim)) = (role.peer_id(), claim) else {
-            return ClaimAckOutcome::NotSent;
-        };
-
-        // §6.3's idempotent re-ack, checked **before** the claim reaches the
-        // book: a byte-identical retransmission at the current watermark is
-        // `accepted`, and nothing is advanced or recorded. A payee that
-        // answered it `nonce_not_advancing` would wedge the peering
-        // permanently, since the payer's only honest retransmission would be
-        // refused forever and minting a higher nonce for the same cumulative
-        // is explicitly forbidden.
-        if self.accepted.is_at_watermark(peer_id, claim) {
-            return ClaimAckOutcome::Accepted;
-        }
-
-        let ack = self.connector.handle_peer_claim(claim.clone());
-        if ack == ClaimAckOutcome::Accepted {
-            self.accepted.record(peer_id, claim);
-        }
-        ack
-    }
-
-    /// The §3 fields that ride *every* answer: the claim ack (§6.1) and the
-    /// flush prompt (§6.4), both gated on role.
+    /// The §3 field that rides *every* answer: the claim ack (§6.1), gated
+    /// on role.
     fn finish(
         &self,
         role: &SessionRole,
@@ -418,20 +302,9 @@ impl PeerHttpState {
     ) -> PeerResponse {
         // §1.7: a connector MUST NOT emit a `Toon-Claim-Ack` on a client
         // interaction, and §6.2 forbids one on a response answering a
-        // request that carried no claim. Both are this one call.
+        // request that carried no voucher. Both are this one call.
         if let Some(value) = claim_ack_to_emit(role, headers::claim_ack_header_value(ack)) {
             response.headers.push(CLAIM_ACK_HEADER, value);
-        }
-        // §6.4: never on a response to a client interaction -- a client is
-        // never treated as a peering relation for flush purposes (§1.7).
-        if let Some(peer_id) = role
-            .grants(Capability::CountTowardPeeringExposure)
-            .then(|| role.peer_id())
-            .flatten()
-        {
-            for channel_id in self.hints.take(peer_id) {
-                response.headers.push(FLUSH_REQUESTED_HEADER, channel_id);
-            }
         }
         response
     }
@@ -487,9 +360,9 @@ fn now_ms() -> u64 {
 }
 
 /// Everything a peer request presents that could prove the peer role (ADR
-/// 0075 decision 5): its claim header -- a `toon-channel` claim or a voucher
-/// -- its peer-role challenge header, and whether its body is a PREPARE that
-/// moves no value.
+/// 0075 decision 5): its claim header -- a voucher, or a `toon-channel` claim
+/// that proves nothing -- its peer-role challenge header, and whether its
+/// body is a PREPARE that moves no value.
 ///
 /// `None` is §1.5's ambiguity, which the caller refuses `400`: more than one
 /// claim header, more than one challenge header, or a claim beside a
@@ -523,31 +396,4 @@ pub fn evidence_on(request: &PeerRequest) -> Option<FrameEvidence> {
         challenge,
         moves_no_value: role_gate::moves_no_value(&request.body),
     })
-}
-
-/// The claim a peer request carries, decoded -- exposed so a caller that
-/// wants to know what a request *would* be judged on, or what role it
-/// proves, does not have to re-derive the header layer. Judging it is
-/// [`PeerHttpState::handle`]'s.
-///
-/// `None` when the request carries no claim header at all, and also when it
-/// carries one this connector could not read: an undecodable claim is *not
-/// acknowledged* (§6.3) rather than rejected, so the payer's claim stays
-/// pending and its retransmission is read the same way instead of being
-/// recorded as a verdict that was never reached.
-#[must_use]
-pub fn claim_on(request: &PeerRequest) -> Option<WireClaim> {
-    match headers::claim_json(&request.headers)? {
-        Ok(raw) => claim_json::parse(&raw)
-            .inspect_err(|error| {
-                // No peer id to name: the claim *is* what would have named
-                // one, and it did not decode.
-                tracing::warn!(%error, "peer claim could not be decoded; not acknowledged");
-            })
-            .ok(),
-        Err(_) => {
-            tracing::warn!("peer claim header is not base64; not acknowledged");
-            None
-        }
-    }
 }

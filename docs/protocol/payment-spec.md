@@ -108,7 +108,10 @@ greeting that states the terms.
 > refusal (issue #881) — on **both** settlement chains since issue #1146, EVM-only before it, which
 > is why a Solana peering could until then only be paid postpay. The `[[pay_channels]]` row that
 > supplies the channel is now **required** of a peering a route forwards to, refused at load without
-> one, and a forward that cannot be covered is refused rather than carried. So "a claim trails its
+> one, and a forward that cannot be covered is refused rather than carried. Since
+> [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (issue #1380)
+> the covering claim is a voucher on this node's own outbound x402 channel toward the hop, which the
+> `[[pay_channels]]` row names, signed by that chain's settlement key. So "a claim trails its
 > fulfilment" is no longer true of anything: ADR 0004's model is deleted from the tree.
 > [ADR 0042](../adr/0042-a-packet-carries-its-claim.md) is no longer a target record on this point;
 > its issue #1145 Update is the authority on what landed.

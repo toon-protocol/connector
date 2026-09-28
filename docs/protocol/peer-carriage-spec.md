@@ -10,7 +10,14 @@ issue #868), and the semantics row in §0, which treated a now-frozen document a
 blesses exactly this narrower form, where prose binds a rule until a vector covers it and the vectors
 win on any encoding disagreement. _Originally:_ Normative for the carriage mapping, in the same sense
 [`peer-semantics-pre-868.md`](peer-semantics-pre-868.md) §3–§6 were said to be normative — this is an operator-to-operator
-wire, and a third-party connector has nothing else to implement against. Subject to
+wire, and a third-party connector has nothing else to implement against. **Amended by
+[ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+([issue #1380](https://github.com/toon-protocol/connector/issues/1380)):** a peering is two one-way
+x402 channels on both carriages, whether it was declared in config or established at runtime; a
+`toon-channel` claim never decides the peer role, and the peer carriages neither send nor judge one.
+The rules that rested on it — P2/P3 (§1.2), the peer claim watermarks and ledger (§1.7, §1.8), the
+FLUSH and its HTTP prompt (§3, §6.3, §6.4), and the `toon-channel` row shapes (§11) — are kept below
+marked superseded, not deleted. Subject to
 [ADR 0021](../adr/0021-vectors-are-normative-prose-is-not.md) where bytes are concerned: **where
 this prose and `vectors/wire-vectors.json` disagree about an encoding, the vectors are right and
 this text is the bug.** §10 enumerates the vectors that must exist for that sentence to mean
@@ -94,39 +101,49 @@ role, no `unknown`, and no unroled state.
 > argument was **absent** from this document, and deleting it now would recreate the very gap that
 > issue named.
 
-An interaction has role `peer` **if and only if both** of the following hold:
+> **Amended by [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+> decision 5 ([issue #1380](https://github.com/toon-protocol/connector/issues/1380)).** P2 and P3
+> below no longer decide role, on either carriage: **a `toon-channel` claim never makes an
+> interaction a peer's**, whatever channel it names and whether or not its signature verifies. The
+> rule is X1/X2 (next subsection) and nothing else, for a config-declared peering as for a runtime
+> one. `connector_peer_auth::decide_role`, which answered `peer` on P2 and a verified P3, is deleted
+> (ADR 0075's falsifier). P2/P3 are kept, marked superseded, because the history in this section
+> argues from them and §1.6's event still names its requirement `P3`.
 
-- **P2 — a channel binding.** The interaction is bound to a peer id `p` that has at least one
-  `[[peer_channels]]` entry.
-- **P3 — a verified claim on one of that peer's channels.** The frame carries a claim naming a
-  `channel_id` that one of `p`'s `[[peer_channels]]` rows configures, and that claim's signature
-  verifies against **the counterparty key that row configures** — never against anything the claim
-  declares about itself.
+> _Superseded by #1380 — the `toon-channel` rule._ An interaction had role `peer` **if and only if
+> both** of the following held:
+>
+> - **P2 — a channel binding.** The interaction is bound to a peer id `p` that has at least one
+>   `[[peer_channels]]` entry.
+> - **P3 — a verified claim on one of that peer's channels.** The frame carries a claim naming a
+>   `channel_id` that one of `p`'s `[[peer_channels]]` rows configures, and that claim's signature
+>   verifies against **the counterparty key that row configures** — never against anything the
+>   claim declares about itself.
 
-If either fails, for any reason, the interaction has role `client`. **There is no fallthrough**: no
-degraded peer, no peer-for-routing-but-client-for-claims, no retry into peer role.
+If X1 and X2 both fail, for any reason, the interaction has role `client`. **There is no
+fallthrough**: no degraded peer, no peer-for-routing-but-client-for-claims, no retry into peer role.
 
 There is no third case left to decide. Under #868 a peer PREPARE carrying no covering claim is not
 admitted at all — it is answered with the same 402 greeting the client edge already gives. Role and
 payment are therefore read from the same bytes, on the same packet, every time.
 
-#### The x402 proof: a voucher, or a challenge (ADR 0075, issue #1377)
+#### The x402 proof: a voucher, or a challenge (ADR 0075, issues #1377, #1380)
 
 > **Amended 2026-09-27 by [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
 > decision 5**, which amends [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md).
 > Under ADR 0075 a peering is two one-way x402 `batch-settlement` channels, and the inbound one is
-> **admitted, not configured** — so the proof above, which needs a `[[peer_channels]]` row naming the
-> channel, cannot reach it. P2 and P3 still decide for a `toon-channel` claim, because
-> config-declared peerings (#1380) still prove themselves that way; runtime peerings moved to x402
-> with #1378 on EVM and #1379 on Solana (§1.11), and #1380 deletes P2/P3 with the last of them.
+> **admitted, not configured** — so the P2/P3 proof, which needed a `[[peer_channels]]` row naming
+> the channel, cannot reach it. Runtime peerings moved to x402 with #1378 on EVM and #1379 on Solana
+> (§1.11), and #1380 moved config-declared peerings and deleted P2/P3: this is now the only proof.
 
-An interaction also has role `peer` **if and only if** it carries either of:
+An interaction has role `peer` **if and only if** it carries either of:
 
 - **X1 — a voucher on a channel bound to that peer.** An x402 `batch-settlement` voucher
   (`client-edge-spec.md` §1.3) whose channel this node's receiving half resolves, whose signature
   verifies against the **voucher signer the chain records for that channel** — EVM
   `payerAuthorizer`, Solana `authorized_signer`, read from what the batch-settlement backend
-  admitted and never from the voucher — and whose signer is **bound** to peer `p`.
+  admitted and never from the voucher — and whose signer is **bound** to peer `p` (on that channel,
+  where the binding is pinned to one).
 - **X2 — for a packet that moves no value, the voucher claim-state challenge.** The PREPARE's
   `amount` is zero, and the frame carries #1364's challenge (§1.4) naming a channel as in X1, signed
   by that channel's voucher signer, and **inside its window**: `expires` has not passed and lies no
@@ -143,7 +160,12 @@ runtime peering (`DELETE /peers`, ADR 0060's kill switch) unbinds its signers wi
 binding has two sources.** The first is built on both chains (#1378 on EVM, #1379 on Solana): the
 key a peer's self-description publishes as its `voucherSigners` entry for the shared network
 (`self-description-spec.md` ND-17), bound when `POST /peers` establishes a peering and rebound from
-the durable row at every boot. The second, the key a `[[peer_channels]]` row names, is #1380.
+the durable row at every boot. The second is built too (#1380): the `voucher_signer` a
+`[[peer_channels]]` row names — the peer's EVM settlement address, or its Solana settlement key —
+bound at boot to that row's peering exactly as `POST /peers` binds a published one
+(`Connector::with_config_voucher_signer`). A row that also names `inbound_channel` **pins** the
+binding: that signer then proves the peering on that one channel and on no other, where an unpinned
+signer proves it on any channel its vouchers verify on (`configuration-spec.md` §2.1).
 
 **Why 300 seconds.** Within `expires` a challenge is a bearer proof for zero-value traffic (ADR 0075,
 Consequences): it names one channel, so only that channel's receiver can use it, but that receiver
@@ -168,17 +190,20 @@ the client edge's claim gate over the same lookups `POST /ilp/claim-state` makes
 signer and verdict, and hands `connector_peer_auth::decide_voucher_role` the bound peer and that
 verdict — nothing a carriage could weight (§1.3).
 
-**Why a verified claim proves more than a bearer token does.** A claim's signature is checked
-against this connector's **own** record of the channel — `counterparties` for an EVM channel, a
-`SolanaChannel`'s `counterparty_public_key` for a Solana one — populated from `[[peer_channels]]`,
-"never the claim's own self-declared field" (`ClaimBook`, in
-`crates/connector-runtime/src/claim.rs`). The check itself is `ClaimBook::verify_signature`, which
-answers `UnknownChannel` for a channel it holds no record of and `SignatureInvalid` for a signature
-that does not recover to the configured key. A bearer secret proved only possession of a string both
-operators had written into their own config files, presented by the dialer out of its own
-`[[peers]]` row on the session's first MESSAGE. A signature over ADR 0024's balance proof proves
-control of the key the channel was actually opened against — strictly stronger, and present on every
-packet rather than once per session.
+**Why a verified voucher proves more than a bearer token did.** A voucher's signature is checked
+against the voucher signer **the chain records** for its channel, as the receiving half admitted it,
+and that signer is looked up in this node's **own** bindings — a `[[peer_channels]]` row or a
+`POST /peers` of the peer's self-description — never in anything the voucher declares about itself.
+A bearer secret proved only possession of a string both operators had written into their own config
+files, presented by the dialer out of its own `[[peers]]` row on the session's first MESSAGE. A
+signature over a voucher proves control of the key the channel was actually opened with — strictly
+stronger, and present on every packet rather than once per session.
+
+> _Superseded by #1380._ This paragraph used to make the argument for a `toon-channel` claim, checked
+> by `ClaimBook::verify_signature` against the counterparty key a `[[peer_channels]]` row configured
+> (`UnknownChannel` for a channel with no record, `SignatureInvalid` for a key that did not
+> recover). The argument transferred intact to the voucher; the check it cited no longer decides
+> role.
 
 > **Tenses and citations corrected 2026-08-26 by [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)
 > (issue #1157).** The bearer-secret sentence stood in the present tense and pointed at the two
@@ -190,14 +215,18 @@ packet rather than once per session.
 > exists. The line numbers went with it, here and in the two bullets below: every one of them had
 > rotted onto unrelated code, and a symbol a reader can grep outlives a line a refactor moves.
 
-**P3 resolves to exactly one relation.** A `channel_id` may appear in at most one
-`[[peer_channels]]` row — a second is `PeerChannelDuplicate` at load, refused precisely so that
-"whichever row's counterparty key won" cannot depend on iteration order
-(`crates/connector-config/src/peer_channel.rs:285-293`) — and a channel in `[[peer_channels]]` may
-never also appear in `[[client_channels]]` (§1.8, `ChannelInBothNamespaces`). A verified claim
-therefore names one channel, one row and one `peer_id`, with no ambiguity for a caller to resolve
-and none for an attacker to manufacture. That config-enforced uniqueness is what makes deciding role
-from a claim safe, and it is why §1.3's former prohibition on doing so is withdrawn.
+**A binding resolves to exactly one relation.** A `voucher_signer`, or an `inbound_channel`, may
+appear in at most one `[[peer_channels]]` row — a second is `PeerChannelDuplicate` at load, refused
+so that which peering a signer proves cannot depend on file order — and binding a signer already
+bound to another peering, from a row or from `POST /peers`, is refused by name. A verified voucher
+therefore names one signer and one `peer_id`, with no ambiguity for a caller to resolve and none for
+an attacker to manufacture. That uniqueness is what makes deciding role from a voucher safe, and it
+is why §1.3's former prohibition on deciding it from payment material is withdrawn.
+
+> _Superseded by #1380._ This paragraph stated the same property for P3: a `channel_id` in at most
+> one `[[peer_channels]]` row, and never also in `[[client_channels]]` (`ChannelInBothNamespaces`).
+> A `[[peer_channels]]` row names no `toon-channel` now, so that refusal is deleted; the one
+> cross-book refusal left is `ChannelInBothDirections` (§1.8).
 
 **What is retired, and what is not.** P1 was retired **as a role requirement** by the amendment
 above, and the credential surface itself is retired with it by
@@ -205,40 +234,45 @@ above, and the credential surface itself is retired with it by
 `[[peers]].credential` does **not** load: it is parsed solely in order to be refused **by name**
 (`ConfigError::PeerCredentialRemoved`, `crates/connector-config/src/peer.rs`), so a node whose
 committed TOML still sets one stops at boot rather than peering without it. A dialer presents
-nothing (§1.4); `peer_auth_refused` names which of P2/P3 failed rather than a mismatched secret
+nothing (§1.4); `peer_auth_refused` names the unmet requirement rather than a mismatched secret
 (§1.6); and §12(7)'s "both operators write the same string" is superseded there — `[[peers]].id` is
-a **local label**, and what the two operators MUST agree on is the channel. There is no replacement
-credential: not renamed, not demoted to a label, not kept as an optional discriminator. §1.9's five
-regression cases all still classify `client`, because none of them carries a verifying claim on a
-configured peer channel; three of them stopped being expressible when the credential was deleted,
-and are restated there in terms of the claim that now decides. Whether the credential surface
+a **local label**, and what the two operators MUST agree on is the key the payer signs with (the
+channel, until #1380). There is no replacement credential: not renamed, not demoted to a label, not
+kept as an optional discriminator. §1.9's regression cases all still classify `client`, because
+none of them carries a verifying voucher from a bound signer; three of them stopped being
+expressible when the credential was deleted, and are restated there in terms of what now decides.
+Whether the credential surface
 should exist at all was [issue #867](https://github.com/toon-protocol/connector/issues/867)'s
 question, and ADR 0060 answers it: it should not.
 
-**Implementation status.** This section's rule for _role_ **is** the code, as of issue #1157
-([ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)).
-`connector_peer_auth::decide_role` takes the presented claim and the peering's channel bindings, and
-answers `peer` only on P2 and a verified P3. It said otherwise here for six months: the P1/P2 branch
-table survived #868's amendment to this section, so the weaker check gated the stronger one in a
-tree whose spec already said it did not. That gap is closed and this paragraph records that it
-existed.
-`Connector::handle_peer_prepare` itself is unchanged and still accepts a `None` claim
-(`crates/connector-runtime/src/connector.rs:667-676`): issue #880 lands the _price-coverage_ half of
-this section (a `Terminated` route's own `price`, §3.1 — since joined by ADR 0042's
-forwarded-arrival rule in the same gate) one layer up, in the accept pipelines
+**Implementation status.** This section's rule for _role_ **is** the code. Since #1380 that is
+`connector_peer_auth::decide_voucher_role`, joined to the receiving half's verdict by
+`connector_peer_btp::role_gate::decide_frame` (above). Before it, as of issue #1157
+([ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)), it was
+`connector_peer_auth::decide_role`, which answered `peer` only on P2 and a verified P3 and is now
+deleted. That one said otherwise here for six months: the P1/P2 branch table survived #868's
+amendment to this section, so the weaker check gated the stronger one in a tree whose spec already
+said it did not. That gap was closed and this paragraph records that it existed.
+`Connector::handle_peer_prepare` itself still accepts a PREPARE with no claim: issue #880 lands the
+_price-coverage_ half of this section (a `Terminated` route's own `price`, §3.1 — since joined by
+ADR 0042's forwarded-arrival rule in the same gate) one layer up, in the accept pipelines
 (`connector-peer-http`'s `PeerHttpState::handle` and `connector-peer-btp`'s
-`PeerSession::handle_message`) -- before `handle_peer_prepare` is ever called, using the claim each
-carriage already judges inline. Both call one decision,
+`PeerSession::handle_message`) -- before `handle_peer_prepare` is ever called, using the voucher
+each carriage already judges inline. Both call one decision,
 `connector_peer_btp::price_gate::payment_required`, so §0.1's one pipeline cannot admit over one
 carriage what it refuses over the other; each carriage keeps only the shape its own wire gives the
 refusal. §3.1's former "a connector MUST NOT answer a peer-role PREPARE with the x402 greeting" was
 corrected by #880 to state the rule that now runs. Issue #881 is the send
-side: covering an outbound peer PREPARE with a claim in the first place. It lands in
-`Connector::forward_via_peer_route` (`crates/connector-runtime/src/connector.rs`): a next hop
-configured via `Connector::with_outbound_client_hop` is covered proactively, from the outbound
-client ledger (#873), for this node's own forwarded value -- before the first attempt is ever sent,
-not merely recovered by #875's retry arm after a refusal teaches this node it must pay. **A hop with
-no such config is refused, not carried** (issue #1145): `cover_forward` has no not-configured arm,
+side: covering an outbound peer PREPARE in the first place. It lands in
+`Connector::forward_via_peer_route` (`crates/connector-runtime/src/connector.rs`): a next hop with
+an outbound x402 channel registered for it — by a `[[pay_channels]]` row at boot
+(`Connector::with_config_pay_channel`, #1380) or by `POST /peers` (§1.11) — is covered
+proactively by `cover_forward`, with a voucher on that channel for this node's own forwarded value
+(or, for a packet that moves no value, the peer-role challenge), before the first attempt is ever
+sent. Until #1380 a config-declared hop was registered by `Connector::with_outbound_client_hop` and
+covered by a `toon-channel` claim from the outbound client ledger (#873, `OutboundClientLedger`);
+both are deleted, with that ledger's `toon-channel` claim-state ask. **A hop with no registered
+channel is refused, not carried** (issue #1145): `cover_forward` has no not-configured arm,
 the packet answers `T00` naming the hop, and `Config::load` refuses a route to such a peering by
 name before the node serves at all. Until #1145 that case fell through to the peer ledger's
 `pending_claim` — ADR 0004's postpay convention, the claim covering crossing _n_ signed after it
@@ -248,41 +282,41 @@ since extended the same shared gate to a `Forwarded` arrival, judged against the
 per-peer knob that is left to select between them (the terminated rule's own `claim_enforcement`
 knob was deleted by ADR 0042 item 4, issue #1077).
 
-**What "configured via `with_outbound_client_hop`" means in a config file**, since for a while it
-meant nothing an operator could write and the covering therefore never ran on a deployed node: it is
-a **`[[pay_channels]]`** row (ADR 0042's item 2). One row per peering this node pays — `peer_id`,
-the `channel_id` it pays from, that channel's `chain_id`/`token_network` (its EIP-712 domain, the
-same two facts its `[[peer_channels]]` row carries, because both roles sign against the very same
-on-chain channel), and `client_edge_url`: that hop's own `POST /ilp` endpoint, asked over
-`POST /ilp/claim-state` (#693) for where this node's claims stand, on every covered packet. The
-signing key is `[settlement.evm]`'s and no second key exists (ADR 0030). **The table is required of
-any peering a `[[routes]]` entry forwards to** (issue #1145): a route naming a peer with no row is
-`ConfigError::PayChannelUnbound`, refused at load naming the peer and the route. A peering this node
-only accepts on needs no row -- the requirement is keyed on the route, not on the peering. It was
-additive when it shipped, and stopped being so when the postpay path it fell back to was deleted.
+**What a config-declared hop is in a config file**: a **`[[pay_channels]]`** row (ADR 0042's item
+2, as [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+decisions 4, 6 and 9 amend it, issue #1380). One row per peering this node pays — `peer_id`;
+`outbound_channel`, an x402 channel **this node opened** toward the peer (`POST /channels`, or an
+earlier `POST /peers`), by channel id on EVM or channel account on Solana, which MUST be in this
+node's outbound-channel journal or the node refuses to start, since it holds no terms for a channel
+it did not open; and `client_edge_url`, that hop's own `POST /ilp` endpoint, where
+`POST /ilp/claim-state` (`scheme: "batch-settlement"`) answers where this node's vouchers on the
+channel stand. That ask restores the channel's watermark after a lost journal and only ever raises
+it (§1.11). The signing key is the chain's settlement key, `[settlement.evm]`'s or
+`[settlement.solana]`'s, and no second key exists (ADR 0030). The row requires the chain's
+`[settlement.<chain>.batch_settlement]` table (`PayChannelWithoutX402`) and `state_dir`
+(`PayChannelsWithoutStateDir`). **The table is required of any peering a `[[routes]]` entry
+forwards to** (issue #1145): a route naming a peer with no row is `ConfigError::PayChannelUnbound`,
+refused at load naming the peer and the route. A peering this node only accepts on needs no row --
+the requirement is keyed on the route, not on the peering. It was additive when it shipped, and
+stopped being so when the postpay path it fell back to was deleted.
 
-**The row has a Solana shape too** (issue #1146), a different shape rather than a different spelling
-of the same one, exactly as `[[peer_channels]]` and `[[client_channels]]` do: `channel_account` in
-place of `channel_id`, no `chain_id` and no `token_network` (Solana has neither a numeric chain id
-nor a per-token verifying contract), the same `client_edge_url`, and the signing key
-`[settlement.solana]`'s. Its ADR 0053 binding — the settlement program id — is **not** a field of the
-row: it is read from `[settlement.solana] program_id`, the one program this node can redeem through,
-under issue #1128's rule. Before #1146 there was no such shape, so a Solana peering could only be
-paid postpay.
+**A pay row's channel is never a peer row's.** An x402 channel moves value one way, so a peering is
+two channels: the one a `[[pay_channels]]` row names, which this node pays on, and the one the peer
+opened toward this node, which its `[[peer_channels]]` row may pin. A pay row naming a channel a
+peer row pins as `inbound_channel` is `ChannelInBothDirections`, refused at load
+(`configuration-spec.md` CF-22).
 
-A Solana row additionally requires that the same peering bind that channel account as a Solana
-`[[peer_channels]]` row, refused at load naming the peer if it does not. `programId` is a required
-field of the claim wire (§4.2) where an EVM claim's domain fields are optional and ride absent, and
-both carriages render it from the peer-channel row; without one there is nothing to write there.
-Holding one channel in both roles with one hop is the shape this table is for, so a real config
-already satisfies it.
-
-The hop being asked MUST answer that ask out of the book that judges the channel — for a channel it
-holds as a `[[peer_channels]]` row, its **peer** book, not its client edge's (`client-edge-spec.md`
-§1.10, issue #1102). One channel in both roles with one hop is the shape this table is for, and a hop
-that answers out of a book no peer claim reaches reports nonce 0 forever: the payer then re-signs one
-cumulative amount at a fresh nonce on every packet, each claim is accepted and advances nothing, and
-a priced termination refuses everything after the first crossing with `F06`, `advanced = 0`.
+> _Superseded by #1380 — the `toon-channel` pay row._ Until ADR 0075 the row named one
+> `toon-channel` held "in both roles at once" with the peering's `[[peer_channels]]` row: `peer_id`,
+> the `channel_id` it paid from and that channel's `chain_id`/`token_network` (its EIP-712 domain),
+> or on Solana (issue #1146) a `channel_account` whose program was `[settlement.solana]`'s and which
+> the same peering had to bind as a Solana `[[peer_channels]]` row, because the carriages rendered a
+> claim's required `programId` from that row. The hop asked answered out of its **peer** book, not
+> its client edge's (`client-edge-spec.md` §1.10, issue #1102), because one channel in both roles
+> answered out of the wrong book reported nonce 0 forever. Every one of those fields is now refused
+> by name at load (`PayChannelToonFieldRemoved`), pointing at ADR 0075's drain procedure, and a
+> voucher channel has one watermark whichever book is asked (§1.8), so the wrong-book failure has no
+> x402 form.
 
 #### Peer role is not a prerequisite for paid carriage
 
@@ -296,17 +330,17 @@ issue #1157): there is no shared credential for peer role either, so the confusi
 #863 can no longer even be stated. This subsection survives that intact, with its conclusion
 unchanged and its argument strictly shorter, because the distinction it draws was never about the
 credential. It is about **configuration at the accepting side**: peer role requires some, and paid
-carriage requires none. Deleting the credential changed what that configuration has to say — a
-channel and a key rather than a matching string — and changed nothing about which of the two needs
-it.
+carriage requires none. Deleting the credential changed what that configuration has to say — a key
+rather than a matching string (a channel and a key until #1380; the payer's voucher signer since) —
+and changed nothing about which of the two needs it.
 
 - A `[[peers]]` row is the **sending** node's own outbound config. It is what lets that node dial,
   and dialling is all it does; by itself it grants the sender nothing at the far end. Peer **role**
-  does still require configuration by the accepting side — but **what the two files must share is a
-  channel, not a name.** The accepting side must hold the on-chain channel the claims are signed
-  against as a `[[peer_channels]]` row, naming the counterparty key that channel was opened
-  against, bound to a peering that side itself configures (a row naming no configured peering binds
-  nothing, and `PeerChannelOrphaned` refuses it at load). What it calls that peering is its own
+  does still require configuration by the accepting side — but **what the two sides must share is a
+  key, not a name.** The accepting side must bind the payer's voucher signer to a peering it itself
+  configures: a `[[peer_channels]]` row naming it as `voucher_signer`, or a `POST /peers` of the
+  payer's URL, which binds the signer its self-description publishes (a row naming no configured
+  peering binds nothing, and `PeerChannelOrphaned` refuses it at load). What it calls that peering is its own
   business: `[[peers]].id` is a **local label**, and a connector MUST NOT require the counterparty's
   file to spell the relation as its own does (§12(7), as amended by ADR 0060). Paid **carriage**
   requires nothing of the sort: the counterparty needs no `[[peers]]` row, no `[[peer_channels]]`
@@ -314,12 +348,12 @@ it.
 - A connector may simply pay another as an ordinary client. Its `auth` frame, if it sends one at
   all, is _acknowledged, not verified_ at the far client edge — "Authorization to write comes from
   the claim on each packet, never from the session"
-  (`crates/connector-client-edge/src/btp.rs`) — and the claim JSON a peer would have sent _is_ a
-  client-edge claim, judged by the same `ClaimBook`. Since ADR 0060 that is one mechanism rather
-  than two that agree: `connector_peer_btp::role_gate::decide` is the single place in this workspace
-  where §1.2's P2/P3 rule meets the claim book's verdict on a signature, and both peer carriages
-  **and** the client edge's shared front door call it. A claim is judged the same way whichever door
-  it arrives at; what differs is only whether it also resolves to a peering.
+  (`crates/connector-client-edge/src/btp.rs`) — and the voucher a peer sends _is_ a client-edge
+  voucher, judged by the same receiving half. Since ADR 0060 that is one mechanism rather than two
+  that agree: `connector_peer_btp::role_gate::decide_frame` is the single place in this workspace
+  where §1.2's rule meets the receiving half's verdict on a signature, and both peer carriages
+  **and** the client edge's shared front door call it. A voucher is judged the same way whichever
+  door it arrives at; what differs is only whether its signer also resolves to a peering.
 - [ADR 0028](../adr/0028-a-forwarded-route-is-priced-at-the-client-edge.md) prices a **forwarded**
   route at the client edge: `Connector::client_route` reports a peer route's own `price` under
   `ClientRouteKind::Forwarded`, so the 402 greeting covers carriage and not only termination —
@@ -345,7 +379,8 @@ many words as "a funded EVM channel this box PAYS … as an ordinary client … 
 still the issue #822 placeholder, and the live box's row named a real channel (`0x0bfd0b88…`) whose
 deposit was 0, so a claim on it is refused before it is ever signed — `InsufficientHeadroom`, because
 "a claim above what has actually been deposited could never be redeemed on chain"
-(`crates/connector-runtime/src/outbound_client.rs:258-269` for the error, `:640-650` for the check).
+(`crates/connector-runtime/src/outbound_client.rs`, since deleted by #1380 with the
+`toon-channel` peer claim it signed).
 It fell back to a client channel, and that fallback is the point: on that path every packet is covered
 by a claim, and an uncovered one is answered `402` with the x402 terms
 (`crates/connector-client-edge/src/lib.rs:754-782`, and `btp.rs:684`/`:725` for the BTP half).
@@ -412,7 +447,8 @@ A connector MUST NOT infer, weight or override role from any of:
 - the shape of what the interaction sent — an inbound TRANSFER, or any carriage-layer entry;
 - anything the interaction did earlier, or that another interaction from the same address did.
 
-Role is decided by P2 and a verified claim, or by X1 or X2 (§1.2), or it is `client`.
+Role is decided by X1 or X2 (§1.2), or it is `client`. (Until #1380 it could also be decided by P2
+and a verified `toon-channel` claim; a `toon-channel` claim now decides nothing.)
 
 > **Withdrawn 2026-08-07 by #868.** The fifth bullet used to end "…or a claim naming a channel that
 > happens to be in `[[peer_channels]]`". That prohibition is now the exact inverse of the rule:
@@ -421,7 +457,9 @@ Role is decided by P2 and a verified claim, or by X1 or X2 (§1.2), or it is `cl
 > "happens to be in `[[peer_channels]]`" describes a claim taken at face value, and a claim is never
 > taken at face value (`crates/connector-runtime/src/claim.rs:1055-1089`). Every other entry on this
 > list is unchanged and still forbidden; one bullet moved, and it moved because the credit window it
-> was written under is gone, not because face-value inference became acceptable.
+> was written under is gone, not because face-value inference became acceptable. (Since #1380 the
+> material that decides is a voucher or challenge from a bound signer's channel, verified the same
+> way; a claim naming a `[[peer_channels]]` channel decides nothing, since no such row names one.)
 
 ### 1.4 Presentation, on each carriage
 
@@ -434,7 +472,9 @@ exists on one carriage and not the other is a defect rather than a property of t
 
 What a peer presents is what every peer frame already carried: **its covering claim**
 ([ADR 0042](../adr/0042-a-packet-carries-its-claim.md)), in the shapes `client-edge-spec.md` §1.9
-already pins. Role is read from those same bytes, on the same packet, every time — §1.2's P2 and P3.
+already pins — since ADR 0075 (#1380), a voucher on the channel it pays this node on, or on a
+zero-value packet the challenge below. Role is read from those same bytes, on the same packet, every
+time — §1.2's X1 and X2.
 
 A connector MUST NOT refuse a request that still carries a `Toon-Peer-Auth` header or an `auth`
 protocolData entry naming a peer. It ignores the value. That is what lets the two ends of a peering
@@ -446,8 +486,8 @@ with its "the contents are not verified" and its permissionless empty-`secret` m
 this section constrains the client role, and an interaction that proves no peering is a client
 (§1.2).
 
-Because HTTP has no session, a request is judged on its own claim. A request carrying none is a
-client request, whatever the previous request from the same connection carried.
+Because HTTP has no session, a request is judged on its own voucher or challenge. A request carrying
+neither is a client request, whatever the previous request from the same connection carried.
 
 **The peer-role challenge (ADR 0075 decision 5, issue #1377).** A voucher rides the claim slot above,
 exactly as a client's does. A zero-value peer packet carries no voucher (ADR 0074 decision 3, extended
@@ -492,23 +532,26 @@ its vector case (ADR 0075 decision 14; ADR 0045).
 > with it, for the same reason: a per-session credential fixed a per-session role, and a per-packet
 > claim fixes a per-packet one.
 
-- **Role is decided from the claim, not before it.** A connector MUST decode and verify the frame's
-  claim first; the verification result is what P3 reads. Role MUST still be fixed **before the
-  packet is routed, before a fee is taken, before a ceiling is consulted, and before any watermark
-  is advanced or anything is journaled.** That ordering already holds in the claim path as written:
-  `accept_inbound_inner` verifies the signature and returns on failure before it so much as reads a
-  watermark, so a claim that does not verify advances nothing
-  (`crates/connector-runtime/src/claim.rs:1116-1131`). Nothing downstream of the `PeerTransport`
-  port may ask which carriage or which credential produced the interaction; it is handed a role.
+- **Role is decided from the voucher, not before it.** A connector MUST resolve the frame's voucher
+  or challenge and verify its signature first; the verification result is what X1 and X2 read. Role
+  MUST still be fixed **before the packet is routed, before a fee is taken, before a ceiling is
+  consulted, and before any watermark is advanced or anything is journaled.** That ordering holds as
+  written: `role_gate::decide_frame` asks the receiving half only for the channel's signer and the
+  signature's verdict, and the voucher is admitted, held to the watermark and journaled only
+  afterwards, by `role_gate::judge_voucher` under the role already fixed. Nothing downstream of the
+  `PeerTransport` port may ask which carriage or which credential produced the interaction; it is
+  handed a role.
 - **Role is a property of the frame, not of the session.** On BTP a session no longer becomes
-  `peer` once and stay so: each frame stands on the claim it carries, and a frame carrying no claim
-  that satisfies P2 and P3 is a client frame however many peer frames preceded it on that socket.
-  This is strictly narrower than the rule it replaces — a session could previously present one
-  credential and then send anything.
-- **Frames not admitted as peer frames MUST NOT be retroactively reclassified.** A claim ingested
-  as a client claim stays a client claim, and its effects on client watermarks stand. §1.8's
-  namespace disjointness is what keeps that safe: the two namespaces can never describe the same
-  channel, so a frame judged in one can never be re-judged in the other.
+  `peer` once and stay so: each frame stands on what it carries, and a frame carrying no voucher or
+  challenge that satisfies X1 or X2 is a client frame however many peer frames preceded it on that
+  socket. This is strictly narrower than the rule it replaces — a session could previously present
+  one credential and then send anything.
+- **Frames not admitted as peer frames MUST NOT be retroactively reclassified.** A voucher accepted
+  as a client's stays accepted, and its advance of the channel's watermark stands. §1.8 is what
+  keeps that safe: an x402 channel has **one** watermark whichever role its vouchers arrive under,
+  so a later peer voucher continues from where the channel stands rather than re-judging what came
+  before. (Until #1380 this rested on the peer and client `toon-channel` namespaces being disjoint
+  by config, so a frame judged in one could never be re-judged in the other.)
 - **A second `auth` entry on a session MUST NOT be evaluated** — nor a first one. There is no
   session-bound role left for one to escalate (bullet 2 above), and no credential left in the entry
   to read ([ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md));
@@ -532,33 +575,32 @@ its vector case (ADR 0075 decision 14; ADR 0045).
 
 ### 1.6 An asserted role is not a proven one
 
-A claim that names a channel a `[[peer_channels]]` row configures, but fails P2 or P3, is an
-**assertion**. The connector:
+A voucher or peer-role challenge on a channel whose chain-recorded voucher signer is **bound** to a
+peering (§1.2), but which fails X1 or X2, is an **assertion**. The connector:
 
 - MUST treat the interaction as a client, per §1.2;
 - MUST NOT refuse it for the assertion alone — refusing would make the check an oracle for which
-  channels this connector has configured;
+  peerings this connector has configured;
 - MUST NOT record, log, meter or expose it as a peer interaction anywhere (`ADR 0014`'s metric and
   log surfaces included); and
 - MUST emit a distinguishable, rate-limited operator-visible event — `peer_auth_refused`, carrying
-  the peering's configured peer id and which of P2/P3 failed — because the most likely real cause
-  is a genuine peer whose key was rotated on one side only, or a `[[peer_channels]]` row this node
-  holds no chain record for, and a silent downgrade to client role would otherwise present to an
-  operator as "peering configured, nothing peers, no error anywhere."
+  the bound peering's peer id and the unmet requirement — because a silent downgrade to client role
+  would otherwise present to an operator as "peering configured, nothing peers, no error anywhere."
 
-The two failures are deliberately **not** one bucket, because they have different fixes. **P2**
-(`UnknownChannel`) means config names a channel the claim book has no record of — config and chain
-disagree, which is this node's wiring rather than the caller's. **P3** (`SignatureInvalid`) means a
-record exists and the signature did not recover to the counterparty key that row configures — a
-rotated key, or somebody else's claim. A shared secret gave one message for both.
+**The two requirements it names (ADR 0075, issues #1377, #1380)** are deliberately **not** one
+bucket, because they have different fixes. A voucher or challenge whose signature does not recover
+to the bound signer is `P3` — somebody else's signature on a bound channel, or a signing fault at the
+payer. A challenge whose signature does verify but whose `expires` is outside its window (§1.2) is
+`P3-expires` — the key is right and the clock or the challenge's lifetime is not. A voucher or
+challenge on a channel whose signer is bound to no peering is silent: every client paying with a
+voucher presents one, so an event there would fire on every client packet. So is one on a channel
+this node cannot resolve, which has no chain-recorded signer to attribute it by. A `toon-channel`
+claim is silent too, since it can no longer assert a peering at all.
 
-**X1 and X2 report the same way (ADR 0075, issue #1377).** A voucher or a challenge on a channel
-whose chain-recorded voucher signer is **bound** to a peering, and whose signature does not recover
-to that signer, is `P3`. A challenge whose signature does verify but whose `expires` is outside its
-window (§1.2) is `P3-expires` — the key is right and the clock or the challenge's lifetime is not, a
-different fix. A voucher or challenge on a channel whose signer is bound to no peering is silent, for
-the reason a claim on an unbound channel is: every client paying with a voucher presents one. So is
-one on a channel this node cannot resolve, which has no chain-recorded signer to attribute it by.
+> _Superseded by #1380._ Under P2/P3 an assertion was a claim naming a channel a `[[peer_channels]]`
+> row configured, and the two buckets were **P2** (`UnknownChannel`: config named a channel the
+> claim book had no record of) and **P3** (`SignatureInvalid`: the signature did not recover to the
+> counterparty key the row configured). A shared secret gave one message for both.
 
 ### 1.7 What each role grants
 
@@ -567,12 +609,17 @@ undefined trust is what leaks.
 
 **Peer role grants, and only these:**
 
-- claims judged against `ClaimBook` and the `[[peer_channels]]` records, advancing peer watermarks
-  and appended to the peer claim ledger;
+- its voucher judged **as a peer's**: by the receiving half against the channel's one watermark
+  (§1.8), journaled, answered in a `claim-ack` (§6), and counted toward price coverage under the
+  peering's own forwarded-claim enforcement (§3.1);
 - being a next hop: packets from this interaction may be forwarded per the routing table, and this
   peering relation may be a route's next hop;
-- `accumulatedCost` relayed with this hop's own fee added (`peer-semantics-pre-868.md` §5.2);
-- FLUSH accepted (§6).
+- `accumulatedCost` relayed with this hop's own fee added (`peer-semantics-pre-868.md` §5.2).
+
+> _Superseded by #1380._ This list used to open with "claims judged against `ClaimBook` and the
+> `[[peer_channels]]` records, advancing peer watermarks and appended to the peer claim ledger" and
+> close with "FLUSH accepted (§6)". No `toon-channel` claim is judged by peer handling now, there is
+> no peer claim watermark or ledger, and no peering sends a FLUSH (§3).
 
 **Peer role does NOT grant:** free carriage; a route the routing table does not have; any operator
 or admin surface (ADR 0008); any exemption from sealing (§8); any say in this connector's fees or
@@ -581,22 +628,34 @@ a route's price; nor the ability to open the payload of a packet it forwards.
 **Client role does NOT grant, and a connector MUST refuse these to a client interaction even when
 it presents bytes that look like them:**
 
-- advancing a `[[peer_channels]]` watermark or writing to the peer claim ledger;
+- having its voucher judged as a peer's — a client's voucher is judged by the client edge's rules
+  on the same channel watermark (§1.8), never under a peering's enforcement;
 - a `claim-ack` / `Toon-Claim-Ack` on a client response — a connector MUST NOT emit one on a
-  client interaction;
-- being treated as a peering relation for flush purposes (§6.4).
+  client interaction.
+
+(Until #1380 this list also named advancing a `[[peer_channels]]` watermark, writing to the peer
+claim ledger, and being treated as a peering relation for flush purposes; none of the three exists
+now.)
 
 ### 1.8 Namespace disjointness
 
-Peer watermarks and client watermarks are **separate records**, keyed in separate namespaces, even
-for the same on-chain channel id. A connector MUST NOT let a claim judged in one namespace advance
-a watermark in the other.
-
-To make that safe rather than merely separate — two namespaces over one channel would otherwise
-let the same claim be counted as credit twice — **a channel id configured in `[[peer_channels]]`
-MUST NOT also appear in `[[client_channels]]`, and a configuration containing both MUST fail at
-load** (§11, `ChannelInBothNamespaces`). Disjointness is enforced in config, so the two namespaces
-can never describe the same money.
+> **Superseded by [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+> (issue #1380) for peer traffic.** The two paragraphs quoted here governed `toon-channel` claims,
+> and no peer claim is a `toon-channel` claim now: there is no peer claim watermark to keep apart
+> from a client's, and a `[[peer_channels]]` row names no `toon-channel` for a `[[client_channels]]`
+> row to collide with, so `ChannelInBothNamespaces` is deleted. `ClaimBook` still holds the client
+> `toon-channel` watermarks (until #1384), and advances no peer's. The x402 rule after the quote is
+> the whole of the rule.
+>
+> Peer watermarks and client watermarks are **separate records**, keyed in separate namespaces, even
+> for the same on-chain channel id. A connector MUST NOT let a claim judged in one namespace advance
+> a watermark in the other.
+>
+> To make that safe rather than merely separate — two namespaces over one channel would otherwise
+> let the same claim be counted as credit twice — **a channel id configured in `[[peer_channels]]`
+> MUST NOT also appear in `[[client_channels]]`, and a configuration containing both MUST fail at
+> load** (§11, `ChannelInBothNamespaces`). Disjointness is enforced in config, so the two
+> namespaces can never describe the same money.
 
 **An x402 channel is not disjoint by config, and its watermark is the channel's (ADR 0075, issue
 #1377).** Whether a voucher channel is a peer's is decided by a runtime binding of its signer
@@ -608,7 +667,11 @@ of the two books (`client-edge-spec.md` §1.10). **Built (#1378):** a peer's vou
 very book a client's is — the client edge's claim gate, keyed by the channel — so there is one
 watermark and one journal (`client-edge-claims.log`) per voucher channel, whichever role its
 vouchers arrive under, and a peer bound after its channel paid as a client continues from where the
-channel stands.
+channel stands. A binding made at boot by a `[[peer_channels]]` row (#1380) is no different.
+
+**What config does keep apart is direction (#1380).** An x402 channel moves value one way, so this
+node is either its payer or its receiver: a `[[pay_channels]]` row's `outbound_channel` that is also
+a `[[peer_channels]]` row's `inbound_channel` is `ChannelInBothDirections`, refused at load.
 
 ### 1.9 The named regression
 
@@ -620,13 +683,21 @@ quasi-peer (the ingress findings ADR 0027 cites).
 following is classified `client` and reaches no peer handling whatsoever:
 
 1. an interaction carrying no claim at all;
-2. an interaction carrying a claim on a channel no `[[peer_channels]]` row configures;
-3. an interaction carrying a claim on a configured channel whose signature does not recover to the
-   counterparty key that row configures (P3 failing);
-4. an interaction carrying a claim on a channel a `[[peer_channels]]` row configures but this node
-   holds no record of (P2 failing);
-5. an interaction carrying a claim on a `[[client_channels]]` channel — the namespace-disjointness
-   case of §1.8, which can never be read as a peering.
+2. ~~an interaction carrying a claim on a channel no `[[peer_channels]]` row configures;~~
+3. ~~an interaction carrying a claim on a configured channel whose signature does not recover to
+   the counterparty key that row configures (P3 failing);~~
+4. ~~an interaction carrying a claim on a channel a `[[peer_channels]]` row configures but this node
+   holds no record of (P2 failing);~~
+5. ~~an interaction carrying a claim on a `[[client_channels]]` channel — the
+   namespace-disjointness case of §1.8, which can never be read as a peering.~~
+
+> **Amended by ADR 0075 (issue #1380).** Cases 2–5 were the `toon-channel` claim's, and collapse
+> into one: **an interaction carrying a `toon-channel` claim, on any channel, whether or not its
+> signature verifies — even under a bound signer's key.** No `toon-channel` claim decides the role
+> now (§1.2), so each of the four still classifies `client`, and is covered by that one case
+> (`a_genuinely_signed_toon_channel_claim_never_decides_the_peer_role` on BTP,
+> `a_toon_channel_claim_never_decides_the_peer_role_even_under_the_bound_signers_key` on HTTP). The
+> numbers are not reused.
 
 > **Rewritten by [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)
 > (issue #1157).** The list previously enumerated credential shapes — no credential, an empty
@@ -646,9 +717,10 @@ following is classified `client` and reaches no peer handling whatsoever:
 10. a challenge's signature presented as a voucher, or a voucher's as a challenge — neither message
     verifies as the other (`connector-signer`'s separation tests).
 
-"Reaches no peer handling" is testable as: no peer watermark moved, nothing was appended to the
-peer claim ledger, and no `claim-ack` was emitted. (Before ADR 0033 this list also named
-peer-relation exposure, which no longer exists to change.)
+"Reaches no peer handling" is testable as: nothing the frame carried moved a watermark as a peer's,
+and no `claim-ack` was emitted. (Before ADR 0033 this list also named peer-relation exposure, which
+no longer exists to change; before #1380 it named the peer claim watermark and ledger, which no
+longer exist either.)
 
 ### 1.10 The dedicated-listener fallback
 
@@ -656,9 +728,9 @@ ADR 0027 names one escape hatch, and it is bounded here so it is not invented un
 role-by-auth cannot be shown safe on a shared listener, a connector MAY expose a **dedicated peer
 listener with mandatory authentication**. If it does:
 
-- role is **still** decided by P2 and P3 on that listener. The listener is defence in depth and
-  MUST NOT become the decider — §1.3 still holds in full;
-- an interaction on that listener that fails P2 or P3 MUST be **refused outright** (BTP: ERROR then
+- role is **still** decided by X1 and X2 (§1.2) on that listener. The listener is defence in depth
+  and MUST NOT become the decider — §1.3 still holds in full;
+- an interaction on that listener that fails X1 and X2 MUST be **refused outright** (BTP: ERROR then
   close; HTTP: `401`) rather than downgraded to client. This is the single place refusal replaces
   downgrade, and it is safe only because a dedicated peer listener serves no clients, so there is
   no client to downgrade to and no oracle to leak (the peer ids it protects are the ones already
@@ -718,6 +790,16 @@ fee)`, ADR 0042). The voucher is signed by the settlement key (`payerAuthorizer 
 
 The peer carriages are mounted wherever `peer_expose` names one, whether or not the config file
 declares a `[[peers]]` table: a runtime peering proves itself on them.
+
+**A config-declared peering is the same two channels (#1380).** Its inbound half is a
+`[[peer_channels]]` row, which binds the peer's voucher signer at boot in place of the published one
+(§1.2); its outbound half is a `[[pay_channels]]` row, which names this node's own journaled
+outbound channel in place of the one `POST /peers` would have opened and registers it as that
+peer's hop. Everything above from "every forward to the peer carries a voucher" on applies to it
+unchanged: the vouchers, the zero-value challenge, the receiver's verdict in the `claim-ack`, and
+the next hop's `POST /ilp/claim-state` as the watermark authority on restore. Neither row opens or
+funds anything — an operator opens the outbound channel with `POST /channels` before writing the
+row, and the peer opens the inbound one.
 
 ---
 
@@ -807,7 +889,9 @@ The fee, the claim watermarks and the claim ledger are **per peering relation, n
 not per connection**. A peering that happens to have two paths (last row of §2.3) is still one
 relation with one set of watermarks. A connector MUST NOT maintain per-carriage watermarks for one
 peer; doing so is a double-spend surface, since the same claim would advance two independent
-watermarks.
+watermarks. Since ADR 0075 (#1380) the watermark is the inbound x402 channel's own (§1.8), which is
+this rule at its strongest: one channel, one watermark, whichever path or role its vouchers arrive
+on.
 
 Where two paths exist, a connector SHOULD prefer the BTP path for claim-bearing traffic, because
 it is the one on which claims cannot race (§7).
@@ -849,20 +933,27 @@ carries the same nonce, which is exactly the case §6.3 requires a payee to answ
 The normative mapping. Each row is a concept from `peer-semantics-pre-868.md` §3–§6 and where its bytes
 ride on each carriage.
 
-| Concept (`peer-semantics-pre-868.md`) | BTP carriage (`wss://`)                                                                                                                    | ILP-over-HTTP carriage (`https://`)                                                                                 |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| PREPARE (§3.1)                        | **MESSAGE** (type 6), OER PREPARE in `ilpPacket`                                                                                           | **POST**, OER PREPARE as the request body                                                                           |
-| FULFILL (§3.1)                        | **RESPONSE** (type 1) under the MESSAGE's `requestId`, OER FULFILL in `ilpPacket`                                                          | **200**, OER FULFILL as the response body                                                                           |
-| REJECT (§5.1)                         | **RESPONSE** under the MESSAGE's `requestId`, OER REJECT in `ilpPacket`                                                                    | **200**, OER REJECT as the response body                                                                            |
-| piggybacked claim (§3.2)              | `payment-channel-claim` protocolData entry, **raw UTF-8 JSON** (§4)                                                                        | `ILP-Payment-Channel-Claim` request header, `base64(JSON)` (§4)                                                     |
-| **FLUSH** (§3.3)                      | **TRANSFER** (type 7): `amount` = the claim's new cumulative, claim in `payment-channel-claim`, no `ilpPacket`                             | **POST with an empty body** plus the claim header — the standalone-claim shape of `client-edge-spec.md` §1.9 step 5 |
-| **CLAIM_ACK** (§3.4)                  | `claim-ack` protocolData entry on the RESPONSE that already answers the claim-bearing frame (§5)                                           | `Toon-Claim-Ack` response header on the response that already answers the claim-bearing request (§5)                |
-| `accumulatedCost` (§5.2)              | `toon-accumulated-cost` entry on the REJECT's RESPONSE, decimal-uint64 UTF-8 — **already implemented on the client edge, reused verbatim** | `Toon-Accumulated-Cost` response header — **already implemented on the client edge, reused verbatim**               |
-| flush prompt (§6.4)                   | _(none — the payee can originate on BTP)_                                                                                                  | `Toon-Flush-Requested` response header, optional (§6.4)                                                             |
-| peer-role challenge (§1.4, ADR 0075)  | `peer-role-challenge` protocolData entry on a zero-value MESSAGE, **raw UTF-8 JSON**                                                       | `Toon-Peer-Role-Challenge` request header, `base64(JSON)`                                                           |
+| Concept (`peer-semantics-pre-868.md`)  | BTP carriage (`wss://`)                                                                                                                    | ILP-over-HTTP carriage (`https://`)                                                                                 |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| PREPARE (§3.1)                         | **MESSAGE** (type 6), OER PREPARE in `ilpPacket`                                                                                           | **POST**, OER PREPARE as the request body                                                                           |
+| FULFILL (§3.1)                         | **RESPONSE** (type 1) under the MESSAGE's `requestId`, OER FULFILL in `ilpPacket`                                                          | **200**, OER FULFILL as the response body                                                                           |
+| REJECT (§5.1)                          | **RESPONSE** under the MESSAGE's `requestId`, OER REJECT in `ilpPacket`                                                                    | **200**, OER REJECT as the response body                                                                            |
+| piggybacked claim (§3.2)               | `payment-channel-claim` protocolData entry, **raw UTF-8 JSON** (§4)                                                                        | `ILP-Payment-Channel-Claim` request header, `base64(JSON)` (§4)                                                     |
+| **FLUSH** (§3.3) — _no longer sent_    | **TRANSFER** (type 7): `amount` = the claim's new cumulative, claim in `payment-channel-claim`, no `ilpPacket`                             | **POST with an empty body** plus the claim header — the standalone-claim shape of `client-edge-spec.md` §1.9 step 5 |
+| **CLAIM_ACK** (§3.4)                   | `claim-ack` protocolData entry on the RESPONSE that already answers the claim-bearing frame (§5)                                           | `Toon-Claim-Ack` response header on the response that already answers the claim-bearing request (§5)                |
+| `accumulatedCost` (§5.2)               | `toon-accumulated-cost` entry on the REJECT's RESPONSE, decimal-uint64 UTF-8 — **already implemented on the client edge, reused verbatim** | `Toon-Accumulated-Cost` response header — **already implemented on the client edge, reused verbatim**               |
+| flush prompt (§6.4) — _no longer sent_ | _(none — the payee can originate on BTP)_                                                                                                  | `Toon-Flush-Requested` response header, optional (§6.4)                                                             |
+| peer-role challenge (§1.4, ADR 0075)   | `peer-role-challenge` protocolData entry on a zero-value MESSAGE, **raw UTF-8 JSON**                                                       | `Toon-Peer-Role-Challenge` request header, `base64(JSON)`                                                           |
 
 Header names are matched case-insensitively per RFC 9110; the canonical lower-case forms are the
 ones the vectors pin.
+
+> **Amended by ADR 0075 (issue #1380).** The FLUSH and flush-prompt rows are kept because their
+> vectors still pin them (§10), but no peer carriage sends either. A FLUSH carried a `toon-channel`
+> claim standing alone, and a voucher rides the PREPARE it covers, so nothing is left pending to
+> flush or to prompt for. An arriving BTP TRANSFER is answered with an empty RESPONSE that
+> acknowledges nothing, keeping RFC-0023's "answer every request"; a voucher standing alone on an
+> HTTP POST with an empty body is still judged and answered.
 
 **A peer connector MUST NOT invent additional entries or headers.** A protocolData entry or header
 this document does not name MUST be ignored on receipt (never refused, so the carriage stays
@@ -877,7 +968,10 @@ additively extensible) and MUST NOT be emitted.
 - **ADR 0024's EIP-712 `BalanceProof` digest is untouched**, on both carriages. A peer claim signs
   exactly the digest `connector_signer::evm_balance_proof_digest` produces today, over exactly the
   fields the deployed `TokenNetwork.sol` typehash requires, `lockedAmount`/`locksRoot` included and
-  hashed as zeros (`peer-semantics-pre-868.md` §3.5). Only carriage moves.
+  hashed as zeros (`peer-semantics-pre-868.md` §3.5). Only carriage moves. _(Since ADR 0075, issue
+  #1380, no peer signs a `BalanceProof` at all: a peer pays with an x402 voucher, whose signed
+  message is the client edge's, `client-edge-spec.md` §1.3. The digest survives for the client
+  edge's `toon-channel` claims until #1384, and in the vectors.)_
 - **`peer-semantics-pre-868.md` §5.1's reject-code table is unchanged, but `F06_UNEXPECTED_PAYMENT` now has
   one peer use** (issue #880, correcting what this bullet said before it landed): a peer PREPARE
   addressed to one of this node's own **`Terminated`** routes, reached over either carriage, MUST
@@ -899,17 +993,18 @@ additively extensible) and MUST NOT be emitted.
   untouched, exactly like the amount check.
 
   **Which record "that channel's watermark" means**, since reading the wrong one is free service:
-  the **durable** one, out of the book that judges the claim — `ClaimBook`'s own inbound watermark
-  for that channel, keyed by channel alone as that book keys it, read before the claim is judged and
-  so possibly advanced. Never a per-process record of what a carriage has observed. `AcceptedClaims`
-  holds one of those for §6.3's byte-identical re-ack, which is correctly a per-relation, per-process
-  question, and a restart empties it while the book replays its journal (ADR 0005). Coverage measured
-  against the emptied record read zero, so the first priced peer PREPARE after a payee restart was
-  credited with its claim's whole cumulative amount instead of its advance — one packet per restart
-  per channel, at the gate standing between a priced termination and free service
-  ([issue #1104](https://github.com/toon-protocol/connector/issues/1104)). The claim book's verdict
-  does not catch this on its own: such a claim's nonce and amount both genuinely advance, so it is
-  `accepted`; only the baseline was wrong.
+  the **durable** one, out of the book that judges the voucher — the receiving half's watermark for
+  that x402 channel (§1.8), journaled in `client-edge-claims.log`, read before the voucher is judged
+  and so possibly advanced. Never a per-process record of what a carriage has observed. Before
+  #1380 the book was `ClaimBook` and the per-process record was the carriages' `AcceptedClaims`
+  ledger (deleted by #1380), which held what §6.3's byte-identical re-ack needed and which a restart
+  emptied while the book replayed its journal (ADR 0005). Coverage measured against the emptied
+  record read zero, so the first priced peer PREPARE after a payee restart was credited with its
+  claim's whole cumulative amount instead of its advance — one packet per restart per channel, at the
+  gate standing between a priced termination and free service
+  ([issue #1104](https://github.com/toon-protocol/connector/issues/1104)). The book's verdict does
+  not catch this on its own: such a claim genuinely advances, so it is `accepted`; only the baseline
+  was wrong.
 
   **A `Forwarded` arrival must cover its own `amount`** ([ADR
   0042](../adr/0042-a-packet-carries-its-claim.md) item 3, correcting what this bullet said while
@@ -947,7 +1042,8 @@ additively extensible) and MUST NOT be emitted.
   includes a **leased** route: `Connector::client_route` excludes leases by construction (ADR 0028),
   so neither rule here reaches one. That is ADR 0028's own gap, unchanged by ADR 0042.
 
-  > **Amended by ADR 0075 (#1378 on EVM, #1379 on Solana).** A runtime peering is two x402 channels
+  > **Amended by ADR 0075 (#1378 on EVM, #1379 on Solana; #1380 for a config-declared peering).** A
+  > runtime peering is two x402 channels
   > (§1.11), and when **both** operators write `POST /peers` naming each other, each side binds the
   > other's published voucher signer: the accepting side then does hold a peering, a voucher on the
   > bound channel decides `peer` (§1.2, X1) and is judged against the channel's one watermark, and
@@ -973,8 +1069,9 @@ additively extensible) and MUST NOT be emitted.
   differences are the client edge's own taxonomy, and neither is a hole in §0.1's one pipeline or a
   drift under I7: the two peer carriages still answer this rule identically, and what changed is
   which **edge** the packet arrived at, not which wire it rode. An operator who wants §3.1's rule to
-  govern what a counterparty sends writes `[[peers]]` and `[[peer_channels]]` on the **accepting**
-  side; there is no runtime write on the payer's node that can put them there.
+  govern what a counterparty sends writes `[[peers]]` and a `[[peer_channels]]` row naming the
+  payer's `voucher_signer` on the **accepting** side, or a `POST /peers` there naming the payer;
+  there is no runtime write on the payer's node that can put either there.
 
 ### 3.2 The `WireClaim` binary encoding is not used on either carriage
 
@@ -989,7 +1086,16 @@ type above the `PeerTransport` port; a carriage converts to and from it and MUST
 
 One claim shape, one JSON encoding, two transfer encodings.
 
-A peer claim is the **same JSON object** `client-edge-spec.md` §1.3 defines for a client claim:
+> **Amended by [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+> (issue #1380).** No peering sends a `toon-channel` claim now: what rides the claim slot on a peer
+> frame is a voucher (below, and §1.11). The slot is still read for a `toon-channel` claim, because it
+> is the client edge's slot too and a client may still pay with one until #1384 — but a frame
+> carrying one is a client frame on either carriage (§1.2), and the peer carriages never judge it.
+> What this section says of a **peer** `toon-channel` claim — the object below as a peer's, §4.1's
+> validation against a `[[peer_channels]]` record, and the declared-`programId` rule — is kept as
+> the record of what ran, and no longer describes peer traffic.
+
+A peer claim was the **same JSON object** `client-edge-spec.md` §1.3 defines for a client claim:
 `version: "1.0"`, discriminated by `blockchain`, with the required fields (`version`, `blockchain`,
 `messageId`, `timestamp`, `senderId`) and the chain-specific fields of that section. This is not a
 convenience: it is why one claim codec, one structural validator and one signature verifier serve
@@ -1001,9 +1107,11 @@ both edges, and why a change to the claim shape cannot land on one and not the o
 - **HTTP**: the `ILP-Payment-Channel-Claim` request header carries `base64(JSON.stringify(claim))`.
   Base64 is a header artifact and nothing more.
 
-**A voucher rides the same slot** (ADR 0075, #1378): the client edge's own `batch-settlement`
-voucher JSON (`client-edge-spec.md` §1.3), verbatim, on both carriages. It is judged by the receiving
-half rather than §4.1's `toon-channel` gate (§1.11).
+**A voucher rides the same slot** (ADR 0075, #1378, and since #1380 the only thing a peer puts
+there): the client edge's own `batch-settlement` voucher JSON (`client-edge-spec.md` §1.3),
+verbatim, on both carriages. It is judged by the receiving half rather than §4.1's `toon-channel`
+gate (§1.11), and a malformed or unverifiable one is answered by the same four `claim-ack` reasons
+(§6.1).
 
 **The privacy-wrapped carriage (`ILP-Payment-Channel-Claim-Wrapped`, NIP-59) is not part of the
 peer carriage on either wire.** A peering relation is configured on both ends by operators who know
@@ -1012,7 +1120,11 @@ that header on a peer-role request.
 
 ### 4.1 Validation
 
-A peer claim is validated by the same gate, in the same order, that
+> _Superseded by ADR 0075 (issue #1380) for peer traffic_ — see §4's banner. A peer's voucher is
+> validated by the receiving half's rules (`client-edge-spec.md` §1.3) against the channel's one
+> watermark (§1.8). The subsection below describes the `toon-channel` peer claim it replaced.
+
+A peer claim was validated by the same gate, in the same order, that
 `peer-semantics-pre-868.md` §3.2 and §3.4 and `client-edge-spec.md` §1.3 already describe — structure,
 then freshness against the watermark, then value, then cryptography — with the peer-side
 differences that were already true and are unchanged by carriage:
@@ -1031,6 +1143,14 @@ differences that were already true and are unchanged by carriage:
   object as, and the next heading says why.
 
 #### The declared `programId` is not reported on this edge — and why that differs from the client edge
+
+> _Superseded by ADR 0075 (issue #1380)._ This rule governed a Solana `toon-channel` peer claim,
+> judged under the program a Solana `[[peer_channels]]` row's peering settled with and rendered from
+> that row. There is no such row now and no such claim on a peer carriage: a Solana peer pays with a
+> `payment-channels` voucher, whose program is a constant of the binary. `claim_json::parse` still
+> drops the field, and the test cited at the end of this subsection
+> (`a_peer_claims_declared_program_is_not_consulted.rs`) is deleted with the claim it held to the
+> rule. Kept as the record of why the two edges differed.
 
 **Normatively.** A peer claim's `programId` MUST carry exactly what `client-edge-spec.md` §1.3 pins
 — the settlement program its `channelAccount` lives under, byte-for-byte the program id the payer
@@ -1169,8 +1289,9 @@ ceiling-shaped config at all.
 A `claim-ack` is a field on the response the carriage **already requires** for the claim-bearing
 frame — never a frame of its own:
 
-- **BTP**: a `claim-ack` protocolData entry on the RESPONSE under the claim-bearing MESSAGE's or
-  TRANSFER's `requestId`.
+- **BTP**: a `claim-ack` protocolData entry on the RESPONSE under the claim-bearing MESSAGE's
+  `requestId`. (A TRANSFER — the FLUSH — was acked the same way until #1380; one arriving now gets
+  an empty RESPONSE carrying no ack, §3.)
 - **HTTP**: a `Toon-Claim-Ack` response header on the response to the claim-bearing request.
 
 The body in both cases is the same JSON, raw UTF-8 on BTP and `base64(JSON)` in the HTTP header:
@@ -1217,6 +1338,16 @@ A `claim-ack` MUST NOT appear on a response answering a frame that carried no cl
 arrives there it MUST be ignored.
 
 ### 6.3 Absence, timeout, and retransmission
+
+> **Amended by ADR 0075 (issue #1380).** The absence rule and the per-PREPARE deadline below govern
+> a voucher exactly as they governed a claim. What does not carry over: the FLUSH rows of the
+> deadline table (no peering sends a FLUSH, §3), so `claim_ack_timeout_ms` still parses on a
+> `[[peers]]` row but no longer bounds anything; and the nonce rules of the retransmission bullets,
+> since a voucher has no nonce. A voucher's freshness is its amount alone (ADR 0074 decision 3): a
+> byte-identical resend at the watermark is `accepted` and advances nothing, a different voucher at
+> or below it is `amount_not_advancing`, and a payer whose voucher went unacknowledged or refused
+> asks the receiver's `POST /ilp/claim-state` where the channel stands before it signs again
+> (§1.11), rather than retransmitting a pending claim.
 
 The one honest loss of moving CLAIM_ACK from a frame type to a field: as an entry or a header it is
 **omissible**, where a distinct frame type made "the peer sent no ack" inexpressible. The
@@ -1285,7 +1416,8 @@ Three consequences, in the order an operator meets them — the third retired by
    detectable (§11, `PeerRouteUndeliverable`) and MUST reject `T01` at runtime otherwise. **This is
    the consequence that actually bites at configuration time**, and it is more likely to surprise
    an operator than the flush question below.
-2. **The residual flush case.** Where an accept-only side nonetheless holds a pending claim for
+2. **The residual flush case** — _retired by ADR 0075 (issue #1380): a voucher rides the PREPARE it
+   covers, so no peering holds a pending claim to flush._ Where an accept-only side nonetheless holds a pending claim for
    that peer — because it could dial earlier and can no longer, or its configured endpoint is
    unreachable — it **cannot send the FLUSH at all**. The claim stays pending until it can dial
    again. `flushIntervalMs` no longer exists as configuration (ADR 0033), and the ceiling that used
@@ -1298,7 +1430,11 @@ Three consequences, in the order an operator meets them — the third retired by
    `AcceptOnlyPeerWithoutCeiling` no longer exists. Kept here, struck through, only so a reader
    following §11's history is not left guessing what the removed error covered.
 
-**`Toon-Flush-Requested` — a hint, and only a hint.** A payee that cannot originate MAY set this
+**`Toon-Flush-Requested` — a hint, and only a hint.** _Retired by ADR 0075 (issue #1380): the peer
+carriages no longer emit it, because it named a pending `toon-channel` claim and a voucher is never
+pending — it rides the PREPARE it covers. The header's name survives only in the vectors (§10). A
+payer receiving one ignores it, which the rules below already required of a payer with nothing
+pending. Kept as the record of what it was._ A payee that cannot originate MAY set this
 response header on any response it sends to that peer:
 
 ```
@@ -1346,6 +1482,10 @@ MUST NOT infer which claim an ack answers from position — the defect §12 reco
 The race `client-edge-spec.md` §1.9 exists to remove is present on an HTTP peering and absent on a
 BTP one: parallel requests carrying nonces _n_ and _n+1_ reach the watermark lock in either order,
 and the loser is refused `nonce_not_advancing` for nothing.
+
+For a voucher (ADR 0075) the race is the same with amounts in place of nonces: parallel cumulative
+vouchers _a_ and _a' > a_ arrive in either order, and _a_ arriving second is refused
+`amount_not_advancing`.
 
 Normative mitigation, matching what the client edge already ships: **a connector dialing a peer
 over HTTP MUST NOT have more than one claim-bearing request in flight to that peer per channel.**
@@ -1465,7 +1605,8 @@ on one carriage and not the other, and cannot appear on the wire without a vecto
 claim JSON, parsed by the same structural validator and checked against the same
 `connector_signer::claim_signature` digest (ADR 0024). There is no peer claim type on the wire.
 
-**I5 — One pipeline below the port.** Route lookup, `ClaimBook`, journal and fee accounting are
+**I5 — One pipeline below the port.** Route lookup, the receiving half that judges a peer's voucher
+(`ClaimBook` until #1380), journal and fee accounting are
 reached only through `PeerTransport`, and none of them can observe which carriage delivered a
 packet. _Enforced by:_ the port's existing contract suite being generic over how a peer is wired up
 (kept deliberately so in issue #679), extended with one arm per carriage. A carriage that needs to
@@ -1474,15 +1615,17 @@ change anything above the port is a signal the seam is wrong.
 **I6 — One relation, one set of watermarks.** §2.5: watermarks and the ledger are per peering
 relation, never per carriage or per connection.
 
-**I7 — One role decision.** §1: the same **P2/P3** rule — a channel binding _and_ a verified claim
-on one of that peer's channels — the same downgrade behaviour, and the same named regression test on
-both carriages, with the **claim** in the two encodings §3's table pins so a carriage cannot admit as
-a peer a frame the other would downgrade. _Enforced by:_ one decision function taking a channel id
+**I7 — One role decision.** §1: the same **X1/X2** rule — a verified voucher, or on a zero-value
+packet a verified in-window challenge, from a channel whose voucher signer is bound to that peer —
+the same downgrade behaviour, and the same named regression test on both carriages, with the
+**voucher** and the challenge in the two encodings §3's table pins so a carriage cannot admit as a
+peer a frame the other would downgrade. _Enforced by:_ one decision function taking the bound peer
 and a verification verdict and nothing else — a value that cannot carry the carriage, the port, the
-source address or the session's history, so two frames differing only in those are literally the same
-input (`crates/connector-peer-auth/src/decision.rs`, `decide_role` and its
-`a_presented_claim_carries_nothing_a_carriage_could_weight`). That is §1.3 made structural rather
-than reviewed.
+source address or the session's history, so two frames differing only in those are literally the
+same input (`crates/connector-peer-auth/src/decision.rs`, `decide_voucher_role`), reached from both
+carriages through the one join, `connector_peer_btp::role_gate::decide_frame`. That is §1.3 made
+structural rather than reviewed. (Until #1380 the rule was P2/P3 and the function
+`decide_role`, over a channel id and a claim verdict; both are deleted.)
 
 > **Corrected 2026-08-20 (issue #1073).** This invariant said "the same P1/P2 rule". **P1 — the
 > `{peerId, secret}` bearer credential — has not decided role since issue #868**, as §1's own banner
@@ -1592,6 +1735,11 @@ and `schema_version` moves to **4** to announce it.
 
 **Flush**
 
+_Amended by ADR 0075 (issue #1380):_ items 13, 14 and 17 still pin their shapes in the corpus at
+`schema_version` 6, but no peer carriage sends a FLUSH or a `Toon-Flush-Requested` hint any more (§3,
+§6.4). They describe the `toon-channel` wire, whose removal from the corpus is ADR 0075 decision
+14's `schema_version` 7 change, not this step's.
+
 13. `peer_flush` _(pair)_ — BTP: a complete TRANSFER frame with `amount` equal to the claim's new
     cumulative, the `payment-channel-claim` entry, and **no** `ilpPacket`. HTTP: a POST with an
     empty body and the claim header. The equality between the TRANSFER `amount` and the claim's
@@ -1685,16 +1833,31 @@ Required surface:
   otherwise have deleted this field's default with it.
 - The accepting mirror, **inverted** by
   [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (issue
-  #1157): configured **channels** map to peer ids, not peer ids to channels. The accepting side
-  reads the `channel_id` the frame's claim names, resolves it to the one `[[peer_channels]]` row
-  that may configure it — one is exact, because a second row on the same channel is
-  `PeerChannelDuplicate` at load — and takes the peer id off **that row**, never off the
-  interaction (§1.2, §1.3). Where the credential mapped a presented name to a peering and thence to
-  its channels, the claim names the channel and config names the peering, so no attacker-chosen
-  string reaches the lookup at all. This is why nothing had to replace the credential: its one
-  remaining structural job, saying which peering to evaluate against, is done by the claim at no
-  cost.
-- `[[peer_channels]]` — EVM shape: `peer_id`, `channel_id`, `counterparty_key`, `chain_id`,
+  #1157) and re-keyed by [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+  (issue #1380): configured **voucher signers** map to peer ids, not peer ids to credentials. The
+  accepting side resolves the channel the frame's voucher or challenge names, reads that channel's
+  voucher signer off the chain, looks the signer up in its bindings — one `[[peer_channels]]` row
+  at most, because a second row naming the same signer or inbound channel is `PeerChannelDuplicate`
+  at load — and takes the peer id off **that binding**, never off the interaction (§1.2, §1.3).
+  Where the credential mapped a presented name to a peering, the chain names the signer and config
+  names the peering, so no attacker-chosen string reaches the lookup at all. This is why nothing had
+  to replace the credential: its one remaining structural job, saying which peering to evaluate
+  against, is done by the voucher at no cost. (Between ADR 0060 and #1380 the lookup was by the
+  `channel_id` a `toon-channel` claim named.)
+- `[[peer_channels]]` (ADR 0075 decisions 5 and 9, issue #1380) — `peer_id`; `voucher_signer`, the
+  key that signs the peer's vouchers (EVM: the peer's settlement address, `0x` and 40 hex, the
+  channel's `payerAuthorizer`; Solana: its base58 `authorized_signer`), whose spelling names the
+  chain; and optional `inbound_channel`, the x402 channel id (EVM) or `payment-channels` channel
+  account (Solana) that pins the binding to one channel (§1.2). The row requires the chain's
+  `[settlement.<chain>.batch_settlement]` table and `state_dir`, and binds the signer at boot
+  (`configuration-spec.md` §2.1 is the key-by-key reference).
+- `[[pay_channels]]` (ADR 0042 item 2, as ADR 0075 decisions 4, 6 and 9 amend it, issue #1380) —
+  `peer_id`, `outbound_channel` (an x402 channel this node opened, which its outbound-channel
+  journal MUST hold or the node refuses to start) and `client_edge_url` (§1.2's "What a
+  config-declared hop is").
+- _Superseded by #1380 — the `toon-channel` `[[peer_channels]]` shapes._ Every field named in the
+  rest of this bullet is refused by name at load now (`PeerChannelToonFieldRemoved`), pointing at
+  ADR 0075's drain procedure. EVM shape: `peer_id`, `channel_id`, `counterparty_key`, `chain_id`,
   `token_network`. Solana shape (issue #759): `peer_id`, `channel_account`, `counterparty_key` —
   no `chain_id`/`token_network`, since a Solana channel has neither an EVM-style numeric chain id
   nor a per-token verifying contract, and (issue #1128) **no `program_id` either**. A Solana
@@ -1730,6 +1893,15 @@ Required surface:
   `accept_inbound` and sign an outbound claim on that channel.
 
 ### 11.1 A channel row requires the settlement table of its own chain (issue #1138)
+
+> **Amended by ADR 0075 (issue #1380).** For the peer and pay books the rule is now stricter: a
+> `[[peer_channels]]` or `[[pay_channels]]` row requires its chain's
+> `[settlement.<chain>.batch_settlement]` table, not merely `[settlement.<chain>]`, because that
+> sub-table is what makes this node take part in x402 channels on the chain at all
+> (`PeerChannelWithoutX402`, `PayChannelWithoutX402`). The per-book consequences below that speak of
+> a peer or pay row's `toon-channel` claims — a claim signed or judged under a program id, an
+> EVM-only file reaching `PayChannelWithoutEvmSettlement` — describe the retired row shapes. The
+> `[[client_channels]]` half is unchanged until #1384.
 
 **One rule, and it governs every channel table.** A `[[peer_channels]]`, `[[client_channels]]` or
 `[[pay_channels]]` row on a chain for which this node declares no `[settlement.<chain>]` table is a
@@ -1780,38 +1952,52 @@ does settle on while paying over one it does not.
 
 Named load-time errors this specification requires (spelling #677's, identity ours):
 
-| Error                                           | Condition                                                                                                                                                                                                                                                                                                                   | Source             |
-| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| `PeerUndialable`                                | `expose` is empty **and** a configured peer has no `endpoint` — a peering that can never establish                                                                                                                                                                                                                          | §2.2               |
-| `PeerEndpointScheme`                            | an `endpoint` whose scheme is neither `wss://` nor `https://` — nor, at a `.onion` or `.anyone` host, `ws://` or `http://` (ADR 0070)                                                                                                                                                                                       | §2.1               |
-| `PeerCredentialRemoved`                         | a `[[peers]]` entry setting `credential` at all — the `{peerId, secret}` shared secret is deleted and nothing replaces it, so a file writing one is stopped **by name** rather than peered without it. Replaces `PeerCredentialMissing` ("no credential — it could never satisfy P1"), a requirement that no longer exists  | §1.2, ADR 0060     |
-| `PeerChannelUnbound`                            | a `[[peers]]` entry with no `[[peer_channels]]` row — it could never satisfy P2                                                                                                                                                                                                                                             | §1.2               |
-| `PeerChannelOrphaned`                           | a `[[peer_channels]]` row naming an unknown `peer_id`                                                                                                                                                                                                                                                                       | §1.2               |
-| `PeerChannelDuplicate`                          | one `channel_id` in two `[[peer_channels]]` rows — "whichever row's counterparty key won" would depend on iteration order. Load-bearing since ADR 0060: P3 resolves a claim to a peering **through its channel**, so this is what makes the claim's `channel_id` a sufficient identifier                                    | §1.2, ADR 0060     |
-| `ChannelInBothNamespaces`                       | a channel id present in both `[[peer_channels]]` and `[[client_channels]]`                                                                                                                                                                                                                                                  | §1.8               |
-| `PeerChannelProgramIdRemoved`                   | a Solana `[[peer_channels]]` row still setting `program_id` — the key is removed; the program is read from `[settlement.solana]`, the only one this node can redeem under                                                                                                                                                   | #1128              |
-| `PeerChannelWithoutSolanaSettlement`            | a Solana `[[peer_channels]]` row on a node with no `[settlement.solana]` table — nothing to read the program id from, and nothing to redeem a claim through                                                                                                                                                                 | #1128              |
-| `PeerChannelWithoutEvmSettlement`               | an EVM `[[peer_channels]]` row on a node with no `[settlement.evm]` table — no address to be the channel's on-chain participant, so nothing to redeem an inbound claim at and no key to sign an outbound one with                                                                                                           | §11.1, #1138       |
-| `ClientChannelWithoutEvmSettlement`             | an EVM `[[client_channels]]` row on a node with no `[settlement.evm]` table — the client-edge case of §11.1; the declared-channel exemption is a credit policy and does not reach redeemability                                                                                                                             | §11.1, #1138       |
-| `ClientChannelWithoutSolanaSettlement`          | a Solana `[[client_channels]]` row on a node with no `[settlement.solana]` table — no program to judge the claim under and no address to collect it at. Was a warn-and-skip that left the row configured and every claim on it refused as unknown                                                                           | §11.1, #1138       |
-| `ClientChannelSolanaSettlementProgramIdInvalid` | a Solana `[[client_channels]]` row whose `[settlement.solana] program_id` is not base58 of a 32-byte value — the twin of the peer row's, and it replaces a boot panic                                                                                                                                                       | §11.1, #1138       |
-| `PeerChannelSolanaSettlementProgramIdInvalid`   | a Solana `[[peer_channels]]` row whose `[settlement.solana] program_id` is not base58 of a 32-byte value                                                                                                                                                                                                                    | #1128              |
-| `PeerChannelInvalidSolanaAccount`               | a Solana `[[peer_channels]]` row's `channel_account`/`counterparty_key` is not base58 of a 32-byte value                                                                                                                                                                                                                    | #759               |
-| `PayChannelUnbound`                             | a `[[routes]]` entry whose next hop is a peering with no `[[pay_channels]]` row — a connector covers every PREPARE it sends and the postpay fallback is deleted, so every packet on that route would be refused at packet time. Keyed on the **route**: a peering this node only accepts on needs no row                    | ADR 0042, #1145    |
-| `PayChannelWithoutSolanaSettlement`             | a Solana `[[pay_channels]]` row on a node with no `[settlement.solana]` table — no ed25519 key to sign a covering claim with, and no program id for ADR 0053 to bind into it                                                                                                                                                | §11.1, #1146       |
-| `PayChannelSolanaSettlementProgramIdInvalid`    | a Solana `[[pay_channels]]` row whose `[settlement.solana] program_id` is not base58 of a 32-byte value — the pay-book twin of the peer and client rows'                                                                                                                                                                    | #1146              |
-| `PayChannelInvalidSolanaAccount`                | a Solana `[[pay_channels]]` row's `channel_account` is not base58 of a 32-byte value                                                                                                                                                                                                                                        | #1146              |
-| `PayChannelProgramIdNotDeclared`                | a Solana `[[pay_channels]]` row setting `program_id` — this table never declared one; the program is `[settlement.solana]`'s, as it is for the other two books. Named rather than left to `#[serde(untagged)]`'s "matched no variant"                                                                                       | #1146              |
-| `PayChannelSolanaWithoutPeerChannel`            | a Solana `[[pay_channels]]` row whose channel account is not also bound by a Solana `[[peer_channels]]` row for that peering — `programId` is a required claim-wire field and the carriage renders it from that row, so every claim this row minted would be unrenderable                                                   | #1146              |
-| `PeerRouteUndeliverable`                        | a route naming as next hop a peer this connector can never originate to                                                                                                                                                                                                                                                     | §2.2, §6.4         |
-| `DuplicatePeerId`                               | two `[[peers]]` entries with the same `id`                                                                                                                                                                                                                                                                                  | —                  |
-| `InvalidForwardedClaimEnforcement`              | `forwarded_claim_enforcement` set to anything other than `"observe"` or `"enforce"` — here a typo meant as `"enforce"` falls through to the permissive default and carries forwards for free                                                                                                                                | ADR 0042           |
-| `PeerMaxPacketAmountZero`                       | `max_packet_amount = 0` — a cap of zero refuses every packet the peering could carry, and there is no "disable the cap" spelling                                                                                                                                                                                            | ADR 0042           |
-| `PeerClaimEnforcementRemoved`                   | `claim_enforcement` set at all — issue #883's canary knob is gone and the terminated rule enforces unconditionally, so `"observe"` names no mode and `"enforce"` names the only behaviour there is. The message also disambiguates the still-live `forwarded_claim_enforcement`, since the two spellings differ by one word | ADR 0042, #1077    |
-| removed-field errors                            | `peer_wire_addr`, `addr` in its old `SocketAddr` shape, or `ceiling`/`flush_interval_ms` (ADR 0033, issue #882) — a **hard, named** error pointing at the bring-up doc, never a silent ignore, because the devnet boxes run bind-mounted configs that lead the repo                                                         | ADR 0027, ADR 0033 |
+| Error                                                                   | Condition                                                                                                                                                                                                                                                                                                                   | Source                |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
+| `PeerUndialable`                                                        | `expose` is empty **and** a configured peer has no `endpoint` — a peering that can never establish                                                                                                                                                                                                                          | §2.2                  |
+| `PeerEndpointScheme`                                                    | an `endpoint` whose scheme is neither `wss://` nor `https://` — nor, at a `.onion` or `.anyone` host, `ws://` or `http://` (ADR 0070)                                                                                                                                                                                       | §2.1                  |
+| `PeerCredentialRemoved`                                                 | a `[[peers]]` entry setting `credential` at all — the `{peerId, secret}` shared secret is deleted and nothing replaces it, so a file writing one is stopped **by name** rather than peered without it. Replaces `PeerCredentialMissing` ("no credential — it could never satisfy P1"), a requirement that no longer exists  | §1.2, ADR 0060        |
+| `PeerChannelUnbound`                                                    | a `[[peers]]` entry with no `[[peer_channels]]` row — no voucher signer is bound to it, so it could never take the peer role                                                                                                                                                                                                | §1.2, #1380           |
+| `PeerChannelOrphaned`                                                   | a `[[peer_channels]]` row naming an unknown `peer_id`                                                                                                                                                                                                                                                                       | §1.2                  |
+| `PeerChannelDuplicate`                                                  | one `voucher_signer`, or one `inbound_channel`, in two `[[peer_channels]]` rows — which peering it proves would depend on file order. Load-bearing since ADR 0060: role resolves to a peering **through the binding**, so this is what makes a verified voucher a sufficient identifier                                     | §1.2, ADR 0060, #1380 |
+| `PeerChannelVoucherSignerMissing`                                       | a `[[peer_channels]]` row with no `voucher_signer`                                                                                                                                                                                                                                                                          | §1.2, #1380           |
+| `PeerChannelInvalidVoucherSigner`                                       | a `voucher_signer` that is neither `0x` + 20-byte hex (EVM) nor base58 of a 32-byte key (Solana)                                                                                                                                                                                                                            | §1.2, #1380           |
+| `PeerChannelInvalidInboundChannel`                                      | an `inbound_channel` that is not an x402 channel on the chain its `voucher_signer` names                                                                                                                                                                                                                                    | §1.2, #1380           |
+| `PeerChannelWithoutX402`                                                | a `[[peer_channels]]` row on a chain whose `[settlement.<chain>]` has no `batch_settlement` sub-table — no channel the peer opens toward this node could ever be admitted                                                                                                                                                   | §11.1, #1380          |
+| `PeerChannelsWithoutStateDir`                                           | `[[peer_channels]]` with no `state_dir` — a peer's vouchers are journaled beside a client's, and a watermark held only in memory is no replay defence                                                                                                                                                                       | §1.8, #1380           |
+| `PeerChannelToonFieldRemoved`                                           | a `[[peer_channels]]` row writing `channel_id`, `channel_account`, `chain_id`, `token_network`, `counterparty_key` or `program_id` — the `toon-channel` row shape, refused by name and pointing at ADR 0075's drain procedure                                                                                               | ADR 0075, #1380       |
+| `ChannelInBothDirections`                                               | a `[[pay_channels]]` `outbound_channel` that is also a `[[peer_channels]]` `inbound_channel` — an x402 channel moves value one way                                                                                                                                                                                          | §1.8, ADR 0075, #1380 |
+| `ClientChannelWithoutEvmSettlement`                                     | an EVM `[[client_channels]]` row on a node with no `[settlement.evm]` table — the client-edge case of §11.1; the declared-channel exemption is a credit policy and does not reach redeemability                                                                                                                             | §11.1, #1138          |
+| `ClientChannelWithoutSolanaSettlement`                                  | a Solana `[[client_channels]]` row on a node with no `[settlement.solana]` table — no program to judge the claim under and no address to collect it at. Was a warn-and-skip that left the row configured and every claim on it refused as unknown                                                                           | §11.1, #1138          |
+| `ClientChannelSolanaSettlementProgramIdInvalid`                         | a Solana `[[client_channels]]` row whose `[settlement.solana] program_id` is not base58 of a 32-byte value — the twin of the peer row's, and it replaces a boot panic                                                                                                                                                       | §11.1, #1138          |
+| `PayChannelUnbound`                                                     | a `[[routes]]` entry whose next hop is a peering with no `[[pay_channels]]` row — a connector covers every PREPARE it sends and the postpay fallback is deleted, so every packet on that route would be refused at packet time. Keyed on the **route**: a peering this node only accepts on needs no row                    | ADR 0042, #1145       |
+| `PayChannelOrphaned`                                                    | a `[[pay_channels]]` row naming an unknown `peer_id`                                                                                                                                                                                                                                                                        | §1.2                  |
+| `PayChannelOutboundChannelMissing` / `PayChannelInvalidOutboundChannel` | a `[[pay_channels]]` row with no `outbound_channel`, or one that is neither an EVM x402 channel id nor a base58 Solana channel account                                                                                                                                                                                      | §1.2, #1380           |
+| `PayChannelWithoutX402`                                                 | a `[[pay_channels]]` row on a chain whose `[settlement.<chain>]` has no `batch_settlement` sub-table — no paying half to sign a voucher with                                                                                                                                                                                | §11.1, #1380          |
+| `PayChannelInvalidClientEdgeUrl` / `PayChannelClientEdgeUrlScheme`      | an unparseable `client_edge_url`, or one that is not `https://` (or `http://` under `peer_allow_plaintext_endpoints`)                                                                                                                                                                                                       | §1.2                  |
+| `PayChannelDuplicatePeer` / `PayChannelDuplicate`                       | one peering in two `[[pay_channels]]` rows, or one channel paying two                                                                                                                                                                                                                                                       | §1.2, #1380           |
+| `PayChannelsWithoutStateDir`                                            | `[[pay_channels]]` with no `state_dir` — the channel is held in the outbound-channel journal there                                                                                                                                                                                                                          | §1.2, #1380           |
+| `PayChannelToonFieldRemoved`                                            | a `[[pay_channels]]` row writing a `toon-channel` field, as for `PeerChannelToonFieldRemoved`                                                                                                                                                                                                                               | ADR 0075, #1380       |
+| `PeerRouteUndeliverable`                                                | a route naming as next hop a peer this connector can never originate to                                                                                                                                                                                                                                                     | §2.2, §6.4            |
+| `DuplicatePeerId`                                                       | two `[[peers]]` entries with the same `id`                                                                                                                                                                                                                                                                                  | —                     |
+| `InvalidForwardedClaimEnforcement`                                      | `forwarded_claim_enforcement` set to anything other than `"observe"` or `"enforce"` — here a typo meant as `"enforce"` falls through to the permissive default and carries forwards for free                                                                                                                                | ADR 0042              |
+| `PeerMaxPacketAmountZero`                                               | `max_packet_amount = 0` — a cap of zero refuses every packet the peering could carry, and there is no "disable the cap" spelling                                                                                                                                                                                            | ADR 0042              |
+| `PeerClaimEnforcementRemoved`                                           | `claim_enforcement` set at all — issue #883's canary knob is gone and the terminated rule enforces unconditionally, so `"observe"` names no mode and `"enforce"` names the only behaviour there is. The message also disambiguates the still-live `forwarded_claim_enforcement`, since the two spellings differ by one word | ADR 0042, #1077       |
+| removed-field errors                                                    | `peer_wire_addr`, `addr` in its old `SocketAddr` shape, or `ceiling`/`flush_interval_ms` (ADR 0033, issue #882) — a **hard, named** error pointing at the bring-up doc, never a silent ignore, because the devnet boxes run bind-mounted configs that lead the repo                                                         | ADR 0027, ADR 0033    |
 
 `AcceptOnlyPeerWithoutCeiling` and the `claim_ack_timeout_ms > flush_interval_ms` load-time warning
 (§6.3) are retired along with `ceiling`/`flush_interval_ms` (ADR 0033, issue #882).
+
+Deleted with the `toon-channel` row shapes by [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+(issue #1380), each now reached as `PeerChannelToonFieldRemoved` or `PayChannelToonFieldRemoved`
+where a file still writes the field it guarded: `ChannelInBothNamespaces` (§1.8),
+`PeerChannelProgramIdRemoved`, `PeerChannelWithoutEvmSettlement`,
+`PeerChannelWithoutSolanaSettlement`, `PeerChannelSolanaSettlementProgramIdInvalid`,
+`PeerChannelInvalidSolanaAccount`, `PayChannelWithoutSolanaSettlement`,
+`PayChannelSolanaSettlementProgramIdInvalid`, `PayChannelInvalidSolanaAccount`,
+`PayChannelProgramIdNotDeclared` and `PayChannelSolanaWithoutPeerChannel`. A `[[pay_channels]]` row
+whose `outbound_channel` this node's outbound-channel journal does not hold is refused at boot rather
+than at load, since the journal is read only once the node starts.
 
 **No `transport` selector.** There is no field selecting between a peer semantics and a carriage: the
 raw-TCP wire is deleted, and the carriage is selected by `expose` and by each endpoint's scheme.
@@ -1859,7 +2045,9 @@ Recorded explicitly so review can accept or overturn each, rather than discoveri
    discloses the peer surface.
 6. **`ChannelInBothNamespaces` (§1.8).** ADR 0027 requires separate roles; the double-counting risk
    of one channel in both namespaces is not addressed there. Enforcing disjointness in config is
-   the cheapest safe answer.
+   the cheapest safe answer. _Superseded by ADR 0075 (issue #1380):_ no peer claim is a
+   `toon-channel` claim, so the error is deleted; an x402 channel has one watermark whichever role
+   pays on it (§1.8), and the one cross-book refusal left is `ChannelInBothDirections`.
 7. **The credential's `peerId` named the peering _relation_, so both operators wrote the same
    string (§1.4, §1.2 P1)** — _superseded by
    [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (issue
@@ -1880,13 +2068,16 @@ Recorded explicitly so review can accept or overturn each, rather than discoveri
    **Nothing puts a peering id on the wire now, and the two operators need not agree on one.**
    `[[peers]].id` is a **local label**: it names a peering to this node's own `[[routes]]`,
    `[[peer_channels]]` and `[[pay_channels]]` rows, and the accepting side reads the peer id off
-   the `[[peer_channels]]` row the claim's channel resolves to, never off the interaction (§1.2).
-   A connector MUST NOT require the counterparty's file to spell the relation as its own file
-   does, and MUST NOT take an id from an interaction at all (§1.3). **What the two files MUST
-   agree on is the channel**: the on-chain channel the peering's claims are signed against and the
-   counterparty key it was opened against, as `[[peer_channels]]` configures them (§11). A
-   disagreement there is no longer invisible — it is P2 or P3, and §1.6 requires it be reported as
-   `peer_auth_refused`.
+   the binding the voucher's signer resolves to, never off the interaction (§1.2). A connector
+   MUST NOT require the counterparty's file to spell the relation as its own file does, and MUST
+   NOT take an id from an interaction at all (§1.3). **What the two sides MUST agree on is the
+   payer's voucher signer** (since ADR 0075, issue #1380; the channel and its counterparty key
+   before it): the key the payer's channel names, as the accepting side's `[[peer_channels]]` row
+   or `POST /peers` binds it (§11). A voucher on a bound channel that does not recover to that key
+   is no longer invisible — it is `P3`, and §1.6 requires it be reported as `peer_auth_refused`. A
+   `voucher_signer` that names the wrong key altogether binds nothing the payer signs with, so the
+   payer's vouchers arrive as a client's: silent by §1.6's rule, and visible as a peering that never
+   takes the peer role.
 
 8. **One node-wide, default-false opt-in may widen which endpoint _schemes_ resolve (§2.1).**
    §2.1's "any other scheme MUST be a load-time error" is kept as the default and as the only

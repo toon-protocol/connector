@@ -6,8 +6,7 @@
 //! # What this crate is, and what it deliberately is not
 //!
 //! It is the **carriage**: where the bytes ride. It is not the semantics.
-//! Claim exchange, flush, fees and the refusal taxonomy
-//! are `peer-semantics-pre-868.md` §3--§6's and live above the
+//! Voucher exchange, fees and the refusal taxonomy are `peer-semantics-pre-868.md` §3--§6's and live above the
 //! [`connector_runtime::PeerTransport`] port, unchanged by which wire carried
 //! them. This crate maps §3's table onto requests and responses, and nothing
 //! else:
@@ -16,15 +15,17 @@
 //! | ------- | ------------- |
 //! | PREPARE | **POST**, OER PREPARE as the request body |
 //! | FULFILL / REJECT | **200**, OER FULFILL/REJECT as the response body |
-//! | piggybacked claim | `ILP-Payment-Channel-Claim` request header, `base64(JSON)` |
-//! | **FLUSH** | **POST with an empty ILP body** plus the claim header -- the standalone-claim shape of `client-edge-spec.md` §1.9 step 5 |
+//! | piggybacked voucher | `ILP-Payment-Channel-Claim` request header, `base64(JSON)` |
+//! | **FLUSH** | **POST with an empty ILP body** plus the claim header -- the standalone-claim shape of `client-edge-spec.md` §1.9 step 5. No longer sent (ADR 0075, #1380); a voucher standing alone is still answered |
 //! | CLAIM_ACK | `Toon-Claim-Ack` response header on the response that already answers the claim-bearing request |
 //! | `accumulatedCost` | `Toon-Accumulated-Cost` response header, on a REJECT only |
-//! | flush prompt | `Toon-Flush-Requested` response header -- HTTP only, and only a hint (§6.4) |
+//! | flush prompt | `Toon-Flush-Requested` response header -- HTTP only, and only a hint (§6.4). No longer emitted: a voucher rides the PREPARE it covers (ADR 0075, #1380) |
 //!
 //! There is no row for a peer credential, and there was one: `Toon-Peer-Auth`
 //! carried a `base64({peerId, secret})` on every request. ADR 0060 deleted
-//! it -- the claim already in the table above is what proves the peering, so
+//! it -- the voucher already in the table above (or, on a packet that moves
+//! no value, the peer-role challenge, ADR 0075 decision 5) is what proves
+//! the peering, so
 //! this carriage neither sets that header nor reads one. An arriving one is
 //! ignored rather than refused, which is what lets the two ends of a peering
 //! be upgraded in either order.
@@ -50,12 +51,12 @@
 //!    flush bound (§12.3). Before ADR 0031/ADR 0033 (issue #882) what
 //!    replaced the bound was an explicit exposure ceiling, refused at load
 //!    when absent (#723's `AcceptOnlyPeerWithoutCeiling`); that requirement
-//!    is retired along with the credit window it protected, leaving only
-//!    §6.4's hint.
-//! 2. **Claims can race** (§7.2). Parallel requests carrying nonces *n* and
-//!    *n+1* reach the payee's watermark lock in either order. The mitigation
-//!    is the client edge's: no more than one claim-bearing request in flight
-//!    per channel ([`dial`]).
+//!    is retired along with the credit window it protected, and §6.4's
+//!    flush hint went with the peer claim it prompted for (ADR 0075, #1380).
+//! 2. **Vouchers can race** (§7.2). Parallel requests carrying cumulative
+//!    amounts *a* and *a' > a* reach the payee's watermark lock in either
+//!    order. The mitigation is the client edge's: no more than one
+//!    voucher-bearing request in flight per peering ([`dial`]).
 //!
 //! And the corollary an operator meets first (§2.4): **an HTTP-only peer can
 //! neither reach nor be reached by a NAT'd peer.** The NAT'd side can only
@@ -74,8 +75,8 @@
 //!    [`connector_peer_btp::claim_json`] parses the claim (I4, through the
 //!    client edge's own validator), [`connector_peer_btp::ack`] encodes and
 //!    decodes the verdict (I3, one refusal taxonomy), and
-//!    [`connector_peer_btp::role_gate::decide`] decides role (I7) -- the
-//!    same call the BTP carriage makes, over the same claim. This crate
+//!    [`connector_peer_btp::role_gate::decide_frame`] decides role (I7) -- the
+//!    same call the BTP carriage makes, over the same evidence. This crate
 //!    calls them.
 //! 3. **Blur the two audiences.** The pipeline below the port is shared with
 //!    the client edge; **the admission is not**. See [`accept`] -- the devnet
@@ -86,9 +87,8 @@
 //! # Why this crate depends on `connector-peer-btp`
 //!
 //! Because the modules it borrows are not BTP. The claim codec, the ack
-//! codec, the canonical channel-id form and the per-relation
-//! [`AcceptedClaims`](connector_peer_btp::AcceptedClaims) ledger are carriage
-//! *semantics* that happen to have landed in #727's crate first, and I3/I4/I6
+//! codec, the canonical channel-id form, the role gate and the price gate
+//! are carriage *semantics* that happen to have landed in #727's crate first, and I3/I4/I6
 //! require exactly one of each. Copying them here would be the drift those
 //! invariants exist to prevent; lifting them into a shared
 //! `connector-peer-role` crate would be a better home and is mechanical, but
@@ -100,18 +100,13 @@
 //! Listener wiring (issue #678's bring-up: this crate answers a
 //! [`PeerRequest`](headers::PeerRequest) and never opens a port), the paired
 //! `peer_carriage` vectors and the five stop-ship regressions (issue #729).
-//! Two limits are inherited from #727 rather than diverged from: a Solana
-//! peer claim is refused `UnsupportedChain` because `ClaimBook` verifies
-//! EIP-712 balance proofs only, and the re-ack record is per-process -- a
-//! restart loses it, and recovering it belongs with the claim journal's own
-//! durability (ADR 0005), not with a carriage.
 
 pub mod accept;
 pub mod client;
 pub mod dial;
 pub mod headers;
 
-pub use accept::{claim_on, evidence_on, FlushHints, PeerHttpPolicy, PeerHttpState};
+pub use accept::{evidence_on, PeerHttpPolicy, PeerHttpState};
 pub use client::ReqwestPeerClient;
 pub use dial::{HttpDialError, HttpPeerTransport, PeerHttpClient, PeerRelation, NAT_NOTE};
 pub use headers::{Headers, PeerRequest, PeerResponse};

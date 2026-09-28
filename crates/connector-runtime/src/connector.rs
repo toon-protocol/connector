@@ -15,12 +15,12 @@ use connector_domain::x402::X402PaymentRequired;
 use connector_domain::{
     amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_fee, delivery_budget,
     forwarded_expiry, is_expired, is_valid_ilp_address, select_route, AssetId, EnvelopeRequest,
-    Fulfill, PacketResponse, Prepare, Price, RateLookup, Reject, RejectCode, Watermark,
+    Fulfill, PacketResponse, Prepare, Price, RateLookup, Reject, RejectCode,
     FORWARDING_MESSAGE_WINDOW,
 };
 use connector_settlement::{ChannelId, SettlementBackend, SettlementError};
 use connector_signer::giftwrap::{derive_fulfillment, open_request, seal_response};
-use connector_signer::{Address, Ed25519Signer, Signer};
+use connector_signer::Signer;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use thiserror::Error;
@@ -30,18 +30,12 @@ use url::Url;
 use crate::app_client::{AppClient, AppOutcome};
 use crate::attribution::{apply_payment_attribution, PaymentAttribution};
 use crate::batch_channels::OutboundChannels;
-use crate::claim::{
-    ChannelDomain, ClaimAckOutcome, ClaimBook, ClaimRejectReason, Covering, InvalidChannelId,
-    InvalidSolanaChannel, WireClaim,
-};
+use crate::claim::{ClaimAckOutcome, ClaimBook, Covering};
 use crate::clock::Clock;
 use crate::journal::{Journal, JournalError};
 use crate::metrics::Metrics;
 use crate::operator_view::{
     ChannelView, ClaimView, LeasedRouteView, PeerRouteView, PeerView, RouteSource, RouteView,
-};
-use crate::outbound_client::{
-    ClaimStateSource, EvmDomain, OutboundClaimBinding, OutboundClientLedger, SolanaDomain,
 };
 use crate::outbound_voucher::{
     challenge_entry, voucher_json, HttpVoucherState, UnreachableVoucherState, VoucherStateSource,
@@ -491,18 +485,16 @@ pub struct Connector {
     /// `Connector` itself has to remember so `channels()` knows which ids
     /// to ask which backend to report on.
     known_channels: RwLock<Vec<(SettlementChain, ChannelId)>>,
-    /// Claims owed to and received from every peering relation (ADR 0004,
-    /// ADR 0005, issue #423): signing an outbound claim on fulfilment,
-    /// verifying and watermarking an inbound one. Empty and signer-less
-    /// until configured via [`Connector::with_signer`] and
-    /// [`Connector::with_channel_verification_key`] -- a node with none of
-    /// those simply never emits or accepts a claim, matching how
-    /// `settlement` degrades to `None`.
+    /// The replay of a peer claim journal an older build wrote (ADR 0005,
+    /// issue #423): the inbound `toon-channel` watermarks it recorded, kept
+    /// only so `GET /claims` still reports where each stood. Nothing
+    /// advances it since ADR 0075 moved every peering onto x402 vouchers
+    /// (#1380); empty until [`Connector::with_journal`] replays one.
     pub(crate) claims: ClaimBook,
     /// This connector's own identity key (ADR 0018, ADR 0022), used to open
-    /// a gift wrap sealed to it (issue #524) -- distinct from `claims`'s
-    /// signer, which signs outbound claims to a peer rather than performing
-    /// key agreement. `None` on a node that hasn't configured one, in which
+    /// a gift wrap sealed to it (issue #524) -- distinct from the settlement
+    /// key a voucher on this node's outbound x402 channel is signed with,
+    /// which pays a peer rather than performing key agreement. `None` on a node that hasn't configured one, in which
     /// case every packet routed to an app route is refused: per ADR 0018
     /// every packet's `data` is a gift wrap, so a node that cannot open one
     /// cannot terminate any app route at all, matching how `settlement`
@@ -520,8 +512,7 @@ pub struct Connector {
     /// Payment channels this connector has seen a valid claim on at its own
     /// client edge (issue #548), and therefore recognizes as belonging to a
     /// sender that holds a channel with it -- the other half of
-    /// [`Connector::handle_probe`]'s first gate, beside `claims`'s
-    /// configured peer-role verification keys. Without this the gate is
+    /// [`Connector::handle_probe`]'s first gate. Without this the gate is
     /// unsatisfiable on a deployed node: nothing in a node's configuration
     /// supplies a client's channel id, and a gate no node can pass is not a
     /// gate (ADR 0011's "accepted only from a sender that already holds an
@@ -529,47 +520,15 @@ pub struct Connector {
     /// [`Connector::recognize_channel`], which the client edge calls when a
     /// claim clears its gate.
     recognized_channels: RwLock<HashSet<String>>,
-    /// This node's OUTBOUND client ledger (issue #873): the nonce line it
-    /// signs claims on when it pays a next hop **as an ordinary client of
-    /// that hop**, rather than as its configured peer.
-    ///
-    /// Deliberately not `claims` above, and the two must never merge.
-    /// `claims` is the inbound journal, where this node is the authority on
-    /// what it accepted; this one's authority is the RECEIVER, asked over
-    /// [`crate::ClaimStateSource`] every time. See
-    /// `crate::outbound_client`'s header for the full table.
-    ///
-    /// `None` on a node that has not been given one, in which case the
-    /// forwarding path simply has no client role available to it -- the
-    /// same way `settlements` degrades to "every channel operation
-    /// refuses" rather than to a second construction path.
-    outbound_client: Option<Arc<OutboundClientLedger>>,
-    /// What this node needs in order to pay each next hop **as an ordinary
-    /// client of it** (issue #875), keyed by peer id: the channel it holds
-    /// with that hop, and the hop itself as the authority on where that
-    /// channel's claims stand.
-    ///
-    /// Empty on a node nobody configured a client role for, in which case a
-    /// greeted forward is relayed as the refusal it is rather than covered
-    /// -- the same "degrade to just empty" shape `settlements` and
-    /// `leased_routes` take.
-    ///
-    /// Held as an atomically-swapped immutable snapshot, like
-    /// `runtime_peers` (issue #1217), from when `POST /peers` registered a
-    /// `toon-channel` hop here live. Since ADR 0075 moved runtime peerings
-    /// to x402 (#1378, #1379) only construction-time
-    /// `with_outbound_client_hop` writes it, for the config file's
-    /// `[[pay_channels]]` rows, until #1380 moves those too.
-    outbound_client_hops: ArcSwap<HashMap<String, OutboundClientHop>>,
     /// The next hops this node pays over its **own outbound x402 channel**
     /// (ADR 0075 decisions 4 and 6), keyed by peer id: a runtime peering
     /// established by `POST /peers`, on EVM since #1378 and on Solana since
-    /// #1379. Checked before `outbound_client_hops` on every forward, and
-    /// never both for one peer: a peering is either on x402 or on a
-    /// `toon-channel`.
+    /// #1379 -- and a config-declared one, from its `[[pay_channels]]` row
+    /// ([`Connector::with_config_pay_channel`], #1380). The one thing
+    /// [`Connector::cover_forward`] reads to cover a forward.
     ///
-    /// Copy-on-write for the reason `outbound_client_hops` is: an operator
-    /// write registers and removes one while the packet path reads it.
+    /// Copy-on-write behind an [`ArcSwap`]: an operator write registers and
+    /// removes one while the packet path reads it lock-free.
     outbound_voucher_hops: ArcSwap<HashMap<String, VoucherHop>>,
     /// The x402 channels this node pays on (ADR 0075 decisions 8 and 11):
     /// what `POST /peers` opens a peering's outbound channel through, and
@@ -739,6 +698,58 @@ pub struct Connector {
     rate_table: Option<SharedRateTable>,
 }
 
+/// Why a config-declared x402 peering could not be wired at boot (ADR 0075
+/// decision 9, issue #1380): refused by name rather than left to refuse
+/// every forward at packet time (ADR 0009).
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ConfigPeeringError {
+    /// A `[[pay_channels]]` row on a node with no x402 channels to pay on.
+    #[error(
+        "the [[pay_channels]] row for peer '{peer_id}' cannot be wired: this node has no x402 \
+         batch-settlement backend to pay on (a [settlement.<chain>.batch_settlement] table)"
+    )]
+    NoOutboundChannels { peer_id: String },
+    /// A `[[pay_channels]]` row naming a channel this node's
+    /// outbound-channel journal does not hold.
+    #[error(
+        "the [[pay_channels]] row for peer '{peer_id}' names outbound channel '{channel}', which \
+         this node's outbound-channel journal does not hold: a pay channel is this node's OWN \
+         x402 channel toward the hop, opened with 'POST /channels' (or an earlier 'POST /peers') \
+         under this state_dir, and nothing else can present it. Open it first, or name the \
+         channel this node did open (GET /channels lists them)"
+    )]
+    OutboundChannelUnknown { peer_id: String, channel: String },
+    /// A `[[pay_channels]]` row naming a journaled outbound channel that
+    /// pays someone other than the voucher signer the same peering's
+    /// `[[peer_channels]]` row binds on that chain.
+    #[error(
+        "the [[pay_channels]] row for peer '{peer_id}' names outbound channel '{channel}', which \
+         does not pay that peer: a peering's settlement key signs its vouchers and receives this \
+         node's (ADR 0075 decision 4), and this channel's receiver is not the voucher signer its \
+         [[peer_channels]] row names. Vouchers on it could never be redeemed by the hop; name \
+         the channel this node opened toward that peer (GET /channels lists them)"
+    )]
+    OutboundChannelPaysSomeoneElse { peer_id: String, channel: String },
+    /// A `[[peer_channels]]` row's voucher signer is not in its chain's
+    /// spelling. `Config::load` refuses one first; the second lock.
+    #[error(
+        "the [[peer_channels]] row for peer '{peer_id}' names voucher signer '{value}', which \
+         this node cannot read as a key on its chain"
+    )]
+    VoucherSignerUnreadable { peer_id: String, value: String },
+    /// A `[[peer_channels]]` row's voucher signer could not be bound: the
+    /// peering is not the config file's, or the signer already proves
+    /// another peering (one signer, one relation).
+    #[error(
+        "the [[peer_channels]] row for peer '{peer_id}' cannot bind its voucher signer: {source}"
+    )]
+    VoucherSignerUnbound {
+        peer_id: String,
+        #[source]
+        source: VoucherBindingError,
+    },
+}
+
 /// Which leg a PREPARE arrived over, and therefore which denomination its
 /// amount is in (ADR 0071 decision 1, issues #1295 and #1301).
 ///
@@ -768,50 +779,6 @@ enum Arrival<'a> {
     /// the key's chain and not its id -- so a channel this node discovered
     /// on chain is denominated exactly like a declared one.
     ClientChannel(&'a str),
-}
-
-/// What a client-role hop's covering claims are signed under, by chain
-/// (issue #1146).
-///
-/// Operator config either way, the same way [`ClaimBook::set_channel_domain`]
-/// and [`ClaimBook::set_solana_channel`] are for the peer role on the very
-/// same channel: a node that opened this channel already knows which
-/// `TokenNetwork` -- or which settlement program -- it was deployed under,
-/// so this is a configured input, not a guess.
-#[derive(Clone, Copy)]
-enum OutboundClientDomain {
-    /// The channel's EIP-712 domain (issue #881). Used to COVER a forward
-    /// proactively, before any greeting exists to read a domain off of;
-    /// [`Connector::cover_greeted_packet`]'s reactive retry still reads the
-    /// domain from the peer's own greeting, deliberately.
-    Evm(EvmDomain),
-    /// The settlement program this channel lives under (ADR 0053), which is
-    /// `[settlement.solana] program_id` and nothing else -- since issue
-    /// #1128 there is exactly one program a node can redeem a Solana claim
-    /// through, so there is exactly one a channel can be signed under. That
-    /// is also why the greeting is not consulted on the retry arm: unlike an
-    /// EVM `TokenNetwork`, there is no second answer a receiver could give.
-    Solana(SolanaDomain),
-}
-
-/// One next hop this connector can pay as a client (issue #875).
-#[derive(Clone)]
-struct OutboundClientHop {
-    /// The channel this node's settlement address holds with the hop, as
-    /// its raw on-chain 32 bytes -- an EVM `bytes32` channel id or a Solana
-    /// channel account, whichever this hop's `domain` says...
-    channel: [u8; 32],
-    /// ...and as the spelling a claim names it by on the wire -- `0x`
-    /// lower-case hex for EVM, base58 for Solana -- kept beside it so the
-    /// packet path never re-renders it.
-    channel_id: String,
-    /// The hop, asked where this node's claims on that channel stand. The
-    /// RECEIVER is the authority on its own watermark (see
-    /// `crate::outbound_client`'s header); nothing local substitutes.
-    claim_state: Arc<dyn ClaimStateSource>,
-    /// What this hop's covering claims are bound to, and which chain's arm
-    /// of the outbound client ledger signs them.
-    domain: OutboundClientDomain,
 }
 
 /// One next hop this connector pays over its own outbound x402 channel
@@ -883,15 +850,13 @@ impl Connector {
             metrics: Arc::new(Metrics::new()),
             settlements: Vec::new(),
             known_channels: RwLock::new(Vec::new()),
-            claims: ClaimBook::new(None, HashMap::new(), HashMap::new()),
+            claims: ClaimBook::new(),
             identity_signer: None,
             probe_rate_limiter: FixedWindowRateLimiter::new(
                 DEFAULT_PROBE_LIMIT,
                 default_probe_window(),
             ),
             recognized_channels: RwLock::new(HashSet::new()),
-            outbound_client: None,
-            outbound_client_hops: ArcSwap::from_pointee(HashMap::new()),
             outbound_voucher_hops: ArcSwap::from_pointee(HashMap::new()),
             outbound_channels: None,
             x402_networks: Vec::new(),
@@ -1271,27 +1236,6 @@ impl Connector {
         self
     }
 
-    /// Give this node an outbound client ledger (issue #873) so the
-    /// forwarding path can pay a next hop it holds no matched credential
-    /// with, as an ordinary client of that hop.
-    ///
-    /// Pass the FILE-BACKED form ([`OutboundClientLedger::open`]) here: a
-    /// serving node restarts, and a restart that reissued a nonce would
-    /// fork its own outbound nonce line. Its path must not be either
-    /// journal file -- this book is not a `JournalEntry` stream, and the
-    /// two ledgers must never merge.
-    pub fn with_outbound_client_ledger(mut self, ledger: Arc<OutboundClientLedger>) -> Self {
-        self.outbound_client = Some(ledger);
-        self
-    }
-
-    /// This node's outbound client ledger, or `None` when it was never
-    /// given one -- the packet path's own read of
-    /// [`Connector::with_outbound_client_ledger`].
-    pub fn outbound_client_ledger(&self) -> Option<&Arc<OutboundClientLedger>> {
-        self.outbound_client.as_ref()
-    }
-
     /// Give this node the x402 channels it pays on (ADR 0075 decisions 8
     /// and 11), and its own CAIP-2 network on each chain they are on: what
     /// `POST /peers` opens a peering's outbound channel through, on either
@@ -1367,9 +1311,26 @@ impl Connector {
         else {
             return;
         };
-        let builder = reqwest::Client::builder().timeout(std::time::Duration::from_millis(
-            connector_config::DEFAULT_PEER_TIMEOUT_MS,
-        ));
+        self.register_voucher_hop_at(
+            peer_id,
+            outbound_channel_id,
+            client_edge_url,
+            std::time::Duration::from_millis(connector_config::DEFAULT_PEER_TIMEOUT_MS),
+        );
+    }
+
+    /// Pay `peer_id` on this node's outbound x402 channel `outbound_channel_id`,
+    /// asking `client_edge_url`'s `POST /ilp/claim-state` where it stands --
+    /// the one registration both a runtime peering and a `[[pay_channels]]`
+    /// row make. `answer_timeout` bounds each claim-state ask.
+    fn register_voucher_hop_at(
+        &self,
+        peer_id: &str,
+        outbound_channel_id: &str,
+        client_edge_url: &str,
+        answer_timeout: std::time::Duration,
+    ) {
+        let builder = reqwest::Client::builder().timeout(answer_timeout);
         let onion = url::Url::parse(client_edge_url)
             .is_ok_and(|url| connector_config::is_onion_endpoint(&url));
         let client = if onion {
@@ -1405,6 +1366,143 @@ impl Connector {
             outbound_channel_id,
             Arc::new(HttpVoucherState::new(client, client_edge_url)),
         );
+    }
+
+    /// Wire one `[[pay_channels]]` row (ADR 0042 item 2, as ADR 0075 decision
+    /// 6 amends it, issue #1380): every forward to `peer_id` is covered by a
+    /// voucher on this node's own outbound x402 channel `outbound_channel`,
+    /// and `client_edge_url`'s `POST /ilp/claim-state` is the watermark
+    /// authority when this process has not yet asked, or has had a voucher
+    /// refused -- exactly as a runtime peering's hop is.
+    ///
+    /// The claim-state ask leaves on the node's `socks_proxy` when the
+    /// client edge is an onion host, by the one host rule
+    /// (`connector_config::is_onion_endpoint`), so call
+    /// [`Connector::with_socks_proxy`] first. `answer_timeout` is the
+    /// peering's own `peer_answer_timeout_ms`: the ask is a request to that
+    /// peer on the packet's path.
+    ///
+    /// # Errors
+    ///
+    /// Refused, by name, when this node has no x402 channels at all or its
+    /// outbound-channel journal does not hold `outbound_channel`: a row
+    /// naming a channel this node never opened -- or opened under a
+    /// `state_dir` it no longer has -- would refuse every forward at packet
+    /// time, and ADR 0009 turns that into a refusal to start. Call
+    /// [`Connector::with_outbound_channels`] first.
+    pub fn with_config_pay_channel(
+        self,
+        peer_id: &str,
+        outbound_channel: &str,
+        client_edge_url: &url::Url,
+        answer_timeout: std::time::Duration,
+    ) -> Result<Self, ConfigPeeringError> {
+        let Some(outbound) = self.outbound_channels.as_ref() else {
+            return Err(ConfigPeeringError::NoOutboundChannels {
+                peer_id: peer_id.to_string(),
+            });
+        };
+        if outbound.presentation(outbound_channel).is_none() {
+            return Err(ConfigPeeringError::OutboundChannelUnknown {
+                peer_id: peer_id.to_string(),
+                channel: outbound_channel.to_string(),
+            });
+        }
+        // A peering's settlement key both signs its vouchers toward this node
+        // and receives this node's (ADR 0075 decision 4), so where the config
+        // binds the peer a voucher signer on the channel's chain, the channel
+        // must pay that key: one opened toward anyone else carries vouchers
+        // the hop cannot redeem, and would only be found at packet time.
+        let chain_of = |signer: &VoucherSigner| match signer {
+            VoucherSigner::Evm(_) => SettlementChain::Evm,
+            VoucherSigner::Solana(_) => SettlementChain::Solana,
+        };
+        let channel_chain =
+            outbound
+                .presentation(outbound_channel)
+                .map(|presentation| match presentation {
+                    connector_settlement::batch::ChannelPresentation::Evm { .. } => {
+                        SettlementChain::Evm
+                    }
+                    connector_settlement::batch::ChannelPresentation::Solana { .. } => {
+                        SettlementChain::Solana
+                    }
+                });
+        let receivers: Vec<VoucherSigner> = self
+            .voucher_bindings
+            .signers_of(peer_id)
+            .into_iter()
+            .filter(|signer| Some(chain_of(signer)) == channel_chain)
+            .collect();
+        if !receivers.is_empty()
+            && !receivers.iter().any(|receiver| {
+                outbound
+                    .opened_toward(receiver)
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case(outbound_channel))
+            })
+        {
+            return Err(ConfigPeeringError::OutboundChannelPaysSomeoneElse {
+                peer_id: peer_id.to_string(),
+                channel: outbound_channel.to_string(),
+            });
+        }
+        self.register_voucher_hop_at(
+            peer_id,
+            outbound_channel,
+            client_edge_url.as_str(),
+            answer_timeout,
+        );
+        Ok(self)
+    }
+
+    /// Wire one `[[peer_channels]]` row (ADR 0075 decisions 4, 5 and 9,
+    /// issue #1380): bind `voucher_signer` -- an EVM address or a base58
+    /// Solana key, on `chain` -- to the config peering `peer_id`, so a
+    /// voucher on a channel the chain records that signer for -- or, for a
+    /// packet that moves no value, the claim-state challenge it signs --
+    /// proves the peer role. With `inbound_channel`, only that one channel
+    /// proves it. Call [`Connector::with_config_peer_ids`] first.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigPeeringError::VoucherSignerUnreadable`] for a signer not in
+    /// `chain`'s spelling (`Config::load` already refuses one), and
+    /// [`ConfigPeeringError::VoucherSignerUnbound`] for a peer id the config
+    /// file does not own or a signer already proving another peering.
+    pub fn with_config_voucher_signer(
+        self,
+        peer_id: &str,
+        chain: SettlementChain,
+        voucher_signer: &str,
+        inbound_channel: Option<&str>,
+    ) -> Result<Self, ConfigPeeringError> {
+        let Some(signer) = crate::peering::parse_chain_key(chain, voucher_signer) else {
+            return Err(ConfigPeeringError::VoucherSignerUnreadable {
+                peer_id: peer_id.to_string(),
+                value: voucher_signer.to_string(),
+            });
+        };
+        let unbound = |source| ConfigPeeringError::VoucherSignerUnbound {
+            peer_id: peer_id.to_string(),
+            source,
+        };
+        if !self.config_peer_ids.contains(peer_id) {
+            return Err(unbound(VoucherBindingError::UnknownPeer(
+                peer_id.to_string(),
+            )));
+        }
+        match inbound_channel {
+            None => self
+                .voucher_bindings
+                .bind(peer_id, signer)
+                .map_err(unbound)?,
+            Some(channel) => self
+                .voucher_bindings
+                .bind_on_channel(peer_id, signer, channel)
+                .map_err(unbound)?,
+        }
+        Ok(self)
     }
 
     /// Pay `peer_id` over this node's outbound x402 channel `channel_id`,
@@ -1461,107 +1559,6 @@ impl Connector {
         self.voucher_bindings.bind(peer_id, signer)
     }
 
-    /// Configure how this node pays `peer_id` **as an ordinary client of
-    /// it** (issue #875): the channel it holds with that hop, and the hop
-    /// itself as the source of that channel's watermark.
-    ///
-    /// Deliberately separate from the PEER-role binding a `[[peer_channels]]`
-    /// row makes, even where both name the same channel id. That one is now
-    /// INBOUND ONLY: its outbound half signed a claim against this node's own
-    /// `ClaimBook` projection once a forward had fulfilled, which was ADR
-    /// 0004's postpay model and was deleted in issue #1145. This one configures the
-    /// CLIENT role, whose watermark authority is the receiver, asked over
-    /// `claim_state` every time. The two books must never merge (see
-    /// `crate::outbound_client`'s header), and configuring them apart is
-    /// where that starts.
-    ///
-    /// Without this -- or without [`Connector::with_outbound_client_ledger`]
-    /// -- a peer that answers a forward with x402 terms simply gets its
-    /// refusal relayed: there is nothing to pay it with, and a packet is
-    /// never emitted claiming to have paid when it has not.
-    ///
-    /// Configuring a hop here also switches [`Connector::forward_via_peer_route`]
-    /// (issue #881) to cover **every** packet forwarded to `peer_id` from
-    /// this ledger proactively, rather than waiting for a `pending_claim`
-    /// watermark the peer ledger's own postpay convention (ADR 0004) would
-    /// otherwise arm. A hop this is never called for is entirely
-    /// unaffected: it keeps riding `pending_claim` exactly as before this
-    /// method existed.
-    pub fn with_outbound_client_hop(
-        self,
-        peer_id: impl Into<String>,
-        channel_id: impl Into<String>,
-        domain: EvmDomain,
-        claim_state: Arc<dyn ClaimStateSource>,
-    ) -> Result<Self, InvalidChannelId> {
-        let channel_id = channel_id.into();
-        let channel = crate::claim::parse_channel_id(&channel_id)?;
-        let mut hops = (*self.outbound_client_hops.load_full()).clone();
-        hops.insert(
-            peer_id.into(),
-            OutboundClientHop {
-                channel,
-                // The canonical spelling (`peer-carriage-spec.md` §4.1): a
-                // claim naming the same channel in two casings is two
-                // watermarks at the far gate.
-                channel_id: format!("0x{}", hex_lower(&channel)),
-                claim_state,
-                domain: OutboundClientDomain::Evm(domain),
-            },
-        );
-        self.outbound_client_hops.store(Arc::new(hops));
-        Ok(self)
-    }
-
-    /// [`Connector::with_outbound_client_hop`] for a **Solana** next hop
-    /// (issue #1146): the channel account this node pays that hop from, and
-    /// the settlement program its claims are signed under.
-    ///
-    /// A second method rather than a chain parameter, exactly as
-    /// [`ClaimBook::set_solana_channel`] is a second method beside
-    /// [`ClaimBook::set_channel_domain`]: the two chains name a channel with
-    /// different kinds of identifier, and a shared entry point would have to
-    /// accept both spellings for both chains and sort them out afterwards.
-    ///
-    /// `program_id` is `[settlement.solana] program_id` -- ADR 0053 signs it
-    /// into every claim on this channel, and issue #1128 made it the single
-    /// source for the peer role on the very same channel. Both it and
-    /// `channel_account` must be base58 of exactly 32 bytes; anything else is
-    /// refused here rather than turned into a claim verified against the
-    /// wrong message.
-    ///
-    /// **Until this existed, a Solana peering could only be paid postpay**
-    /// -- `cover_forward` had no arm to mint under, so the claim covering
-    /// crossing n rode crossing n + 1, which is the model ADR 0042 exists to
-    /// retire.
-    pub fn with_solana_outbound_client_hop(
-        self,
-        peer_id: impl Into<String>,
-        channel_account: impl Into<String>,
-        program_id: &str,
-        claim_state: Arc<dyn ClaimStateSource>,
-    ) -> Result<Self, InvalidSolanaChannel> {
-        let channel_account = channel_account.into();
-        let channel = crate::claim::parse_base58_32("channel account", &channel_account)?;
-        let program_id = crate::claim::parse_base58_32("program id", program_id)?;
-        let mut hops = (*self.outbound_client_hops.load_full()).clone();
-        hops.insert(
-            peer_id.into(),
-            OutboundClientHop {
-                channel,
-                // Re-encoded from the bytes rather than kept as written, so
-                // the wire carries one spelling of the account however the
-                // operator's config spelled it -- the base58 counterpart of
-                // the EVM arm's lower-casing above.
-                channel_id: bs58::encode(channel).into_string(),
-                claim_state,
-                domain: OutboundClientDomain::Solana(SolanaDomain { program_id }),
-            },
-        );
-        self.outbound_client_hops.store(Arc::new(hops));
-        Ok(self)
-    }
-
     /// Configure this node's own identity key (issue #524), used to open a
     /// gift wrap sealed to it -- the same identity `connector-client-edge`
     /// reports at `GET /ilp/identity` (ADR 0022). Without one configured, a
@@ -1577,78 +1574,6 @@ impl Connector {
     /// checked against this connector's own injected clock.
     pub fn with_probe_rate_limit(mut self, max_per_window: u32, window: Duration) -> Self {
         self.probe_rate_limiter = FixedWindowRateLimiter::new(max_per_window, window);
-        self
-    }
-
-    /// Configure this node's own signer (issue #423), used to sign every
-    /// outbound claim. Without one configured, a fulfilled packet still
-    /// forwards and fulfils normally -- it simply never emits a claim,
-    /// matching how a node with no settlement backend never gets a working
-    /// channel surface.
-    pub fn with_signer(mut self, signer: Arc<dyn Signer>) -> Self {
-        self.claims.set_signer(signer);
-        self
-    }
-
-    /// Configure the EVM address whose signature this node accepts on an
-    /// inbound claim for `channel_id` (issue #423, peer-semantics-pre-868.md §1.1's
-    /// "a configured peer id and verification key"; issue #575: this is now
-    /// the channel's counterparty *address*, recovered from an EIP-712
-    /// `BalanceProof` signature, not a raw public key checked against a
-    /// connector-internal digest). Pair with
-    /// [`Connector::with_channel_domain`] for the same `channel_id` -- a
-    /// claim naming a channel with no domain configured is refused
-    /// regardless of this.
-    pub fn with_channel_verification_key(
-        self,
-        channel_id: impl Into<String>,
-        counterparty: Address,
-    ) -> Self {
-        self.claims.set_verification_key(channel_id, counterparty);
-        self
-    }
-
-    /// Configure `channel_id`'s EIP-712 signing domain -- the chain it is
-    /// deployed on and the `TokenNetwork` contract that verifies a claim's
-    /// signature on redemption (issue #575/#566). Required, alongside
-    /// a `[[peer_channels]]` row or
-    /// [`Connector::with_channel_verification_key`], before this channel
-    /// can sign or accept a claim -- see [`ClaimBook::set_channel_domain`].
-    /// `channel_id` must already be the channel's on-chain `bytes32`, refused
-    /// otherwise rather than hashed or truncated into shape.
-    pub fn with_channel_domain(
-        self,
-        channel_id: impl Into<String>,
-        domain: ChannelDomain,
-    ) -> Result<Self, InvalidChannelId> {
-        self.claims.set_channel_domain(channel_id, domain)?;
-        Ok(self)
-    }
-
-    /// Configure `channel_account`'s Solana peer binding (issue #732/#998):
-    /// the base58 Ed25519 public key whose signature this node accepts on a
-    /// claim for it. The Solana counterpart of both
-    /// [`Connector::with_channel_verification_key`] and
-    /// [`Connector::with_channel_domain`] in one call -- see
-    /// [`ClaimBook::set_solana_channel`] for why the two cannot be
-    /// separated on this chain.
-    pub fn with_solana_channel(
-        self,
-        channel_account: impl Into<String>,
-        counterparty_public_key: &str,
-        program_id: &str,
-    ) -> Result<Self, InvalidSolanaChannel> {
-        self.claims
-            .set_solana_channel(channel_account, counterparty_public_key, program_id)?;
-        Ok(self)
-    }
-
-    /// Configure this node's own ed25519 identity (issue #742/#998), used to
-    /// sign every outbound claim on a channel registered via
-    /// [`Connector::with_solana_channel`] -- the Solana counterpart of
-    /// [`Connector::with_signer`].
-    pub fn with_solana_signer(mut self, signer: Arc<dyn Ed25519Signer>) -> Self {
-        self.claims.set_solana_signer(signer);
         self
     }
 
@@ -1679,11 +1604,10 @@ impl Connector {
         self
     }
 
-    /// Configure the durable journal this node's claim state is persisted
-    /// to and rebuilt from (ADR 0005, issue #424). Call this *last* in the
-    /// builder chain -- rebuild uses whatever signer is already configured
-    /// to re-arm any outbound claim left unacknowledged (see
-    /// `ClaimBook::rebuild_from`'s own doc for why that is always safe).
+    /// Replay the peer claim journal an older build wrote (ADR 0005, issue
+    /// #424) into the replay-only peer book, so `GET /claims` still reports
+    /// where each channel's watermark stood. Nothing is appended to it since
+    /// ADR 0075 moved every peering onto x402 vouchers (#1380).
     pub fn with_journal(mut self, journal: Arc<dyn Journal>) -> Result<Self, JournalError> {
         self.claims.set_journal(journal)?;
         Ok(self)
@@ -1912,6 +1836,16 @@ impl Connector {
         self.voucher_bindings.peer_for(signer)
     }
 
+    /// The peering `signer` proves on `channel` -- an EVM channel id as
+    /// lower-case `0x` hex, a Solana channel account in base58 -- if it is
+    /// bound to one: [`Self::voucher_signer_peer`], except that a signer a
+    /// `[[peer_channels]]` row pinned to one `inbound_channel` proves
+    /// nothing on any other.
+    #[must_use]
+    pub fn voucher_signer_peer_on(&self, signer: &VoucherSigner, channel: &str) -> Option<String> {
+        self.voucher_bindings.peer_for_channel(signer, channel)
+    }
+
     /// Whether any voucher signer is bound at all. `false` on every node
     /// before its first x402 peering, where a voucher can prove nothing but
     /// a client and the role gate need not look its channel up.
@@ -1957,8 +1891,7 @@ impl Connector {
     /// runtime twin of ADR 0042's `[[pay_channels]]` load rule, which ADR
     /// 0058 requires enforced continuously rather than once at boot. That
     /// checks the hop a forward is paid on -- the x402 voucher hop a
-    /// runtime peering registers (ADR 0075), or a `toon-channel` client hop
-    /// (`outbound_client_hops`, issue #1217) -- not `peering.channels`,
+    /// runtime peering registers (ADR 0075) -- not `peering.channels`,
     /// which is non-empty for every peering `establish_peering` ever writes
     /// and so never caught the gap this guard exists for: a peering that
     /// can accept a claim but hold nothing to sign one with. A config-file
@@ -1985,10 +1918,7 @@ impl Connector {
         if !self.config_peer_ids.contains(&peer_id) {
             match self.runtime_peers_snapshot().get(&peer_id) {
                 None => return Err(PeerRouteTableError::UnknownPeerId { prefix, peer_id }),
-                Some(_)
-                    if !self.outbound_client_hops.load_full().contains_key(&peer_id)
-                        && !self.outbound_voucher_hops.load().contains_key(&peer_id) =>
-                {
+                Some(_) if !self.outbound_voucher_hops.load().contains_key(&peer_id) => {
                     return Err(PeerRouteTableError::PeerHasNoPayChannel { prefix, peer_id })
                 }
                 Some(_) => {}
@@ -2177,12 +2107,10 @@ impl Connector {
     }
 
     /// The peer semantics's entry point (issue #423): accepts an inbound PREPARE
-    /// exactly like [`Connector::handle_prepare`], but also verifies and
-    /// watermarks whatever claim it carries (peer-semantics-pre-868.md §3.2).
-    ///
-    /// The claim outcome and the PREPARE outcome are independent -- a
-    /// rejected claim does not reject the PREPARE it rode in on (§3.4), and
-    /// this method decides neither from the other.
+    /// exactly like [`Connector::handle_prepare`]. Whatever voucher it carried
+    /// was judged by the accept pipeline above this method (ADR 0075
+    /// decision 6), whose verdict and this PREPARE's outcome are independent
+    /// (§3.4).
     ///
     /// Issue #752: a destination that resolves to one of this connector's
     /// own priced *terminated* routes is refused `F03_INVALID_AMOUNT`
@@ -2214,12 +2142,7 @@ impl Connector {
         &self,
         arrived_from: Option<&str>,
         prepare: Prepare,
-        claim: Option<WireClaim>,
-    ) -> (PacketResponse, ClaimAckOutcome) {
-        let ack = claim.map_or(ClaimAckOutcome::NotSent, |claim| {
-            self.handle_peer_claim(claim)
-        });
-
+    ) -> PacketResponse {
         if let Some(route) = self.client_route(&prepare.destination) {
             // ADR 0029's per-packet coverage rule, read off the schedule at
             // this packet's own payload length (ADR 0065): the peer measures
@@ -2238,14 +2161,12 @@ impl Connector {
                     data: Vec::new(),
                     accumulated_cost: 0,
                 });
-                return (self.finish(reject), ack);
+                return self.finish(reject);
             }
         }
 
-        let response = self
-            .handle_prepare_spanned(prepare, None, arrived_from.map(Arrival::Peer))
-            .await;
-        (response, ack)
+        self.handle_prepare_spanned(prepare, None, arrived_from.map(Arrival::Peer))
+            .await
     }
 
     /// Record that `channel_id` names a payment channel this connector
@@ -2273,58 +2194,14 @@ impl Connector {
         }
     }
 
-    /// Where a channel this node holds as a **peer** channel stands in the
-    /// book that actually judges its claims -- [`crate::ClaimBook`]'s own
-    /// inbound watermark -- or `None` when this node holds no peer channel
-    /// by that name.
-    ///
-    /// A connector keeps two inbound books (`crate::outbound_client`'s
-    /// header has the table), and which one is the authority for a channel
-    /// is a property of the **channel**, never of who is asking: a claim
-    /// naming a `[[peer_channels]]` row is judged here, and
-    /// `Config::load` refuses a channel that is also a `[[client_channels]]`
-    /// row (`ConfigError::ChannelInBothNamespaces`), so at most one book
-    /// can ever be the authority. That is what lets
-    /// `POST /ilp/claim-state` answer a payer correctly without knowing
-    /// which role the payer holds.
-    ///
-    /// `Some(Watermark { nonce: 0, cumulative_amount: 0 })` for a
-    /// configured peer channel nothing has claimed on yet -- deliberately
-    /// not `None`, which would send the caller back to the wrong book for
-    /// exactly the first claim on a channel.
-    ///
-    /// Covers both chains: an EVM `channel_id` (`0x` + 64 hex) and a
-    /// Solana `channel_account` (base58) are drawn from disjoint spellings,
-    /// so one lookup cannot answer for the other chain by accident.
-    #[must_use]
-    pub fn peer_channel_watermark(&self, channel_id: &str) -> Option<Watermark> {
-        if !self.claims.has_verification_key(channel_id)
-            && !self.claims.has_solana_channel(channel_id)
-        {
-            return None;
-        }
-        Some(
-            self.claims
-                .inbound_watermark(channel_id)
-                .unwrap_or(Watermark {
-                    nonce: 0,
-                    cumulative_amount: 0,
-                }),
-        )
-    }
-
-    /// Whether `channel_id` is a channel this connector recognizes: either
-    /// a peer channel whose verification key its operator configured
-    /// ([`Connector::with_channel_verification_key`]), or a client channel
-    /// [`Connector::recognize_channel`] recorded when a claim on it
+    /// Whether `channel_id` is a client channel this connector recognizes:
+    /// one [`Connector::recognize_channel`] recorded when a claim on it
     /// verified at this connector's client edge.
     pub fn recognizes_channel(&self, channel_id: &str) -> bool {
-        self.claims.has_verification_key(channel_id)
-            || self
-                .recognized_channels
-                .read()
-                .expect("recognized channels lock poisoned")
-                .contains(channel_id)
+        self.recognized_channels
+            .read()
+            .expect("recognized channels lock poisoned")
+            .contains(channel_id)
     }
 
     /// Every client channel [`Connector::recognize_channel`] has recorded
@@ -2341,18 +2218,6 @@ impl Connector {
             .iter()
             .cloned()
             .collect()
-    }
-
-    /// Whether `channel_account` is a Solana peer channel this
-    /// connector recognizes -- the Solana counterpart of
-    /// [`Connector::recognizes_channel`] (issue #732/#998). A separate
-    /// query rather than folded into `recognizes_channel`: an EVM
-    /// `channel_id` and a Solana `channel_account` are drawn from disjoint
-    /// spellings (`0x` + 64 hex vs. base58), so there is no name either
-    /// chain's config could hand this connector that the other chain would
-    /// also recognize.
-    pub fn recognizes_solana_channel(&self, channel_account: &str) -> bool {
-        self.claims.has_solana_channel(channel_account)
     }
 
     /// Entry point for a probe -- an ordinary packet a sender expects to be
@@ -2440,29 +2305,6 @@ impl Connector {
             }
         }
         Ok(self.handle_prepare(prepare).await)
-    }
-
-    /// What this node's own record of a peer channel makes of `claim`'s
-    /// signature -- `Ok(())`, [`ClaimRejectReason::UnknownChannel`] or
-    /// [`ClaimRejectReason::SignatureInvalid`] -- with nothing accepted,
-    /// no watermark advanced and nothing journaled.
-    ///
-    /// This is `peer-carriage-spec.md` §1.2's **P3**, and it is what
-    /// decides role: a peer carriage asks this of the claim a frame
-    /// carries, and admits the frame as a peer frame only on `Ok`. The
-    /// check is against the counterparty key the `[[peer_channels]]` row
-    /// configures, never against anything the claim declares about itself,
-    /// which is the whole reason a signature proves more here than a
-    /// bearer string ever did (ADR 0060).
-    pub fn verify_peer_claim(&self, claim: &WireClaim) -> Result<(), ClaimRejectReason> {
-        self.claims.verify_signature(claim)
-    }
-
-    /// Verify and, if valid, accept a claim received over the peer semantics --
-    /// whether it rode a PREPARE or a FLUSH -- advancing its channel's
-    /// watermark (issue #423, peer-semantics-pre-868.md §3.4).
-    pub fn handle_peer_claim(&self, claim: WireClaim) -> ClaimAckOutcome {
-        self.claims.accept_inbound(&claim)
     }
 
     async fn handle_prepare_traced(
@@ -2805,9 +2647,9 @@ impl Connector {
         cost_before_rate_and_fee(cost, rate, fee)
     }
 
-    /// Forward `prepare` to `peer_route`'s peer, covered by a claim minted
-    /// from the outbound CLIENT ledger before the packet is put on the wire
-    /// (ADR 0042, issue #881). **There is no other way out of this method
+    /// Forward `prepare` to `peer_route`'s peer, covered by a voucher on this
+    /// node's own outbound x402 channel toward it, signed before the packet
+    /// is put on the wire (ADR 0042, as ADR 0075 decision 6 amends it). **There is no other way out of this method
     /// with a packet sent.** A peering this node cannot cover a forward to
     /// is refused here, naming the hop and the reason; it is never carried
     /// uncovered and nothing is ever owed for it afterwards.
@@ -2815,8 +2657,8 @@ impl Connector {
     /// That "afterwards" is what issue #1145 deleted. ADR 0004's model --
     /// the claim covering crossing *n* signed once it fulfilled and riding
     /// crossing *n + 1* out of `ClaimBook::pending_claim` -- used to run
-    /// here for any peering with no [`Connector::with_outbound_client_hop`],
-    /// and ADR 0042 exists to retire it. It is gone from the peer role
+    /// here for any peering with no pre-paid hop configured, and ADR 0042
+    /// exists to retire it. It is gone from the peer role
     /// entirely: no fulfilment arms a peer claim, so no packet leaves owing
     /// one. (`ClaimBook::record_fulfillment` is gone too: its last caller,
     /// the client payout ledger, pays in vouchers since ADR 0075 decision 7.)
@@ -2827,7 +2669,7 @@ impl Connector {
     /// checked against the peering's own cap
     /// ([`Self::packet_cap_for`]) and refused with `T04` if it exceeds it.
     /// The cap bounds a single packet -- how much this connector is willing
-    /// to lose at once to a hop that takes the claim and does not carry --
+    /// to lose at once to a hop that takes the voucher and does not carry --
     /// and never an accumulation. On a crossing that is the **converted**
     /// amount (ADR 0071 decision 1): the cap is configured against the
     /// outgoing peering, so it was always denominated in the outgoing
@@ -2845,16 +2687,15 @@ impl Connector {
     ///
     /// # Covering (issue #881), and the retry arm beside it
     ///
-    /// [`Connector::cover_forward`] mints for exactly this packet's own
-    /// forwarded value: a hop configured via
-    /// [`Connector::with_outbound_client_hop`] gets a fresh claim from the
-    /// outbound client ledger (issue #873) minted and attached before the
-    /// packet is ever sent -- covered from the first attempt, including the
-    /// first attempt after a restart, never merely recovered after a
-    /// refusal. If the claim cannot be produced at all (no hop configured,
-    /// no signer, no headroom, a receiver that will not report its
-    /// watermark), the packet fails right there naming the hop and the
-    /// reason. `Config::load` refuses a peering with a route to it and no
+    /// [`Connector::cover_forward`] signs for exactly this packet's own
+    /// forwarded value: a hop registered by a runtime peering or by
+    /// [`Connector::with_config_pay_channel`] gets a fresh voucher on its
+    /// outbound x402 channel, signed and journaled before the packet is
+    /// ever sent -- covered from the first attempt, including the first
+    /// attempt after a restart, never merely recovered after a refusal. If
+    /// the voucher cannot be produced at all (no hop registered, no x402
+    /// backend, a channel the outbound journal does not hold), the packet
+    /// fails right there naming the hop and the reason. `Config::load` refuses a peering with a route to it and no
     /// `[[pay_channels]]` row (`ConfigError::PayChannelUnbound`), so on a
     /// configured route the no-hop case is unreachable from a file that
     /// loaded -- it is still refused here rather than assumed away, because
@@ -2863,19 +2704,20 @@ impl Connector {
     ///
     /// The retry arm issue #875 added is kept, narrowed to what it is now
     /// actually for: a covered packet the peer STILL greets is a
-    /// disagreement about the terms (the price moved, the claim did not
+    /// disagreement about the terms (the price moved, the voucher did not
     /// clear the far gate) rather than the routine case, and is retried
-    /// **once** with a claim minted against the peer's own quoted price
+    /// **once** with a voucher signed against the peer's own quoted price
     /// from its greeting -- the authoritative figure in a disagreement,
     /// where this hop's own idea of the forwarded value is not. A second
     /// greeting after that is a failure, not a second retry.
     ///
-    /// Cost: a forward spends one watermark round trip to the receiver and
-    /// the one durable nonce reservation
-    /// [`OutboundClientLedger::next_claim`] makes, on every packet (issue
-    /// #879 measured the forwarded-packet path at 3.00 `fdatasync`/packet
-    /// with exposure accounting on; this is a fourth). That is the price of
-    /// ADR 0042 and it is now paid on every forward, because there is no
+    /// Cost: a forward spends the one durable journal write that records
+    /// its voucher before the packet leaves, on every packet (issue #879
+    /// measured the forwarded-packet path at 3.00 `fdatasync`/packet with
+    /// exposure accounting on; this is one more), and a watermark round
+    /// trip to the receiver only when this process has not yet synced the
+    /// channel or has had a voucher refused since. That is the price of
+    /// ADR 0042 and it is paid on every forward, because there is no
     /// longer a cheaper uncovered path to fall back to.
     async fn forward_via_peer_route(
         &self,
@@ -3019,9 +2861,9 @@ impl Connector {
             ..prepare
         };
 
-        // ADR 0042: a connector covers every PREPARE it sends. The claim is
-        // minted from this packet's own forwarded value and attached before
-        // the packet leaves; a peering that cannot be covered is refused
+        // ADR 0042: a connector covers every PREPARE it sends. The voucher
+        // is signed for this packet's own forwarded value and attached
+        // before the packet leaves; a peering that cannot be covered is refused
         // here and the packet is not forwarded at all.
         //
         // There is no `NotConfigured` arm any more (issue #1145). It used to
@@ -3030,9 +2872,10 @@ impl Connector {
         // the model ADR 0042 retires, and while it existed "a connector
         // covers every PREPARE it sends" was a record rather than a fact.
         // Nothing this method sends is acknowledged against `self.claims`
-        // either: the claim's watermark authority is the RECEIVER, asked
-        // over `claim_state`, and the peer book knows nothing of it (see
-        // `crate::outbound_client`'s header).
+        // either: the voucher is journaled by `OutboundChannels`, its
+        // watermark authority on restore is the RECEIVER, asked over
+        // `claim_state`, and the replay-only peer book knows nothing of it
+        // (ADR 0075 decision 6).
         let riding = match self.cover_forward(peer_id, forwarded_amount).await {
             Ok(covering) => covering,
             Err(reason) => {
@@ -3090,9 +2933,9 @@ impl Connector {
             }
         }
         // The retry's own `ack` is deliberately NOT fed to `self.claims`:
-        // the claim it acknowledges belongs to the outbound CLIENT ledger,
-        // whose authority is the receiver's watermark rather than anything
-        // this book records (see `crate::outbound_client`'s header).
+        // the voucher it acknowledges is on this node's outbound x402
+        // channel, whose authority is the receiver's watermark rather than
+        // anything this replay-only book records (ADR 0075 decision 6).
 
         match answer.response {
             // No claim is signed here, and that absence is the whole of
@@ -3148,105 +2991,28 @@ impl Connector {
     }
 
     /// Cover a forward to `peer_id` for exactly `amount` -- the value THIS
-    /// packet forwards -- from the outbound CLIENT ledger (issue #873),
-    /// before the packet is ever sent (issue #881). Mirrors
-    /// [`Connector::cover_greeted_packet`]'s mechanism but never reads a
-    /// greeting: `amount` and [`OutboundClientHop::domain`] are both known
-    /// locally, which is exactly what lets this run proactively rather
-    /// than only once a refusal has already taught this node a price.
+    /// packet forwards -- before the packet is ever sent (ADR 0042): a
+    /// voucher on this node's own outbound x402 channel toward the hop (ADR
+    /// 0075 decision 6), whether a runtime peering registered that channel
+    /// (`register_voucher_hop`) or a `[[pay_channels]]` row did
+    /// ([`Connector::with_config_pay_channel`]).
     async fn cover_forward(&self, peer_id: &str, amount: u64) -> Result<Covering, String> {
-        // ADR 0075 decision 6: a peering on x402 is paid on this node's own
-        // outbound channel, and no `toon-channel` hop is consulted for it.
-        if let Some(hop) = self.outbound_voucher_hops.load().get(peer_id).cloned() {
-            return self.cover_with_voucher(peer_id, &hop, amount).await;
-        }
-        let hops = self.outbound_client_hops.load_full();
-        let Some(hop) = hops.get(peer_id) else {
+        let Some(hop) = self.outbound_voucher_hops.load().get(peer_id).cloned() else {
             // Nothing has armed this peering -- no `[[pay_channels]]` row
-            // at boot, and no x402 voucher hop from a runtime peering
-            // (`register_voucher_hop`, ADR 0075) -- so there is nothing to
-            // pay it from, and since issue
-            // #1145 there is no postpay path to fall through to either.
-            // `Config::load` refuses a configured route to an uncovered
-            // peering by name (`ConfigError::PayChannelUnbound`), so a file
-            // that loaded cannot reach this; a leased or runtime-installed
-            // route (ADR 0028) can, and is refused here rather than carried
-            // free.
+            // at boot, and no runtime peering (ADR 0058) -- so there is
+            // nothing to pay it from, and since issue #1145 there is no
+            // postpay path to fall through to either. `Config::load` refuses
+            // a configured route to an uncovered peering by name
+            // (`ConfigError::PayChannelUnbound`), so a file that loaded
+            // cannot reach this; a leased or runtime-installed route (ADR
+            // 0028) can, and is refused here rather than carried free.
             return Err(format!(
-                "no client-role channel is configured to pay peer '{peer_id}' from -- neither a \
-                 '[[pay_channels]]' row nor a runtime peering (ADR 0058) has bound one -- and a \
+                "no outbound channel is registered to pay peer '{peer_id}' on -- neither a \
+                 '[[pay_channels]]' row nor a runtime peering (ADR 0058) has named one -- and a \
                  connector covers every PREPARE it sends (ADR 0042)"
             ));
         };
-        let Some(ledger) = self.outbound_client.as_ref() else {
-            return Err(
-                "a client-role channel is configured for this peer but this node has no \
-                 outbound client ledger to sign from"
-                    .to_string(),
-            );
-        };
-        // The key is the settlement identity of the channel's on-chain
-        // participant, on the channel's own chain (issue #1146) -- the same
-        // key the PEER role on that channel signs with, because it is the
-        // same participant. Chosen by matching the hop's domain, so a
-        // secp256k1 key can never be paired with a Solana program id.
-        let binding = match &hop.domain {
-            OutboundClientDomain::Evm(domain) => {
-                let Some(signer) = self.claims.signer() else {
-                    return Err(
-                        "this node has no EVM settlement signer to sign a claim with".to_string(),
-                    );
-                };
-                OutboundClaimBinding::Evm {
-                    domain: *domain,
-                    signer: signer.as_ref(),
-                }
-            }
-            OutboundClientDomain::Solana(domain) => {
-                let Some(signer) = self.claims.solana_signer() else {
-                    return Err(
-                        "this node has no Solana settlement signer to sign a claim with"
-                            .to_string(),
-                    );
-                };
-                OutboundClaimBinding::Solana {
-                    program_id: domain.program_id,
-                    signer: signer.as_ref(),
-                }
-            }
-        };
-
-        let claim = match ledger
-            .next_claim(
-                peer_id,
-                hop.claim_state.as_ref(),
-                &hop.channel,
-                &binding,
-                amount,
-            )
-            .await
-        {
-            Ok(claim) => claim,
-            Err(error) => return Err(error.to_string()),
-        };
-        // The wire carries `cumulative_amount` as a `uint64` (§4.2); see
-        // the matching check in `cover_greeted_packet` for why this is
-        // refused rather than truncated.
-        let Ok(cumulative_amount) = u64::try_from(claim.cumulative) else {
-            return Err(format!(
-                "the covering claim's cumulative amount {} does not fit the wire's uint64",
-                claim.cumulative
-            ));
-        };
-        Ok(Covering::Claim(WireClaim {
-            channel_id: hop.channel_id.clone(),
-            nonce: claim.nonce,
-            cumulative_amount,
-            // Already discriminated by the binding that produced it -- an
-            // ed25519 signature is never re-labelled as an EVM one on its
-            // way to the carriage (issue #732's rule, issue #1146's arm).
-            signature: claim.signature,
-        }))
+        self.cover_with_voucher(peer_id, &hop, amount).await
     }
 
     /// Cover a forward to `peer_id` over this node's own outbound x402
@@ -3364,104 +3130,29 @@ impl Connector {
         }
     }
 
-    /// Sign a claim covering the terms `peer_id` just quoted, ready to ride
-    /// one retry of the packet it refused (issue #875).
+    /// Cover the terms `peer_id` just quoted, ready to ride one retry of the
+    /// packet it refused (issue #875): the voucher this forward rode was not
+    /// enough for the far end, so ask it where the channel stands and cover
+    /// its own quoted price once, on the same outbound x402 channel (ADR
+    /// 0075 decision 6).
     ///
-    /// The claim is minted from the outbound CLIENT ledger (issue #873):
-    /// its cumulative amount is the RECEIVER's own watermark advanced by the
-    /// quoted price, and on EVM its EIP-712 domain is the receiver's own,
-    /// read off the greeting rather than out of this node's settlement
-    /// config -- a claim signed under the payer's idea of the `TokenNetwork`
-    /// recovers to a different address and is refused at the far gate.
-    ///
-    /// **A Solana hop reads no domain off the greeting** (issue #1146), and
-    /// that is not the same shortcut this method refuses for EVM. ADR 0053's
-    /// binding is the settlement program id, and since issue #1128 a node
-    /// has exactly one -- the program it can redeem through -- so a payer and
-    /// a payee that disagreed about it would have no channel in common to be
-    /// quoting each other prices about. The greeting supplies the price and
-    /// nothing else. The retry arm therefore works on both chains rather
-    /// than silently doing nothing on one.
-    ///
-    /// `None` -- with the reason logged, never silently -- for every way
-    /// this node cannot pay: no ledger, no client-role channel configured
-    /// for this hop, no settlement signer on that channel's chain, an EVM
-    /// hop whose greeting names no EVM settlement, or a receiver that would
-    /// not report the watermark (which includes refusing for want of
-    /// headroom). The caller then relays the peer's refusal as it stands;
-    /// nothing is ever emitted claiming to have paid when it has not.
+    /// `None` -- with the reason logged, never silently -- when this node
+    /// has no outbound channel registered for the hop, or cannot sign on
+    /// it. The caller then relays the peer's refusal as it stands; nothing
+    /// is ever emitted claiming to have paid when it has not.
     async fn cover_greeted_packet(
         &self,
         peer_id: &str,
         terms: &X402PaymentRequired,
     ) -> Option<Covering> {
-        // An x402 peering: the voucher this forward rode was not enough for
-        // the far end, so ask it where the channel stands and cover its own
-        // quoted price once, on the same channel.
-        if let Some(hop) = self.outbound_voucher_hops.load().get(peer_id).cloned() {
-            hop.synced.store(false, Ordering::Release);
-            let price = terms.price()?;
-            return match self.cover_with_voucher(peer_id, &hop, price).await {
-                Ok(covering) => Some(covering),
-                Err(reason) => {
-                    tracing::warn!(peer_id, %reason, "could not sign a voucher covering the peer's terms");
-                    None
-                }
-            };
-        }
-        let Some(ledger) = self.outbound_client.as_ref() else {
+        let Some(hop) = self.outbound_voucher_hops.load().get(peer_id).cloned() else {
             tracing::warn!(
                 peer_id,
-                "peer quoted x402 terms but this node has no outbound client ledger to pay from"
+                "peer quoted x402 terms but no outbound channel is registered to pay it on"
             );
             return None;
         };
-        let hops = self.outbound_client_hops.load_full();
-        let Some(hop) = hops.get(peer_id) else {
-            tracing::warn!(
-                peer_id,
-                "peer quoted x402 terms but no client-role channel is configured for it"
-            );
-            return None;
-        };
-        let binding = match &hop.domain {
-            OutboundClientDomain::Evm(_) => {
-                let Some(signer) = self.claims.signer() else {
-                    tracing::warn!(
-                        peer_id,
-                        "peer quoted x402 terms but this node has no EVM settlement signer to \
-                         sign a claim with"
-                    );
-                    return None;
-                };
-                let Some(domain) = EvmDomain::from_greeting(terms) else {
-                    tracing::warn!(
-                        peer_id,
-                        resource = %terms.resource.url,
-                        "peer quoted x402 terms naming no EVM settlement this node can sign under"
-                    );
-                    return None;
-                };
-                OutboundClaimBinding::Evm {
-                    domain,
-                    signer: signer.as_ref(),
-                }
-            }
-            OutboundClientDomain::Solana(domain) => {
-                let Some(signer) = self.claims.solana_signer() else {
-                    tracing::warn!(
-                        peer_id,
-                        "peer quoted x402 terms but this node has no Solana settlement signer to \
-                         sign a claim with"
-                    );
-                    return None;
-                };
-                OutboundClaimBinding::Solana {
-                    program_id: domain.program_id,
-                    signer: signer.as_ref(),
-                }
-            }
-        };
+        hop.synced.store(false, Ordering::Release);
         let Some(price) = terms.price() else {
             // Unreachable through a parsed greeting (`parse_greeting`
             // refuses an unreadable amount), and still not defaulted to
@@ -3469,45 +3160,13 @@ impl Connector {
             tracing::warn!(peer_id, "peer quoted x402 terms with no readable price");
             return None;
         };
-
-        let claim = match ledger
-            .next_claim(
-                peer_id,
-                hop.claim_state.as_ref(),
-                &hop.channel,
-                &binding,
-                price,
-            )
-            .await
-        {
-            Ok(claim) => claim,
-            Err(error) => {
-                tracing::warn!(
-                    peer_id,
-                    %error,
-                    "could not sign a claim covering the peer's terms"
-                );
-                return None;
+        match self.cover_with_voucher(peer_id, &hop, price).await {
+            Ok(covering) => Some(covering),
+            Err(reason) => {
+                tracing::warn!(peer_id, %reason, "could not sign a voucher covering the peer's terms");
+                None
             }
-        };
-        // The wire carries `cumulative_amount` as a `uint64` (§4.2); a
-        // channel whose lifetime total has outgrown that is refused here
-        // rather than truncated into a claim for a smaller number than the
-        // one signed.
-        let Ok(cumulative_amount) = u64::try_from(claim.cumulative) else {
-            tracing::error!(
-                peer_id,
-                cumulative = %claim.cumulative,
-                "the covering claim's cumulative amount does not fit the wire's uint64"
-            );
-            return None;
-        };
-        Some(Covering::Claim(WireClaim {
-            channel_id: hop.channel_id.clone(),
-            nonce: claim.nonce,
-            cumulative_amount,
-            signature: claim.signature,
-        }))
+        }
     }
 
     /// Issue #545: a reject this connector originates because the packet
@@ -3627,7 +3286,8 @@ impl Connector {
     /// That asymmetry is deliberate and is the whole of ADR 0064: the claim
     /// paying for this packet was taken *before* the app was called -- at
     /// the client edge by `ClientClaimGate::ingest`, or on a peer arrival by
-    /// `ClaimBook`, in both cases with the watermark advanced and journalled
+    /// the same gate's voucher admission (ADR 0075 decision 6), in both
+    /// cases with the watermark advanced and journalled
     /// before routing began -- and only a forwarded route's terminal reject
     /// gives one back (`roll_back_uncarried_forward`, issue #1012). So the
     /// verdict returned here decides nothing about who is out of pocket.
@@ -4302,7 +3962,7 @@ mod tests {
         answered, answered_with_status, covering, expected_fulfillment, fulfill_envelope,
         fulfill_envelope_with_status, identity_signer, open_sealed_envelope,
         sealed_envelope_request_data, sealed_envelope_request_data_with_headers,
-        sealed_envelope_request_data_with_target, test_channel_domain, test_channel_id,
+        sealed_envelope_request_data_with_target, voucher_amount,
     };
     use async_trait::async_trait;
     use chrono::{Duration, TimeZone, Utc};
@@ -5407,12 +5067,8 @@ mod tests {
     /// only arrival that names an incoming peering, and therefore the only
     /// one that can cross a boundary.
     async fn arrives_from_upstream(hop: &Connector, amount: u64) -> PacketResponse {
-        let (response, _ack) = hop
-            .handle_peer_prepare(
-                Some(UPSTREAM),
-                prepare_with_amount("g.example.app", amount),
-                None,
-            )
+        let response = hop
+            .handle_peer_prepare(Some(UPSTREAM), prepare_with_amount("g.example.app", amount))
             .await;
         response
     }
@@ -5477,10 +5133,10 @@ mod tests {
         );
     }
 
-    /// Decision 1: the covering claim `cover_forward` mints is for the
-    /// CONVERTED figure, on the outgoing channel. Claims needed no change
+    /// Decision 1: the covering voucher `cover_forward` signs is for the
+    /// CONVERTED figure, on the outgoing channel. Vouchers needed no change
     /// for this -- they are denominated by channel identity alone -- which
-    /// is exactly why the figure on the claim has to be the outgoing one:
+    /// is exactly why the figure on the voucher has to be the outgoing one:
     /// nothing else on it says what unit it is in.
     #[tokio::test]
     async fn the_covering_claim_is_minted_for_the_converted_outgoing_figure() {
@@ -5493,14 +5149,14 @@ mod tests {
 
         arrives_from_upstream(&hop, 1_000_000).await;
 
-        let claim = peer.covered_by()[0]
+        let covering = peer.covered_by()[0]
             .clone()
             .expect("ADR 0042: no PREPARE leaves this connector uncovered");
-        assert_eq!(claim.cumulative_amount, 3_999_000_000_000_000_000);
+        assert_eq!(voucher_amount(&covering), 3_999_000_000_000_000_000);
         assert_eq!(
-            claim.cumulative_amount,
-            peer.carried()[0].amount,
-            "the claim covers what went out, not what came in"
+            voucher_amount(&covering),
+            u128::from(peer.carried()[0].amount),
+            "the voucher covers what went out, not what came in"
         );
     }
 
@@ -6037,21 +5693,13 @@ mod tests {
             &self,
             _peer_id: &str,
             prepare: Prepare,
-            claim: Option<Covering>,
+            _covering: Option<Covering>,
         ) -> PeerForward {
-            let (response, ack) = self
+            let response = self
                 .downstream
-                .handle_peer_prepare(
-                    Some(&self.arrives_as),
-                    prepare,
-                    claim.and_then(Covering::into_claim),
-                )
+                .handle_peer_prepare(Some(&self.arrives_as), prepare)
                 .await;
-            PeerForward::answered(response, ack)
-        }
-
-        async fn flush(&self, _peer_id: &str, _claim: WireClaim) -> ClaimAckOutcome {
-            ClaimAckOutcome::NotSent
+            PeerForward::answered(response, ClaimAckOutcome::NotSent)
         }
     }
 
@@ -6084,10 +5732,6 @@ mod tests {
                 }),
                 ClaimAckOutcome::NotSent,
             )
-        }
-
-        async fn flush(&self, _peer_id: &str, _claim: WireClaim) -> ClaimAckOutcome {
-            ClaimAckOutcome::NotSent
         }
     }
 
@@ -7058,10 +6702,6 @@ mod tests {
         ) -> PeerForward {
             PeerForward::answered(self.0.clone(), ClaimAckOutcome::NotSent)
         }
-
-        async fn flush(&self, _peer_id: &str, _claim: WireClaim) -> ClaimAckOutcome {
-            ClaimAckOutcome::NotSent
-        }
     }
 
     /// Issue #1269 / ADR 0069: a peer's FULFILL rides home unchecked. Until
@@ -7117,11 +6757,11 @@ mod tests {
     #[derive(Default)]
     struct CarriesAndRemembers {
         carried: Mutex<Vec<Prepare>>,
-        /// The claim that rode with each carried packet, in the same order
-        /// -- what `cover_forward` actually minted, which is the only way
-        /// to see whether ADR 0071's covering claim was written for the
-        /// converted figure (issue #1295).
-        covered_by: Mutex<Vec<Option<WireClaim>>>,
+        /// What covered each carried packet, in the same order -- what
+        /// `cover_forward` actually signed, which is the only way to see
+        /// whether ADR 0071's covering voucher was written for the converted
+        /// figure (issue #1295).
+        covered_by: Mutex<Vec<Option<Covering>>>,
         /// The running cost this peer's own reject arrives with: what
         /// everything beyond it charges, in ITS unit, which is the outgoing
         /// leg's (ADR 0011, ADR 0071 decision 7, issue #1296). Zero -- the
@@ -7145,7 +6785,7 @@ mod tests {
             self.carried.lock().unwrap().clone()
         }
 
-        fn covered_by(&self) -> Vec<Option<WireClaim>> {
+        fn covered_by(&self) -> Vec<Option<Covering>> {
             self.covered_by.lock().unwrap().clone()
         }
     }
@@ -7159,10 +6799,7 @@ mod tests {
             claim: Option<Covering>,
         ) -> PeerForward {
             self.carried.lock().unwrap().push(prepare);
-            self.covered_by
-                .lock()
-                .unwrap()
-                .push(claim.and_then(Covering::into_claim));
+            self.covered_by.lock().unwrap().push(claim);
             PeerForward::answered(
                 PacketResponse::Reject(Reject {
                     code: RejectCode::f02_unreachable(),
@@ -7173,10 +6810,6 @@ mod tests {
                 }),
                 ClaimAckOutcome::NotSent,
             )
-        }
-
-        async fn flush(&self, _peer_id: &str, _claim: WireClaim) -> ClaimAckOutcome {
-            ClaimAckOutcome::NotSent
         }
     }
 
@@ -7576,903 +7209,6 @@ mod tests {
                 }
                 other => panic!("expected an R00 reject, got {other:?}"),
             }
-        }
-    }
-
-    /// Issue #881: every packet forwarded to a hop configured for
-    /// client-role covering carries a claim of its own, minted before the
-    /// packet is sent -- plus issue #875's one bounded retry for the hop
-    /// that greets a covered packet anyway.
-    ///
-    /// The stand-ins here are the two real roles of that exchange, not
-    /// mocks with expectations: [`GreetingPeer`] is a receiver that refuses
-    /// an uncovered packet with terms and carries a covered one -- exactly
-    /// what a client edge does (`client-edge-spec.md` §1.4) -- and
-    /// [`StandingWatermark`] is the receiver answering where this node's
-    /// claims on the channel stand, the same answer `HttpClaimState` reads
-    /// off a real `POST /ilp/claim-state` (proven against a live HTTP
-    /// receiver in `outbound_client`'s own tests).
-    mod covering_a_forward {
-        use super::*;
-        use crate::claim::ClaimSignature;
-        use crate::outbound_client::{
-            ClaimStateDomain, ClaimStateSource, ClaimWatermark, EvmDomain, OutboundClientError,
-            OutboundClientLedger,
-        };
-        use connector_domain::x402::{
-            X402AcceptOption, X402ChannelExtra, X402PaymentOption, X402PaymentRequired,
-            X402Resource, X402SettlementTerms, X402_VERSION,
-        };
-        use connector_signer::{LocalEd25519Signer, LocalSigner};
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-        /// The price the far side quotes for carrying one packet.
-        const PRICE: u64 = 250;
-        /// What the packet itself is worth -- deliberately different from
-        /// `PRICE`, so a test can tell which figure a claim covers.
-        const PACKET_AMOUNT: u64 = 1_000;
-
-        /// The terms a receiver quotes, carrying the EVM settlement facts
-        /// (issues #617/#632) a payer signs its claim under. The domain is
-        /// [`test_channel_domain`]'s, because the channel the greeting is
-        /// about is this crate's own test channel.
-        fn quoted_terms() -> X402PaymentRequired {
-            let domain = test_channel_domain();
-            X402PaymentRequired {
-                x402_version: X402_VERSION,
-                resource: X402Resource {
-                    url: "g.example.app".to_string(),
-                },
-                request: None,
-                accepts: vec![X402AcceptOption::Channel(Box::new(X402PaymentOption {
-                    scheme: "toon-channel".to_string(),
-                    network: "g.example.app".to_string(),
-                    amount: PRICE.to_string(),
-                    pay_to: "g.example.app".to_string(),
-                    max_timeout_seconds: 60,
-                    http_endpoint: "/ilp".to_string(),
-                    extra: X402ChannelExtra {
-                        settlement: Some(X402SettlementTerms {
-                            chain: format!("evm:{}", domain.chain_id),
-                            settlement_address: format!("0x{}", "aa".repeat(20)),
-                            token_network_registry: format!("0x{}", "bb".repeat(20)),
-                            token_network: format!(
-                                "0x{}",
-                                domain
-                                    .token_network_address
-                                    .iter()
-                                    .map(|byte| format!("{byte:02x}"))
-                                    .collect::<String>()
-                            ),
-                            token_address: format!("0x{}", "cc".repeat(20)),
-                            decimals: 6,
-                        }),
-                        ..X402ChannelExtra::default()
-                    },
-                }))],
-            }
-        }
-
-        /// A next hop that carries a packet only once it is covered: an
-        /// uncovered PREPARE is refused with the §1.4 greeting, a covered
-        /// one fulfils. `always_greets` is the far side that goes on
-        /// demanding payment even after a covering claim -- a price that
-        /// moved, or a claim its gate would not take.
-        struct GreetingPeer {
-            fulfillment: [u8; 32],
-            always_greets: bool,
-            /// Whether it quotes terms at all. `false` is the peer that
-            /// never demands payment -- the pre-#875 world, which must be
-            /// unaffected.
-            greets: bool,
-            /// Every forward it saw, in order, with whatever claim rode
-            /// along.
-            seen: Mutex<Vec<Option<WireClaim>>>,
-        }
-
-        impl GreetingPeer {
-            fn new(fulfillment: [u8; 32]) -> Arc<GreetingPeer> {
-                Arc::new(GreetingPeer {
-                    fulfillment,
-                    always_greets: false,
-                    greets: true,
-                    seen: Mutex::new(Vec::new()),
-                })
-            }
-
-            fn seen(&self) -> Vec<Option<WireClaim>> {
-                self.seen.lock().expect("seen lock poisoned").clone()
-            }
-        }
-
-        #[async_trait]
-        impl PeerTransport for GreetingPeer {
-            async fn forward(
-                &self,
-                _peer_id: &str,
-                _prepare: Prepare,
-                claim: Option<Covering>,
-            ) -> PeerForward {
-                let claim = claim.and_then(Covering::into_claim);
-                let covered = claim
-                    .as_ref()
-                    .is_some_and(|claim| claim.cumulative_amount >= PRICE);
-                self.seen.lock().expect("seen lock poisoned").push(claim);
-                if self.greets && (!covered || self.always_greets) {
-                    return PeerForward::quoted(
-                        PacketResponse::Reject(Reject {
-                            code: RejectCode::f06_unexpected_payment(),
-                            triggered_by: String::new(),
-                            message: "payment required".to_string(),
-                            data: Vec::new(),
-                            accumulated_cost: 0,
-                        }),
-                        ClaimAckOutcome::NotSent,
-                        quoted_terms(),
-                    );
-                }
-                PeerForward::answered(
-                    PacketResponse::Fulfill(Fulfill {
-                        fulfillment: self.fulfillment,
-                        data: Vec::new(),
-                    }),
-                    ClaimAckOutcome::Accepted,
-                )
-            }
-
-            async fn flush(&self, _peer_id: &str, _claim: WireClaim) -> ClaimAckOutcome {
-                ClaimAckOutcome::NotSent
-            }
-        }
-
-        /// The receiver answering where this node's claims on the channel
-        /// stand -- the authority the outbound client ledger prices every
-        /// claim off (see `crate::outbound_client`'s header).
-        struct StandingWatermark {
-            nonce: AtomicU64,
-            cumulative: AtomicU64,
-            asked: AtomicU64,
-            /// Which chain's ask each call made (issue #1146). A covering
-            /// payer that asked one chain and signed on the other would
-            /// still get an answer here, so the ask itself has to be
-            /// observable for a test to say the arm was chosen correctly.
-            asked_about: Mutex<Vec<ClaimStateDomain>>,
-            /// The receiver that will not answer at all: there is then no
-            /// watermark to advance, and nothing safe to sign.
-            silent: AtomicBool,
-        }
-
-        impl StandingWatermark {
-            fn at(nonce: u64, cumulative: u64) -> Arc<StandingWatermark> {
-                Arc::new(StandingWatermark {
-                    nonce: AtomicU64::new(nonce),
-                    cumulative: AtomicU64::new(cumulative),
-                    asked: AtomicU64::new(0),
-                    asked_about: Mutex::new(Vec::new()),
-                    silent: AtomicBool::new(false),
-                })
-            }
-        }
-
-        #[async_trait]
-        impl ClaimStateSource for StandingWatermark {
-            async fn watermark(
-                &self,
-                channel: &[u8; 32],
-                domain: &ClaimStateDomain,
-            ) -> Result<ClaimWatermark, OutboundClientError> {
-                self.asked.fetch_add(1, Ordering::SeqCst);
-                self.asked_about
-                    .lock()
-                    .expect("asked-about lock poisoned")
-                    .push(*domain);
-                if self.silent.load(Ordering::SeqCst) {
-                    return Err(OutboundClientError::ClaimStateUnavailable {
-                        channel: format!("0x{}", hex_lower(channel)),
-                        reason: "the test receiver is not answering".to_string(),
-                    });
-                }
-                Ok(ClaimWatermark {
-                    nonce: self.nonce.load(Ordering::SeqCst),
-                    cumulative: u128::from(self.cumulative.load(Ordering::SeqCst)),
-                    available: Some(1_000_000),
-                })
-            }
-        }
-
-        /// [`test_channel_domain`]'s facts, as the [`EvmDomain`]
-        /// `with_outbound_client_hop` (issue #881) takes as operator
-        /// config rather than reads off a greeting -- the same chain id
-        /// and `TokenNetwork` a channel's peer-role domain carries, since
-        /// both roles sign against the very same on-chain channel.
-        fn test_channel_evm_domain() -> EvmDomain {
-            let domain = test_channel_domain();
-            EvmDomain {
-                chain_id: domain.chain_id,
-                token_network: domain.token_network_address,
-            }
-        }
-
-        /// A first hop routing `g.example.app` to `second-hop`, charging
-        /// `fee` for the carriage, holding the client role for that hop:
-        /// the ledger it signs from plus the receiver as the authority on
-        /// where its claims stand. The channel is also bound in the PEER
-        /// role (`with_channel_domain`) because that is the deployed
-        /// shape -- one channel, the peer role for what arrives and the
-        /// client role for what this node sends.
-        ///
-        /// It no longer registers an OUTBOUND peer-role channel, because
-        /// there is no longer such a thing (issue #1145): nothing is owed
-        /// to a peer after a fulfilment, so `[[peer_channels]]` is an
-        /// inbound binding only.
-        fn first_hop_charging(
-            peer: Arc<GreetingPeer>,
-            receiver: Arc<StandingWatermark>,
-            ledger: Arc<OutboundClientLedger>,
-            fee: u64,
-        ) -> Connector {
-            Connector::new(
-                vec![],
-                vec![PeerRoute::new("g.example.app", "second-hop")],
-                Arc::new(FakeAppClient::new()),
-                peer,
-                test_clock(),
-            )
-            .with_peer_fees([("second-hop".to_string(), fee)])
-            .with_signer(Arc::new(LocalSigner::generate("settlement-key")))
-            .with_channel_domain(test_channel_id(1), test_channel_domain())
-            .expect("test_channel_id(1) is a valid on-chain channel id")
-            .with_outbound_client_ledger(ledger)
-            .with_outbound_client_hop(
-                "second-hop",
-                test_channel_id(1),
-                test_channel_evm_domain(),
-                receiver,
-            )
-            .expect("test_channel_id(1) is a valid on-chain channel id")
-        }
-
-        /// [`first_hop_charging`] with no fee, which is what most of these
-        /// tests want: the claim then covers the packet's own amount and
-        /// there is one number to follow rather than two.
-        fn first_hop(
-            peer: Arc<GreetingPeer>,
-            receiver: Arc<StandingWatermark>,
-            ledger: Arc<OutboundClientLedger>,
-        ) -> Connector {
-            first_hop_charging(peer, receiver, ledger, 0)
-        }
-
-        fn ledger() -> (tempfile::TempDir, Arc<OutboundClientLedger>) {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let ledger = Arc::new(
-                OutboundClientLedger::open(dir.path().join("outbound-client.log")).expect("open"),
-            );
-            (dir, ledger)
-        }
-
-        /// **The test that proves the hole is closed.** N consecutive
-        /// forwards over a healthy link -- nothing is ever pending on the
-        /// peer ledger in this test at all, so before #881 the old
-        /// `pending_claim`-first design would have sent every single one
-        /// of these uncovered -- each carry their OWN covering claim from
-        /// the FIRST attempt: no round trip is ever spent discovering a
-        /// refusal before this node pays.
-        #[tokio::test]
-        async fn n_consecutive_forwards_over_a_healthy_link_each_carry_their_own_covering_claim() {
-            let (sealed, shared_secret) = sealed_prepare(b"hello");
-            let peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-            let receiver = StandingWatermark::at(7, 7_000);
-            let (_dir, ledger) = ledger();
-            let connector = first_hop(peer.clone(), receiver, ledger.clone());
-
-            const N: u64 = 3;
-            for _ in 0..N {
-                let response = connector
-                    .handle_prepare(Prepare {
-                        amount: PACKET_AMOUNT,
-                        ..sealed.clone()
-                    })
-                    .await;
-                assert!(
-                    matches!(response, PacketResponse::Fulfill(_)),
-                    "a proactively covered forward must fulfil, got {response:?}"
-                );
-            }
-
-            let seen = peer.seen();
-            assert_eq!(
-                seen.len(),
-                N as usize,
-                "no retries: every one of the N attempts was covered and fulfilled on its first try"
-            );
-            for (index, claim) in seen.iter().enumerate() {
-                let claim = claim.as_ref().unwrap_or_else(|| {
-                    panic!("packet {index} was emitted uncovered -- exactly the hole #881 closes")
-                });
-                assert_eq!(claim.channel_id, test_channel_id(1));
-                assert_eq!(
-                    claim.nonce,
-                    8 + index as u64,
-                    "nonces advance one per packet, starting above the receiver's watermark"
-                );
-                assert_eq!(
-                    claim.cumulative_amount,
-                    7_000 + PACKET_AMOUNT,
-                    "each claim covers this node's own forwarded value over the receiver's \
-                     watermark, not merely the peer's quoted price"
-                );
-            }
-            assert_eq!(ledger.issued_nonce("second-hop"), 7 + N);
-        }
-
-        /// The first packet after a restart is covered too -- not just
-        /// packets after the process has already signed one (issue #881's
-        /// own acceptance). A restart reopens the SAME ledger file with a
-        /// fresh, empty in-memory book, which is exactly what proves the
-        /// nonce floor on disk -- not anything this process remembers --
-        /// is what makes the first forward proactive rather than merely
-        /// "warmed up".
-        #[tokio::test]
-        async fn the_first_forward_after_a_restart_is_covered() {
-            let (sealed, shared_secret) = sealed_prepare(b"hello");
-            let receiver = StandingWatermark::at(5, 5_000);
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().join("outbound-client.log");
-
-            // A prior process's ledger, over the same file, signs one claim
-            // and exits -- nothing in memory survives it.
-            {
-                let ledger = Arc::new(OutboundClientLedger::open(&path).expect("open"));
-                let peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-                let connector = first_hop(peer.clone(), receiver.clone(), ledger.clone());
-                let response = connector
-                    .handle_prepare(Prepare {
-                        amount: PACKET_AMOUNT,
-                        ..sealed.clone()
-                    })
-                    .await;
-                assert!(matches!(response, PacketResponse::Fulfill(_)));
-                assert_eq!(ledger.issued_nonce("second-hop"), 6);
-            }
-
-            // The restart: a fresh ledger, over the same file, in a fresh
-            // connector.
-            let ledger = Arc::new(OutboundClientLedger::open(&path).expect("reopen"));
-            let peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-            let connector = first_hop(peer.clone(), receiver, ledger);
-            let response = connector
-                .handle_prepare(Prepare {
-                    amount: PACKET_AMOUNT,
-                    ..sealed
-                })
-                .await;
-
-            assert!(
-                matches!(response, PacketResponse::Fulfill(_)),
-                "the first forward after a restart must still be covered, got {response:?}"
-            );
-            let seen = peer.seen();
-            assert_eq!(
-                seen.len(),
-                1,
-                "covered from the first attempt -- no retry needed"
-            );
-            let claim = seen[0]
-                .as_ref()
-                .expect("the first packet after a restart must not be emitted uncovered");
-            assert_eq!(
-                claim.nonce, 7,
-                "the restart resumes above every nonce ever issued, never reusing one"
-            );
-        }
-
-        /// One retry, never a loop: a peer that keeps demanding payment
-        /// despite an already-covering claim gets exactly one recovery
-        /// attempt, and its second refusal is the answer.
-        #[tokio::test]
-        async fn a_second_payment_required_is_a_failure_rather_than_a_second_retry() {
-            let (sealed, shared_secret) = sealed_prepare(b"hello");
-            let mut peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-            Arc::get_mut(&mut peer).expect("sole owner").always_greets = true;
-            let receiver = StandingWatermark::at(0, 0);
-            let (_dir, ledger) = ledger();
-            let connector = first_hop(peer.clone(), receiver, ledger.clone());
-
-            let response = connector
-                .handle_prepare(Prepare {
-                    amount: PACKET_AMOUNT,
-                    ..sealed
-                })
-                .await;
-
-            match response {
-                PacketResponse::Reject(reject) => assert_eq!(reject.code.as_str(), "F06"),
-                other => panic!("expected the peer's second refusal, got {other:?}"),
-            }
-            assert_eq!(
-                peer.seen().len(),
-                2,
-                "bounded: the proactively covered attempt and exactly one recovery retry"
-            );
-            assert_eq!(
-                ledger.issued_nonce("second-hop"),
-                2,
-                "one claim for the proactive attempt, one more for the one bounded retry"
-            );
-        }
-
-        /// No double-spend: a proactively covered forward advances the
-        /// outbound client ledger exactly once, and no peer-role claim is
-        /// armed for the same packet.
-        #[tokio::test]
-        async fn a_covered_forward_advances_one_ledger_once_and_the_other_not_at_all() {
-            let (sealed, shared_secret) = sealed_prepare(b"hello");
-            let peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-            let receiver = StandingWatermark::at(3, 3_000);
-            let (_dir, ledger) = ledger();
-            let connector = first_hop(peer.clone(), receiver.clone(), ledger.clone());
-
-            let response = connector
-                .handle_prepare(Prepare {
-                    amount: PACKET_AMOUNT,
-                    ..sealed
-                })
-                .await;
-
-            assert!(matches!(response, PacketResponse::Fulfill(_)));
-            assert_eq!(
-                ledger.issued_nonce("second-hop"),
-                4,
-                "exactly one nonce for one successful forward"
-            );
-            assert_eq!(
-                receiver.asked.load(Ordering::SeqCst),
-                1,
-                "the receiver is asked once per covered packet, not once per attempt"
-            );
-        }
-
-        /// No double-spend, part two: even a fully failed forward --
-        /// proactive cover refused, recovery retry refused too -- only
-        /// ever skips nonces, and the value it would have moved is never
-        /// lost: a fresh attempt against a peer that now accepts payment
-        /// succeeds proactively, at a strictly higher nonce, still priced
-        /// off whatever the receiver reports.
-        #[tokio::test]
-        async fn a_failed_forward_skips_nonces_rather_than_burning_the_ledger() {
-            let (sealed, shared_secret) = sealed_prepare(b"hello");
-            let mut peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-            Arc::get_mut(&mut peer).expect("sole owner").always_greets = true;
-            let receiver = StandingWatermark::at(11, 11_000);
-            let (_dir, ledger) = ledger();
-            let refusing = first_hop(peer.clone(), receiver.clone(), ledger.clone());
-
-            let refused = refusing
-                .handle_prepare(Prepare {
-                    amount: PACKET_AMOUNT,
-                    ..sealed.clone()
-                })
-                .await;
-            assert!(matches!(refused, PacketResponse::Reject(_)));
-            let seen = peer.seen();
-            let proactive = seen[0]
-                .as_ref()
-                .expect("the proactive attempt did carry a claim");
-            let burned = seen[1]
-                .as_ref()
-                .expect("the failed retry did carry a claim")
-                .clone();
-            assert!(
-                burned.nonce > proactive.nonce,
-                "the retry must burn a strictly higher nonce than the proactive attempt: \
-                 {} vs {}",
-                burned.nonce,
-                proactive.nonce
-            );
-
-            // The receiver never recorded either claim -- it is still where
-            // it was. A second attempt, against a peer that now takes
-            // payment, succeeds proactively on the first try.
-            let peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-            let connector = first_hop(peer.clone(), receiver.clone(), ledger.clone());
-            let response = connector
-                .handle_prepare(Prepare {
-                    amount: PACKET_AMOUNT,
-                    ..sealed
-                })
-                .await;
-
-            assert!(matches!(response, PacketResponse::Fulfill(_)));
-            let seen = peer.seen();
-            assert_eq!(
-                seen.len(),
-                1,
-                "covered proactively -- no retry needed this time"
-            );
-            let covering = seen[0]
-                .as_ref()
-                .expect("the proactive claim covers it")
-                .clone();
-            assert!(
-                covering.nonce > burned.nonce,
-                "a nonce is never reissued: {} must exceed the burned {}",
-                covering.nonce,
-                burned.nonce
-            );
-            assert_eq!(
-                covering.cumulative_amount,
-                11_000 + PACKET_AMOUNT,
-                "priced off the receiver's watermark advanced by this node's own forwarded \
-                 value, so the failed attempts cost nothing but two nonces"
-            );
-        }
-
-        /// Interop (issue #881's own acceptance): a receiver that has not
-        /// taken #868/#880 and demands no payment at all still gets the
-        /// default covering claim -- attaching one is harmless to a
-        /// receiver that never asked for it, and this hop is configured
-        /// for client-role covering regardless of what any one receiver
-        /// currently enforces.
-        #[tokio::test]
-        async fn a_peer_that_demands_no_payment_still_gets_the_default_covering_claim() {
-            let (sealed, shared_secret) = sealed_prepare(b"hello");
-            let mut peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-            Arc::get_mut(&mut peer).expect("sole owner").greets = false;
-            let receiver = StandingWatermark::at(0, 0);
-            let (_dir, ledger) = ledger();
-            let connector = first_hop(peer.clone(), receiver.clone(), ledger.clone());
-
-            let response = connector
-                .handle_prepare(Prepare {
-                    amount: PACKET_AMOUNT,
-                    ..sealed
-                })
-                .await;
-
-            assert!(matches!(response, PacketResponse::Fulfill(_)));
-            let seen = peer.seen();
-            assert_eq!(seen.len(), 1, "one forward, no retry needed");
-            let claim = seen[0]
-                .as_ref()
-                .expect("covered by default even though the peer never demanded it");
-            assert_eq!(claim.cumulative_amount, PACKET_AMOUNT);
-            assert_eq!(ledger.issued_nonce("second-hop"), 1);
-            assert_eq!(receiver.asked.load(Ordering::SeqCst), 1);
-        }
-
-        /// **A peering that cannot cover a forward does not forward it**
-        /// (issue #1145). This is the deleted fallback, asserted as its
-        /// own refusal: a hop with no client-role config used to fall
-        /// through to `ClaimBook::pending_claim` and carry the packet on
-        /// ADR 0004's postpay convention -- the model ADR 0042 exists to
-        /// retire, and the reason "a connector covers every PREPARE it
-        /// sends" was a record rather than a fact. There is now no arm
-        /// that reaches the wire uncovered, so the packet dies here and
-        /// the peer never sees it.
-        ///
-        /// Note which peer this uses: one that demands nothing. Even a
-        /// receiver perfectly happy to carry the packet for free does not
-        /// get it, because the rule is about what this connector will
-        /// send, not about what the far side will accept.
-        #[tokio::test]
-        async fn a_hop_with_no_client_role_configured_refuses_the_forward_rather_than_sending_it() {
-            let (sealed, shared_secret) = sealed_prepare(b"hello");
-            let mut peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-            Arc::get_mut(&mut peer).expect("sole owner").greets = false;
-            let connector = Connector::new(
-                vec![],
-                vec![PeerRoute::new("g.example.app", "second-hop")],
-                Arc::new(FakeAppClient::new()),
-                peer.clone(),
-                test_clock(),
-            )
-            .with_signer(Arc::new(LocalSigner::generate("settlement-key")))
-            .with_channel_domain(test_channel_id(1), test_channel_domain())
-            .expect("test_channel_id(1) is a valid on-chain channel id");
-            // Deliberately no `with_outbound_client_ledger` /
-            // `with_outbound_client_hop` -- the `[[pay_channels]]` row
-            // `Config::load` now refuses a routed peering for being
-            // without.
-
-            let response = connector
-                .handle_prepare(Prepare {
-                    amount: PACKET_AMOUNT,
-                    ..sealed
-                })
-                .await;
-
-            match response {
-                PacketResponse::Reject(reject) => {
-                    assert_eq!(reject.code.as_str(), "T00");
-                    assert!(
-                        reject.message.contains("second-hop")
-                            && reject.message.contains("pay_channels"),
-                        "the refusal must name the hop and what is missing: {}",
-                        reject.message
-                    );
-                }
-                other => panic!("expected a local refusal, got {other:?}"),
-            }
-            assert!(
-                peer.seen().is_empty(),
-                "nothing may reach the peer when nothing could pay for it"
-            );
-        }
-
-        /// The fee is subtracted BEFORE the claim is minted: this hop
-        /// covers what it forwards, not what arrived, so it keeps exactly
-        /// its own fee (ADR 0010's earnings rule, ADR 0042's symmetric
-        /// figure). The property the deleted postpay test
-        /// `forwarding_to_a_peer_subtracts_that_relations_flat_fee` used to
-        /// read off the peer ledger's armed claim, read off the covering
-        /// claim that actually rides the packet instead.
-        #[tokio::test]
-        async fn a_covered_forward_covers_the_amount_after_this_hops_own_fee() {
-            const FEE: u64 = 7;
-            let (sealed, shared_secret) = sealed_prepare(b"hello");
-            let peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-            let receiver = StandingWatermark::at(4, 4_000);
-            let (_dir, ledger) = ledger();
-            let connector = first_hop_charging(peer.clone(), receiver, ledger, FEE);
-
-            let response = connector
-                .handle_prepare(Prepare {
-                    amount: PACKET_AMOUNT,
-                    ..sealed
-                })
-                .await;
-
-            assert!(matches!(response, PacketResponse::Fulfill(_)));
-            let seen = peer.seen();
-            assert_eq!(seen.len(), 1, "covered on the first attempt");
-            let claim = seen[0].as_ref().expect("covered before it was sent");
-            assert_eq!(
-                claim.cumulative_amount,
-                4_000 + PACKET_AMOUNT - FEE,
-                "the covering claim advances by what this hop FORWARDS, so the difference \
-                 between what it collected and what it covered is exactly its fee"
-            );
-        }
-
-        /// A receiver that will not report its watermark leaves nothing
-        /// safe to sign, so the packet FAILS outright (issue #881's own
-        /// acceptance) -- it is never emitted uncovered as a fallback, and
-        /// never even reaches the peer: there is nothing honest to send.
-        #[tokio::test]
-        async fn a_receiver_that_will_not_report_its_watermark_fails_without_forwarding() {
-            let (sealed, shared_secret) = sealed_prepare(b"hello");
-            let peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-            let receiver = StandingWatermark::at(0, 0);
-            receiver.silent.store(true, Ordering::SeqCst);
-            let (_dir, ledger) = ledger();
-            let connector = first_hop(peer.clone(), receiver, ledger.clone());
-
-            let response = connector
-                .handle_prepare(Prepare {
-                    amount: PACKET_AMOUNT,
-                    ..sealed
-                })
-                .await;
-
-            match response {
-                PacketResponse::Reject(reject) => {
-                    assert_eq!(reject.code.as_str(), "T00");
-                    assert!(
-                        reject.message.contains("second-hop"),
-                        "the refusal must name the next hop: {}",
-                        reject.message
-                    );
-                }
-                other => panic!("expected a local refusal, got {other:?}"),
-            }
-            assert_eq!(
-                peer.seen().len(),
-                0,
-                "no watermark, no claim, and nothing sent uncovered"
-            );
-            assert_eq!(
-                ledger.issued_nonce("second-hop"),
-                0,
-                "a claim that was never signed must not have consumed a nonce"
-            );
-        }
-
-        /// The domain a covering claim is signed under comes from the
-        /// RECEIVER's greeting (issue #873's `EvmDomain` doc), and a
-        /// greeting naming no EVM settlement leaves this node nothing it can
-        /// sign under -- refused rather than defaulted.
-        #[test]
-        fn the_signing_domain_is_read_from_the_greeting_and_refused_when_absent() {
-            let terms = quoted_terms();
-            let domain = test_channel_domain();
-            assert_eq!(
-                EvmDomain::from_greeting(&terms),
-                Some(EvmDomain {
-                    chain_id: domain.chain_id,
-                    token_network: domain.token_network_address,
-                })
-            );
-
-            let mut settlement_less = quoted_terms();
-            settlement_less.offer_mut().unwrap().extra.settlement = None;
-            assert_eq!(EvmDomain::from_greeting(&settlement_less), None);
-        }
-
-        // -----------------------------------------------------------
-        // Solana (issue #1146): the arm `cover_forward` did not have.
-        // -----------------------------------------------------------
-
-        /// The Solana channel account this node pays its next hop from.
-        const SOLANA_ACCOUNT: [u8; 32] = [0x6a; 32];
-        /// `[settlement.solana] program_id` -- what ADR 0053 signs into
-        /// every claim on that channel.
-        const SOLANA_PROGRAM: [u8; 32] = [0x2c; 32];
-
-        fn solana_base58(bytes: &[u8; 32]) -> String {
-            bs58::encode(bytes).into_string()
-        }
-
-        /// [`first_hop`]'s Solana twin: the same node, the same routes, the
-        /// same ledger -- with the client-role hop bound to a Solana channel
-        /// account instead of an EVM channel id, and an ed25519 settlement
-        /// key to sign under.
-        ///
-        /// Before #1146 this connector could not be built at all:
-        /// `with_outbound_client_hop` took an `EvmDomain` and nothing else,
-        /// so the b-c leg of `local/mixed-chain` had no way to be covered
-        /// and rode ADR 0004's postpay convention forever.
-        fn first_hop_on_solana(
-            peer: Arc<GreetingPeer>,
-            receiver: Arc<StandingWatermark>,
-            ledger: Arc<OutboundClientLedger>,
-            claim_signer: Arc<dyn Ed25519Signer>,
-        ) -> Connector {
-            let account = solana_base58(&SOLANA_ACCOUNT);
-            let program = solana_base58(&SOLANA_PROGRAM);
-            // The counterparty this node's PEER book would judge inbound
-            // claims on the same channel by -- the deployed shape, one
-            // channel in both roles.
-            let counterparty = solana_base58(
-                &LocalEd25519Signer::from_secret_bytes([44u8; 32])
-                    .unwrap()
-                    .public_key(),
-            );
-            Connector::new(
-                vec![],
-                vec![PeerRoute::new("g.example.app", "second-hop")],
-                Arc::new(FakeAppClient::new()),
-                peer,
-                test_clock(),
-            )
-            .with_solana_signer(claim_signer)
-            .with_solana_channel(account.clone(), &counterparty, &program)
-            .expect("a well-formed channel account")
-            .with_outbound_client_ledger(ledger)
-            .with_solana_outbound_client_hop("second-hop", account, &program, receiver)
-            .expect("a well-formed channel account")
-        }
-
-        /// The Solana half of
-        /// [`n_consecutive_forwards_over_a_healthy_link_each_carry_their_own_covering_claim`]:
-        /// a forward to a Solana peering is covered BEFORE it is sent, with
-        /// an ed25519 claim that verifies under the channel's own settlement
-        /// program.
-        ///
-        /// The three things this pins, each of which was impossible before
-        /// #1146: the claim exists at all on the first attempt; it is a
-        /// `ClaimSignature::Solana` rather than an EVM signature wearing a
-        /// Solana channel's name; and the watermark ask that priced it was
-        /// made as a Solana ask, not an EVM one that happened to be
-        /// answered.
-        #[tokio::test]
-        async fn a_forward_to_a_solana_peering_is_covered_before_it_is_sent() {
-            let (sealed, shared_secret) = sealed_prepare(b"hello");
-            let peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-            let receiver = StandingWatermark::at(7, 7_000);
-            let (_dir, ledger) = ledger();
-            let key = LocalEd25519Signer::from_secret_bytes([13u8; 32]).expect("a settlement key");
-            let public_key = key.public_key();
-            let connector = first_hop_on_solana(
-                peer.clone(),
-                Arc::clone(&receiver),
-                ledger.clone(),
-                Arc::new(key),
-            );
-
-            let response = connector
-                .handle_prepare(Prepare {
-                    amount: PACKET_AMOUNT,
-                    ..sealed
-                })
-                .await;
-            assert!(
-                matches!(response, PacketResponse::Fulfill(_)),
-                "a proactively covered Solana forward must fulfil, got {response:?}"
-            );
-
-            let seen = peer.seen();
-            assert_eq!(seen.len(), 1, "covered on the first attempt, so no retry");
-            let claim = seen[0]
-                .as_ref()
-                .expect("the packet must not have been emitted uncovered");
-            assert_eq!(claim.channel_id, solana_base58(&SOLANA_ACCOUNT));
-            assert_eq!(claim.nonce, 8);
-            assert_eq!(claim.cumulative_amount, 7_000 + PACKET_AMOUNT);
-
-            let ClaimSignature::Solana(signature) = claim.signature else {
-                panic!("a Solana hop must mint a Solana claim, not an EVM one");
-            };
-            assert!(
-                connector_signer::verify_solana_balance_proof(
-                    &SOLANA_PROGRAM,
-                    &SOLANA_ACCOUNT,
-                    claim.nonce,
-                    claim.cumulative_amount,
-                    &signature,
-                    &public_key,
-                ),
-                "the far gate must verify this claim under the channel's own settlement program"
-            );
-
-            assert_eq!(
-                *receiver
-                    .asked_about
-                    .lock()
-                    .expect("asked-about lock poisoned"),
-                vec![ClaimStateDomain::Solana],
-                "the watermark ask must be the Solana one -- an EVM challenge would be answered \
-                 `unverified` by a real payee, and this node would have signed nothing"
-            );
-        }
-
-        /// A Solana hop on a node with no ed25519 settlement key cannot sign,
-        /// and the packet FAILS naming the reason rather than going out
-        /// uncovered. The same rule the EVM arm holds, and the reason
-        /// `cover_forward` has no "send it anyway" branch on either chain.
-        #[tokio::test]
-        async fn a_solana_hop_with_no_solana_signer_fails_the_packet_rather_than_sending_it() {
-            let (sealed, shared_secret) = sealed_prepare(b"hello");
-            let peer = GreetingPeer::new(expected_fulfillment(&shared_secret));
-            let receiver = StandingWatermark::at(0, 0);
-            let (_dir, ledger) = ledger();
-            let account = solana_base58(&SOLANA_ACCOUNT);
-            let program = solana_base58(&SOLANA_PROGRAM);
-            let connector = Connector::new(
-                vec![],
-                vec![PeerRoute::new("g.example.app", "second-hop")],
-                Arc::new(FakeAppClient::new()),
-                peer.clone(),
-                test_clock(),
-            )
-            // Deliberately `with_signer` and NOT `with_solana_signer`: an
-            // EVM key is no use to a Solana channel, and silently reaching
-            // for it would sign a claim on the wrong curve.
-            .with_signer(Arc::new(LocalSigner::generate("evm-only")))
-            .with_outbound_client_ledger(ledger.clone())
-            .with_solana_outbound_client_hop("second-hop", account, &program, receiver)
-            .expect("a well-formed channel account");
-
-            let response = connector
-                .handle_prepare(Prepare {
-                    amount: PACKET_AMOUNT,
-                    ..sealed
-                })
-                .await;
-            match response {
-                PacketResponse::Reject(reject) => assert!(
-                    reject.message.contains("Solana settlement signer"),
-                    "the reject must name what is missing, got: {}",
-                    reject.message
-                ),
-                other => panic!("expected a local refusal, got {other:?}"),
-            }
-            assert_eq!(
-                peer.seen().len(),
-                0,
-                "nothing may be sent when no claim could be signed"
-            );
-            assert_eq!(ledger.issued_nonce("second-hop"), 0);
         }
     }
 
@@ -9415,12 +8151,8 @@ mod tests {
             app_client.respond(route.handler_url(), answered(b"irrelevant"));
             let connector = connector_with(vec![route], app_client.clone(), test_clock());
 
-            let (response, ack) = connector
-                .handle_peer_prepare(
-                    Some("upstream"),
-                    prepare_with_amount("g.example.app", 10),
-                    None,
-                )
+            let response = connector
+                .handle_peer_prepare(Some("upstream"), prepare_with_amount("g.example.app", 10))
                 .await;
 
             match response {
@@ -9430,7 +8162,6 @@ mod tests {
                 }
                 other => panic!("expected an F03 reject, got {other:?}"),
             }
-            assert_eq!(ack, ClaimAckOutcome::NotSent);
             assert!(app_client.deliveries().is_empty());
         }
 
@@ -9444,12 +8175,8 @@ mod tests {
             app_client.respond(route.handler_url(), answered(b"irrelevant"));
             let connector = connector_with(vec![route], app_client.clone(), test_clock());
 
-            let (response, _ack) = connector
-                .handle_peer_prepare(
-                    Some("upstream"),
-                    prepare_with_amount("g.example.app", 25),
-                    None,
-                )
+            let response = connector
+                .handle_peer_prepare(Some("upstream"), prepare_with_amount("g.example.app", 25))
                 .await;
 
             assert!(matches!(response, PacketResponse::Fulfill(_)));
@@ -9468,12 +8195,8 @@ mod tests {
             app_client.respond(route.handler_url(), answered(b"irrelevant"));
             let connector = connector_with(vec![route], app_client.clone(), test_clock());
 
-            let (response, _ack) = connector
-                .handle_peer_prepare(
-                    Some("upstream"),
-                    prepare_with_amount("g.example.app", 100),
-                    None,
-                )
+            let response = connector
+                .handle_peer_prepare(Some("upstream"), prepare_with_amount("g.example.app", 100))
                 .await;
 
             assert!(matches!(response, PacketResponse::Fulfill(_)));
@@ -9491,12 +8214,8 @@ mod tests {
             app_client.respond(route.handler_url(), answered(b"irrelevant"));
             let connector = connector_with(vec![route], app_client.clone(), test_clock());
 
-            let (response, _ack) = connector
-                .handle_peer_prepare(
-                    Some("upstream"),
-                    prepare_with_amount("g.example.app", 0),
-                    None,
-                )
+            let response = connector
+                .handle_peer_prepare(Some("upstream"), prepare_with_amount("g.example.app", 0))
                 .await;
 
             assert!(matches!(response, PacketResponse::Fulfill(_)));
@@ -9699,14 +8418,13 @@ mod tests {
 
             // Carries the base exactly -- what a sender reading only
             // `extra.price` would send.
-            let (response, _ack) = connector
+            let response = connector
                 .handle_peer_prepare(
                     Some("upstream"),
                     Prepare {
                         amount: 100,
                         ..large.clone()
                     },
-                    None,
                 )
                 .await;
             match response {
@@ -9723,14 +8441,13 @@ mod tests {
             assert_eq!(app_client.deliveries().len(), 0);
 
             // Carrying the packet's own charge is admitted and delivered.
-            let (response, _ack) = connector
+            let response = connector
                 .handle_peer_prepare(
                     Some("upstream"),
                     Prepare {
                         amount: charge,
                         ..large
                     },
-                    None,
                 )
                 .await;
             assert!(matches!(response, PacketResponse::Fulfill(_)));
@@ -10536,6 +9253,7 @@ mod tests {
     mod x402_peering_covers {
         use super::*;
         use crate::batch_channels::OutboundChannels;
+        use crate::claim::ClaimRejectReason;
         use crate::journal::InMemoryJournal;
         use crate::outbound_voucher::VoucherStateSource;
         use connector_domain::client_claim::{parse_client_claim, ClientClaim};
@@ -10596,10 +9314,6 @@ mod tests {
                     }),
                     ack,
                 )
-            }
-
-            async fn flush(&self, _peer_id: &str, _claim: WireClaim) -> ClaimAckOutcome {
-                ClaimAckOutcome::NotSent
             }
         }
 
@@ -10675,6 +9389,37 @@ mod tests {
                 Arc::clone(&receiver) as Arc<dyn VoucherStateSource>,
             );
             (connector, next_hop, receiver, outbound, channel)
+        }
+
+        /// A `[[pay_channels]]` row must name a channel that pays the
+        /// peering's own settlement key -- the voucher signer its
+        /// `[[peer_channels]]` row binds (#1380): the in-memory counterparty
+        /// is party `0x02`, so a peering bound to `0x03…` is refused at boot
+        /// and one bound to `0x02…` is wired.
+        #[tokio::test]
+        async fn a_config_pay_channel_must_pay_the_peerings_own_signer() {
+            let url = url::Url::parse("https://next-hop.example/ilp").unwrap();
+            let timeout = std::time::Duration::from_secs(1);
+            for (signer, pays_it) in [
+                (format!("0x{}", "03".repeat(20)), false),
+                (format!("0x{}", "02".repeat(20)), true),
+            ] {
+                let (connector, _, _, _, channel) = peered().await;
+                let wired = connector
+                    .with_config_peer_ids(["next-hop".to_string()])
+                    .with_config_voucher_signer("next-hop", SettlementChain::Evm, &signer, None)
+                    .expect("bind the signer")
+                    .with_config_pay_channel("next-hop", &channel, &url, timeout);
+                if pays_it {
+                    assert!(wired.is_ok(), "the channel pays {signer}");
+                } else {
+                    assert!(matches!(
+                        wired,
+                        Err(ConfigPeeringError::OutboundChannelPaysSomeoneElse { ref peer_id, .. })
+                            if peer_id == "next-hop"
+                    ));
+                }
+            }
         }
 
         fn prepare(amount: u64) -> Prepare {
@@ -11005,8 +9750,8 @@ mod tests {
                 )
                 .with_rate_table(declaring(USDC, USDC_SOLANA, 1_000, 1));
 
-            let (response, _ack) = connector
-                .handle_peer_prepare(Some("up-evm"), prepare(7), None)
+            let response = connector
+                .handle_peer_prepare(Some("up-evm"), prepare(7))
                 .await;
             assert!(
                 matches!(response, PacketResponse::Fulfill(_)),

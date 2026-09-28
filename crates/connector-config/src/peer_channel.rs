@@ -1,339 +1,183 @@
+//! `[[peer_channels]]`: the **inbound** half of a config-declared peering
+//! (ADR 0075 decisions 4, 5 and 9, issue #1380).
+//!
+//! Under ADR 0075 a peering is two one-way x402 channels, and the one the
+//! peer pays this node on is **admitted, not configured**: the peer opens it,
+//! and this node admits its vouchers by exactly the rules it admits a
+//! client's by. What makes that channel the *peer's* rather than a client's
+//! is its **voucher signer** -- EVM `payerAuthorizer`, Solana
+//! `authorized_signer`, always as the chain records it -- being a key bound to
+//! the peering. A runtime peering binds the key the peer's self-description
+//! publishes (#1378, #1379). A config-declared peering has no
+//! self-description in hand at boot, so its row names the key:
+//!
+//! ```toml
+//! [[peer_channels]]
+//! peer_id        = "store"
+//! voucher_signer = "0x…"   # EVM address, or a base58 Solana key
+//! # inbound_channel = "0x…" # optional: the one channel this signer proves the peer role on
+//! ```
+//!
+//! A voucher on a channel that signer signs for, or -- for a packet that moves
+//! no value -- the claim-state challenge signed by it, is what gives an
+//! interaction role `peer` (`peer-carriage-spec.md` §1.2, ADR 0060 as ADR
+//! 0075 decision 5 amends it). Without an `inbound_channel`, every channel the
+//! signer's vouchers verify on is the peer's, the same as a runtime peering's;
+//! with one, only that channel is.
+//!
+//! The outbound half -- the channel this node pays the peer on -- is
+//! `[[pay_channels]]`'s (`crate::pay_channel`).
+//!
+//! # What a `toon-channel` row wrote, and why each field is refused by name
+//!
+//! This table used to name a TOON channel and the key a `toon-channel` claim
+//! on it was verified against: an EVM `channel_id` derived from the two
+//! participants (ADR 0059) with the `chain_id`/`token_network` EIP-712 domain
+//! it was signed under (ADR 0024), or a Solana `channel_account` of TOON's
+//! own program, and in both cases a `counterparty_key`. ADR 0075 retires all
+//! of it, and every one of those fields is still parsed so that a file which
+//! writes it is refused naming it (ADR 0009) rather than failing the row's
+//! shape: [`ConfigError::PeerChannelToonFieldRemoved`].
+
 use std::collections::HashSet;
 
 use serde::Deserialize;
 
-use crate::client_channel::{is_base58_32_bytes, parse_evm_address, parse_hex_bytes, to_hex};
 use crate::error::ConfigError;
 use crate::settlement::{SettlementChain, SettlementTables};
+use crate::x402_row::{parse_voucher_signer, parse_x402_channel, RemovedToonFields};
 
-/// One `[[peer_channels]]` entry as written in the config file, in either
-/// chain shape this connector accepts (issue #759): EVM
-/// ([`RawEvmPeerChannel`]) or Solana ([`RawSolanaPeerChannel`]).
-/// `#[serde(untagged)]` picks whichever shape matches -- the same pattern
-/// [`crate::client_channel::RawClientChannel`] already uses for its own
-/// per-chain shapes, and for the same reason: the EVM shape requires
-/// `channel_id`/`chain_id`/`token_network` and forbids `channel_account`,
-/// the Solana shape the reverse, and each variant is
-/// `deny_unknown_fields` so the two can never blend.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum RawPeerChannel {
-    Evm(RawEvmPeerChannel),
-    Solana(RawSolanaPeerChannel),
-}
-
-/// `[[peer_channels]]`'s original (and, before issue #759, only) shape: the
-/// payment channel a peering relation's claims are judged against, and the
-/// EIP-712 domain they are signed under (ADR 0024).
+/// One `[[peer_channels]]` entry as written in the config file.
 ///
-/// This is the table whose **absence** made ADR 0024 inert (#620 gap 3):
-/// the peer-claim mechanism was fully implemented and never wired, because
-/// `ClaimBook`'s verification key and domain had no field to hang on and
-/// `connector-cli::runtime::build` therefore never set them. A peering
-/// without a row here can never satisfy `peer-carriage-spec.md` §1.2's P2,
-/// so it can never take the peer role at all -- which is why an unbound
-/// peer is a load-time error rather than a runtime surprise.
-///
-/// `deny_unknown_fields`: a dropped `counterparty_key` here would be a
-/// dropped authorization decision, exactly as in `[[client_channels]]`.
+/// `deny_unknown_fields`: a dropped `voucher_signer` would be a dropped
+/// authorization decision. The `toon-channel` fields are `toml::Value` so a
+/// value of any type is named as the removed key.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RawEvmPeerChannel {
+pub(crate) struct RawPeerChannel {
     peer_id: String,
-    channel_id: String,
-    counterparty_key: String,
-    chain_id: u64,
-    token_network: String,
-}
-
-/// `[[peer_channels]]`'s Solana shape (issue #759): the deployed
-/// `payment-channel` program's channel PDA (`channel_account`, not an
-/// EVM-style `channel_id`) and the base58 Ed25519 public key whose
-/// signature this node accepts on a claim for it.
-///
-/// **`program_id` is not one of this row's facts (issue #1128).** It is
-/// read from `[settlement.solana]`, the one program this node can actually
-/// redeem a claim under, exactly as `[[client_channels]]`'s Solana shape
-/// has read it since #1082. The field survives here only so a config that
-/// still writes it is refused **by name**
-/// ([`ConfigError::PeerChannelProgramIdRemoved`]) rather than dropped or
-/// lost in `#[serde(untagged)]`'s "matched no variant" -- the posture ADR
-/// 0009 requires of every removed key, and the same one `RawPeer`'s
-/// `addr`/`ceiling` fields take. `toml::Value` rather than `String` for the
-/// same reason `addr` uses it: `program_id = 5` is still the removed key,
-/// and must be named as such rather than failing shape-match.
-///
-/// No `chain_id` or `token_network` -- Solana has neither an EVM-style
-/// numeric chain id nor a per-token verifying contract for a declared
-/// channel to name, the same reasoning
-/// [`crate::client_channel::RawSolanaClientChannel`] already documents.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RawSolanaPeerChannel {
-    peer_id: String,
-    channel_account: String,
-    counterparty_key: String,
+    #[serde(default)]
+    voucher_signer: Option<String>,
+    #[serde(default)]
+    inbound_channel: Option<String>,
+    #[serde(default)]
+    channel_id: Option<toml::Value>,
+    #[serde(default)]
+    channel_account: Option<toml::Value>,
+    #[serde(default)]
+    chain_id: Option<toml::Value>,
+    #[serde(default)]
+    token_network: Option<toml::Value>,
+    #[serde(default)]
+    counterparty_key: Option<toml::Value>,
     #[serde(default)]
     program_id: Option<toml::Value>,
 }
 
-/// A fully validated `[[peer_channels]]` EVM entry. Constructed only by
-/// [`resolve_peer_channels`], so a value that exists has already had its
-/// channel identifier and both addresses checked -- downstream code never
-/// re-validates any of them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EvmPeerChannelConfig {
-    peer_id: String,
-    channel_id: String,
-    counterparty_key: [u8; 20],
-    chain_id: u64,
-    token_network: [u8; 20],
+impl RawPeerChannel {
+    fn removed(&self) -> RemovedToonFields {
+        RemovedToonFields {
+            channel_id: self.channel_id.is_some(),
+            channel_account: self.channel_account.is_some(),
+            chain_id: self.chain_id.is_some(),
+            token_network: self.token_network.is_some(),
+            counterparty_key: self.counterparty_key.is_some(),
+            program_id: self.program_id.is_some(),
+        }
+    }
 }
 
-impl EvmPeerChannelConfig {
-    /// The peering relation this channel belongs to -- a `[[peers]]`
-    /// entry's `id`. A row naming an id no `[[peers]]` entry configures is
+/// A fully validated `[[peer_channels]]` entry. Constructed only by
+/// [`resolve_peer_channels`], so a value that exists names a signer in one
+/// chain's spelling, on a chain this node takes x402 vouchers on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerChannelConfig {
+    peer_id: String,
+    chain: SettlementChain,
+    voucher_signer: String,
+    inbound_channel: Option<String>,
+}
+
+impl PeerChannelConfig {
+    /// The peering relation this row binds -- a `[[peers]]` entry's `id`. A
+    /// row naming an id no `[[peers]]` entry configures is
     /// [`ConfigError::PeerChannelOrphaned`].
     pub fn peer_id(&self) -> &str {
         &self.peer_id
     }
 
-    /// The channel's on-chain identifier, canonicalized to lowercase
-    /// `0x`-prefixed hex however the operator wrote it -- the same value a
-    /// peer claim names the channel by.
-    ///
-    /// It may not also appear in `[[client_channels]]`
-    /// ([`ConfigError::ChannelInBothNamespaces`]): peer and client
-    /// watermarks live in separate namespaces, and one channel in both
-    /// would let one claim be counted as credit twice
-    /// (`peer-carriage-spec.md` §1.8).
-    pub fn channel_id(&self) -> &str {
-        &self.channel_id
-    }
-
-    /// The address whose signature this node accepts on a peer claim for
-    /// this channel -- `ClaimBook`'s verification key. Never the claim's
-    /// own self-declared signer.
-    pub fn counterparty_key(&self) -> [u8; 20] {
-        self.counterparty_key
-    }
-
-    /// The chain this channel is deployed on: half of the EIP-712 domain
-    /// its balance proofs are signed under (ADR 0024).
-    pub fn chain_id(&self) -> u64 {
-        self.chain_id
-    }
-
-    /// The `TokenNetwork` that verifies this channel's claims on
-    /// redemption -- the EIP-712 `verifyingContract`, and the other half of
-    /// the domain.
-    pub fn token_network(&self) -> [u8; 20] {
-        self.token_network
-    }
-}
-
-/// A fully validated `[[peer_channels]]` Solana entry (issue #759).
-/// Constructed only by [`resolve_peer_channels`] -- `channel_account`,
-/// `counterparty_key` and `program_id` have already been checked to be
-/// base58-encoded 32-byte values.
-///
-/// `program_id` is a field of this value but **not** of the config row it
-/// came from (issue #1128): it is copied in from `[settlement.solana]`
-/// during resolution, so every Solana peer channel a loaded `Config` holds
-/// names the program this node settles under, by construction rather than
-/// by the operator having typed the same address twice and got it right.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SolanaPeerChannelConfig {
-    peer_id: String,
-    channel_account: String,
-    counterparty_key: String,
-    program_id: String,
-}
-
-impl SolanaPeerChannelConfig {
-    /// The peering relation this channel belongs to -- a `[[peers]]`
-    /// entry's `id`.
-    pub fn peer_id(&self) -> &str {
-        &self.peer_id
-    }
-
-    /// The channel's on-chain PDA, base58-encoded -- the same value a
-    /// Solana peer claim names its `channelAccount` by.
-    ///
-    /// It may not also appear in `[[client_channels]]`
-    /// ([`ConfigError::ChannelInBothNamespaces`]), the Solana counterpart
-    /// of [`EvmPeerChannelConfig::channel_id`]'s own namespace rule.
-    pub fn channel_account(&self) -> &str {
-        &self.channel_account
-    }
-
-    /// The base58 Ed25519 public key whose signature this node accepts on
-    /// a peer claim for this channel. Never the claim's own self-declared
-    /// `signerPublicKey`.
-    pub fn counterparty_key(&self) -> &str {
-        &self.counterparty_key
-    }
-
-    /// The base58 program id of the deployed `payment-channel` program
-    /// this channel is judged and settled under -- the value a rendered
-    /// outbound Solana claim's `programId` carries (issue #759), and the
-    /// value ADR 0053 binds into the signed message of every claim on this
-    /// channel in either direction.
-    ///
-    /// **Always `[settlement.solana] program_id` (issue #1128.)** Not a
-    /// declared fact of the row: the row used to carry one, nothing
-    /// compared the two, and a node whose row and settlement table
-    /// disagreed accepted peer claims signed under one program while
-    /// redeeming under the other -- carriage rendered for money it could
-    /// never collect. There is exactly one Solana program a node can submit
-    /// a redemption to, so there is exactly one a peer channel can live
-    /// under, and it is read from the table that names it.
-    pub fn program_id(&self) -> &str {
-        &self.program_id
-    }
-}
-
-/// One `[[peer_channels]]` entry, typed by chain (issue #759) -- an EVM
-/// `channelId` and a Solana `channelAccount` name genuinely different kinds
-/// of on-chain identifier, so a single shared shape would either force one
-/// to fake fields it does not have or erase which chain a value came from.
-/// The same reason [`crate::ClientChannelConfig`] is an enum rather than
-/// one struct with optional fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PeerChannelConfig {
-    Evm(EvmPeerChannelConfig),
-    Solana(SolanaPeerChannelConfig),
-}
-
-impl PeerChannelConfig {
-    /// The peering relation this channel belongs to, whichever chain it is
-    /// on.
-    pub fn peer_id(&self) -> &str {
-        match self {
-            PeerChannelConfig::Evm(evm) => evm.peer_id(),
-            PeerChannelConfig::Solana(solana) => solana.peer_id(),
-        }
-    }
-
-    /// The on-chain identifier a claim names this channel by, whichever
-    /// chain it is on: an EVM `channel_id` (lowercase `0x` hex) or a Solana
-    /// `channel_account` (base58). The two spellings are disjoint, so one
-    /// namespace over both chains cannot collide.
-    ///
-    /// This is the key `peer-carriage-spec.md` §1.2's P2 resolves a claim
-    /// through: a channel appears in at most one `[[peer_channels]]` row
-    /// ([`ConfigError::PeerChannelDuplicate`]) and never also in
-    /// `[[client_channels]]` ([`ConfigError::ChannelInBothNamespaces`]), so
-    /// it names exactly one peering relation.
-    pub fn channel_identifier(&self) -> &str {
-        match self {
-            PeerChannelConfig::Evm(evm) => evm.channel_id(),
-            PeerChannelConfig::Solana(solana) => solana.channel_account(),
-        }
-    }
-
-    /// The chain this declared channel lives on.
+    /// The chain the voucher signer, and so the peer's channel, is on --
+    /// read off the signer's own spelling.
     pub fn chain(&self) -> SettlementChain {
-        match self {
-            PeerChannelConfig::Evm(_) => SettlementChain::Evm,
-            PeerChannelConfig::Solana(_) => SettlementChain::Solana,
-        }
+        self.chain
+    }
+
+    /// The key whose vouchers prove this peering: an EVM address as
+    /// lower-case `0x` hex, or a Solana public key in base58. Checked
+    /// against the signer **the chain records** for a channel, never
+    /// against anything a voucher declares about itself.
+    pub fn voucher_signer(&self) -> &str {
+        &self.voucher_signer
+    }
+
+    /// The one channel [`Self::voucher_signer`] proves this peering on,
+    /// when the row names one: an EVM channel id as lower-case `0x` hex, or
+    /// a Solana channel account in base58. `None` -- the default -- is
+    /// every channel that signer's vouchers verify on.
+    pub fn inbound_channel(&self) -> Option<&str> {
+        self.inbound_channel.as_deref()
     }
 }
 
-/// `tables` is which `[settlement.<chain>]` tables this node declares. An
-/// EVM peer channel needs the EVM one (issue #1138): not for its EIP-712
-/// domain, which the row declares, but because a claim on the channel is
-/// redeemed by the channel's on-chain participant and that address is
-/// `[settlement.evm.key]`'s. See [`SettlementTables`] for the one rule all
-/// four channel tables share.
-fn resolve_evm_peer_channel(
-    raw: RawEvmPeerChannel,
+fn resolve_peer_channel(
+    raw: RawPeerChannel,
     tables: SettlementTables<'_>,
-) -> Result<EvmPeerChannelConfig, ConfigError> {
-    if !tables.evm() {
-        return Err(ConfigError::PeerChannelWithoutEvmSettlement {
+) -> Result<PeerChannelConfig, ConfigError> {
+    // First, because "you wrote a key that no longer exists" explains the
+    // file better than any other complaint when both are true, and because
+    // this is the branch that must never fall through to a silent ignore
+    // (ADR 0009).
+    if let Some(field) = raw.removed().first() {
+        return Err(ConfigError::PeerChannelToonFieldRemoved {
             peer_id: raw.peer_id,
+            field,
         });
     }
-    let channel_id = parse_hex_bytes::<32>(&raw.channel_id).ok_or_else(|| {
-        ConfigError::PeerChannelInvalidId {
-            value: raw.channel_id.clone(),
-        }
-    })?;
-    let counterparty_key = parse_evm_address(&raw.counterparty_key).ok_or_else(|| {
-        ConfigError::PeerChannelInvalidAddress {
-            field: "counterparty_key",
-            value: raw.counterparty_key.clone(),
-        }
-    })?;
-    let token_network = parse_evm_address(&raw.token_network).ok_or_else(|| {
-        ConfigError::PeerChannelInvalidAddress {
-            field: "token_network",
-            value: raw.token_network.clone(),
-        }
-    })?;
-    Ok(EvmPeerChannelConfig {
-        peer_id: raw.peer_id,
-        channel_id: to_hex(&channel_id),
-        counterparty_key,
-        chain_id: raw.chain_id,
-        token_network,
-    })
-}
-
-/// `tables.solana_program_id()` is `[settlement.solana] program_id`, or
-/// `None` for a node with no `[settlement.solana]` table at all. It is the
-/// only source of a Solana peer channel's program id (issue #1128); the row
-/// is refused outright if it tries to name a second one, and refused again
-/// if there is no table to read the first from.
-fn resolve_solana_peer_channel(
-    raw: RawSolanaPeerChannel,
-    tables: SettlementTables<'_>,
-) -> Result<SolanaPeerChannelConfig, ConfigError> {
-    let settlement_program_id = tables.solana_program_id();
-    // Before the shape checks, because "you wrote a key that no longer
-    // exists" explains the file better than "one of your other values is
-    // malformed" when both are true -- and because this is the branch that
-    // must never fall through to a silent ignore (ADR 0009).
-    if raw.program_id.is_some() {
-        return Err(ConfigError::PeerChannelProgramIdRemoved {
-            peer_id: raw.peer_id,
-        });
-    }
-    if !is_base58_32_bytes(&raw.channel_account) {
-        return Err(ConfigError::PeerChannelInvalidSolanaAccount {
-            field: "channel_account",
-            value: raw.channel_account,
-        });
-    }
-    if !is_base58_32_bytes(&raw.counterparty_key) {
-        return Err(ConfigError::PeerChannelInvalidSolanaAccount {
-            field: "counterparty_key",
-            value: raw.counterparty_key,
-        });
-    }
-    let Some(program_id) = settlement_program_id else {
-        return Err(ConfigError::PeerChannelWithoutSolanaSettlement {
+    let Some(written) = raw.voucher_signer else {
+        return Err(ConfigError::PeerChannelVoucherSignerMissing {
             peer_id: raw.peer_id,
         });
     };
-    // `[settlement.solana]`'s own resolver checks this value for
-    // non-emptiness only, and the settlement backend does not parse it
-    // until it dials a chain. A peer channel needs it to be a real
-    // 32-byte address before that, because it is now part of what every
-    // claim on this channel is verified against.
-    if !is_base58_32_bytes(program_id) {
-        return Err(ConfigError::PeerChannelSolanaSettlementProgramIdInvalid {
+    let Some(signer) = parse_voucher_signer(&written) else {
+        return Err(ConfigError::PeerChannelInvalidVoucherSigner {
             peer_id: raw.peer_id,
-            value: program_id.to_string(),
+            value: written,
+        });
+    };
+    let inbound_channel = match raw.inbound_channel {
+        None => None,
+        Some(written) => match parse_x402_channel(&written) {
+            Some(channel) if channel.chain == signer.chain => Some(channel.value),
+            _ => {
+                return Err(ConfigError::PeerChannelInvalidInboundChannel {
+                    peer_id: raw.peer_id,
+                    value: written,
+                    chain: signer.chain.name(),
+                })
+            }
+        },
+    };
+    if !tables.x402(signer.chain) {
+        return Err(ConfigError::PeerChannelWithoutX402 {
+            peer_id: raw.peer_id,
+            chain: signer.chain.name(),
         });
     }
-    Ok(SolanaPeerChannelConfig {
+    Ok(PeerChannelConfig {
         peer_id: raw.peer_id,
-        channel_account: raw.channel_account,
-        counterparty_key: raw.counterparty_key,
-        program_id: program_id.to_string(),
+        chain: signer.chain,
+        voucher_signer: signer.value,
+        inbound_channel,
     })
 }
 
@@ -341,36 +185,30 @@ pub(crate) fn resolve_peer_channels(
     raw: Vec<RawPeerChannel>,
     tables: SettlementTables<'_>,
 ) -> Result<Vec<PeerChannelConfig>, ConfigError> {
-    let mut seen_evm = HashSet::with_capacity(raw.len());
-    let mut seen_solana = HashSet::with_capacity(raw.len());
+    let mut seen_signers = HashSet::with_capacity(raw.len());
+    let mut seen_channels = HashSet::with_capacity(raw.len());
     let mut channels = Vec::with_capacity(raw.len());
 
-    for channel in raw {
-        let channel = match channel {
-            RawPeerChannel::Evm(evm) => {
-                let evm = resolve_evm_peer_channel(evm, tables)?;
-                // Two rows for one channel is the same double-count hazard
-                // `ChannelInBothNamespaces` closes across namespaces, closed
-                // here within one: whichever row's counterparty key won
-                // would be whichever the loop happened to see last.
-                if !seen_evm.insert(evm.channel_id.clone()) {
-                    return Err(ConfigError::PeerChannelDuplicate {
-                        value: evm.channel_id,
-                    });
-                }
-                PeerChannelConfig::Evm(evm)
+    for row in raw {
+        let row = resolve_peer_channel(row, tables)?;
+        // One signer proves one relation: a signer on two rows would make
+        // "which peering does this voucher prove?" depend on file order
+        // (`connector_runtime::VoucherSignerBindings` refuses the same at
+        // runtime). Two rows naming one signer for one peer are refused
+        // too -- the second says nothing the first did not.
+        if !seen_signers.insert(row.voucher_signer.clone()) {
+            return Err(ConfigError::PeerChannelDuplicate {
+                value: row.voucher_signer,
+            });
+        }
+        if let Some(channel) = &row.inbound_channel {
+            if !seen_channels.insert(channel.clone()) {
+                return Err(ConfigError::PeerChannelDuplicate {
+                    value: channel.clone(),
+                });
             }
-            RawPeerChannel::Solana(solana) => {
-                let solana = resolve_solana_peer_channel(solana, tables)?;
-                if !seen_solana.insert(solana.channel_account.clone()) {
-                    return Err(ConfigError::PeerChannelDuplicate {
-                        value: solana.channel_account,
-                    });
-                }
-                PeerChannelConfig::Solana(solana)
-            }
-        };
-        channels.push(channel);
+        }
+        channels.push(row);
     }
 
     Ok(channels)
@@ -380,378 +218,184 @@ pub(crate) fn resolve_peer_channels(
 mod tests {
     use super::*;
 
+    const EVM_SIGNER: &str = "0x2222222222222222222222222222222222222222";
     const CHANNEL: &str = "0xaaaabbbbccccddddeeeeffff00001111aaaabbbbccccddddeeeeffff00001111";
-    const KEY: &str = "0x2222222222222222222222222222222222222222";
-    const NETWORK: &str = "0x3333333333333333333333333333333333333333";
+    const SOLANA_SIGNER: &str = "8pM1DN3RiT8vbom5u1sNryaNT1nyL8CTTW3b5PwWXRBH";
+    const SOLANA_CHANNEL: &str = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
 
-    /// A real base58-encoded 32-byte value -- used wherever a test needs a
-    /// well-formed Solana account/key without caring which one.
-    const SOME_SOLANA_ACCOUNT: &str = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
-    const ANOTHER_SOLANA_ACCOUNT: &str = "8pM1DN3RiT8vbom5u1sNryaNT1nyL8CTTW3b5PwWXRBH";
-
-    fn raw(peer_id: &str, channel_id: &str) -> RawPeerChannel {
-        RawPeerChannel::Evm(RawEvmPeerChannel {
-            peer_id: peer_id.to_string(),
-            channel_id: channel_id.to_string(),
-            counterparty_key: KEY.to_string(),
-            chain_id: 31_337,
-            token_network: NETWORK.to_string(),
-        })
+    fn parse(text: &str) -> RawPeerChannel {
+        toml::from_str(text).expect("the row parses")
     }
 
-    /// The program id `[settlement.solana]` names in these tests -- the one
-    /// place a Solana peer channel's program can come from since issue
-    /// #1128.
-    const SETTLEMENT_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-
-    /// `program_id` is what a config file that still writes the removed key
-    /// looks like; `None` is the shape every correct file now has.
-    fn raw_solana(
-        peer_id: &str,
-        channel_account: &str,
-        program_id: Option<&str>,
-    ) -> RawPeerChannel {
-        RawPeerChannel::Solana(RawSolanaPeerChannel {
-            peer_id: peer_id.to_string(),
-            channel_account: channel_account.to_string(),
-            counterparty_key: ANOTHER_SOLANA_ACCOUNT.to_string(),
-            program_id: program_id.map(|id| toml::Value::String(id.to_string())),
-        })
-    }
-
-    /// `resolve_peer_channels` for a node that settles on both chains,
-    /// with `[settlement.solana]` naming [`SETTLEMENT_PROGRAM_ID`] -- the
-    /// ordinary case.
-    fn resolve(raw: Vec<RawPeerChannel>) -> Result<Vec<PeerChannelConfig>, ConfigError> {
+    fn resolve(rows: &[&str]) -> Result<Vec<PeerChannelConfig>, ConfigError> {
         resolve_peer_channels(
-            raw,
-            SettlementTables::for_tests(true, Some(SETTLEMENT_PROGRAM_ID)),
+            rows.iter().map(|text| parse(text)).collect(),
+            SettlementTables::for_x402_tests(true, true),
         )
     }
 
+    fn row(signer: &str) -> String {
+        format!("peer_id = \"store\"\nvoucher_signer = \"{signer}\"")
+    }
+
     #[test]
-    fn resolves_and_canonicalizes_a_row() {
-        let channels = resolve(vec![raw(
-            "store",
-            &CHANNEL.to_uppercase().replace("0X", "0x"),
+    fn an_evm_row_names_a_voucher_signer_and_is_canonicalized() {
+        let channels = resolve(&[&format!(
+            "peer_id = \"store\"\nvoucher_signer = \"{}\"\ninbound_channel = \"{}\"",
+            EVM_SIGNER.to_uppercase().replace("0X", "0x"),
+            CHANNEL.to_uppercase().replace("0X", "0x"),
         )])
-        .expect("resolve");
+        .expect("valid");
 
-        assert_eq!(channels.len(), 1);
-        let PeerChannelConfig::Evm(channel) = &channels[0] else {
-            panic!("expected an EVM channel");
-        };
         assert_eq!(channels[0].peer_id(), "store");
-        assert_eq!(channel.channel_id(), CHANNEL);
-        assert_eq!(channel.chain_id(), 31_337);
-        assert_eq!(channel.counterparty_key(), [0x22u8; 20]);
-        assert_eq!(channel.token_network(), [0x33u8; 20]);
         assert_eq!(channels[0].chain(), SettlementChain::Evm);
+        assert_eq!(channels[0].voucher_signer(), EVM_SIGNER);
+        assert_eq!(channels[0].inbound_channel(), Some(CHANNEL));
     }
 
     #[test]
-    fn rejects_a_malformed_channel_id() {
-        let result = resolve(vec![raw("store", "0xnope")]);
+    fn a_solana_row_names_a_base58_signer_and_needs_no_channel() {
+        let channels = resolve(&[&row(SOLANA_SIGNER)]).expect("valid");
 
-        assert!(matches!(
-            result,
-            Err(ConfigError::PeerChannelInvalidId { ref value }) if value == "0xnope"
-        ));
-    }
-
-    #[test]
-    fn rejects_a_malformed_counterparty_key() {
-        let RawPeerChannel::Evm(mut entry) = raw("store", CHANNEL) else {
-            unreachable!()
-        };
-        entry.counterparty_key = "0x12".to_string();
-
-        let result = resolve(vec![RawPeerChannel::Evm(entry)]);
-
-        assert!(matches!(
-            result,
-            Err(ConfigError::PeerChannelInvalidAddress { field, .. }) if field == "counterparty_key"
-        ));
-    }
-
-    #[test]
-    fn rejects_a_channel_named_twice() {
-        let result = resolve(vec![raw("store", CHANNEL), raw("relay", CHANNEL)]);
-
-        assert!(matches!(
-            result,
-            Err(ConfigError::PeerChannelDuplicate { .. })
-        ));
-    }
-
-    /// Issue #759's AC, as issue #1128 leaves it: a `[[peer_channels]]`
-    /// entry can declare a Solana channel -- `channel_account`/
-    /// `counterparty_key` rather than `channel_id`/`chain_id`/
-    /// `token_network` -- and parses into a distinctly typed
-    /// [`PeerChannelConfig::Solana`].
-    #[test]
-    fn a_solana_peer_channel_is_declared_and_typed_distinctly_from_evm() {
-        let channels =
-            resolve(vec![raw_solana("store", SOME_SOLANA_ACCOUNT, None)]).expect("valid");
-
-        let PeerChannelConfig::Solana(solana) = &channels[0] else {
-            panic!("expected a Solana channel");
-        };
-        assert_eq!(channels[0].peer_id(), "store");
-        assert_eq!(solana.channel_account(), SOME_SOLANA_ACCOUNT);
-        assert_eq!(solana.counterparty_key(), ANOTHER_SOLANA_ACCOUNT);
         assert_eq!(channels[0].chain(), SettlementChain::Solana);
+        assert_eq!(channels[0].voucher_signer(), SOLANA_SIGNER);
+        assert_eq!(channels[0].inbound_channel(), None);
     }
 
-    /// Issue #1128, the whole point: a Solana peer channel's program id is
-    /// the settlement program's, read from `[settlement.solana]` and not
-    /// from the row -- so the two cannot disagree, and a node cannot verify
-    /// a peer claim under a program it does not settle with.
+    /// ADR 0009 and issue #1380's acceptance criterion: every field a
+    /// `toon-channel` row wrote is refused **by name**, whatever else the
+    /// row says and whatever type the value is.
     #[test]
-    fn a_solana_peer_channel_takes_its_program_id_from_the_settlement_table() {
-        let channels =
-            resolve(vec![raw_solana("store", SOME_SOLANA_ACCOUNT, None)]).expect("valid");
-
-        let PeerChannelConfig::Solana(solana) = &channels[0] else {
-            panic!("expected a Solana channel");
-        };
-        assert_eq!(solana.program_id(), SETTLEMENT_PROGRAM_ID);
+    fn every_toon_channel_field_is_refused_by_name() {
+        for (field, value) in [
+            ("channel_id", format!("\"{CHANNEL}\"")),
+            ("channel_account", format!("\"{SOLANA_CHANNEL}\"")),
+            ("chain_id", "31337".to_string()),
+            ("token_network", format!("\"{EVM_SIGNER}\"")),
+            ("counterparty_key", format!("\"{EVM_SIGNER}\"")),
+            ("program_id", "5".to_string()),
+        ] {
+            let text = format!("{}\n{field} = {value}", row(EVM_SIGNER));
+            let error = resolve(&[&text]).expect_err(field);
+            assert!(
+                matches!(
+                    &error,
+                    ConfigError::PeerChannelToonFieldRemoved { peer_id, field: named }
+                        if peer_id == "store" && *named == field
+                ),
+                "{field}: {error:?}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains(field) && message.contains("ADR 0075"),
+                "{message}"
+            );
+        }
     }
 
-    /// The removed key is refused **by name** rather than ignored or lost
-    /// in `#[serde(untagged)]`'s "matched no variant" (ADR 0009, issue
-    /// #1128). Refused even when it agrees with `[settlement.solana]`: the
-    /// key is gone, and a file that still writes it is a file whose author
-    /// believes it decides something.
+    /// A whole `toon-channel` row, as `local/` and the fleet wrote one
+    /// before ADR 0075, is refused naming its first removed field rather
+    /// than "missing field voucher_signer".
     #[test]
-    fn a_solana_peer_channel_that_still_declares_a_program_id_is_refused_by_name() {
-        let result = resolve(vec![raw_solana(
-            "store",
-            SOME_SOLANA_ACCOUNT,
-            Some(SETTLEMENT_PROGRAM_ID),
-        )]);
-
-        assert!(matches!(
-            result,
-            Err(ConfigError::PeerChannelProgramIdRemoved { ref peer_id }) if peer_id == "store"
-        ));
-    }
-
-    /// The failure issue #1128 is actually about, in the shape an operator
-    /// writes it: a row left behind after a program redeploy. It used to
-    /// load, and quietly split the node's verification program from its
-    /// settlement program. Now it does not load at all.
-    #[test]
-    fn a_solana_peer_channel_naming_a_program_the_node_does_not_settle_with_is_refused() {
-        let result = resolve(vec![raw_solana(
-            "store",
-            SOME_SOLANA_ACCOUNT,
-            Some(ANOTHER_SOLANA_ACCOUNT),
-        )]);
-
-        assert!(matches!(
-            result,
-            Err(ConfigError::PeerChannelProgramIdRemoved { .. })
-        ));
-    }
-
-    /// A value of the wrong TOML *type* is still the removed key, and must
-    /// be named as such -- the reason the field is `toml::Value` rather
-    /// than `Option<String>`, which would have failed the untagged
-    /// shape-match and surfaced "data did not match any variant" instead.
-    #[test]
-    fn a_removed_program_id_of_any_toml_type_is_still_named() {
-        let RawPeerChannel::Solana(mut entry) = raw_solana("store", SOME_SOLANA_ACCOUNT, None)
-        else {
-            unreachable!()
-        };
-        entry.program_id = Some(toml::Value::Integer(5));
-
-        let result = resolve(vec![RawPeerChannel::Solana(entry)]);
-
-        assert!(matches!(
-            result,
-            Err(ConfigError::PeerChannelProgramIdRemoved { .. })
-        ));
-    }
-
-    /// With the per-row key gone, `[settlement.solana]` is the only source
-    /// of a program id -- so a node without that table cannot bind a Solana
-    /// peer channel at all, and says so rather than binding one whose
-    /// claims it could never redeem. The sibling of
-    /// `PayChannelWithoutEvmSettlement`.
-    #[test]
-    fn a_solana_peer_channel_on_a_node_with_no_solana_settlement_is_refused() {
-        let result = resolve_peer_channels(
-            vec![raw_solana("store", SOME_SOLANA_ACCOUNT, None)],
-            SettlementTables::for_tests(true, None),
-        );
-
-        assert!(matches!(
-            result,
-            Err(ConfigError::PeerChannelWithoutSolanaSettlement { ref peer_id })
-                if peer_id == "store"
-        ));
-    }
-
-    /// `[settlement.solana]`'s own resolver checks `program_id` for
-    /// non-emptiness only. A Solana peer channel needs a real address,
-    /// because that value is now part of what every claim on the channel is
-    /// verified against.
-    #[test]
-    fn a_settlement_program_id_that_is_not_base58_32_bytes_is_refused_for_a_solana_row() {
-        let result = resolve_peer_channels(
-            vec![raw_solana("store", SOME_SOLANA_ACCOUNT, None)],
-            SettlementTables::for_tests(true, Some("not-base58!!!")),
-        );
-
-        assert!(matches!(
-            result,
-            Err(ConfigError::PeerChannelSolanaSettlementProgramIdInvalid { ref peer_id, .. })
-                if peer_id == "store"
-        ));
-    }
-
-    /// An EVM row on a node with no Solana settlement is untouched by any
-    /// of the above -- those refusals are Solana-shaped, and a node that
-    /// settles only on EVM keeps loading exactly as it did. The rule is
-    /// per chain: a row needs the table for *its own* chain and no other.
-    #[test]
-    fn an_evm_peer_channel_needs_no_solana_settlement_table() {
-        let channels = resolve_peer_channels(
-            vec![raw("store", CHANNEL)],
-            SettlementTables::for_tests(true, None),
-        )
-        .expect("EVM needs no Solana");
-        assert_eq!(channels.len(), 1);
-    }
-
-    /// The EVM half of the same rule (issue #1138). Not the Solana row's
-    /// missing input -- an EVM row declares its own EIP-712 domain, so the
-    /// file is complete and this node happily verified inbound peer claims
-    /// on it. What is missing is the node's EVM identity: a claim is
-    /// redeemed by the channel's on-chain participant, and that address is
-    /// `[settlement.evm.key]`'s.
-    #[test]
-    fn an_evm_peer_channel_on_a_node_with_no_evm_settlement_is_refused() {
-        let error = resolve_peer_channels(
-            vec![raw("store", CHANNEL)],
-            SettlementTables::for_tests(false, Some(SETTLEMENT_PROGRAM_ID)),
-        )
+    fn a_whole_toon_channel_row_is_refused_naming_the_channel_it_derived() {
+        let error = resolve(&[&format!(
+            "peer_id = \"store\"\nchannel_id = \"{CHANNEL}\"\ncounterparty_key = \
+             \"{EVM_SIGNER}\"\nchain_id = 8453\ntoken_network = \"{EVM_SIGNER}\""
+        )])
         .unwrap_err();
-
-        assert!(
-            matches!(&error, ConfigError::PeerChannelWithoutEvmSettlement { peer_id } if peer_id == "store"),
-            "got: {error:?}"
-        );
-        let message = error.to_string();
-        assert!(
-            message.contains("[settlement.evm]")
-                && message.contains("InvalidParticipant")
-                && message.contains("ADR 0024"),
-            "got: {message}"
-        );
-    }
-
-    /// A Solana peer row on a node that settles only on Solana keeps
-    /// loading: the EVM refusal is EVM-shaped, and the mirror of
-    /// `an_evm_peer_channel_needs_no_solana_settlement_table`. This is the
-    /// shape `local/mixed-chain/connector-c.toml` is committed in.
-    #[test]
-    fn a_solana_peer_channel_needs_no_evm_settlement_table() {
-        let channels = resolve_peer_channels(
-            vec![raw_solana("store", SOME_SOLANA_ACCOUNT, None)],
-            SettlementTables::for_tests(false, Some(SETTLEMENT_PROGRAM_ID)),
-        )
-        .expect("Solana needs no EVM");
-        assert_eq!(channels.len(), 1);
-    }
-
-    #[test]
-    fn a_solana_channel_account_that_is_not_valid_base58_32_bytes_is_refused() {
-        let result = resolve(vec![raw_solana("store", "not-base58!!!", None)]);
-
         assert!(matches!(
-            result,
-            Err(ConfigError::PeerChannelInvalidSolanaAccount {
+            error,
+            ConfigError::PeerChannelToonFieldRemoved {
+                field: "channel_id",
+                ..
+            }
+        ));
+
+        let error = resolve(&[&format!(
+            "peer_id = \"store\"\nchannel_account = \"{SOLANA_CHANNEL}\"\ncounterparty_key = \
+             \"{SOLANA_SIGNER}\""
+        )])
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::PeerChannelToonFieldRemoved {
                 field: "channel_account",
                 ..
-            })
+            }
         ));
     }
 
     #[test]
-    fn the_same_solana_channel_configured_twice_is_refused() {
-        let result = resolve(vec![
-            raw_solana("store", SOME_SOLANA_ACCOUNT, None),
-            raw_solana("relay", SOME_SOLANA_ACCOUNT, None),
-        ]);
-
+    fn a_row_without_a_voucher_signer_is_refused_by_name() {
+        let error = resolve(&["peer_id = \"store\""]).unwrap_err();
         assert!(matches!(
-            result,
-            Err(ConfigError::PeerChannelDuplicate { .. })
+            error,
+            ConfigError::PeerChannelVoucherSignerMissing { ref peer_id } if peer_id == "store"
         ));
     }
 
-    /// EVM and Solana peer channels are separate namespaces, the same as
-    /// `[[client_channels]]`'s own split: an EVM `channel_id` and a Solana
-    /// `channel_account` can coexist, and a duplicate check on one chain
-    /// must never trip on the other's entry.
     #[test]
-    fn evm_and_solana_peer_channels_coexist_without_colliding() {
-        let channels = resolve(vec![
-            raw("store", CHANNEL),
-            raw_solana("relay", SOME_SOLANA_ACCOUNT, None),
-        ])
-        .expect("valid: distinct chains never collide");
+    fn a_signer_in_neither_chains_spelling_is_refused() {
+        for bad in ["0x12", "not-base58!!!", CHANNEL] {
+            let error = resolve(&[&row(bad)]).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::PeerChannelInvalidVoucherSigner { .. }),
+                "{bad}: {error:?}"
+            );
+        }
+    }
+
+    /// An inbound channel on the other chain from its signer names a
+    /// channel that signer can never sign for.
+    #[test]
+    fn an_inbound_channel_on_another_chain_than_its_signer_is_refused() {
+        let error = resolve(&[&format!(
+            "{}\ninbound_channel = \"{SOLANA_CHANNEL}\"",
+            row(EVM_SIGNER)
+        )])
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::PeerChannelInvalidInboundChannel { chain: "evm", .. }
+        ));
+    }
+
+    /// A row on a chain this node takes no x402 voucher on names a channel
+    /// no voucher could be admitted on.
+    #[test]
+    fn a_row_on_a_chain_without_x402_is_refused_per_chain() {
+        let rows = || vec![parse(&row(EVM_SIGNER))];
+        let error = resolve_peer_channels(rows(), SettlementTables::for_x402_tests(false, true))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::PeerChannelWithoutX402 { chain: "evm", .. }
+        ));
+        assert!(
+            resolve_peer_channels(rows(), SettlementTables::for_x402_tests(true, false)).is_ok(),
+            "the rule is per chain"
+        );
+    }
+
+    #[test]
+    fn one_signer_on_two_rows_is_refused() {
+        let other = format!("peer_id = \"relay\"\nvoucher_signer = \"{EVM_SIGNER}\"");
+        let error = resolve(&[&row(EVM_SIGNER), &other]).unwrap_err();
+        assert!(matches!(error, ConfigError::PeerChannelDuplicate { .. }));
+    }
+
+    #[test]
+    fn one_peering_may_bind_a_signer_on_each_chain() {
+        let channels = resolve(&[&row(EVM_SIGNER), &row(SOLANA_SIGNER)]).expect("valid");
         assert_eq!(channels.len(), 2);
     }
 
-    /// `#[serde(untagged)]` really does dispatch on the config file's own
-    /// shape: this is the TOML-level proof, not just the constructor-level
-    /// one above.
     #[test]
-    fn toml_deserializes_each_shape_into_its_own_raw_variant() {
-        let raw: RawPeerChannel = toml::from_str(&format!(
-            r#"
-peer_id = "store"
-channel_id = "0x{}"
-counterparty_key = "0x00000000000000000000000000000000000000aa"
-chain_id = 8453
-token_network = "0x00000000000000000000000000000000000000bb"
-"#,
-            "ab".repeat(32)
+    fn an_unknown_field_is_refused() {
+        assert!(toml::from_str::<RawPeerChannel>(&format!(
+            "{}\nvoucher_signr = \"{EVM_SIGNER}\"",
+            row(EVM_SIGNER)
         ))
-        .expect("valid EVM TOML");
-        assert!(matches!(raw, RawPeerChannel::Evm(_)));
-
-        let raw: RawPeerChannel = toml::from_str(&format!(
-            r#"
-peer_id = "store"
-channel_account = "{SOME_SOLANA_ACCOUNT}"
-counterparty_key = "{ANOTHER_SOLANA_ACCOUNT}"
-"#
-        ))
-        .expect("valid Solana TOML");
-        assert!(matches!(raw, RawPeerChannel::Solana(_)));
-
-        // And a file that still writes the removed key still *parses* into
-        // the Solana variant -- which is the whole reason the field is kept
-        // (issue #1128). If it did not, the untagged enum would answer
-        // "matched no variant" and the named refusal could never be
-        // reached.
-        let raw: RawPeerChannel = toml::from_str(&format!(
-            r#"
-peer_id = "store"
-channel_account = "{SOME_SOLANA_ACCOUNT}"
-counterparty_key = "{ANOTHER_SOLANA_ACCOUNT}"
-program_id = "{ANOTHER_SOLANA_ACCOUNT}"
-"#
-        ))
-        .expect("the removed key must still parse, so it can be refused by name");
-        let RawPeerChannel::Solana(solana) = raw else {
-            panic!("expected the Solana variant");
-        };
-        assert!(solana.program_id.is_some());
+        .is_err());
     }
 }

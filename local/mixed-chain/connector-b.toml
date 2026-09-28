@@ -23,23 +23,21 @@
 # packet crosses both carriages as well as both chains, and the hop that reads
 # it off one wire and writes it onto the other is this one.
 #
-# ── Two peerings, four channels, none of them in this file ───────────────────
+# ── Two peerings: one in this file, one written at runtime ──────────────────
 #
 # ADR 0075: each peering is two one-way x402 channels, and each node opens only
 # its own. `local/keys.sh mixed-chain channels` writes `POST /peers` to this
-# node twice -- naming A's URL (binding A's EVM voucher signer, and opening a
-# B->A channel nothing pays on) and naming C's URL (opening and funding B's
-# Solana channel toward C through C's sponsor endpoint, decision 3, and
-# binding C's) -- and then `POST /routes/peers` for `g.local.mixed.b.c`.
+# node once, naming C's URL (opening and funding B's Solana channel toward C
+# through C's sponsor endpoint, decision 3, and binding C's voucher signer),
+# and then `POST /routes/peers` for `g.local.mixed.b.c`.
 #
-# One thing this file used to say that the runtime peering cannot: A's
-# peering here was `forwarded_claim_enforcement = "enforce"` (ADR 0042 item
-# 3), the only enforcing peering in the repository. A runtime peering has no
-# such knob and observes (the default), so an uncovered arrival from A would
-# now be forwarded and logged rather than refused `F06`. The rehearsal still
-# catches it -- B's journal must show exactly one 1100 voucher per crossing --
-# but the enforcing refusal itself no longer runs on a shipped image. It comes
-# back with config-declared x402 peerings (#1380).
+# A's peering is DECLARED here instead, at the bottom of this file, because it
+# says the one thing a runtime peering cannot: `forwarded_claim_enforcement =
+# "enforce"` (ADR 0042 item 3), the only enforcing peering in the repository.
+# An arrival from A that B forwards must carry a voucher covering the packet's
+# own amount, or it is refused `F06` rather than forwarded and logged. B opens
+# no channel toward A -- nothing is ever paid that way -- so this peering is
+# the one channel A opens toward B with its own `POST /peers`.
 # =============================================================================
 
 client_edge_addr = "0.0.0.0:3000"
@@ -125,3 +123,25 @@ key_file = "/app/data/settlement-solana.key"
 
 [settlement.solana.batch_settlement]
 min_sponsored_deposit = 1
+
+# ── A's peering, config-declared (ADR 0075 decision 9, issue #1380) ──────────
+# The id is the one `local/keys.sh`'s topology table names, so the `channels`
+# stage finds it here and skips this end's `POST /peers`. No `endpoint`: A
+# dials in, over the BTP carriage `peer_expose` opens above.
+#
+# `forwarded_claim_enforcement = "enforce"`: an arrival from A that this node
+# forwards must carry a voucher covering the packet's own amount, or it is
+# refused F06 -- the enforcing refusal no runtime peering can ask for.
+[[peers]]
+id = "a-b"
+forwarded_claim_enforcement = "enforce"
+
+# The key A signs its vouchers with: A's EVM settlement address, derived by
+# `local/keys.sh` from anvil's public mnemonic at A's index (7), and held to
+# that derivation by the `channels` stage. No `inbound_channel`: A opens its
+# channel toward B at run time, so its id is not known when this file is
+# written, and a voucher by this signer proves the peering on whichever
+# channel it rides.
+[[peer_channels]]
+peer_id = "a-b"
+voucher_signer = "0x14dc79964da2c08b23698b3d3cc7ca32193d9955"

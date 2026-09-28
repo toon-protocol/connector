@@ -14,8 +14,10 @@
 //! 0075, issue #1383). A peering is two one-way `batch-settlement` channels,
 //! each opened by its own payer, and it is established from a URL by a signed
 //! `POST /peers` on each end (ADR 0058 as 0075 decision 4 amends it) -- so no
-//! committed file here holds a `[[peers]]`, `[[peer_channels]]` or
-//! `[[pay_channels]]` row. What each peering costs lives in `local/keys.sh`'s
+//! committed file here holds a `[[pay_channels]]` row, and only one holds a
+//! `[[peers]]` or `[[peer_channels]]` row: `mixed-chain`'s B, whose A peering
+//! is config-declared so that it can enforce (issue #1380), and which names a
+//! voucher signer rather than a channel. What each peering costs lives in `local/keys.sh`'s
 //! topology table instead (its `fee`, its cap, and the forwarding route's
 //! `price`), because that script makes the writes. So the multi-file drift this
 //! test has always caught -- a figure that must agree across two or three
@@ -520,11 +522,14 @@ fn settlement(config: &Config, chain: SettlementChain) -> &SettlementConfig {
 /// A peering is established from a URL by a signed `POST /peers` on each end,
 /// which opens that node's own outbound x402 channel and binds the other's by
 /// the voucher signer its self-description publishes. There is no channel id
-/// to paste anywhere, so a `[[peer_channels]]`/`[[pay_channels]]` row here
-/// would be a TOON channel, and a `[[peers]]` row a config-declared peering --
-/// which still proves itself with a `toon-channel` claim until #1380. Both
-/// shapes still PARSE (#1380 refuses them by name); this is what keeps
-/// `local/` off them in the meantime.
+/// to paste anywhere -- every channel is opened at run time -- so no config
+/// here can hold a `[[pay_channels]]` row, which names this node's own
+/// journaled outbound channel.
+///
+/// The one config-declared peering is `mixed-chain`'s B accepting from A
+/// ([`the_mixed_chain_middle_hop_enforces_a_config_declared_peering`]): a
+/// `[[peers]]` row and a `[[peer_channels]]` row naming A's voucher signer,
+/// which is deterministic. Every other config holds neither.
 #[test]
 fn every_local_config_loads_and_holds_no_toon_channel_row() {
     for (name, raw) in EVERY_CONFIG
@@ -533,16 +538,22 @@ fn every_local_config_loads_and_holds_no_toon_channel_row() {
         .chain([("local/anyone/connector.toml", ANYONE_CONFIG)])
     {
         let config = load(name, raw);
-        assert!(
+        let declares_a_peering = name == "local/mixed-chain/connector-b.toml";
+        assert_eq!(
             config.peers().is_empty(),
-            "{name} declares a [[peers]] row. Every local peering is a runtime one, written by \
-             local/keys.sh's `channels` stage with `POST /peers`; a config-declared peering still \
-             proves itself with a toon-channel claim (#1380)."
+            !declares_a_peering,
+            "{name}: only mixed-chain's B declares a [[peers]] row. Every other local peering is \
+             a runtime one, written by local/keys.sh's `channels` stage with `POST /peers`."
+        );
+        assert_eq!(
+            config.peer_channels().is_empty(),
+            !declares_a_peering,
+            "{name}: only mixed-chain's B binds a voucher signer in [[peer_channels]]"
         );
         assert!(
-            config.peer_channels().is_empty() && config.pay_channels().is_empty(),
-            "{name} names a channel in [[peer_channels]] or [[pay_channels]] -- a TOON channel, \
-             which no local chain opens any more (ADR 0075)"
+            config.pay_channels().is_empty(),
+            "{name} names a [[pay_channels]] row -- an outbound channel id, which no committed \
+             file can know, since every local channel is opened at run time"
         );
         assert!(
             config.client_channels().is_empty(),
@@ -555,11 +566,61 @@ fn every_local_config_loads_and_holds_no_toon_channel_row() {
              local/keys.sh's table"
         );
         for line in executable_lines(raw) {
-            for header in ["[[peers]]", "[[peer_channels]]", "[[pay_channels]]"] {
-                assert_ne!(line, header, "{name} still carries a `{header}` table");
+            assert_ne!(
+                line, "[[pay_channels]]",
+                "{name} still carries a `[[pay_channels]]` table"
+            );
+            if !declares_a_peering {
+                for header in ["[[peers]]", "[[peer_channels]]"] {
+                    assert_ne!(line, header, "{name} still carries a `{header}` table");
+                }
             }
         }
     }
+}
+
+/// **The one enforcing peering** (ADR 0042 item 3, restored by issue #1380).
+/// A runtime peering has no `forwarded_claim_enforcement` knob and observes,
+/// so `mixed-chain`'s B declares its A peering in config instead: the `a-b`
+/// id `local/keys.sh`'s table names, no `endpoint` (A dials in over the BTP
+/// carriage B exposes), `"enforce"`, and one `[[peer_channels]]` row naming
+/// A's EVM voucher signer on no pinned channel -- A's channel is opened at run
+/// time, so its id cannot be committed. The address is A's derived settlement
+/// address, which `local/keys.sh`'s `channels` stage holds the row to
+/// (`config_must_name`) before it skips this end's `POST /peers`.
+#[test]
+fn the_mixed_chain_middle_hop_enforces_a_config_declared_peering() {
+    let b = load("local/mixed-chain/connector-b.toml", MIXED_B);
+    let table = topology("mixed-chain");
+    let a_b = table.peering("a-b");
+    assert_eq!(a_b.payee, "connector-b");
+    assert_eq!(a_b.chain, SettlementChain::Evm);
+
+    let [peer] = b.peers() else {
+        panic!("mixed-chain's B declares exactly one peering, A's");
+    };
+    assert_eq!(peer.id(), "a-b", "the id local/keys.sh's table names");
+    assert_eq!(peer.endpoint(), None, "A dials B; B never dials A");
+    assert_eq!(
+        peer.forwarded_claim_enforcement(),
+        connector_config::ForwardedClaimEnforcement::Enforce
+    );
+    assert!(b.peer_expose().exposes(connector_config::PeerCarriage::Btp));
+
+    let [row] = b.peer_channels() else {
+        panic!("mixed-chain's B binds exactly one voucher signer, A's");
+    };
+    assert_eq!(row.peer_id(), "a-b");
+    assert_eq!(row.chain(), SettlementChain::Evm);
+    assert_eq!(row.inbound_channel(), None);
+
+    let stage = code(KEYS_SCRIPT);
+    assert!(
+        stage.contains("if config_declares_peering \"$payee\" \"$id\"; then")
+            && stage.contains("config_must_name \"$(evm_settlement_address \"$payer\")\""),
+        "local/keys.sh must skip the payee's POST /peers for a config-declared peering and \
+         hold the row's voucher signer to the payer's derived address"
+    );
 }
 
 /// **Every settlement table is an x402 one, on the chain `infra/` seeds** (ADR

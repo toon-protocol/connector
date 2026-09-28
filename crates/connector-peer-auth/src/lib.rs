@@ -9,29 +9,33 @@
 //! replaces the proof is this crate. Everything here is a stop-ship
 //! invariant.
 //!
-//! # The rule (§1.2)
+//! # The rule (§1.2, as ADR 0075 decision 5 amends it)
 //!
-//! An interaction has role `peer` **if and only if both** hold:
+//! An interaction has role `peer` **if and only if** it carries either:
 //!
-//! * **P2 — a channel binding.** The frame's claim names a `channel_id`
-//!   that one of a configured peering's `[[peer_channels]]` rows binds.
-//! * **P3 — a verified claim signature.** That claim's signature verifies
-//!   against **the counterparty key that row configures** — never against
-//!   anything the claim declares about itself.
+//! * **a voucher on a channel bound to that peering** -- an x402 channel
+//!   whose voucher signer, as the **chain** records it (EVM
+//!   `payerAuthorizer`, Solana `authorized_signer`), is a key this node has
+//!   bound to the peering: published in the peer's self-description (a
+//!   runtime peering) or named by a `[[peer_channels]]` row (a
+//!   config-declared one) -- and the voucher's signature recovers to it; or
+//! * **for a packet that moves no value, the voucher claim-state
+//!   challenge** signed by such a signer and still inside its window.
 //!
-//! If either fails, for any reason, the role is `client`. There is no
+//! If neither holds, for any reason, the role is `client`. There is no
 //! fallthrough, no degraded peer, no third state: [`SessionRole`] has two
 //! variants and no `Unknown`.
 //!
+//! **A `toon-channel` claim never decides the role** (ADR 0075, issue
+//! #1380). It used to -- P2 and P3 were "a claim on a channel a
+//! `[[peer_channels]]` row binds, whose signature verifies against the key
+//! that row configures" -- and that proof is deleted with its last caller,
+//! the config-declared peering.
+//!
 //! **There is no P1, and no bearer credential anywhere in this crate.**
 //! Until ADR 0060 a `{peerId, secret}` shared secret decided role, and the
-//! weaker check gated the stronger one: a peering whose secret was stale
-//! was downgraded to `client` on the strength of a shared string, while the
-//! signature that actually proves who it is was never consulted. That
-//! credential is deleted rather than renamed, demoted to a label or kept as
-//! an optional discriminator — a second identifier for a relation the claim
-//! already names is the fault ADR 0060 removes, and rebuilding it smaller
-//! would be the same fault.
+//! weaker check gated the stronger one. That credential is deleted rather
+//! than renamed, demoted to a label or kept as an optional discriminator.
 //!
 //! # Why the decision cannot see the transport (§1.3)
 //!
@@ -44,23 +48,21 @@
 //! That is enforced here structurally rather than by review, in three
 //! layers:
 //!
-//! 1. **The signature.** [`decide_role`] takes exactly
-//!    `(Option<PresentedClaim>, &PeerAuthPolicy)` and returns a
-//!    [`RoleDecision`]. A [`PresentedClaim`] holds a channel id and a
-//!    [`ClaimVerification`] and nothing else; a [`PeerAuthPolicy`] is built
-//!    from configuration and nothing else. Neither type has a field a port
-//!    number, a peer address or a carriage could be smuggled in, so a
-//!    caller wanting to weight one has nowhere to put it.
-//! 2. **The dependency graph.** This crate depends on `connector-config`
-//!    and nothing else. It depends on no async runtime, no HTTP or
-//!    websocket stack, and no other connector crate — so it cannot name a
-//!    socket, a request, a session or a frame even privately.
-//!    [`tests::the_decision_crate_cannot_name_a_transport`] asserts that
-//!    against the manifest, so a future dependency has to argue with a
-//!    failing test. It is also why the signature *verdict* arrives as a
-//!    [`ClaimVerification`] rather than being computed here: verifying one
-//!    needs the counterparty key the claim book holds, and reaching for it
-//!    would mean depending on the runtime.
+//! 1. **The signature.** [`decide_voucher_role`] takes exactly an
+//!    `Option<PresentedVoucher>` -- the peering the evidence's signer is
+//!    bound to, and a [`VoucherVerification`] -- and returns a
+//!    [`RoleDecision`]. Neither has a field a port number, a peer address or
+//!    a carriage could be smuggled in, so a caller wanting to weight one has
+//!    nowhere to put it.
+//! 2. **The dependency graph.** This crate depends on nothing: no async
+//!    runtime, no HTTP or websocket stack, and no other connector crate --
+//!    so it cannot name a socket, a request, a session or a frame even
+//!    privately. `tests::the_decision_crate_cannot_name_a_transport`
+//!    asserts that against the manifest, so a future dependency has to argue
+//!    with a failing test. It is also why the signature *verdict* arrives
+//!    as a [`VoucherVerification`] rather than being computed here:
+//!    verifying one needs the signer the chain records, and reaching for it
+//!    would mean depending on a settlement backend.
 //! 3. **No I/O and no clock.** Nothing here reads a socket, a file or the
 //!    time. Every function is pure, which is what makes the whole surface
 //!    testable without one (ADR 0007: fakes yes, mocks no) — the rate limit
@@ -69,37 +71,31 @@
 //!
 //! There is deliberately **no** "trusted network" or "loopback is a peer"
 //! escape hatch. Every such shortcut is transport inference wearing a
-//! different hat, and §1.3 does not have an exception for the convenient
-//! ones. The one escape hatch ADR 0027 does name — a dedicated peer
-//! listener (§1.10) — is defence in depth that changes *nothing* here: role
-//! is still decided by P2 and P3, and the listener only changes what a
-//! carriage does with a `client` verdict on it.
+//! different hat. The one escape hatch ADR 0027 does name — a dedicated peer
+//! listener (§1.10) — is defence in depth that changes *nothing* here: it
+//! only changes what a carriage does with a `client` verdict on it.
 //!
 //! # What this crate is not
 //!
 //! It is not a carriage. The BTP peer carriage (issue #727) and the
 //! ILP-over-HTTP one (issue #728) own sessions, frames, headers, requests
-//! and responses, and they own decoding a claim off their own wire. What
-//! reaches here is the two facts §1.2 reads.
+//! and responses, and they own decoding the evidence off their own wire.
+//! What reaches here is the two facts the rule reads.
 //!
 //! # Layout
 //!
 //! | Module | What it holds |
 //! | ------ | -------------- |
-//! | [`policy`] | the configured side: which channel belongs to which peering |
-//! | [`decision`] | [`decide_role`], its verdict, and the `peer_auth_refused` operator event |
+//! | [`decision`] | [`decide_voucher_role`], its verdict, and the `peer_auth_refused` operator event |
 //! | [`role`] | the two roles and the containment enumeration |
 
 pub mod decision;
-pub mod policy;
 pub mod role;
 
 pub use decision::{
-    decide_role, decide_voucher_role, ClaimVerification, PeerAuthRefusal, PeerAuthRefusalLog,
-    PeerAuthRefusalReport, PresentedClaim, PresentedVoucher, RoleDecision, UnmetRequirement,
-    VoucherVerification, PEER_AUTH_REFUSED_EVENT,
+    decide_voucher_role, PeerAuthRefusal, PeerAuthRefusalLog, PeerAuthRefusalReport,
+    PresentedVoucher, RoleDecision, UnmetRequirement, VoucherVerification, PEER_AUTH_REFUSED_EVENT,
 };
-pub use policy::PeerAuthPolicy;
 pub use role::{claim_ack_to_emit, Capability, SessionRole};
 
 #[cfg(test)]
@@ -111,7 +107,7 @@ mod tests {
     /// claim book.
     ///
     /// This is the mechanical half of the property; the other half is
-    /// [`crate::decide_role`]'s signature, which has nowhere to put a
+    /// [`crate::decide_voucher_role`]'s signature, which has nowhere to put a
     /// transport fact even if one were reachable.
     const TRANSPORT_CRATES: &[&str] = &[
         "tokio",
@@ -130,12 +126,12 @@ mod tests {
         "connector-operator",
     ];
 
-    /// The `[dependencies]` section only. There are no `[dev-dependencies]`
-    /// left to exempt — the one that existed named `connector-btp` so the
-    /// credential's protocolData entry could not fork from the frame
-    /// grammar's spelling, and ADR 0060 deleted the credential.
-    fn declared_dependencies() -> String {
-        let manifest = include_str!("../Cargo.toml");
+    /// The `[dependencies]` section of `manifest` only. There are no
+    /// `[dev-dependencies]` left to exempt — the one that existed named
+    /// `connector-btp` so the credential's protocolData entry could not fork
+    /// from the frame grammar's spelling, and ADR 0060 deleted the
+    /// credential.
+    fn declared_dependencies_of(manifest: &str) -> String {
         let mut inside = false;
         let mut collected = String::new();
         for line in manifest.lines() {
@@ -154,6 +150,10 @@ mod tests {
         collected
     }
 
+    fn declared_dependencies() -> String {
+        declared_dependencies_of(include_str!("../Cargo.toml"))
+    }
+
     #[test]
     fn the_decision_crate_cannot_name_a_transport() {
         let dependencies = declared_dependencies();
@@ -162,24 +162,28 @@ mod tests {
             assert!(
                 !dependencies.contains(forbidden),
                 "connector-peer-auth grew a dependency on `{forbidden}`. Role is decided by \
-                 the frame's verified claim and the config, never by the transport \
-                 (peer-carriage-spec.md §1.3): a crate that can name a socket, a session or a \
-                 frame is a crate where someone can weight one. Dependencies were:\n\
-                 {dependencies}"
+                 the frame's verified voucher and this node's bindings, never by the \
+                 transport (peer-carriage-spec.md §1.3): a crate that can name a socket, a \
+                 session or a frame is a crate where someone can weight one. Dependencies \
+                 were:\n{dependencies}"
             );
         }
     }
 
-    /// Guards the guard: a manifest whose `[dependencies]` section this
-    /// parser fails to find would pass the assertion above vacuously.
+    /// Guards the guard: a parser that failed to find a `[dependencies]`
+    /// section would pass the assertion above vacuously. This crate's own
+    /// section is empty, so the parser is held to a manifest that has one.
     #[test]
-    fn the_transport_guard_reads_a_non_empty_dependency_section() {
-        let dependencies = declared_dependencies();
+    fn the_transport_guard_reads_a_dependency_section() {
+        let dependencies = declared_dependencies_of(
+            "[package]\nname = \"x\"\n\n[dependencies]\n# prose\ntokio = \"1\"\n\n\
+             [dev-dependencies]\naxum = \"0.6\"\n",
+        );
 
+        assert_eq!(dependencies, "tokio = \"1\"\n\n");
         assert!(
-            dependencies.contains("connector-config"),
-            "the dependency-section parser found nothing, so the transport guard proves \
-             nothing; got:\n{dependencies}"
+            !declared_dependencies().contains('='),
+            "this crate depends on nothing"
         );
     }
 }

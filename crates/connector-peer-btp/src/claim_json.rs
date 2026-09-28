@@ -52,9 +52,9 @@ pub enum ClaimDecodeError {
     /// A claim on a chain this connector cannot judge. Only `mina`
     /// reaches this now (ADR 0002 drops Mina from the Rust connector, and
     /// `ClientClaim` has no Mina variant at all); `solana` used to, and
-    /// no longer does -- `ClaimBook` verifies ed25519 balance proofs
-    /// alongside EIP-712 ones since issue #732, which is what the live
-    /// devnet peering actually settles on.
+    /// no longer does -- ed25519 balance proofs are verified alongside
+    /// EIP-712 ones since issue #732 (by the client edge's claim gate alone
+    /// since ADR 0075, #1380).
     UnsupportedChain(&'static str),
     /// The `signature` field is not the shape its chain requires: `0x` +
     /// 130 hex characters for EVM (§4.2's 65-byte `r ‖ s ‖ v`), or base64
@@ -64,8 +64,7 @@ pub enum ClaimDecodeError {
     /// serves both edges.
     Signature,
     /// An x402 `batch-settlement` **voucher**, handed to [`parse`], which
-    /// reads only `toon-channel` claims into the [`WireClaim`] `ClaimBook`
-    /// judges. A voucher is not structurally wrong and, since ADR 0075
+    /// reads only `toon-channel` claims into a [`WireClaim`]. A voucher is not structurally wrong and, since ADR 0075
     /// decision 5, not on the wrong edge either: it proves the peer role on
     /// a bound channel, and [`parse_presented`] keeps it for the role gate.
     /// Reported by name rather than as [`ClaimDecodeError::Structural`] for
@@ -342,7 +341,8 @@ pub fn parse(raw: &[u8]) -> Result<WireClaim, ClaimDecodeError> {
 /// ([`crate::role_gate::VoucherEvidence`]), which this crate cannot reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresentedPeerClaim {
-    /// A `toon-channel` claim, in the in-process shape `ClaimBook` judges.
+    /// A `toon-channel` claim, in its in-process shape. It never decides
+    /// the peer role (#1380): a frame carrying one is a client frame.
     Channel(WireClaim),
     /// A voucher, as the client edge's own parser read it: always
     /// [`ClientClaim::EvmVoucher`] or [`ClientClaim::SolanaVoucher`].
@@ -380,8 +380,9 @@ pub fn parse_presented(raw: &[u8]) -> Result<PresentedPeerClaim, ClaimDecodeErro
         // `programId`/`signerPublicKey` are validated by the structural
         // pass above and then dropped here, exactly as the EVM branch
         // drops `signerAddress`: whose signature a claim is checked
-        // against comes from `ClaimBook`'s own per-channel record
-        // (`set_solana_channel`), never from the claim.
+        // against comes from the judging book's own per-channel record --
+        // since #1380 only the client edge's claim gate judges one -- never
+        // from the claim.
         //
         // For `signerPublicKey` that is the whole story -- it rides the
         // wire and carries no authority, and no value is pinned for it.
@@ -390,25 +391,13 @@ pub fn parse_presented(raw: &[u8]) -> Result<PresentedPeerClaim, ClaimDecodeErro
         // payer MUST write there is pinned -- the settlement program the
         // `channelAccount` lives under -- and the client edge **reports**
         // a claim that writes something else (`connector_client_edge`'s
-        // `claim_gate`, at `warn`). Dropping it here means the peer edge
-        // does not, and that difference is a decision rather than an
-        // oversight: `peer-carriage-spec.md` §4.1 states it and argues it,
-        // and `client-edge-spec.md` §1.3 step 4 records that the reporting
-        // duty is the client edge's alone.
-        //
-        // The short of it. Since issue #1128 a Solana peering has exactly
-        // one program it can be judged under, `[settlement.solana]
-        // program_id`, and that one value both renders `programId` on an
-        // outbound peer claim (`encode` above, from
-        // `PeerRelation::solana_program_ids`) and keys the `SolanaChannel`
-        // an inbound one is verified against. A peer that declares a
-        // program it did not sign under is a disagreement this connector
-        // cannot produce; a peer that signs under a program this node does
-        // not settle with already fails `SignatureInvalid` and moves no
-        // traffic at all. Neither leaves a report anyone could act on, and
-        // the price of one would be an authority-free field on `WireClaim`.
-        // `tests/a_peer_claims_declared_program_is_not_consulted.rs` holds
-        // both halves of that.
+        // `claim_gate`, at `warn`). Dropping it here costs the peer edge
+        // nothing, because since ADR 0075 (#1380) the peer edge judges no
+        // `toon-channel` claim at all: a frame carrying one is a client
+        // frame on either carriage (`crate::role_gate`), and reporting a
+        // mis-declared `programId` is the client edge's duty alone
+        // (`client-edge-spec.md` §1.3 step 4). Keeping it would put an
+        // authority-free field on `WireClaim` for no reader.
         ClientClaim::Solana(claim) => WireClaim {
             channel_id: claim.channel_account,
             nonce: claim.nonce,
@@ -516,8 +505,7 @@ mod tests {
     }
 
     /// A well-formed voucher -- on either chain -- never becomes a
-    /// `WireClaim`: [`parse`] refuses it by name, so `ClaimBook` never
-    /// judges one. Since ADR 0075 decision 5 it is not discarded, though:
+    /// `WireClaim`: [`parse`] refuses it by name. Since ADR 0075 decision 5 it is not discarded, though:
     /// [`parse_presented`] keeps it, for the role gate to resolve against a
     /// bound channel.
     #[test]

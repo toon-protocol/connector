@@ -37,15 +37,16 @@ pub enum SessionRole {
     /// default, because §1.5 starts every interaction here.
     #[default]
     Client,
-    /// A proven peering: P2 and P3 both held — the frame's claim named a
-    /// channel a `[[peer_channels]]` row binds, and its signature verified
-    /// against the counterparty key that row configures.
+    /// A proven peering: the frame carried a voucher, or a peer-role
+    /// challenge, whose signature verified against the voucher signer the
+    /// chain records for its channel, and that signer is bound to this
+    /// peering (ADR 0075 decision 5).
     Peer {
-        /// The **configured** peer id — the `[[peer_channels]]` row's own
-        /// `peer_id`, never a string the interaction asserted. The claim
-        /// names a channel and config names the relation, which is what
-        /// lets everything downstream treat this as an identifier rather
-        /// than as input.
+        /// The **bound** peer id — the peering this node bound the signer to,
+        /// never a string the interaction asserted. The evidence names a
+        /// channel, the chain names its signer and this node's binding names
+        /// the relation, which is what lets everything downstream treat this
+        /// as an identifier rather than as input.
         peer_id: String,
     },
 }
@@ -140,14 +141,13 @@ impl fmt::Display for SessionRole {
 /// refused to a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Capability {
-    /// Advance a `[[peer_channels]]` watermark. Peer only: peer and client
-    /// watermarks are separate records in separate namespaces (§1.8), and
-    /// a claim judged in one may never advance the other. A client
-    /// interaction presenting a claim that names a `[[peer_channels]]`
-    /// channel is still a client — §1.3 forbids inferring role from "a
-    /// claim naming a channel that happens to be in `[[peer_channels]]`" —
-    /// and `ChannelInBothNamespaces` keeps the two from ever describing
-    /// the same money.
+    /// Judge a voucher as a peering's payment and answer it in a
+    /// `claim-ack`. Peer only in its verdict's destination: the voucher is
+    /// held to its channel's **one** watermark whichever role it arrives
+    /// under (§1.8, ADR 0075 decision 6), and a client interaction
+    /// presenting a voucher from a bound signer's channel is still a client
+    /// unless the voucher itself proved the role -- §1.3 forbids inferring
+    /// it from "a channel that happens to be bound".
     AdvancePeerWatermark,
     /// Append to the peer claim ledger.
     AppendToPeerClaimLedger,
@@ -155,7 +155,8 @@ pub enum Capability {
     /// MUST NOT emit one on a client interaction. See
     /// [`claim_ack_to_emit`].
     EmitClaimAck,
-    /// Accept a FLUSH (§6).
+    /// Accept a FLUSH (§6). No peering sends one since ADR 0075 (#1380):
+    /// a voucher rides the PREPARE it covers.
     AcceptFlush,
     /// Be a route's next hop: this peering relation may appear in the
     /// routing table as somewhere to forward to. Not the same as having
@@ -166,8 +167,8 @@ pub enum Capability {
     /// client interaction is never treated as a peering relation for flush
     /// purposes. Named for the credit-window exposure/ceiling accounting
     /// this capability originally gated too; that machinery is retired
-    /// (ADR 0031, ADR 0033, issue #882) and this is now the flush prompt's
-    /// own gate.
+    /// (ADR 0031, ADR 0033, issue #882), and the prompt itself is no longer
+    /// emitted since ADR 0075 (#1380).
     CountTowardPeeringExposure,
 
     /// Carriage without paying for it. Granted to neither role: a peering

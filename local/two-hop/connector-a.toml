@@ -19,8 +19,10 @@
 # each node is sent one signed `POST /peers` naming the other's
 # self-description URL, opens and funds only ITS OWN outbound channel, and
 # binds the other's channel toward it by the voucher signer the other's
-# self-description publishes. Nobody pastes a channel id anywhere, so there is
-# no `[[peer_channels]]` or `[[pay_channels]]` row here to paste it into.
+# self-description publishes. Nobody pastes a key or a channel id anywhere, so
+# there is no `[[peer_channels]]` row (which would name B's voucher signer) or
+# `[[pay_channels]]` row (which would name A's own outbound channel) here --
+# the runtime peering binds and registers both itself (ADR 0075, #1380).
 #
 # `local/keys.sh two-hop channels` makes those writes once both nodes are
 # serving, and it is where this peering's facts live -- its `fee` (100), the

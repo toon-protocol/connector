@@ -5,6 +5,11 @@
 > rows it names, on both sides — no longer exists in any committed config. There is no channel left
 > to migrate. Kept as the historical record of the ERC-2771 TokenNetwork split-brain and how it was
 > resolved while the peering was still live.
+>
+> **The row shape it edits is retired too** ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md),
+> issue #1380): a `[[peer_channels]]` row now names the peer's `voucher_signer`, and one still
+> writing `channel_id`, `counterparty_key`, `chain_id` or `token_network` is refused by name at load.
+> Nothing below describes a configuration this build loads.
 
 Operator runbook for [issue #822](https://github.com/toon-protocol/connector/issues/822): the
 apex↔store `[[peer_channels]]` row still settles on the OLD `TokenNetwork`
