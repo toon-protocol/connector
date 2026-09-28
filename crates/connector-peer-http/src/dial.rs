@@ -51,11 +51,11 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use connector_btp::CLAIM_HEADER;
+use connector_btp::{CLAIM_HEADER, PEER_CHALLENGE_HEADER};
 use connector_config::{PeerCarriage, PeerChannelConfig, PeerConfig};
 use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 use connector_peer_btp::claim_json::{self, PeerClaimDomain};
-use connector_runtime::{ClaimAckOutcome, Clock, PeerForward, PeerTransport, WireClaim};
+use connector_runtime::{ClaimAckOutcome, Clock, Covering, PeerForward, PeerTransport, WireClaim};
 use url::Url;
 
 use crate::headers::{self, Headers, PeerRequest, PeerResponse};
@@ -72,6 +72,11 @@ use crate::headers::{self, Headers, PeerRequest, PeerResponse};
 pub const NAT_NOTE: &str = "an HTTP-only peer can neither reach nor be reached by a NAT'd peer: \
      the NAT'd side can only dial, and can only receive over a persistent \
      session, so that session must be BTP (peer-carriage-spec.md §2.4)";
+
+/// The §7.2 in-flight lock key voucher-bearing requests share on one
+/// relation: not a channel id, so it can never collide with a
+/// `toon-channel` claim's lock.
+const VOUCHER_IN_FLIGHT: &str = "x402-voucher";
 
 /// Why a peer could not be reached. Carries the peer id and the endpoint
 /// that was attempted, because §2.2 requires a dial failure name both rather
@@ -620,8 +625,17 @@ impl PeerTransport for HttpPeerTransport {
         &self,
         peer_id: &str,
         prepare: Prepare,
-        claim: Option<WireClaim>,
+        covering: Option<Covering>,
     ) -> PeerForward {
+        // A voucher or a challenge arrives rendered and rides its own
+        // header verbatim (§1.4, §4); only a `toon-channel` claim is
+        // rendered, cached and retransmitted here (§6.3).
+        let (claim, rendered) = match covering {
+            Some(Covering::Claim(claim)) => (Some(claim), None),
+            Some(Covering::Voucher(json)) => (None, Some((CLAIM_HEADER, json, true))),
+            Some(Covering::Challenge(json)) => (None, Some((PEER_CHALLENGE_HEADER, json, false))),
+            None => (None, None),
+        };
         let Some(state) = self.relation(peer_id) else {
             tracing::warn!(peer_id, "no HTTP peering to originate to; {NAT_NOTE}");
             return PeerForward {
@@ -645,15 +659,25 @@ impl PeerTransport for HttpPeerTransport {
         // caller's claim: the caller sent none, so it is told none was
         // acknowledged, and the ack is applied to the retransmission cache
         // here instead.
-        let hinted = claim
-            .is_none()
+        let hinted = (claim.is_none() && rendered.is_none())
             .then(|| self.hinted_retransmission(state))
             .flatten();
+        let voucher = matches!(rendered, Some((_, _, true)));
+        if let Some((header, json, _)) = rendered.as_ref() {
+            request
+                .headers
+                .push(*header, headers::claim_header_value(json));
+        }
         let carried = claim.as_ref().map(|claim| self.claim_header(state, claim));
         let claim_channel = claim
             .as_ref()
             .map(|claim| claim.channel_id.clone())
-            .or_else(|| hinted.as_ref().map(|(claim, _)| claim.channel_id.clone()));
+            .or_else(|| hinted.as_ref().map(|(claim, _)| claim.channel_id.clone()))
+            // A voucher is §7.2's case too: a peering's vouchers are
+            // cumulative on one outbound channel, so two in flight at once
+            // could arrive out of order and the lower refused as not
+            // advancing. They take one lock per relation between them.
+            .or_else(|| voucher.then(|| VOUCHER_IN_FLIGHT.to_string()));
         if let Some(value) = carried.or_else(|| hinted.as_ref().map(|(_, value)| value.clone())) {
             request.headers.push(CLAIM_HEADER, value);
         }
@@ -680,7 +704,12 @@ impl PeerTransport for HttpPeerTransport {
         };
         self.note_flush_hints(state, &response);
 
-        let ack = self.read_ack(state, claim.as_ref(), &response);
+        let ack = if voucher {
+            // §6.1: a voucher's verdict rides back exactly as a claim's.
+            headers::claim_ack(&response.headers).unwrap_or(ClaimAckOutcome::NotSent)
+        } else {
+            self.read_ack(state, claim.as_ref(), &response)
+        };
         if let Some((hinted, _)) = hinted.as_ref() {
             // The caller's accounting is untouched: it sent no claim, so it
             // is told `NotSent` below. Ours is not -- an accepted

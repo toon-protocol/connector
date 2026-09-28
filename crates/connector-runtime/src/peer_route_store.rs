@@ -65,37 +65,72 @@ pub enum PeerRouteStoreError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    /// The table holds a runtime EVM peering over a `TokenNetwork` channel
+    /// (ADR 0058, before ADR 0075). This build pays and is paid on x402
+    /// channels only, so it cannot sign on that channel, judge a claim on
+    /// it, or land one -- and dropping the row would forget a channel that
+    /// may still hold unlanded claims. Refused by name at boot, never
+    /// skipped (ADR 0075 decision 8, issue #1378).
+    #[error(
+        "the runtime peer/route table at {path} holds peering '{peer_id}' over TokenNetwork \
+         channel {channel_id}, and this build peers on EVM over x402 channels only (ADR 0075). \
+         Drain it on the last release that supports TOON channels -- land its latest claim, \
+         close and settle the channel, confirm on chain it is closed (ADR 0075, \"Draining a \
+         node with live TOON channels\") -- then remove the peering there (DELETE \
+         /peers/{peer_id}) and establish it again on this build with POST /peers"
+    )]
+    TokenNetworkPeering {
+        path: PathBuf,
+        peer_id: String,
+        channel_id: String,
+    },
 }
 
 /// One runtime peering's binding to one payment channel, by chain.
 ///
-/// The runtime twin of a `[[peer_channels]]` row plus its `[[pay_channels]]`
-/// counterpart: the same channel holds both roles with one hop -- the peer
-/// role for what arrives, the client role for what this node sends -- which
-/// is the deployed shape `connector_config::pay_channel`'s own header
-/// describes.
+/// **EVM (ADR 0075 decision 4).** A peering is two one-way x402 channels,
+/// one opened by each side, and this row names this node's own: the
+/// outbound channel it signs vouchers on ([`RuntimePeerChannel::EvmVoucher`]),
+/// and the key the peer signs *its* vouchers with, which binds the peer's
+/// channel toward this node when it shows up. Nothing is derived: the
+/// channel id is the one this node opened, and the key is the one the
+/// peer's self-description published.
 ///
-/// `counterparty_key` is **the counterparty's settlement address on this
-/// entry's own chain**, and is what the channel was derived from (ADR
-/// 0059). It is never the peer's edge identity: `TokenNetwork` recovers a
-/// balance proof's signer and requires it to *be* a channel participant, so
-/// a secp256k1 edge key in this field would name a participant no chain
-/// holds. On Solana the two could not even be confused -- an ed25519 public
-/// key and a secp256k1 one are different values on different curves.
+/// **Solana, until #1379.** Still the `toon-channel` shape: one channel held
+/// in both roles, derived from the two settlement keys (ADR 0059) -- the
+/// runtime twin of a `[[peer_channels]]` row plus its `[[pay_channels]]`
+/// counterpart. `counterparty_key` is the counterparty's settlement key on
+/// Solana, never its edge identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "chain", rename_all = "lowercase")]
 pub enum RuntimePeerChannel {
+    /// A `TokenNetwork` channel a runtime EVM peering held before ADR 0075.
+    /// **Parsed only to be refused by name**
+    /// ([`PeerRouteStoreError::TokenNetworkPeering`]): no build since #1378
+    /// writes one, binds one or signs on one.
     Evm {
         /// The `TokenNetwork` channel id, `0x`-prefixed lowercase hex.
         channel_id: String,
         /// The peer's 20-byte EVM settlement address, `0x`-prefixed hex.
         counterparty_key: String,
-        /// Half of the EIP-712 domain this channel's claims are signed
-        /// under (ADR 0024).
         chain_id: u64,
-        /// The other half: the `TokenNetwork` that verifies a claim on
-        /// redemption, `0x`-prefixed hex.
         token_network: String,
+    },
+    /// An x402 EVM peering (ADR 0075 decisions 4 and 6): this node's
+    /// outbound `x402BatchSettlement` channel toward the peer, and the
+    /// peer's voucher signer.
+    #[serde(rename = "evm-voucher")]
+    EvmVoucher {
+        /// This node's outbound channel toward the peer, `0x` and 64
+        /// lowercase hex: the channel every forward to the peer is covered
+        /// on.
+        outbound_channel_id: String,
+        /// The peer's voucher signer as its self-description published it
+        /// (its EVM settlement address), `0x`-prefixed hex: a channel toward
+        /// this node whose `payerAuthorizer` it is, is the peer's.
+        voucher_signer: String,
+        /// The CAIP-2 network the two share, `eip155:<chainId>`.
+        network: String,
     },
     Solana {
         /// The channel PDA, base58.
@@ -109,22 +144,26 @@ pub enum RuntimePeerChannel {
 }
 
 impl RuntimePeerChannel {
-    /// How a claim on this channel names it on the wire -- an EVM
-    /// `channelId` or a Solana `channelAccount`. The one spelling every
-    /// cross-table check compares by, matching
-    /// `connector_config::PayChannelConfig::channel`.
+    /// The channel this binding names -- an EVM `channelId` (inbound and
+    /// outbound for a `TokenNetwork` one, outbound for an x402 one) or a
+    /// Solana `channelAccount`.
     #[must_use]
     pub fn channel(&self) -> &str {
         match self {
             RuntimePeerChannel::Evm { channel_id, .. } => channel_id,
+            RuntimePeerChannel::EvmVoucher {
+                outbound_channel_id,
+                ..
+            } => outbound_channel_id,
             RuntimePeerChannel::Solana {
                 channel_account, ..
             } => channel_account,
         }
     }
 
-    /// The counterparty's settlement address on this entry's chain, in
-    /// that chain's own spelling.
+    /// The counterparty's key on this entry's chain, in that chain's own
+    /// spelling: its settlement address or key, which on an x402 peering is
+    /// its voucher signer.
     #[must_use]
     pub fn counterparty_key(&self) -> &str {
         match self {
@@ -134,6 +173,7 @@ impl RuntimePeerChannel {
             | RuntimePeerChannel::Solana {
                 counterparty_key, ..
             } => counterparty_key,
+            RuntimePeerChannel::EvmVoucher { voucher_signer, .. } => voucher_signer,
         }
     }
 }
@@ -411,7 +451,7 @@ impl PeerRouteStore {
                 path: path.to_path_buf(),
                 source,
             })?;
-        let peers = snapshot
+        let peers: RuntimePeers = snapshot
             .peers
             .into_iter()
             .map(|peer| {
@@ -419,6 +459,31 @@ impl PeerRouteStore {
                 (peer.id, peer.peering)
             })
             .collect();
+        // ADR 0075 decision 8: a runtime EVM peering over a `TokenNetwork`
+        // channel is refused by name, never replayed and never dropped.
+        let mut toon: Vec<(&String, &str)> = peers
+            .iter()
+            .flat_map(|(id, peering)| {
+                peering
+                    .channels
+                    .iter()
+                    .filter_map(move |channel| match channel {
+                        RuntimePeerChannel::Evm { channel_id, .. } => {
+                            Some((id, channel_id.as_str()))
+                        }
+                        RuntimePeerChannel::EvmVoucher { .. }
+                        | RuntimePeerChannel::Solana { .. } => None,
+                    })
+            })
+            .collect();
+        toon.sort();
+        if let Some((peer_id, channel_id)) = toon.first() {
+            return Err(PeerRouteStoreError::TokenNetworkPeering {
+                path: path.to_path_buf(),
+                peer_id: (*peer_id).clone(),
+                channel_id: (*channel_id).to_string(),
+            });
+        }
         let routes = snapshot
             .routes
             .into_iter()
@@ -506,11 +571,10 @@ mod tests {
             endpoint: Some("https://peer.example/ilp".to_string()),
             edge_identity: Some("0x04ab".to_string()),
             client_edge_url: Some("https://peer.example/ilp".to_string()),
-            channels: vec![RuntimePeerChannel::Evm {
-                channel_id: format!("0x{}", "ab".repeat(32)),
-                counterparty_key: "0x00000000000000000000000000000000000000aa".to_string(),
-                chain_id: 31337,
-                token_network: "0x00000000000000000000000000000000000000bb".to_string(),
+            channels: vec![RuntimePeerChannel::EvmVoucher {
+                outbound_channel_id: format!("0x{}", "ab".repeat(32)),
+                voucher_signer: "0x00000000000000000000000000000000000000aa".to_string(),
+                network: "eip155:31337".to_string(),
             }],
         }
     }
@@ -734,6 +798,50 @@ mod tests {
 
         let (_store, read_peers, _) = PeerRouteStore::open(&path).expect("re-open");
         assert_eq!(read_peers["solana-hop"].channels, vec![solana]);
+    }
+
+    /// ADR 0075 decision 8, issue #1378: a runtime EVM peering written
+    /// before ADR 0075 names a `TokenNetwork` channel this build cannot
+    /// sign on, judge a claim on or land. Dropping the row would forget a
+    /// channel that may still hold value, so the table is refused by name,
+    /// with the drain procedure in the message.
+    #[test]
+    fn a_runtime_evm_peering_over_a_token_network_channel_is_refused_by_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("runtime_peers.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"peers":[{{"id":"apex-relay-2","fee":1,"max_packet_amount":0,
+                "channels":[{{"chain":"evm","channel_id":"0x{}","counterparty_key":"0x{}",
+                "chain_id":31337,"token_network":"0x{}"}}]}}],"routes":[]}}"#,
+                "ab".repeat(32),
+                "aa".repeat(20),
+                "bb".repeat(20)
+            ),
+        )
+        .expect("write a pre-ADR-0075 table");
+
+        let error = PeerRouteStore::open(&path).expect_err("a TOON EVM peering is refused");
+        let PeerRouteStoreError::TokenNetworkPeering {
+            peer_id,
+            channel_id,
+            ..
+        } = &error
+        else {
+            panic!("expected the named refusal, got {error:?}");
+        };
+        assert_eq!(peer_id, "apex-relay-2");
+        assert_eq!(channel_id, &format!("0x{}", "ab".repeat(32)));
+        let message = error.to_string();
+        for named in [
+            "TokenNetwork",
+            "ADR 0075",
+            "Draining",
+            "/peers/apex-relay-2",
+        ] {
+            assert!(message.contains(named), "{named} in: {message}");
+        }
     }
 
     #[test]

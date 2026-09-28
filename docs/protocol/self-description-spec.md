@@ -7,7 +7,7 @@ carrying a URL (#1083, [ADR 0054](../adr/0054-an-unsealed-termination-reject-ans
 and the route descriptions [ADR 0044](../adr/0044-a-probe-answers-what-a-route-costs-and-what-it-does.md)
 adds.
 
-**Coverage:** none of ND-01 – ND-16 is vectored. This **is** a wire surface, so unlike the
+**Coverage:** none of ND-01 – ND-17 is vectored. This **is** a wire surface, so unlike the
 configuration and operator documents these rules **do** enter
 [ADR 0045](../adr/0045-a-behavioural-rule-is-normative-prose-until-its-vector-lands.md)'s debt ledger,
 and the burn-down order is issue #1084's.
@@ -84,6 +84,7 @@ The document carries:
 | public HTTP and BTP endpoints, and which carriages are exposed                                                                                                                                                                                                                                                                                                                                                    | where to reach it, and how                                                            |
 | **edge identity** — the key a packet is sealed to                                                                                                                                                                                                                                                                                                                                                                 | without it a packet cannot be sealed, so it cannot be delivered                       |
 | per chain: chain id, settlement address, token network and its registry, token address, decimals                                                                                                                                                                                                                                                                                                                  | what a buyer needs to **open a channel**                                              |
+| per chain paid on over x402, as `voucherSigners` (ND-17): the key this node's vouchers are signed by                                                                                                                                                                                                                                                                                                              | what a peer **binds this node's channel toward it** by                                |
 | per chain opted in to x402 `batch-settlement` ([ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 8), as `batchSettlements`: `network`, `asset`, `payTo`, and `receiverAuthorizer`, the minimum `withdrawDelay` and the asset's EIP-712 `name`/`version` on EVM, or `feePayer`, the minimum `withdrawDelay`, `tokenProgram`, `minDeposit` and `sponsorEndpoint` on Solana | what a buyer needs to **open an x402 channel** this node admits, or have it sponsored |
 | route prices — the whole schedule, base and per-KiB slope ([ADR 0065](../adr/0065-a-price-is-a-schedule-over-payload-length.md)) — and their descriptions once [ADR 0044](../adr/0044-a-probe-answers-what-a-route-costs-and-what-it-does.md) is built                                                                                                                                                            | what a route costs **at any size**, and what it does                                  |
 | a route's declared **request** shape, where the operator wrote one ([ADR 0067](../adr/0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md))                                                                                                                                                                                                                                               | what to **send** to use the route, for a route whose app expects a specific payload   |
@@ -123,6 +124,18 @@ of one fact is how a mainnet node comes to announce itself as devnet.**
 > every surface that mentions it — this document, the greeting, `GET /ilp/routes/price` — is a
 > projection of that one declaration, read back through the lookup the connector enforces from.
 > There is no second value to disagree with.
+
+**ND-17** `[connector]` — A connector that pays on x402 `batch-settlement` channels MUST publish,
+per chain it pays on, its **voucher signer** as `voucherSigners`: `[{ "network": "<CAIP-2>",
+"signer": "<key>" }]` — its settlement address on EVM (`0x` + 40 lowercase hex), its settlement key
+on Solana (base58). It is the key every channel it opens names as its voucher signer (EVM
+`payerAuthorizer`, equal to `payer`; Solana `authorized_signer`), and what a peer binds this node's
+channel toward it by when `POST /peers` establishes the peering
+([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decisions 3, 4
+and 10, #1378). Derived from the backend the key was connected through, never declared (ND-07), and
+omitted — not an empty array — on a node that pays on no x402 channel. A peer reads the entry whose
+`network` is the one its own x402 terms name, and refuses by name to establish an EVM peering with a
+node that publishes none. `settlements` stays beside it until #1384 drops it.
 
 **ND-07a** `[connector]` — A route's `request` table is the one exception to ND-07's "derived, never
 declared" rule, and deliberately so: there is no backend this connector can ask what an arbitrary
@@ -232,6 +245,9 @@ Uses exactly the vocabulary of [`CONTEXT.md`](../../CONTEXT.md) and implements
 [ADR 0046](../adr/0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md),
 [ADR 0054](../adr/0054-an-unsealed-termination-reject-answers-where-to-ask.md) and
 [ADR 0072](../adr/0072-a-carriage-pin-is-published-on-the-route-that-enforces-it.md).
+
+**Built (#1378):** `voucherSigners` (ND-17), published for EVM and Solana wherever the chain's
+x402 backend is configured; EVM peering reads it (Solana's is #1379).
 
 **Built (#1080):** the endpoint. `GET /ilp` answers this document, free and unauthenticated,
 projected from live state on each request; the x402 greeting's `extra` node facts are read off the

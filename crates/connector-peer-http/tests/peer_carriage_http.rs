@@ -627,7 +627,7 @@ async fn a_claim_riding_a_prepare_is_judged_independently_of_the_packet() {
         reached_peer: reached,
         ..
     } = transport
-        .forward(PEER_ID, prepare("g.nowhere"), Some(claim))
+        .forward(PEER_ID, prepare("g.nowhere"), Some(claim.into()))
         .await;
 
     match response {
@@ -653,7 +653,7 @@ async fn the_request_a_dialed_peering_puts_on_the_wire_is_the_one_section_3_name
     let prepare = prepare("g.nowhere");
 
     let _ = transport
-        .forward(PEER_ID, prepare.clone(), Some(claim.clone()))
+        .forward(PEER_ID, prepare.clone(), Some(claim.clone().into()))
         .await;
 
     let sent = client.last();
@@ -1032,7 +1032,7 @@ async fn a_non_200_answer_is_no_ilp_answer_at_all() {
         .forward(
             PEER_ID,
             prepare("g.nowhere"),
-            Some(sign_claim(&payer_signer, 1, 500)),
+            Some(sign_claim(&payer_signer, 1, 500).into()),
         )
         .await;
 

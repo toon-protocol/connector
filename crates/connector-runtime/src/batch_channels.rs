@@ -220,7 +220,8 @@ fn chain_of(name: &str) -> SettlementChain {
     SettlementChain::from_str(name).expect("the settlement port names only evm and solana")
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// `bytes` as `0x` and lowercase hex.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(2 + 2 * bytes.len());
     out.push_str("0x");
     for byte in bytes {
@@ -553,8 +554,9 @@ impl OutboundChannels {
     /// voucher is never handed out, so the watermark a restart restores is
     /// still an honest one.
     ///
-    /// The seam `[[pay_channels]]` and client payouts sign through (issues
-    /// #1378, #1380); nothing in this build calls it on the packet path yet.
+    /// The seam the packet path signs through: a runtime EVM peering's
+    /// every forward since #1378 (`Connector::cover_forward`), and
+    /// `[[pay_channels]]` and client payouts once #1380 and #1381 land.
     pub async fn sign_voucher(
         &self,
         id: &str,
@@ -571,6 +573,85 @@ impl OutboundChannels {
             tracked.signed = tracked.signed.max(cumulative_amount);
         }
         Ok(voucher)
+    }
+
+    /// Sign the voucher claim-state challenge for an outbound channel,
+    /// valid until `expires` (ADR 0075 decisions 5 and 6): what this node
+    /// asks the receiver's `POST /ilp/claim-state` with, and what proves the
+    /// peer role on a packet that moves no value. Nothing is journaled: a
+    /// challenge moves no value and advances no watermark.
+    pub async fn sign_challenge(
+        &self,
+        id: &str,
+        expires: u64,
+    ) -> Result<Vec<u8>, BatchChannelError> {
+        let (channel, payer) = self.ready(id).await?;
+        Ok(payer.sign_claim_state_challenge(&channel, expires).await?)
+    }
+
+    /// A **live** outbound channel on `chain` toward `receiver` (its raw
+    /// address or key), if this node has one: "is there a live channel with
+    /// this peer?" as a lookup of this node's own channels rather than a
+    /// derivation (ADR 0075 decision 4). Live is read from the chain now: a
+    /// channel whose withdrawal or close has started backs nothing new, so a
+    /// peering re-established after one is given a fresh channel rather than
+    /// the one being wound down. Several are legal; the live one with the
+    /// highest signed watermark answers, so a repeat finds the channel the
+    /// peering has been paying on. A channel whose chain cannot be read now
+    /// is not live, and an error is never mistaken for an absence -- it
+    /// answers `Err`.
+    ///
+    /// Narrows [`Self::opened_toward`], the journal's own "channels toward
+    /// this party", to the ones the chain still shows open.
+    pub async fn live_toward(
+        &self,
+        receiver: &VoucherSigner,
+    ) -> Result<Option<String>, BatchChannelError> {
+        let mut candidates: Vec<(String, u128)> = self
+            .opened_toward(receiver)
+            .into_iter()
+            .map(|id| {
+                let signed = self.signed(&id).unwrap_or(0);
+                (id, signed)
+            })
+            .collect();
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
+        for (id, _) in candidates {
+            let (channel, payer) = self.ready(&id).await?;
+            if payer.outbound_state(&channel).await?.on_chain.status == BatchChannelStatus::Open {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Raise an outbound channel's signed watermark to `amount`, where the
+    /// receiver reports holding a voucher that high (ADR 0075 decision 6:
+    /// the receiver's `POST /ilp/claim-state` is the watermark authority on
+    /// restore). A node that lost its journal would otherwise sign a voucher
+    /// that fails to advance; one that did not already stands at least this
+    /// high, and nothing changes.
+    ///
+    /// Journaled as a signed voucher before it is believed, because it is
+    /// one: the receiver holds a voucher at `amount` only if this node's key
+    /// signed it.
+    pub async fn raise_watermark(&self, id: &str, amount: u128) -> Result<u128, BatchChannelError> {
+        let id = canonical_id(id);
+        let tracked = self.tracked(&id)?;
+        if amount <= tracked.signed {
+            return Ok(tracked.signed);
+        }
+        let payer = Arc::clone(self.payer(tracked.chain)?);
+        self.append(JournalEntry::OutboundVoucherSigned {
+            channel_id: journal_key(tracked.chain, tracked.record.channel()),
+            cumulative_amount: amount,
+        })?;
+        payer.restore_outbound(&tracked.record, amount).await?;
+        if let Some(tracked) = self.channels().get_mut(&id) {
+            tracked.signed = tracked.signed.max(amount);
+            tracked.restored = true;
+        }
+        Ok(amount)
     }
 
     /// The channel as its receiver is shown it -- on EVM with the config its

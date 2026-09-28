@@ -147,40 +147,53 @@ announced into existence ([ADR 0043](../adr/0043-purchasable-peering-is-removed.
 ([ADR 0058](../adr/0058-a-peering-is-established-from-a-url.md)):
 
 ```
-POST /peers { "id": "...", "url": "https://…/ilp", "fee": 100, "max_packet_amount": 5000 }
+POST /peers { "id": "...", "url": "https://…/ilp", "fee": 100, "max_packet_amount": 5000,
+             "deposit": 100000 }
 ```
 
 The node `GET`s that URL's self-description and takes from it the endpoint, the carriage that
 endpoint's scheme selects (`wss://` for BTP, `https://` for HTTP), the counterparty's edge identity,
-and its per-chain settlement address and chain facts. It then derives the payment channel from the
-two settlement addresses, opens it on chain if it is absent, and writes the peering down
-([ADR 0059](../adr/0059-a-channel-is-derived-from-its-participants.md)). Both operators do this,
-each with the other's URL, and they land on the same channel without exchanging an identifier.
+and its per-chain facts. **On EVM a peering is two one-way x402 channels**
+([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 4,
+#1378): the node opens and funds **only its own** outbound `x402BatchSettlement` channel toward the
+counterparty, on the terms its `batchSettlements` entry publishes, with `deposit` (in base units of
+the shared token), and binds the counterparty's channel toward it by the voucher signer its
+`voucherSigners` entry publishes. The counterparty does the same with this node's URL; neither
+operator exchanges a channel id, and every forward to the peer then carries a voucher on this node's
+channel. `deposit` is needed only when this node has no open channel toward the counterparty yet; a
+repeat finds that channel and spends nothing (top it up with `POST /channels/:id/fund`). **On Solana,
+until #1379**, the node still derives one `toon-channel` from the two settlement keys, opens it if
+absent, and holds it in both roles
+([ADR 0059](../adr/0059-a-channel-is-derived-from-its-participants.md)).
+
+**A runtime EVM peering written before #1378** names a `TokenNetwork` channel this build cannot
+sign on, and the node refuses to boot on it, by name, pointing at ADR 0075's drain procedure — never
+dropping the row.
 
 **There is nothing else to exchange out of band, and there is no shared secret.** Both halves an
-earlier bring-up had to hand over by hand are gone rather than merely documented. The **channel** is
-derived from the two settlement addresses, so it is not published by either node beforehand and no
-address is copied between operators — which is what makes an exchange that could not have worked
-before ADR 0059 work now. The **peer credential** that had to be byte-identical in both data dirs is
+earlier bring-up had to hand over by hand are gone rather than merely documented. No **channel** id
+is copied between operators: on EVM each node opens its own and binds the other's by a published key
+(ADR 0075), and on Solana the channel is still derived from the two settlement keys (ADR 0059). The **peer credential** that had to be byte-identical in both data dirs is
 **deleted, with nothing replacing it**: a peer's role is proved per frame by its `[[peer_channels]]`
 binding and its claim signature
 ([ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)).
 `[[peers]].credential` is a tombstone, so a configuration copied from an older runbook is refused by
 name at boot rather than quietly ignored.
 
-**What you supply, and why only these three.** `id` is your own **local label** — never derived from
-the peer's ILP address, which is self-asserted, and never from the URL host. `fee` and
-`max_packet_amount` are your policy about that counterparty, and are in the request precisely because
-no document can supply them.
+**What you supply, and why only these.** `id` is your own **local label** — never derived from the
+peer's ILP address, which is self-asserted, and never from the URL host. `fee`, `max_packet_amount`
+and `deposit` are your policy about that counterparty, and are in the request precisely because no
+document can supply them.
 
 **Whatever the URL serves is who the peering is with.** The identity in the document is not checked
 against anything you sent, and it is not pinned, verified or attested by anything. It is
 trust-on-first-use over TLS, and your vetting of the URL is the whole of the assurance. A party who
-controls that hostname's DNS, or a certificate for it, chooses the counterparty — and that choice
-determines the channel address, so it is a party you would fund.
+controls that hostname's DNS, or a certificate for it, chooses the counterparty — and so the receiver
+this node funds a channel toward.
 
 **This write can spend gas.** It is safe to retry: a repeat against a peering already established
-finds the same channel and succeeds. The answer says which branch it took —
+finds the same channel and succeeds — on EVM this node's own open channel toward the counterparty,
+and an open journaled but not yet confirmed is resumed rather than sent twice. The answer says which branch it took —
 `"channel": { "id": "0x…", "status": "found" | "created" }` — so an unintended second channel shows
 up in your own output rather than on a block explorer later.
 
@@ -200,7 +213,9 @@ Onboarding is those two calls, with `POST /channels` still available for an oper
 a channel on their own terms first; this write then _finds_ it.
 
 **`DELETE /peers/:id` is the kill switch.** It takes the carriage away with the durable row, so it is
-immediate and needs no restart. A peering still referenced by a runtime route is refused until the
+immediate and needs no restart. On EVM it also unbinds the peer's voucher signer and stops signing on
+this node's outbound channel, which stays open for the operator to withdraw from
+(`POST /channels/:id/withdraw`). A peering still referenced by a runtime route is refused until the
 route goes ([ADR 0034](../adr/0034-a-runtime-peer-route-table-never-shadows-the-config-file.md)).
 
 A peering written in the config file is the same object, differing only in where it is recorded and
@@ -298,9 +313,9 @@ assumed one). A node draining live TOON channels does so on the last release tha
 writes (ADR 0075, "Draining a node with live TOON channels"). **Two `toon-channel` branches remain.**
 A body carrying `counterparty_hex` with `"chain": "solana"` still opens a Solana `toon-channel`,
 because `local/keys.sh`'s `solana-channels` stage opens its channels through it until #1383 moves the
-local stack to x402. And `/fund` still funds a `toon-channel` on either chain, by `amount` or by
-`total`: on Solana for the same stage, and on EVM because a `POST /peers` peering, whose channel that
-write opens, is collateralised through it until #1378 moves the peering to x402.
+local stack to x402. And `/fund` still funds a Solana `toon-channel`, by `amount` or by `total`, for
+the same stage. Its EVM `toon-channel` branch is deleted (#1378) and refused by name: an EVM
+`POST /peers` peering now opens and funds its own x402 channel.
 
 ### 2.3 What an operator can see
 

@@ -128,38 +128,38 @@ every other infra-touching ticket in this repo's history records when it applies
    a peering — before it is trusted with a peer claim from the apex.
 
 7. **Channel open.** Open a payment channel from the apex's settlement identity to the relay's, via
-   the apex's operator surface (ADR 0008, issue #459). **Stale since #1376:** the `"chain":"evm"`
-   `toon-channel` open below is refused by name (ADR 0075); an EVM peering's channel is opened by
-   `POST /peers`, and an x402 channel by `POST /channels { terms, deposit }`
-   ([`operator-spec.md` §2.2](../protocol/operator-spec.md)).
+   the apex's operator surface (ADR 0008, issue #459). **On EVM this step is now `POST /peers`**
+   (ADR 0075, #1378): each box writes `POST /peers { id, url, fee, max_packet_amount, deposit }`
+   naming the other's URL, which opens and funds that box's own outbound x402 channel and binds the
+   other's by its published voucher signer — nothing below applies to the EVM leg, no channel id is
+   recorded, and no `[[peer_channels]]` row is written for it
+   ([`operator-spec.md` §1.5](../protocol/operator-spec.md)). The `"chain":"evm"` `toon-channel`
+   open and top-up below are refused by name. What follows is the **Solana** leg only, until #1379.
 
    ```sh
    curl -X POST https://proxy.devnet.toonprotocol.dev/channels \
      -H "Authorization: Bearer ${OPERATOR_TOKEN}" \
      -H 'Content-Type: application/json' \
-     -d '{"counterparty_hex":"<relay box settlement address/pubkey, hex>","settlement_timeout_seconds":<…>,"chain":"evm"}'
+     -d '{"counterparty_hex":"<relay box settlement pubkey, hex>","settlement_timeout_seconds":<…>,"chain":"solana"}'
    ```
 
-   (`"chain":"solana"` for the Solana leg — a node settling on more than one chain refuses an
-   omitted `chain` as ambiguous.)
+   (A node settling on more than one chain refuses an omitted `chain` as ambiguous.)
 
-   **Collateral, on both chains.** `POST /channels/:id/fund` is a **self-deposit** (issue #1118):
-   run it on the box that will _sign_ claims on this channel, and it puts that box's own collateral
-   behind them, raising `own_deposited` on `GET /channels`. It works identically on EVM and Solana.
-   Each participant funds their own side; neither box can fund the other's, and the endpoint no
-   longer tries — `packages/solana-program`'s `Deposit` credits strictly by signer, and
-   `TokenNetwork.setTotalDeposit`'s ability to credit an arbitrary participant from the caller's
-   balance is deliberately not exposed. So: the apex funds the apex's side, the relay funds the
-   relay's, and the direction debt actually flows decides which of the two matters (§6.4 — debt
-   flows the way packets do).
+   **Collateral.** `POST /channels/:id/fund` is a **self-deposit** (issue #1118): run it on the box
+   that will _sign_ claims on this channel, and it puts that box's own collateral behind them,
+   raising `own_deposited` on `GET /channels`. Each participant funds their own side; neither box
+   can fund the other's — `packages/solana-program`'s `Deposit` credits strictly by signer. So: the
+   apex funds the apex's side, the relay funds the relay's, and the direction debt actually flows
+   decides which of the two matters (§6.4 — debt flows the way packets do). On EVM the deposit is
+   `POST /peers`'s own `deposit`, and a top-up is `POST /channels/:id/fund` on the outbound x402
+   channel it opened.
 
    Before the Solana leg can be funded, the box's `[settlement.solana]` address needs the SPL token
    itself, not just SOL for fees: the deposit moves real tokens out of that identity's associated
    token account, which the node creates at boot but nothing fills.
 
    Record the resulting
-   `channel_id`/`channel_account`, the relay's `counterparty_key`, and (EVM) `chain_id` +
-   `token_network` — exactly the fields `btp-peer-transport-bringup.md`'s "A correct peering"
+   `channel_account` and the relay's `counterparty_key` — exactly the fields `btp-peer-transport-bringup.md`'s "A correct peering"
    example's `[[peer_channels]]` row needs, one row on each side.
 
 8. **Peering flip.** A repo PR (#820), deployed in the same window it merges:

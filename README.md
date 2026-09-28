@@ -525,6 +525,18 @@ curl -s https://their-node.example/ilp | jq
       "decimals": 6
     }
   ],
+  "batchSettlements": [
+    {
+      "network": "eip155:84532",
+      "asset": "0x0C996d7c934c79a6255254875607Fe69df25C0E1",
+      "payTo": "0x…",
+      "receiverAuthorizer": "0x…",
+      "withdrawDelay": 86400,
+      "name": "USDC",
+      "version": "2"
+    }
+  ],
+  "voucherSigners": [{ "network": "eip155:84532", "signer": "0x…" }],
   "routes": [{ "prefix": "g.their.node.app", "price": "1000" }],
   "supportedVersions": [1],
   "defaultVersion": 1
@@ -537,7 +549,8 @@ Four fields decide whether a peering is possible at all:
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | `peerCarriages`                | Empty means not dialable — they have not set `peer_expose`, and your write will answer `502`.                            |
 | `httpEndpoint` / `btpEndpoint` | Where you dial, and which carriage: `wss://` is BTP, `https://` is ILP-over-HTTP. BTP wins where both are published.     |
-| `settlements[]`                | You need a chain **in common**. No overlap is a `502`.                                                                   |
+| `batchSettlements[]`           | On EVM you need x402 terms on a network **in common** (Solana still reads `settlements[]`). No overlap is a `502`.       |
+| `voucherSigners[]`             | The key their vouchers are signed with. Without one for the shared network the EVM write is a `502`.                     |
 | `routes[].price`               | What their terminating route charges — the number your `--amount` has to cover. A decimal **string**, not a JSON number. |
 
 Addresses come back lowercased, so compare them case-insensitively against
@@ -546,12 +559,18 @@ anything you derived yourself. Fields a node has nothing to say about are
 table has no `ilpAddresses`, `httpEndpoint` or `routes` key at all — so parse
 this document for absent keys, not empty ones.
 
-Note what is _not_ there: no channel id, no peer list, no fee, no cap. The channel
-is **derived** from the two settlement addresses, so neither side publishes one
-and no identifier is ever exchanged
-([ADR 0059](docs/adr/0059-a-channel-is-derived-from-its-participants.md)). There is
-no shared secret either — a peer's role is proved per packet by its claim
-signature ([ADR 0060](docs/adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)).
+Note what is _not_ there: no channel id, no peer list, no fee, no cap. On EVM a
+peering is **two one-way x402 channels**, one opened by each side
+([ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)):
+you open and fund yours toward their `payTo`, they open theirs toward yours, and
+each node recognises the other's channel by the `voucherSigners` key the other
+publishes — so no identifier is ever exchanged. Both nodes need
+`[settlement.evm.batch_settlement]` configured. (On Solana a peering is still one
+channel **derived** from the two settlement keys,
+[ADR 0059](docs/adr/0059-a-channel-is-derived-from-its-participants.md), until
+#1379.) There is no shared secret either — a peer's role is proved per packet by
+its voucher or claim signature
+([ADR 0060](docs/adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)).
 
 ### The three writes
 
@@ -565,7 +584,7 @@ signer, and [Signing a write](#signing-a-write) is how it works.
 ```bash
 docs/operators/sign-write.sh -k operator-write.key -X POST -p /peers \
   -u https://your-node.example \
-  -b '{"id":"their-node","url":"https://their-node.example/ilp","fee":100,"max_packet_amount":5000}'
+  -b '{"id":"their-node","url":"https://their-node.example/ilp","fee":100,"max_packet_amount":5000,"deposit":100000}'
 ```
 
 The script prints the three headers it computed, then the node's answer:
@@ -581,10 +600,17 @@ The script prints the three headers it computed, then the node's answer:
 ```
 
 Your node fetches that URL, picks the carriage from their endpoint's scheme,
-finds the settlement chain you share, derives the channel from the two settlement
-addresses, and **opens it on chain if it is absent**. `"status"` says which branch
-it took — `"created"` or `"found"` — so an unintended second channel shows up in
-your own output rather than on a block explorer later.
+finds the settlement chain you share, and on EVM **opens and funds your own
+outbound x402 channel toward them** with `deposit` (base units of the shared
+token) — or finds the one you already have open, spending nothing. `"channel"`
+is that channel, and `"status"` says which branch it took — `"created"` or
+`"found"` — so an unintended second channel shows up in your own output rather
+than on a block explorer later. `deposit` is needed only for `"created"`. Every
+packet you forward to them from then on carries a voucher on this channel. They
+do the same with your URL, and their channel toward you is recognised by the
+key they publish; until they do, their packets reach you as a client's. (On
+Solana the write still derives one shared channel and opens it if absent,
+until #1379.)
 
 `id` is your own local label for the relation; nothing puts it on the wire. `fee`
 is what you keep for carrying one packet over this peering — flat, per packet,
@@ -599,19 +625,18 @@ Two nodes that settle on **more than one chain in common** must say which: add
 `"chain": "evm"` or `"chain": "solana"`. Without it the write is refused by name
 rather than resolved silently.
 
-**2. Put your own collateral behind your own claims.** Opening a channel does not
-fund it. `fund` is a self-deposit — the chain credits strictly by signer, so only
-you can back your side:
+**2. Keep your own collateral behind your own vouchers.** On EVM the opening
+deposit came with the write above; top your channel up when it runs low. `fund`
+takes an **increment**, so posting the same write twice deposits twice:
 
 ```bash
 docs/operators/sign-write.sh -k operator-write.key -X POST -p /channels/0x…/fund \
   -u https://your-node.example -b '{"amount":3000}'
 ```
 
-It answers the channel, with `own_deposited` raised by that amount. On EVM this
-is an absolute `setTotalDeposit` under the hood; the request itself takes an
-**increment** on both chains, so posting the same write twice deposits twice —
-3000 then 3000 leaves `own_deposited` at 6000, not 3000.
+It answers the channel, with its `collateral` raised by that amount. On Solana,
+until #1379, opening the derived channel does not fund it, and this same write is
+how you put your side behind it (`own_deposited`).
 
 That is also the cure when a channel runs out of headroom and starts refusing
 packets `T00`, with one caveat worth knowing before you conclude the fund

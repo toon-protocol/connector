@@ -68,7 +68,7 @@ use connector_settlement::batch::{
     OutboundChannelRecord, OutboundChannelState, ReceiverTerms, Voucher, VoucherSigner,
 };
 use connector_settlement::ChannelId;
-use connector_signer::evm_voucher_digest;
+use connector_signer::{evm_voucher_claim_state_challenge_digest, evm_voucher_digest};
 use ethers::abi::{encode, Token};
 use ethers::core::rand::random;
 use ethers::middleware::Middleware;
@@ -786,6 +786,22 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
         let config = self.require_outbound(channel)?.config;
         let (_, state) = self.observe_outbound(channel, &config).await?;
         Ok(state)
+    }
+
+    /// `ClaimStateChallenge(bytes32 channelId,uint256 expires)` under the
+    /// `x402BatchSettlement` domain, signed by the settlement key -- the
+    /// channel's `payerAuthorizer` (ADR 0075 decision 3). No chain read: the
+    /// channel is one this node opened, and its id is its record's.
+    async fn sign_claim_state_challenge(
+        &self,
+        channel: &ChannelId,
+        expires: u64,
+    ) -> Result<Vec<u8>, BatchSettlementError> {
+        self.require_outbound(channel)?;
+        let id = admitted_id(channel)?;
+        let digest = evm_voucher_claim_state_challenge_digest(&self.domain(), &id, expires);
+        let signature = self.sender.sign_digest(digest).map_err(backend_error)?;
+        Ok(signature.to_vec())
     }
 }
 

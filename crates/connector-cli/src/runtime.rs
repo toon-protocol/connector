@@ -1649,6 +1649,13 @@ pub struct Runtime {
     /// node whose settlement tables write no `batch_settlement` sub-table,
     /// which is every node before this record.
     pub batch_settlements: Vec<connector_client_edge::X402BatchSettlementTerms>,
+    /// The key this node signs its vouchers with on each chain it pays x402
+    /// on (ADR 0075 decisions 3 and 10), published so a peer can bind this
+    /// node's channel toward it: the EVM settlement address, which every
+    /// outbound EVM channel names as `payer` and `payerAuthorizer`, and the
+    /// Solana settlement key. Read off the backends this node connected,
+    /// alongside `batch_settlements`, never declared.
+    pub voucher_signers: Vec<connector_domain::VoucherSignerFact>,
     /// The rates this node deals at, or `None` for a node that declares no
     /// token to deal (ADR 0071 decision 6, issue #1294) -- which is every
     /// node that predates the record, and is why this is an `Option` rather
@@ -1876,6 +1883,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // the greeting's `batch-settlement` entry and its `toon-channel` entry
     // can never name two different deployments of "this chain".
     let mut batch_settlements: Vec<connector_client_edge::X402BatchSettlementTerms> = Vec::new();
+    let mut voucher_signers: Vec<connector_domain::VoucherSignerFact> = Vec::new();
     let mut batch_settlement_evm: Option<Arc<EvmBatchSettlementBackend>> = None;
     let mut batch_settlement_solana: Option<Arc<SolanaBatchSettlement>> = None;
     // Each table's one transport, built once and handed to every client of
@@ -1923,6 +1931,14 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 // recomputed, so the two entries can never disagree about
                 // which chain or which address this is (CF-26).
                 if let Some(batch) = evm.batch_settlement() {
+                    // ADR 0075 decisions 3 and 10: the settlement key signs
+                    // this node's vouchers (`payerAuthorizer == payer`), so
+                    // the settlement address is the voucher signer a peer
+                    // binds this node's channel toward it by.
+                    voucher_signers.push(connector_domain::VoucherSignerFact {
+                        network: format!("eip155:{}", backend.chain_id()),
+                        signer: evm_terms.settlement_address.clone(),
+                    });
                     batch_settlements.push(connector_client_edge::X402BatchSettlementTerms::Evm(
                         connector_client_edge::X402BatchSettlementEvmTerms {
                             network: format!("eip155:{}", backend.chain_id()),
@@ -2044,6 +2060,13 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 // adds x402's required `tokenProgram`, the program `connect`
                 // proved owns the mint, and where the sponsor is served.
                 if let Some(batch) = &batch_settlement_solana {
+                    // ADR 0075 decisions 3 and 10: the Solana settlement key
+                    // is `authorized_signer` on every channel this node
+                    // opens (#1379 binds by it).
+                    voucher_signers.push(connector_domain::VoucherSignerFact {
+                        network: backend.caip2_network(),
+                        signer: backend.own_pubkey().to_string(),
+                    });
                     batch_settlements.push(
                         connector_client_edge::X402BatchSettlementTerms::Solana(
                             connector_client_edge::X402BatchSettlementSolanaTerms {
@@ -2068,6 +2091,26 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 );
             }
         }
+    }
+    // ADR 0075 decisions 4 and 8: the x402 channels this node pays on,
+    // restored from their journal before the runtime peer table below is
+    // replayed, because a durable x402 peering is rehydrated onto them --
+    // one replayed first would have nothing to sign its forwards on.
+    let outbound_channels =
+        restore_outbound_channels(config, &batch_settlement_evm, &batch_settlement_solana).await?;
+    if let Some(outbound) = &outbound_channels {
+        let networks = batch_settlements
+            .iter()
+            .map(|terms| match terms {
+                connector_client_edge::X402BatchSettlementTerms::Evm(evm) => {
+                    (SettlementChain::Evm, evm.network.clone())
+                }
+                connector_client_edge::X402BatchSettlementTerms::Solana(solana) => {
+                    (SettlementChain::Solana, solana.network.clone())
+                }
+            })
+            .collect();
+        connector = connector.with_outbound_channels(Arc::clone(outbound), networks);
     }
     // The peer semantics's own claim watermarks, made durable by the same
     // `state_dir` the client edge's are (issue #605, and #556's
@@ -2176,8 +2219,6 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
             .await;
         }
     }
-    let outbound_channels =
-        restore_outbound_channels(config, &batch_settlement_evm, &batch_settlement_solana).await?;
     let connector = Arc::new(connector);
     Ok(Runtime {
         connector,
@@ -2187,6 +2228,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         solana_cluster,
         settlements,
         batch_settlements,
+        voucher_signers,
         rate_table,
         batch_settlement_evm,
         batch_settlement_solana,
@@ -2855,6 +2897,7 @@ fn node_facts(config: &Config, runtime: &Runtime) -> connector_domain::NodeFacts
             .collect(),
         settlements: runtime.settlements.clone(),
         batch_settlements: runtime.batch_settlements.clone(),
+        voucher_signers: runtime.voucher_signers.clone(),
     }
 }
 
@@ -5164,12 +5207,12 @@ key_file = "{key_file}"
                 &self,
                 peer_id: &str,
                 prepare: Prepare,
-                claim: Option<WireClaim>,
+                claim: Option<connector_runtime::Covering>,
             ) -> PeerForward {
                 self.forwards.lock().expect("forwards lock poisoned").push((
                     peer_id.to_string(),
                     prepare,
-                    claim,
+                    claim.and_then(connector_runtime::Covering::into_claim),
                 ));
                 PeerForward::answered(
                     PacketResponse::Fulfill(Fulfill {

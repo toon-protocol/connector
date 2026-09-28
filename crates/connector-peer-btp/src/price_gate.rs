@@ -69,7 +69,7 @@ use std::collections::BTreeMap;
 use connector_config::{ForwardedClaimEnforcement, PeerConfig};
 use connector_domain::x402::GreetingTerms;
 use connector_domain::{validate_price, Prepare, Price, Reject, RejectCode, Watermark};
-use connector_runtime::{ClaimAckOutcome, ClientRouteKind, Connector, WireClaim};
+use connector_runtime::{ClaimAckOutcome, ClientRouteKind, Connector};
 
 /// Each peering's [`ForwardedClaimEnforcement`], the rest reading as
 /// [`ForwardedClaimEnforcement::default`] -- including an id neither
@@ -153,16 +153,19 @@ pub struct PaymentRequired {
 ///   post-fee remainder of exactly that figure. The difference this
 ///   connector keeps is its fee, and no third number is involved.
 ///
-/// `claim` and `prior_watermark` are what this PREPARE rode in on:
-/// `prior_watermark` MUST be read *before* the claim was judged (and so
-/// possibly recorded), so coverage is the claim's own advance rather than
-/// the zero advance past the watermark it just became. Both rules measure
-/// that advance the same way, through [`validate_price`].
+/// `claimed` and `prior_watermark` are what this PREPARE rode in on: the
+/// cumulative amount its judged claim or voucher names, and the channel's
+/// watermark just before it. `prior_watermark` MUST be read *before* the
+/// evidence was judged (and so possibly recorded), so coverage is its own
+/// advance rather than the zero advance past the watermark it just became.
+/// Both rules measure that advance the same way, through [`validate_price`].
 ///
-/// It MUST also be read from the book that judges the claim --
-/// [`Connector::peer_channel_watermark`], which is
+/// It MUST also be read from the book that judges the evidence -- for a
+/// `toon-channel` claim [`Connector::peer_channel_watermark`], which is
 /// [`connector_runtime::ClaimBook`]'s own durable inbound watermark, keyed
-/// by channel. A watermark from any per-process record disagrees with the
+/// by channel; for a voucher the channel's one amount watermark the
+/// receiving half judged it against (ADR 0075, `peer-carriage-spec.md`
+/// §1.8). A watermark from any per-process record disagrees with the
 /// judgement across a restart, and the disagreement is money: the book
 /// replays its journal, the record starts empty, and the first priced peer
 /// PREPARE after a restart is measured against zero and so credited with
@@ -194,7 +197,7 @@ pub fn payment_required(
     peer_id: &str,
     prepare: &Prepare,
     ack: ClaimAckOutcome,
-    claim: Option<&WireClaim>,
+    claimed: Option<u64>,
     prior_watermark: Option<Watermark>,
     enforcement: ForwardedClaimEnforcement,
 ) -> Option<PaymentRequired> {
@@ -236,9 +239,8 @@ pub fn payment_required(
     }
 
     let covers = ack == ClaimAckOutcome::Accepted
-        && claim.is_some_and(|claim| {
-            validate_price(prior_watermark, claim.cumulative_amount, required).is_ok()
-        });
+        && claimed
+            .is_some_and(|claimed| validate_price(prior_watermark, claimed, required).is_ok());
     if covers {
         return None;
     }
@@ -246,9 +248,8 @@ pub fn payment_required(
     // A claim the book did not accept advances nothing, whatever it
     // declares -- reporting its declared amount would read as "nearly paid"
     // for a forged or replayed claim that bought nothing at all.
-    let advanced = match claim {
-        Some(claim) if ack == ClaimAckOutcome::Accepted => claim
-            .cumulative_amount
+    let advanced = match claimed {
+        Some(claimed) if ack == ClaimAckOutcome::Accepted => claimed
             .saturating_sub(prior_watermark.map_or(0, |watermark| watermark.cumulative_amount)),
         _ => 0,
     };

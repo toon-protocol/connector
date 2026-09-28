@@ -92,6 +92,27 @@ pub struct NodeFacts {
     /// `batch-settlement` `accepts[]` entries and the self-description's
     /// `batchSettlements` are both projections of this one list (ND-11).
     pub batch_settlements: Vec<X402BatchSettlementTerms>,
+    /// The key this node signs its own vouchers with, per chain it pays on
+    /// (ADR 0075 decisions 3 and 10): its settlement address on EVM (the
+    /// `payerAuthorizer` its outbound channels name, equal to their `payer`),
+    /// its settlement key on Solana (their `authorized_signer`). A peer binds
+    /// this node's inbound channel to the peering by this value (decision
+    /// 4). Empty on a node that pays on no x402 channel.
+    pub voucher_signers: Vec<VoucherSignerFact>,
+}
+
+/// One chain's voucher signer, as the self-description publishes it (ADR
+/// 0075 decision 10): the CAIP-2 network it signs on, and the key, in that
+/// chain's own spelling -- `0x` and 40 lowercase hex on EVM, base58 on
+/// Solana.
+///
+/// Proved, not declared (ND-07): it is the address of the settlement key
+/// this node's paying half signs with, read off the backend that key was
+/// connected through.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VoucherSignerFact {
+    pub network: String,
+    pub signer: String,
 }
 
 impl NodeFacts {
@@ -246,6 +267,16 @@ pub struct NodeSelfDescription {
         default
     )]
     pub batch_settlements: Vec<X402BatchSettlementTerms>,
+    /// [`NodeFacts::voucher_signers`] (ADR 0075 decision 10): the key this
+    /// node's vouchers are signed by on each chain it pays on, which a peer
+    /// binds this node's channel toward it by. Absent, not an empty array,
+    /// on a node that pays on no x402 channel.
+    #[serde(
+        rename = "voucherSigners",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    pub voucher_signers: Vec<VoucherSignerFact>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub routes: Vec<RoutePrice>,
     /// The one client transport the routes covering this node's own
@@ -284,6 +315,7 @@ impl NodeSelfDescription {
             edge_identity,
             settlements: facts.settlements.clone(),
             batch_settlements: facts.batch_settlements.clone(),
+            voucher_signers: facts.voucher_signers.clone(),
             routes,
             required_transport,
             supported_versions: CLIENT_EDGE_SUPPORTED_VERSIONS.to_vec(),
@@ -373,6 +405,7 @@ mod tests {
             peer_carriages: vec!["btp".to_string()],
             settlements: vec![X402ChainSettlementTerms::Evm(evm())],
             batch_settlements: Vec::new(),
+            voucher_signers: Vec::new(),
         }
     }
 

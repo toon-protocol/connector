@@ -1,27 +1,29 @@
-//! Issue #1217: a peering established by `POST /peers` (ADR 0058) can
-//! accept a claim but could never pay one -- nothing populated the outbound
-//! CLIENT hop `Connector::cover_forward` reads, so every packet originated
-//! over the peering was refused `T00` naming a `[[pay_channels]]` row that
-//! ADR 0058 says an operator no longer needs to write.
+//! Issue #1217, on vouchers (ADR 0075 decision 6, issue #1378): a peering
+//! established by `POST /peers` can pay the forward it accepted -- every
+//! forwarded PREPARE covered by a voucher on this node's own outbound x402
+//! channel, from the first packet and from the first packet after a
+//! restart.
 //!
-//! This is a sibling of `connector-cli/tests/peering_from_a_url.rs`, not a
-//! replacement for it: that file proves the CHANNEL half against a real
-//! `anvil` chain (derivation, idempotence, trust-on-first-use). This proves
-//! the PAYMENT half -- the thing #1217 found missing -- at the level
-//! `pay_channel_claim_state_round_trip.rs` (this file's actual sibling)
-//! already works at: two real `connector-runtime::Connector`s, a real
-//! `POST /ilp/claim-state` over a real socket, and `InProcessPeerTransport`
-//! standing in for the wire so this is about the WIRING inside
-//! `connector-runtime`, not about a chain (ADR 0007 tier 1/2) or about which
-//! peer carriage `establish_peering` would have dialled.
+//! A sibling of `connector-cli/tests/peering_from_a_url.rs`, not a
+//! replacement: that file drives two config-built nodes over both
+//! carriages. This one proves the **paying half's wiring inside
+//! `connector-runtime`** -- `establish_peering` registering a payable hop,
+//! `POST /routes/peers`'s guard accepting a route to it, `cover_forward`
+//! signing and journaling a voucher on every forward, and a restart
+//! rehydrating a payable hop rather than a name -- at the level this file
+//! always worked at:
 //!
-//! The settlement backend is a small fixed-id fake rather than
-//! `InMemorySettlementBackend`: that one's auto-incrementing decimal ids are
-//! accepted by `ClaimBook` but refused by `ClientChannelRegistry`, which
-//! `POST /ilp/claim-state`'s challenge resolution needs and which requires
-//! canonical `0x`-hex -- the shape every real `SettlementBackend` already
-//! returns.
+//! * the payer is a real `Connector` whose outbound channel is opened and
+//!   signed on by x402's real `x402BatchSettlement` on a disposable `anvil`,
+//!   so the vouchers it signs are genuine and the payee verifies them;
+//! * the payee is a real client edge answering a real `POST /ilp` and a real
+//!   `POST /ilp/claim-state` over a real socket, its claim gate over a fake
+//!   of the batch-settlement **seam** that admits a channel paying it -- the
+//!   kind of fake `voucher_claims.rs` runs the real gate over (ADR 0007: it
+//!   holds which channels exist, and asserts no call);
+//! * the wire between them is the real ILP-over-HTTP peer carriage.
 
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Arc;
 
@@ -30,106 +32,114 @@ use chrono::{Duration as ChronoDuration, Utc};
 use url::Url;
 
 use connector_client_edge::{
-    router_with_gate, ClientChannelRegistry, ClientClaimGate, DepositFloor, EvmChannel,
+    router_with_gate, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
+    BatchSettlementChannels, ChannelResolutionError, ClientChannelRegistry, ClientClaimGate,
 };
 use connector_config::StaticRoute;
-use connector_domain::x402::{X402ChainSettlementTerms, X402SettlementTerms};
+use connector_domain::x402::{X402BatchSettlementEvmTerms, X402BatchSettlementTerms};
 use connector_domain::{
     EnvelopeRequest, EnvelopeResponse, NodeFacts, NodeSelfDescription, PacketResponse, Prepare,
-    Price,
+    Price, VoucherSignerFact,
 };
+use connector_peer_http::{HttpPeerTransport, PeerRelation, ReqwestPeerClient};
 use connector_runtime::{
-    AppOutcome, ChannelBranch, ChannelDomain, Connector, FakeAppClient, InMemoryJournal,
-    InProcessPeerTransport, OutboundClientLedger, PeerRouteStore, PeerRouteTableError,
+    AppOutcome, ChannelBranch, Connector, FakeAppClient, FileJournal, InMemoryJournal,
+    InProcessPeerTransport, Journal, OutboundChannels, PeerRouteStore, PeerRouteTableError,
     PeerTransport, RuntimePeerChannel, RuntimePeering, SelfDescriptionError, SelfDescriptionSource,
     SettlementChain, SystemClock,
 };
-use connector_settlement::{
-    ChannelId, ChannelState, ChannelStatus, Claim, SettlementBackend, SettlementError,
+use connector_settlement::batch::BatchSettlementPayer;
+use connector_settlement_evm::test_support::x402::X402Chain;
+use connector_settlement_evm::test_support::{
+    require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
+use connector_settlement_evm::EvmSettlementBackend;
 use connector_signer::giftwrap::{open_response, seal_request};
-use connector_signer::{derive_evm_address, to_hex, Address, LocalSigner, PublicKeyBytes, Signer};
+use connector_signer::{
+    BatchChannelConfig, BatchSettlementDomain, LocalSigner, PublicKeyBytes, Signer,
+};
+use ethers::signers::{LocalWallet, Signer as _};
+use ethers::types::Address;
 
-const CHAIN_ID: u64 = 31_337;
-const TOKEN_NETWORK: [u8; 20] = [0x42; 20];
+/// This binary's own base port for [`Anvil::spawn`], clear of every other
+/// anvil binary's range.
+const ANVIL_BASE_PORT: u16 = 23_300;
 const ROUTE_PRICE: u64 = 1_000;
+const DEPOSIT: u128 = 10_000;
 const PEER_ID: &str = "payee";
 const PREFIX: &str = "g.example.payee.app";
 
-fn channel_hex() -> String {
-    format!("0x{}", "ab".repeat(32))
+fn key_bytes(key: &str) -> [u8; 32] {
+    let key = key.trim_start_matches("0x");
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&key[2 * i..2 * i + 2], 16).expect("hex");
+    }
+    out
 }
 
-/// A [`SettlementBackend`] that always answers the same channel id, however
-/// it is asked. `establish_peering` only ever needs `open`/`live_channel_with`
-/// on this write; the rest of the port belongs to the channel-lifecycle
-/// surface, which this test never touches -- reached, they would be a bug in
-/// this test, not a case to make behave plausibly.
-struct FixedChannelBackend {
-    channel_id: ChannelId,
+fn address_of(key: &str) -> Address {
+    LocalWallet::from_bytes(&key_bytes(key))
+        .expect("key")
+        .address()
+}
+
+fn spelled(address: Address) -> String {
+    format!("{address:#x}")
+}
+
+/// The payee's batch-settlement seam: it admits any channel a presented
+/// config names **this payee** as receiver of, backed by [`DEPOSIT`]. The
+/// gate above it re-hashes the config to the voucher's channel id and
+/// verifies the voucher against the config's `payerAuthorizer`, so what it
+/// accepts is exactly what a real backend's admission would let through.
+#[derive(Debug)]
+struct PaysThisNode {
+    domain: BatchSettlementDomain,
+    receiver: [u8; 20],
+    admitted: std::sync::Mutex<HashMap<[u8; 32], BatchChannelConfig>>,
 }
 
 #[async_trait]
-impl SettlementBackend for FixedChannelBackend {
-    async fn open(
+impl BatchSettlementChannels for PaysThisNode {
+    fn evm_domain(&self) -> Option<BatchSettlementDomain> {
+        Some(self.domain)
+    }
+
+    fn accepts_solana(&self) -> bool {
+        false
+    }
+
+    async fn evm(
         &self,
-        _counterparty: Vec<u8>,
-        _settlement_timeout: ChronoDuration,
-    ) -> Result<ChannelId, SettlementError> {
-        Ok(self.channel_id.clone())
+        channel_id: &[u8; 32],
+        presented_config: Option<&BatchChannelConfig>,
+    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
+        let mut admitted = self.admitted.lock().expect("lock");
+        let config = match presented_config {
+            Some(config) if config.receiver == self.receiver => *config,
+            Some(_) => return Ok(None),
+            None => match admitted.get(channel_id) {
+                Some(config) => *config,
+                None => return Ok(None),
+            },
+        };
+        admitted.insert(*channel_id, config);
+        Ok(Some(AdmittedEvmVoucherChannel {
+            config,
+            max_cumulative: u64::try_from(DEPOSIT).expect("small"),
+        }))
     }
 
-    async fn fund(
+    async fn solana(
         &self,
-        _channel: &ChannelId,
-        _amount: u128,
-    ) -> Result<ChannelState, SettlementError> {
-        unreachable!("this test never funds a channel")
-    }
-
-    async fn redeem(
-        &self,
-        _channel: &ChannelId,
-        _claim: Claim,
-    ) -> Result<ChannelState, SettlementError> {
-        unreachable!("this test never redeems a claim")
-    }
-
-    async fn close(&self, _channel: &ChannelId) -> Result<ChannelState, SettlementError> {
-        unreachable!("this test never closes a channel")
-    }
-
-    async fn settle(&self, _channel: &ChannelId) -> Result<ChannelState, SettlementError> {
-        unreachable!("this test never settles a channel")
-    }
-
-    async fn channel_state(&self, channel: &ChannelId) -> Result<ChannelState, SettlementError> {
-        // `Connector::open_channel` reads this back immediately after
-        // `open` to build its `ChannelView` answer -- never reached for any
-        // other reason in this test.
-        Ok(ChannelState {
-            id: channel.clone(),
-            counterparty: Vec::new(),
-            status: ChannelStatus::Open,
-            counterparty_deposited: 0,
-            own_deposited: 0,
-            redeemed: 0,
-        })
-    }
-
-    async fn live_channel_with(
-        &self,
-        _counterparty: Vec<u8>,
-    ) -> Result<Option<ChannelId>, SettlementError> {
-        // Always "no channel yet" -- so `establish_peering` always takes the
-        // `Created` branch through `open` above, deterministically.
+        _channel_account: &[u8; 32],
+    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
         Ok(None)
     }
 }
 
-/// `establish_peering` fetches this instead of dialling a real host -- the
-/// same seam `connector-runtime`'s own
-/// `a_write_that_cannot_land_is_refused_before_the_fetch` exercises.
+/// `establish_peering` fetches this instead of dialling a host.
 struct FixedSelfDescription(NodeSelfDescription);
 
 #[async_trait]
@@ -139,7 +149,7 @@ impl SelfDescriptionSource for FixedSelfDescription {
     }
 }
 
-fn sealed_prepare_data(body: &[u8], receiver_public: &PublicKeyBytes) -> (Vec<u8>, [u8; 32]) {
+fn sealed_prepare(body: &[u8], receiver: &PublicKeyBytes) -> (Prepare, [u8; 32]) {
     let plaintext = EnvelopeRequest {
         method: "POST".to_string(),
         target: "/".to_string(),
@@ -147,33 +157,23 @@ fn sealed_prepare_data(body: &[u8], receiver_public: &PublicKeyBytes) -> (Vec<u8
         body: body.to_vec(),
     }
     .encode();
-    seal_request(&plaintext, receiver_public).expect("seal")
+    let (data, shared_secret) = seal_request(&plaintext, receiver).expect("seal");
+    (
+        Prepare {
+            amount: ROUTE_PRICE,
+            expires_at: Utc::now() + ChronoDuration::minutes(5),
+            greeting: false,
+            destination: PREFIX.to_string(),
+            data,
+        },
+        shared_secret,
+    )
 }
 
-fn sample_prepare(
-    destination: &str,
-    amount: u64,
-    data: Vec<u8>,
-    _shared_secret: &[u8; 32],
-) -> Prepare {
-    Prepare {
-        amount,
-        expires_at: Utc::now() + ChronoDuration::minutes(5),
-        greeting: false,
-        destination: destination.to_string(),
-        data,
-    }
-}
-
-/// The payee: a real `Connector` bound in the PEER role to `channel_hex()`
-/// (so it accepts `payer_address`'s claims on it) and terminating one priced
-/// app route with a canned answer, plus a real `POST /ilp/claim-state`
-/// server over a real socket -- `pay_channel_claim_state_round_trip.rs`'s
-/// own `spawn_payee` shape, with an app route added so a covered forward
-/// can actually be delivered and fulfilled rather than merely claim-verified.
-async fn spawn_payee(
-    payer_address: Address,
-) -> (std::net::SocketAddr, PublicKeyBytes, Arc<Connector>) {
+/// The payee: a real `Connector` terminating one priced app route, behind
+/// a real client edge on a real socket, its claim gate over
+/// [`PaysThisNode`].
+fn spawn_payee(domain: BatchSettlementDomain) -> (std::net::SocketAddr, PublicKeyBytes) {
     let app_route = StaticRoute::new_priced(PREFIX, "http://app.example/", ROUTE_PRICE)
         .expect("a valid priced route");
     let app_client = Arc::new(FakeAppClient::new());
@@ -187,13 +187,8 @@ async fn spawn_payee(
             },
         },
     );
-
-    let identity_signer = LocalSigner::generate("payee-edge-identity");
-    let identity_public_key = identity_signer
-        .public_key()
-        .expect("a secp256k1 signer produces a public key");
-    let identity_signer: Arc<dyn Signer> = Arc::new(identity_signer);
-
+    let identity = LocalSigner::generate("payee-edge-identity");
+    let identity_public_key = identity.public_key().expect("a public key");
     let connector = Arc::new(
         Connector::new(
             vec![app_route],
@@ -202,116 +197,164 @@ async fn spawn_payee(
             Arc::new(InProcessPeerTransport::new()),
             Arc::new(SystemClock),
         )
-        .with_identity_signer(identity_signer)
-        .with_channel_verification_key(channel_hex(), payer_address)
-        .with_channel_domain(
-            channel_hex(),
-            ChannelDomain {
-                chain_id: CHAIN_ID,
-                token_network_address: TOKEN_NETWORK,
-            },
-        )
-        .expect("a well-formed channel id"),
+        .with_identity_signer(Arc::new(identity)),
     );
-
-    let mut registry = ClientChannelRegistry::new();
-    registry
-        .record_evm(
-            &channel_hex(),
-            EvmChannel {
-                counterparty: payer_address,
-                chain_id: CHAIN_ID,
-                token_network_address: TOKEN_NETWORK,
-                deposit_floor: DepositFloor::Unknown,
-            },
-        )
-        .expect("a 32-byte channel id");
-    let gate = ClientClaimGate::restore(registry, Arc::new(InMemoryJournal::new()))
-        .expect("a fresh in-memory journal has nothing to replay");
-
-    let router_signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("payee-router-identity"));
-    let app = router_with_gate(Arc::clone(&connector), router_signer, None, gate);
+    let seam = Arc::new(PaysThisNode {
+        domain,
+        receiver: address_of(COUNTERPARTY_PRIVATE_KEY).to_fixed_bytes(),
+        admitted: std::sync::Mutex::new(HashMap::new()),
+    });
+    let gate = ClientClaimGate::restore(
+        ClientChannelRegistry::new(),
+        Arc::new(InMemoryJournal::new()),
+    )
+    .expect("a fresh journal")
+    .with_batch_settlement(seam as Arc<dyn BatchSettlementChannels>);
+    let router_signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("payee-router"));
+    let app = router_with_gate(connector, router_signer, None, gate);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind payee socket");
     let addr = listener.local_addr().expect("payee addr");
-    let server = axum::Server::from_tcp(listener)
-        .expect("axum server from tcp listener")
-        .serve(app.into_make_service());
-    tokio::spawn(server);
-
-    (addr, identity_public_key, connector)
+    tokio::spawn(
+        axum::Server::from_tcp(listener)
+            .expect("serve")
+            .serve(app.into_make_service()),
+    );
+    (addr, identity_public_key)
 }
 
-/// The full claim: `establish_peering` derives and registers a payable
-/// hop, `POST /routes/peers`'s guard accepts a route to it, a packet
-/// originated over that peering actually fulfils (twice, so the payee's
-/// watermark genuinely advances rather than replaying ADR 0004's retired
-/// postpay claim), and a restart's rehydrated row still pays.
-#[tokio::test]
-async fn a_runtime_established_peering_can_pay_the_forward_it_accepted() {
-    let payer_settlement_signer = LocalSigner::generate("payer-settlement");
-    let payer_address = derive_evm_address(
-        &payer_settlement_signer
-            .public_key()
-            .expect("a secp256k1 signer"),
-    );
-    let payer_settlement_signer: Arc<dyn Signer> = Arc::new(payer_settlement_signer);
-
-    let (payee_addr, payee_identity, payee) = spawn_payee(payer_address).await;
-
-    let fixed_channel_id = ChannelId(channel_hex());
-    let backend = FixedChannelBackend {
-        channel_id: fixed_channel_id.clone(),
-    };
-
-    // Whoever the payee's self-description says it is -- a placeholder
-    // settlement address, since `FixedChannelBackend` ignores it, and the
-    // real point under test is what happens once a channel exists, not how
-    // its counterparty bytes were chosen.
-    let document = NodeSelfDescription::describe(
+/// The payee's self-description: its x402 terms and its voucher signer.
+fn payee_document(
+    addr: std::net::SocketAddr,
+    chain_id: u64,
+    token: Address,
+) -> NodeSelfDescription {
+    let payee = spelled(address_of(COUNTERPARTY_PRIVATE_KEY));
+    let network = format!("eip155:{chain_id}");
+    NodeSelfDescription::describe(
         &NodeFacts {
             ilp_addresses: vec!["g.example.payee".to_string()],
-            http_endpoint: Some(format!("http://{payee_addr}/ilp")),
+            http_endpoint: Some(format!("http://{addr}/ilp")),
             btp_endpoint: None,
             peer_carriages: vec!["http".to_string()],
-            settlements: vec![X402ChainSettlementTerms::Evm(X402SettlementTerms {
-                chain: format!("evm:{CHAIN_ID}"),
-                settlement_address: to_hex(&[0x22u8; 20]),
-                token_network_registry: to_hex(&[0x99u8; 20]),
-                token_network: to_hex(&TOKEN_NETWORK),
-                token_address: to_hex(&[0x77u8; 20]),
-                decimals: 6,
+            settlements: Vec::new(),
+            batch_settlements: vec![X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
+                network: network.clone(),
+                asset: spelled(token),
+                pay_to: payee.clone(),
+                receiver_authorizer: payee.clone(),
+                min_withdraw_delay_secs: 86_400,
+                name: "USDC".to_string(),
+                version: "2".to_string(),
             })],
-            batch_settlements: Vec::new(),
+            voucher_signers: vec![VoucherSignerFact {
+                network,
+                signer: payee,
+            }],
         },
         None,
         Vec::new(),
         None,
-    );
+    )
+}
 
-    let mut transport = InProcessPeerTransport::new();
-    transport.add_peer(PEER_ID, Arc::clone(&payee));
-    let transport: Arc<dyn PeerTransport> = Arc::new(transport);
+/// The payer's carriage: ILP-over-HTTP to the payee, as a peering's
+/// registrar would dial it.
+fn transport_to(payee: std::net::SocketAddr) -> Arc<dyn PeerTransport> {
+    let transport = HttpPeerTransport::new(
+        Arc::new(ReqwestPeerClient::new(reqwest::Client::new())),
+        [0u8; 20],
+        Arc::new(SystemClock),
+    );
+    transport.add_peer(PeerRelation::new(
+        PEER_ID,
+        Url::parse(&format!("http://{payee}/ilp")).expect("url"),
+        HashMap::new(),
+        HashMap::new(),
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(10),
+    ));
+    Arc::new(transport)
+}
+
+/// The payer's x402 channels, over the real paying half on `anvil` and a
+/// journal file in `state_dir`: what a booting node restores.
+async fn outbound_channels(
+    rpc_url: &str,
+    registry: Address,
+    token: Address,
+    state_dir: &std::path::Path,
+) -> Arc<OutboundChannels> {
+    let payer = EvmSettlementBackend::connect(
+        &connector_settlement_evm::RpcTransport::direct(rpc_url).expect("rpc transport"),
+        DEPLOYER_PRIVATE_KEY,
+        registry,
+        token,
+        6,
+    )
+    .await
+    .expect("connect the payer's settlement key")
+    .batch_settlement(86_400)
+    .await
+    .expect("the payer's x402 half");
+    let journal: Arc<dyn Journal> = Arc::new(
+        FileJournal::open(state_dir.join("outbound-channels.log")).expect("open the journal"),
+    );
+    Arc::new(
+        OutboundChannels::restore(
+            journal,
+            vec![(
+                SettlementChain::Evm,
+                Arc::new(payer) as Arc<dyn BatchSettlementPayer>,
+            )],
+        )
+        .await
+        .expect("the journal replays"),
+    )
+}
+
+/// The full claim: `establish_peering` opens this node's own channel and
+/// registers a payable hop on it, `POST /routes/peers`'s guard accepts a
+/// route to it, a packet originated over the peering fulfils -- twice, each
+/// voucher advanced by exactly the forward -- and a restart's rehydrated
+/// row still pays, above the watermark it restored.
+#[tokio::test]
+async fn a_runtime_established_peering_can_pay_the_forward_it_accepted() {
+    if !require_anvil() {
+        return;
+    }
+    let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+    let mut x402 = X402Chain::place(&anvil.rpc_url).await;
+    let token = x402.deploy_fiat_token().await;
+    let registry = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
+        .await
+        .expect("a TokenNetwork registry to connect the settlement key through")
+        .registry_address();
+    x402.mint(token, address_of(DEPLOYER_PRIVATE_KEY), 1_000_000)
+        .await;
+
+    let (payee_addr, payee_identity) = spawn_payee(x402.domain());
+    let document = payee_document(payee_addr, x402.chain_id(), token);
+    let network = format!("eip155:{}", x402.chain_id());
 
     let state_dir = tempfile::tempdir().expect("temp state dir");
     let store_path = state_dir.path().join("runtime_peers.json");
-    let (store, peers, routes) = PeerRouteStore::open(&store_path).expect("open a fresh store");
-
-    let payer = Connector::new(
-        vec![],
-        vec![],
-        Arc::new(FakeAppClient::new()),
-        Arc::clone(&transport),
-        Arc::new(SystemClock),
-    )
-    .with_settlement(SettlementChain::Evm, Arc::new(backend))
-    .with_signer(Arc::clone(&payer_settlement_signer))
-    .with_outbound_client_ledger(Arc::new(OutboundClientLedger::in_memory()))
-    .with_self_description_source(Arc::new(FixedSelfDescription(document)))
-    // The payee's endpoint is a loopback `http://` socket, same as any
-    // `local/` topology's own opt-in for a TLS terminator this test does
-    // not have.
-    .with_peer_allow_plaintext_endpoints(true)
-    .with_runtime_peer_route_store(store, peers, routes);
+    let boot = |outbound: Arc<OutboundChannels>| {
+        let (store, peers, routes) = PeerRouteStore::open(&store_path).expect("open the store");
+        Connector::new(
+            vec![],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            transport_to(payee_addr),
+            Arc::new(SystemClock),
+        )
+        .with_outbound_channels(outbound, vec![(SettlementChain::Evm, network.clone())])
+        .with_self_description_source(Arc::new(FixedSelfDescription(document.clone())))
+        // The payee's endpoint is a loopback `http://` socket.
+        .with_peer_allow_plaintext_endpoints(true)
+        .with_runtime_peer_route_store(store, peers, routes)
+    };
+    let outbound = outbound_channels(&anvil.rpc_url, registry, token, state_dir.path()).await;
+    let payer = boot(Arc::clone(&outbound));
 
     // ── The write ADR 0058 promises: accept AND pay ─────────────────────
     let established = payer
@@ -321,111 +364,58 @@ async fn a_runtime_established_peering_can_pay_the_forward_it_accepted() {
             0,
             0,
             Some(SettlementChain::Evm),
+            Some(DEPOSIT),
         )
         .await
         .expect("establishing a peering against a reachable, payable document must succeed");
     assert_eq!(established.channel.status, ChannelBranch::Created);
-    assert_eq!(established.channel.id, fixed_channel_id.0);
-
-    // Issue #1217's guard fix: a peering `establish_peering` just wired a
-    // CLIENT-role hop for is payable, so `POST /routes/peers` to it must
-    // not be refused `PeerHasNoPayChannel` -- the guard that, before this
-    // fix, tested the PEER-role bindings (always non-empty here) and so
-    // never caught a peering that could accept a claim but sign none.
+    let channel = established.channel.id.clone();
     payer
         .upsert_runtime_peer_route(PREFIX, PEER_ID, Price::FREE)
-        .expect("a payable peering must be routable");
+        .expect("a peering paid over its own outbound channel is routable");
 
-    // ── First crossing: the peering can actually pay ────────────────────
-    let (data, shared_secret) = sealed_prepare_data(b"first crossing", &payee_identity);
-    let prepare = sample_prepare(PREFIX, ROUTE_PRICE, data, &shared_secret);
+    // ── Two crossings, each covered by a voucher ────────────────────────
+    for (crossing, body) in [(1u64, b"first".as_slice()), (2, b"second".as_slice())] {
+        let (prepare, shared_secret) = sealed_prepare(body, &payee_identity);
+        let response = payer.handle_prepare(prepare).await;
+        let PacketResponse::Fulfill(fulfill) = response else {
+            panic!("crossing {crossing} must fulfil: {response:?}");
+        };
+        let opened = open_response(&shared_secret, &fulfill.data).expect("open");
+        assert_eq!(
+            EnvelopeResponse::decode(&opened).expect("envelope").body,
+            b"delivered"
+        );
+        assert_eq!(
+            outbound.signed(&channel),
+            Some(u128::from(crossing * ROUTE_PRICE)),
+            "each crossing signs a voucher advanced by exactly what it forwards"
+        );
+    }
+
+    // ── A restart rehydrates a payable hop, not a name ──────────────────
+    drop(payer);
+    drop(outbound);
+    let outbound = outbound_channels(&anvil.rpc_url, registry, token, state_dir.path()).await;
+    let payer = boot(Arc::clone(&outbound));
+    let (prepare, shared_secret) = sealed_prepare(b"after a restart", &payee_identity);
     let response = payer.handle_prepare(prepare).await;
     let PacketResponse::Fulfill(fulfill) = response else {
-        panic!(
-            "expected a fulfil -- issue #1217's bug answers a T00 naming a missing \
-             '[[pay_channels]]' row here instead: {response:?}"
-        );
+        panic!("a restart must not turn a payable peering accept-only: {response:?}");
     };
-    let opened = open_response(&shared_secret, &fulfill.data).expect("open the sealed response");
-    let envelope = EnvelopeResponse::decode(&opened).expect("decode envelope response");
-    assert_eq!(envelope.status, 200);
-    assert_eq!(envelope.body, b"delivered");
-
+    assert!(open_response(&shared_secret, &fulfill.data).is_ok());
     assert_eq!(
-        payee
-            .peer_channel_watermark(&fixed_channel_id.0)
-            .map(|w| (w.nonce, w.cumulative_amount)),
-        Some((1, ROUTE_PRICE)),
-        "the payee's own peer book must show the payer's claim, advanced by the forward"
-    );
-
-    // ── Second crossing: genuinely covered, not stuck replaying ─────────
-    // ADR 0004's retired postpay claim signed the SAME cumulative amount at
-    // a fresh nonce every time -- a nonce that advances while the amount
-    // does not, which `pay_channel_claim_state_round_trip.rs` measured as
-    // the exact shape of that defect.
-    let (data2, shared_secret2) = sealed_prepare_data(b"second crossing", &payee_identity);
-    let prepare2 = sample_prepare(PREFIX, ROUTE_PRICE, data2, &shared_secret2);
-    let response2 = payer.handle_prepare(prepare2).await;
-    assert!(
-        matches!(response2, PacketResponse::Fulfill(_)),
-        "expected a second fulfil: {response2:?}"
-    );
-    assert_eq!(
-        payee
-            .peer_channel_watermark(&fixed_channel_id.0)
-            .map(|w| (w.nonce, w.cumulative_amount)),
-        Some((2, 2 * ROUTE_PRICE)),
-        "each crossing must advance the payee's watermark by what it forwards"
-    );
-
-    // ── A restart rehydrates a payable hop, not a name ───────────────────
-    let (store2, peers2, routes2) = PeerRouteStore::open(&store_path).expect("reopen the store");
-    assert!(
-        peers2.contains_key(PEER_ID),
-        "the peering itself must have survived the restart"
-    );
-    let payer_after_restart = Connector::new(
-        vec![],
-        vec![],
-        Arc::new(FakeAppClient::new()),
-        Arc::clone(&transport),
-        Arc::new(SystemClock),
-    )
-    .with_signer(payer_settlement_signer)
-    .with_outbound_client_ledger(Arc::new(OutboundClientLedger::in_memory()))
-    .with_runtime_peer_route_store(store2, peers2, routes2);
-
-    let (data3, shared_secret3) = sealed_prepare_data(b"after a restart", &payee_identity);
-    let prepare3 = sample_prepare(PREFIX, ROUTE_PRICE, data3, &shared_secret3);
-    let response3 = payer_after_restart.handle_prepare(prepare3).await;
-    let PacketResponse::Fulfill(fulfill3) = response3 else {
-        panic!(
-            "expected a fulfil after rehydration -- a restart must not turn a payable peering \
-             back into an accept-only one: {response3:?}"
-        );
-    };
-    let opened3 = open_response(&shared_secret3, &fulfill3.data).expect("open sealed response");
-    let envelope3 = EnvelopeResponse::decode(&opened3).expect("decode envelope response");
-    assert_eq!(envelope3.status, 200);
-    assert_eq!(
-        payee
-            .peer_channel_watermark(&fixed_channel_id.0)
-            .map(|w| (w.nonce, w.cumulative_amount)),
-        Some((3, 3 * ROUTE_PRICE)),
-        "the same channel's watermark keeps advancing after the payer's restart"
+        outbound.signed(&channel),
+        Some(u128::from(3 * ROUTE_PRICE)),
+        "the restored watermark is where the next voucher is signed from"
     );
 }
 
-/// The exact shape issue #1217 found, reproduced directly: a runtime
-/// peering with a PEER-role channel binding (`RuntimePeering::channels`,
-/// non-empty for every peering `establish_peering` ever writes) but no
-/// CLIENT-role outbound hop ever registered for it -- the old guard
-/// (`peering.channels.is_empty()`) never caught this, and this is the
-/// unit test proving the fixed one (testing `outbound_client_hops`
-/// instead) does.
+/// The exact shape issue #1217 found, on the x402 row: a runtime peering
+/// written with a binding but no hop ever registered for it cannot take a
+/// route -- the guard checks the paying hop, never the row.
 #[tokio::test]
-async fn a_peering_with_a_peer_role_channel_but_no_client_role_hop_cannot_pay_a_route_to_it() {
+async fn a_peering_with_a_binding_but_no_paying_hop_cannot_pay_a_route_to_it() {
     let connector = Connector::new(
         vec![],
         vec![],
@@ -433,27 +423,25 @@ async fn a_peering_with_a_peer_role_channel_but_no_client_role_hop_cannot_pay_a_
         Arc::new(InProcessPeerTransport::new()),
         Arc::new(SystemClock),
     );
-
     let peering = RuntimePeering {
         fee: 0,
         max_packet_amount: 0,
         endpoint: Some("https://peer.example/ilp".to_string()),
         edge_identity: None,
         client_edge_url: Some("https://peer.example/ilp".to_string()),
-        channels: vec![RuntimePeerChannel::Evm {
-            channel_id: channel_hex(),
-            counterparty_key: to_hex(&[0xaa; 20]),
-            chain_id: CHAIN_ID,
-            token_network: to_hex(&TOKEN_NETWORK),
+        channels: vec![RuntimePeerChannel::EvmVoucher {
+            outbound_channel_id: format!("0x{}", "ab".repeat(32)),
+            voucher_signer: format!("0x{}", "aa".repeat(20)),
+            network: "eip155:31337".to_string(),
         }],
     };
     connector
         .upsert_runtime_peer("half-bound", peering)
-        .expect("a peering with a peer-role channel binding is accepted at write time");
+        .expect("a peering with a binding is accepted at write time");
 
     let error = connector
         .upsert_runtime_peer_route("g.example.half", "half-bound", Price::FREE)
-        .expect_err("no outbound client hop was ever registered for this peering");
+        .expect_err("no paying hop was ever registered for this peering");
     assert!(
         matches!(error, PeerRouteTableError::PeerHasNoPayChannel { .. }),
         "expected the pay-channel guard to fire, got {error:?}"

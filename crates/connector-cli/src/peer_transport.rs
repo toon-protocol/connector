@@ -52,12 +52,11 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use connector_config::{Config, PeerCarriage, DEFAULT_PEER_TIMEOUT_MS};
 use connector_domain::Prepare;
-use connector_peer_btp::claim_json::canonical_evm_channel_id;
-use connector_peer_btp::{BtpPeerTransport, PeerClaimDomain, TungsteniteDialer};
+use connector_peer_btp::{BtpPeerTransport, TungsteniteDialer};
 use connector_peer_http::{HttpPeerTransport, ReqwestPeerClient};
 use connector_runtime::{
-    ClaimAckOutcome, Clock, InProcessPeerTransport, PeerForward, PeerRegistrar, PeerTransport,
-    RuntimePeerChannel, RuntimePeering, WireClaim,
+    ClaimAckOutcome, Clock, Covering, InProcessPeerTransport, PeerForward, PeerRegistrar,
+    PeerTransport, RuntimePeerChannel, RuntimePeering, WireClaim,
 };
 
 /// One [`PeerTransport`] over both carriages, dispatching by peer id --
@@ -212,7 +211,9 @@ impl PeerRegistrar for ConfiguredPeerTransport {
             self.deregister(peer_id);
             return;
         };
-        let (domains, programs) = claim_bindings(peer_id, peering);
+        // A runtime peering's `toon-channel` claims are Solana ones only
+        // since #1378, so it binds no EIP-712 domain.
+        let (domains, programs) = (HashMap::new(), solana_programs(peering));
         let answer_timeout = Duration::from_millis(DEFAULT_PEER_TIMEOUT_MS);
         match carriage {
             PeerCarriage::Btp => self.btp.add_peer(connector_peer_btp::PeerRelation::new(
@@ -249,73 +250,27 @@ impl PeerRegistrar for ConfiguredPeerTransport {
     }
 }
 
-/// The EIP-712 domains a runtime peering's EVM channels sign under, and the
-/// programs its Solana channels bind to (ADR 0053) -- the same two maps
-/// `PeerRelation::from_config` builds out of `[[peer_channels]]`, built
-/// instead out of the durable row.
+/// The programs a runtime peering's Solana channels bind to (ADR 0053) --
+/// the map `PeerRelation::from_config` builds out of `[[peer_channels]]`,
+/// built instead out of the durable row, until #1379.
 ///
-/// A binding whose `token_network` is not a readable address is skipped
-/// rather than defaulted: a claim signed under a zero `verifyingContract`
-/// verifies nowhere, and producing no claim at all is what a channel with
-/// no domain has always done.
-fn claim_bindings(
-    peer_id: &str,
-    peering: &RuntimePeering,
-) -> (HashMap<String, PeerClaimDomain>, HashMap<String, String>) {
-    let mut domains = HashMap::new();
-    let mut programs = HashMap::new();
-    for binding in &peering.channels {
-        match binding {
-            RuntimePeerChannel::Evm {
-                channel_id,
-                chain_id,
-                token_network,
-                ..
-            } => {
-                let Some(token_network) = parse_evm_address(token_network) else {
-                    // Same silence, same cost (issue #1240): a channel with
-                    // no domain produces no claim, and nothing said so.
-                    tracing::warn!(
-                        peer_id,
-                        channel_id = %channel_id,
-                        token_network = %token_network,
-                        "peer channel binds no claim domain: its token_network is not \
-                         a readable address -- claims on this channel ride without one"
-                    );
-                    continue;
-                };
-                domains.insert(
-                    canonical_evm_channel_id(channel_id),
-                    PeerClaimDomain {
-                        chain_id: *chain_id,
-                        token_network,
-                    },
-                );
-            }
+/// There is no EVM counterpart: a runtime EVM peering pays with vouchers on
+/// its own x402 channel since #1378, which reach the carriage already
+/// rendered and need no EIP-712 domain from it, and a row naming a
+/// `TokenNetwork` channel is refused at boot.
+fn solana_programs(peering: &RuntimePeering) -> HashMap<String, String> {
+    peering
+        .channels
+        .iter()
+        .filter_map(|binding| match binding {
             RuntimePeerChannel::Solana {
                 channel_account,
                 program_id,
                 ..
-            } => {
-                programs.insert(channel_account.clone(), program_id.clone());
-            }
-        }
-    }
-    (domains, programs)
-}
-
-/// A 20-byte EVM address from its hex spelling, or `None` -- never a padded
-/// or truncated one.
-fn parse_evm_address(value: &str) -> Option<[u8; 20]> {
-    let hex = value.strip_prefix("0x").unwrap_or(value);
-    if hex.len() != 40 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut address = [0u8; 20];
-    for (i, byte) in address.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(address)
+            } => Some((channel_account.clone(), program_id.clone())),
+            RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::EvmVoucher { .. } => None,
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -324,11 +279,11 @@ impl PeerTransport for ConfiguredPeerTransport {
         &self,
         peer_id: &str,
         prepare: Prepare,
-        claim: Option<WireClaim>,
+        covering: Option<Covering>,
     ) -> PeerForward {
         match self.transport_for(peer_id) {
-            Some(transport) => transport.forward(peer_id, prepare, claim).await,
-            None => self.unreachable.forward(peer_id, prepare, claim).await,
+            Some(transport) => transport.forward(peer_id, prepare, covering).await,
+            None => self.unreachable.forward(peer_id, prepare, covering).await,
         }
     }
 
@@ -534,11 +489,10 @@ token_network = "0x00000000000000000000000000000000000000bb"
             endpoint: Some(endpoint.to_string()),
             edge_identity: Some("0x04ab".to_string()),
             client_edge_url: Some(endpoint.to_string()),
-            channels: vec![RuntimePeerChannel::Evm {
-                channel_id: format!("0x{}", "ab".repeat(32)),
-                counterparty_key: "0x00000000000000000000000000000000000000aa".to_string(),
-                chain_id: 31337,
-                token_network: "0x00000000000000000000000000000000000000bb".to_string(),
+            channels: vec![RuntimePeerChannel::EvmVoucher {
+                outbound_channel_id: format!("0x{}", "ab".repeat(32)),
+                voucher_signer: "0x00000000000000000000000000000000000000aa".to_string(),
+                network: "eip155:31337".to_string(),
             }],
         }
     }

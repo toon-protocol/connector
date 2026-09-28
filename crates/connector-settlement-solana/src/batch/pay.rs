@@ -782,4 +782,20 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
             signed: record.signed,
         })
     }
+
+    /// Ed25519 over `"toon-voucher-claim-state-challenge-v1" ‖
+    /// channelAccount ‖ expires`, signed by the settlement key -- the
+    /// channel's `authorized_signer` (ADR 0075 decision 3).
+    async fn sign_claim_state_challenge(
+        &self,
+        channel: &ChannelId,
+        expires: u64,
+    ) -> Result<Vec<u8>, BatchSettlementError> {
+        let (address, _) = self.outbound_record(channel)?;
+        let message = connector_signer::solana_voucher_claim_state_challenge_message(
+            &address.to_bytes(),
+            expires,
+        );
+        Ok(self.sponsor.sign_message(&message).as_ref().to_vec())
+    }
 }

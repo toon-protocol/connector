@@ -47,6 +47,56 @@ pub struct WireClaim {
     pub signature: ClaimSignature,
 }
 
+/// What covers a PREPARE this node sends a peer (ADR 0042: a packet
+/// carries its claim), as the [`crate::PeerTransport`] port hands it to a
+/// carriage.
+///
+/// Two schemes ride the peer carriages until #1380 retires the first: a
+/// `toon-channel` [`WireClaim`], which the carriage renders itself, and an
+/// x402 **voucher** (ADR 0075 decision 6), which arrives rendered -- the
+/// client edge's own voucher JSON (`client-edge-spec.md` §1.3), exactly the
+/// bytes the receiving half parses. A packet that moves no value on an x402
+/// peering carries no voucher (ADR 0075 decision 5) and, where it needs the
+/// peer role, the voucher claim-state **challenge** instead: a separate
+/// slot on both carriages (`peer-carriage-spec.md` §1.4), because a
+/// challenge is not a claim and moves nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Covering {
+    /// A `toon-channel` claim: the claim slot, rendered by the carriage.
+    Claim(WireClaim),
+    /// An x402 `batch-settlement` voucher's JSON: the claim slot, verbatim.
+    Voucher(String),
+    /// A voucher claim-state challenge's JSON: the peer-role challenge
+    /// slot, verbatim.
+    Challenge(String),
+}
+
+impl Covering {
+    /// The `toon-channel` claim this covering is, if it is one.
+    #[must_use]
+    pub fn claim(&self) -> Option<&WireClaim> {
+        match self {
+            Covering::Claim(claim) => Some(claim),
+            Covering::Voucher(_) | Covering::Challenge(_) => None,
+        }
+    }
+
+    /// The `toon-channel` claim this covering is, by value.
+    #[must_use]
+    pub fn into_claim(self) -> Option<WireClaim> {
+        match self {
+            Covering::Claim(claim) => Some(claim),
+            Covering::Voucher(_) | Covering::Challenge(_) => None,
+        }
+    }
+}
+
+impl From<WireClaim> for Covering {
+    fn from(claim: WireClaim) -> Covering {
+        Covering::Claim(claim)
+    }
+}
+
 const EVM_SIGNATURE_LEN: usize = 65; // r(32) + s(32) + recovery_id(1)
 const SOLANA_SIGNATURE_LEN: usize = 64; // ed25519 R(32) + S(32)
 

@@ -10,6 +10,7 @@ mod journal;
 mod metrics;
 mod operator_view;
 mod outbound_client;
+mod outbound_voucher;
 mod peer_route_store;
 mod peer_transport;
 mod peering;
@@ -38,8 +39,8 @@ pub use batch_channels::{
     ChannelDirection, OutboundChannels, WithdrawStep,
 };
 pub use claim::{
-    ChannelDomain, ClaimAckOutcome, ClaimBook, ClaimRejectReason, ClaimSignature, InvalidChannelId,
-    InvalidSolanaChannel, SolanaChannel, WireClaim,
+    ChannelDomain, ClaimAckOutcome, ClaimBook, ClaimRejectReason, ClaimSignature, Covering,
+    InvalidChannelId, InvalidSolanaChannel, SolanaChannel, WireClaim,
 };
 pub use clock::{Clock, SystemClock, TestClock};
 pub use connector::{
@@ -66,6 +67,12 @@ pub use outbound_client::{
     ClaimStateChallengeSigner, ClaimStateDomain, ClaimStateSource, ClaimWatermark, EvmDomain,
     HttpClaimState, OutboundClaim, OutboundClaimBinding, OutboundClientError, OutboundClientLedger,
     OwnedHttpClaimState, SolanaDomain,
+};
+// What this node puts on a peer carriage when it pays over one of its own
+// x402 channels (ADR 0075 decisions 5 and 6), and how it asks the receiver
+// where that channel's watermark stands.
+pub use outbound_voucher::{
+    challenge_entry, voucher_json, HttpVoucherState, VoucherStateSource, PEER_CHALLENGE_TTL_SECS,
 };
 pub use peer_route_store::{
     PeerRouteStore, PeerRouteStoreError, RuntimePeerChannel, RuntimePeering, RuntimePeers,

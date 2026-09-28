@@ -630,6 +630,49 @@ key_file = "{key_file}"
     );
 }
 
+/// ADR 0075 decision 8, issue #1378: a durable runtime EVM peering over a
+/// `TokenNetwork` channel -- what `POST /peers` wrote before ADR 0075 -- is
+/// refused at boot **by name**, with the drain procedure in the message.
+/// Dropping the row would forget a channel that may still hold unlanded
+/// claims; serving it would mean signing on a channel this build cannot.
+#[test]
+fn exits_non_zero_naming_the_drain_on_a_runtime_peering_over_a_token_network_channel() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    std::fs::write(
+        state_dir.path().join("runtime-peers.json"),
+        format!(
+            r#"{{"peers":[{{"id":"apex-relay-2","fee":0,"max_packet_amount":0,
+            "endpoint":"https://relay.example/ilp",
+            "channels":[{{"chain":"evm","channel_id":"0x{}","counterparty_key":"0x{}",
+            "chain_id":84532,"token_network":"0x{}"}}]}}],"routes":[]}}"#,
+            "ab".repeat(32),
+            "aa".repeat(20),
+            "bb".repeat(20)
+        ),
+    )
+    .expect("write a pre-ADR-0075 runtime peer table");
+    let config_file = write_config(&format!(
+        r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+"#,
+        key_file = key_file.path().display(),
+        state_dir = state_dir.path().display(),
+    ));
+
+    let output = run(Some(config_file.path()));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in ["apex-relay-2", "TokenNetwork", "ADR 0075", "Draining"] {
+        assert!(stderr.contains(named), "expected {named} in: {stderr}");
+    }
+}
+
 /// A journal this build cannot decode stops the node. Refusing to start is
 /// the whole point: the only other option is starting from no watermarks,
 /// which is exactly the defect.

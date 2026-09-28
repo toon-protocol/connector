@@ -604,7 +604,7 @@ async fn a_claim_riding_a_prepare_is_judged_independently_of_the_packet() {
         reached_peer: reached,
         ..
     } = transport
-        .forward(PEER_ID, prepare("g.nowhere"), Some(claim))
+        .forward(PEER_ID, prepare("g.nowhere"), Some(claim.into()))
         .await;
 
     match response {
@@ -631,7 +631,7 @@ async fn the_frames_a_dialed_peering_puts_on_the_wire_are_the_ones_section_3_nam
         .forward(
             PEER_ID,
             prepare("g.nowhere"),
-            Some(sign_claim(&payer_signer, 1, 500)),
+            Some(sign_claim(&payer_signer, 1, 500).into()),
         )
         .await;
 
@@ -1005,7 +1005,7 @@ async fn a_packet_after_the_far_side_restarts_is_redialled_rather_than_refused()
         .forward(
             PEER_ID,
             prepare("g.nowhere"),
-            Some(sign_claim(&payer_signer, 1, 500)),
+            Some(sign_claim(&payer_signer, 1, 500).into()),
         )
         .await;
     assert!(first.reached_peer, "the peering was carrying before this");
@@ -1023,7 +1023,7 @@ async fn a_packet_after_the_far_side_restarts_is_redialled_rather_than_refused()
         .forward(
             PEER_ID,
             prepare("g.nowhere"),
-            Some(sign_claim(&payer_signer, 2, 900)),
+            Some(sign_claim(&payer_signer, 2, 900).into()),
         )
         .await;
 
@@ -1492,7 +1492,7 @@ async fn a_claim_that_does_not_cover_the_routes_price_is_refused_the_same_way() 
         payment_required,
         ..
     } = transport
-        .forward(PEER_ID, prepare("g.example.app"), Some(claim))
+        .forward(PEER_ID, prepare("g.example.app"), Some(claim.into()))
         .await;
 
     assert_eq!(ack, ClaimAckOutcome::Accepted);
@@ -1569,7 +1569,7 @@ async fn a_covering_claim_is_admitted_exactly_as_today() {
         payment_required,
         ..
     } = transport
-        .forward(PEER_ID, sealed_prepare, Some(claim))
+        .forward(PEER_ID, sealed_prepare, Some(claim.into()))
         .await;
 
     assert_eq!(ack, ClaimAckOutcome::Accepted);
@@ -1631,7 +1631,7 @@ async fn a_forged_claim_declaring_a_large_amount_does_not_buy_coverage() {
         payment_required,
         ..
     } = transport
-        .forward(PEER_ID, prepare("g.example.app"), Some(claim))
+        .forward(PEER_ID, prepare("g.example.app"), Some(claim.into()))
         .await;
 
     assert_eq!(
@@ -1706,7 +1706,11 @@ async fn a_claim_replayed_at_a_used_nonce_never_buys_coverage() {
             payment_required,
             ..
         } = transport
-            .forward(PEER_ID, prepare("g.example.app"), Some(replayed.clone()))
+            .forward(
+                PEER_ID,
+                prepare("g.example.app"),
+                Some(replayed.clone().into()),
+            )
             .await;
 
         assert_eq!(
@@ -1823,7 +1827,9 @@ async fn a_restart_does_not_credit_a_claim_with_the_amount_it_already_paid() {
         ack,
         payment_required,
         ..
-    } = transport.forward(PEER_ID, prepare, Some(claim)).await;
+    } = transport
+        .forward(PEER_ID, prepare, Some(claim.into()))
+        .await;
 
     assert_eq!(
         ack,
@@ -1873,7 +1879,9 @@ async fn a_restart_still_admits_a_claim_that_genuinely_advances_by_the_price() {
         ack,
         payment_required,
         ..
-    } = transport.forward(PEER_ID, prepare, Some(claim)).await;
+    } = transport
+        .forward(PEER_ID, prepare, Some(claim.into()))
+        .await;
 
     assert_eq!(ack, ClaimAckOutcome::Accepted);
     assert!(
@@ -1930,7 +1938,7 @@ async fn a_forwarded_arrival_that_undercovers_is_admitted_by_default() {
         response,
         payment_required,
         ..
-    } = transport.forward(PEER_ID, sealed, Some(short)).await;
+    } = transport.forward(PEER_ID, sealed, Some(short.into())).await;
 
     assert!(
         payment_required.is_none(),
@@ -1973,7 +1981,7 @@ async fn a_forwarded_arrival_that_undercovers_is_refused_once_this_peering_enfor
         response,
         payment_required,
         ..
-    } = transport.forward(PEER_ID, sealed, Some(short)).await;
+    } = transport.forward(PEER_ID, sealed, Some(short.into())).await;
 
     match response {
         PacketResponse::Reject(reject) => assert_eq!(reject.code.as_str(), "F06"),
@@ -2018,7 +2026,7 @@ async fn a_claim_covering_the_arriving_amount_is_admitted_under_either_setting()
             ack,
             payment_required,
             ..
-        } = transport.forward(PEER_ID, sealed, Some(claim)).await;
+        } = transport.forward(PEER_ID, sealed, Some(claim.into())).await;
 
         assert_eq!(ack, ClaimAckOutcome::Accepted);
         assert!(
@@ -2067,7 +2075,7 @@ async fn a_claim_advancing_less_than_the_arriving_amount_never_covers_it() {
             ack,
             payment_required,
             ..
-        } = transport.forward(PEER_ID, sealed, Some(claim)).await;
+        } = transport.forward(PEER_ID, sealed, Some(claim.into())).await;
 
         // The claim is perfectly valid and is still acknowledged: the two
         // verdicts stay independent (§6.2).
@@ -2143,7 +2151,7 @@ async fn no_peering_setting_admits_an_uncovered_arrival_at_a_priced_termination(
             response,
             payment_required,
             ..
-        } = transport.forward(PEER_ID, sealed, Some(short)).await;
+        } = transport.forward(PEER_ID, sealed, Some(short.into())).await;
 
         assert!(
             matches!(&response, PacketResponse::Reject(reject) if reject.code.as_str() == "F06"),
@@ -2311,7 +2319,7 @@ async fn the_btp_carriage_upholds_the_peer_transport_contract() {
         .forward(
             PEER_ID,
             prepare("g.nowhere-on-the-peer"),
-            Some(sign_claim(&payer_signer, 1, 500)),
+            Some(sign_claim(&payer_signer, 1, 500).into()),
         )
         .await;
     match response {

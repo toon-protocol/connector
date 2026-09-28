@@ -42,11 +42,14 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use connector_btp::{BtpFrame, BtpSessionHandle, OriginateError, ProtocolData, BTP_ERROR};
+use connector_btp::{
+    BtpFrame, BtpSessionHandle, OriginateError, ProtocolData, BTP_ERROR, CONTENT_TYPE_TEXT,
+    PEER_CHALLENGE_PROTOCOL,
+};
 use connector_config::{PeerCarriage, PeerChannelConfig, PeerConfig};
 use connector_domain::x402::{GreetingError, X402PaymentRequired};
 use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
-use connector_runtime::{ClaimAckOutcome, Clock, PeerForward, PeerTransport, WireClaim};
+use connector_runtime::{ClaimAckOutcome, Clock, Covering, PeerForward, PeerTransport, WireClaim};
 use url::Url;
 
 use crate::claim_json::{self, PeerClaimDomain};
@@ -598,17 +601,39 @@ impl PeerTransport for BtpPeerTransport {
         &self,
         peer_id: &str,
         prepare: Prepare,
-        claim: Option<WireClaim>,
+        covering: Option<Covering>,
     ) -> PeerForward {
         let Some(state) = self.relation(peer_id) else {
             return PeerForward::unreachable(peer_id);
         };
         let state = state.as_ref();
 
+        // A `toon-channel` claim is rendered here, and cached for §6.3's
+        // byte-identical retransmission. A voucher arrives rendered, and
+        // rides the same slot verbatim: a voucher's freshness is its amount,
+        // so a resend is recognised by its signature rather than its bytes
+        // (ADR 0074 decision 3). A challenge rides a slot of its own
+        // (§1.4), because it is not a claim.
         let mut entries = Vec::new();
-        if let Some(claim) = claim.as_ref() {
-            entries.push(self.claim_entry(state, claim));
-        }
+        let (claim, voucher) = match covering {
+            Some(Covering::Claim(claim)) => {
+                entries.push(self.claim_entry(state, &claim));
+                (Some(claim), false)
+            }
+            Some(Covering::Voucher(json)) => {
+                entries.push(claim_json::protocol_data(&json));
+                (None, true)
+            }
+            Some(Covering::Challenge(json)) => {
+                entries.push(ProtocolData {
+                    name: PEER_CHALLENGE_PROTOCOL.to_string(),
+                    content_type: CONTENT_TYPE_TEXT,
+                    data: json.into_bytes(),
+                });
+                (None, false)
+            }
+            None => (None, false),
+        };
         // §8.1: `data` rides byte-for-byte unchanged. `Prepare::encode` is
         // the same OER encoding every other carriage puts on a wire, and
         // nothing here re-wraps, pads or truncates a payload it holds no
@@ -638,7 +663,12 @@ impl PeerTransport for BtpPeerTransport {
             return unreachable_at(peer_id, &state.relation.endpoint);
         }
 
-        let ack = self.read_ack(state, claim.as_ref(), &frame);
+        let ack = if voucher {
+            // §6.1: a voucher's verdict rides back exactly as a claim's.
+            ack::from_protocol_data(&frame.protocol_data).unwrap_or(ClaimAckOutcome::NotSent)
+        } else {
+            self.read_ack(state, claim.as_ref(), &frame)
+        };
         match decode_answer(&frame) {
             // The terms are read and REPORTED here, not acted on: turning a
             // quote into a payment is the forwarding path's decision to make

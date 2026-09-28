@@ -461,5 +461,7 @@ authority. **The rule is unchanged**: every PREPARE carries the claim that pays 
 voucher, and the cap, the forwarded-arrival rule and `amount_after_fee(amount, fee)` are untouched.
 Each direction settles on its own; nothing nets.
 
-Until #1371's implementing steps land, the binary behaves as this record describes above; this
-Update states what changes when they do.
+**Built for runtime EVM peerings by #1378:** every forward to such a peer is covered by a voucher on
+this node's outbound channel (a zero-value one by the peer-role challenge instead), judged by the next
+hop against the channel's one watermark and acknowledged in the ack. `[[pay_channels]]` (#1380),
+Solana peerings (#1379) and payouts (#1381) still sign `toon-channel` claims.

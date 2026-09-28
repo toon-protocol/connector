@@ -187,5 +187,5 @@ stays. The document also publishes, per chain, the node's **voucher signer** —
 address on EVM, its settlement key on Solana — which is what a peer binds this node's inbound
 channel by. The greeting's `accepts[]` is `batch-settlement` entries only.
 
-Until #1371's implementing steps land, the binary behaves as this record describes above; this
-Update states what changes when they do.
+**Built in part by #1378:** the document publishes `voucherSigners`, one per chain this node pays
+x402 on. `settlements` stays until #1384 drops it, and the greeting is untouched until then.
