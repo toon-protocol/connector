@@ -1,97 +1,48 @@
-//! `POST /ilp/claim-state` (issue #693, epic toon-meta#261): an
-//! owner-authenticated bulk read of claim state -- deposit total,
-//! cumulative claimed, available balance, nonce, last-claim time -- over
-//! every channel a caller can prove it controls, in one request.
+//! `POST /ilp/claim-state` (issues #693, #1364): an owner-authenticated
+//! bulk read of voucher state -- the amount watermark, the ceiling the next
+//! voucher is admitted against, and the last-claim time -- over every x402
+//! channel a caller can prove it controls, in one request.
 //!
-//! **Why this shape.** The fleet-money epic's decision 5 makes this
-//! connector the source of truth for a channel's off-chain claim
-//! watermark: an agent's own client and this connector's claim gate are
-//! the only two parties who know it, and an agent that is broke or dead
-//! cannot afford to publish it itself (a report event would cost a paid
-//! write). A human managing N agents needs this for every channel at
-//! once, not one HTTP round trip per agent, and needs it to answer
-//! correctly precisely when the agent it is asking about cannot answer
-//! for itself.
+//! **Why this shape.** This connector is the source of truth for a
+//! channel's off-chain watermark: a voucher has no nonce, so a payer that
+//! lost its channel store can learn the amount its next voucher must
+//! strictly exceed only here -- the chain's `totalClaimed` / `settled` is a
+//! floor, trailing the watermark until this node lands its latest voucher.
+//! A human managing N agents needs this for every channel at once, and needs
+//! it to answer correctly precisely when the agent cannot answer for itself.
 //!
-//! **Auth.** Per-channel, not per-request: each entry in the request
-//! carries its own signature proving control of *that* channel, over a
-//! domain-separated challenge (`connector_signer::claim_state_challenge`)
-//! distinct from a real claim's balance-proof signature -- reusing the
-//! claim signature scheme would make a captured challenge replayable as a
-//! payment and vice versa. Verification is against the channel's already
-//! *registered* counterparty (`ClientChannelRegistry`, issue #558's rule
-//! applied to a read instead of a write) -- an owner whose agent keys
-//! derive from its own seed can sign as any agent's channel this way, and
-//! the connector never needs to know anything about that derivation; it
-//! only ever checks "does this signature verify against this channel's
-//! recorded key", exactly as claim verification does.
+//! **Auth.** Per-channel, not per-request: each entry carries its own
+//! signature by the channel's **voucher signer** (EVM `payerAuthorizer`,
+//! Solana `authorized_signer`, read from the chain, never from the request)
+//! over the voucher claim-state challenge (`connector_signer`'s
+//! `ClaimStateChallenge` under the `x402BatchSettlement` domain on EVM, the
+//! `toon-voucher-claim-state-challenge-v1` message on Solana) -- distinct
+//! from a voucher's own signature, so neither can be replayed as the other.
+//!
+//! **`scheme` is required** (ADR 0075 decision 8, issue #1384): every entry
+//! names `scheme: "batch-settlement"`. An entry with no `scheme`, or with
+//! `scheme: "toon-channel"`, asked about a `toon-channel` channel, whose
+//! scheme is retired; it is answered `"toon-channel-refused"` by name, and
+//! nothing is looked up for it.
 //!
 //! **What a failure reveals.** Every reason a channel entry cannot be
 //! answered -- it does not exist, the signature does not verify, this
 //! connector's resolution of it failed -- collapses to one generic
-//! `"unverified"` result. This is deliberately more conservative than
-//! claim ingestion's own refusal taxonomy (client-edge-spec.md §1.3, which
-//! *does* distinguish "no such channel" from "bad signature" for a payer's
-//! benefit): this endpoint's whole acceptance criterion is that a caller
-//! learns nothing about a channel it does not control, and "channel
-//! exists but your signature is wrong" already tells an attacker the
-//! channel exists. `"expired"` is the one distinct reason, because it is
-//! a fact about the caller's own request, not about the channel.
-//!
-//! **What the operator sees instead (issue #908).** The wire response
-//! stays this coarse deliberately, but that left the *operator* running
-//! this node as blind as the caller it is protecting -- a refused channel
-//! could not be diagnosed without a debugger, only reproduced. Every
-//! branch below that refuses or verifies an entry logs the real cause at
-//! `debug` ([`log_outcome`], [`log_lookup_error`]): a malformed field, no
-//! record of the channel, the underlying [`ChannelResolutionError`]
-//! (lookup failure, budget exhaustion, or a terminal channel, each with
-//! its own string), a signature that does not verify, an expired
-//! challenge, or success. This is exactly the distinction the wire
-//! response must not make, moved to a place only this node's own operator
-//! reads.
+//! `"unverified"` result: a caller learns nothing about a channel it does
+//! not control. `"expired"` and `"toon-channel-refused"` are the distinct
+//! reasons, because each is a fact about the caller's own request, not about
+//! the channel. Every branch logs the real cause at `debug` for the
+//! operator ([`log_outcome`], [`log_lookup_error`], issue #908).
 //!
 //! **One book answers.** Every channel this endpoint reports is judged by
-//! the client edge's [`crate::ClientClaimGate`]. The peer semantics's own
-//! book (`ClaimBook`) used to judge a `toon-channel` claim on a
-//! `[[peer_channels]]` channel, and this endpoint answered the higher of the
-//! two (issues #1257/#1258); ADR 0075 moved every peering onto x402 vouchers
-//! (#1378-#1380), which the claim gate judges against the channel's one
-//! watermark whichever role they arrive under, so there is no second book
-//! left to consult.
+//! the client edge's [`crate::ClientClaimGate`], whichever role its vouchers
+//! arrive under (ADR 0075 decision 6): a peer restoring its outbound
+//! watermark from here is told exactly where the channel stands.
 //!
-//! **An x402 `batch-settlement` channel (issue #1364).** An entry carrying
-//! `scheme: "batch-settlement"` asks about a channel this node receives
-//! **vouchers** on (ADR 0074). A voucher has no nonce, so this endpoint is
-//! the only place a client that lost its channel store can learn the amount
-//! its next voucher must strictly exceed: the chain's `totalClaimed` /
-//! `settled` is only a floor, trailing the watermark until this node lands
-//! its latest voucher. Such an entry is proved by the channel's voucher
-//! signer over a challenge of its own ([`resolve_evm_voucher`],
-//! [`resolve_solana_voucher`]), and answered with the amount watermark and
-//! the ceiling the claim gate admits the next voucher against, and no nonce
-//! ([`VerifiedVoucherChannelState`]). Without the discriminator, an entry
-//! is a `toon-channel` one and a voucher channel is never found.
-//!
-//! **A peer's voucher channel too (ADR 0075, issue #1377).** Since ADR 0075
-//! decision 5 a voucher proves the peer role on a channel whose voucher
-//! signer is bound to a peering, and decision 6 makes this endpoint the
-//! watermark authority a paying peer restores from. So a batch-settlement
-//! entry is answered for a peer-bound channel exactly as for a client's --
-//! the channel is found, and its signer read, by the same lookups -- and its
-//! watermark is the higher of the two books', as a `toon-channel` entry's
-//! already is, not the client edge's alone.
-//!
-//! **The admission path is untouched.** This handler only reads --
-//! [`crate::ClientClaimGate::watermark`], [`crate::ClientClaimGate::channels`],
-//! [`crate::ClientClaimGate::last_claim_time`] -- and a channel lookup that
-//! is not already known goes through the same budgeted
-//! [`crate::channels::ClientChannelRegistry::evm`]/`::solana` resolution a
-//! claim's own channel lookup does (a voucher channel, through the same
-//! metered batch-settlement lookup a voucher's does), so a flood of fabricated channel ids
-//! against this endpoint is bounded exactly as issue #613 already bounds
-//! it for claims. Nothing here calls `ingest`/`admit`, and no new work
-//! lands on `handle_prepare`'s packet path (see #686/#690).
+//! **The admission path is untouched.** This handler only reads, and a
+//! channel lookup that is not already known goes through the same metered
+//! batch-settlement lookup a voucher's does, so a flood of fabricated
+//! channel ids is bounded exactly as issue #613 bounds it for vouchers.
 
 use std::sync::Arc;
 
@@ -102,16 +53,15 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use connector_domain::client_claim::{parse_evm_channel_config, SCHEME_BATCH_SETTLEMENT};
+use connector_domain::client_claim::{
+    declared_scheme, parse_evm_channel_config, DeclaredScheme, SCHEME_BATCH_SETTLEMENT,
+};
 use connector_signer::{
-    evm_voucher_signer, verify_evm_claim_state_challenge, verify_evm_voucher_claim_state_challenge,
-    verify_solana_claim_state_challenge, verify_solana_voucher_claim_state_challenge,
-    BatchChannelConfig, EvmClaimStateChallenge,
+    evm_voucher_signer, verify_evm_voucher_claim_state_challenge,
+    verify_solana_voucher_claim_state_challenge, BatchChannelConfig,
 };
 
-use crate::channels::{
-    decode_base58_bytes, decode_hex_bytes, ChannelResolutionError, DepositFloor,
-};
+use crate::channels::{decode_base58_bytes, decode_hex_bytes, ChannelResolutionError};
 use crate::claim_gate::decode_evm_channel_config;
 use crate::{hex_encode, now_unix, ClientEdgeState};
 
@@ -168,7 +118,7 @@ enum ChannelProofRequest {
         expires: u64,
         signature: String,
         #[serde(default)]
-        scheme: ChannelScheme,
+        scheme: Option<String>,
         /// A batch-settlement channel's `ChannelConfig`, for a channel this
         /// node has no record of yet; see [`resolve_evm_voucher`].
         /// Parsed by `connector_domain`'s own `channelConfig` parser, the
@@ -182,21 +132,13 @@ enum ChannelProofRequest {
         expires: u64,
         signature: String,
         #[serde(default)]
-        scheme: ChannelScheme,
+        scheme: Option<String>,
     },
 }
 
-/// Which kind of channel an entry asks about, spelled as a claim's own
-/// `scheme` discriminator (ADR 0074 decision 4): absent means
-/// `toon-channel`, as it does on a claim.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-enum ChannelScheme {
-    #[default]
-    #[serde(rename = "toon-channel")]
-    ToonChannel,
-    #[serde(rename = "batch-settlement")]
-    BatchSettlement,
-}
+/// The one refusal an entry is given by name rather than as
+/// `"unverified"`: it asked about a retired `toon-channel` channel.
+const TOON_CHANNEL_REFUSED: &str = "toon-channel-refused";
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ClaimStateResponse {
@@ -210,39 +152,8 @@ pub(crate) struct ClaimStateResponse {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum ChannelStateResult {
-    Verified(VerifiedChannelState),
     VerifiedVoucher(VerifiedVoucherChannelState),
     Unverified(UnverifiedChannelState),
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct VerifiedChannelState {
-    blockchain: &'static str,
-    channel_id: String,
-    ok: bool,
-    /// `null` for a declared (`[[client_channels]]`) channel, which names
-    /// no amount ([`DepositFloor::Unknown`]) -- see
-    /// `crate::channels`'s own doc for why that is a deliberate exemption,
-    /// not a gap. A decimal string, matching the incoming claim wire's own
-    /// `transferredAmount` convention, since this is a monetary value a
-    /// JS `Number` cannot represent exactly past 2^53.
-    deposit_total: Option<String>,
-    cumulative_claimed: String,
-    /// `depositTotal - cumulativeClaimed`: the same headroom the
-    /// collateral-binding check in `client-edge-spec.md` §1.3 step 5 admits
-    /// an inbound claim against. A payout this connector owes the client
-    /// rides a channel of its own and nets against nothing (ADR 0075
-    /// decision 7, retiring issue #700's netting). `null` exactly when
-    /// `depositTotal` is, for the same reason.
-    available: Option<String>,
-    nonce: u64,
-    /// Unix seconds this connector last accepted a claim on this channel,
-    /// or `null` if it has not (or not since its own last restart -- see
-    /// [`crate::ClientClaimGate`]'s `last_claim_seen` doc: this figure is
-    /// best-effort and non-durable by design, unlike every other field
-    /// here).
-    last_claim_time: Option<u64>,
 }
 
 /// A verified x402 `batch-settlement` channel's answer (issue #1364). A
@@ -271,7 +182,10 @@ struct VerifiedVoucherChannelState {
     /// `maxCumulative − cumulativeClaimed`, at least zero: how much the next
     /// voucher may add.
     available: String,
-    /// As [`VerifiedChannelState::last_claim_time`].
+    /// Unix seconds this connector last accepted a voucher on this channel,
+    /// or `null` if it has not since its own last restart -- best-effort and
+    /// non-durable by design (see [`crate::ClientClaimGate`]'s
+    /// `last_claim_seen`), unlike every other field here.
     last_claim_time: Option<u64>,
 }
 
@@ -281,8 +195,8 @@ struct UnverifiedChannelState {
     blockchain: &'static str,
     channel_id: String,
     ok: bool,
-    /// `"expired"` or `"unverified"` -- see this module's own doc for why
-    /// nothing more specific is ever reported.
+    /// `"expired"`, `"toon-channel-refused"` or `"unverified"` -- see this
+    /// module's own doc for why nothing more specific is ever reported.
     error: &'static str,
 }
 
@@ -349,10 +263,21 @@ async fn resolve_evm(
     channel_id_text: String,
     expires: u64,
     signature_text: String,
-    scheme: ChannelScheme,
+    scheme: Option<String>,
     channel_config: Option<serde_json::Value>,
     now: u64,
 ) -> ChannelStateResult {
+    match declared_scheme(scheme.as_deref()) {
+        DeclaredScheme::BatchSettlement => {}
+        DeclaredScheme::ToonChannel => {
+            log_outcome("evm", &channel_id_text, "toon_channel_refused");
+            return unverified("evm", channel_id_text, TOON_CHANNEL_REFUSED);
+        }
+        DeclaredScheme::Unknown => {
+            log_outcome("evm", &channel_id_text, "unknown_scheme");
+            return unverified("evm", channel_id_text, "unverified");
+        }
+    }
     if expires <= now {
         log_outcome("evm", &channel_id_text, "expired");
         return unverified("evm", channel_id_text, "expired");
@@ -367,72 +292,32 @@ async fn resolve_evm(
     };
 
     let requester = format!("claim-state-challenge:{signature_text}");
-    if scheme == ChannelScheme::BatchSettlement {
-        let presented = channel_config
-            .filter(|config| !config.is_null())
-            .map(|config| {
-                let config = parse_evm_channel_config(&config).ok()?;
-                decode_evm_channel_config(&config).ok()
-            });
-        let presented = match presented {
-            Some(None) => {
-                log_outcome("evm", &channel_id_text, "malformed_channel_config");
-                return unverified("evm", channel_id_text, "unverified");
-            }
-            Some(Some(config)) => Some(config),
-            None => None,
-        };
-        return resolve_evm_voucher(
-            state,
-            channel_id_text,
-            channel_id,
-            VoucherProof {
-                expires,
-                signature: &signature,
-                requester: &requester,
-            },
-            presented,
-        )
-        .await;
-    }
-    let lookup = state
-        .claim_gate
-        .channels()
-        .evm(&channel_id, &requester)
-        .await;
-    let channel = match lookup {
-        Ok(Some(channel)) => channel,
-        Ok(None) => {
-            log_outcome("evm", &channel_id_text, "channel_unknown");
+    let presented = channel_config
+        .filter(|config| !config.is_null())
+        .map(|config| {
+            let config = parse_evm_channel_config(&config).ok()?;
+            decode_evm_channel_config(&config).ok()
+        });
+    let presented = match presented {
+        Some(None) => {
+            log_outcome("evm", &channel_id_text, "malformed_channel_config");
             return unverified("evm", channel_id_text, "unverified");
         }
-        Err(error) => {
-            log_lookup_error("evm", &channel_id_text, &error);
-            return unverified("evm", channel_id_text, "unverified");
-        }
+        Some(Some(config)) => Some(config),
+        None => None,
     };
-
-    let challenge = EvmClaimStateChallenge {
-        channel_id,
-        expires,
-        chain_id: channel.chain_id,
-        token_network_address: channel.token_network_address,
-    };
-    if !verify_evm_claim_state_challenge(&challenge, &signature, &channel.counterparty) {
-        log_outcome("evm", &channel_id_text, "signature_invalid");
-        return unverified("evm", channel_id_text, "unverified");
-    }
-    log_outcome("evm", &channel_id_text, "verified");
-
-    let channel_id_hex = format!("0x{}", hex_encode(&channel_id));
-    let channel_key = format!("evm:{channel_id_hex}");
-    ChannelStateResult::Verified(verified_state(
-        "evm",
-        channel_id_hex,
+    resolve_evm_voucher(
         state,
-        &channel_key,
-        channel.deposit_floor,
-    ))
+        channel_id_text,
+        channel_id,
+        VoucherProof {
+            expires,
+            signature: &signature,
+            requester: &requester,
+        },
+        presented,
+    )
+    .await
 }
 
 async fn resolve_solana(
@@ -440,9 +325,20 @@ async fn resolve_solana(
     channel_account_text: String,
     expires: u64,
     signature_text: String,
-    scheme: ChannelScheme,
+    scheme: Option<String>,
     now: u64,
 ) -> ChannelStateResult {
+    match declared_scheme(scheme.as_deref()) {
+        DeclaredScheme::BatchSettlement => {}
+        DeclaredScheme::ToonChannel => {
+            log_outcome("solana", &channel_account_text, "toon_channel_refused");
+            return unverified("solana", channel_account_text, TOON_CHANNEL_REFUSED);
+        }
+        DeclaredScheme::Unknown => {
+            log_outcome("solana", &channel_account_text, "unknown_scheme");
+            return unverified("solana", channel_account_text, "unverified");
+        }
+    }
     if expires <= now {
         log_outcome("solana", &channel_account_text, "expired");
         return unverified("solana", channel_account_text, "expired");
@@ -457,55 +353,17 @@ async fn resolve_solana(
     };
 
     let requester = format!("claim-state-challenge:{signature_text}");
-    if scheme == ChannelScheme::BatchSettlement {
-        return resolve_solana_voucher(
-            state,
-            channel_account_text,
-            channel_account,
-            VoucherProof {
-                expires,
-                signature: &signature,
-                requester: &requester,
-            },
-        )
-        .await;
-    }
-    let lookup = state
-        .claim_gate
-        .channels()
-        .solana(&channel_account, &requester)
-        .await;
-    let channel = match lookup {
-        Ok(Some(channel)) => channel,
-        Ok(None) => {
-            log_outcome("solana", &channel_account_text, "channel_unknown");
-            return unverified("solana", channel_account_text, "unverified");
-        }
-        Err(error) => {
-            log_lookup_error("solana", &channel_account_text, &error);
-            return unverified("solana", channel_account_text, "unverified");
-        }
-    };
-
-    if !verify_solana_claim_state_challenge(
-        &channel_account,
-        expires,
-        &signature,
-        &channel.counterparty,
-    ) {
-        log_outcome("solana", &channel_account_text, "signature_invalid");
-        return unverified("solana", channel_account_text, "unverified");
-    }
-    log_outcome("solana", &channel_account_text, "verified");
-
-    let channel_key = format!("solana:{channel_account_text}");
-    ChannelStateResult::Verified(verified_state(
-        "solana",
-        channel_account_text,
+    resolve_solana_voucher(
         state,
-        &channel_key,
-        channel.deposit_floor,
-    ))
+        channel_account_text,
+        channel_account,
+        VoucherProof {
+            expires,
+            signature: &signature,
+            requester: &requester,
+        },
+    )
+    .await
 }
 
 /// A batch-settlement entry's already-decoded proof.
@@ -645,770 +503,4 @@ fn verified_voucher_state(
             .to_string(),
         last_claim_time: state.claim_gate.last_claim_time(channel_key),
     })
-}
-
-/// `deposit_total`, `cumulativeClaimed`, `nonce` and `available` this
-/// endpoint reports for one verified channel (`client-edge-spec.md` §1.10):
-/// `available` is the same headroom
-/// [`crate::claim_gate::ClientClaimGate`]'s collateral check admits
-/// against -- `deposit - owed`, `owed` being `cumulative_claimed` below.
-/// Payouts net against nothing (ADR 0075 decision 7).
-///
-/// `last_claim_time` is best-effort and non-durable, as that field's own doc
-/// says.
-fn verified_state(
-    blockchain: &'static str,
-    channel_id: String,
-    state: &ClientEdgeState,
-    channel_key: &str,
-    deposit_floor: DepositFloor,
-) -> VerifiedChannelState {
-    let watermark = state.claim_gate.watermark(channel_key);
-    let cumulative_claimed = watermark.map(|w| w.cumulative_amount).unwrap_or(0);
-    let nonce = watermark.map(|w| w.nonce).unwrap_or(0);
-    let deposit_total = deposit_floor.deposit();
-    let available = deposit_total.map(|deposit| deposit.saturating_sub(cumulative_claimed));
-
-    VerifiedChannelState {
-        blockchain,
-        channel_id,
-        ok: true,
-        deposit_total: deposit_total.map(|amount| amount.to_string()),
-        cumulative_claimed: cumulative_claimed.to_string(),
-        available: available.map(|amount| amount.to_string()),
-        nonce,
-        last_claim_time: state.claim_gate.last_claim_time(channel_key),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use chrono::{TimeZone, Utc};
-    use connector_domain::Prepare;
-    use connector_runtime::{
-        Connector, FakeAppClient, InMemoryJournal, InProcessPeerTransport, TestClock,
-    };
-    use connector_signer::{
-        evm_claim_state_challenge_digest, solana_claim_state_challenge_message, LocalSigner, Signer,
-    };
-    use ed25519_dalek::Signer as Ed25519Signer;
-    use libsecp256k1::{Message, PublicKey, SecretKey};
-    use rand::SeedableRng;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use tower::ServiceExt;
-
-    use crate::channels::test_source::FakeChannelSource;
-    use crate::{
-        router_with_gate, ChannelLookupFailed, ClientChannelRegistry, ClientClaimGate, EvmChannel,
-    };
-
-    const EVM_CHAIN_ID: u64 = 8453;
-    const EVM_TOKEN_NETWORK_ADDRESS: [u8; 20] = [0x42; 20];
-    const EVM_CHANNEL_ID: [u8; 32] = [0xab; 32];
-    const KNOWN_DEPOSIT: u64 = 1_000_000;
-    const SOLANA_CHANNEL_ACCOUNT: [u8; 32] = [3u8; 32];
-
-    fn evm_channel_id_hex() -> String {
-        format!("0x{}", hex_encode(&EVM_CHANNEL_ID))
-    }
-
-    fn evm_signer() -> (SecretKey, connector_signer::Address) {
-        let secret = SecretKey::parse(&[9u8; 32]).unwrap();
-        let public = PublicKey::from_secret_key(&secret);
-        (
-            secret,
-            connector_signer::derive_evm_address(&public.serialize()),
-        )
-    }
-
-    fn sign_evm(secret: &SecretKey, digest: &[u8; 32]) -> Vec<u8> {
-        let message = Message::parse(digest);
-        let (signature, recovery_id) = libsecp256k1::sign(&message, secret);
-        let mut bytes = signature.serialize().to_vec();
-        let recovery_byte: u8 = recovery_id.into();
-        bytes.push(recovery_byte + 27);
-        bytes
-    }
-
-    fn evm_challenge_signature(secret: &SecretKey, channel_id: [u8; 32], expires: u64) -> String {
-        let challenge = EvmClaimStateChallenge {
-            channel_id,
-            expires,
-            chain_id: EVM_CHAIN_ID,
-            token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-        };
-        let digest = evm_claim_state_challenge_digest(&challenge);
-        format!("0x{}", hex_encode(&sign_evm(secret, &digest)))
-    }
-
-    fn solana_signer() -> ed25519_dalek::Keypair {
-        let mut rng = rand::rngs::StdRng::from_seed([13u8; 32]);
-        ed25519_dalek::Keypair::generate(&mut rng)
-    }
-
-    fn base58_encode(bytes: &[u8]) -> String {
-        bs58::encode(bytes).into_string()
-    }
-
-    fn solana_challenge_signature(keypair: &ed25519_dalek::Keypair, expires: u64) -> String {
-        let message = solana_claim_state_challenge_message(&SOLANA_CHANNEL_ACCOUNT, expires);
-        let signature = keypair.sign(&message);
-        BASE64.encode(signature.to_bytes())
-    }
-
-    /// A registry with one EVM channel resolved (not declared) with a known
-    /// deposit, via a [`FakeChannelSource`] -- `record_evm` alone always
-    /// leaves [`DepositFloor::Unknown`] (a declared channel names no
-    /// amount), so exercising `depositTotal`/`available` as real numbers
-    /// needs the resolution path a `[settlement]`-backed node actually
-    /// uses. Also declares one Solana channel with the usual "no deposit
-    /// knowable" shape, for the tests that only care about the signature
-    /// and watermark halves.
-    fn test_channels() -> ClientChannelRegistry {
-        let (_secret, address) = evm_signer();
-        let source = FakeChannelSource::knowing(vec![(
-            EVM_CHANNEL_ID,
-            EvmChannel {
-                counterparty: address,
-                chain_id: EVM_CHAIN_ID,
-                token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-                deposit_floor: DepositFloor::AtLeast(KNOWN_DEPOSIT),
-            },
-        )]);
-        let mut channels = ClientChannelRegistry::new().with_source(Arc::new(source));
-        channels
-            .record_solana(
-                &base58_encode(&SOLANA_CHANNEL_ACCOUNT),
-                &base58_encode(&solana_signer().public.to_bytes()),
-                "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx",
-            )
-            .expect("a 32-byte base58 channel account");
-        channels
-    }
-
-    fn test_gate() -> ClientClaimGate {
-        ClientClaimGate::restore(test_channels(), Arc::new(InMemoryJournal::new()))
-            .expect("a fresh in-memory journal has nothing to replay")
-    }
-
-    fn test_signer() -> Arc<dyn Signer> {
-        Arc::new(LocalSigner::generate("test-signer"))
-    }
-
-    fn test_connector() -> Arc<Connector> {
-        Arc::new(Connector::new(
-            vec![],
-            vec![],
-            Arc::new(FakeAppClient::new()),
-            Arc::new(InProcessPeerTransport::new()),
-            Arc::new(TestClock::new(
-                Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap(),
-            )),
-        ))
-    }
-
-    fn far_future_expiry() -> u64 {
-        Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0)
-            .unwrap()
-            .timestamp() as u64
-    }
-
-    fn long_past_expiry() -> u64 {
-        Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0)
-            .unwrap()
-            .timestamp() as u64
-    }
-
-    async fn post_claim_state(gate: ClientClaimGate, body: serde_json::Value) -> serde_json::Value {
-        let app = router_with_gate(test_connector(), test_signer(), None, gate);
-        let request = Request::builder()
-            .method("POST")
-            .uri("/ilp/claim-state")
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        serde_json::from_slice(&bytes).expect("valid JSON response")
-    }
-
-    /// Issue #908: this module's own two logging call sites
-    /// ([`log_outcome`], [`log_lookup_error`]) never appear on the wire, so
-    /// asserting they fire -- and with which cause -- needs a `Subscriber`
-    /// installed for the duration of a request, exactly like
-    /// `connector_runtime::connector`'s `SpanFieldCapture` does for the
-    /// `"packet"` span, adapted to events instead.
-    ///
-    /// Only this module's own events are kept: `enabled` has to answer
-    /// `true` for everything (see [`claim_state_events`] on why a narrower
-    /// answer is not race-free), which otherwise leaves the assertions
-    /// below counting whatever axum, tower or hyper happens to log on the
-    /// same thread during the request.
-    struct EventFieldCapture {
-        events: Arc<Mutex<Vec<HashMap<String, String>>>>,
-    }
-
-    /// `tracing`'s default target -- the module path of the
-    /// [`log_outcome`]/[`log_lookup_error`] call sites, which are in the
-    /// parent module, not in `tests`.
-    const CLAIM_STATE_TARGET: &str = "connector_client_edge::claim_state";
-
-    struct StringVisitor<'a>(&'a mut HashMap<String, String>);
-
-    impl tracing::field::Visit for StringVisitor<'_> {
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.0.insert(field.name().to_string(), value.to_string());
-        }
-
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0
-                .insert(field.name().to_string(), format!("{value:?}"));
-        }
-    }
-
-    impl tracing::Subscriber for EventFieldCapture {
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            if event.metadata().target() != CLAIM_STATE_TARGET {
-                return;
-            }
-            let mut fields = HashMap::new();
-            let mut visitor = StringVisitor(&mut fields);
-            event.record(&mut visitor);
-            self.events
-                .lock()
-                .expect("capture lock poisoned")
-                .push(fields);
-        }
-
-        fn enter(&self, _span: &tracing::span::Id) {}
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    /// Run `work` under an [`EventFieldCapture`] and return every event
-    /// this module's logging recorded, in `work`'s own order, alongside
-    /// `work`'s result.
-    ///
-    /// Probes both [`log_outcome`] and [`log_lookup_error`] -- this
-    /// module's only two logging call sites, however many distinct
-    /// `cause`s flow through them at runtime -- and rebuilds tracing-core's
-    /// callsite interest cache until the probes are observably captured.
-    /// A single rebuild is not race-free under the default parallel
-    /// `cargo test`: each call site's `Interest` is cached globally,
-    /// computed once by whichever thread touches it first, and a
-    /// concurrent test elsewhere in this file that never installs a
-    /// subscriber can be that first toucher, caching `Interest::never`
-    /// before this capture ever runs. See
-    /// `connector_runtime::connector`'s `packet_span_fields` for the fuller
-    /// account of why probing until the capture actually fires is the only
-    /// race-free fix.
-    async fn claim_state_events<T, F: std::future::Future<Output = T>>(
-        work: F,
-    ) -> (Vec<HashMap<String, String>>, T) {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let guard = tracing::subscriber::set_default(EventFieldCapture {
-            events: Arc::clone(&events),
-        });
-        let mut attempts = 0u32;
-        loop {
-            tracing::callsite::rebuild_interest_cache();
-            log_outcome("evm", "probe", "probe");
-            log_lookup_error(
-                "evm",
-                "probe",
-                &ChannelResolutionError::LookupFailed(ChannelLookupFailed("probe".to_string())),
-            );
-            if events.lock().expect("capture lock poisoned").len() >= 2 {
-                events.lock().expect("capture lock poisoned").clear();
-                break;
-            }
-            attempts += 1;
-            assert!(
-                attempts < 1_000,
-                "the claim-state log call sites never became enabled under this capture"
-            );
-            std::thread::yield_now();
-        }
-
-        let result = work.await;
-
-        drop(guard);
-        let captured = events.lock().expect("capture lock poisoned").clone();
-        (captured, result)
-    }
-
-    #[tokio::test]
-    async fn a_verified_evm_channel_reports_deposit_cumulative_available_and_nonce() {
-        let (secret, _address) = evm_signer();
-        let expires = far_future_expiry();
-        let body = serde_json::json!({
-            "channels": [{
-                "blockchain": "evm",
-                "channelId": evm_channel_id_hex(),
-                "expires": expires,
-                "signature": evm_challenge_signature(&secret, EVM_CHANNEL_ID, expires),
-            }]
-        });
-
-        let response = post_claim_state(test_gate(), body).await;
-        let entry = &response["channels"][0];
-        assert_eq!(entry["ok"], true);
-        assert_eq!(entry["blockchain"], "evm");
-        assert_eq!(entry["depositTotal"], KNOWN_DEPOSIT.to_string());
-        assert_eq!(entry["cumulativeClaimed"], "0");
-        assert_eq!(entry["available"], KNOWN_DEPOSIT.to_string());
-        assert_eq!(entry["nonce"], 0);
-        assert!(entry["lastClaimTime"].is_null());
-    }
-
-    #[tokio::test]
-    async fn a_declared_solana_channel_reports_null_deposit_and_available() {
-        let keypair = solana_signer();
-        let expires = far_future_expiry();
-        let body = serde_json::json!({
-            "channels": [{
-                "blockchain": "solana",
-                "channelAccount": base58_encode(&SOLANA_CHANNEL_ACCOUNT),
-                "expires": expires,
-                "signature": solana_challenge_signature(&keypair, expires),
-            }]
-        });
-
-        let response = post_claim_state(test_gate(), body).await;
-        let entry = &response["channels"][0];
-        assert_eq!(entry["ok"], true);
-        assert_eq!(entry["blockchain"], "solana");
-        assert!(entry["depositTotal"].is_null());
-        assert_eq!(entry["cumulativeClaimed"], "0");
-        assert!(entry["available"].is_null());
-        assert_eq!(entry["nonce"], 0);
-    }
-
-    #[tokio::test]
-    async fn a_wrong_signature_and_an_unknown_channel_report_the_identical_generic_error() {
-        let expires = far_future_expiry();
-        // A channel this registry knows about, but signed by the wrong key.
-        let forger_secret = SecretKey::parse(&[42u8; 32]).unwrap();
-        let wrong_signature = evm_challenge_signature(&forger_secret, EVM_CHANNEL_ID, expires);
-
-        // A channel this registry has never heard of, with a well-formed
-        // but meaningless signature.
-        let unknown_channel_id = [0x99u8; 32];
-        let unknown_channel_signature =
-            evm_challenge_signature(&forger_secret, unknown_channel_id, expires);
-
-        let body = serde_json::json!({
-            "channels": [
-                {
-                    "blockchain": "evm",
-                    "channelId": evm_channel_id_hex(),
-                    "expires": expires,
-                    "signature": wrong_signature,
-                },
-                {
-                    "blockchain": "evm",
-                    "channelId": format!("0x{}", hex_encode(&unknown_channel_id)),
-                    "expires": expires,
-                    "signature": unknown_channel_signature,
-                },
-            ]
-        });
-
-        let response = post_claim_state(test_gate(), body).await;
-        for index in 0..2 {
-            let entry = &response["channels"][index];
-            assert_eq!(entry["ok"], false);
-            assert_eq!(entry["error"], "unverified");
-            // Confirms the two failures are byte-identical shapes -- a
-            // caller cannot tell "wrong key" from "no such channel" apart.
-            assert_eq!(entry.as_object().unwrap().len(), 4);
-        }
-    }
-
-    /// Issue #908: the wire response for a bad signature and an unknown
-    /// channel is the identical `"unverified"` shape (proven above), but an
-    /// operator reading this node's own logs must be able to tell them
-    /// apart -- that is the whole point of the issue. Same two requests as
-    /// the wire-shape test above; this one asserts on what got logged
-    /// instead of what got answered.
-    #[tokio::test]
-    async fn an_unknown_channel_and_a_bad_signature_are_logged_with_different_causes() {
-        let expires = far_future_expiry();
-        let forger_secret = SecretKey::parse(&[42u8; 32]).unwrap();
-        let wrong_signature = evm_challenge_signature(&forger_secret, EVM_CHANNEL_ID, expires);
-
-        let unknown_channel_id = [0x99u8; 32];
-        let unknown_channel_signature =
-            evm_challenge_signature(&forger_secret, unknown_channel_id, expires);
-
-        let body = serde_json::json!({
-            "channels": [
-                {
-                    "blockchain": "evm",
-                    "channelId": evm_channel_id_hex(),
-                    "expires": expires,
-                    "signature": wrong_signature,
-                },
-                {
-                    "blockchain": "evm",
-                    "channelId": format!("0x{}", hex_encode(&unknown_channel_id)),
-                    "expires": expires,
-                    "signature": unknown_channel_signature,
-                },
-            ]
-        });
-
-        let (events, response) = claim_state_events(post_claim_state(test_gate(), body)).await;
-
-        for index in 0..2 {
-            assert_eq!(response["channels"][index]["error"], "unverified");
-        }
-        let causes: Vec<Option<&str>> = events
-            .iter()
-            .map(|fields| fields.get("cause").map(String::as_str))
-            .collect();
-        assert_eq!(
-            causes,
-            vec![Some("signature_invalid"), Some("channel_unknown")],
-            "the two identical wire refusals must be distinguishable in the log"
-        );
-    }
-
-    /// Issue #908: a lookup this connector could not complete (an
-    /// unreachable settlement RPC, say) is not the same event as a channel
-    /// this connector has simply never heard of -- both answer the wire the
-    /// identical `"unverified"`, but the log must carry the underlying
-    /// [`crate::channels::ChannelLookupFailed`] reason, not just the fact
-    /// that *something* failed.
-    #[tokio::test]
-    async fn a_channel_lookup_failure_is_logged_with_its_underlying_reason() {
-        let source = FakeChannelSource::unreachable("settlement rpc unreachable");
-        let channels = ClientChannelRegistry::new().with_source(Arc::new(source));
-        let gate = ClientClaimGate::restore(channels, Arc::new(InMemoryJournal::new()))
-            .expect("a fresh in-memory journal has nothing to replay");
-
-        let expires = far_future_expiry();
-        let body = serde_json::json!({
-            "channels": [{
-                "blockchain": "evm",
-                "channelId": evm_channel_id_hex(),
-                "expires": expires,
-                "signature": format!("0x{}", "11".repeat(65)),
-            }]
-        });
-
-        let (events, response) = claim_state_events(post_claim_state(gate, body)).await;
-
-        assert_eq!(response["channels"][0]["ok"], false);
-        assert_eq!(response["channels"][0]["error"], "unverified");
-
-        let event = events
-            .iter()
-            .find(|fields| fields.get("cause").map(String::as_str) == Some("channel_lookup_failed"))
-            .expect("a channel_lookup_failed event");
-        assert_eq!(
-            event.get("detail").map(String::as_str),
-            Some("settlement rpc unreachable")
-        );
-    }
-
-    /// Issue #908: a settled channel is a known, definitive fact (issue
-    /// #661) -- distinct in the log from both an unknown channel and a
-    /// bare lookup failure, the same way [`crate::ClaimIngestRejection`]
-    /// keeps it distinct on the claim-ingestion path.
-    #[tokio::test]
-    async fn a_terminal_channel_is_logged_distinctly_from_an_unknown_one() {
-        let source = FakeChannelSource::knowing(vec![]);
-        source.now_terminal(EVM_CHANNEL_ID);
-        let channels = ClientChannelRegistry::new().with_source(Arc::new(source));
-        let gate = ClientClaimGate::restore(channels, Arc::new(InMemoryJournal::new()))
-            .expect("a fresh in-memory journal has nothing to replay");
-
-        let expires = far_future_expiry();
-        let body = serde_json::json!({
-            "channels": [{
-                "blockchain": "evm",
-                "channelId": evm_channel_id_hex(),
-                "expires": expires,
-                "signature": format!("0x{}", "11".repeat(65)),
-            }]
-        });
-
-        let (events, response) = claim_state_events(post_claim_state(gate, body)).await;
-
-        assert_eq!(response["channels"][0]["error"], "unverified");
-        let event = events
-            .iter()
-            .find(|fields| fields.get("cause").map(String::as_str) == Some("channel_terminal"))
-            .expect("a channel_terminal event");
-        assert!(event
-            .get("detail")
-            .is_some_and(|detail| detail.contains("settled")));
-    }
-
-    /// Issue #908: malformed input (an unparseable channel id or
-    /// signature) never reaches a channel lookup at all, and the log line
-    /// says so distinctly from both "no such channel" and "bad signature".
-    #[tokio::test]
-    async fn malformed_fields_are_logged_before_any_lookup_is_attempted() {
-        let body = serde_json::json!({
-            "channels": [
-                {
-                    "blockchain": "evm",
-                    "channelId": "not-hex",
-                    "expires": far_future_expiry(),
-                    "signature": format!("0x{}", "11".repeat(65)),
-                },
-                {
-                    "blockchain": "evm",
-                    "channelId": evm_channel_id_hex(),
-                    "expires": far_future_expiry(),
-                    "signature": "not-hex-either",
-                },
-            ]
-        });
-
-        let (events, response) = claim_state_events(post_claim_state(test_gate(), body)).await;
-
-        for index in 0..2 {
-            assert_eq!(response["channels"][index]["error"], "unverified");
-        }
-        let causes: Vec<Option<&str>> = events
-            .iter()
-            .map(|fields| fields.get("cause").map(String::as_str))
-            .collect();
-        assert_eq!(
-            causes,
-            vec![Some("malformed_channel_id"), Some("malformed_signature")]
-        );
-    }
-
-    /// Issue #908: a successful verification logs too -- "nothing happened"
-    /// and "a request I cannot explain happened" must not look the same in
-    /// the log.
-    #[tokio::test]
-    async fn a_verified_channel_is_logged_as_verified() {
-        let (secret, _address) = evm_signer();
-        let expires = far_future_expiry();
-        let body = serde_json::json!({
-            "channels": [{
-                "blockchain": "evm",
-                "channelId": evm_channel_id_hex(),
-                "expires": expires,
-                "signature": evm_challenge_signature(&secret, EVM_CHANNEL_ID, expires),
-            }]
-        });
-
-        let (events, response) = claim_state_events(post_claim_state(test_gate(), body)).await;
-
-        assert_eq!(response["channels"][0]["ok"], true);
-        let causes: Vec<Option<&str>> = events
-            .iter()
-            .map(|fields| fields.get("cause").map(String::as_str))
-            .collect();
-        assert_eq!(causes, vec![Some("verified")]);
-    }
-
-    /// Issue #908: the Solana branch refuses on the same generic
-    /// `"unverified"` as the EVM one, so it owes the operator the same
-    /// distinguishing log line -- and the line is only actionable if it also
-    /// says *which* chain and *which* channel, which is the half of the
-    /// issue's ask ("the channel id and the branch taken") the
-    /// cause-only assertions above do not pin down.
-    #[tokio::test]
-    async fn a_bad_solana_signature_is_logged_with_its_chain_and_channel() {
-        let channel_account = base58_encode(&SOLANA_CHANNEL_ACCOUNT);
-        let body = serde_json::json!({
-            "channels": [{
-                "blockchain": "solana",
-                "channelAccount": channel_account,
-                "expires": far_future_expiry(),
-                "signature": BASE64.encode([7u8; 64]),
-            }]
-        });
-
-        let (events, response) = claim_state_events(post_claim_state(test_gate(), body)).await;
-
-        assert_eq!(response["channels"][0]["error"], "unverified");
-        let logged: Vec<(Option<&str>, Option<&str>, Option<&str>)> = events
-            .iter()
-            .map(|fields| {
-                (
-                    fields.get("blockchain").map(String::as_str),
-                    fields.get("channel_id").map(String::as_str),
-                    fields.get("cause").map(String::as_str),
-                )
-            })
-            .collect();
-        assert_eq!(
-            logged,
-            vec![(
-                Some("solana"),
-                Some(channel_account.as_str()),
-                Some("signature_invalid")
-            )]
-        );
-    }
-
-    #[tokio::test]
-    async fn an_expired_challenge_is_refused_distinctly_from_an_unverified_one() {
-        let (secret, _address) = evm_signer();
-        let expires = long_past_expiry();
-        let body = serde_json::json!({
-            "channels": [{
-                "blockchain": "evm",
-                "channelId": evm_channel_id_hex(),
-                "expires": expires,
-                "signature": evm_challenge_signature(&secret, EVM_CHANNEL_ID, expires),
-            }]
-        });
-
-        let response = post_claim_state(test_gate(), body).await;
-        let entry = &response["channels"][0];
-        assert_eq!(entry["ok"], false);
-        assert_eq!(entry["error"], "expired");
-    }
-
-    #[tokio::test]
-    async fn a_batch_of_several_channels_is_resolved_independently_and_in_order() {
-        let (secret, _address) = evm_signer();
-        let keypair = solana_signer();
-        let expires = far_future_expiry();
-        let forger_secret = SecretKey::parse(&[42u8; 32]).unwrap();
-
-        let body = serde_json::json!({
-            "channels": [
-                {
-                    "blockchain": "evm",
-                    "channelId": evm_channel_id_hex(),
-                    "expires": expires,
-                    "signature": evm_challenge_signature(&secret, EVM_CHANNEL_ID, expires),
-                },
-                {
-                    "blockchain": "solana",
-                    "channelAccount": base58_encode(&SOLANA_CHANNEL_ACCOUNT),
-                    "expires": expires,
-                    "signature": solana_challenge_signature(&keypair, expires),
-                },
-                {
-                    "blockchain": "evm",
-                    "channelId": evm_channel_id_hex(),
-                    "expires": expires,
-                    "signature": evm_challenge_signature(&forger_secret, EVM_CHANNEL_ID, expires),
-                },
-            ]
-        });
-
-        let response = post_claim_state(test_gate(), body).await;
-        let channels = response["channels"].as_array().unwrap();
-        assert_eq!(channels.len(), 3);
-        assert_eq!(channels[0]["ok"], true);
-        assert_eq!(channels[0]["blockchain"], "evm");
-        assert_eq!(channels[1]["ok"], true);
-        assert_eq!(channels[1]["blockchain"], "solana");
-        assert_eq!(channels[2]["ok"], false);
-        assert_eq!(channels[2]["error"], "unverified");
-    }
-
-    #[tokio::test]
-    async fn a_real_claim_updates_cumulative_claimed_nonce_and_last_claim_time() {
-        let (secret, address) = evm_signer();
-        let gate = test_gate();
-        let balance_proof = connector_signer::EvmBalanceProof {
-            channel_id: EVM_CHANNEL_ID,
-            nonce: 1,
-            transferred_amount: 500,
-            locked_amount: 0,
-            locks_root: [0u8; 32],
-            chain_id: EVM_CHAIN_ID,
-            token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-        };
-        let balance_proof_digest = connector_signer::evm_balance_proof_digest(&balance_proof);
-        let balance_proof_signature = format!(
-            "0x{}",
-            hex_encode(&sign_evm(&secret, &balance_proof_digest))
-        );
-        let claim_json = serde_json::json!({
-            "version": "1.0",
-            "blockchain": "evm",
-            "messageId": "m1",
-            "timestamp": "2030-01-01T00:00:00Z",
-            "senderId": "sender",
-            "channelId": evm_channel_id_hex(),
-            "nonce": 1,
-            "transferredAmount": "500",
-            "lockedAmount": "0",
-            "locksRoot": format!("0x{}", "0".repeat(64)),
-            "signature": balance_proof_signature,
-            "signerAddress": format!("0x{}", hex_encode(&address)),
-            "chainId": EVM_CHAIN_ID,
-            "tokenNetworkAddress": format!("0x{}", hex_encode(&EVM_TOKEN_NETWORK_ADDRESS)),
-        })
-        .to_string();
-
-        let connector = test_connector();
-        let signer = test_signer();
-        let app = router_with_gate(Arc::clone(&connector), Arc::clone(&signer), None, gate);
-
-        let prepare = Prepare {
-            amount: 0,
-            expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
-            greeting: false,
-            destination: "g.nowhere".to_string(),
-            data: Vec::new(),
-        };
-        let request = Request::builder()
-            .method("POST")
-            .uri("/ilp")
-            .header(crate::CLAIM_HEADER, BASE64.encode(claim_json))
-            .body(Body::from(prepare.encode()))
-            .unwrap();
-        let before = now_unix();
-        let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let expires = far_future_expiry();
-        let body = serde_json::json!({
-            "channels": [{
-                "blockchain": "evm",
-                "channelId": evm_channel_id_hex(),
-                "expires": expires,
-                "signature": evm_challenge_signature(&secret, EVM_CHANNEL_ID, expires),
-            }]
-        });
-        let request = Request::builder()
-            .method("POST")
-            .uri("/ilp/claim-state")
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-
-        let entry = &response["channels"][0];
-        assert_eq!(entry["ok"], true);
-        assert_eq!(entry["nonce"], 1);
-        assert_eq!(entry["cumulativeClaimed"], "500");
-        assert_eq!(entry["available"], (KNOWN_DEPOSIT - 500).to_string());
-        let last_claim_time = entry["lastClaimTime"]
-            .as_u64()
-            .expect("a recorded claim time");
-        assert!(last_claim_time >= before);
-    }
 }

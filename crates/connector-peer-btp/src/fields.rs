@@ -106,7 +106,7 @@ mod tests {
     }
 
     const TERMS: &[u8] = br#"{"x402Version":2,"resource":{"url":"g.toon.relay"},
-        "accepts":[{"amount":"2000","payTo":"g.toon.relay"}]}"#;
+        "extensions":{"toon":{"info":{"amount":"2000","ilpAddress":"g.toon.relay"}}}}"#;
 
     #[test]
     fn an_answer_with_no_greeting_asks_for_nothing() {
@@ -120,7 +120,7 @@ mod tests {
             .expect("the entry is there")
             .expect("and it reads");
         assert_eq!(terms.price(), Some(2000));
-        assert_eq!(terms.pay_to(), Some("g.toon.relay"));
+        assert_eq!(terms.ilp_address(), Some("g.toon.relay"));
     }
 
     /// Issue #874's load-bearing distinction: an unreadable greeting is an

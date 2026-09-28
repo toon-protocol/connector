@@ -63,7 +63,6 @@ fn voucher_ack(rejection: &ClaimIngestRejection) -> ClaimAckOutcome {
             ClaimAckOutcome::Rejected(ClaimRejectReason::SignatureInvalid)
         }
         ClaimIngestRejection::AmountNotAdvancing
-        | ClaimIngestRejection::NonceNotAdvancing
         | ClaimIngestRejection::Underpayment { .. }
         | ClaimIngestRejection::Undercollateralized { .. } => {
             ClaimAckOutcome::Rejected(ClaimRejectReason::AmountNotAdvancing)
@@ -73,11 +72,11 @@ fn voucher_ack(rejection: &ClaimIngestRejection) -> ClaimAckOutcome {
         // caught by a wildcard, so a new refusal has to be placed here.
         ClaimIngestRejection::Malformed(_)
         | ClaimIngestRejection::Mina
+        | ClaimIngestRejection::ToonChannel
         | ClaimIngestRejection::UnknownChannel
         | ClaimIngestRejection::ChannelTerminal(_)
         | ClaimIngestRejection::WrapUnsupported
         | ClaimIngestRejection::WrapFailed(_)
-        | ClaimIngestRejection::SolanaClusterMismatch { .. }
         | ClaimIngestRejection::BatchSettlementNotAccepted
         | ClaimIngestRejection::VoucherChannelConfigMismatch => {
             ClaimAckOutcome::Rejected(ClaimRejectReason::UnknownChannel)
@@ -237,9 +236,6 @@ impl VoucherEvidence for ClientClaimGate {
                 )
                 .await
             }
-            // A `toon-channel` claim never proves the peer role (#1380):
-            // the role gate reads the frame carrying one as a client's.
-            ClientClaim::Evm(_) | ClientClaim::Solana(_) => VoucherCheck::Unresolved,
         }
     }
 

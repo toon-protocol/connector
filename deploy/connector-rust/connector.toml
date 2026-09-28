@@ -37,10 +37,12 @@ client_edge_addr = "0.0.0.0:3000"
 # Both are append-only, fsync'd per accepted claim, and replayed before this
 # node serves anything. Without a state_dir every channel's watermark lives
 # in process memory only, so a restart resets each one to "no claim ever
-# seen" -- and a channel with no watermark accepts any nonce, handing a
-# client every claim it already spent back as free service.
+# seen" -- and a channel with no watermark accepts any voucher naming more
+# than zero, handing a client every voucher it already spent back as free
+# service.
 #
-# Config load REFUSES a file that sets [[client_channels]] without this, and
+# Config load REFUSES a file that configures settlement or a channel row
+# without this, and
 # startup refuses to boot at all if the directory cannot be written, naming
 # the path -- never at the first claim, hours later.
 #
@@ -311,8 +313,8 @@ write_keys = ["REPLACE-WITH-A-64-HEX-CHARACTER-ED25519-PUBLIC-KEY-SEE-README-STE
 # # pin the peering to that one channel; omit it and a voucher by this signer
 # # proves the peering on whichever channel it rides.
 # #
-# # A channel here must NOT also be named in [[client_channels]] or as a
-# # [[pay_channels]] outbound_channel: a peering is two one-way channels, and
+# # A channel here must NOT also be named as a [[pay_channels]]
+# # outbound_channel: a peering is two one-way channels, and
 # # one channel in two roles would let the same money be counted twice.
 # #
 # # A row REQUIRES that chain's [settlement.<chain>.batch_settlement] table:
@@ -370,12 +372,13 @@ write_keys = ["REPLACE-WITH-A-64-HEX-CHARACTER-ED25519-PUBLIC-KEY-SEE-README-STE
 # # channel journal holds, or the node refuses to start: a channel it never
 # # opened is one it holds no terms for and could sign nothing on.
 # #
-# # Three tables name channels and they are not interchangeable:
+# # Two tables name channels and they are not interchangeable:
 # #   [[peer_channels]]   -- whose vouchers prove a peering (and, pinned,
 # #                          the channel the peer pays this node on)
-# #   [[client_channels]] -- a channel this node RECEIVES claims on
 # #   [[pay_channels]]    -- the channel this node PAYS the peer from
-# # No channel may appear in two of them.
+# # No channel may appear in both. ([[client_channels]] is gone: a client's
+# # x402 channel is resolved from the chain when its voucher presents it,
+# # and the table is refused by name -- ADR 0075, issue #1384.)
 # #
 # # client_edge_url is that peer's own `POST /ilp` endpoint: where this node
 # # arrives as a buyer, and where `POST /ilp/claim-state` says where its

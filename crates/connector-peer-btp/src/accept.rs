@@ -284,7 +284,7 @@ impl PeerSession {
                     frame.request_id,
                     "F00",
                     "NotAcceptedError",
-                    ambiguous.message(),
+                    &ambiguous.message(),
                 ))
                 .await?;
                 return Ok(None);

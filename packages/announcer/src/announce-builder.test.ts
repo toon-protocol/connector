@@ -22,30 +22,24 @@ const IDENTITY: ClientEdgeIdentity = { keyId: 'edge-key-1', publicKey: '0x04dead
 const EVM_GREETING: RouteGreeting = {
   destination: 'g.toon.relay',
   price: '1000',
-  httpEndpoint: '/ilp',
-  settlement: {
-    chain: 'evm:84532',
-    settlementAddress: '0xSettlement',
-    tokenNetworkRegistry: '0xRegistry',
-    tokenNetwork: '0xTokenNetwork',
-    tokenAddress: '0xToken',
-    decimals: 6,
-  },
-  settlements: [
+  endpoint: '/ilp',
+  batchSettlements: [
     {
-      chain: 'evm:84532',
-      settlementAddress: '0xSettlement',
-      tokenNetworkRegistry: '0xRegistry',
-      tokenNetwork: '0xTokenNetwork',
-      tokenAddress: '0xToken',
-      decimals: 6,
+      network: 'eip155:84532',
+      asset: '0xToken',
+      payTo: '0xSettlement',
+      extra: {
+        receiverAuthorizer: '0xSettlement',
+        withdrawDelay: 86400,
+        name: 'USDC',
+        version: '2',
+      },
     },
     {
-      chain: 'solana',
-      settlementAddress: 'SolSettlement111',
-      programId: 'ProgramId1111',
-      tokenAddress: 'MintAddress111',
-      decimals: 6,
+      network: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+      asset: 'MintAddress111',
+      payTo: 'SolSettlement111',
+      extra: { feePayer: 'SolSettlement111', withdrawDelay: 86400 },
     },
   ],
 };
@@ -66,10 +60,6 @@ test('buildAnnouncementInfo: given a mocked identity + greeting, produces the ex
       'evm:84532': '0xSettlement',
       'solana:devnet': 'SolSettlement111',
     },
-    tokenNetworks: {
-      'evm:84532': '0xTokenNetwork',
-      'solana:devnet': 'ProgramId1111',
-    },
     preferredTokens: {
       'evm:84532': '0xToken',
       'solana:devnet': 'MintAddress111',
@@ -80,10 +70,10 @@ test('buildAnnouncementInfo: given a mocked identity + greeting, produces the ex
   });
 });
 
-test('buildAnnouncementInfo: re-qualifies the edge greeting\'s bare "solana" chain to the configured solanaChainId', () => {
+test('buildAnnouncementInfo: announces a CAIP-2 solana network under the configured solanaChainId, and eip155 as evm', () => {
   const info = buildAnnouncementInfo(CONFIG, null, [EVM_GREETING]);
-  assert.ok(info.supportedChains?.includes('solana:devnet'));
-  assert.ok(!info.supportedChains?.includes('solana'));
+  assert.deepEqual(info.supportedChains, ['evm:84532', 'solana:devnet']);
+  assert.equal('tokenNetworks' in info, false);
 });
 
 test('buildAnnouncementInfo: degrades gracefully when identity and every greeting failed to resolve', () => {

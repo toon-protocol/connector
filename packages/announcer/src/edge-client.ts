@@ -9,13 +9,12 @@
  * - `GET /ilp/identity` (lib.rs ~202-207): this node's client-edge identity
  *   (`keyId` + the ADR 0018 wrap public key). Cheap, unauthenticated, always
  *   available.
- * - The x402 payment-required greeting (lib.rs ~365-368 documents
- *   `X402SettlementTerms` as exactly the facts a kind:10032 announce would
- *   otherwise carry): triggered by an unpaid `POST /ilp` addressing a priced
- *   route, decoded from the `payment-required` response header (base64 JSON,
- *   client-edge-spec.md §1.4). This is where the settlement contract
- *   addresses, token addresses and route price come from — the sidecar never
- *   hardcodes them.
+ * - The x402 payment-required greeting: triggered by an unpaid `POST /ilp`
+ *   addressing a priced route, decoded from the `payment-required` response
+ *   header (base64 JSON, client-edge-spec.md §1.4). Its `batch-settlement`
+ *   `accepts[]` entries are where the chains, receiving addresses and tokens
+ *   come from, and its `extensions.toon` terms are where the route price
+ *   comes from — the sidecar never hardcodes them.
  *
  * Both are best-effort: a failure to reach the edge, a non-402 answer, or a
  * malformed header logs and returns `null`/omits the route, exactly like the
@@ -34,46 +33,30 @@ export interface ClientEdgeIdentity {
   publicKey: string;
 }
 
-/** The EVM-shaped channel-opening facts (issue #617). */
-export interface X402EvmSettlementTerms {
-  chain: string;
-  settlementAddress: string;
-  tokenNetworkRegistry: string;
-  tokenNetwork: string;
-  tokenAddress: string;
-  decimals: number;
-}
-
-/** The Solana twin (issue #632). Structurally disjoint from the EVM shape (no `tokenNetworkRegistry`). */
-export interface X402SolanaSettlementTerms {
-  chain: string;
-  settlementAddress: string;
-  programId: string;
-  tokenAddress: string;
-  decimals: number;
-}
-
-export type X402ChainSettlementTerms = X402EvmSettlementTerms | X402SolanaSettlementTerms;
-
-export function isEvmSettlementTerms(
-  terms: X402ChainSettlementTerms
-): terms is X402EvmSettlementTerms {
-  return 'tokenNetworkRegistry' in terms;
-}
-
-export function isSolanaSettlementTerms(
-  terms: X402ChainSettlementTerms
-): terms is X402SolanaSettlementTerms {
-  return 'programId' in terms;
+/**
+ * One x402 `batch-settlement` entry of the greeting's `accepts[]` (ADR 0074
+ * decision 8, ADR 0075 decision 10): the chain it settles on (`network`,
+ * CAIP-2 -- `eip155:<chainId>` or `solana:<genesis-hash>`), the token
+ * (`asset`) and the receiver a payer's channel names (`payTo`). Since ADR
+ * 0075 (connector#1384) these are the whole list: the `toon-channel` entry,
+ * and its `TokenNetwork` / TOON-program settlement terms, are gone.
+ */
+export interface X402BatchSettlementOffer {
+  network: string;
+  asset: string;
+  payTo: string;
+  extra: Record<string, unknown>;
 }
 
 /** One route's resolved greeting facts. */
 export interface RouteGreeting {
   destination: string;
+  /** The route's price schedule base, from `extensions.toon.info.price`. */
   price: string;
-  httpEndpoint: string;
-  settlement?: X402EvmSettlementTerms;
-  settlements: X402ChainSettlementTerms[];
+  /** The path ILP packets are posted to, from `extensions.toon.info.endpoint`. */
+  endpoint: string;
+  /** Every `batch-settlement` entry of `accepts[]`, one per chain the node settles on. */
+  batchSettlements: X402BatchSettlementOffer[];
 }
 
 const PAYMENT_REQUIRED_HEADER = 'payment-required';
@@ -191,43 +174,42 @@ export async function fetchGreeting(
   }
 }
 
-/** Decode the base64 `payment-required` header into a {@link RouteGreeting}. Never throws. */
+/**
+ * Decode the base64 `payment-required` header into a {@link RouteGreeting}.
+ * Never throws.
+ *
+ * The route's TOON terms are read from `extensions.toon.info` (x402 v2's
+ * extension slot, connector#1384); the channel terms from the
+ * `batch-settlement` entries of `accepts[]` alone. A greeting from a
+ * connector that predates ADR 0075 -- its terms on a `toon-channel`
+ * `accepts[]` entry, no `extensions.toon` -- does not parse, and is logged.
+ */
 export function parseGreetingHeader(
   header: string,
   destination: string,
   logger: Logger
 ): RouteGreeting | null {
   try {
-    const json: unknown = JSON.parse(Buffer.from(header, 'base64').toString('utf8'));
-    const accepts = (json as { accepts?: unknown[] }).accepts;
-    const entry = Array.isArray(accepts)
-      ? (accepts[0] as Record<string, unknown> | undefined)
-      : undefined;
-    const extra = entry?.extra as Record<string, unknown> | undefined;
-    if (
-      !entry ||
-      !extra ||
-      typeof entry.httpEndpoint !== 'string' ||
-      typeof extra.price !== 'string'
-    ) {
+    const json = JSON.parse(Buffer.from(header, 'base64').toString('utf8')) as {
+      accepts?: unknown[];
+      extensions?: { toon?: { info?: Record<string, unknown> } };
+    };
+    const info = json.extensions?.toon?.info;
+    if (!info || typeof info.price !== 'string') {
       logger.warn(
         { event: 'edge_greeting_malformed', destination },
-        'payment-required header did not parse to the expected shape'
+        'payment-required header carried no extensions.toon terms'
       );
       return null;
     }
-    const settlement = isEvmLike(extra.settlement)
-      ? (extra.settlement as X402EvmSettlementTerms)
-      : undefined;
-    const settlements = Array.isArray(extra.settlements)
-      ? (extra.settlements as unknown[]).filter(isChainSettlementLike)
+    const batchSettlements = Array.isArray(json.accepts)
+      ? json.accepts.filter(isBatchSettlementOffer)
       : [];
     return {
       destination,
-      price: extra.price,
-      httpEndpoint: entry.httpEndpoint,
-      settlement,
-      settlements,
+      price: info.price,
+      endpoint: typeof info.endpoint === 'string' ? info.endpoint : '/ilp',
+      batchSettlements,
     };
   } catch (err) {
     logger.warn(
@@ -238,13 +220,17 @@ export function parseGreetingHeader(
   }
 }
 
-function isEvmLike(value: unknown): value is X402EvmSettlementTerms {
-  return typeof value === 'object' && value !== null && 'tokenNetworkRegistry' in value;
-}
-
-function isChainSettlementLike(value: unknown): value is X402ChainSettlementTerms {
+function isBatchSettlementOffer(value: unknown): value is X402BatchSettlementOffer {
   if (typeof value !== 'object' || value === null) return false;
-  return 'tokenNetworkRegistry' in value || 'programId' in value;
+  const entry = value as Record<string, unknown>;
+  return (
+    entry.scheme === 'batch-settlement' &&
+    typeof entry.network === 'string' &&
+    typeof entry.asset === 'string' &&
+    typeof entry.payTo === 'string' &&
+    typeof entry.extra === 'object' &&
+    entry.extra !== null
+  );
 }
 
 function errMsg(err: unknown): string {

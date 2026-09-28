@@ -864,7 +864,6 @@ fn serve_self_description(chain: &Chain, receiver: Address) -> SocketAddr {
             http_endpoint: Some(format!("http://{addr}/ilp")),
             btp_endpoint: None,
             peer_carriages: vec!["http".to_string()],
-            settlements: Vec::new(),
             batch_settlements: vec![X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
                 network: network.clone(),
                 asset: spelled(chain.token),

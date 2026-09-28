@@ -1458,6 +1458,7 @@ dependencies = [
  "connector-peer-btp",
  "connector-peer-http",
  "connector-runtime",
+ "connector-settlement",
  "connector-signer",
  "hex",
  "serde",

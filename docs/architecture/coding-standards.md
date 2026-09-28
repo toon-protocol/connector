@@ -80,7 +80,7 @@ one.
   ([ADR 0014](../adr/0014-metrics-surface-and-packet-correlated-logs.md)). Do not thread a
   correlation id through call signatures. The same span carries `client_channel_id` whenever a
   client claim admitted the packet, joinable to `state_dir/client-edge-claims.log`'s
-  `InboundClaimAccepted` entries and the channel's `[[client_channels]]`/chain-resolved record
+  `InboundClaimAccepted` entries and the channel's chain-resolved record
   ([ADR 0036](../adr/0036-a-paid-deliverys-attribution-stays-on-the-connector.md)) — the same
   channel key the delivery's own `X-TOON-Payer` carries, per the bullet below.
 - **Never log a private key, a mnemonic, a bearer token or a decrypted payload.** A gift wrap's

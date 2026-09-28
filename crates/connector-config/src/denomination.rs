@@ -5,7 +5,7 @@ use chrono::TimeDelta;
 use connector_domain::{AssetChain, AssetId, GuardOverride, Guards, MaxMove, Rate, Spread, Ttl};
 use serde::Deserialize;
 
-use crate::client_channel::{is_base58_32_bytes, parse_evm_address, to_hex};
+use crate::encoding::{is_base58_32_bytes, parse_evm_address, to_hex};
 use crate::error::ConfigError;
 use crate::settlement::{SettlementChain, SettlementTables};
 

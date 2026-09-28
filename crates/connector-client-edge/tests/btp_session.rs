@@ -11,9 +11,11 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use connector_client_edge::{
-    ClientChannelRegistry, ClientClaimGate, DepositFloor, EvmChannel, SESSION_LEASE_BACKSTOP_TTL,
+    AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
+    ChannelResolutionError, ClientClaimGate, SESSION_LEASE_BACKSTOP_TTL,
 };
 use connector_config::{StaticRoute, TransportPolicy};
 use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject};
@@ -21,8 +23,8 @@ use connector_runtime::{
     AppOutcome, Connector, FakeAppClient, InMemoryJournal, InProcessPeerTransport, TestClock,
 };
 use connector_signer::{
-    derive_evm_address, evm_balance_proof_digest, to_hex, EvmBalanceProof, LocalSigner,
-    PublicKeyBytes, Signer,
+    derive_evm_address, evm_batch_channel_id, evm_voucher_digest, BatchChannelConfig,
+    BatchSettlementDomain, LocalSigner, PublicKeyBytes, Signer,
 };
 use futures_util::{SinkExt, StreamExt};
 use hyper::{Body as HttpBody, Client as HttpClient, Request as HttpRequest, StatusCode};
@@ -30,8 +32,7 @@ use libsecp256k1::{Message as SecpMessage, PublicKey, SecretKey};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 const PRICE: u64 = 100;
-const EVM_CHAIN_ID: u64 = 8453;
-const EVM_TOKEN_NETWORK_ADDRESS: [u8; 20] = [0x42; 20];
+const EVM_CHAIN_ID: u64 = 84_532;
 
 // ─── client-side §1.9 frame grammar, written independently of the server ───
 
@@ -175,56 +176,103 @@ fn evm_signer() -> (SecretKey, connector_signer::Address) {
     (secret, derive_evm_address(&public.serialize()))
 }
 
-fn channel_hex() -> String {
-    "ab".repeat(32)
+fn domain() -> BatchSettlementDomain {
+    BatchSettlementDomain::x402(EVM_CHAIN_ID)
 }
 
-/// An EVM claim JSON with a genuine EIP-712 signature over its own fields,
-/// exactly the JSON `JSON.stringify(claim)` produces client-side -- raw,
-/// not base64: §1.9's protocolData carriage.
-fn evm_claim_json(nonce: u64, transferred_amount: u64) -> String {
-    let (secret, address) = evm_signer();
-    let mut channel_id = [0u8; 32];
-    hex::decode_to_slice(channel_hex(), &mut channel_id).unwrap();
-    let proof = EvmBalanceProof {
-        channel_id,
-        nonce,
-        transferred_amount: u128::from(transferred_amount),
-        locked_amount: 0,
-        locks_root: [0u8; 32],
-        chain_id: EVM_CHAIN_ID,
-        token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-    };
-    let digest = evm_balance_proof_digest(&proof);
+/// The one x402 channel every voucher below is on, its voucher signer
+/// ([`evm_signer`]) its `payerAuthorizer`.
+fn config() -> BatchChannelConfig {
+    BatchChannelConfig {
+        payer: [0x11; 20],
+        payer_authorizer: evm_signer().1,
+        receiver: [0x33; 20],
+        receiver_authorizer: [0x33; 20],
+        token: [0x55; 20],
+        withdraw_delay: 86_400,
+        salt: [0x66; 32],
+    }
+}
+
+/// An EVM voucher JSON for cumulative `amount`, genuinely signed, exactly
+/// the JSON `JSON.stringify(voucher)` produces client-side -- raw, not
+/// base64: §1.9's protocolData carriage.
+fn evm_claim_json(amount: u64) -> String {
+    let (secret, _address) = evm_signer();
+    let config = config();
+    let channel_id = evm_batch_channel_id(&domain(), &config);
+    let digest = evm_voucher_digest(&domain(), &channel_id, u128::from(amount));
     let (signature, recovery_id) = libsecp256k1::sign(&SecpMessage::parse(&digest), &secret);
     let mut sig_bytes = signature.serialize().to_vec();
-    let recovery_byte: u8 = recovery_id.into();
-    sig_bytes.push(recovery_byte + 27);
-    format!(
-        r#"{{"version":"1.0","blockchain":"evm","messageId":"msg-{nonce}","timestamp":"2026-02-02T12:00:00.000Z","senderId":"btp-test","channelId":"0x{channel}","nonce":{nonce},"transferredAmount":"{transferred_amount}","lockedAmount":"0","locksRoot":"0x{zeros}","signature":"0x{signature}","signerAddress":"{address}","chainId":{EVM_CHAIN_ID},"tokenNetworkAddress":"{token_network}"}}"#,
-        channel = channel_hex(),
-        zeros = "0".repeat(64),
-        signature = hex::encode(&sig_bytes),
-        address = to_hex(&address),
-        token_network = to_hex(&EVM_TOKEN_NETWORK_ADDRESS),
-    )
+    sig_bytes.push(recovery_id.serialize() + 27);
+    let address = |bytes: &[u8; 20]| format!("0x{}", hex::encode(bytes));
+    serde_json::json!({
+        "version": "1.0",
+        "blockchain": "evm",
+        "scheme": "batch-settlement",
+        "messageId": format!("msg-{amount}"),
+        "timestamp": "2026-02-02T12:00:00.000Z",
+        "senderId": "btp-test",
+        "channelId": format!("0x{}", hex::encode(channel_id)),
+        "maxClaimableAmount": amount.to_string(),
+        "signature": format!("0x{}", hex::encode(sig_bytes)),
+        "channelConfig": {
+            "payer": address(&config.payer),
+            "payerAuthorizer": address(&config.payer_authorizer),
+            "receiver": address(&config.receiver),
+            "receiverAuthorizer": address(&config.receiver_authorizer),
+            "token": address(&config.token),
+            "withdrawDelay": config.withdraw_delay,
+            "salt": format!("0x{}", hex::encode(config.salt)),
+        },
+    })
+    .to_string()
 }
 
-fn test_channels() -> ClientChannelRegistry {
-    let (_secret, counterparty) = evm_signer();
-    let mut channels = ClientChannelRegistry::new();
-    channels
-        .record_evm(
-            &channel_hex(),
-            EvmChannel {
-                counterparty,
-                chain_id: EVM_CHAIN_ID,
-                token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-                deposit_floor: DepositFloor::Unknown,
-            },
+/// A settlement backend admitting [`config`]'s channel with unbounded
+/// collateral: the chain these tests do not need, which only ever answers
+/// what a real backend would for that one channel.
+#[derive(Debug)]
+struct OneChannel;
+
+#[async_trait]
+impl BatchSettlementChannels for OneChannel {
+    fn evm_domain(&self) -> Option<BatchSettlementDomain> {
+        Some(domain())
+    }
+
+    fn accepts_solana(&self) -> bool {
+        false
+    }
+
+    async fn evm(
+        &self,
+        channel_id: &[u8; 32],
+        _presented_config: Option<&BatchChannelConfig>,
+    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
+        Ok(
+            (*channel_id == evm_batch_channel_id(&domain(), &config())).then_some(
+                AdmittedEvmVoucherChannel {
+                    config: config(),
+                    max_cumulative: u64::MAX,
+                },
+            ),
         )
-        .expect("a 32-byte hex channel id");
-    channels
+    }
+
+    async fn solana(
+        &self,
+        _channel_account: &[u8; 32],
+    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
+        Ok(None)
+    }
+}
+
+/// A gate over `journal` admitting vouchers on [`config`]'s channel.
+fn voucher_gate(journal: Arc<dyn connector_runtime::Journal>) -> ClientClaimGate {
+    ClientClaimGate::restore(journal)
+        .expect("the journal replays")
+        .with_batch_settlement(Arc::new(OneChannel))
 }
 
 fn test_clock() -> Arc<TestClock> {
@@ -301,8 +349,7 @@ async fn serve_edge_with_route(
         )
         .with_identity_signer(signer.clone()),
     );
-    let gate = ClientClaimGate::restore(test_channels(), Arc::new(InMemoryJournal::new()))
-        .expect("a fresh in-memory journal has nothing to replay");
+    let gate = voucher_gate(Arc::new(InMemoryJournal::new()));
     let app = connector_client_edge::router_with_gate(connector, signer.clone(), None, gate);
     let server = axum::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(app.into_make_service());
     let addr = server.local_addr();
@@ -369,7 +416,7 @@ async fn an_authenticated_session_pipelines_paid_writes_in_claim_order() {
     let receiver = signer.public_key().unwrap();
     // All five frames written before any response is read.
     for nonce in 1..=5u64 {
-        let claim = evm_claim_json(nonce, nonce * PRICE);
+        let claim = evm_claim_json(nonce * PRICE);
         let prepare = sealed_prepare("g.test.app", &receiver);
         send(
             &mut session,
@@ -429,12 +476,15 @@ async fn a_claimless_prepare_to_a_priced_route_is_refused_with_the_terms() {
         serde_json::from_slice(pd(&answer, "payment-required").expect("the terms ride along"))
             .expect("the terms are the §1.4 JSON");
     assert_eq!(terms["x402Version"], 2);
-    assert_eq!(terms["accepts"][0]["amount"], PRICE.to_string());
+    assert_eq!(
+        terms["extensions"]["toon"]["info"]["amount"],
+        PRICE.to_string()
+    );
     // Issue #722: the same greeting also carries the session lease backstop
     // TTL the client session registry actually enforces, over BTP exactly
     // as over HTTP -- both carriages share `x402_terms_body`.
     assert_eq!(
-        terms["accepts"][0]["extra"]["sessionLeaseTtlMs"],
+        terms["extensions"]["toon"]["info"]["sessionLeaseTtlMs"],
         SESSION_LEASE_BACKSTOP_TTL.as_millis() as u64
     );
 }
@@ -484,10 +534,10 @@ async fn a_dialing_peer_reads_the_terms_off_the_greeting_the_edge_emits() {
         Some(PRICE),
         "the price the dialer must cover is the one this route charges"
     );
-    assert_eq!(terms.pay_to(), Some("g.test.app"));
+    assert_eq!(terms.ilp_address(), Some("g.test.app"));
     assert_eq!(terms.required_transport(), None);
     assert_eq!(
-        terms.offer().unwrap().extra.session_lease_ttl_ms,
+        terms.toon().unwrap().session_lease_ttl_ms,
         SESSION_LEASE_BACKSTOP_TTL.as_millis() as u64
     );
 }
@@ -553,7 +603,10 @@ async fn a_prepare_to_an_http_only_route_is_refused_over_btp_with_the_required_t
     let terms: serde_json::Value =
         serde_json::from_slice(pd(&answer, "payment-required").expect("the terms ride along"))
             .expect("the terms are the §1.4 JSON, reused");
-    assert_eq!(terms["accepts"][0]["extra"]["requiredTransport"], "http");
+    assert_eq!(
+        terms["extensions"]["toon"]["info"]["requiredTransport"],
+        "http"
+    );
 
     assert!(
         app_client.deliveries().is_empty(),
@@ -577,7 +630,7 @@ async fn a_paid_prepare_to_an_http_only_route_is_still_refused_over_btp() {
     let (addr, signer) = serve_edge_with_route(route, app_client.clone()).await;
     let mut session = connect(addr).await;
 
-    let claim = evm_claim_json(1, PRICE);
+    let claim = evm_claim_json(PRICE);
     let prepare = sealed_prepare("g.test.app", &signer.public_key().unwrap());
     send(
         &mut session,
@@ -600,16 +653,17 @@ async fn a_paid_prepare_to_an_http_only_route_is_still_refused_over_btp() {
     );
 }
 
-/// §1.3 over the new carriage: a non-advancing nonce is refused exactly as
-/// HTTP refuses it (F01, the shared taxonomy) -- same gate, same watermark,
-/// so the first claim's nonce is spent for both carriages at once.
+/// §1.3 over the new carriage: a voucher that does not advance the watermark
+/// is refused exactly as HTTP refuses it (F01, the shared taxonomy) -- same
+/// gate, same watermark, so the first voucher is spent for both carriages at
+/// once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replayed_claim_is_refused_with_the_http_taxonomy() {
     let (addr, signer) = serve_edge().await;
     let mut session = connect(addr).await;
     let receiver = signer.public_key().unwrap();
 
-    let claim = evm_claim_json(1, PRICE);
+    let claim = evm_claim_json(2 * PRICE);
     send(
         &mut session,
         btp_message(
@@ -622,13 +676,14 @@ async fn a_replayed_claim_is_refused_with_the_http_taxonomy() {
     let first = next_answer(&mut session).await;
     Fulfill::decode(&first.ilp_packet).expect("the fresh claim pays");
 
-    // The same claim again: structurally and cryptographically fine, its
-    // nonce simply does not advance.
+    // An older voucher: structurally and cryptographically fine, its
+    // amount simply does not exceed the watermark.
+    let older = evm_claim_json(PRICE);
     send(
         &mut session,
         btp_message(
             2,
-            &[("payment-channel-claim", claim.as_bytes())],
+            &[("payment-channel-claim", older.as_bytes())],
             &sealed_prepare("g.test.app", &receiver).encode(),
         ),
     )
@@ -651,7 +706,7 @@ async fn a_claim_covering_a_packet_refused_for_envelope_shape_is_never_spent_ove
     let (addr, signer) = serve_edge().await;
     let mut session = connect(addr).await;
     let receiver = signer.public_key().unwrap();
-    let claim = evm_claim_json(1, PRICE);
+    let claim = evm_claim_json(PRICE);
 
     send(
         &mut session,
@@ -685,13 +740,13 @@ async fn a_claim_covering_a_packet_refused_for_envelope_shape_is_never_spent_ove
 /// §1.9 step 4: a standalone claim is ingested fire-and-forget -- no
 /// response frame -- and genuinely advances the shared watermark: the auth
 /// frame sent after it is answered first (nothing answered the claim), and
-/// a following paid write must present nonce 2, not 1.
+/// a following paid write must advance past it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_standalone_claim_registers_silently_and_advances_the_watermark() {
     let (addr, signer) = serve_edge().await;
     let mut session = connect(addr).await;
 
-    let claim = evm_claim_json(1, PRICE);
+    let claim = evm_claim_json(PRICE);
     send(
         &mut session,
         btp_message(1, &[("payment-channel-claim", claim.as_bytes())], &[]),
@@ -708,10 +763,11 @@ async fn a_standalone_claim_registers_silently_and_advances_the_watermark() {
         "the standalone claim is answered with nothing; the auth ack is the first frame back"
     );
 
-    // Nonce 1 is spent: a packet claim reusing it is refused, and nonce 2
-    // fulfils -- the fire-and-forget claim reached the same watermark.
+    // The voucher is spent: resent on a paid packet it buys nothing (an
+    // underpayment), and one advancing past it fulfils -- the
+    // fire-and-forget claim reached the same watermark.
     let receiver = signer.public_key().unwrap();
-    let replay = evm_claim_json(1, PRICE);
+    let replay = evm_claim_json(PRICE);
     send(
         &mut session,
         btp_message(
@@ -723,9 +779,9 @@ async fn a_standalone_claim_registers_silently_and_advances_the_watermark() {
     .await;
     let refused = next_answer(&mut session).await;
     let reject = Reject::decode(&refused.ilp_packet).expect("an OER REJECT");
-    assert_eq!(reject.code.as_str(), "F01");
+    assert_eq!(reject.code.as_str(), "F03");
 
-    let fresh = evm_claim_json(2, 2 * PRICE);
+    let fresh = evm_claim_json(2 * PRICE);
     send(
         &mut session,
         btp_message(
@@ -736,7 +792,7 @@ async fn a_standalone_claim_registers_silently_and_advances_the_watermark() {
     )
     .await;
     let fulfilled = next_answer(&mut session).await;
-    Fulfill::decode(&fulfilled.ilp_packet).expect("nonce 2 pays");
+    Fulfill::decode(&fulfilled.ilp_packet).expect("an advancing voucher pays");
 }
 
 /// §1.9 step 5: an undecodable frame whose requestId was readable is
@@ -1072,8 +1128,7 @@ async fn serve_slow_edge(
         )
         .with_identity_signer(signer.clone()),
     );
-    let gate =
-        ClientClaimGate::restore(test_channels(), journal).expect("a fresh journal replays empty");
+    let gate = voucher_gate(journal);
     let app = connector_client_edge::router_with_gate(connector, signer.clone(), None, gate);
     let server = axum::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(app.into_make_service());
     let addr = server.local_addr();
@@ -1142,7 +1197,7 @@ async fn a_single_session_pipelines_admission_instead_of_serializing_it() {
     });
 
     for nonce in 1..=WRITES {
-        let claim = evm_claim_json(nonce, nonce * PRICE);
+        let claim = evm_claim_json(nonce * PRICE);
         let prepare = sealed_prepare("g.test.app", &receiver);
         sink.send(WsMessage::Binary(btp_message(
             nonce as u32,

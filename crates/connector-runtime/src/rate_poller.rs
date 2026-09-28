@@ -437,7 +437,7 @@ impl RatePoller {
     /// that has just booted prices its pairs as soon as its source can
     /// answer rather than one cadence later. Never returns, so it is
     /// spawned rather than awaited: startup does not wait on a chain, in the
-    /// same shape `EvmChannelIndexSyncer::run` already runs in.
+    /// same shape the batch-settlement watchers run in.
     pub async fn run(self) {
         let mut ticks = tokio::time::interval(self.cadence);
         // A tick missed because a read took longer than the cadence is a

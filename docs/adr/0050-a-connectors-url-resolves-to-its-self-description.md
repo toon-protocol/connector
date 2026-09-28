@@ -188,4 +188,7 @@ address on EVM, its settlement key on Solana — which is what a peer binds this
 channel by. The greeting's `accepts[]` is `batch-settlement` entries only.
 
 **Built in part by #1378:** the document publishes `voucherSigners`, one per chain this node pays
-x402 on. `settlements` stays until #1384 drops it, and the greeting is untouched until then.
+x402 on. **Built by #1384:** the document no longer publishes `settlements`; `batchSettlements`
+and `voucherSigners` are its settlement facts. The greeting's `accepts[]` is `batch-settlement`
+entries only, and TOON's own terms (the quoted amount, the price schedule, this node's addresses)
+ride in x402's `extensions.toon` (0075's `## Update (issue #1384)`).

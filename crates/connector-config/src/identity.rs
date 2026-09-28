@@ -8,8 +8,8 @@ use crate::error::ConfigError;
 /// client-edge identity this node authenticates over HTTP
 /// (`docs/protocol/client-edge-spec.md` §1.2), distinct from `[[peers]]`
 /// (a peering relation this node dials, addressed by `endpoint`) and from
-/// `[[client_channels]]` (which channel a claim is judged against, never
-/// who presented it). A client identity has no network address and no
+/// the channel a voucher names (which is what a claim is judged against,
+/// never who presented it). A client identity has no network address and no
 /// channel of its own -- it is authenticated by `id` + `secret` alone,
 /// since the party presenting it (a registered buyer over `POST /ilp`) is
 /// never something this node connects out to.

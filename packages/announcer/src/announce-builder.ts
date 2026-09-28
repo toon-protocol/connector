@@ -16,7 +16,6 @@
  */
 
 import type { ClientEdgeIdentity, RouteGreeting } from './edge-client';
-import { isEvmSettlementTerms, isSolanaSettlementTerms } from './edge-client';
 import type { IlpPeerInfo, OperatorNotice } from './event';
 
 /** Static (never edge-derived) parts of the announcement — sidecar config. */
@@ -38,11 +37,11 @@ export interface AnnounceStaticConfig {
   /** The address a client should STORE (blob uploads) to. */
   routeStore: string;
   /**
-   * The x402 greeting's Solana settlement terms report a bare `"solana"`
-   * chain (no cluster id — see `X402SolanaSettlementTerms`'s doc in
-   * edge-client.ts). Core's kind:10032 schema requires a qualified 2-3
-   * segment chain id, so this re-qualifies it (default `solana:devnet`,
-   * matching this fleet's only deployed cluster).
+   * The x402 greeting's Solana `batch-settlement` entry names its chain by
+   * CAIP-2 genesis hash (`solana:<hash>`), not by cluster name. Kind:10032
+   * consumers key chains as `solana:<cluster>`, so every `solana:*` network
+   * is announced under this id (default `solana:devnet`, matching this
+   * fleet's only deployed cluster).
    */
   solanaChainId: string;
   /**
@@ -67,29 +66,27 @@ export function buildAnnouncementInfo(
 ): IlpPeerInfo {
   const supportedChains: string[] = [];
   const settlementAddresses: Record<string, string> = {};
-  const tokenNetworks: Record<string, string> = {};
   const preferredTokens: Record<string, string> = {};
   const routePrices: Record<string, string> = {};
 
-  const addChain = (id: string): string => (id === 'solana' ? config.solanaChainId : id);
+  // CAIP-2 `eip155:<id>` is announced as TOON's `evm:<id>`; any `solana:*`
+  // as the configured cluster id. Anything else passes through unchanged.
+  const chainOf = (network: string): string => {
+    if (network.startsWith('eip155:')) return `evm:${network.slice('eip155:'.length)}`;
+    if (network === 'solana' || network.startsWith('solana:')) return config.solanaChainId;
+    return network;
+  };
 
   for (const greeting of greetings) {
     routePrices[greeting.destination] = greeting.price;
-
-    const allTerms = [
-      ...(greeting.settlement ? [greeting.settlement] : []),
-      ...greeting.settlements,
-    ];
-    for (const terms of allTerms) {
-      const chainId = addChain(terms.chain);
+    // ADR 0075 (connector#1384): the greeting's `batch-settlement` entries
+    // are the only channel terms there are. There is no TokenNetwork or
+    // TOON program to announce any more, so `tokenNetworks` is gone.
+    for (const offer of greeting.batchSettlements) {
+      const chainId = chainOf(offer.network);
       if (!supportedChains.includes(chainId)) supportedChains.push(chainId);
-      settlementAddresses[chainId] = terms.settlementAddress;
-      preferredTokens[chainId] = terms.tokenAddress;
-      if (isEvmSettlementTerms(terms)) {
-        tokenNetworks[chainId] = terms.tokenNetwork;
-      } else if (isSolanaSettlementTerms(terms)) {
-        tokenNetworks[chainId] = terms.programId;
-      }
+      settlementAddresses[chainId] = offer.payTo;
+      preferredTokens[chainId] = offer.asset;
     }
   }
 
@@ -103,7 +100,6 @@ export function buildAnnouncementInfo(
     assetScale: config.assetScale,
     ...(supportedChains.length > 0 ? { supportedChains } : {}),
     ...(Object.keys(settlementAddresses).length > 0 ? { settlementAddresses } : {}),
-    ...(Object.keys(tokenNetworks).length > 0 ? { tokenNetworks } : {}),
     ...(Object.keys(preferredTokens).length > 0 ? { preferredTokens } : {}),
     ...(Object.keys(routePrices).length > 0 ? { routePrices } : {}),
     ...(identity ? { edgeIdentity: { keyId: identity.keyId, publicKey: identity.publicKey } } : {}),

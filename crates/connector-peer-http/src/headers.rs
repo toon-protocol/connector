@@ -160,6 +160,18 @@ impl PeerResponse {
         }
     }
 
+    /// A refusal with no ILP body that names its reason in a `text/plain`
+    /// body -- a `toon-channel` claim, refused by name (ADR 0075, issue
+    /// #1384). Still not an ILP answer: the status is what says so.
+    #[must_use]
+    pub fn refused_naming(status: u16, reason: &[u8]) -> Self {
+        PeerResponse {
+            status,
+            headers: Headers::new(),
+            body: reason.to_vec(),
+        }
+    }
+
     /// Whether this response carries an ILP answer at all. A non-`200` does
     /// not, so nothing on it -- including a `Toon-Claim-Ack` -- is read as a
     /// verdict.

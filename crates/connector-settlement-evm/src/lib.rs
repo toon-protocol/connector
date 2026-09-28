@@ -28,8 +28,6 @@ mod batch_settlement;
 mod batch_watch;
 mod bindings;
 mod channel_id;
-mod channel_index;
-pub mod channel_index_sync;
 mod log_query;
 mod send;
 // Also compiled for this crate's own `#[cfg(test)]` unit tests (none left
@@ -49,13 +47,8 @@ pub use batch_watch::{
     WITHDRAWAL_WATCH_INTERVAL,
 };
 pub use channel_id::{derive_channel_id, sort_participants};
-pub use channel_index::{
-    ChannelIndexEvent, ChannelIndexLookup, EvmChannelIndex, EvmChannelIndexError,
-    IndexedChannelStatus, IndexedContract, OrderedChannelIndexEvent, RejectedSnapshot,
-};
-pub use channel_index_sync::{ChannelIndexSyncError, EvmChannelIndexSyncer, DEFAULT_POLL_INTERVAL};
 /// A settlement table's endpoint, which [`EvmSettlementBackend::connect`]
-/// and [`EvmChannelIndexSyncer::new`] take in place of a URL (ADR 0073).
+/// takes in place of a URL (ADR 0073).
 /// Re-exported so a caller building one does not need a second dependency
 /// to name it.
 pub use connector_chain_rpc::RpcTransport;
@@ -445,13 +438,11 @@ impl EvmSettlementBackend {
     /// never confused with "I could not find out". Two `eth_call`s:
     /// `channelEpoch`, then `channels` at the id that derives from it.
     ///
-    /// The read goes to the chain rather than to
-    /// [`EvmChannelIndex`]'s `lookup`, and deliberately: that index is a
-    /// projection of `ChannelOpened` logs and is only complete once
-    /// `channel_index_from_block` has been replayed, so a "none exists"
-    /// out of a half-built index opens a duplicate channel. A derivation
-    /// plus a point read has no such window -- ADR 0059 rejects building
-    /// a local participant index for exactly this reason.
+    /// The read goes to the chain, never to a local projection of
+    /// `ChannelOpened` logs: a "none exists" out of a half-built index
+    /// opens a duplicate channel. A derivation plus a point read has no
+    /// such window -- ADR 0059 rejects building a local participant index
+    /// for exactly this reason.
     ///
     /// "Live" is `Opened` or `Closed`: a `Closed` channel is still in its
     /// challenge window, still holds collateral and still occupies the

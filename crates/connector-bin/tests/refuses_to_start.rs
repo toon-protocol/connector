@@ -466,13 +466,13 @@ peer_id = "store"
 
 // -- Durable claim state (issue #605) --
 
-/// A node that can accept claims but names nowhere durable to record them
+/// A node that can accept vouchers but names nowhere durable to record them
 /// never starts. Without this it starts happily, serves, and gives every
-/// already-spent claim back to the client the next time it restarts --
+/// already-spent voucher back to the client the next time it restarts --
 /// with nothing in any log to see, because from the gate's point of view
-/// every replayed nonce genuinely looks fresh.
+/// every replayed voucher genuinely looks fresh.
 #[test]
-fn exits_non_zero_when_client_channels_are_configured_without_a_state_dir() {
+fn exits_non_zero_when_a_settlement_table_is_configured_without_a_state_dir() {
     let key_file = write_raw_key_file();
     let config_file = write_config(&format!(
         r#"
@@ -481,15 +481,6 @@ client_edge_addr = "127.0.0.1:0"
 [signer]
 key_file = "{key_file}"
 
-[[client_channels]]
-channel_id = "0x{channel}"
-counterparty = "0x00000000000000000000000000000000000000aa"
-chain_id = 8453
-token_network_address = "0x00000000000000000000000000000000000000bb"
-
-# An EVM client channel needs `[settlement.evm]` too (issue #1138), and
-# this test is about the other requirement -- so it carries one, or the
-# refusal it asserts would never be the one reached.
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
 contract_address = "0x1234567890123456789012345678901234567890"
@@ -500,7 +491,6 @@ decimals = 6
 key_file = "{key_file}"
 "#,
         key_file = key_file.path().display(),
-        channel = "ab".repeat(32),
     ));
 
     let output = run(Some(config_file.path()));
@@ -513,19 +503,12 @@ key_file = "{key_file}"
     );
 }
 
-/// The `[[client_channels]]` half of issue #1138's one rule, at the level
-/// an operator meets it: the binary refuses to start, names the table to
-/// add, and says why. The same config with `[settlement.evm]` present is
-/// the test above, which reaches a different refusal entirely.
-///
-/// A declared channel is deliberately usable with no *chain connection* --
-/// it is answered from memory, never resolved, and exempt from the deposit
-/// cap (issue #646). That latitude is over how much a counterparty may
-/// spend on a channel this node is a participant of. Without
-/// `[settlement.evm]` this node has no EVM address to be that participant,
-/// so it would serve paid writes for claims nothing it holds could redeem.
+/// ADR 0075 decision 9, issue #1384, at the level an operator meets it: a
+/// config still declaring `[[client_channels]]` -- the channels a retired
+/// `toon-channel` claim was paid on -- stops the binary, by name, rather
+/// than booting a node that silently ignores the table.
 #[test]
-fn exits_non_zero_when_an_evm_client_channel_has_no_evm_settlement_table() {
+fn exits_non_zero_when_client_channels_are_still_declared() {
     let key_file = write_raw_key_file();
     let state_dir = tempfile::tempdir().expect("temp state dir");
     let config_file = write_config(&format!(
@@ -552,8 +535,8 @@ token_network_address = "0x00000000000000000000000000000000000000bb"
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("[settlement.evm]") && stderr.contains("on-chain participant"),
-        "expected the error to name the table to add and why, got: {stderr}"
+        stderr.contains("[[client_channels]]") && stderr.contains("ADR 0075"),
+        "expected the error to name the removed table and the record, got: {stderr}"
     );
 }
 

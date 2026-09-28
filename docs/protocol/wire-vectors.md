@@ -1,11 +1,14 @@
 # Wire vectors: the invariants behind them
 
 **Status:** **Live — the vector companion, role unchanged** (wayfinder map #1049, issue #1065).
-Its Scope section is stale on three counts and is corrected as part of the vector-coverage work
-(issue #1073): the committed set now also carries a `peer_carriage` section (20 dual-encoded entries,
-several of them behavioural) and a `channel_control_declaration` section that nothing describes, and it
-carries **no client-edge carriage section at all** despite this document's Scope claiming the client edge
-as its subject. _Originally:_ Non-normative. Per [ADR 0021](../adr/0021-vectors-are-normative-prose-is-not.md), the
+**`schema_version` 7** (issue #1384, [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+decision 14): every claim is an x402 voucher, and every `toon-channel` section — the EIP-712
+`BalanceProof` claim, the peer carriage's `toon-channel` claims, FLUSH and nonce cases, and the
+`TokenNetwork`-domain `channel_control_declaration` — is gone from the committed set. Its Scope
+section was stale and is corrected as part of the vector-coverage work (issue #1073): the committed
+set carries a `peer_carriage` section (dual-encoded entries, several of them behavioural), and a
+client-edge carriage section only for the `payout-claim` TRANSFER (`payout_voucher`). _Originally:_
+Non-normative. Per [ADR 0021](../adr/0021-vectors-are-normative-prose-is-not.md), the
 committed vector set (`vectors/wire-vectors.json`) is the cross-repo contract; this document only
 names the invariants it is evidence of, written down before any vector was generated, per its own
 acceptance criterion. A disagreement between this text and the vectors is a bug in this text.
@@ -16,14 +19,12 @@ acceptance criterion. A disagreement between this text and the vectors is a bug 
 
 This covers the **client edge** termination wire (issue #498): the structured envelope
 (`connector_domain::envelope`), the gift wrap sealing it (`connector_signer::giftwrap`), the
-fulfilment a terminating connector derives from it (ADR 0019), and the EIP-712 `BalanceProof`
-claim-signing scheme (`connector_signer::claim_signature`, ADR 0024). The claim scheme is included
-even though it is also what the **peer semantics**'s claim exchange uses (`docs/protocol/
-peer-semantics-pre-868.md` §3.5) — `connector_signer::claim_signature` is one implementation shared by
-both wires, not two, and a client-edge claim (`client-edge-spec.md` §1.3 step 4) is checked against
-exactly the same digest. Nothing else about the peer semantics is in scope here: it is
-operator-to-operator on both ends (ADR 0003), already normative prose for a different reason, and
-the rest of it is out of this issue's scope.
+fulfilment a terminating connector derives from it (ADR 0019), and — since ADR 0075 made it the only
+claim on either edge — the x402 `batch-settlement` **voucher** (`connector_signer::voucher_signature`,
+ADR 0074), with the challenge that proves control of a voucher channel without moving value. The
+voucher is in scope on the peer carriages too: one parser (`parse_client_claim`) and one verifier
+serve both edges, so the peer carriage's voucher, peer-role challenge and refusal cases pin the same
+scheme. The retired `toon-channel` claim appears only as what every edge refuses by name.
 
 **The ILP packet's own encoding is in scope of the committed set, and was not in scope of this
 document.** That is worth saying because it has been misread three times: the `peer_carriage`
@@ -95,21 +96,21 @@ Held by `giftwrap::tests::derive_fulfillment_is_deterministic_for_the_same_secre
 determinism to a genuine `seal_request`/`open_request` pair rather than to a secret handed to both
 sides out of band.
 
-### 5. A claim's EIP-712 `BalanceProof` digest recovers to its signer, under its own domain
+### 5. A `toon-channel` claim is refused by name, everywhere
 
-`connector_signer::claim_signature::evm_balance_proof_digest` is deterministic for the same
-fields, and `verify_evm_balance_proof` accepts a signature over that digest only from the address
-that actually produced it — changing any one field (`channel_id`, `nonce`, `transferred_amount`,
-`chain_id`, or `token_network_address`) invalidates a prior signature rather than being silently
-tolerated. This is the scheme both the peer semantics (`ClaimBook::accept_inbound`) and the client edge
-(`client-edge-spec.md` §1.3 step 4) check a claim's signature against, replacing a SHA-256 tuple
-(`connector_domain::claim_digest`, removed by #575/#583) that no chain ever verified.
+[ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 8,
+issue #1384: a claim's `scheme` is required. A claim with no `scheme`, or with
+`scheme: "toon-channel"`, is the retired `toon-channel` claim (the EIP-712 `BalanceProof` of ADR
+0024 and the Solana message of ADR 0053, both retired by ADR 0075), and every edge refuses it **by
+name** rather than as malformed: the client edge's parser (`ClientClaimError::ToonChannel`), the BTP
+peer carriage with an ERROR frame (`F00`, `NotAcceptedError`, the refusal text as `data`), and the
+HTTP peer carriage with a `400` whose body is that text — each before the role is decided. `mina` is
+refused by name the same way, and first.
 
-Held open by `connector-signer`'s `claim_signature::tests` module:
-`a_genuine_evm_signature_verifies_against_its_signers_address`,
-`an_evm_signature_does_not_verify_against_a_different_partys_address`,
-`changing_any_evm_proof_field_invalidates_a_prior_signature` (covers every field, including the
-domain's `chain_id`/`token_network_address`), and `the_evm_digest_is_deterministic`.
+Held open by `connector-domain`'s `client_claim::tests` (including a proptest that no `scheme` or
+`"toon-channel"` is always refused), `connector-peer-btp`'s `claim_json::tests`, and pinned cross-repo
+by the `toon_channel_refused` section, whose generator runs every case through the real parser, the
+BTP evidence reader and the HTTP evidence reader before committing it.
 
 ### 6. A route's charge is `base + per_kib * ceil(payload_len / 1024)`, saturating
 
@@ -141,12 +142,12 @@ arithmetic and asserts it against `Price::charge` before committing it.
 
 [ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 3, issue
 #1347: a client-edge claim under `scheme: "batch-settlement"` — a **voucher** — carries no nonce, so
-`connector_domain::validate_voucher` judges its freshness by cumulative amount alone, and the
-comparison is not [`validate_claim`]'s. An amount **equal** to the channel's watermark is refused
-(`amount_not_advancing`) unless it is byte-identical — same amount, same signature — to the voucher
-that set that watermark, in which case it is a retransmission: accepted again, buying nothing new,
-exactly as a `toon-channel` claim retransmitted at its own watermark is accepted again today —
-and, because it buys nothing, refused as an underpayment where the charge is not zero. A strictly
+`connector_domain::validate_voucher` judges its freshness by cumulative amount alone — the only
+freshness rule since ADR 0075 deleted the nonce rules. An amount **equal** to the channel's
+watermark is refused (`amount_not_advancing`) unless it is byte-identical — same amount, same
+signature — to the voucher that set that watermark, in which case it is a retransmission: accepted
+again, buying nothing new — and, because it buys nothing, refused as an underpayment where the
+charge is not zero. A strictly
 higher amount is accepted, by the difference. Also pinned: a Solana voucher's `expiresAt`
 must be `0` — x402 requires it, and the program refuses a nonzero one at `settle` with no state
 change — so the connector refuses it structurally, before any signature check.
@@ -160,18 +161,42 @@ cross-repo by the `claim_voucher` section, whose `evm`/`solana` cases are checke
 workspace run, by `connector-settlement-evm`'s `x402_voucher_vector.rs`, against the deployed
 bytecode on an `anvil` at chain 84532 — and whose
 `amount_only_watermark`/`invalid` cases are checked against the real `validate_voucher` and claim
-parser before being committed.
+parser before being committed. The same `x402_voucher_vector.rs` also checks
+`peer_carriage.voucher_evm` and `payout_voucher.evm` — every EVM voucher the set pins — against the
+contract's own `getChannelId`/`getVoucherDigest`.
 
 ### 8. A voucher channel's claim-state challenge is its voucher signer's, and not a voucher
 
 Issue #1364: `POST /ilp/claim-state` answers for an x402 `batch-settlement` channel only against a
 signature by the key the chain checks that channel's vouchers against — never a key the request
-names — over a challenge no voucher and no `toon-channel` challenge can stand in for: on EVM the
+names — over a challenge no voucher can stand in for: on EVM the
 `ClaimStateChallenge` struct under `x402BatchSettlement`'s domain, on Solana a message tagged
 `toon-voucher-claim-state-challenge-v1`. Held open by `connector-signer`'s
 `claim_state_challenge::tests` (each challenge against a voucher and against the other scheme's
 challenge), by `connector-client-edge`'s `voucher_claims.rs` (the endpoint over the real gate), and
 pinned cross-repo by the `voucher_claim_state_challenge` section.
+
+### 9. A peering pays in vouchers, and a zero-value packet proves itself with the challenge
+
+ADR 0075 decisions 5 and 6: a paying node covers every forwarded PREPARE with a voucher on its own
+outbound channel, signed by its chain's settlement key (`payerAuthorizer == payer`), rendered as the
+client edge's own voucher JSON and carried in the claim slot — raw UTF-8 in the BTP
+`payment-channel-claim` entry, base64 in the `Payment-Channel-Claim` header. A packet that moves no
+value carries **no voucher**, and carries the voucher claim-state challenge (invariant 8's message)
+in a slot of its own — the `peer-role-challenge` entry, the `Toon-Peer-Role-Challenge` header —
+signed by the same key; a challenge is never a voucher. Held open by the peer carriages' own tests
+and `connector-runtime`'s covering tests, and pinned cross-repo by `peer_carriage.voucher_evm`,
+`voucher_solana`, `prepare` and `zero_value_challenge`, each rendered by the paying side's own
+functions (`voucher_json`, `challenge_entry`) and read back by the receiving side's evidence readers
+on both carriages before it is committed.
+
+### 10. A payout is a voucher the client can land by itself
+
+ADR 0075 decision 7: a connector pays a client with a voucher on its own outbound channel toward the
+client's payee key, carried in a BTP TRANSFER's `payout-claim` entry whose `amount` is the voucher's
+cumulative amount. The entry is the voucher claim JSON less its envelope, and on EVM always carries
+the `channelConfig` landing needs. Pinned by the `payout_voucher` section, whose generator restores
+the envelope and parses each case with the client edge's own parser, and verifies each signature.
 
 ## Generation
 
@@ -179,8 +204,9 @@ pinned cross-repo by the `voucher_claim_state_challenge` section.
 keys, secrets, nonces and payloads, not values sampled anew each run — and self-verifies each
 entry against the same functions these invariants name (an envelope vector is decoded back and
 compared before being serialized; a giftwrap vector is opened back with the receiver's own signer;
-a fulfilment vector's two secrets are checked to derive two different fulfilments; a claim
-vector's signature is checked against `verify_evm_balance_proof`) before writing it out.
+a fulfilment vector's two secrets are checked to derive two different fulfilments; a voucher
+vector's signature is checked against `verify_evm_voucher`/`verify_solana_voucher`, and every peer
+and refusal case is read back by the carriages' own evidence readers) before writing it out.
 Regenerating (`cargo run -p connector-vectors --bin generate-vectors`) against an
 unchanged implementation is therefore a no-op — same fixtures through the same code always produce
 the same data — and `cargo test -p connector-vectors` is the gate: it regenerates the set in

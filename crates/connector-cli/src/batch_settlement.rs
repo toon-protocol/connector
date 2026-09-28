@@ -6,10 +6,9 @@
 //! of the claim gate the watchers and sweeps (#1344) read the latest voucher
 //! on each channel from ([`ClaimGateVouchers`]).
 //!
-//! Here rather than in either crate it joins, for the reason
-//! `SettlementChannelSource` is: `connector-client-edge` does not depend on
-//! the settlement crates and should not, and ADR 0001 puts construction in
-//! `connector-cli`.
+//! Here rather than in either crate it joins: `connector-client-edge` does
+//! not depend on the settlement crates and should not, and ADR 0001 puts
+//! construction in `connector-cli`.
 //!
 //! **Thin on purpose.** Admission, collateral and the chain reads are the
 //! port's; freshness, the signature and the journal are the gate's. This
@@ -267,8 +266,7 @@ impl HeldVouchers for ClaimGateVouchers {
             .batch_channels()
             .into_iter()
             .filter_map(|channel| {
-                let (_nonce, amount, signature) =
-                    self.0.latest_inbound_claim(&channel.channel_key())?;
+                let (amount, signature) = self.0.latest_inbound_claim(&channel.channel_key())?;
                 Some(held_voucher(channel, amount, signature))
             })
             .collect()

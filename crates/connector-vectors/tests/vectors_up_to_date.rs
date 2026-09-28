@@ -31,80 +31,9 @@ fn committed_vectors_match_what_the_implementation_generates_today() {
     );
 }
 
-/// The committed contract, read as a payer reads it: a Solana claim's
-/// `programId` names the settlement program its `channelAccount` lives under
-/// (`docs/protocol/client-edge-spec.md` §1.3), which is the same 32 bytes
-/// ADR 0053 puts at offset 16 of the signed balance proof.
-///
-/// This asserts on the **committed artifact**, not on the generator, because
-/// the artifact is what `toon-client`, `rig` and `swap` replay (ADR 0021).
-/// Until issue #1127 the fixture declared the system program while the
-/// connector verified against the channel's own program, so the one
-/// cross-repo statement of this field taught every payer reading it that any
-/// base58 32-byte value would do -- and that is exactly why the connector
-/// still only warns on a disagreement (§1.3) instead of refusing.
-///
-/// The system-program exclusion is spelled out rather than implied: it is the
-/// specific wrong value this vector shipped, and re-introducing it would be
-/// silent under an equality check alone.
-#[test]
-fn the_solana_claim_vector_declares_the_program_its_signature_is_bound_to() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/wire-vectors.json");
-    let committed: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the committed vectors"))
-            .expect("the committed vectors are valid JSON");
-
-    let case = &committed["peer_carriage"]["claim_solana"];
-    let claim: serde_json::Value = serde_json::from_str(
-        case["json"]
-            .as_str()
-            .expect("claim_solana carries its claim as a JSON string"),
-    )
-    .expect("the claim string is itself valid JSON");
-
-    let declared = claim["programId"]
-        .as_str()
-        .expect("a Solana claim declares a programId");
-    let declared_bytes = bs58::decode(declared)
-        .into_vec()
-        .expect("programId is base58");
-    assert_eq!(
-        declared_bytes.len(),
-        32,
-        "a programId is a 32-byte Solana address"
-    );
-
-    let signed_message = hex::decode(
-        case["signed_message_hex"]
-            .as_str()
-            .expect("claim_solana carries the message its signature covers"),
-    )
-    .expect("signed_message_hex is hex");
-    assert_eq!(
-        signed_message.len(),
-        96,
-        "ADR 0053's balance proof is 96 bytes"
-    );
-
-    assert_eq!(
-        &signed_message[16..48],
-        declared_bytes.as_slice(),
-        "the declared programId must be the program the signature is bound to -- a fixture that \
-         declares one program and signs under another is not a contract anyone can conform to"
-    );
-    assert_ne!(
-        declared, "11111111111111111111111111111111",
-        "the system program is not a settlement program: no channel lives under it, so a claim \
-         declaring it names nothing (issue #1127)"
-    );
-}
-
 /// ADR 0074 decision 7 (issue #1347): the committed voucher vectors replay
 /// against the real verification and parsing code, not merely against the
-/// generator that produced them -- the same discipline
-/// `the_solana_claim_vector_declares_the_program_its_signature_is_bound_to`
-/// already applies to `claim_solana` above, extended to both voucher
-/// shapes, the amount-only watermark rule and the nonzero-`expiresAt`
+/// generator that produced them -- both voucher shapes, the amount-only watermark rule and the nonzero-`expiresAt`
 /// refusal. Asserts on the **committed artifact** read fresh from disk,
 /// because that artifact -- not the generator that produced it -- is what
 /// `toon-client`, `rig` and `swap` replay (ADR 0021).
@@ -313,4 +242,248 @@ fn the_committed_voucher_vectors_replay_against_the_real_implementation() {
             other => panic!("case {name}: unknown expected_error tag {other:?}"),
         }
     }
+}
+
+fn committed() -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/wire-vectors.json");
+    serde_json::from_str(&std::fs::read_to_string(&path).expect("read the committed vectors"))
+        .expect("the committed vectors are valid JSON")
+}
+
+fn hex_array<const N: usize>(value: &serde_json::Value) -> [u8; N] {
+    let text = value.as_str().expect("a hex string");
+    hex::decode(text.trim_start_matches("0x"))
+        .unwrap_or_else(|e| panic!("{text} is not hex: {e}"))
+        .try_into()
+        .unwrap_or_else(|v: Vec<u8>| panic!("{text} is not {N} bytes, got {}", v.len()))
+}
+
+/// ADR 0075 decision 8 (issue #1384): every committed `toon-channel` claim
+/// -- no `scheme`, or `scheme: "toon-channel"` -- is refused by name by the
+/// client edge's parser and the peer carriage's, replayed from the
+/// committed artifact.
+#[test]
+fn the_committed_toon_channel_claims_are_refused_by_name() {
+    use connector_domain::client_claim::{parse_client_claim, ClientClaimError};
+    use connector_peer_btp::{claim_json, ClaimDecodeError};
+
+    let committed = committed();
+    let cases = committed["toon_channel_refused"]["cases"]
+        .as_array()
+        .expect("cases is an array");
+    assert!(!cases.is_empty());
+    for case in cases {
+        let json = case["claim_json"].as_str().expect("claim_json");
+        assert_eq!(case["client_edge_error"], "toon_channel");
+        assert_eq!(
+            parse_client_claim(json),
+            Err(ClientClaimError::ToonChannel),
+            "{json}"
+        );
+        assert_eq!(
+            claim_json::parse(json.as_bytes()),
+            Err(ClaimDecodeError::ToonChannel)
+        );
+        assert_eq!(case["http_status"], 400);
+        let refusal = case["refusal_text"].as_str().expect("refusal_text");
+        assert!(refusal.contains("toon-channel") && refusal.contains("ADR 0075"));
+        assert_eq!(
+            hex::decode(case["http_response_body_hex"].as_str().expect("body")).expect("hex"),
+            refusal.as_bytes()
+        );
+    }
+}
+
+/// ADR 0075 decisions 5 and 6: the committed peer vouchers and the
+/// zero-value packet's challenge replay against the real verifiers and
+/// parsers -- a challenge verifies as the channel's voucher signer's and
+/// never as a voucher.
+#[test]
+fn the_committed_peer_vouchers_and_challenge_replay() {
+    use connector_domain::client_claim::{parse_client_claim, ClientClaim};
+    use connector_peer_btp::challenge_json;
+    use connector_signer::{
+        evm_voucher_claim_state_challenge_digest, evm_voucher_digest, solana_voucher_message,
+        verify_evm_voucher, verify_evm_voucher_claim_state_challenge, verify_solana_voucher,
+        BatchSettlementDomain,
+    };
+
+    let committed = committed();
+    let peer = &committed["peer_carriage"];
+
+    let evm = &peer["voucher_evm"];
+    let domain = BatchSettlementDomain::x402(evm["chain_id"].as_u64().expect("chain_id"));
+    let channel_id: [u8; 32] = hex_array(&evm["channel_id_hex"]);
+    let amount = evm["max_claimable_amount"].as_u64().expect("amount");
+    assert_eq!(
+        hex::encode(evm_voucher_digest(&domain, &channel_id, u128::from(amount))),
+        evm["digest_hex"].as_str().expect("digest_hex")
+    );
+    let signer: [u8; 20] = hex_array(&evm["signer_address_hex"]);
+    assert_eq!(
+        signer,
+        hex_array::<20>(&evm["channel_config"]["payer_hex"]),
+        "a peer voucher is signed by the payer's settlement key (payerAuthorizer == payer)"
+    );
+    assert!(verify_evm_voucher(
+        &domain,
+        &channel_id,
+        u128::from(amount),
+        &hex_array::<65>(&evm["signature_hex"]),
+        &signer
+    ));
+    assert!(matches!(
+        parse_client_claim(evm["json"].as_str().expect("json")),
+        Ok(ClientClaim::EvmVoucher(_))
+    ));
+
+    let solana = &peer["voucher_solana"];
+    let account: [u8; 32] = bs58::decode(
+        solana["channel_account_base58"]
+            .as_str()
+            .expect("channel_account_base58"),
+    )
+    .into_vec()
+    .expect("base58")
+    .try_into()
+    .expect("32 bytes");
+    let solana_amount = solana["max_claimable_amount"].as_u64().expect("amount");
+    let signature: [u8; 64] = bs58::decode(solana["signature_base58"].as_str().expect("sig"))
+        .into_vec()
+        .expect("base58")
+        .try_into()
+        .expect("64 bytes");
+    let authorized: [u8; 32] = bs58::decode(
+        solana["authorized_signer_base58"]
+            .as_str()
+            .expect("authorized_signer_base58"),
+    )
+    .into_vec()
+    .expect("base58")
+    .try_into()
+    .expect("32 bytes");
+    assert_eq!(
+        hex::encode(solana_voucher_message(&account, solana_amount, 0)),
+        solana["signed_message_hex"].as_str().expect("message")
+    );
+    assert!(verify_solana_voucher(
+        &account,
+        solana_amount,
+        0,
+        &signature,
+        &authorized
+    ));
+    assert!(matches!(
+        parse_client_claim(solana["json"].as_str().expect("json")),
+        Ok(ClientClaim::SolanaVoucher(_))
+    ));
+
+    let zero = &peer["zero_value_challenge"];
+    assert_eq!(zero["packet"]["prepare"]["amount"], 0);
+    assert!(
+        zero["packet"]["claim_json"].is_null(),
+        "no voucher rides it"
+    );
+    let challenge = challenge_json::parse(
+        zero["packet"]["challenge_json"]
+            .as_str()
+            .expect("challenge_json")
+            .as_bytes(),
+    )
+    .expect("the challenge parses");
+    let expires = zero["expires"].as_u64().expect("expires");
+    assert_eq!(challenge.expires(), expires);
+    let challenge_channel: [u8; 32] = hex_array(&zero["channel_id_hex"]);
+    assert_eq!(challenge_channel, channel_id, "the voucher's channel");
+    assert_eq!(
+        hex::encode(evm_voucher_claim_state_challenge_digest(
+            &domain,
+            &challenge_channel,
+            expires
+        )),
+        zero["digest_hex"].as_str().expect("digest_hex")
+    );
+    let challenge_signature: [u8; 65] = hex_array(&zero["signature_hex"]);
+    assert!(verify_evm_voucher_claim_state_challenge(
+        &domain,
+        &challenge_channel,
+        expires,
+        &challenge_signature,
+        &signer
+    ));
+    assert!(
+        !verify_evm_voucher(
+            &domain,
+            &challenge_channel,
+            u128::from(expires),
+            &challenge_signature,
+            &signer
+        ),
+        "a challenge is never a voucher"
+    );
+}
+
+/// ADR 0075 decision 7: each committed payout voucher, with the claim
+/// envelope restored, parses as the client edge's own voucher and its
+/// signature verifies.
+#[test]
+fn the_committed_payout_vouchers_replay() {
+    use connector_domain::client_claim::{parse_client_claim, ClientClaim};
+    use connector_signer::{
+        evm_voucher_digest, verify_evm_voucher, verify_solana_voucher, BatchSettlementDomain,
+    };
+
+    let committed = committed();
+    let payout = &committed["payout_voucher"];
+    let with_envelope = |json: &str| {
+        let mut claim: serde_json::Value = serde_json::from_str(json).expect("JSON");
+        claim["version"] = "1.0".into();
+        claim["messageId"] = "replay".into();
+        claim["timestamp"] = "2030-01-01T00:00:00.000Z".into();
+        claim["senderId"] = "replay".into();
+        parse_client_claim(&claim.to_string()).expect("the payout parses as a voucher")
+    };
+
+    let evm = &payout["evm"];
+    let ClientClaim::EvmVoucher(voucher) = with_envelope(evm["json"].as_str().expect("json"))
+    else {
+        panic!("an EVM payout");
+    };
+    assert!(voucher.channel_config.is_some(), "landing needs the config");
+    let domain = BatchSettlementDomain::x402(evm["chain_id"].as_u64().expect("chain_id"));
+    let channel_id: [u8; 32] = hex_array(&evm["channel_id_hex"]);
+    let amount = evm["max_claimable_amount"].as_u64().expect("amount");
+    assert_eq!(voucher.max_claimable_amount, amount);
+    assert_eq!(
+        hex::encode(evm_voucher_digest(&domain, &channel_id, u128::from(amount))),
+        evm["digest_hex"].as_str().expect("digest_hex")
+    );
+    assert!(verify_evm_voucher(
+        &domain,
+        &channel_id,
+        u128::from(amount),
+        &hex_array::<65>(&evm["signature_hex"]),
+        &hex_array::<20>(&evm["signer_address_hex"])
+    ));
+
+    let solana = &payout["solana"];
+    let ClientClaim::SolanaVoucher(voucher) = with_envelope(solana["json"].as_str().expect("json"))
+    else {
+        panic!("a Solana payout");
+    };
+    let decode = |field: &str| {
+        bs58::decode(solana[field].as_str().expect(field))
+            .into_vec()
+            .expect("base58")
+    };
+    let account: [u8; 32] = decode("channel_account_base58").try_into().expect("32");
+    let signature: [u8; 64] = decode("signature_base58").try_into().expect("64");
+    let signer: [u8; 32] = decode("authorized_signer_base58").try_into().expect("32");
+    assert!(verify_solana_voucher(
+        &account,
+        voucher.max_claimable_amount,
+        0,
+        &signature,
+        &signer
+    ));
 }

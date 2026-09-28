@@ -531,7 +531,7 @@ impl PeerTransport for BtpPeerTransport {
                     peer_id,
                     code = reject.code.as_str(),
                     price = terms.price().unwrap_or_default(),
-                    pay_to = terms.pay_to().unwrap_or_default(),
+                    resource = %terms.resource.url,
                     required_transport = terms.required_transport().unwrap_or_default(),
                     "peer refused a forwarded PREPARE with x402 terms"
                 );
@@ -572,7 +572,7 @@ mod tests {
     /// runs this same reader over what the real emitter actually writes, so
     /// this stays a fixture rather than a second definition of the shape.
     const TERMS: &[u8] = br#"{"x402Version":2,"resource":{"url":"g.toon.relay"},
-        "accepts":[{"amount":"2000","payTo":"g.toon.relay"}]}"#;
+        "extensions":{"toon":{"info":{"amount":"2000","ilpAddress":"g.toon.relay"}}}}"#;
 
     fn response(ilp_packet: Vec<u8>, protocol_data: Vec<ProtocolData>) -> BtpFrame {
         BtpFrame {
@@ -649,7 +649,7 @@ mod tests {
         assert_eq!(reject.code.as_str(), "F06");
         assert_eq!(reject.accumulated_cost, 41);
         assert_eq!(terms.price(), Some(2000));
-        assert_eq!(terms.pay_to(), Some("g.toon.relay"));
+        assert_eq!(terms.ilp_address(), Some("g.toon.relay"));
     }
 
     /// Issue #874's second: garbage in the greeting slot is its own

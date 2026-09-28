@@ -22,10 +22,10 @@ use crate::settlement::{SettlementChain, SettlementConfig};
 ///
 /// A peering resolves from its `[[peers]]` row; a client channel has no
 /// equivalent, because the channel that matters most is the one no row
-/// names. A settlement backend registers a `ClientChannelSource` (ADR
-/// 0052, issue #502), so a node with a `[settlement.<chain>]` table accepts
-/// claims on channels it has never been configured for -- and a table built
-/// from `[[client_channels]]` rows alone would leave every one of those
+/// names. A node with a `[settlement.<chain>]` table admits vouchers on
+/// channels it has never been configured for (ADR 0052, issue #502) -- and
+/// since ADR 0075 (issue #1384) no config row names a client channel at all
+/// -- so a table built from declared rows would leave every one of those
 /// unresolved, which is the unconverted crossing arriving by the one door
 /// the absence rule does not cover.
 ///
@@ -117,11 +117,10 @@ impl FromIterator<(SettlementChain, AssetId)> for ClientChannelAssets {
 /// one declared token a channel there holds (ADR 0071 decision 1, issue
 /// #1301).
 ///
-/// Every `[settlement.<chain>]` table is resolved, not only the chains
-/// `[[client_channels]]` names rows on, and that is the point rather than
-/// an over-reach: a settlement table is what registers the
-/// `ClientChannelSource` that admits a channel no row names (ADR 0052,
-/// issue #502), so on a dealing node every one of those chains can carry an
+/// Every `[settlement.<chain>]` table is resolved, and that is the point
+/// rather than an over-reach: a settlement table is what lets this node
+/// admit a voucher on a channel nothing names (ADR 0052, issue #502), so on
+/// a dealing node every one of those chains can carry an
 /// arrival whose denomination a forward has to know. A chain resolved here
 /// and a chain left out are the difference between a crossing that converts
 /// and one that silently does not.

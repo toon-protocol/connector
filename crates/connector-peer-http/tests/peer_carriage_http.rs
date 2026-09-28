@@ -59,15 +59,14 @@ use connector_peer_http::headers::{Headers, PeerRequest, PeerResponse};
 use connector_peer_http::{HttpPeerTransport, NAT_NOTE};
 use connector_runtime::covering_fake::covering;
 use connector_runtime::{
-    ClaimAckOutcome, ClaimRejectReason, ClaimSignature, Connector, Covering, FakeAppClient,
-    InProcessPeerTransport, PeerForward, PeerRoute, PeerTransport, TestClock, VoucherSigner,
-    WireClaim,
+    ClaimAckOutcome, ClaimRejectReason, Connector, Covering, FakeAppClient, InProcessPeerTransport,
+    PeerForward, PeerRoute, PeerTransport, TestClock, VoucherSigner,
 };
 use connector_signer::{
-    derive_evm_address, evm_balance_proof_digest, evm_batch_channel_id,
-    evm_voucher_claim_state_challenge_digest, evm_voucher_digest, evm_voucher_signer,
-    verify_evm_voucher, verify_evm_voucher_claim_state_challenge, BatchChannelConfig,
-    BatchSettlementDomain, EvmBalanceProof, LocalSigner, Signer,
+    derive_evm_address, evm_batch_channel_id, evm_voucher_claim_state_challenge_digest,
+    evm_voucher_digest, evm_voucher_signer, verify_evm_voucher,
+    verify_evm_voucher_claim_state_challenge, BatchChannelConfig, BatchSettlementDomain,
+    LocalSigner, Signer,
 };
 use libsecp256k1::{Message, PublicKey, SecretKey};
 use url::Url;
@@ -1398,55 +1397,31 @@ async fn the_named_regression_no_request_becomes_a_peer_without_a_bound_verifyin
     );
 }
 
-/// ADR 0075 decision 5 and #1380: **a `toon-channel` claim never decides
-/// the peer role** on this carriage -- not even one genuinely signed by the
-/// very key this node binds to the peering as its voucher signer. The
-/// request is a client's: `F02`, no peer route, no `Toon-Claim-Ack`, and a
-/// dedicated peer listener refuses it `401`.
+/// ADR 0075 decision 8 and #1384: **a `toon-channel` claim is refused by
+/// name** on this carriage -- `400`, with the retirement named in the body,
+/// on a shared listener and a dedicated one alike, before any role is
+/// decided. No `Toon-Claim-Ack`: nothing was judged.
 #[tokio::test]
-async fn a_toon_channel_claim_never_decides_the_peer_role_even_under_the_bound_signers_key() {
+async fn a_toon_channel_claim_is_refused_by_name() {
     let book = VoucherBook::new();
-    // The SAME secret the peer's vouchers are signed with, and the key
-    // `bound` binds to `PEER_ID`.
-    let same_key = LocalSigner::from_secret_bytes("peer", PEER_SECRET).expect("signer");
-    assert_eq!(
-        derive_evm_address(&same_key.public_key().unwrap()),
-        address_of(&peer_key())
-    );
-    let mut on_chain_id = [0u8; 32];
-    on_chain_id[31] = 7;
-    let token_network = [0x33; 20];
-    let proof = EvmBalanceProof {
-        channel_id: on_chain_id,
-        nonce: 1,
-        transferred_amount: 500,
-        locked_amount: 0,
-        locks_root: [0u8; 32],
-        chain_id: CHAIN_ID,
-        token_network_address: token_network,
-    };
-    let claim = WireClaim {
-        channel_id: hex(&on_chain_id),
-        nonce: 1,
-        cumulative_amount: 500,
-        signature: ClaimSignature::Evm(
-            same_key
-                .sign(&evm_balance_proof_digest(&proof))
-                .expect("sign"),
-        ),
-    };
-    let json = connector_peer_btp::claim_json::encode(
-        &claim,
-        &address_of(&peer_key()),
-        None,
-        None,
-        Some(connector_peer_btp::PeerClaimDomain {
-            chain_id: CHAIN_ID,
-            token_network,
-        }),
-        "message-1",
-        "2030-01-01T00:00:00.000Z",
-    );
+    // The retired claim exactly as a pre-ADR 0075 peer rendered it: no
+    // `scheme`, a nonce and an EIP-712 balance proof. Refused before
+    // anything about it is read, so its signature does not matter.
+    let json = serde_json::json!({
+        "version": "1.0",
+        "blockchain": "evm",
+        "messageId": "message-1",
+        "timestamp": "2030-01-01T00:00:00.000Z",
+        "senderId": "peer",
+        "channelId": format!("0x{}", "07".repeat(32)),
+        "nonce": 1,
+        "transferredAmount": "500",
+        "lockedAmount": "0",
+        "locksRoot": format!("0x{}", "00".repeat(32)),
+        "signature": format!("0x{}", "11".repeat(65)),
+        "signerAddress": format!("0x{}", "44".repeat(20)),
+    })
+    .to_string();
 
     let shared = accepting(payee(), &book)
         .handle(request(Some(&json), prepare("g.nowhere").encode()))
@@ -1455,20 +1430,13 @@ async fn a_toon_channel_claim_never_decides_the_peer_role_even_under_the_bound_s
         .handle(request(Some(&json), prepare("g.nowhere").encode()))
         .await;
 
-    assert_eq!(shared.status, 200);
-    assert_eq!(
-        reject_code(&shared),
-        "F02",
-        "a client-role packet reaches no peer route"
-    );
-    assert!(
-        ack_on(&shared).is_none(),
-        "a toon-channel claim is a client's, and a client gets no claim-ack"
-    );
-    assert_eq!(
-        on_dedicated.status, 401,
-        "a dedicated peer listener serves no client"
-    );
+    for response in [&shared, &on_dedicated] {
+        assert_eq!(response.status, 400);
+        assert!(ack_on(response).is_none(), "nothing was judged");
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(body.contains("toon-channel"), "{body}");
+        assert!(body.contains("ADR 0075"), "{body}");
+    }
 }
 
 /// §1.5's header-smuggling defence over the material that decides role:
@@ -2015,7 +1983,7 @@ async fn a_forwarded_arrival_that_undercovers_is_refused_once_this_peering_enfor
         Some(ARRIVING_AMOUNT),
         "a forwarded arrival is quoted the packet's own amount, not the route's price"
     );
-    assert_eq!(terms.pay_to(), Some(FORWARDED_DESTINATION));
+    assert_eq!(terms.ilp_address(), Some(FORWARDED_DESTINATION));
     assert!(
         next_hop_app.deliveries().is_empty(),
         "a refused arrival is never carried"

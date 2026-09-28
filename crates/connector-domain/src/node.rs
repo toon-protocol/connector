@@ -34,7 +34,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::x402::{X402BatchSettlementTerms, X402ChainSettlementTerms, X402SettlementTerms};
+use crate::x402::X402BatchSettlementTerms;
 
 /// The client-edge versions this connector serves, and the one an
 /// unversioned `POST /ilp` resolves to (issue #1054,
@@ -59,12 +59,14 @@ pub const CLIENT_EDGE_DEFAULT_VERSION: u32 = 1;
 /// * `ilp_addresses`, `http_endpoint` and `btp_endpoint` are **configured**,
 ///   because they cannot be introspected -- a container sees `0.0.0.0:4000`,
 ///   never `https://proxy.example/ilp`. They are `[node]`'s three fields.
-/// * `settlements` is **proved**: each entry is what a settlement backend
-///   resolved and checked against a live chain before this node agreed to
-///   boot. It is never separately declared, which is what makes issue #981
-///   (`solana_chain_id` defaulting to `solana:devnet` on a mainnet node)
-///   impossible rather than merely detected -- there is no second
-///   declaration left to disagree with (ND-07).
+/// * `batch_settlements` and `voucher_signers` are **proved**: each entry is
+///   read off a settlement backend that was connected and checked against a
+///   live chain before this node agreed to boot. Never separately declared,
+///   which is what makes issue #981 (`solana_chain_id` defaulting to
+///   `solana:devnet` on a mainnet node) impossible rather than merely
+///   detected -- there is no second declaration left to disagree with
+///   (ND-07). (`settlements`, the `toon-channel` terms, was the third and
+///   is gone with that scheme -- ADR 0075 decision 10, issue #1384.)
 ///
 /// The default is a node that configures no `[node]` section and settles
 /// nowhere: every field empty, every key absent from the wire.
@@ -81,8 +83,6 @@ pub struct NodeFacts {
     /// exist is a fact about this node's own listeners; **who** rides them is
     /// not published (ND-09).
     pub peer_carriages: Vec<String>,
-    /// Every chain this node settles on, as the settlement backend proved it.
-    pub settlements: Vec<X402ChainSettlementTerms>,
     /// One entry per chain this node has opted into accepting an x402
     /// `batch-settlement` channel on (ADR 0074 decision 8) --
     /// `[settlement.evm.batch_settlement]` and/or
@@ -113,22 +113,6 @@ pub struct NodeFacts {
 pub struct VoucherSignerFact {
     pub network: String,
     pub signer: String,
-}
-
-impl NodeFacts {
-    /// The EVM entry of [`Self::settlements`], which is also the greeting's
-    /// legacy `extra.settlement` object (issue #617).
-    ///
-    /// Derived rather than carried beside the list, so the one-chain object
-    /// and the per-chain list cannot describe different deployments. A node
-    /// has at most one `[settlement.evm]` table, so "the first EVM entry" is
-    /// "the EVM entry".
-    pub fn evm_settlement(&self) -> Option<&X402SettlementTerms> {
-        self.settlements.iter().find_map(|entry| match entry {
-            X402ChainSettlementTerms::Evm(evm) => Some(evm),
-            X402ChainSettlementTerms::Solana(_) => None,
-        })
-    }
 }
 
 /// This connector's identity: the key a packet's payload is **sealed to**
@@ -255,8 +239,6 @@ pub struct NodeSelfDescription {
         default
     )]
     pub edge_identity: Option<EdgeIdentity>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub settlements: Vec<X402ChainSettlementTerms>,
     /// [`NodeFacts::batch_settlements`], published verbatim (ADR 0074
     /// decision 8, ND-11): the same facts the greeting's own
     /// `batch-settlement` `accepts[]` entries project. Absent, not an empty
@@ -313,7 +295,6 @@ impl NodeSelfDescription {
             btp_endpoint: facts.btp_endpoint.clone(),
             peer_carriages: facts.peer_carriages.clone(),
             edge_identity,
-            settlements: facts.settlements.clone(),
             batch_settlements: facts.batch_settlements.clone(),
             voucher_signers: facts.voucher_signers.clone(),
             routes,
@@ -386,35 +367,15 @@ mod tests {
     use super::*;
     use crate::x402::{X402BatchSettlementEvmTerms, X402BatchSettlementSolanaTerms};
 
-    fn evm() -> X402SettlementTerms {
-        X402SettlementTerms {
-            chain: "evm:84532".to_string(),
-            settlement_address: "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf".to_string(),
-            token_network_registry: "0xcc9079ade929b168b54145f6d25262b64fab9d5b".to_string(),
-            token_network: "0x1e95493fef46707e034b4a1945f25a8c76a1823d".to_string(),
-            token_address: "0x49bee1bca5d15fb0963117923403f9498119a9ce".to_string(),
-            decimals: 6,
-        }
-    }
-
     fn facts() -> NodeFacts {
         NodeFacts {
             ilp_addresses: vec!["g.toon.ario".to_string()],
             http_endpoint: Some("https://proxy.example/ilp".to_string()),
             btp_endpoint: Some("wss://proxy.example/ilp/btp".to_string()),
             peer_carriages: vec!["btp".to_string()],
-            settlements: vec![X402ChainSettlementTerms::Evm(evm())],
             batch_settlements: Vec::new(),
             voucher_signers: Vec::new(),
         }
-    }
-
-    /// The legacy one-chain greeting object is the list's EVM entry, never a
-    /// second field somebody has to remember to keep in step.
-    #[test]
-    fn the_evm_settlement_is_the_lists_own_evm_entry() {
-        assert_eq!(facts().evm_settlement(), Some(&evm()));
-        assert_eq!(NodeFacts::default().evm_settlement(), None);
     }
 
     /// A node with no `[node]` section and no settlement backend answers a

@@ -37,15 +37,35 @@ pub fn load_config(text: &str) -> Config {
     Config::load(file.path()).expect("the config loads")
 }
 
-/// An app on its own socket, recording the body of every write it is sent.
-pub async fn spawn_recording_app() -> (String, Arc<Mutex<Vec<Bytes>>>) {
+/// One write an app was sent: its HTTP headers -- where ADR 0040's
+/// attribution (`X-TOON-Payer`, `-Amount`, `-Chain`) rides -- and its body.
+#[derive(Clone)]
+pub struct RecordedWrite {
+    pub headers: axum::http::HeaderMap,
+    pub body: Bytes,
+}
+
+impl RecordedWrite {
+    /// `header` as a string, or `None` when the write carried none.
+    pub fn header(&self, header: &str) -> Option<&str> {
+        self.headers
+            .get(header)
+            .map(|value| value.to_str().expect("header is valid ASCII"))
+    }
+}
+
+/// An app on its own socket, recording every write it is sent.
+pub async fn spawn_recording_app() -> (String, Arc<Mutex<Vec<RecordedWrite>>>) {
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let router = Router::new().route(
         "/",
         post({
             let recorded = Arc::clone(&recorded);
-            move |body: Bytes| async move {
-                recorded.lock().unwrap().push(body);
+            move |headers: axum::http::HeaderMap, body: Bytes| async move {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(RecordedWrite { headers, body });
                 StatusCode::OK
             }
         }),

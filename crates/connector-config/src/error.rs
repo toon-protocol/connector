@@ -517,24 +517,6 @@ pub enum ConfigError {
     )]
     ChannelInBothDirections { value: String },
 
-    /// A `[[peer_channels]]` `inbound_channel` or a `[[pay_channels]]`
-    /// `outbound_channel` that a `[[client_channels]]` row also names
-    /// (configuration-spec.md CF-22). The two kinds of channel live in
-    /// different contracts, so the only way to write one is to paste a client
-    /// channel's id into a peering row -- refused rather than left to decide
-    /// which book's watermark the value is read against.
-    #[error(
-        "channel '{value}' is named by a '[[client_channels]]' row and by the '{table}' row of \
-         peer '{peer_id}': one channel in two books is one channel counted twice \
-         (configuration-spec.md CF-22). A peering's channels are x402 channels its own rows \
-         name; a '[[client_channels]]' row is a channel a client pays this node on"
-    )]
-    ChannelAlsoAClientChannel {
-        value: String,
-        table: &'static str,
-        peer_id: String,
-    },
-
     #[error(
         "peer '{peer_id}' is the next hop of route '{prefix}' but has no '[[pay_channels]]' \
          entry: a connector covers every PREPARE it sends (ADR 0042), so a peering this node \
@@ -715,14 +697,16 @@ pub enum ConfigError {
     #[error("the [settlement.solana] section's token_address is empty")]
     SettlementMissingSolanaTokenAddress,
 
+    /// A `[settlement.evm]` key that tuned the local `TokenNetwork` channel
+    /// index (issue #661), deleted with the `toon-channel` client claims it
+    /// resolved (ADR 0075 decisions 9 and 12, issue #1384).
     #[error(
-        "the [settlement.evm] section's channel_index_confirmations is 0: applying a log at \
-         chain head has nothing to fall back on if the head reorgs, and issue #661 deliberately \
-         ships no unwind logic for that case -- a channel inside the confirmation window is \
-         meant to fall through to a direct chain read instead. Omit the field for the default \
-         confirmation depth, or set a depth of at least 1 block"
+        "'[settlement.evm] {field}' was removed with the TokenNetwork channel index it tuned \
+         (ADR 0075, issue #1384): every claim is an x402 voucher, whose channel the settlement \
+         backend reads from the chain when it is presented, so nothing indexes TokenNetwork \
+         logs any more. Delete the line"
     )]
-    SettlementChannelIndexConfirmationsZero,
+    SettlementChannelIndexKeyRemoved { field: &'static str },
 
     /// A `batch_settlement` table published a minimum `withdrawDelay` or
     /// `grace_period` below x402's 900 seconds (ADR 0074 decision 5).
@@ -795,138 +779,43 @@ pub enum ConfigError {
     )]
     SettlementRpcViaSocksProxyPlaintext { table: &'static str, value: String },
 
-    #[error(
-        "invalid [[client_channels]] channel_id '{value}': must be 64 hex characters \
-         (an on-chain 32-byte channel identifier), optionally '0x'-prefixed"
-    )]
-    ClientChannelInvalidId { value: String },
-
-    #[error(
-        "invalid [[client_channels]] {field} '{value}': must be 40 hex characters \
-         (a 20-byte EVM address), optionally '0x'-prefixed"
-    )]
-    ClientChannelInvalidAddress { field: &'static str, value: String },
-
-    #[error("[[client_channels]] names channel '{value}' more than once")]
-    ClientChannelDuplicate { value: String },
-
-    #[error(
-        "invalid [[client_channels]] {field} '{value}': must be base58 encoding a 32-byte \
-         Solana account"
-    )]
-    ClientChannelInvalidSolanaAccount { field: &'static str, value: String },
-
-    /// An EVM `[[client_channels]]` row on a node with no
-    /// `[settlement.evm]` table (issue #1138). The client-edge case of the
-    /// one rule `crate::settlement::SettlementTables` states, and the one
-    /// the issue called the hard half -- so, explicitly: **the declared
-    /// channel path's latitude does not reach this.**
-    ///
-    /// `connector_client_edge::DepositFloor::Unknown` exempts a declared
-    /// channel from the collateral cap (issue #646) because how much
-    /// unverified exposure to take on a channel is a *policy*, and an
-    /// operator hand-declaring a channel is making it. That latitude is
-    /// over how much may be spent on a channel this node is a participant
-    /// of. It is not latitude over whether such a channel exists at all: a
-    /// claim is redeemed by the channel's on-chain participant and this
-    /// node's EVM participant address IS `[settlement.evm.key]`
-    /// (ADR 0030's "no second key ... and none is invented", the same
-    /// sentence the retired `toon-channel` pay-channel refusal made).
-    /// With no table there is no such address, so the row names a channel
-    /// this node is not in and every write it buys is given away. That is
-    /// a fact about the chain with exactly one answer -- the category
-    /// issue #1136 put the EIP-712 domain in -- not a policy.
-    ///
-    /// The wire already agreed before this refusal existed: a
-    /// settlement-less node's x402 greeting carries no `settlement` or
-    /// `settlements` key at all, so no conforming client can even discover
-    /// the domain to sign under, and this connector's own announce path
-    /// refuses to pay such a node by name ("a node with no settlement
-    /// backend cannot be paid by channel claim",
-    /// `connector_cli::announce`'s `NoSettlementTerms`).
-    #[error(
-        "'[[client_channels]]' names EVM channel '{channel_id}' but this node has no \
-         '[settlement.evm]' table: a client claim is an EIP-712 balance proof redeemed by the \
-         channel's on-chain participant, which IS this node's settlement address -- there is no \
-         second key to configure and none is invented (ADR 0030). With no table there is no \
-         address to be that participant, so this node would accept the claim, serve the paid \
-         write and never be able to collect. Declaring a channel is an operator's own credit \
-         decision (issue #646) and stays one; being able to redeem it at all is not a policy \
-         but a fact about the chain (issue #1136). Add '[settlement.evm]', or delete the row"
-    )]
-    ClientChannelWithoutEvmSettlement { channel_id: String },
-
-    /// A Solana `[[client_channels]]` row on a node with no
-    /// `[settlement.solana]` table (issue #1138), the twin of
-    /// [`ConfigError::ClientChannelWithoutEvmSettlement`] and of
-    /// the retired `toon-channel` peer-channel refusal on Solana.
-    ///
-    /// Over-determined here, as it is on the peer table: besides having no
-    /// Solana identity to be the channel's participant, the node has no
-    /// program id to read, and since ADR 0053 that program id is part of
-    /// what every Solana claim signs -- so the row could not even be given
-    /// a verification domain.
-    ///
-    /// This replaces `connector-cli`'s warn-and-skip, which its own
-    /// comment already called the worse answer: a skipped row is a
-    /// configured channel that silently refuses every claim as unknown.
-    #[error(
-        "'[[client_channels]]' names Solana channel '{channel_account}' but this node has no \
-         '[settlement.solana]' table: a claim on that channel signs the settlement program's id \
-         (ADR 0053), which is read from that table, and is redeemed by the channel's on-chain \
-         participant, which is that table's key. Without it there is neither a program to judge \
-         the claim under nor an address to collect it at. Previously this row was skipped with \
-         a warning and every claim on it refused as an unknown channel; it is refused by name \
-         at load instead (issue #1138). Add '[settlement.solana]', or delete the row"
-    )]
-    ClientChannelWithoutSolanaSettlement { channel_account: String },
-
-    /// `[settlement.solana] program_id` is checked only for non-emptiness
-    /// where it is resolved, and a Solana `[[client_channels]]` row now
-    /// carries it (issue #1138) exactly as the peer table has since #1128
-    /// -- so the value has to be a real 32-byte address before any claim
-    /// can be judged against it. The client-edge twin of
-    /// the retired `toon-channel` peer-channel refusal of the same value, and
-    /// it closes a real crash: `ClientChannelRegistry::record_solana`
-    /// base58-decodes the program id and `connector-cli` `expect`s that
-    /// decode, so a malformed one used to panic the boot with a message
-    /// blaming the row's own fields.
-    #[error(
-        "'[[client_channels]]' names Solana channel '{channel_account}', whose settlement \
-         program is read from '[settlement.solana] program_id' -- but that is '{value}', which \
-         is not base58 encoding a 32-byte Solana program address. Since ADR 0053 a claim on \
-         this channel signs that program id, so it must name a real deployed program"
-    )]
-    ClientChannelSolanaSettlementProgramIdInvalid {
-        channel_account: String,
-        value: String,
-    },
-
     #[error("[[client_identities]] entry has an empty 'id'")]
     ClientIdentityIdEmpty,
 
     #[error("[[client_identities]] names identity '{id}' more than once")]
     DuplicateClientIdentityId { id: String },
 
+    /// `[[client_channels]]`: the channels a `toon-channel` client claim could
+    /// be paid on, declared with their counterparty (issue #558). Deleted
+    /// with that claim scheme (ADR 0075 decision 9, issue #1384).
     #[error(
-        "[[client_channels]] is configured but 'state_dir' is not: this node would accept \
-         claims and keep their replay watermarks only in memory, so every claim a client \
-         has already spent becomes spendable again the next time this process restarts \
-         (issue #605). Set a top-level state_dir to a directory this node can write, and \
-         mount it so it outlives the container"
+        "'[[client_channels]]' was removed with the toon-channel claim (ADR 0075, issue #1384): \
+         every claim is an x402 'batch-settlement' voucher, whose channel is read from the chain \
+         when the voucher presents it, so no channel is declared in config. Delete the table. A \
+         client pays on an x402 channel it opens toward this node; a toon-channel channel still \
+         open is drained on the last release that supports toon-channel claims"
     )]
-    ClientChannelsWithoutStateDir,
+    ClientChannelsRemoved,
 
-    /// A settlement table is what registers the `ClientChannelSource` that
-    /// resolves an undeclared channel from chain (ADR 0052, CF-27), so a
-    /// node configuring one accepts claims from strangers whether or not it
-    /// declares a single `[[client_channels]]` row -- and therefore has
+    /// A tuning key of the client edge's `toon-channel` channel registry's
+    /// liveness memo (issue #649), deleted with the registry (ADR 0075,
+    /// issue #1384).
+    #[error(
+        "'{field}' was removed with the toon-channel client channel registry it tuned (ADR 0075, \
+         issue #1384): every claim is an x402 voucher, whose channel is read from the settlement \
+         backend with no liveness memo in between. Delete the line"
+    )]
+    ChannelLivenessKeyRemoved { field: &'static str },
+
+    /// A settlement table is what lets this node admit a voucher on a
+    /// channel it has never been configured for (ADR 0052, CF-27), so a node
+    /// configuring one accepts claims from strangers -- and therefore has
     /// watermarks to lose. Issue #1186: this arm did not exist, so the
     /// permissionless shape, which is the one an operator should be running,
     /// was the one shape that could boot with its watermarks in memory.
     #[error(
         "a settlement backend is configured but 'state_dir' is not: this node resolves an \
-         undeclared channel from chain and accepts the claim (ADR 0052), so it takes payment \
+         undeclared channel from chain and accepts its voucher (ADR 0052), so it takes payment \
          from senders it has never been configured for -- and would keep their replay \
          watermarks only in memory. Every claim any of them has already spent becomes \
          spendable again the next time this process restarts, and nothing in a log shows \
@@ -937,35 +826,6 @@ pub enum ConfigError {
 
     #[error("state_dir '{path}' exists but is not a directory")]
     StateDirNotADirectory { path: PathBuf },
-
-    #[error(
-        "channel_liveness_ttl_secs is 0: this node would re-read the chain for every channel \
-         on every packet rather than caching a resolution at all, which is a way to exhaust \
-         an RPC endpoint's request budget and take the node's own paid writes down with it \
-         (issue #649). Omit the field for the default, or set the number of seconds a \
-         resolved channel's liveness may be believed for"
-    )]
-    ZeroChannelLivenessTtl,
-
-    #[error(
-        "channel_reattempt_interval_ms is 0: this node would put no floor at all on how often \
-         one channel can make it read the chain, so a single client -- by sending packets, by \
-         sending them at once, or by re-presenting one claim its channel cannot cover -- \
-         becomes one RPC request each (issue #649). Omit the field for the default, or set the \
-         milliseconds one channel must wait between lookups"
-    )]
-    ZeroChannelReattemptInterval,
-
-    #[error(
-        "channel_serve_stale_secs is {serve_stale_secs}s but channel_liveness_ttl_secs is \
-         {ttl_secs}s: a resolved channel would stop being believed and stop being servable at \
-         the same moment, so the stale window could never be used. Set it to at least the ttl, \
-         or to 0 to never serve a reading this node could not confirm"
-    )]
-    ServeStaleShorterThanLivenessTtl {
-        serve_stale_secs: u64,
-        ttl_secs: u64,
-    },
 
     #[error(
         "unresolvable_lookup_budget_{field} is 0: this node would never resolve a channel it \
@@ -1460,9 +1320,9 @@ pub enum ConfigError {
     /// the stronger reason.
     ///
     /// Named by CHAIN rather than by channel, because the channel that
-    /// forces this refusal is the one no `[[client_channels]]` row names: a
-    /// settlement table registers the `ClientChannelSource` that admits a
-    /// buyer this operator has never heard of (ADR 0052, issue #502), so
+    /// forces this refusal is one no config names: a settlement table is what
+    /// lets this node admit a voucher from a buyer this operator has never
+    /// heard of (ADR 0052, issue #502), so
     /// every chain with a settlement table can carry an arrival whose
     /// denomination a forward must know. Left unresolved on a dealing node,
     /// such an arrival would forward across a real boundary at an implied
@@ -1476,9 +1336,9 @@ pub enum ConfigError {
          not a token this node deals: a node that declares [[tokens]] must be able to say \
          which declared token every channel it accepts a claim on holds, because a forward \
          out of a client arrival is a conversion exactly when that token and the outgoing \
-         peering's differ. This applies to every channel on the chain and not only to a \
-         declared [[client_channels]] row -- a [settlement.{chain}] table is what lets this \
-         node accept a claim on a channel it has never been configured for (ADR 0052). The \
+         peering's differ. This applies to every channel on the chain -- a \
+         [settlement.{chain}] table is what lets this node accept a claim on a channel it has \
+         never been configured for (ADR 0052). The \
          token comes from that table's own 'token_address' -- declare it with a [[tokens]] \
          row, remove the [settlement.{chain}] table, or remove the [[tokens]] table if this \
          node deals nothing"

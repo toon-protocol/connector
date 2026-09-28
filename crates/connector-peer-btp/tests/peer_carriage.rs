@@ -66,15 +66,14 @@ use connector_peer_btp::{
 };
 use connector_runtime::covering_fake::covering;
 use connector_runtime::{
-    ClaimAckOutcome, ClaimRejectReason, ClaimSignature, Connector, Covering, FakeAppClient,
-    InProcessPeerTransport, PeerForward, PeerRoute, PeerTransport, TestClock, VoucherSigner,
-    WireClaim,
+    ClaimAckOutcome, ClaimRejectReason, Connector, Covering, FakeAppClient, InProcessPeerTransport,
+    PeerForward, PeerRoute, PeerTransport, TestClock, VoucherSigner,
 };
 use connector_signer::{
-    derive_evm_address, evm_balance_proof_digest, evm_batch_channel_id,
-    evm_voucher_claim_state_challenge_digest, evm_voucher_digest, evm_voucher_signer,
-    verify_evm_voucher, verify_evm_voucher_claim_state_challenge, BatchChannelConfig,
-    BatchSettlementDomain, EvmBalanceProof, LocalSigner, Signer,
+    derive_evm_address, evm_batch_channel_id, evm_voucher_claim_state_challenge_digest,
+    evm_voucher_digest, evm_voucher_signer, verify_evm_voucher,
+    verify_evm_voucher_claim_state_challenge, BatchChannelConfig, BatchSettlementDomain,
+    LocalSigner, Signer,
 };
 use libsecp256k1::{Message, PublicKey, SecretKey};
 use tokio::sync::{mpsc, oneshot};
@@ -1361,76 +1360,49 @@ async fn the_named_regression_no_frame_becomes_a_peer_without_a_bound_verifying_
     );
 }
 
-/// **#1380: a `toon-channel` claim never decides the peer role.** The claim
-/// below is genuine -- an EIP-712 balance proof signed by the very key this
-/// node binds to [`PEER_ID`] as its voucher signer, rendered exactly as the
-/// old peer carriage rendered one -- and it still proves nothing: the frame
-/// is answered as a client's, `F02` with no `claim-ack`, and nothing is
-/// judged. ADR 0075 decision 5 makes a voucher (or the challenge) the only
-/// proof; a `toon-channel` claim is a client's to pay with until #1384.
+/// **#1384: a `toon-channel` claim is refused by name.** ADR 0075 retired
+/// the scheme: a frame whose claim slot holds one -- no `scheme`, or
+/// `scheme: "toon-channel"` -- is answered with an ERROR frame naming the
+/// retirement, before any role is decided, and nothing is judged.
 #[tokio::test]
-async fn a_genuinely_signed_toon_channel_claim_never_decides_the_peer_role() {
+async fn a_toon_channel_claim_is_refused_by_name() {
     let book = ChannelBook::new();
     let state = carriage(payee(), &book);
-
-    // The same secret the bound voucher signer is the address of.
-    let signer = LocalSigner::from_secret_bytes("payer", [0x0a; 32]).expect("payer signer");
-    let address = derive_evm_address(&signer.public_key().expect("public key"));
-    assert_eq!(
-        VoucherSigner::Evm(address),
-        payer_signer(),
-        "the claim is signed by the key bound as this peering's voucher signer"
+    // The retired claim exactly as a pre-ADR 0075 peer rendered it: no
+    // `scheme`, a nonce and an EIP-712 balance proof. Refused before
+    // anything about it is read, so its signature does not matter.
+    let json = serde_json::json!({
+        "version": "1.0",
+        "blockchain": "evm",
+        "messageId": "message-1",
+        "timestamp": "2030-01-01T00:00:00.000Z",
+        "senderId": "peer",
+        "channelId": format!("0x{}", "07".repeat(32)),
+        "nonce": 1,
+        "transferredAmount": "500",
+        "lockedAmount": "0",
+        "locksRoot": format!("0x{}", "00".repeat(32)),
+        "signature": format!("0x{}", "11".repeat(65)),
+        "signerAddress": format!("0x{}", "44".repeat(20)),
+    })
+    .to_string();
+    let explicit = json.replace(
+        r#""blockchain":"evm""#,
+        r#""blockchain":"evm","scheme":"toon-channel""#,
     );
-    let token_network = [0x33; 20];
-    let mut channel_id = [0u8; 32];
-    channel_id[31] = 7;
-    let proof = EvmBalanceProof {
-        channel_id,
-        nonce: 1,
-        transferred_amount: 500,
-        locked_amount: 0,
-        locks_root: [0u8; 32],
-        chain_id: CHAIN_ID,
-        token_network_address: token_network,
-    };
-    let claim = WireClaim {
-        channel_id: hex0x(&channel_id),
-        nonce: 1,
-        cumulative_amount: 500,
-        signature: ClaimSignature::Evm(
-            signer
-                .sign(&evm_balance_proof_digest(&proof))
-                .expect("sign"),
-        ),
-    };
-    let json = connector_peer_btp::claim_json::encode(
-        &claim,
-        &address,
-        None,
-        None,
-        Some(connector_peer_btp::PeerClaimDomain {
-            chain_id: CHAIN_ID,
-            token_network,
-        }),
-        "message-1",
-        "2030-01-01T00:00:00.000Z",
-    );
+    assert_ne!(explicit, json, "the scheme really was written");
 
-    let mut session = accepting(state);
-    session.send(voucher_frame(1, &json)).await;
-    let answer = session.answer().await;
-
-    assert_eq!(answer.frame_type, BTP_RESPONSE);
-    assert!(
-        ack::from_protocol_data(&answer.protocol_data).is_none(),
-        "a client frame gets no claim-ack (§1.7)"
-    );
-    match decode_answer(&answer).map(|answer| answer.into_response()) {
-        Some(PacketResponse::Reject(reject)) => {
-            assert_eq!(reject.code.as_str(), "F02");
-            assert_eq!(reject.message, "no peer route for this interaction");
-        }
-        other => panic!("expected the client-role F02, got {other:?}"),
+    for (request_id, claim) in [(1, &json), (2, &explicit)] {
+        let mut session = accepting(Arc::clone(&state));
+        session.send(voucher_frame(request_id, claim)).await;
+        // The raw frame: an ERROR's data is what names the refusal, and the
+        // decoder keeps only its type and request id.
+        let bytes = session.answers.recv().await.expect("answered");
+        let answer = decode_frame(&bytes).expect("our own encoder");
+        assert_eq!(answer.frame_type, BTP_ERROR, "{claim}");
+        let reason = String::from_utf8_lossy(&bytes);
+        assert!(reason.contains("toon-channel"), "{reason}");
+        assert!(reason.contains("ADR 0075"), "{reason}");
     }
     assert_eq!(book.watermark(&payer_channel()), None);
 }
@@ -1950,7 +1922,7 @@ async fn a_forwarded_arrival_that_undercovers_is_refused_once_this_peering_enfor
         Some(ARRIVING_AMOUNT),
         "a forwarded arrival is quoted the packet's own amount, not the route's price"
     );
-    assert_eq!(terms.pay_to(), Some(FORWARDED_DESTINATION));
+    assert_eq!(terms.ilp_address(), Some(FORWARDED_DESTINATION));
     assert!(
         next_hop_app.deliveries().is_empty(),
         "a refused arrival is never carried"

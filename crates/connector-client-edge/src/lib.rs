@@ -6,10 +6,11 @@
 //! present claim is parsed, structurally validated, checked for
 //! freshness/watermark, checked to advance value by at least the
 //! destination's matched app route's price, and -- last -- cryptographically
-//! verified against the counterparty this connector records for the channel
-//! the claim names (`ClientClaimGate` over a `ClientChannelRegistry`, issue
-//! #558 -- a claim's own declared signer carries no authority, and a claim
-//! naming an unrecorded channel is refused outright),
+//! verified against its channel's voucher signer as the chain records it
+//! (`ClientClaimGate`, issue #558 -- a claim's own declared sender carries
+//! no authority, and a claim naming a channel the settlement backend does
+//! not admit is refused outright; every claim is an x402 voucher since ADR
+//! 0075, issue #1384),
 //! all before the packet is routed; and, as of issue #526, §1.4 (the x402
 //! greeting) and the answering half of identity: `GET /ilp/identity`
 //! reports the public key a sender seals a packet to (ADR 0018), and an
@@ -46,14 +47,15 @@
 //! [`Connector::handle_prepare`] at all.
 //!
 //! As of issue #693, `POST /ilp/claim-state` (§1.10, `claim_state` module)
-//! answers a bulk, owner-authenticated read of claim state -- deposit
-//! total, cumulative claimed, available balance, nonce, last-claim time --
-//! for every channel a caller can prove it controls with a per-channel
-//! signature over a domain-separated challenge, distinct from a real
-//! claim's signature. Also purely a read against existing state
-//! ([`ClientClaimGate::watermark`], [`ClientClaimGate::channels`],
-//! [`ClientClaimGate::last_claim_time`] -- the one book since ADR 0075
-//! moved every peering onto x402 vouchers, #1380); it never calls
+//! answers a bulk, owner-authenticated read of voucher state -- the amount
+//! watermark, the ceiling the next voucher is admitted against, last-claim
+//! time -- for every channel a caller can prove it controls with a
+//! per-channel signature by the channel's voucher signer over a
+//! domain-separated challenge, distinct from a voucher's own signature.
+//! Also purely a read against existing state
+//! ([`ClientClaimGate::watermark`], [`ClientClaimGate::last_claim_time`] --
+//! the one book since ADR 0075 moved every peering onto x402 vouchers,
+//! #1380); it never calls
 //! `ingest`/`admit`, so it adds nothing to the packet admission path #686/#688/#690 spent
 //! this edge's history keeping cheap.
 
@@ -91,16 +93,14 @@ mod outbound_ledger;
 mod peer;
 mod session_registry;
 mod session_route;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod voucher_evidence;
 pub use batch_settlement::{
     journaled_batch_channels, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
     BatchSettlementChannels, JournaledBatchChannel,
 };
-pub use channels::{
-    ChannelLivenessPolicy, ChannelLookupFailed, ChannelResolutionError, ChannelTerminal,
-    ClientChannelRegistry, ClientChannelSource, DepositFloor, EvmChannel, InvalidChannelIdentifier,
-    SolanaChannel, DEFAULT_LIVENESS_TTL, DEFAULT_MIN_REATTEMPT_INTERVAL, DEFAULT_SERVE_STALE_UNTIL,
-};
+pub use channels::{ChannelLookupFailed, ChannelResolutionError, ChannelTerminal};
 pub use claim_gate::{ClaimIngestRejection, ClientClaimGate};
 pub use lookup_budget::{
     LookupBudgetBound, LookupBudgetExhausted, UnresolvableLookupBudget,
@@ -209,11 +209,11 @@ struct ClientEdgeState {
 /// `signer`: `POST /ilp` per `docs/protocol/client-edge-spec.md` §1.1, plus
 /// `GET /ilp/identity` and `GET /ilp/routes/price` (§1.2/§1.4, issue #526),
 /// with no configured NIP-59 receiver key -- a privacy-wrapped claim is
-/// refused rather than accepted -- and a record of no payment channel at
-/// all, so every claim presented to it is refused as
-/// [`ClaimIngestRejection::UnknownChannel`] (issue #558). Use
+/// refused rather than accepted -- and no settlement backend, so every
+/// voucher presented to it is refused as
+/// [`ClaimIngestRejection::BatchSettlementNotAccepted`]. Use
 /// [`router_with_wrap_key`] to accept wrapped claims, and
-/// [`router_with_gate`] to give this edge the channels whose claims it
+/// [`router_with_gate`] to give this edge the backends whose vouchers it
 /// should accept.
 pub fn router(connector: Arc<Connector>, signer: Arc<dyn Signer>) -> Router {
     router_with_wrap_key(connector, signer, None)
@@ -227,34 +227,23 @@ pub fn router_with_wrap_key(
     signer: Arc<dyn Signer>,
     wrap_receiver_secret: Option<[u8; 32]>,
 ) -> Router {
-    // A gate with a record of no channel accepts nothing, so it has no
-    // watermark a restart could lose and needs no durable journal (issue
-    // #605). A node that means to accept claims goes through
-    // `router_with_gate` and supplies a gate built over a real one.
-    let gate = ClientClaimGate::restore(
-        ClientChannelRegistry::new(),
-        Arc::new(connector_runtime::InMemoryJournal::new()),
-    )
-    .expect("a fresh in-memory journal has nothing to replay");
+    // A gate with no backend accepts nothing, so it has no watermark a
+    // restart could lose and needs no durable journal (issue #605). A node
+    // that means to accept vouchers goes through `router_with_gate` and
+    // supplies a gate built over a real one.
+    let gate = ClientClaimGate::restore(Arc::new(connector_runtime::InMemoryJournal::new()))
+        .expect("a fresh in-memory journal has nothing to replay");
     router_with_gate(connector, signer, wrap_receiver_secret, gate)
 }
 
 /// As [`router_with_wrap_key`], but with a fully built [`ClientClaimGate`]
-/// -- the channels whose claims this edge accepts (issue #558) *and* the
+/// -- the settlement backends whose vouchers this edge accepts *and* the
 /// durable journal their watermarks survive a restart in (issue #605).
 ///
 /// The gate is passed in rather than assembled here on purpose: building
 /// one can fail (a journal that will not replay), and that failure has to
 /// stop the node starting, which a function returning a [`Router`] cannot
-/// do. This is also the seam a node's startup arming (issue #556)
-/// populates: the [`ClientChannelRegistry`] the gate was built over
-/// carries both sources of a channel's record -- whatever the node
-/// declared (`[[client_channels]]`) and, optionally, a
-/// [`ClientChannelSource`] resolving anything else against the chain
-/// ([`ClientChannelRegistry::with_source`]), which is what lets an
-/// unaffiliated buyer who has opened a channel on chain pay without the
-/// operator editing config first (issue #502). A registry with neither
-/// refuses every claim.
+/// do.
 pub fn router_with_gate(
     connector: Arc<Connector>,
     signer: Arc<dyn Signer>,
@@ -750,16 +739,14 @@ async fn route_price(
 /// `connector_domain::x402::parse_greeting`. One definition, so an emitter
 /// change cannot leave a reader behind.
 ///
-/// Re-exported rather than merely imported because `X402SettlementTerms`,
-/// `X402ChainSettlementTerms` and `X402SolanaSettlementTerms` are this
-/// crate's public configuration surface -- `connector-cli` builds them at
-/// startup and hands them to [`ClientEdgeState`] -- so the paths its
-/// callers already use keep working.
+/// Re-exported rather than merely imported because the batch-settlement
+/// terms are this crate's public configuration surface -- `connector-cli`
+/// builds them at startup and hands them to [`ClientEdgeState`] -- so the
+/// paths its callers already use keep working.
 pub use connector_domain::x402::{
-    X402AcceptOption, X402BatchSettlementEvmTerms, X402BatchSettlementOption,
-    X402BatchSettlementSolanaTerms, X402BatchSettlementTerms, X402ChainSettlementTerms,
-    X402ChannelExtra, X402PaymentOption, X402PaymentRequired, X402Resource, X402SettlementTerms,
-    X402SolanaSettlementTerms, X402_VERSION,
+    X402BatchSettlementEvmTerms, X402BatchSettlementOption, X402BatchSettlementSolanaTerms,
+    X402BatchSettlementTerms, X402Extensions, X402PaymentRequired, X402Resource, X402ToonExtension,
+    X402ToonTerms, X402_VERSION,
 };
 
 /// Answer an unpaid request to `destination` with terms instead of doing
@@ -957,22 +944,18 @@ struct AdmittedClaim {
 /// names when a forwarded route's next hop turns out never to have carried
 /// the packet that claim paid for.
 ///
-/// A named pair rather than a loose `(u64, u64)` because both carriages
-/// thread it from their admission to their rollback, and two fields of the
-/// same type transposed anywhere along that path would still compile --
-/// [`Self::of`] is the only way to build one, so the two can only ever come
-/// from the claim itself, in the order the gate reads them back in.
+/// A named type rather than a loose `u64` because both carriages thread it
+/// from their admission to their rollback -- [`Self::of`] is the only way
+/// to build one, so it can only ever come from the voucher itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AdmittedWatermark {
-    nonce: u64,
     cumulative_amount: u64,
 }
 
 impl AdmittedWatermark {
-    /// Read `claim`'s own nonce and transferred (cumulative) amount.
+    /// Read `claim`'s own cumulative amount.
     pub(crate) fn of(claim: &ClientClaim) -> AdmittedWatermark {
         AdmittedWatermark {
-            nonce: claim.nonce(),
             cumulative_amount: claim.transferred_amount(),
         }
     }
@@ -1453,7 +1436,7 @@ pub(crate) async fn roll_back_uncarried_forward(
     };
     if let Err(error) = state
         .claim_gate
-        .roll_back(channel_key, watermark.nonce, watermark.cumulative_amount)
+        .roll_back(channel_key, watermark.cumulative_amount)
         .await
     {
         tracing::error!(
@@ -1536,12 +1519,17 @@ mod tests {
     use connector_signer::LocalSigner;
     use tower::ServiceExt;
 
-    /// A claim gate over `channels`, journaling to a store that lives no
-    /// longer than the test does. These tests are about the HTTP surface
-    /// in front of the gate; that a watermark survives a restart is
-    /// `claim_gate`'s own `durability` module, over a real file.
-    fn test_gate(channels: ClientChannelRegistry) -> ClientClaimGate {
-        ClientClaimGate::restore(channels, Arc::new(InMemoryJournal::new()))
+    /// A claim gate admitting vouchers through `backend`, journaling to a
+    /// store that lives no longer than the test does. These tests are about
+    /// the HTTP surface in front of the gate; that a watermark survives a
+    /// restart is `claim_gate`'s own tests, over a real file.
+    fn test_gate(backend: Arc<crate::test_support::FakeBatchSettlement>) -> ClientClaimGate {
+        crate::test_support::gate_over(Arc::new(InMemoryJournal::new()), &backend)
+    }
+
+    /// A gate with no settlement backend: it accepts no voucher.
+    fn gate_without_backend() -> ClientClaimGate {
+        ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
             .expect("a fresh in-memory journal has nothing to replay")
     }
 
@@ -2497,8 +2485,11 @@ mod tests {
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(terms.x402_version, 2);
         assert_eq!(terms.resource.url, "g.example.app");
-        assert_eq!(terms.accepts.len(), 1, "terms are carried as a list");
-        assert_eq!(terms.offer().unwrap().amount, "100");
+        assert!(
+            terms.accepts.is_empty(),
+            "a node settling on no chain offers no accepts[] entry: {terms:?}"
+        );
+        assert_eq!(terms.toon().unwrap().amount, "100");
 
         // The header carries the same body the greeting sends over the wire.
         let header_bytes = BASE64.decode(&payment_required_header).unwrap();
@@ -2509,19 +2500,11 @@ mod tests {
             "the app must never be asked to do the work an unpaid request didn't pay for"
         );
 
-        // A node with no settlement backend keeps the pre-#617 greeting
-        // shape exactly: no `settlement` key at all, not a null one. Issue
-        // #632 adds `settlements` beside it on the same terms: absent, not
-        // an empty array, on a settlement-less node.
-        let extra = serde_json::to_value(&terms.offer().unwrap().extra).unwrap();
-        assert!(
-            extra.get("settlement").is_none(),
-            "a settlement-less node's greeting must not carry a settlement key: {extra}"
-        );
-        assert!(
-            extra.get("settlements").is_none(),
-            "a settlement-less node's greeting must not carry a settlements key: {extra}"
-        );
+        // ADR 0075 decision 10 (issue #1384): no `toon-channel` entry and
+        // no `settlement`/`settlements` terms anywhere in the greeting.
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!text.contains("toon-channel"), "{text}");
+        assert!(!text.contains("\"settlement"), "{text}");
     }
 
     /// Issue #1210: a route's `request` table rides on the HTTP 402
@@ -2555,7 +2538,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["request"], declared);
         assert!(
-            value["accepts"][0].get("request").is_none(),
+            value["extensions"]["toon"]["info"].get("request").is_none(),
             "request describes the resource, not a payment option"
         );
 
@@ -2642,7 +2625,7 @@ mod tests {
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            terms.offer().unwrap().extra.session_lease_ttl_ms,
+            terms.toon().unwrap().session_lease_ttl_ms,
             crate::session_registry::SESSION_LEASE_BACKSTOP_TTL.as_millis() as u64,
             "the advertised lease must be exactly what the session registry enforces"
         );
@@ -2683,7 +2666,7 @@ mod tests {
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            terms.offer().unwrap().extra.required_transport.as_deref(),
+            terms.toon().unwrap().required_transport.as_deref(),
             Some("btp"),
             "the client should learn this route requires BTP"
         );
@@ -2719,21 +2702,21 @@ mod tests {
 
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(terms.offer().unwrap().extra.required_transport, None);
-        let extra = serde_json::to_value(&terms.offer().unwrap().extra).unwrap();
+        assert_eq!(terms.toon().unwrap().required_transport, None);
+        let extra = serde_json::to_value(terms.toon().unwrap()).unwrap();
         assert!(
             extra.get("requiredTransport").is_none(),
             "an unrestricted route's greeting must not carry a requiredTransport key: {extra}"
         );
     }
 
-    /// Issue #617: a node WITH a settlement backend answers the greeting
-    /// with its channel-opening facts -- the counterparty address, chain,
-    /// registry, resolved `TokenNetwork`, token and scale -- so an
-    /// unaffiliated buyer can open a channel by ASKING (ADR 0022) instead
-    /// of needing an announce this connector never makes.
+    /// ADR 0075 decision 10 (issue #1384): a node settling on both chains
+    /// greets with one x402-valid `batch-settlement` entry per chain and
+    /// nothing else -- no `toon-channel` entry, no `settlement` or
+    /// `settlements` -- and quotes the charge in `extensions.toon` as in each
+    /// entry's own `amount`.
     #[tokio::test]
-    async fn an_unpaid_request_to_a_settling_node_is_answered_with_channel_opening_facts() {
+    async fn a_settling_node_greets_with_one_batch_settlement_entry_per_chain() {
         let route = StaticRoute::new_priced("g.example.app", "http://localhost:4000", 100).unwrap();
         let connector = Arc::new(Connector::new(
             vec![route],
@@ -2742,21 +2725,32 @@ mod tests {
             Arc::new(InProcessPeerTransport::new()),
             test_clock(),
         ));
-        let terms = X402SettlementTerms {
-            chain: "evm:84532".to_string(),
-            settlement_address: "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf".to_string(),
-            token_network_registry: "0xcc9079ade929b168b54145f6d25262b64fab9d5b".to_string(),
-            token_network: "0x1e95493fef46707e034b4a1945f25a8c76a1823d".to_string(),
-            token_address: "0x49bee1bca5d15fb0963117923403f9498119a9ce".to_string(),
-            decimals: 6,
-        };
+        let evm = X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
+            network: "eip155:84532".to_string(),
+            asset: "0x49bee1bca5d15fb0963117923403f9498119a9ce".to_string(),
+            pay_to: "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf".to_string(),
+            receiver_authorizer: "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf".to_string(),
+            min_withdraw_delay_secs: 86_400,
+            name: "USDC".to_string(),
+            version: "2".to_string(),
+        });
+        let solana = X402BatchSettlementTerms::Solana(X402BatchSettlementSolanaTerms {
+            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
+            asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            pay_to: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
+            fee_payer: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
+            min_grace_period_secs: 86_400,
+            min_deposit: "1000000".to_string(),
+            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            sponsor_endpoint: "/ilp/batch-settlement/solana/open".to_string(),
+        });
         let app = router_with_gate_and_terms(
             connector,
             test_signer(),
             None,
-            test_gate(ClientChannelRegistry::new()),
+            gate_without_backend(),
             NodeFacts {
-                settlements: vec![X402ChainSettlementTerms::Evm(terms.clone())],
+                batch_settlements: vec![evm, solana],
                 ..Default::default()
             },
         );
@@ -2769,92 +2763,16 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!text.contains("toon-channel"), "{text}");
+        assert!(!text.contains("\"settlement"), "{text}");
         let answered: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            answered.offer().unwrap().extra.settlement.as_ref(),
-            Some(&terms),
-            "the greeting must carry the node's channel-opening facts verbatim"
-        );
-
-        // Issue #632: an EVM-only node's additive `settlements` list is a
-        // one-entry list, its entry byte-identical to the legacy object.
-        assert_eq!(
-            answered.offer().unwrap().extra.settlements,
-            vec![X402ChainSettlementTerms::Evm(terms)],
-            "an EVM-only node's settlements list must carry exactly one entry, matching `settlement` verbatim"
-        );
-    }
-
-    /// Issue #632: a node settling on two chains carries BOTH chains'
-    /// channel-opening facts in `extra.settlements`, while the legacy
-    /// `extra.settlement` object stays exactly what it was before this
-    /// issue -- the EVM entry alone, unaffected by the Solana leg's
-    /// presence. This is the demoable slice's acceptance criterion: "a node
-    /// with both [settlement.evm] and [settlement.solana] greets with both
-    /// chains' facts; an EVM-only node greets with the legacy object
-    /// unchanged plus a one-entry list."
-    #[tokio::test]
-    async fn a_two_chain_node_greets_with_both_chains_facts_and_an_unchanged_legacy_object() {
-        let route = StaticRoute::new_priced("g.example.app", "http://localhost:4000", 100).unwrap();
-        let connector = Arc::new(Connector::new(
-            vec![route],
-            vec![],
-            Arc::new(FakeAppClient::new()),
-            Arc::new(InProcessPeerTransport::new()),
-            test_clock(),
-        ));
-        let evm_terms = X402SettlementTerms {
-            chain: "evm:84532".to_string(),
-            settlement_address: "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf".to_string(),
-            token_network_registry: "0xcc9079ade929b168b54145f6d25262b64fab9d5b".to_string(),
-            token_network: "0x1e95493fef46707e034b4a1945f25a8c76a1823d".to_string(),
-            token_address: "0x49bee1bca5d15fb0963117923403f9498119a9ce".to_string(),
-            decimals: 6,
-        };
-        let solana_terms = X402SolanaSettlementTerms {
-            chain: "solana".to_string(),
-            settlement_address: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
-            program_id: "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip".to_string(),
-            token_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
-            decimals: 6,
-        };
-        let app = router_with_gate_and_terms(
-            connector,
-            test_signer(),
-            None,
-            test_gate(ClientChannelRegistry::new()),
-            NodeFacts {
-                settlements: vec![
-                    X402ChainSettlementTerms::Evm(evm_terms.clone()),
-                    X402ChainSettlementTerms::Solana(solana_terms.clone()),
-                ],
-                ..Default::default()
-            },
-        );
-
-        let request = Request::builder()
-            .method("POST")
-            .uri("/ilp")
-            .body(Body::from(sample_prepare("g.example.app").encode()))
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let answered: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
-
-        assert_eq!(
-            answered.offer().unwrap().extra.settlement.as_ref(),
-            Some(&evm_terms),
-            "the legacy settlement object stays the EVM leg alone, unchanged by the Solana leg"
-        );
-        assert_eq!(
-            answered.offer().unwrap().extra.settlements,
-            vec![
-                X402ChainSettlementTerms::Evm(evm_terms),
-                X402ChainSettlementTerms::Solana(solana_terms),
-            ],
-            "a two-chain node's settlements list carries both chains' facts"
-        );
+        assert_eq!(answered.accepts.len(), 2);
+        for offer in answered.batch_settlement_offers() {
+            assert_eq!(offer.scheme, "batch-settlement");
+            assert_eq!(offer.amount, "100");
+        }
+        assert_eq!(answered.price(), Some(100));
     }
 
     /// A claim header suppresses the greeting even to a priced route --
@@ -2891,7 +2809,7 @@ mod tests {
         // no longer be observing what it names -- that a *present* claim
         // sends the request down §1.3's validation path rather than the
         // unpaid-greeting one.
-        let claim_json = claim_headers::evm_claim_json(1, 100);
+        let claim_json = claim_headers::evm_claim_json(100);
         let request = Request::builder()
             .method("POST")
             .uri("/ilp")
@@ -2996,7 +2914,7 @@ mod tests {
 
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(terms.offer().unwrap().amount, "0");
+        assert_eq!(terms.toon().unwrap().amount, "0");
         assert!(
             app_client.deliveries().is_empty(),
             "a bootstrap probe must never reach an app"
@@ -3064,7 +2982,7 @@ mod tests {
             test_gate(claim_headers::test_channels()),
         );
 
-        let claim_json = claim_headers::evm_claim_json(1, 100);
+        let claim_json = claim_headers::evm_claim_json(100);
         let request = Request::builder()
             .method("POST")
             .uri("/ilp")
@@ -3113,21 +3031,12 @@ mod tests {
             connector,
             test_signer(),
             None,
-            Arc::new(test_gate(ClientChannelRegistry::new())),
+            Arc::new(gate_without_backend()),
             NodeFacts {
                 ilp_addresses: vec!["g.example.app".to_string()],
                 http_endpoint: Some("https://node.example/ilp".to_string()),
                 btp_endpoint: Some("wss://node.example/ilp/btp".to_string()),
                 peer_carriages: vec!["btp".to_string()],
-                settlements: vec![X402ChainSettlementTerms::Evm(X402SettlementTerms {
-                    chain: "evm:84532".to_string(),
-                    settlement_address: "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf".to_string(),
-                    token_network_registry: "0xcc9079ade929b168b54145f6d25262b64fab9d5b"
-                        .to_string(),
-                    token_network: "0x1e95493fef46707e034b4a1945f25a8c76a1823d".to_string(),
-                    token_address: "0x49bee1bca5d15fb0963117923403f9498119a9ce".to_string(),
-                    decimals: 6,
-                })],
                 batch_settlements: Vec::new(),
                 voucher_signers: Vec::new(),
             },
@@ -3173,15 +3082,9 @@ mod tests {
             serde_json::json!("wss://node.example/ilp/btp")
         );
         assert_eq!(document["peerCarriages"], serde_json::json!(["btp"]));
-        assert_eq!(
-            document["settlements"][0]["chain"],
-            serde_json::json!("evm:84532")
-        );
-        assert_eq!(
-            document["settlements"][0]["tokenNetworkRegistry"],
-            serde_json::json!("0xcc9079ade929b168b54145f6d25262b64fab9d5b"),
-            "the channel-opening facts come from the settlement backend that verified them \
-             against a chain at startup, never a second declaration (ND-07)"
+        assert!(
+            document.get("settlements").is_none(),
+            "the toon-channel terms are gone with the scheme (ADR 0075 decision 10)"
         );
         assert_eq!(
             document["routes"],
@@ -3236,7 +3139,7 @@ mod tests {
             connector,
             test_signer(),
             None,
-            Arc::new(test_gate(ClientChannelRegistry::new())),
+            Arc::new(gate_without_backend()),
             NodeFacts {
                 ilp_addresses: vec![
                     "g.toon.relay".to_string(),
@@ -3245,7 +3148,6 @@ mod tests {
                 http_endpoint: Some("https://proxy.relay.example/ilp".to_string()),
                 btp_endpoint: Some("wss://proxy.relay.example/ilp/btp".to_string()),
                 peer_carriages: Vec::new(),
-                settlements: Vec::new(),
                 batch_settlements: Vec::new(),
                 voucher_signers: Vec::new(),
             },
@@ -3310,13 +3212,12 @@ mod tests {
             connector.clone(),
             test_signer(),
             None,
-            Arc::new(test_gate(ClientChannelRegistry::new())),
+            Arc::new(gate_without_backend()),
             NodeFacts {
                 ilp_addresses: vec!["g.toon.relay".to_string()],
                 http_endpoint: Some("https://proxy.relay.example/ilp".to_string()),
                 btp_endpoint: Some("wss://proxy.relay.example/ilp/btp".to_string()),
                 peer_carriages: Vec::new(),
-                settlements: Vec::new(),
                 batch_settlements: Vec::new(),
                 voucher_signers: Vec::new(),
             },
@@ -3412,7 +3313,7 @@ mod tests {
             connector,
             signer.clone(),
             None,
-            Arc::new(test_gate(ClientChannelRegistry::new())),
+            Arc::new(gate_without_backend()),
             NodeFacts::default(),
             DEFAULT_BTP_SESSION_WINDOW,
             None,
@@ -3453,7 +3354,7 @@ mod tests {
             Arc::new(connector),
             signer,
             None,
-            Arc::new(test_gate(ClientChannelRegistry::new())),
+            Arc::new(gate_without_backend()),
             NodeFacts::default(),
             DEFAULT_BTP_SESSION_WINDOW,
             None,
@@ -3589,7 +3490,7 @@ mod tests {
             connector.clone(),
             test_signer(),
             None,
-            Arc::new(test_gate(ClientChannelRegistry::new())),
+            Arc::new(gate_without_backend()),
             facts.clone(),
             DEFAULT_BTP_SESSION_WINDOW,
             None,
@@ -3627,7 +3528,7 @@ mod tests {
             connector,
             test_signer(),
             None,
-            Arc::new(test_gate(ClientChannelRegistry::new())),
+            Arc::new(gate_without_backend()),
             facts,
             DEFAULT_BTP_SESSION_WINDOW,
             None,
@@ -3661,7 +3562,7 @@ mod tests {
         let response = described_node().oneshot(request).await.unwrap();
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let greeting: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
-        let extra = &greeting.offer().unwrap().extra;
+        let extra = &greeting.toon().unwrap();
 
         assert_eq!(
             serde_json::to_value(&extra.ilp_addresses).unwrap(),
@@ -3672,14 +3573,9 @@ mod tests {
             document["btpEndpoint"]
         );
         assert_eq!(
-            serde_json::to_value(&extra.settlements).unwrap(),
-            document["settlements"]
-        );
-        assert_eq!(
-            serde_json::to_value(extra.settlement.as_ref()).unwrap(),
-            document["settlements"][0],
-            "the greeting's legacy one-chain object is the list's own EVM entry, derived rather \
-             than carried beside it"
+            greeting.accepts.is_empty(),
+            document.get("batchSettlements").is_none(),
+            "the greeting's accepts[] is the document's batchSettlements, projected"
         );
     }
 
@@ -3723,7 +3619,7 @@ mod tests {
             connector,
             test_signer(),
             None,
-            Arc::new(test_gate(ClientChannelRegistry::new())),
+            Arc::new(gate_without_backend()),
             NodeFacts {
                 ilp_addresses: vec!["g.toon.apex".to_string(), "g.toon.apex.alt".to_string()],
                 btp_endpoint: Some("wss://apex.example/ilp/btp".to_string()),
@@ -3745,16 +3641,16 @@ mod tests {
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            terms.offer().unwrap().extra.ilp_addresses,
+            terms.toon().unwrap().ilp_addresses,
             vec!["g.toon.apex".to_string(), "g.toon.apex.alt".to_string()],
             "ilpAddresses must be this node's own configured addresses, not an echo"
         );
         assert_eq!(
-            terms.offer().unwrap().extra.btp_endpoint.as_deref(),
+            terms.toon().unwrap().btp_endpoint.as_deref(),
             Some("wss://apex.example/ilp/btp")
         );
         // The legacy field is untouched: still an echo of the probed destination.
-        assert_eq!(terms.offer().unwrap().extra.ilp_address, "g.whatever");
+        assert_eq!(terms.toon().unwrap().ilp_address, "g.whatever");
     }
 
     /// The absence half of the test above: a node with no `[node]` section
@@ -3784,10 +3680,10 @@ mod tests {
 
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
-        assert!(terms.offer().unwrap().extra.ilp_addresses.is_empty());
-        assert!(terms.offer().unwrap().extra.btp_endpoint.is_none());
+        assert!(terms.toon().unwrap().ilp_addresses.is_empty());
+        assert!(terms.toon().unwrap().btp_endpoint.is_none());
 
-        let extra = serde_json::to_value(&terms.offer().unwrap().extra).unwrap();
+        let extra = serde_json::to_value(terms.toon().unwrap()).unwrap();
         assert!(
             extra.get("ilpAddresses").is_none(),
             "a node with no [announce] must not carry an ilpAddresses key: {extra}"
@@ -3805,188 +3701,32 @@ mod tests {
     /// HTTP seam rather than against `ClientClaimGate` directly.
     mod claim_headers {
         use super::*;
-        use libsecp256k1::{Message, PublicKey, SecretKey};
+        use crate::test_support::{self, FakeBatchSettlement};
+        use libsecp256k1::{PublicKey, SecretKey};
 
-        const EVM_CHAIN_ID: u64 = 8453;
-        const EVM_TOKEN_NETWORK_ADDRESS: [u8; 20] = [0x42; 20];
-
-        /// base58 of `[7u8; 32]`, the settlement program every Solana channel
-        /// in this module lives under -- so it is also the `programId` a
-        /// conforming claim on one of them declares
-        /// (`client-edge-spec.md` §1.3: the settlement program the
-        /// `channelAccount` lives under).
-        ///
-        /// Every Solana claim below used to declare its own *payer's* public
-        /// key here, which names no program at all. Nothing failed, because
-        /// the field grants nothing -- the signature is checked against the
-        /// channel's program (ADR 0053) -- but these fixtures are the closest
-        /// thing this crate has to a written-down example of a real claim,
-        /// and one that cannot be conformed to is worse than none (issue
-        /// #1127).
-        const SOLANA_CHANNEL_PROGRAM_BASE58: &str = "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx";
-
-        /// The literal above is base58 of `[7u8; 32]` -- the bytes the
-        /// balance proofs below are signed under and the
-        /// `FakeSolanaChannelSource` records. Nothing else in this module
-        /// says so, and a claim declaring a program its channel does not live
-        /// under is precisely what these fixtures are no longer supposed to
-        /// be.
-        #[test]
-        fn the_declared_solana_program_is_the_one_these_channels_live_under() {
-            assert_eq!(
-                bs58::decode(SOLANA_CHANNEL_PROGRAM_BASE58)
-                    .into_vec()
-                    .expect("a base58 literal"),
-                [7u8; 32],
-            );
+        /// The backend every voucher below is judged by: it holds the one EVM
+        /// channel `test_support::config()` names (and a second, salted one),
+        /// and the Solana channel, each able to pay a great deal.
+        pub(super) fn test_channels() -> Arc<FakeBatchSettlement> {
+            Arc::new(FakeBatchSettlement::new(1_000_000_000))
         }
 
-        /// The one channel every claim below is presented on, recorded with
-        /// [`evm_signer`]'s address as its counterparty (issue #558) -- a
-        /// claim signed by anyone else, or naming any other channel, is
-        /// refused however well-formed it is.
-        pub(super) fn test_channels() -> ClientChannelRegistry {
-            let (_secret, counterparty) = evm_signer();
-            let mut channels = ClientChannelRegistry::new();
-            channels
-                .record_evm(
-                    &"ab".repeat(32),
-                    EvmChannel {
-                        counterparty,
-                        chain_id: EVM_CHAIN_ID,
-                        token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-                        // Declared, so exempt from the collateral cap
-                        // (issue #646) exactly as config records are.
-                        deposit_floor: crate::DepositFloor::Unknown,
-                    },
-                )
-                .expect("a 32-byte hex channel id");
-            channels
+        /// The payer's genuine voucher for cumulative `amount` on the EVM
+        /// channel -- every test using this helper exercises the real
+        /// verification path, not a bypass.
+        pub(super) fn evm_claim_json(amount: u64) -> String {
+            test_support::signed_voucher(amount)
         }
 
-        /// A fixed, deterministic EVM keypair every genuine claim below is
-        /// signed with, so each test's own signature verifies.
-        fn evm_signer() -> (SecretKey, connector_signer::Address) {
-            let secret = SecretKey::parse(&[9u8; 32]).unwrap();
-            let public = PublicKey::from_secret_key(&secret);
-            (
-                secret,
-                connector_signer::derive_evm_address(&public.serialize()),
-            )
-        }
-
-        /// Sign `digest` exactly the way a real EVM wallet would (a 65-byte
-        /// `r || s || v` signature, `v` in the conventional `{27, 28}` range).
-        fn sign_evm(secret: &SecretKey, digest: &[u8; 32]) -> Vec<u8> {
-            let message = Message::parse(digest);
-            let (signature, recovery_id) = libsecp256k1::sign(&message, secret);
-            let mut bytes = signature.serialize().to_vec();
-            let recovery_byte: u8 = recovery_id.into();
-            bytes.push(recovery_byte + 27);
-            bytes
-        }
-
-        /// An EVM claim JSON carrying whatever `signature` hex string is
-        /// given verbatim, genuine or not.
-        fn evm_claim_json_with_signature(
-            nonce: u64,
-            transferred_amount: u64,
-            signature_hex: &str,
-        ) -> String {
-            let (_secret, address) = evm_signer();
-            evm_claim_json_with_signature_and_signer(
-                nonce,
-                transferred_amount,
-                signature_hex,
-                &address,
-            )
-        }
-
-        /// As [`evm_claim_json_with_signature`], but declaring whatever
-        /// `signer_address` it is given -- what a forger does (issue #558):
-        /// sign with a key of one's own and name oneself the payer.
-        fn evm_claim_json_with_signature_and_signer(
-            nonce: u64,
-            transferred_amount: u64,
-            signature_hex: &str,
-            signer_address: &connector_signer::Address,
-        ) -> String {
-            let address = signer_address;
-            format!(
-                r#"{{
-                    "version": "1.0",
-                    "blockchain": "evm",
-                    "messageId": "msg-{nonce}",
-                    "timestamp": "2026-02-02T12:00:00.000Z",
-                    "senderId": "peer-bob",
-                    "channelId": "0x{channel}",
-                    "nonce": {nonce},
-                    "transferredAmount": "{transferred_amount}",
-                    "lockedAmount": "0",
-                    "locksRoot": "0x{zeros}",
-                    "signature": "{signature_hex}",
-                    "signerAddress": "{address}",
-                    "chainId": {EVM_CHAIN_ID},
-                    "tokenNetworkAddress": "{token_network_address}"
-                }}"#,
-                channel = "ab".repeat(32),
-                zeros = "0".repeat(64),
-                address = connector_signer::to_hex(address),
-                token_network_address = connector_signer::to_hex(&EVM_TOKEN_NETWORK_ADDRESS),
-            )
-        }
-
-        /// A claim over the recorded channel, genuinely and correctly
-        /// signed -- by a key that is not that channel's counterparty, and
-        /// declaring itself the payer. The forger of issue #558.
-        fn forged_evm_claim_json(nonce: u64, transferred_amount: u64) -> String {
-            let secret = SecretKey::parse(&[0x5a; 32]).unwrap();
-            let address = connector_signer::derive_evm_address(
-                &PublicKey::from_secret_key(&secret).serialize(),
-            );
-            let channel = "ab".repeat(32);
-            let mut channel_id = [0u8; 32];
-            channel_id.copy_from_slice(&hex::decode(&channel).unwrap());
-            let proof = connector_signer::EvmBalanceProof {
-                channel_id,
-                nonce,
-                transferred_amount: u128::from(transferred_amount),
-                locked_amount: 0,
-                locks_root: [0u8; 32],
-                chain_id: EVM_CHAIN_ID,
-                token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-            };
-            let signature = sign_evm(&secret, &connector_signer::evm_balance_proof_digest(&proof));
-            evm_claim_json_with_signature_and_signer(
-                nonce,
-                transferred_amount,
-                &format!("0x{}", hex_encode(&signature)),
-                &address,
-            )
-        }
-
-        /// An EVM claim JSON with a genuine EIP-712 signature over its own
-        /// fields (issue #506/#544) -- every test using this helper
-        /// exercises the real verification path, not a bypass.
-        pub(super) fn evm_claim_json(nonce: u64, transferred_amount: u64) -> String {
-            let channel = "ab".repeat(32);
-            let mut channel_id = [0u8; 32];
-            channel_id.copy_from_slice(&hex::decode(&channel).unwrap());
-            let (secret, _address) = evm_signer();
-            let proof = connector_signer::EvmBalanceProof {
-                channel_id,
-                nonce,
-                transferred_amount: u128::from(transferred_amount),
-                locked_amount: 0,
-                locks_root: [0u8; 32],
-                chain_id: EVM_CHAIN_ID,
-                token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-            };
-            let signature = sign_evm(&secret, &connector_signer::evm_balance_proof_digest(&proof));
-            evm_claim_json_with_signature(
-                nonce,
-                transferred_amount,
-                &format!("0x{}", hex_encode(&signature)),
+        /// A voucher of cumulative `amount` whose signature is well-formed
+        /// (65 bytes) and signs nothing: it decodes, so it reaches the stages
+        /// after structure, and it can never verify.
+        fn voucher_with_a_signature_that_signs_nothing(amount: u64) -> String {
+            test_support::evm_voucher_with(
+                &test_support::config(),
+                amount,
+                &format!("0x{}", "00".repeat(65)),
+                "client-1",
             )
         }
 
@@ -3998,11 +3738,7 @@ mod tests {
                 "timestamp": "2026-02-02T12:00:00.000Z",
                 "senderId": "peer-dave",
                 "zkAppAddress": "irrelevant",
-                "tokenId": "1",
-                "balanceCommitment": "abc",
-                "nonce": 1,
-                "proof": "AAAA",
-                "salt": "salt"
+                "nonce": 1
             }"#
         }
 
@@ -4040,8 +3776,7 @@ mod tests {
                 sealed_sample_prepare("g.example.app", &signer.public_key().unwrap());
             let app = router_with_gate(connector, signer, None, test_gate(test_channels()));
 
-            let request =
-                request_with_claim_header(&prepare, CLAIM_HEADER, &evm_claim_json(1, 100));
+            let request = request_with_claim_header(&prepare, CLAIM_HEADER, &evm_claim_json(100));
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
 
@@ -4051,7 +3786,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_replayed_claim_nonce_rejects_before_reaching_the_app() {
+        async fn an_older_voucher_rejects_before_reaching_the_app() {
             let route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
             let app_client = Arc::new(FakeAppClient::new());
             app_client.respond(route.handler_url(), answered(b"ok"));
@@ -4071,17 +3806,18 @@ mod tests {
             let (first_prepare, _shared_secret) =
                 sealed_sample_prepare("g.example.app", &signer.public_key().unwrap());
             let first =
-                request_with_claim_header(&first_prepare, CLAIM_HEADER, &evm_claim_json(5, 500));
+                request_with_claim_header(&first_prepare, CLAIM_HEADER, &evm_claim_json(500));
             let response = app.clone().oneshot(first).await.unwrap();
             Fulfill::decode(&hyper::body::to_bytes(response.into_body()).await.unwrap())
                 .expect("first claim accepted");
 
-            // The replay is rejected on the claim nonce alone, before the
-            // envelope would ever need to open -- plaintext is fine here.
+            // An older voucher on the channel is refused on its amount alone
+            // -- it does not strictly exceed the watermark -- before the
+            // envelope would ever need to open; plaintext is fine here.
             let replay = request_with_claim_header(
                 &sample_prepare("g.example.app"),
                 CLAIM_HEADER,
-                &evm_claim_json(5, 999),
+                &evm_claim_json(400),
             );
             let response = app.oneshot(replay).await.unwrap();
             // An ILP-level outcome, even a reject, is always HTTP 200.
@@ -4111,7 +3847,7 @@ mod tests {
             let request = request_with_claim_header(
                 &sample_prepare("g.example.app"),
                 CLAIM_HEADER,
-                r#"{"version":"1.0","blockchain":"evm"}"#,
+                r#"{"version":"1.0","blockchain":"evm","scheme":"batch-settlement"}"#,
             );
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -4175,7 +3911,7 @@ mod tests {
             let receiver_secret = SecretKey::parse(&receiver_secret_bytes).unwrap();
             let receiver_public = PublicKey::from_secret_key(&receiver_secret);
 
-            let claim_json = evm_claim_json(1, 100);
+            let claim_json = evm_claim_json(100);
             let wrapped = connector_signer::wrap_claim(
                 claim_json.as_bytes(),
                 &sender_secret,
@@ -4255,8 +3991,7 @@ mod tests {
                 sealed_sample_prepare("g.example.app", &signer.public_key().unwrap());
             let app = router_with_gate(connector, signer, None, test_gate(test_channels()));
 
-            let request =
-                request_with_claim_header(&prepare, CLAIM_HEADER, &evm_claim_json(1, 100));
+            let request = request_with_claim_header(&prepare, CLAIM_HEADER, &evm_claim_json(100));
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
 
@@ -4270,7 +4005,7 @@ mod tests {
         /// covering claim's watermark -- the payer is told `accumulated_
         /// cost` 0 and the app is never asked to do anything, so the claim
         /// it rode in on must still be spendable afterward. Proven the same
-        /// way `a_replayed_claim_nonce_rejects_before_reaching_the_app`
+        /// way `an_older_voucher_rejects_before_reaching_the_app`
         /// proves the opposite direction: the identical claim, resent with
         /// a target that resolves cleanly, is still accepted -- which is
         /// only possible if the first, refused attempt left the watermark
@@ -4293,7 +4028,7 @@ mod tests {
                 .with_identity_signer(signer.clone()),
             );
             let app = router_with_gate(connector, signer.clone(), None, test_gate(test_channels()));
-            let claim = evm_claim_json(1, 100);
+            let claim = evm_claim_json(100);
 
             let (escaping_prepare, _shared_secret) = sealed_sample_prepare_with_target(
                 "g.example.app",
@@ -4353,15 +4088,14 @@ mod tests {
                 sealed_sample_prepare("g.example.relay", &signer.public_key().unwrap());
             let app = router_with_gate(connector, signer, None, test_gate(test_channels()));
 
-            let request =
-                request_with_claim_header(&prepare, CLAIM_HEADER, &evm_claim_json(1, 100));
+            let request = request_with_claim_header(&prepare, CLAIM_HEADER, &evm_claim_json(100));
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
 
             let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
             let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(
-                terms.offer().unwrap().extra.required_transport.as_deref(),
+                terms.toon().unwrap().required_transport.as_deref(),
                 Some("btp")
             );
 
@@ -4393,7 +4127,7 @@ mod tests {
             let request = request_with_claim_header(
                 &sample_prepare("g.example.app"),
                 CLAIM_HEADER,
-                &evm_claim_json(1, 99),
+                &evm_claim_json(99),
             );
             let response = app.oneshot(request).await.unwrap();
             // An ILP-level outcome, even a reject, is always HTTP 200.
@@ -4460,7 +4194,7 @@ mod tests {
                 .oneshot(request_with_claim_header(
                     &small,
                     CLAIM_HEADER,
-                    &evm_claim_json(1, small_charge),
+                    &evm_claim_json(small_charge),
                 ))
                 .await
                 .unwrap();
@@ -4482,7 +4216,7 @@ mod tests {
                 .oneshot(request_with_claim_header(
                     &large,
                     CLAIM_HEADER,
-                    &evm_claim_json(2, small_charge + 100),
+                    &evm_claim_json(small_charge + 100),
                 ))
                 .await
                 .unwrap();
@@ -4517,7 +4251,7 @@ mod tests {
                 .oneshot(request_with_claim_header(
                     &large,
                     CLAIM_HEADER,
-                    &evm_claim_json(3, small_charge + large_charge),
+                    &evm_claim_json(small_charge + large_charge),
                 ))
                 .await
                 .unwrap();
@@ -4564,8 +4298,7 @@ mod tests {
             ));
             let app = router_with_gate(connector, test_signer(), None, test_gate(test_channels()));
 
-            let garbage_signature_claim =
-                evm_claim_json_with_signature(1, 50, "0xnotarealsignatureatall");
+            let garbage_signature_claim = voucher_with_a_signature_that_signs_nothing(50);
             let request = request_with_claim_header(
                 &sample_prepare("g.example.app"),
                 CLAIM_HEADER,
@@ -4594,7 +4327,7 @@ mod tests {
             ));
             let app = router_with_gate(connector, test_signer(), None, test_gate(test_channels()));
 
-            let unverifiable_claim = evm_claim_json_with_signature(1, 100, "0xabcd");
+            let unverifiable_claim = voucher_with_a_signature_that_signs_nothing(100);
             let request = request_with_claim_header(
                 &sample_prepare("g.example.app"),
                 CLAIM_HEADER,
@@ -4632,7 +4365,7 @@ mod tests {
             let request = request_with_claim_header(
                 &sample_prepare("g.example.app"),
                 CLAIM_HEADER,
-                &forged_evm_claim_json(1, 100),
+                &test_support::forged_voucher(100),
             );
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -4640,7 +4373,7 @@ mod tests {
             let reject = Reject::decode(&bytes).expect("decode reject");
             assert_eq!(reject.code.as_str(), "F01");
             assert!(
-                reject.message.contains("counterparty"),
+                reject.message.contains("voucher signer"),
                 "the refusal names why it was refused: {}",
                 reject.message
             );
@@ -4667,13 +4400,21 @@ mod tests {
                 Arc::new(InProcessPeerTransport::new()),
                 test_clock(),
             ));
-            // `router`, not `router_with_gate`: no channel recorded.
-            let app = router(connector, test_signer());
+            // A backend that admits another channel, not this one.
+            let app = router_with_gate(
+                connector,
+                test_signer(),
+                None,
+                test_gate(Arc::new(FakeBatchSettlement::holding(
+                    vec![test_support::config_salted(0x77)],
+                    1_000_000_000,
+                ))),
+            );
 
             let request = request_with_claim_header(
                 &sample_prepare("g.example.app"),
                 CLAIM_HEADER,
-                &evm_claim_json(1, 100),
+                &evm_claim_json(100),
             );
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -4681,24 +4422,17 @@ mod tests {
             let reject = Reject::decode(&bytes).expect("decode reject");
             assert_eq!(reject.code.as_str(), "F01");
             assert!(
-                reject.message.contains("no record of"),
+                reject.message.contains("does not admit"),
                 "an unknown channel is refused for being unknown, not for a bad signature: {}",
                 reject.message
             );
             assert!(app_client.deliveries().is_empty());
         }
 
-        /// Issues #556/#502, at the real HTTP seam: a buyer this operator
-        /// has never heard of -- no `[[client_channels]]` entry, nothing
-        /// declared for their channel at all -- pays and the write lands,
-        /// because the connector resolves the channel's counterparty from
-        /// the chain the channel was opened on.
-        ///
-        /// This is the test that fails on `origin/main`: there, the only
-        /// possible record is a declared one, so this exact request is
-        /// refused F01 "no record of" and the app is never asked to work.
+        /// A Solana voucher, genuinely signed by its channel's
+        /// `authorized_signer`, buys the write exactly as an EVM one does.
         #[tokio::test]
-        async fn a_claim_on_a_channel_only_the_chain_knows_about_reaches_the_app() {
+        async fn a_solana_voucher_reaches_the_app() {
             let route =
                 StaticRoute::new_priced("g.example.app", "http://localhost:4000", 100).unwrap();
             let app_client = Arc::new(FakeAppClient::new());
@@ -4714,50 +4448,27 @@ mod tests {
                 )
                 .with_identity_signer(signer.clone()),
             );
-
-            // Nothing declared. The source stands in for
-            // `TokenNetwork.channels(id)`, which is what names the buyer
-            // as this channel's counterparty.
-            let (_secret, counterparty) = evm_signer();
-            let mut channel_id = [0u8; 32];
-            channel_id.copy_from_slice(&hex::decode("ab".repeat(32)).unwrap());
-            let channels = ClientChannelRegistry::new().with_source(Arc::new(
-                crate::channels::test_source::FakeChannelSource::knowing(vec![(
-                    channel_id,
-                    EvmChannel {
-                        counterparty,
-                        chain_id: EVM_CHAIN_ID,
-                        token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-                        deposit_floor: crate::DepositFloor::AtLeast(1_000_000),
-                    },
-                )]),
-            ));
-            assert!(
-                !channels.is_empty(),
-                "a registry with a source can vouch for channels nobody wrote down"
-            );
-
             let (prepare, _shared_secret) =
                 sealed_sample_prepare("g.example.app", &signer.public_key().unwrap());
-            let app = router_with_gate(connector, signer, None, test_gate(channels));
-            let request =
-                request_with_claim_header(&prepare, CLAIM_HEADER, &evm_claim_json(1, 100));
-            let response = app.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
+            let app = router_with_gate(connector, signer, None, test_gate(test_channels()));
 
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            Fulfill::decode(&bytes).expect(
-                "an unaffiliated buyer's on-chain channel is payable without a config edit",
+            let request = request_with_claim_header(
+                &prepare,
+                CLAIM_HEADER,
+                &test_support::solana_voucher(100, &test_support::solana_signer()),
             );
+            let response = app.oneshot(request).await.unwrap();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            Fulfill::decode(&bytes).expect("a genuine Solana voucher buys the write");
             assert_eq!(app_client.deliveries().len(), 1);
         }
 
-        /// A lookup this connector could not complete refuses the claim --
-        /// it never degrades to believing what the claim says about its
-        /// own signer -- and says which failure it was, so an operator can
-        /// tell a broken RPC endpoint from a sender guessing channel ids.
+        /// Issue #556, for a voucher: a lookup the backend could not complete
+        /// is refused as this connector's own temporary failure (`T00`), never
+        /// as an unknown channel, and never falls back to trusting the
+        /// voucher.
         #[tokio::test]
-        async fn a_claim_whose_channel_lookup_fails_never_reaches_the_app() {
+        async fn a_voucher_whose_channel_lookup_fails_never_reaches_the_app() {
             let route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
             let app_client = Arc::new(FakeAppClient::new());
             app_client.respond(route.handler_url(), answered(b"ok"));
@@ -4768,387 +4479,95 @@ mod tests {
                 Arc::new(InProcessPeerTransport::new()),
                 test_clock(),
             ));
-            let channels = ClientChannelRegistry::new().with_source(Arc::new(
-                crate::channels::test_source::FakeChannelSource::unreachable("connection refused"),
-            ));
-            let app = router_with_gate(connector, test_signer(), None, test_gate(channels));
+            let app = router_with_gate(
+                connector,
+                test_signer(),
+                None,
+                test_gate(Arc::new(FakeBatchSettlement::unreachable())),
+            );
 
             let request = request_with_claim_header(
                 &sample_prepare("g.example.app"),
                 CLAIM_HEADER,
-                &evm_claim_json(1, 100),
+                &evm_claim_json(100),
             );
             let response = app.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
             let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
             let reject = Reject::decode(&bytes).expect("decode reject");
-            // T00, not F01 (issue #613's review): a failed lookup is this
-            // connector's problem and not the claim's, so it must come back
-            // as a *temporary* error. Told F01 a sender concludes its
-            // perfectly good claim is invalid and stops, because a third
-            // party's RPC endpoint blipped.
             assert_eq!(reject.code.as_str(), "T00");
-            assert!(
-                reject.message.contains("could not look up"),
-                "an unreachable chain is reported as such, not as an unknown channel: {}",
-                reject.message
-            );
             assert!(app_client.deliveries().is_empty());
         }
 
-        /// Issue #630's demoable slice, proven at this crate's own real
-        /// HTTP seam -- the same one
-        /// `a_fresh_plaintext_claim_lets_the_packet_reach_the_app` proves
-        /// for EVM, above: a Solana channel declared only in
-        /// [`ClientChannelRegistry`] (the `[[client_channels]]`-equivalent
-        /// -- no chain resolution, no settlement backend, matching
-        /// `ClientChannelRegistry::solana`'s own "declared records only"
-        /// doc), a genuinely Ed25519-signed claim over it, verified,
-        /// journaled and forwarded to the app.
+        /// ADR 0075 decision 8 (issue #1384), at the real HTTP seam: the
+        /// retired `toon-channel` claim -- no `scheme`, or `scheme:
+        /// "toon-channel"` -- is refused by name, distinguishably from a
+        /// malformed claim, and never reaches the app.
         #[tokio::test]
-        async fn a_declared_solana_client_channel_claim_reaches_the_app() {
-            use base64::engine::general_purpose::STANDARD as BASE64;
-            use base64::Engine;
-            use ed25519_dalek::{Keypair as SolanaKeypair, Signer as Ed25519Signer};
-            use rand::rngs::OsRng;
-
+        async fn a_toon_channel_claim_is_refused_by_name_before_reaching_the_app() {
             let route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
             let app_client = Arc::new(FakeAppClient::new());
             app_client.respond(route.handler_url(), answered(b"ok"));
-            let signer = test_signer();
-            let connector = Arc::new(
-                Connector::new(
-                    vec![route],
-                    vec![],
-                    app_client.clone(),
-                    Arc::new(InProcessPeerTransport::new()),
-                    test_clock(),
-                )
-                .with_identity_signer(signer.clone()),
+            let connector = Arc::new(Connector::new(
+                vec![route],
+                vec![],
+                app_client.clone(),
+                Arc::new(InProcessPeerTransport::new()),
+                test_clock(),
+            ));
+            let app = router_with_gate(connector, test_signer(), None, test_gate(test_channels()));
+            let unschemed = test_support::toon_channel_claim();
+            let explicit = unschemed.replace(
+                r#""blockchain":"evm""#,
+                r#""blockchain":"evm","scheme":"toon-channel""#,
             );
+            assert_ne!(explicit, unschemed);
 
-            // The channel's counterparty must be a real Ed25519 identity
-            // able to sign a genuine balance proof (issue #558) -- generated
-            // here rather than a placeholder, since the claim below signs
-            // with it for real.
-            let counterparty_keypair = SolanaKeypair::generate(&mut OsRng);
-            let channel_account = [0x42u8; 32];
-            let channel_account_base58 = bs58::encode(channel_account).into_string();
-            let counterparty_base58 =
-                bs58::encode(counterparty_keypair.public.to_bytes()).into_string();
-
-            // Declared, not resolved from chain: `[[client_channels]]`'s
-            // own registration path (issue #630). The chain-resolved twin
-            // of this test, for a channel nothing declared, is issue
-            // #631's `a_solana_claim_on_a_channel_only_the_chain_knows_about_reaches_the_app`
-            // below.
-            let mut channels = ClientChannelRegistry::new();
-            channels
-                .record_solana(
-                    &channel_account_base58,
-                    &counterparty_base58,
-                    SOLANA_CHANNEL_PROGRAM_BASE58,
-                )
-                .expect("valid base58 32-byte accounts");
-
-            let nonce = 1u64;
-            let transferred_amount = 100u64;
-            let message = connector_signer::solana_balance_proof_message(
-                &[7u8; 32],
-                &channel_account,
-                nonce,
-                transferred_amount,
-            );
-            let signature = counterparty_keypair.sign(&message);
-            let signature_base64 = BASE64.encode(signature.to_bytes());
-
-            let claim_json = format!(
-                r#"{{
-                    "version": "1.0",
-                    "blockchain": "solana",
-                    "messageId": "msg-1",
-                    "timestamp": "2026-02-02T12:00:00.000Z",
-                    "senderId": "peer-bob",
-                    "programId": "{SOLANA_CHANNEL_PROGRAM_BASE58}",
-                    "channelAccount": "{channel_account_base58}",
-                    "nonce": {nonce},
-                    "transferredAmount": "{transferred_amount}",
-                    "signature": "{signature_base64}",
-                    "signerPublicKey": "{counterparty_base58}"
-                }}"#,
-            );
-
-            let (prepare, _shared_secret) =
-                sealed_sample_prepare("g.example.app", &signer.public_key().unwrap());
-            let app = router_with_gate(connector, signer, None, test_gate(channels));
-
-            let request = request_with_claim_header(&prepare, CLAIM_HEADER, &claim_json);
-            let response = app.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            Fulfill::decode(&bytes).expect("decode fulfill");
-            assert_eq!(app_client.deliveries().len(), 1);
+            for claim in [unschemed, explicit] {
+                let request = request_with_claim_header(
+                    &sample_prepare("g.example.app"),
+                    CLAIM_HEADER,
+                    &claim,
+                );
+                let response = app.clone().oneshot(request).await.unwrap();
+                let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                let reject = Reject::decode(&bytes).expect("decode reject");
+                assert_eq!(reject.code.as_str(), "F01");
+                assert!(
+                    reject.message.contains("toon-channel"),
+                    "{}",
+                    reject.message
+                );
+                assert!(reject.message.contains("ADR 0075"), "{}", reject.message);
+                assert!(!reject.message.contains("structurally invalid"));
+            }
+            assert!(app_client.deliveries().is_empty());
         }
 
-        /// The forger of issue #558, Solana-flavored: a claim genuinely
-        /// signed, but by a key that is not the declared channel's
-        /// counterparty, and declaring itself the payer anyway. Must be
-        /// refused exactly as the equivalent EVM forgery is -- the claim's
-        /// own `signerPublicKey` is never trusted, only the registry's
-        /// declared counterparty is checked against.
+        /// A node with no settlement backend accepts no voucher, and says why.
         #[tokio::test]
-        async fn a_solana_claim_forged_by_a_non_counterparty_key_is_refused() {
-            use base64::engine::general_purpose::STANDARD as BASE64;
-            use base64::Engine;
-            use ed25519_dalek::{Keypair as SolanaKeypair, Signer as Ed25519Signer};
-            use rand::rngs::OsRng;
-
+        async fn a_voucher_to_a_node_settling_on_no_chain_is_refused_by_name() {
             let route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
             let app_client = Arc::new(FakeAppClient::new());
-            app_client.respond(route.handler_url(), answered(b"ok"));
-            let signer = test_signer();
-            let connector = Arc::new(
-                Connector::new(
-                    vec![route],
-                    vec![],
-                    app_client.clone(),
-                    Arc::new(InProcessPeerTransport::new()),
-                    test_clock(),
-                )
-                .with_identity_signer(signer.clone()),
+            let connector = Arc::new(Connector::new(
+                vec![route],
+                vec![],
+                app_client.clone(),
+                Arc::new(InProcessPeerTransport::new()),
+                test_clock(),
+            ));
+            let app = router(connector, test_signer());
+            let request = request_with_claim_header(
+                &sample_prepare("g.example.app"),
+                CLAIM_HEADER,
+                &evm_claim_json(100),
             );
-
-            let real_counterparty = SolanaKeypair::generate(&mut OsRng);
-            let forger = SolanaKeypair::generate(&mut OsRng);
-            let channel_account = [0x43u8; 32];
-            let channel_account_base58 = bs58::encode(channel_account).into_string();
-            let real_counterparty_base58 =
-                bs58::encode(real_counterparty.public.to_bytes()).into_string();
-            let forger_base58 = bs58::encode(forger.public.to_bytes()).into_string();
-
-            let mut channels = ClientChannelRegistry::new();
-            channels
-                .record_solana(
-                    &channel_account_base58,
-                    &real_counterparty_base58,
-                    SOLANA_CHANNEL_PROGRAM_BASE58,
-                )
-                .expect("valid base58 32-byte accounts");
-
-            let nonce = 1u64;
-            let transferred_amount = 100u64;
-            let message = connector_signer::solana_balance_proof_message(
-                &[7u8; 32],
-                &channel_account,
-                nonce,
-                transferred_amount,
-            );
-            // Signed genuinely -- just by the wrong key.
-            let signature = forger.sign(&message);
-            let signature_base64 = BASE64.encode(signature.to_bytes());
-
-            let claim_json = format!(
-                r#"{{
-                    "version": "1.0",
-                    "blockchain": "solana",
-                    "messageId": "msg-1",
-                    "timestamp": "2026-02-02T12:00:00.000Z",
-                    "senderId": "peer-bob",
-                    "programId": "{SOLANA_CHANNEL_PROGRAM_BASE58}",
-                    "channelAccount": "{channel_account_base58}",
-                    "nonce": {nonce},
-                    "transferredAmount": "{transferred_amount}",
-                    "signature": "{signature_base64}",
-                    "signerPublicKey": "{forger_base58}"
-                }}"#,
-            );
-
-            let (prepare, _shared_secret) =
-                sealed_sample_prepare("g.example.app", &signer.public_key().unwrap());
-            let app = router_with_gate(connector, signer, None, test_gate(channels));
-
-            let request = request_with_claim_header(&prepare, CLAIM_HEADER, &claim_json);
             let response = app.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-
             let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
             let reject = Reject::decode(&bytes).expect("decode reject");
             assert_eq!(reject.code.as_str(), "F01");
-            assert!(app_client.deliveries().is_empty());
-        }
-
-        /// Issue #631, the Solana twin of
-        /// `a_claim_on_a_channel_only_the_chain_knows_about_reaches_the_app`
-        /// above: a buyer this operator has never heard of -- no
-        /// `[[client_channels]]` entry, nothing declared for their channel
-        /// at all -- pays and the write lands, because the connector
-        /// resolves the channel's counterparty from the deployed Solana
-        /// payment-channel program the channel was opened on.
-        #[tokio::test]
-        async fn a_solana_claim_on_a_channel_only_the_chain_knows_about_reaches_the_app() {
-            use base64::engine::general_purpose::STANDARD as BASE64;
-            use base64::Engine;
-            use ed25519_dalek::{Keypair as SolanaKeypair, Signer as Ed25519Signer};
-            use rand::rngs::OsRng;
-
-            let route =
-                StaticRoute::new_priced("g.example.app", "http://localhost:4000", 100).unwrap();
-            let app_client = Arc::new(FakeAppClient::new());
-            app_client.respond(route.handler_url(), answered(b"ok"));
-            let signer = test_signer();
-            let connector = Arc::new(
-                Connector::new(
-                    vec![route],
-                    vec![],
-                    app_client.clone(),
-                    Arc::new(InProcessPeerTransport::new()),
-                    test_clock(),
-                )
-                .with_identity_signer(signer.clone()),
-            );
-
-            // Nothing declared. The source stands in for
-            // `SolanaSettlementBackend::channel_counterparty`, which is
-            // what names the buyer as this channel's counterparty.
-            let counterparty_keypair = SolanaKeypair::generate(&mut OsRng);
-            let channel_account = [0x44u8; 32];
-            let channel_account_base58 = bs58::encode(channel_account).into_string();
-            let counterparty_base58 =
-                bs58::encode(counterparty_keypair.public.to_bytes()).into_string();
-
-            let channels = ClientChannelRegistry::new().with_solana_source(Arc::new(
-                crate::channels::test_source::FakeSolanaChannelSource::knowing(vec![(
-                    channel_account,
-                    crate::SolanaChannel {
-                        program_id: [7u8; 32],
-                        counterparty: counterparty_keypair.public.to_bytes(),
-                        deposit_floor: crate::DepositFloor::AtLeast(1_000_000),
-                    },
-                )]),
-            ));
             assert!(
-                !channels.is_empty(),
-                "a registry with a source can vouch for channels nobody wrote down"
-            );
-
-            let nonce = 1u64;
-            let transferred_amount = 100u64;
-            let message = connector_signer::solana_balance_proof_message(
-                &[7u8; 32],
-                &channel_account,
-                nonce,
-                transferred_amount,
-            );
-            let signature = counterparty_keypair.sign(&message);
-            let signature_base64 = BASE64.encode(signature.to_bytes());
-
-            let claim_json = format!(
-                r#"{{
-                    "version": "1.0",
-                    "blockchain": "solana",
-                    "messageId": "msg-1",
-                    "timestamp": "2026-02-02T12:00:00.000Z",
-                    "senderId": "peer-bob",
-                    "programId": "{SOLANA_CHANNEL_PROGRAM_BASE58}",
-                    "channelAccount": "{channel_account_base58}",
-                    "nonce": {nonce},
-                    "transferredAmount": "{transferred_amount}",
-                    "signature": "{signature_base64}",
-                    "signerPublicKey": "{counterparty_base58}"
-                }}"#,
-            );
-
-            let (prepare, _shared_secret) =
-                sealed_sample_prepare("g.example.app", &signer.public_key().unwrap());
-            let app = router_with_gate(connector, signer, None, test_gate(channels));
-
-            let request = request_with_claim_header(&prepare, CLAIM_HEADER, &claim_json);
-            let response = app.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            Fulfill::decode(&bytes).expect(
-                "an unaffiliated Solana buyer's on-chain channel is payable without a config edit",
-            );
-            assert_eq!(app_client.deliveries().len(), 1);
-        }
-
-        /// The Solana twin of `a_claim_whose_channel_lookup_fails_never_reaches_the_app`:
-        /// a lookup this connector could not complete refuses the claim
-        /// rather than believing what it says about its own signer.
-        #[tokio::test]
-        async fn a_solana_claim_whose_channel_lookup_fails_never_reaches_the_app() {
-            use base64::engine::general_purpose::STANDARD as BASE64;
-            use base64::Engine;
-            use ed25519_dalek::{Keypair as SolanaKeypair, Signer as Ed25519Signer};
-            use rand::rngs::OsRng;
-
-            let route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
-            let app_client = Arc::new(FakeAppClient::new());
-            app_client.respond(route.handler_url(), answered(b"ok"));
-            let signer = test_signer();
-            let connector = Arc::new(
-                Connector::new(
-                    vec![route],
-                    vec![],
-                    app_client.clone(),
-                    Arc::new(InProcessPeerTransport::new()),
-                    test_clock(),
-                )
-                .with_identity_signer(signer.clone()),
-            );
-            let channels = ClientChannelRegistry::new().with_solana_source(Arc::new(
-                crate::channels::test_source::FakeSolanaChannelSource::unreachable(
-                    "connection refused",
-                ),
-            ));
-            let app = router_with_gate(connector, signer.clone(), None, test_gate(channels));
-
-            let keypair = SolanaKeypair::generate(&mut OsRng);
-            let channel_account = [0x45u8; 32];
-            let channel_account_base58 = bs58::encode(channel_account).into_string();
-            let signer_base58 = bs58::encode(keypair.public.to_bytes()).into_string();
-            let message = connector_signer::solana_balance_proof_message(
-                &[7u8; 32],
-                &channel_account,
-                1,
-                100,
-            );
-            let signature_base64 = BASE64.encode(keypair.sign(&message).to_bytes());
-
-            let claim_json = format!(
-                r#"{{
-                    "version": "1.0",
-                    "blockchain": "solana",
-                    "messageId": "msg-1",
-                    "timestamp": "2026-02-02T12:00:00.000Z",
-                    "senderId": "peer-bob",
-                    "programId": "{SOLANA_CHANNEL_PROGRAM_BASE58}",
-                    "channelAccount": "{channel_account_base58}",
-                    "nonce": 1,
-                    "transferredAmount": "100",
-                    "signature": "{signature_base64}",
-                    "signerPublicKey": "{signer_base58}"
-                }}"#,
-            );
-
-            let (prepare, _shared_secret) =
-                sealed_sample_prepare("g.example.app", &signer.public_key().unwrap());
-            let request = request_with_claim_header(&prepare, CLAIM_HEADER, &claim_json);
-            let response = app.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            let reject = Reject::decode(&bytes).expect("decode reject");
-            // T00, not F01 (issue #613's review): a failed lookup is this
-            // connector's problem and not the claim's, so it must come back
-            // as a *temporary* error. Told F01 a sender concludes its
-            // perfectly good claim is invalid and stops, because a third
-            // party's RPC endpoint blipped.
-            assert_eq!(reject.code.as_str(), "T00");
-            assert!(
-                reject.message.contains("could not look up"),
-                "an unreachable chain is reported as such, not as an unknown channel: {}",
+                reject.message.contains("does not settle on"),
+                "{}",
                 reject.message
             );
             assert!(app_client.deliveries().is_empty());
@@ -5231,7 +4650,7 @@ mod tests {
             let request = request_with_claim_header(
                 &sample_prepare("g.example.app"),
                 CLAIM_HEADER,
-                &evm_claim_json(1, PRICE - 1),
+                &evm_claim_json(PRICE - 1),
             );
             let response = app.oneshot(request).await.unwrap();
 
@@ -5282,7 +4701,7 @@ mod tests {
             let response = app
                 .oneshot(probe_request(
                     &sample_prepare("g.example.app"),
-                    Some(&evm_claim_json(1, PRICE)),
+                    Some(&evm_claim_json(PRICE)),
                 ))
                 .await
                 .unwrap();
@@ -5314,19 +4733,20 @@ mod tests {
                 .oneshot(request_with_claim_header(
                     &paid,
                     CLAIM_HEADER,
-                    &evm_claim_json(1, PRICE),
+                    &evm_claim_json(PRICE),
                 ))
                 .await
                 .unwrap();
             assert_eq!(paid_response.status(), StatusCode::OK);
             assert_eq!(app_client.deliveries().len(), 1);
 
-            // A fresh nonce at the same cumulative amount: the claim
-            // identifies, and advances no value at all.
+            // The same voucher, resent: a probe charges nothing, so a
+            // byte-identical resend at the watermark identifies the sender
+            // and advances no value at all (ADR 0074 decision 3).
             let probe_response = app
                 .oneshot(probe_request(
                     &sample_prepare("g.example.app"),
-                    Some(&evm_claim_json(2, PRICE)),
+                    Some(&evm_claim_json(PRICE)),
                 ))
                 .await
                 .unwrap();
@@ -5358,7 +4778,7 @@ mod tests {
                 .oneshot(request_with_claim_header(
                     &paid,
                     CLAIM_HEADER,
-                    &evm_claim_json(1, PRICE),
+                    &evm_claim_json(PRICE),
                 ))
                 .await
                 .unwrap();
@@ -5367,7 +4787,7 @@ mod tests {
                 .clone()
                 .oneshot(probe_request(
                     &sample_prepare("g.example.app"),
-                    Some(&evm_claim_json(2, PRICE)),
+                    Some(&evm_claim_json(PRICE)),
                 ))
                 .await
                 .unwrap();
@@ -5380,7 +4800,7 @@ mod tests {
                 .oneshot(request_with_claim_header(
                     &second,
                     CLAIM_HEADER,
-                    &evm_claim_json(3, PRICE + quoted),
+                    &evm_claim_json(PRICE + quoted),
                 ))
                 .await
                 .unwrap();
@@ -5481,7 +4901,7 @@ mod tests {
             let terms: X402PaymentRequired = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(terms.resource.url, REMOTE_APP);
             assert_eq!(
-                terms.offer().unwrap().amount,
+                terms.toon().unwrap().amount,
                 FORWARD_PRICE.to_string(),
                 "the greeting quotes the forwarded route's `price`, never its `fee`"
             );
@@ -5512,7 +4932,7 @@ mod tests {
                 .oneshot(request_with_claim_header(
                     &prepare,
                     CLAIM_HEADER,
-                    &evm_claim_json(1, FORWARD_PRICE),
+                    &evm_claim_json(FORWARD_PRICE),
                 ))
                 .await
                 .unwrap();
@@ -5545,7 +4965,7 @@ mod tests {
                 .oneshot(request_with_claim_header(
                     &prepare,
                     CLAIM_HEADER,
-                    &evm_claim_json(1, FORWARD_PRICE - 1),
+                    &evm_claim_json(FORWARD_PRICE - 1),
                 ))
                 .await
                 .unwrap();
@@ -5586,7 +5006,7 @@ mod tests {
                 .oneshot(request_with_claim_header(
                     &prepare,
                     CLAIM_HEADER,
-                    &evm_claim_json(1, FORWARD_PRICE),
+                    &evm_claim_json(FORWARD_PRICE),
                 ))
                 .await
                 .unwrap();
@@ -5659,12 +5079,12 @@ mod tests {
         /// exercises unpriced, but this time over a route that actually
         /// admitted a claim -- that claim must not count against the
         /// client. Proven behaviourally rather than by reaching into the
-        /// gate's internals: the exact same claim (identical nonce and
-        /// cumulative amount) presented a second time is judged exactly as
-        /// fresh as the first, which is only possible if this connector
-        /// rolled its watermark back rather than leaving it charged. Left
-        /// charged, `ClientClaimGate::admit` would refuse the resubmission
-        /// as a stale nonce (F01) before the packet is ever routed a
+        /// gate's internals: the exact same voucher presented a second time
+        /// is judged exactly as fresh as the first, which is only possible if
+        /// this connector rolled its watermark back rather than leaving it
+        /// charged. Left charged, `ClientClaimGate::admit` would take the
+        /// resend as a retransmission that buys nothing, and refuse it as
+        /// an underpayment (F03) before the packet is ever routed a
         /// second time -- rolled back, it is admitted again, forwarded
         /// again, and meets the identical F02 the first attempt did.
         #[tokio::test]
@@ -5697,7 +5117,7 @@ mod tests {
             ));
             let app = router_with_gate(payer, signer.clone(), None, test_gate(test_channels()));
 
-            let claim_json = evm_claim_json(1, FORWARD_PRICE);
+            let claim_json = evm_claim_json(FORWARD_PRICE);
             let attempt = |app: axum::Router| {
                 let claim_json = claim_json.clone();
                 let signer = signer.clone();
@@ -5732,7 +5152,7 @@ mod tests {
                 second.code.as_str(),
                 "F02",
                 "the identical claim reached the peer again rather than being refused as a \
-                 stale nonce -- the first reject did not charge the client"
+                 underpaying resend -- the first reject did not charge the client"
             );
         }
 
@@ -5741,7 +5161,7 @@ mod tests {
         /// advances the watermark by exactly `price`, as it always has.
         /// Proven the same behavioural way, since the gate's watermarks
         /// are not reachable from here: after the fulfilment the identical
-        /// claim is refused as a stale nonce (`F01`), and the next claim
+        /// voucher, resent, buys nothing (`F03`), and the next voucher
         /// must clear a cumulative amount a full `FORWARD_PRICE` higher --
         /// one base unit short of that is an underpayment (`F03`), exactly
         /// on it fulfils again. Nothing but a watermark sitting at
@@ -5772,20 +5192,23 @@ mod tests {
                 }
             };
 
-            let first = attempt(app.clone(), evm_claim_json(1, FORWARD_PRICE)).await;
+            let first = attempt(app.clone(), evm_claim_json(FORWARD_PRICE)).await;
             Fulfill::decode(&first).expect("a paid forwarded packet fulfils");
 
-            let replayed = attempt(app.clone(), evm_claim_json(1, FORWARD_PRICE)).await;
+            // A byte-identical resend of a voucher at the watermark buys
+            // nothing (ADR 0074 decision 3), so against this packet's charge
+            // it is an underpayment.
+            let replayed = attempt(app.clone(), evm_claim_json(FORWARD_PRICE)).await;
             assert_eq!(
                 Reject::decode(&replayed)
                     .expect("a replayed claim is rejected")
                     .code
                     .as_str(),
-                "F01",
-                "the fulfilled packet's claim stayed charged -- the watermark did not roll back"
+                "F03",
+                "the fulfilled packet's voucher stayed charged -- the watermark did not roll back"
             );
 
-            let short = attempt(app.clone(), evm_claim_json(2, 2 * FORWARD_PRICE - 1)).await;
+            let short = attempt(app.clone(), evm_claim_json(2 * FORWARD_PRICE - 1)).await;
             assert_eq!(
                 Reject::decode(&short)
                     .expect("an underpaying claim is rejected")
@@ -5796,7 +5219,7 @@ mod tests {
                  the price underpays"
             );
 
-            let second = attempt(app, evm_claim_json(2, 2 * FORWARD_PRICE)).await;
+            let second = attempt(app, evm_claim_json(2 * FORWARD_PRICE)).await;
             Fulfill::decode(&second).expect("a claim advancing by a full price fulfils again");
             assert_eq!(
                 remote_app.deliveries().len(),
@@ -5874,7 +5297,7 @@ mod tests {
                 connector,
                 signer,
                 None,
-                test_gate(ClientChannelRegistry::new()),
+                gate_without_backend(),
                 Arc::from(identities),
             )
         }
@@ -6077,7 +5500,7 @@ mod tests {
         #[tokio::test]
         async fn a_plaintext_claim_admits_with_its_self_declared_signer() {
             let state = state_with_claim_gate(test_gate(super::claim_headers::test_channels()));
-            let claim_json = super::claim_headers::evm_claim_json(1, 100);
+            let claim_json = super::claim_headers::evm_claim_json(100);
             let mut headers = HeaderMap::new();
             headers.insert(
                 CLAIM_HEADER,
@@ -6090,7 +5513,8 @@ mod tests {
                 .expect("claim header present");
             assert_eq!(
                 admitted.plaintext_signer.as_deref(),
-                Some("0x58da990a8f4a3a6ca7cb6315d68a140105917352")
+                Some("client-1"),
+                "a voucher's self-declared signer is its senderId"
             );
         }
 
@@ -6104,7 +5528,7 @@ mod tests {
             let sender_secret = SecretKey::parse(&[1u8; 32]).unwrap();
             let receiver_secret = SecretKey::parse(&[2u8; 32]).unwrap();
             let receiver_public = PublicKey::from_secret_key(&receiver_secret);
-            let claim_json = super::claim_headers::evm_claim_json(1, 100);
+            let claim_json = super::claim_headers::evm_claim_json(100);
             let wrapped = connector_signer::wrap_claim(
                 claim_json.as_bytes(),
                 &sender_secret,

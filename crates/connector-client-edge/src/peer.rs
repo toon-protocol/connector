@@ -199,8 +199,9 @@ impl PeerCarriages {
         // peer handler decides again from the same evidence, which lets
         // that handler stand alone on its own listener (§1.10). A request
         // whose evidence is ambiguous (§1.5) proves no peering here, and
-        // the client path answers it.
-        let evidence = connector_peer_http::evidence_on(&request)?;
+        // the client path answers it -- as does a `toon-channel` claim, which
+        // the client gate refuses by name.
+        let evidence = connector_peer_http::evidence_on(&request).ok()?;
         let (role, refusal) = self.decide(&evidence).await.into_parts();
         self.log_refusal(refusal.as_ref());
         if !role.is_peer() {
@@ -411,7 +412,7 @@ asset_eip712_version = "2"
 
         use crate::{
             AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
-            ChannelResolutionError, ClientChannelRegistry, ClientClaimGate,
+            ChannelResolutionError, ClientClaimGate,
         };
 
         const CHAIN: u64 = 84_532;
@@ -664,12 +665,9 @@ asset_eip712_version = "2"
                     .bind_voucher_signer(PEER_ID, *signer)
                     .expect("store is a configured peering");
             }
-            let gate = ClientClaimGate::restore(
-                ClientChannelRegistry::new(),
-                Arc::new(InMemoryJournal::new()),
-            )
-            .expect("an empty journal")
-            .with_batch_settlement(Arc::new(TwoChannelsEachChain));
+            let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
+                .expect("an empty journal")
+                .with_batch_settlement(Arc::new(TwoChannelsEachChain));
             let carriages = PeerCarriages::from_config(
                 Arc::clone(&connector),
                 config.peers(),
@@ -892,55 +890,15 @@ asset_eip712_version = "2"
             );
         }
 
-        /// ADR 0075, issue #1380: **a `toon-channel` claim never decides the
-        /// peer role, on either carriage** -- not even one genuinely signed
-        /// by the very key this node has bound to the peering, which is the
-        /// key a `toon-channel` peer claim used to be verified against. The
-        /// frame is a client's, and the client edge answers it.
+        /// ADR 0075, issues #1380 and #1384: **a `toon-channel` claim never
+        /// decides the peer role, on either carriage.** The peer carriage
+        /// refuses one by name; on this shared listener the front door hands
+        /// the arrival to the client edge, whose gate refuses it by name in
+        /// turn. It is never a peer's.
         #[tokio::test]
         async fn a_toon_channel_claim_never_decides_the_peer_role_on_either_carriage() {
             let (_, carriages) = bound();
-            let signer = connector_signer::LocalSigner::from_secret_bytes(
-                "bound-peer-settlement-key",
-                [0x0a; 32],
-            )
-            .expect("the peer's key");
-            assert_eq!(
-                derive_evm_address(&connector_signer::Signer::public_key(&signer).unwrap()),
-                address_of(&peer_key()),
-                "the claim is signed by the peer's own bound key"
-            );
-            let channel = [0x11; 32];
-            let digest =
-                connector_signer::evm_balance_proof_digest(&connector_signer::EvmBalanceProof {
-                    channel_id: channel,
-                    nonce: 1,
-                    transferred_amount: 500,
-                    locked_amount: 0,
-                    locks_root: [0; 32],
-                    chain_id: CHAIN,
-                    token_network_address: [0xbb; 20],
-                });
-            let claim = connector_runtime::WireClaim {
-                channel_id: format!("0x{}", hex::encode(channel)),
-                nonce: 1,
-                cumulative_amount: 500,
-                signature: connector_runtime::ClaimSignature::Evm(
-                    connector_signer::Signer::sign(&signer, &digest).expect("sign"),
-                ),
-            };
-            let toon_claim = connector_peer_btp::claim_json::encode(
-                &claim,
-                &address_of(&peer_key()),
-                None,
-                None,
-                Some(connector_peer_btp::PeerClaimDomain {
-                    chain_id: CHAIN,
-                    token_network: [0xbb; 20],
-                }),
-                "toon-claim-1",
-                "2026-09-28T00:00:00.000Z",
-            );
+            let toon_claim = crate::test_support::toon_channel_claim();
 
             for packet in [prepare(500), prepare(0), Vec::new()] {
                 assert_eq!(
@@ -992,12 +950,9 @@ asset_eip712_version = "2"
                     )
                     .expect("store is a configured peering"),
                 );
-                let gate = ClientClaimGate::restore(
-                    ClientChannelRegistry::new(),
-                    Arc::new(InMemoryJournal::new()),
-                )
-                .expect("an empty journal")
-                .with_batch_settlement(Arc::new(TwoChannelsEachChain));
+                let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
+                    .expect("an empty journal")
+                    .with_batch_settlement(Arc::new(TwoChannelsEachChain));
                 PeerCarriages::from_config(
                     connector,
                     config.peers(),

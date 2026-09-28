@@ -76,7 +76,7 @@ use connector_btp::{
 use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 use connector_peer_auth::{claim_ack_to_emit, PeerAuthRefusal, PeerAuthRefusalLog, SessionRole};
 use connector_peer_btp::price_gate::{self, ClaimEnforcementPolicy, PaymentRequired};
-use connector_peer_btp::role_gate::{self, AmbiguousEvidence, FrameEvidence, VoucherEvidence};
+use connector_peer_btp::role_gate::{self, FrameEvidence, RefusedEvidence, VoucherEvidence};
 use connector_runtime::{ClaimAckOutcome, Connector};
 
 use crate::headers::{self, PeerRequest, PeerResponse};
@@ -160,8 +160,16 @@ impl PeerHttpState {
         // The same for the peer-role challenge (ADR 0075 decision 5), and a
         // claim beside a challenge is refused too: two pieces of
         // authentication material, and "which did we check?" has no answer.
-        let Some(evidence) = evidence_on(&request) else {
-            return PeerResponse::refused(400);
+        //
+        // A `toon-channel` claim is refused `400` too, and by name: ADR 0075
+        // retired the scheme (issue #1384), and a straggling peer is told so
+        // in the body rather than silently read as presenting nothing.
+        let evidence = match evidence_on(&request) {
+            Ok(evidence) => evidence,
+            Err(refused @ RefusedEvidence::ToonChannelClaim) => {
+                return PeerResponse::refused_naming(400, &refused.message());
+            }
+            Err(_) => return PeerResponse::refused(400),
         };
 
         // **Role, from this request's own evidence** (§1.2, §1.5): decoded
@@ -360,24 +368,24 @@ fn now_ms() -> u64 {
 }
 
 /// Everything a peer request presents that could prove the peer role (ADR
-/// 0075 decision 5): its claim header -- a voucher, or a `toon-channel` claim
-/// that proves nothing -- its peer-role challenge header, and whether its
-/// body is a PREPARE that moves no value.
+/// 0075 decision 5): its claim header -- a voucher -- its peer-role challenge
+/// header, and whether its body is a PREPARE that moves no value.
 ///
-/// `None` is §1.5's ambiguity, which the caller refuses `400`: more than one
-/// claim header, more than one challenge header, or a claim beside a
-/// challenge. An unreadable claim or challenge is not ambiguity; it proves
-/// nothing, and the request is judged as if it were absent.
-#[must_use]
-pub fn evidence_on(request: &PeerRequest) -> Option<FrameEvidence> {
-    AmbiguousEvidence::check(
+/// # Errors
+///
+/// [`RefusedEvidence`], which the caller refuses `400`: §1.5's ambiguity --
+/// more than one claim header, more than one challenge header, or a claim
+/// beside a challenge -- or a `toon-channel` claim (ADR 0075 decision 8). An
+/// otherwise unreadable claim or challenge is neither; it proves nothing,
+/// and the request is judged as if it were absent.
+pub fn evidence_on(request: &PeerRequest) -> Result<FrameEvidence, RefusedEvidence> {
+    RefusedEvidence::check(
         request.headers.get_all(CLAIM_HEADER).len(),
         request.headers.get_all(PEER_CHALLENGE_HEADER).len(),
-    )
-    .ok()?;
+    )?;
     let claim = match headers::claim_json(&request.headers) {
         None => None,
-        Some(Ok(raw)) => role_gate::decode_claim(&raw),
+        Some(Ok(raw)) => role_gate::decode_claim(&raw)?,
         Some(Err(_)) => {
             tracing::warn!("peer claim header is not base64; not acknowledged");
             None
@@ -391,7 +399,7 @@ pub fn evidence_on(request: &PeerRequest) -> Option<FrameEvidence> {
             None
         }
     };
-    Some(FrameEvidence {
+    Ok(FrameEvidence {
         claim,
         challenge,
         moves_no_value: role_gate::moves_no_value(&request.body),

@@ -59,9 +59,8 @@ use crate::channel_id::format_channel_id;
 use crate::log_query::scoped_event;
 use crate::send::confirm;
 
-/// How often the watcher reads new `WithdrawInitiated` logs. The same
-/// cadence the channel-index syncer polls the same endpoint at
-/// ([`crate::DEFAULT_POLL_INTERVAL`]): a withdrawal's delay is at least this
+/// How often the watcher reads new `WithdrawInitiated` logs. A
+/// withdrawal's delay is at least this
 /// node's published minimum, a day by default (ADR 0074 decision 5), so what
 /// the interval buys is margin, not correctness.
 pub const WITHDRAWAL_WATCH_INTERVAL: Duration = Duration::from_secs(5);

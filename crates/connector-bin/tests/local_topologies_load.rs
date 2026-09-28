@@ -555,10 +555,8 @@ fn every_local_config_loads_and_holds_no_toon_channel_row() {
             "{name} names a [[pay_channels]] row -- an outbound channel id, which no committed \
              file can know, since every local channel is opened at run time"
         );
-        assert!(
-            config.client_channels().is_empty(),
-            "{name} declares a [[client_channels]] row -- a TOON channel by construction"
-        );
+        // `[[client_channels]]` needs no check here: it is refused by name at
+        // load (issue #1384), so a file declaring one never reached `load`.
         assert!(
             config.peer_routes().is_empty(),
             "{name} writes a forwarding `[[routes]]` row. A forward names a peering, and every \

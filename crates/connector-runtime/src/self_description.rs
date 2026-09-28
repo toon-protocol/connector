@@ -335,7 +335,6 @@ mod tests {
                 http_endpoint: Some("https://peer.example/ilp".to_string()),
                 btp_endpoint: None,
                 peer_carriages: vec!["http".to_string()],
-                settlements: Vec::new(),
                 batch_settlements: Vec::new(),
                 voucher_signers: Vec::new(),
             },

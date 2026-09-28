@@ -274,8 +274,8 @@ accepts.
 The circuit a settlement table's RPC rides when that table sets `rpc_via_socks_proxy = true`: the
 node's one `socks_proxy`, authenticated with a SOCKS username fixed per chain
 (`toon-settlement-evm`, `toon-settlement-solana`), so each chain stays on its own circuit and off the
-ILP wire's. Every client of the table's `rpc_url` rides it (the backend, and on EVM the
-channel-index syncer and the rate source), and none ever falls back to a direct dial. It hides the
+ILP wire's. Every client of the table's `rpc_url` rides it (the backend, and on EVM the rate
+source), and none ever falls back to a direct dial. It hides the
 node's address from the RPC provider; it does not hide the node's keys, its transactions or its
 payments, which are on chain either way
 ([ADR 0073](docs/adr/0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md)).
@@ -332,9 +332,9 @@ _Avoid_: channel (when ambiguous with a route or a stream)
 **Claim**:
 A signed statement of a payment channel's cumulative state, handed from payer to payee.
 Each claim supersedes the last, so a lost claim costs nothing and a replayed claim gains
-nothing. Every claim is a **voucher** ([ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)). Until #1371's implementing steps land, the binary
-still also speaks `toon-channel` claims, the scheme ADR 0075 retires — since #1380 only at the client
-edge, from a client, until #1384; no peering sends or is proven by one.
+nothing. Every claim is a **voucher** ([ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)).
+Since #1384 a `toon-channel` claim — one with no `scheme`, or `scheme: "toon-channel"`, the scheme
+ADR 0075 retires — is refused by name at the client edge and on both peer carriages.
 _Avoid_: receipt, payment, balance proof; `toon-channel` (retired, ADR 0075)
 
 **Voucher**:

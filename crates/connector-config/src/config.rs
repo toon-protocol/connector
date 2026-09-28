@@ -6,7 +6,6 @@ use std::time::Duration;
 use serde::Deserialize;
 use url::Url;
 
-use crate::client_channel::{resolve_client_channels, ClientChannelConfig, RawClientChannel};
 use crate::client_channel_asset::{resolve_client_channel_assets, ClientChannelAssets};
 use crate::denomination::{
     resolve_denomination, DenominationConfig, RawRateGuards, RawRateRow, RawToken,
@@ -24,8 +23,8 @@ use crate::peering_asset::{resolve_peering_assets, PeeringAssets};
 use crate::route::{resolve_routes, PeerRouteConfig, RawChild, RawRoute, StaticRoute};
 use crate::secret::{RawSignerConfig, SecretLocation};
 use crate::settlement::{
-    check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettlementChain,
-    SettlementConfig, SettlementTables,
+    check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettlementConfig,
+    SettlementTables,
 };
 
 /// The config file's shape exactly as written -- convenience forms
@@ -159,12 +158,11 @@ struct RawConfig {
     /// as before this section existed.
     #[serde(default)]
     settlement: Option<RawSettlementSection>,
-    /// The payment channels this node accepts client-edge claims on, and
-    /// the counterparty whose signature it accepts on each (issue #558).
-    /// Absent -- or empty -- means this node has a record of no channel,
-    /// so every claim presented at its client edge is refused as unknown.
+    /// `[[client_channels]]`, deleted with the `toon-channel` claim (ADR
+    /// 0075, issue #1384): parsed only so it can be refused by name
+    /// ([`ConfigError::ClientChannelsRemoved`]).
     #[serde(default)]
-    client_channels: Vec<RawClientChannel>,
+    client_channels: Option<toml::Value>,
     /// The client-edge identities this node authenticates over HTTP (issue
     /// #502, `docs/protocol/client-edge-spec.md` §1.2): an `id` a request
     /// presents via `ILP-Peer-Id` and the `Authorization: Bearer <secret>`
@@ -181,33 +179,15 @@ struct RawConfig {
     /// since a watermark held only in memory is not a replay defence.
     #[serde(default)]
     state_dir: Option<String>,
-    /// How long this node may believe a chain-resolved channel's *mutable*
-    /// facts -- that it has not settled, and that its token still matches
-    /// -- before re-reading them (issue #649). Absent means the client
-    /// edge's own default.
-    ///
-    /// An operator knob rather than a constant because the trade it makes
-    /// is a deployment's to make: a node on a rate-limited public RPC
-    /// endpoint wants it longer, and one that wants a settled channel
-    /// noticed sooner wants it shorter. `0` re-verifies on every packet,
-    /// which is correct and expensive, so it is refused at load rather
-    /// than silently accepted as a way to melt an endpoint.
+    /// The client-edge channel registry's liveness knobs (issue #649),
+    /// deleted with the registry (ADR 0075, issue #1384): parsed only so
+    /// each can be refused by name ([`ConfigError::ChannelLivenessKeyRemoved`]).
     #[serde(default)]
-    channel_liveness_ttl_secs: Option<u64>,
-    /// How long past `channel_liveness_ttl_secs` a channel's last good
-    /// reading may still be *served* while the chain cannot be reached
-    /// (issue #649). Absent means the client edge's own default; `0` means
-    /// never -- a coherent fail-closed choice, unlike a zero TTL, since
-    /// nothing about it costs an extra chain read.
+    channel_liveness_ttl_secs: Option<toml::Value>,
     #[serde(default)]
-    channel_serve_stale_secs: Option<u64>,
-    /// The floor on how often one channel may provoke a chain lookup, in
-    /// milliseconds. Absent means the client edge's own default. This is
-    /// the knob an operator on a rate-limited endpoint reaches for, and
-    /// `0` is refused for the same reason a zero TTL is: it is how one
-    /// packet becomes one RPC.
+    channel_serve_stale_secs: Option<toml::Value>,
     #[serde(default)]
-    channel_reattempt_interval_ms: Option<u64>,
+    channel_reattempt_interval_ms: Option<toml::Value>,
     /// The rate one self-declared signer's lookups for channels that do not
     /// resolve are shaped to, per window, once the node-wide drain below is
     /// in arrears (issue #613). Absent means the client edge's own default;
@@ -322,12 +302,8 @@ pub struct Config {
     operator: Option<OperatorConfig>,
     node: Option<NodeConfig>,
     settlements: Vec<SettlementConfig>,
-    client_channels: Vec<ClientChannelConfig>,
     client_identities: Vec<ClientIdentityConfig>,
     state_dir: Option<PathBuf>,
-    channel_liveness_ttl: Option<Duration>,
-    channel_serve_stale: Option<Duration>,
-    channel_reattempt_interval: Option<Duration>,
     unresolvable_lookups_per_signer: Option<u32>,
     unresolvable_lookups_total: Option<u32>,
     unresolvable_lookup_window: Option<Duration>,
@@ -447,7 +423,27 @@ impl Config {
             return Err(ConfigError::AnnounceSectionRenamed);
         }
         let node = resolve_node(raw.node, peer_expose)?;
-        let client_channels = resolve_client_channels(raw.client_channels, settlement_tables)?;
+        if raw.client_channels.is_some() {
+            return Err(ConfigError::ClientChannelsRemoved);
+        }
+        for (field, present) in [
+            (
+                "channel_liveness_ttl_secs",
+                raw.channel_liveness_ttl_secs.is_some(),
+            ),
+            (
+                "channel_serve_stale_secs",
+                raw.channel_serve_stale_secs.is_some(),
+            ),
+            (
+                "channel_reattempt_interval_ms",
+                raw.channel_reattempt_interval_ms.is_some(),
+            ),
+        ] {
+            if present {
+                return Err(ConfigError::ChannelLivenessKeyRemoved { field });
+            }
+        }
         let client_identities = resolve_client_identities(raw.client_identities)?;
         // `[[pay_channels]]` (ADR 0042 item 2, as ADR 0075 decision 6
         // amends it): this node's own outbound x402 channel toward each next
@@ -477,40 +473,6 @@ impl Config {
             {
                 return Err(ConfigError::ChannelInBothDirections {
                     value: pay_channel.outbound_channel().to_string(),
-                });
-            }
-        }
-        // CF-22: no channel in two books. A client row names its channel in
-        // the same canonical spelling the peering rows do, so a pasted id is
-        // caught whichever way it was cased.
-        let peering_channels = peer_channels
-            .iter()
-            .filter_map(|row| {
-                row.inbound_channel()
-                    .map(|channel| (row.chain(), channel, "[[peer_channels]]", row.peer_id()))
-            })
-            .chain(pay_channels.iter().map(|row| {
-                (
-                    row.chain(),
-                    row.outbound_channel(),
-                    "[[pay_channels]]",
-                    row.peer_id(),
-                )
-            }));
-        for (chain, channel, table, peer_id) in peering_channels {
-            let named_by_a_client = client_channels.iter().any(|client| match client {
-                ClientChannelConfig::Evm(evm) => {
-                    chain == SettlementChain::Evm && evm.channel_id() == channel
-                }
-                ClientChannelConfig::Solana(solana) => {
-                    chain == SettlementChain::Solana && solana.channel_account() == channel
-                }
-            });
-            if named_by_a_client {
-                return Err(ConfigError::ChannelAlsoAClientChannel {
-                    value: channel.to_string(),
-                    table,
-                    peer_id: peer_id.to_string(),
                 });
             }
         }
@@ -578,42 +540,12 @@ impl Config {
         // peerings, so that a node whose peering already names an
         // undeclared token is refused by the more specific message.
         // Resolved from the settlement tables alone and keyed by chain,
-        // because the channel this has to cover is the one no
-        // `[[client_channels]]` row names (ADR 0052, issue #502).
+        // because the channel this has to cover is one no config names
+        // (ADR 0052, issue #502).
         let client_channel_assets = resolve_client_channel_assets(&settlements, &denomination)?;
         let state_dir = raw.state_dir.map(PathBuf::from);
-        let channel_liveness_ttl = match raw.channel_liveness_ttl_secs {
-            Some(0) => return Err(ConfigError::ZeroChannelLivenessTtl),
-            other => other.map(Duration::from_secs),
-        };
-        // Zero is allowed here and refused above, and the asymmetry is the
-        // point: a zero TTL means "re-read on every packet", which is how
-        // an endpoint's budget is exhausted, while a zero stale window
-        // means "never serve a reading I could not confirm", which costs
-        // nothing extra and is a defensible thing to want.
-        let channel_serve_stale = raw.channel_serve_stale_secs.map(Duration::from_secs);
-        let channel_reattempt_interval = match raw.channel_reattempt_interval_ms {
-            Some(0) => return Err(ConfigError::ZeroChannelReattemptInterval),
-            other => other.map(Duration::from_millis),
-        };
-        // A stale window shorter than the TTL is not a stricter setting,
-        // it is an incoherent one: an entry would pass out of "believed"
-        // and out of "servable" at the same moment, so the window it names
-        // could never be used. Refused rather than silently behaving as
-        // zero, since an operator who wrote it meant something.
-        if let (Some(ttl), Some(stale)) = (channel_liveness_ttl, channel_serve_stale) {
-            if stale > Duration::ZERO && stale < ttl {
-                return Err(ConfigError::ServeStaleShorterThanLivenessTtl {
-                    serve_stale_secs: stale.as_secs(),
-                    ttl_secs: ttl.as_secs(),
-                });
-            }
-        }
-
         // The unresolvable-lookup budget (issue #613). Every one of these
-        // is refused at zero, unlike `channel_serve_stale_secs` above:
-        // there, zero names a coherent fail-closed choice that costs
-        // nothing extra; here, each zero either switches the
+        // is refused at zero: each zero either switches the
         // registration-free path off entirely or switches the budget off
         // while leaving it configured, and neither is a thing an operator
         // could mean by writing a number down.
@@ -712,17 +644,17 @@ impl Config {
         // #558's reasoning that a node with a record of no channel refuses
         // every claim outright and so has no watermark to lose. That was
         // true when it was written and stopped being true with chain
-        // resolution: since #611 and #631 `connector-cli` registers a
-        // `ClientChannelSource` over each configured settlement table, and
-        // a claim naming a channel nothing declared is resolved from chain
-        // and accepted. That is ADR 0052 and CF-27, and it is the whole of
+        // resolution: since #611 and #631 a claim naming a channel nothing
+        // declared is resolved from chain and accepted -- and since ADR 0075
+        // (#1384) every voucher is, through each configured settlement
+        // table's backend. That is ADR 0052 and CF-27, and it is the whole of
         // what makes payment permissionless -- so the node MOST exposed to
         // strangers was the one this check did not reach.
         //
         // What survives of #558 is the exemption's shape, and it is worth
-        // keeping: a registry with neither a record nor a source refuses
-        // every claim, so a node configuring no channel book and no
-        // settlement genuinely has nothing to lose. Demanding a path of it
+        // keeping: a node with no settlement table refuses every voucher,
+        // so a node configuring no channel book and no settlement genuinely
+        // has nothing to lose. Demanding a path of it
         // would be ceremony, and ceremony is what gets configured with a
         // path nobody checked.
         //
@@ -734,8 +666,6 @@ impl Config {
             if path.exists() && !path.is_dir() {
                 return Err(ConfigError::StateDirNotADirectory { path: path.clone() });
             }
-        } else if !client_channels.is_empty() {
-            return Err(ConfigError::ClientChannelsWithoutStateDir);
         } else if !peer_channels.is_empty() {
             // The peer half of the same rule: a peer's voucher watermark
             // is no less a replay defence than a client's, and it is the
@@ -775,12 +705,8 @@ impl Config {
             operator,
             node,
             settlements,
-            client_channels,
             client_identities,
             state_dir,
-            channel_liveness_ttl,
-            channel_serve_stale,
-            channel_reattempt_interval,
             unresolvable_lookups_per_signer,
             unresolvable_lookups_total,
             unresolvable_lookup_window,
@@ -832,30 +758,10 @@ impl Config {
     /// `[[tokens]]`: such a node resolves no channel, answers no boundary,
     /// and forwards a client arrival exactly as it did before ADR 0071.
     /// A node that does declare tokens got every chain it can be paid on
-    /// resolved here at boot -- including the chains whose channels no
-    /// `[[client_channels]]` row names, which is the point.
+    /// resolved here at boot -- keyed by chain, since no config names a
+    /// client's channel, which is the point.
     pub fn client_channel_assets(&self) -> &ClientChannelAssets {
         &self.client_channel_assets
-    }
-
-    /// How long a chain-resolved client channel's liveness may be believed
-    /// before it is re-read (issue #649), or `None` to use the client
-    /// edge's own default.
-    pub fn channel_liveness_ttl(&self) -> Option<Duration> {
-        self.channel_liveness_ttl
-    }
-
-    /// How long past [`Self::channel_liveness_ttl`] a channel's last good
-    /// reading may still be served while the chain is unreachable, or
-    /// `None` to use the client edge's own default.
-    pub fn channel_serve_stale(&self) -> Option<Duration> {
-        self.channel_serve_stale
-    }
-
-    /// The floor on how often one channel may provoke a chain lookup, or
-    /// `None` to use the client edge's own default.
-    pub fn channel_reattempt_interval(&self) -> Option<Duration> {
-        self.channel_reattempt_interval
     }
 
     /// How many chain lookups for channels that do not resolve one declared
@@ -1046,15 +952,6 @@ impl Config {
         &self.settlements
     }
 
-    /// The payment channels this node accepts client-edge claims on, and
-    /// the counterparty whose signature it accepts on each (issue #558).
-    /// Empty means this node has a record of no channel at all, so every
-    /// claim presented at its client edge is refused as unknown rather
-    /// than trusted about who signed it.
-    pub fn client_channels(&self) -> &[ClientChannelConfig] {
-        &self.client_channels
-    }
-
     /// The client-edge identities this node authenticates over HTTP (issue
     /// #502, `docs/protocol/client-edge-spec.md` §1.2). Empty means this
     /// node configures no peer identity -- every request is either
@@ -1067,8 +964,8 @@ impl Config {
     /// The directory this node keeps its durable money state in -- the
     /// claim journals whose replay is what makes a watermark survive a
     /// restart (issue #605). `None` means this node writes none, which
-    /// [`Config::load`] permits only when `[[client_channels]]` is empty
-    /// and so no claim can ever be accepted.
+    /// [`Config::load`] permits only when no settlement table or channel
+    /// book is configured and so no claim can ever be accepted.
     ///
     /// The directory is not created or probed here: config load says what
     /// was asked for, and whether it can actually be written is
@@ -1134,6 +1031,7 @@ mod tests {
     use super::*;
     use crate::peer::{PeerCarriage, DEFAULT_MAX_PACKET_AMOUNT};
     use crate::route::TransportPolicy;
+    use crate::settlement::SettlementChain;
     use connector_domain::{AssetId, Price};
     use std::io::Write;
     use std::path::PathBuf;
@@ -1489,7 +1387,7 @@ handler_url = "http://localhost:5000"
     const PEER_CHANNEL: &str = "0xaaaabbbbccccddddeeeeffff00001111aaaabbbbccccddddeeeeffff00001111";
     /// The peer's EVM settlement address: its voucher signer (ADR 0075).
     const PEER_KEY: &str = "0x2222222222222222222222222222222222222222";
-    /// The `TokenNetwork` a `[[client_channels]]` row still names until #1384.
+    /// A `TokenNetwork` address: what a retired `toon-channel` row named.
     const PEER_TOKEN_NETWORK: &str = "0x3333333333333333333333333333333333333333";
 
     /// An `[settlement.evm]` table and its key, in the shape a channel row
@@ -2604,8 +2502,8 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
     //
     // The client edge's half of the rule above, and keyed by CHAIN rather
     // than by declared row: a `[settlement.<chain>]` table is what lets
-    // this node accept a claim on a channel no `[[client_channels]]` row
-    // names (ADR 0052, issue #502), so every chain with such a table can
+    // this node accept a voucher on a channel no config names (ADR 0052,
+    // issue #502), so every chain with such a table can
     // carry an arrival a forward has to denominate.
 
     /// A channel key exactly as
@@ -2615,9 +2513,8 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
     const UNDECLARED_EVM_CHANNEL_KEY: &str =
         "evm:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    /// [`peering_config`] plus a second settlement table and a
-    /// `[[client_channels]]` row on it -- an EVM peering and a Solana
-    /// client edge, which is the shape that separates the two rules: the
+    /// [`peering_config`] plus a second settlement table -- an EVM peering
+    /// and a Solana client edge, which is the shape that separates the two rules: the
     /// peering resolves against the EVM token and the client channel
     /// against the Solana one.
     fn client_channel_on_a_second_chain(key_path: &Path, declaration: &str) -> String {
@@ -2631,10 +2528,6 @@ decimals = 6
 
 [settlement.solana.key]
 key_file = "{key_file}"
-
-[[client_channels]]
-channel_account = "{SOLANA_CHANNEL_ACCOUNT}"
-counterparty = "{SOLANA_COUNTERPARTY_KEY}"
 {declaration}"#,
             key_file = key_path.display(),
         )
@@ -2789,112 +2682,6 @@ counterparty = "{SOLANA_COUNTERPARTY_KEY}"
         );
     }
 
-    /// The client edge's EVM half, and the answer to the question issue
-    /// #1138 called the hard one: **the declared-channel path's latitude
-    /// does not extend to redeemability.** `DepositFloor::Unknown` lets an
-    /// operator vouch for how much a counterparty may spend on a channel
-    /// this node is a participant of; it is not a way to declare a channel
-    /// this node has no address to be a participant of.
-    #[test]
-    fn rejects_an_evm_client_channel_on_a_node_that_does_not_settle_on_evm() {
-        let state_dir = tempfile::tempdir().expect("temp state dir");
-        let channel = format!("0x{}", "ab".repeat(32));
-        let result = with_key_file(|key_path| {
-            format!(
-                r#"
-client_edge_addr = "127.0.0.1:3000"
-state_dir = "{state_dir}"
-
-[signer]
-key_file = "{key_path}"
-
-[[client_channels]]
-channel_id = "{channel}"
-counterparty = "0x00000000000000000000000000000000000000aa"
-chain_id = 8453
-token_network_address = "0x00000000000000000000000000000000000000bb"
-"#,
-                key_path = key_path.display(),
-                state_dir = state_dir.path().display(),
-            )
-        });
-
-        let message = expect_error(
-            result,
-            |error| matches!(error, ConfigError::ClientChannelWithoutEvmSettlement { channel_id } if *channel_id == channel),
-        );
-        assert!(
-            message.contains("[settlement.evm]") && message.contains("not a policy"),
-            "got: {message}"
-        );
-    }
-
-    /// The client edge's Solana half, which was a `connector-cli`
-    /// warn-and-skip: the row loaded, was not recorded, and every claim on
-    /// it was then refused as an unknown channel. Refused by name at load
-    /// instead, so the two client-edge chains answer the question the same
-    /// way and both answer it the way the peer table does.
-    #[test]
-    fn rejects_a_solana_client_channel_on_a_node_that_does_not_settle_on_solana() {
-        let state_dir = tempfile::tempdir().expect("temp state dir");
-        let result = with_key_file(|key_path| {
-            format!(
-                r#"
-client_edge_addr = "127.0.0.1:3000"
-state_dir = "{state_dir}"
-
-[signer]
-key_file = "{key_path}"
-
-[[client_channels]]
-channel_account = "{SOLANA_CHANNEL_ACCOUNT}"
-counterparty = "{SOLANA_COUNTERPARTY_KEY}"
-"#,
-                key_path = key_path.display(),
-                state_dir = state_dir.path().display(),
-            )
-        });
-
-        let message = expect_error(
-            result,
-            |error| matches!(error, ConfigError::ClientChannelWithoutSolanaSettlement { channel_account } if channel_account == SOLANA_CHANNEL_ACCOUNT),
-        );
-        assert!(
-            message.contains("[settlement.solana]") && message.contains("ADR 0053"),
-            "got: {message}"
-        );
-    }
-
-    /// A Solana `[[client_channels]]` row carries the program its claims
-    /// are judged under, filled in from `[settlement.solana]` (issues
-    /// #1082, #1138) rather than looked up again in `connector-cli`. The
-    /// value reaching a loaded `Config` is the settlement table's, by
-    /// construction.
-    #[test]
-    fn a_solana_client_channel_takes_its_program_id_from_the_settlement_table() {
-        let state_dir = tempfile::tempdir().expect("temp state dir");
-        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
-        key_file
-            .write_all(b"not a real key")
-            .expect("write key file");
-        let text = format!(
-            "{}\n[[client_channels]]\nchannel_account = \"{SOLANA_COUNTERPARTY_KEY}\"\n\
-             counterparty = \"{SOLANA_CHANNEL_ACCOUNT}\"\n",
-            solana_peering_config(
-                key_file.path(),
-                state_dir.path(),
-                "",
-                Some(SOLANA_PROGRAM_ID),
-            ),
-        );
-        let config = Config::from_toml_str(&text, Path::new("test.toml")).expect("load");
-
-        let ClientChannelConfig::Solana(solana) = &config.client_channels()[0] else {
-            panic!("expected a Solana client channel");
-        };
-        assert_eq!(solana.program_id(), SOLANA_PROGRAM_ID);
-    }
-
     /// The rule is **per chain**: a row needs the table for its own chain
     /// and no other. This is the shape `local/mixed-chain/connector-c.toml`
     /// is committed in -- a Solana peering on a node with no
@@ -2934,36 +2721,6 @@ counterparty = "{SOLANA_COUNTERPARTY_KEY}"
             |error| matches!(error, ConfigError::ChannelInBothDirections { value } if value == PEER_CHANNEL),
         );
         assert!(message.contains("one way"), "got: {message}");
-    }
-
-    /// CF-22: a peering's channel pasted into `[[client_channels]]` as well
-    /// is refused, naming the table and peer it collides with -- for the
-    /// peer's pinned inbound channel and for this node's outbound one alike.
-    #[test]
-    fn rejects_a_peering_channel_a_client_row_also_names() {
-        for (channel, table) in [
-            (PEER_CHANNEL, "[[peer_channels]]"),
-            (PAY_CHANNEL, "[[pay_channels]]"),
-        ] {
-            let result = load_peering(|text| {
-                format!(
-                    "{text}\n[[client_channels]]\nchannel_id = \"{}\"\n\
-                     counterparty = \"0x00000000000000000000000000000000000000aa\"\n\
-                     chain_id = 31337\n\
-                     token_network_address = \"0x00000000000000000000000000000000000000bb\"\n",
-                    channel.to_uppercase().replace("0X", "0x")
-                )
-            });
-
-            let message = expect_error(result, |error| {
-                matches!(
-                    error,
-                    ConfigError::ChannelAlsoAClientChannel { value, table: named, peer_id }
-                        if value == channel && *named == table && peer_id == "store"
-                )
-            });
-            assert!(message.contains("CF-22"), "got: {message}");
-        }
     }
 
     // -- `[[pay_channels]]` (ADR 0042 item 2, as ADR 0075 decision 6 amends
@@ -3447,6 +3204,74 @@ lease_seconds = 3600
             message.contains("peer_sale"),
             "the error must name the section an operator has to delete: {message}"
         );
+    }
+
+    /// ADR 0075 decision 9, issue #1384: `[[client_channels]]` declared the
+    /// channels a `toon-channel` claim could be paid on, and goes with that
+    /// claim scheme -- refused by name, whatever its rows say, never
+    /// silently ignored.
+    #[test]
+    fn rejects_a_config_that_still_declares_client_channels() {
+        let result = with_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[[client_channels]]
+channel_id = "0x{}"
+counterparty = "0x{}"
+"#,
+                key_path.display(),
+                "ab".repeat(32),
+                "cd".repeat(20),
+            )
+        });
+
+        let Err(error) = result else {
+            panic!("expected a config error");
+        };
+        assert!(
+            matches!(error, ConfigError::ClientChannelsRemoved),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("[[client_channels]]"), "{message}");
+        assert!(message.contains("ADR 0075"), "{message}");
+    }
+
+    /// The client-edge channel registry's liveness knobs go with the
+    /// registry (issue #1384), each refused by its own name.
+    #[test]
+    fn rejects_each_retired_channel_liveness_key_by_name() {
+        for (field, value) in [
+            ("channel_liveness_ttl_secs", "60"),
+            ("channel_serve_stale_secs", "600"),
+            ("channel_reattempt_interval_ms", "2000"),
+        ] {
+            let result = with_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:3000"
+{field} = {value}
+
+[signer]
+key_file = "{}"
+"#,
+                    key_path.display(),
+                )
+            });
+            let Err(error) = result else {
+                panic!("expected '{field}' to be refused");
+            };
+            assert!(
+                matches!(error, ConfigError::ChannelLivenessKeyRemoved { field: named } if named == field),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains(field), "{error}");
+        }
     }
 
     /// The abuse-bound half of the same section (ADR 0039's own fields) is
@@ -4261,48 +4086,12 @@ write_keys = ["{key}"]
 
     // -- state_dir (issue #605) --
 
-    /// A node that can accept claims but has nowhere durable to record
-    /// them is refused at load. Without this it starts, serves, and hands
-    /// out free service after every restart -- silently, because a
-    /// forgotten watermark makes every replayed nonce look fresh.
-    #[test]
-    fn client_channels_without_a_state_dir_is_refused_at_load() {
-        let result = with_key_file(|key_path| {
-            format!(
-                r#"
-client_edge_addr = "127.0.0.1:3000"
-
-[signer]
-key_file = "{key_path}"
-{settlement}
-[[client_channels]]
-channel_id = "0x{channel}"
-counterparty = "0x00000000000000000000000000000000000000aa"
-chain_id = 8453
-token_network_address = "0x00000000000000000000000000000000000000bb"
-"#,
-                key_path = key_path.display(),
-                settlement = evm_settlement(key_path),
-                channel = "ab".repeat(32),
-            )
-        });
-
-        assert!(matches!(
-            result,
-            Err(ConfigError::ClientChannelsWithoutStateDir)
-        ));
-        // The message has to tell the operator what to do about it, since
-        // this refusal is the first they will hear of the requirement.
-        let message = result.unwrap_err().to_string();
-        assert!(message.contains("state_dir"), "{message}");
-    }
-
     /// Issue #1186: the shape this check used to miss, and the one an
     /// operator should actually be running -- a priced terminated route and
     /// a settlement backend, declaring no channel at all.
     ///
-    /// A settlement table registers the `ClientChannelSource` that resolves
-    /// an undeclared channel from chain (ADR 0052, CF-27), so this node takes
+    /// A settlement table is what resolves an undeclared channel from chain
+    /// (ADR 0052, CF-27), so this node takes
     /// payment from senders it was never configured for. Before #1186 it was
     /// the one shape that could boot with its watermarks in memory, which
     /// made the node most exposed to strangers the one the parser did not
@@ -4367,36 +4156,6 @@ price = 0
         .expect("a node with no settlement and no channel book loads without a state_dir");
 
         assert!(config.state_dir().is_none());
-    }
-
-    /// The same config with a `state_dir` loads, and reports it.
-    #[test]
-    fn client_channels_with_a_state_dir_loads() {
-        let state_dir = tempfile::tempdir().expect("temp state dir");
-        let config = with_key_file(|key_path| {
-            format!(
-                r#"
-client_edge_addr = "127.0.0.1:3000"
-state_dir = "{state_dir}"
-
-[signer]
-key_file = "{key_path}"
-{settlement}
-[[client_channels]]
-channel_id = "0x{channel}"
-counterparty = "0x00000000000000000000000000000000000000aa"
-chain_id = 8453
-token_network_address = "0x00000000000000000000000000000000000000bb"
-"#,
-                key_path = key_path.display(),
-                state_dir = state_dir.path().display(),
-                settlement = evm_settlement(key_path),
-                channel = "ab".repeat(32),
-            )
-        })
-        .expect("load");
-
-        assert_eq!(config.state_dir(), Some(state_dir.path()));
     }
 
     /// A node with no channels needs no `state_dir`: it refuses every
@@ -4482,111 +4241,6 @@ secret = "two"
             result,
             Err(ConfigError::DuplicateClientIdentityId { id }) if id == "peer-a"
         ));
-    }
-
-    /// Issue #649: how long a chain-resolved channel's liveness may be
-    /// believed is an operator knob, because the trade it makes -- RPC
-    /// load against how quickly a settled channel stops being paid on --
-    /// belongs to a deployment and not to a constant in this repository.
-    #[test]
-    fn a_channel_liveness_ttl_is_read_from_config() {
-        let config = with_key_file(|key_path| {
-            format!(
-                r#"
-client_edge_addr = "127.0.0.1:3000"
-channel_liveness_ttl_secs = 15
-
-[signer]
-key_file = "{key_path}"
-"#,
-                key_path = key_path.display(),
-            )
-        })
-        .expect("a config naming a liveness ttl loads");
-
-        assert_eq!(
-            config.channel_liveness_ttl(),
-            Some(std::time::Duration::from_secs(15))
-        );
-    }
-
-    /// Absent means "whatever the client edge's own default is" -- not
-    /// zero, which is the one value that would turn every packet into a
-    /// chain read.
-    #[test]
-    fn an_absent_channel_liveness_ttl_is_the_edges_own_default() {
-        let config = with_key_file(|key_path| {
-            format!(
-                r#"
-client_edge_addr = "127.0.0.1:3000"
-
-[signer]
-key_file = "{key_path}"
-"#,
-                key_path = key_path.display(),
-            )
-        })
-        .expect("a config naming no liveness ttl loads");
-
-        assert_eq!(config.channel_liveness_ttl(), None);
-    }
-
-    /// Zero is refused rather than obeyed: it reads as "always fresh" and
-    /// behaves as "one chain read per packet", which is how an operator
-    /// exhausts an RPC endpoint's budget and takes their own paid writes
-    /// down with it.
-    #[test]
-    fn a_zero_channel_liveness_ttl_is_refused_at_load() {
-        let result = with_key_file(|key_path| {
-            format!(
-                r#"
-client_edge_addr = "127.0.0.1:3000"
-channel_liveness_ttl_secs = 0
-
-[signer]
-key_file = "{key_path}"
-"#,
-                key_path = key_path.display(),
-            )
-        });
-
-        assert!(matches!(result, Err(ConfigError::ZeroChannelLivenessTtl)));
-    }
-
-    /// The other two liveness knobs (the availability review of #654): an
-    /// operator on a rate-limited public RPC endpoint is exactly who needs
-    /// to widen the stale window and the re-attempt floor, and before this
-    /// they had no lever short of a rebuild.
-    #[test]
-    fn the_stale_window_and_reattempt_interval_are_read_from_config() {
-        let config = with_key_file(|key_path| {
-            format!(
-                r#"
-client_edge_addr = "127.0.0.1:3000"
-channel_liveness_ttl_secs = 30
-channel_serve_stale_secs = 1800
-channel_reattempt_interval_ms = 5000
-
-[signer]
-key_file = "{key_path}"
-"#,
-                key_path = key_path.display(),
-            )
-        })
-        .expect("a config naming all three liveness knobs loads");
-
-        assert_eq!(
-            config.channel_liveness_ttl(),
-            Some(std::time::Duration::from_secs(30))
-        );
-        assert_eq!(
-            config.channel_serve_stale(),
-            Some(std::time::Duration::from_secs(1800))
-        );
-        assert_eq!(
-            config.channel_reattempt_interval(),
-            Some(std::time::Duration::from_millis(5000))
-        );
     }
 
     /// The BTP session window (issue #688): how many of one session's
@@ -4961,85 +4615,6 @@ key_file = "{key_path}"
             Err(ConfigError::UnresolvableLookupPerSignerAboveTotal {
                 per_signer: 10000,
                 ..
-            })
-        ));
-    }
-
-    /// Zero is refused for the re-attempt floor for the same reason it is
-    /// refused for the ttl: it is the value that turns one packet into one
-    /// RPC request.
-    #[test]
-    fn a_zero_reattempt_interval_is_refused_at_load() {
-        let result = with_key_file(|key_path| {
-            format!(
-                r#"
-client_edge_addr = "127.0.0.1:3000"
-channel_reattempt_interval_ms = 0
-
-[signer]
-key_file = "{key_path}"
-"#,
-                key_path = key_path.display(),
-            )
-        });
-
-        assert!(matches!(
-            result,
-            Err(ConfigError::ZeroChannelReattemptInterval)
-        ));
-    }
-
-    /// ...but zero *is* allowed for the stale window, and the asymmetry is
-    /// deliberate: "never serve a reading I could not confirm" is a
-    /// defensible fail-closed choice that costs no extra chain read, which
-    /// is precisely what a zero ttl or a zero interval would not be.
-    #[test]
-    fn a_zero_stale_window_is_allowed_because_it_costs_nothing() {
-        let config = with_key_file(|key_path| {
-            format!(
-                r#"
-client_edge_addr = "127.0.0.1:3000"
-channel_serve_stale_secs = 0
-
-[signer]
-key_file = "{key_path}"
-"#,
-                key_path = key_path.display(),
-            )
-        })
-        .expect("never serving a stale reading is a choice an operator may make");
-
-        assert_eq!(
-            config.channel_serve_stale(),
-            Some(std::time::Duration::ZERO)
-        );
-    }
-
-    /// A stale window shorter than the ttl names a window that could never
-    /// be used -- an entry would stop being believed and stop being
-    /// servable at the same moment. Refused rather than silently treated
-    /// as zero, since whoever wrote it meant something else.
-    #[test]
-    fn a_stale_window_shorter_than_the_ttl_is_refused_at_load() {
-        let result = with_key_file(|key_path| {
-            format!(
-                r#"
-client_edge_addr = "127.0.0.1:3000"
-channel_liveness_ttl_secs = 60
-channel_serve_stale_secs = 30
-
-[signer]
-key_file = "{key_path}"
-"#,
-                key_path = key_path.display(),
-            )
-        });
-
-        assert!(matches!(
-            result,
-            Err(ConfigError::ServeStaleShorterThanLivenessTtl {
-                serve_stale_secs: 30,
-                ttl_secs: 60,
             })
         ));
     }

@@ -620,7 +620,6 @@ mod tests {
                 http_endpoint: http.map(str::to_string),
                 btp_endpoint: btp.map(str::to_string),
                 peer_carriages: vec!["http".to_string()],
-                settlements: Vec::new(),
                 batch_settlements,
                 voucher_signers,
             },

@@ -26,8 +26,8 @@
 //! Every test returns immediately unless `STORE_PROBE_EDGE` is set, so an
 //! ordinary `cargo test` run never needs a live fleet. The PAID test needs a funded channel as well and stays
 //! inert without one; running it SPENDS REAL DEVNET VALUE (one packet, at the
-//! quoted price) and ADVANCES THE CHANNEL WATERMARK, so `STORE_PROBE_NONCE` /
-//! `STORE_PROBE_CUMULATIVE` must be bumped between runs.
+//! quoted price) and ADVANCES THE CHANNEL WATERMARK, so `STORE_PROBE_CUMULATIVE`
+//! must be raised between runs.
 //!
 //!   # free checks only
 //!   STORE_PROBE_EDGE=https://proxy.devnet.toonprotocol.dev \
@@ -37,10 +37,9 @@
 //!   # ...plus the paid round trip (adds one packet's cost to the channel)
 //!   STORE_PROBE_PAYER_KEY=<32-byte hex, NEVER committed> \
 //!   STORE_PROBE_CHANNEL=0x... \
-//!   STORE_PROBE_TOKEN_NETWORK=0x... \
 //!   STORE_PROBE_CHAIN_ID=84532 \
-//!   STORE_PROBE_NONCE=<previous + 1> \
 //!   STORE_PROBE_CUMULATIVE=<previous + price> \
+//!   [STORE_PROBE_CHANNEL_CONFIG='<the channelConfig JSON, first voucher only>'] \
 //!     cargo test -p connector --test devnet_store_leg_probe -- --nocapture
 //!
 //! Nothing here is hardcoded to one deployment and no key material is
@@ -101,8 +100,9 @@
 //!     exactly that. Cheap to hit and free to learn -- a structurally invalid
 //!     claim is refused before the packet is forwarded, so nothing is charged.
 //!
-//!   * **A claim nonce must ADVANCE the channel's watermark.** Replaying one
-//!     comes back "nonce does not advance this channel's watermark (replay)",
+//!   * **A voucher's amount must STRICTLY EXCEED the channel's watermark.**
+//!     Replaying one comes back "cumulative amount does not strictly exceed
+//!     this channel's watermark (replay)",
 //!     and the connector journals the watermark durably (`state_dir`), so it
 //!     survives restarts and cannot be reset by redeploying.
 //!
@@ -128,7 +128,7 @@ use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Price, Reject};
 use connector_signer::giftwrap::{derive_fulfillment, open_response, seal_request};
 use connector_signer::{
-    derive_evm_address, evm_balance_proof_digest, to_hex, EvmBalanceProof, LocalSigner,
+    derive_evm_address, evm_voucher_digest, to_hex, BatchSettlementDomain, LocalSigner,
     PublicKeyBytes, Signer,
 };
 
@@ -395,16 +395,18 @@ fn sealed_prepare(
 
 // ── the claim ────────────────────────────────────────────────────────────────
 
-/// Everything needed to sign one claim against an already-open, already-funded
-/// channel. Read wholly from the environment: this probe opens no channel,
-/// touches no faucet, and holds no key of its own.
+/// Everything needed to sign one voucher on an already-open, already-funded
+/// x402 `batch-settlement` channel (ADR 0075: every claim is a voucher). Read
+/// wholly from the environment: this probe opens no channel, touches no
+/// faucet, and holds no key of its own.
 struct Payer {
     secret_hex: String,
     channel_id: [u8; 32],
-    token_network: [u8; 20],
     chain_id: u64,
-    nonce: u64,
     cumulative: u128,
+    /// The channel's `ChannelConfig` JSON, for the first voucher on a channel
+    /// the edge has never admitted; `None` after.
+    channel_config: Option<serde_json::Value>,
 }
 
 impl Payer {
@@ -415,20 +417,18 @@ impl Payer {
         let channel_id: [u8; 32] = hex_decode(&env("STORE_PROBE_CHANNEL")?)
             .try_into()
             .expect("STORE_PROBE_CHANNEL is a 32-byte channel id");
-        let token_network: [u8; 20] = hex_decode(&env("STORE_PROBE_TOKEN_NETWORK")?)
-            .try_into()
-            .expect("STORE_PROBE_TOKEN_NETWORK is a 20-byte address");
         Some(Payer {
             secret_hex,
             channel_id,
-            token_network,
             chain_id: env("STORE_PROBE_CHAIN_ID")?.parse().expect("chain id"),
-            // No defaults for these two on purpose: guessing a watermark
-            // either replays (refused) or silently overpays.
-            nonce: env("STORE_PROBE_NONCE")?.parse().expect("nonce"),
+            // No default on purpose: guessing a watermark either replays
+            // (refused) or silently overpays.
             cumulative: env("STORE_PROBE_CUMULATIVE")?
                 .parse()
-                .expect("cumulative transferred amount"),
+                .expect("cumulative amount"),
+            channel_config: env("STORE_PROBE_CHANNEL_CONFIG").map(|json| {
+                serde_json::from_str(&json).expect("STORE_PROBE_CHANNEL_CONFIG is JSON")
+            }),
         })
     }
 
@@ -443,64 +443,37 @@ impl Payer {
         derive_evm_address(&self.signer().public_key().expect("public key"))
     }
 
-    fn proof(&self) -> EvmBalanceProof {
-        EvmBalanceProof {
-            channel_id: self.channel_id,
-            nonce: self.nonce,
-            transferred_amount: self.cumulative,
-            locked_amount: 0,
-            locks_root: [0u8; 32],
-            chain_id: self.chain_id,
-            token_network_address: self.token_network,
-        }
-    }
-
-    /// The client-edge claim JSON, signed through this workspace's PRODUCTION
-    /// signing path (`Signer::sign` + `Signature::to_bytes`), whose byte 64 is
-    /// libsecp256k1's raw recovery id in `{0,1}`. Deliberately no `+27`: issue
-    /// #590/#591 moved that normalisation to the settlement boundary, and a
-    /// probe that pre-shifted the byte would prove nothing about whether the
-    /// boundary does its job.
+    /// The voucher JSON, signed through this workspace's production signing
+    /// path over `Voucher(channelId, maxClaimableAmount)` under
+    /// `x402BatchSettlement`'s EIP-712 domain. `v` is written the wallet way
+    /// (`27`/`28`), as a stock x402 client writes it.
     fn claim_json(&self) -> String {
-        let proof = self.proof();
-        let signature = self
-            .signer()
-            .sign(&evm_balance_proof_digest(&proof))
-            .expect("sign")
-            .to_bytes();
-        format!(
-            r#"{{
-                "version": "1.0",
-                "blockchain": "evm",
-                "messageId": "store-probe-{nonce}",
-                "timestamp": "{timestamp}",
-                "senderId": "{address}",
-                "channelId": "0x{channel_id}",
-                "nonce": {nonce},
-                "transferredAmount": "{amount}",
-                "lockedAmount": "0",
-                "locksRoot": "0x{zeros}",
-                "signature": "0x{signature}",
-                "signerAddress": "{address}",
-                "chainId": {chain_id},
-                "tokenNetworkAddress": "{token_network}"
-            }}"#,
-            nonce = proof.nonce,
-            // `Z`, not `+00:00`. The claim gate refuses a `+00:00` offset
-            // outright -- "'timestamp' must be ISO 8601 with a 'Z' timezone" --
-            // and `chrono`'s plain `to_rfc3339()` produces exactly the spelling
-            // it rejects. This is a structural refusal at the gate, so the
-            // packet is never forwarded and nothing is charged, but it is an
-            // easy half hour to lose.
-            timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            channel_id = hex_encode(&proof.channel_id),
-            amount = proof.transferred_amount,
-            zeros = "0".repeat(64),
-            signature = hex_encode(&signature),
-            address = to_hex(&self.address()),
-            chain_id = proof.chain_id,
-            token_network = to_hex(&proof.token_network_address),
-        )
+        let digest = evm_voucher_digest(
+            &BatchSettlementDomain::x402(self.chain_id),
+            &self.channel_id,
+            self.cumulative,
+        );
+        let mut signature = self.signer().sign(&digest).expect("sign").to_bytes();
+        if signature[64] < 27 {
+            signature[64] += 27;
+        }
+        let mut voucher = serde_json::json!({
+            "version": "1.0",
+            "blockchain": "evm",
+            "scheme": "batch-settlement",
+            "messageId": format!("store-probe-{}", self.cumulative),
+            // `Z`, not `+00:00`: the claim gate refuses a `+00:00` offset by
+            // name, and `chrono`'s plain `to_rfc3339()` produces exactly that.
+            "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            "senderId": to_hex(&self.address()),
+            "channelId": format!("0x{}", hex_encode(&self.channel_id)),
+            "maxClaimableAmount": self.cumulative.to_string(),
+            "signature": format!("0x{}", hex_encode(&signature)),
+        });
+        if let Some(config) = &self.channel_config {
+            voucher["channelConfig"] = config.clone();
+        }
+        voucher.to_string()
     }
 }
 
@@ -660,7 +633,14 @@ async fn an_unpaid_store_job_is_answered_with_x402_terms_and_never_reaches_the_a
     assert!(response.headers().contains_key("payment-required"));
     let terms: serde_json::Value = response.json().await.expect("x402 terms");
     assert_eq!(terms["x402Version"], 2);
-    assert_eq!(terms["accepts"][0]["scheme"], "toon-channel");
+    // ADR 0075: TOON's own terms ride `extensions.toon`, and every
+    // `accepts[]` entry is x402 `batch-settlement`.
+    assert!(terms["extensions"]["toon"]["info"]["amount"].is_string());
+    assert!(terms["accepts"]
+        .as_array()
+        .expect("accepts is a list")
+        .iter()
+        .all(|entry| entry["scheme"] == "batch-settlement"));
     // No OER packet came back at all, so the forwarding decision was never
     // reached and no peering carried anything for free.
     assert!(Prepare::decode(terms.to_string().as_bytes()).is_err());

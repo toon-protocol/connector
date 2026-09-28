@@ -401,7 +401,9 @@ async fn claims(State(state): State<OperatorState>) -> Json<Vec<ClaimView>> {
             peer_id: None,
             channel_id,
             direction: ClaimDirection::Inbound,
-            nonce: watermark.nonce,
+            // A voucher has no nonce (ADR 0075 decision 8); a `toon-channel`
+            // row a pre-ADR 0075 journal left is replayed by amount alone.
+            nonce: connector_domain::VOUCHER_WATERMARK_NONCE,
             cumulative_amount: watermark.cumulative_amount,
             pending: false,
             book: ClaimBookKind::Client,
@@ -1163,7 +1165,6 @@ fn node_identity(signer: &dyn Signer) -> Result<NodeIdentity, SignerError> {
 mod tests {
     use super::*;
     use axum::body::Body;
-    use connector_client_edge::ClientChannelRegistry;
     use connector_config::StaticRoute;
     use connector_runtime::{
         FakeAppClient, InMemoryJournal, InProcessPeerTransport, RouteSource, TestClock,
@@ -1180,17 +1181,14 @@ mod tests {
         connector_runtime::covering_fake::covering(connector, peer_id)
     }
 
-    /// A client-edge claim book over no declared channels, journaling
+    /// A client-edge claim book with no settlement backend, journaling
     /// nowhere durable -- the operator-surface tests below that are not
     /// specifically about the client-edge book (most of them) need a
     /// `ClientClaimGate` to satisfy `router`'s signature and nothing more.
     fn empty_claim_gate() -> Arc<ClientClaimGate> {
         Arc::new(
-            ClientClaimGate::restore(
-                ClientChannelRegistry::new(),
-                Arc::new(InMemoryJournal::new()),
-            )
-            .expect("a fresh in-memory journal has nothing to replay"),
+            ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
+                .expect("a fresh in-memory journal has nothing to replay"),
         )
     }
 
@@ -2349,7 +2347,6 @@ mod tests {
                     http_endpoint: Some("http://counterparty.example/ilp".to_string()),
                     btp_endpoint: None,
                     peer_carriages: vec!["http".to_string()],
-                    settlements: Vec::new(),
                     batch_settlements: vec![X402BatchSettlementTerms::Evm(
                         X402BatchSettlementEvmTerms {
                             network: NETWORK.to_string(),

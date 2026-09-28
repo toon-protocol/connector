@@ -5,11 +5,12 @@
 //!
 //! Issue #611 is what makes ADR/issue #502's *"anonymity is a first-class
 //! path"* real: a buyer who has opened a channel on chain pays without the
-//! operator hand-editing a config file, because
-//! [`crate::ClientChannelRegistry`] resolves the channel from the chain the
-//! `[settlement]` section already names. That resolution costs one chain
-//! read per **previously-unseen** channel id, and before this module
-//! nothing bounded how many a sender could cause.
+//! operator hand-editing a config file, because the claim gate resolves the
+//! channel from the chain through its settlement backend
+//! ([`crate::BatchSettlementChannels`] since ADR 0075; the retired
+//! `toon-channel` registry before it). That resolution costs one chain read
+//! per **previously-unseen** channel id, and before this module nothing
+//! bounded how many a sender could cause.
 //!
 //! So a sender naming a fresh nonexistent channel id on every request made
 //! this connector issue one `eth_call` (or one Solana account read) per
@@ -66,12 +67,12 @@
 //!
 //! # What #654 already bounds, and why it cannot bound this
 //!
-//! [`crate::ChannelLivenessPolicy`] looks like it should already cover
-//! this, and it does not. Every one of its protections --
-//! `refresh_after`, `serve_stale_until`, `min_reattempt_interval`, and the
-//! single-flight in-flight marker -- hangs off a *memo entry*, and
-//! `ClientChannelRegistry::resolve_evm` only ever inserts one for a channel
-//! the chain vouched for; a channel that resolves to nothing is
+//! The retired `toon-channel` registry's liveness policy (deleted with it,
+//! issue #1384) looked like it should already cover this, and it did not.
+//! Every one of its protections -- `refresh_after`, `serve_stale_until`,
+//! `min_reattempt_interval`, and the single-flight in-flight marker -- hung
+//! off a *memo entry*, and the registry only ever inserted one for a
+//! channel the chain vouched for; a channel that resolves to nothing is
 //! `memo.remove`d, never inserted. The consequence is stronger than "a
 //! fresh id each time escapes the interval": **even the same nonexistent
 //! id, presented two hundred times in a row under a ten-minute
@@ -102,15 +103,12 @@
 //!   nginx is a genuine defence -- the only sybil-resistant axis available
 //!   at this layer -- it simply is not something this crate can reach. See
 //!   `client-edge-spec.md` §1.3 for that and for the durable fix.
-//! * **The claim's own signer is read, and deliberately not verified.** For
-//!   Solana a balance proof is signed over the channel account, nonce and
-//!   amount alone, so it *could* be checked locally. For EVM it could not:
-//!   the EIP-712 digest needs the channel's `chainId`/`tokenNetworkAddress`,
-//!   which come from the resolution that has not happened yet, so the only
-//!   check possible before the lookup is against the claim's
-//!   *self-declared* domain -- which proves nothing except that the sender
-//!   can run one `ecrecover`. Requiring either would also swap one
-//!   amplifier for another: an anonymous request would buy an
+//! * **The voucher's signer is not known, and the sender is not verified.**
+//!   A voucher names no signer: its channel's voucher signer is read from
+//!   the chain by the very lookup being budgeted, so nothing before it can
+//!   say whose key signed. Recovering *a* key from the signature proves
+//!   nothing except that the sender can run one `ecrecover`, and would swap
+//!   one amplifier for another: an anonymous request would buy an
 //!   elliptic-curve operation instead of a hashmap increment. So
 //!   [`connector_domain::client_claim::ClientClaim::signer_key`] is a label
 //!   for grouping and attribution, never a credential.
@@ -167,9 +165,9 @@
 //! lookups that came back with nothing, or that failed, leave a mark. A
 //! failed lookup consumes deliberately -- the RPC was spent either way, and
 //! a node whose endpoint is down must not keep paying for the discovery.
-//! It stays distinguishable while it does: `ClientChannelRegistry` reports
-//! a refusal as a lookup failure, not as a budget, whenever the last lookup
-//! it actually completed had failed, so an outage never reads as an attack.
+//! A lookup the backend could not complete is reported as a lookup failure
+//! (`ChannelLookupFailed`), distinguishably from a lookup this budget
+//! withheld, so the two refusals stay separately countable.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -644,8 +642,9 @@ impl UnresolvableLookupBudget {
     }
 
     /// How far behind the node-wide drain currently is, past the burst it
-    /// tolerates -- i.e. what a lookup arriving now would wait. For a log
-    /// line or a test, never for a decision.
+    /// tolerates -- i.e. what a lookup arriving now would wait. For a
+    /// test, never for a decision.
+    #[cfg(test)]
     pub(crate) fn queued_for(&self) -> Duration {
         let now = Instant::now();
         let tolerance = self.policy.tolerance(self.policy.node_interval());

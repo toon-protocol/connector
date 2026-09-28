@@ -8,7 +8,7 @@ use crate::batch_settlement::{
     resolve_evm_batch_settlement, resolve_solana_batch_settlement, EvmBatchSettlementConfig,
     RawEvmBatchSettlementTable, RawSolanaBatchSettlementTable, SolanaBatchSettlementConfig,
 };
-use crate::client_channel::to_hex;
+use crate::encoding::{parse_evm_address, to_hex};
 use crate::error::ConfigError;
 use crate::secret::SecretLocation;
 
@@ -81,13 +81,10 @@ pub(crate) struct RawKeyedSettlementConfig {
 /// `[settlement.evm]`: the same fields the legacy flat shape carries, minus
 /// `chain` -- the table's own key already says which chain this is.
 ///
-/// `channel_index_from_block`/`channel_index_confirmations` (issue #661) are
-/// new, additive knobs for the local `ChannelOpened`/`ChannelNewDeposit`/
-/// `ChannelSettled` index built from this same `TokenNetwork`: the block to
-/// backfill from on a cold start with no checkpoint, and the depth behind
-/// chain head logs are applied at. Both default when omitted -- see
-/// [`resolve_evm_fields`] -- so an existing `[settlement.evm]` table keeps
-/// parsing with unchanged behaviour.
+/// `channel_index_from_block`/`channel_index_confirmations` tuned the local
+/// `TokenNetwork` channel index (issue #661), deleted with the `toon-channel`
+/// client claims it resolved (ADR 0075, issue #1384). Both are still parsed,
+/// only to be refused by name ([`ConfigError::SettlementChannelIndexKeyRemoved`]).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawEvmSettlementTable {
@@ -97,9 +94,9 @@ pub(crate) struct RawEvmSettlementTable {
     decimals: u8,
     key: RawSettlementKeyConfig,
     #[serde(default)]
-    channel_index_from_block: Option<u64>,
+    channel_index_from_block: Option<toml::Value>,
     #[serde(default)]
-    channel_index_confirmations: Option<u64>,
+    channel_index_confirmations: Option<toml::Value>,
     /// ADR 0073: dial this table's `rpc_url` through the root
     /// `socks_proxy`. See [`EvmSettlementConfig::rpc_via_socks_proxy`].
     #[serde(default)]
@@ -246,20 +243,9 @@ pub struct EvmSettlementConfig {
     token_address: [u8; 20],
     decimals: u8,
     key: SecretLocation,
-    channel_index_from_block: u64,
-    channel_index_confirmations: u64,
     rpc_via_socks_proxy: bool,
     batch_settlement: Option<EvmBatchSettlementConfig>,
 }
-
-/// How many blocks behind chain head a `ChannelOpened`/`ChannelNewDeposit`/
-/// `ChannelSettled` log must be before the local channel index applies it
-/// (issue #661), when `channel_index_confirmations` is not set. Deep enough
-/// that an ordinary chain reorg cannot un-confirm a log this index has
-/// already applied -- there is deliberately no unwind path, so this default
-/// has to actually hold rather than merely look safe on a chain that has not
-/// reorged yet.
-pub const DEFAULT_CHANNEL_INDEX_CONFIRMATIONS: u64 = 5;
 
 impl EvmSettlementConfig {
     /// The RPC endpoint this backend connects through.
@@ -296,26 +282,8 @@ impl EvmSettlementConfig {
         &self.key
     }
 
-    /// The block the local channel index (issue #661) backfills from on a
-    /// cold start with no durable checkpoint. `0` (scan from genesis) unless
-    /// `channel_index_from_block` is set -- an operator who knows their
-    /// `TokenNetwork`'s deploy block should set it, since scanning a public
-    /// chain from genesis is the cold-start cost this field exists to avoid.
-    pub fn channel_index_from_block(&self) -> u64 {
-        self.channel_index_from_block
-    }
-
-    /// How many blocks behind chain head a channel-index log must be before
-    /// it is applied (issue #661) -- always at least 1, enforced at load
-    /// time by [`resolve_evm_fields`], since indexing at head has nothing to
-    /// fall back on when the head reorgs and this index ships no unwind
-    /// path.
-    pub fn channel_index_confirmations(&self) -> u64 {
-        self.channel_index_confirmations
-    }
-
-    /// Whether every client of this table's `rpc_url` (the backend, the
-    /// channel-index syncer and the rate source) dials through the root
+    /// Whether every client of this table's `rpc_url` (the backend and the
+    /// rate source) dials through the root
     /// `socks_proxy`, on this chain's own pinned circuit (ADR 0073). `false`
     /// unless the table says so. When `true`, `Config::load` has already
     /// checked that a `socks_proxy` exists, and that the endpoint is
@@ -545,11 +513,7 @@ pub(crate) fn check_settlement_rpc_routes(
 /// this node is not in, and every claim admitted on that row is carriage
 /// rendered for money it can never collect. That is a **fact** about the
 /// chain with exactly one answer, not a policy an operator may set -- the
-/// same category issue #1136 put the EIP-712 domain in, and the reason
-/// `connector_client_edge::DepositFloor::Unknown`'s latitude does not
-/// reach it: a deposit floor is how much risk to take on a channel this
-/// node *is* a participant of, so it presupposes redeemability rather than
-/// conferring it.
+/// same category issue #1136 put the EIP-712 domain in.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SettlementTables<'a> {
     evm: bool,
@@ -640,25 +604,6 @@ impl<'a> SettlementTables<'a> {
     }
 }
 
-/// Parse a 20-byte EVM address written as 40 hex characters, an optional
-/// `0x`/`0X` prefix accepted since that is how every address in this
-/// workspace's own docs, infra and decision comments is already written
-/// (e.g. `'0x49beE1Bca5d15Fb0963117923403F9498119a9Ce'`).
-fn parse_evm_address(value: &str) -> Option<[u8; 20]> {
-    let hex = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-        .unwrap_or(value);
-    if hex.len() != 40 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut out = [0u8; 20];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
-}
-
 fn resolve_settlement_key(raw: RawSettlementKeyConfig) -> Result<SecretLocation, ConfigError> {
     match (raw.key_file, raw.kms_key_id) {
         (Some(path), None) => {
@@ -722,11 +667,17 @@ fn resolve_evm_fields(table: RawEvmSettlementTable) -> Result<EvmSettlementConfi
 
     let key = resolve_settlement_key(table.key)?;
 
-    let channel_index_confirmations = table
-        .channel_index_confirmations
-        .unwrap_or(DEFAULT_CHANNEL_INDEX_CONFIRMATIONS);
-    if channel_index_confirmations == 0 {
-        return Err(ConfigError::SettlementChannelIndexConfirmationsZero);
+    // The local `TokenNetwork` channel index these tuned is deleted (ADR
+    // 0075, issue #1384): refused by name, never silently ignored.
+    if table.channel_index_from_block.is_some() {
+        return Err(ConfigError::SettlementChannelIndexKeyRemoved {
+            field: "channel_index_from_block",
+        });
+    }
+    if table.channel_index_confirmations.is_some() {
+        return Err(ConfigError::SettlementChannelIndexKeyRemoved {
+            field: "channel_index_confirmations",
+        });
     }
 
     Ok(EvmSettlementConfig {
@@ -735,8 +686,6 @@ fn resolve_evm_fields(table: RawEvmSettlementTable) -> Result<EvmSettlementConfi
         token_address,
         decimals: table.decimals,
         key,
-        channel_index_from_block: table.channel_index_from_block.unwrap_or(0),
-        channel_index_confirmations,
         rpc_via_socks_proxy: table.rpc_via_socks_proxy,
         batch_settlement: table
             .batch_settlement
@@ -1127,6 +1076,35 @@ key_file = "{}"
         toml::from_str(body).expect("valid keyed settlement toml")
     }
 
+    /// Issue #1384: the `TokenNetwork` channel index these keys tuned is
+    /// deleted, so each is refused by its own name rather than ignored.
+    #[test]
+    fn the_retired_channel_index_keys_are_refused_by_name() {
+        let key_file = temp_key_file();
+        for field in ["channel_index_from_block", "channel_index_confirmations"] {
+            let text = format!(
+                r#"
+[evm]
+rpc_url = "http://127.0.0.1:8545"
+contract_address = "{CONTRACT}"
+token_address = "{TOKEN}"
+decimals = 6
+{field} = 5
+
+[evm.key]
+key_file = "{}"
+"#,
+                key_file.path().display()
+            );
+            let error = resolve_settlement(Some(keyed_toml(&text))).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::SettlementChannelIndexKeyRemoved { field: named } if named == field),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
     #[test]
     fn a_keyed_evm_table_resolves_the_same_as_the_legacy_shape() {
         let key_file = temp_key_file();
@@ -1382,99 +1360,6 @@ key_file = "{}"
             result,
             Err(ConfigError::SettlementMissingProgramId)
         ));
-    }
-
-    #[test]
-    fn an_evm_table_with_no_channel_index_fields_gets_the_default_confirmation_depth() {
-        let key_file = temp_key_file();
-        let text = format!(
-            r#"
-[evm]
-rpc_url = "http://127.0.0.1:8545"
-contract_address = "{CONTRACT}"
-token_address = "{TOKEN}"
-decimals = 6
-
-[evm.key]
-key_file = "{}"
-"#,
-            key_file.path().display()
-        );
-        let resolved = resolve_settlement(Some(keyed_toml(&text))).expect("resolve");
-        let resolved = expect_single_evm(resolved);
-        assert_eq!(resolved.channel_index_from_block(), 0);
-        assert_eq!(
-            resolved.channel_index_confirmations(),
-            DEFAULT_CHANNEL_INDEX_CONFIRMATIONS
-        );
-    }
-
-    #[test]
-    fn an_evm_table_can_set_the_channel_index_from_block_and_confirmations() {
-        let key_file = temp_key_file();
-        let text = format!(
-            r#"
-[evm]
-rpc_url = "http://127.0.0.1:8545"
-contract_address = "{CONTRACT}"
-token_address = "{TOKEN}"
-decimals = 6
-channel_index_from_block = 123456
-channel_index_confirmations = 12
-
-[evm.key]
-key_file = "{}"
-"#,
-            key_file.path().display()
-        );
-        let resolved = resolve_settlement(Some(keyed_toml(&text))).expect("resolve");
-        let resolved = expect_single_evm(resolved);
-        assert_eq!(resolved.channel_index_from_block(), 123456);
-        assert_eq!(resolved.channel_index_confirmations(), 12);
-    }
-
-    #[test]
-    fn a_channel_index_confirmations_of_zero_is_rejected_at_load_time() {
-        let key_file = temp_key_file();
-        let text = format!(
-            r#"
-[evm]
-rpc_url = "http://127.0.0.1:8545"
-contract_address = "{CONTRACT}"
-token_address = "{TOKEN}"
-decimals = 6
-channel_index_confirmations = 0
-
-[evm.key]
-key_file = "{}"
-"#,
-            key_file.path().display()
-        );
-        let result = resolve_settlement(Some(keyed_toml(&text)));
-        assert!(matches!(
-            result,
-            Err(ConfigError::SettlementChannelIndexConfirmationsZero)
-        ));
-    }
-
-    #[test]
-    fn the_legacy_flat_shape_gets_the_default_channel_index_confirmations() {
-        let key_file = temp_key_file();
-        let resolved = resolve_settlement(Some(raw(
-            "evm",
-            "http://127.0.0.1:8545",
-            CONTRACT,
-            TOKEN,
-            6,
-            Some(key_file.path().to_path_buf()),
-        )))
-        .expect("resolve");
-        let resolved = expect_single_evm(resolved);
-        assert_eq!(resolved.channel_index_from_block(), 0);
-        assert_eq!(
-            resolved.channel_index_confirmations(),
-            DEFAULT_CHANNEL_INDEX_CONFIRMATIONS
-        );
     }
 
     #[test]
