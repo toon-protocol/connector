@@ -34,7 +34,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use connector_btp::{
     ProtocolData, ACCUMULATED_COST_HEADER, ACCUMULATED_COST_PROTOCOL, CLAIM_ACK_HEADER,
-    CLAIM_HEADER, CONTENT_TYPE_TEXT, FLUSH_REQUESTED_HEADER,
+    CLAIM_HEADER, CONTENT_TYPE_TEXT, FLUSH_REQUESTED_HEADER, PEER_CHALLENGE_HEADER,
 };
 use connector_peer_btp::{ack, fields};
 use connector_runtime::ClaimAckOutcome;
@@ -215,6 +215,21 @@ pub fn payment_required_header_value(terms: &[u8]) -> String {
 /// identity, so the anonymity it buys has no peer use.
 pub fn claim_json(headers: &Headers) -> Option<Result<Vec<u8>, ClaimHeaderNotBase64>> {
     let value = headers.get(CLAIM_HEADER)?;
+    Some(STANDARD.decode(value).map_err(|_| ClaimHeaderNotBase64))
+}
+
+/// The `Toon-Peer-Role-Challenge` header value for a challenge's JSON (ADR
+/// 0075 decision 5): base64, as the claim header's is.
+#[must_use]
+pub fn peer_challenge_header_value(json: &str) -> String {
+    STANDARD.encode(json.as_bytes())
+}
+
+/// The peer-role challenge a request carries, base64-decoded. `None` when
+/// the header is absent; the caller counts duplicates first (§1.5).
+#[must_use]
+pub fn peer_challenge_json(headers: &Headers) -> Option<Result<Vec<u8>, ClaimHeaderNotBase64>> {
+    let value = headers.get(PEER_CHALLENGE_HEADER)?;
     Some(STANDARD.decode(value).map_err(|_| ClaimHeaderNotBase64))
 }
 

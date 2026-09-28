@@ -747,10 +747,14 @@ mod claim_state {
     use base64::Engine;
     use chrono::{TimeZone, Utc};
     use connector_client_edge::router_with_gate;
-    use connector_runtime::{Connector, FakeAppClient, InProcessPeerTransport, TestClock};
+    use connector_runtime::{
+        ChannelDomain, ClaimAckOutcome, ClaimSignature, Connector, FakeAppClient,
+        InProcessPeerTransport, TestClock, VoucherSigner, WireClaim,
+    };
     use connector_signer::{
-        evm_claim_state_challenge_digest, evm_voucher_claim_state_challenge_digest,
-        solana_voucher_claim_state_challenge_message, EvmClaimStateChallenge, LocalSigner,
+        evm_balance_proof_digest, evm_claim_state_challenge_digest,
+        evm_voucher_claim_state_challenge_digest, solana_voucher_claim_state_challenge_message,
+        EvmBalanceProof, EvmClaimStateChallenge, LocalSigner, Signer as _,
     };
     use tower::ServiceExt;
 
@@ -1047,5 +1051,172 @@ mod claim_state {
         .await;
 
         assert_eq!(entry["error"], "unverified");
+    }
+
+    // -- A peer's voucher channel (ADR 0075 decisions 5 and 6, issue #1377) --
+
+    const PEER_ID: &str = "store";
+
+    /// A node holding one peering, `store`, whose voucher signers -- the
+    /// channel's `payerAuthorizer` on EVM, its `authorized_signer` on Solana
+    /// -- are bound to it: both channels are the peer's, not a client's.
+    fn peer_bound_connector() -> Arc<Connector> {
+        let connector = Connector::new(
+            vec![],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            Arc::new(TestClock::new(
+                Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap(),
+            )),
+        )
+        .with_config_peer_ids([PEER_ID.to_string()]);
+        bind_peer(connector)
+    }
+
+    fn bind_peer(connector: Connector) -> Arc<Connector> {
+        connector
+            .bind_voucher_signer(PEER_ID, VoucherSigner::Evm(address_of(&authorizer())))
+            .expect("store is a peering");
+        connector
+            .bind_voucher_signer(
+                PEER_ID,
+                VoucherSigner::Solana(solana_signer().public.to_bytes()),
+            )
+            .expect("store is a peering");
+        Arc::new(connector)
+    }
+
+    async fn claim_state_on(
+        connector: Arc<Connector>,
+        gate: ClientClaimGate,
+        entry: serde_json::Value,
+    ) -> serde_json::Value {
+        let app = router_with_gate(
+            connector,
+            Arc::new(LocalSigner::generate("test-signer")),
+            None,
+            gate,
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ilp/claim-state")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "channels": [entry] }).to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        body["channels"][0].clone()
+    }
+
+    /// The watermark authority a paying peer restores from (ADR 0075
+    /// decision 6) answers for the peer's channel on either chain, proved by
+    /// the same challenge that proves the peer role (decision 5).
+    #[tokio::test]
+    async fn a_voucher_challenge_is_answered_for_a_peer_bound_channel() {
+        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let (gate, _journal) = gate_with(&backend);
+        gate.ingest(&signed_evm_voucher(100), 100)
+            .await
+            .expect("accepted");
+        let connector = peer_bound_connector();
+        assert_eq!(
+            connector
+                .voucher_signer_peer(&VoucherSigner::Evm(address_of(&authorizer())))
+                .as_deref(),
+            Some(PEER_ID),
+            "the channel is the peer's"
+        );
+
+        let evm = claim_state_on(
+            Arc::clone(&connector),
+            gate,
+            evm_entry(evm_challenge(&authorizer(), channel_id()), None),
+        )
+        .await;
+        assert_eq!(evm["ok"], true, "{evm}");
+        assert_eq!(evm["scheme"], "batch-settlement");
+        assert_eq!(evm["cumulativeClaimed"], "100");
+
+        let (gate, _journal) = gate_with(&backend);
+        gate.ingest(&solana_voucher(70, &solana_signer(), 0), 70)
+            .await
+            .expect("accepted");
+        let solana = claim_state_on(connector, gate, solana_entry(&solana_signer())).await;
+        assert_eq!(solana["ok"], true, "{solana}");
+        assert_eq!(solana["cumulativeClaimed"], "70");
+    }
+
+    /// Widened to the peer book, as ADR 0075's Prerequisites require: the
+    /// answer is the higher of the two books' watermarks, never the client
+    /// edge's alone, so a payer restoring from it is never told less than
+    /// its channel stands at.
+    #[tokio::test]
+    async fn a_voucher_channels_watermark_is_the_higher_of_the_two_books() {
+        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let (gate, _journal) = gate_with(&backend);
+        gate.ingest(&signed_evm_voucher(100), 100)
+            .await
+            .expect("accepted");
+
+        // The peer book holds the same channel id at 400.
+        let channel_hex = format!("0x{}", hex::encode(channel_id()));
+        let token_network = [0x42; 20];
+        let key = LocalSigner::generate("peer-book");
+        let connector = Connector::new(
+            vec![],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            Arc::new(TestClock::new(
+                Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap(),
+            )),
+        )
+        .with_config_peer_ids([PEER_ID.to_string()])
+        .with_channel_verification_key(
+            channel_hex.clone(),
+            derive_evm_address(&key.public_key().unwrap()),
+        )
+        .with_channel_domain(
+            channel_hex.clone(),
+            ChannelDomain {
+                chain_id: CHAIN_ID,
+                token_network_address: token_network,
+            },
+        )
+        .expect("a bytes32 channel id");
+        let digest = evm_balance_proof_digest(&EvmBalanceProof {
+            channel_id: channel_id(),
+            nonce: 1,
+            transferred_amount: 400,
+            locked_amount: 0,
+            locks_root: [0u8; 32],
+            chain_id: CHAIN_ID,
+            token_network_address: token_network,
+        });
+        assert_eq!(
+            connector.handle_peer_claim(WireClaim {
+                channel_id: channel_hex,
+                nonce: 1,
+                cumulative_amount: 400,
+                signature: ClaimSignature::Evm(key.sign(&digest).unwrap()),
+            }),
+            ClaimAckOutcome::Accepted
+        );
+
+        let entry = claim_state_on(
+            bind_peer(connector),
+            gate,
+            evm_entry(evm_challenge(&authorizer(), channel_id()), None),
+        )
+        .await;
+
+        assert_eq!(entry["ok"], true, "{entry}");
+        assert_eq!(entry["cumulativeClaimed"], "400");
+        assert_eq!(entry["available"], "600");
     }
 }

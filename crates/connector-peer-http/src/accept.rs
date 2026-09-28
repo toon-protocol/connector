@@ -71,15 +71,15 @@ use std::sync::{Arc, RwLock};
 
 use connector_btp::{
     ACCUMULATED_COST_HEADER, CLAIM_ACK_HEADER, CLAIM_HEADER, FLUSH_REQUESTED_HEADER,
-    PAYMENT_REQUIRED_HEADER,
+    PAYMENT_REQUIRED_HEADER, PEER_CHALLENGE_HEADER,
 };
 use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 use connector_peer_auth::{
     claim_ack_to_emit, Capability, PeerAuthPolicy, PeerAuthRefusal, PeerAuthRefusalLog, SessionRole,
 };
-use connector_peer_btp::claim_json::{self};
+use connector_peer_btp::claim_json::{self, PresentedPeerClaim};
 use connector_peer_btp::price_gate::{self, ClaimEnforcementPolicy, PaymentRequired};
-use connector_peer_btp::role_gate;
+use connector_peer_btp::role_gate::{self, FrameEvidence, VoucherEvidence};
 use connector_peer_btp::AcceptedClaims;
 use connector_runtime::{ClaimAckOutcome, Connector, WireClaim};
 
@@ -162,6 +162,10 @@ pub struct PeerHttpState {
     hints: Arc<FlushHints>,
     refusals: Mutex<PeerAuthRefusalLog>,
     policy: PeerHttpPolicy,
+    /// The receiving half a voucher or a peer-role challenge is resolved
+    /// through (ADR 0075 decision 5). `None` -- [`Self::new`]'s default --
+    /// and neither proves the peer role on this carriage.
+    vouchers: Option<Arc<dyn VoucherEvidence>>,
 }
 
 impl PeerHttpState {
@@ -188,7 +192,17 @@ impl PeerHttpState {
             hints,
             refusals: Mutex::new(PeerAuthRefusalLog::default()),
             policy,
+            vouchers: None,
         }
+    }
+
+    /// Resolve vouchers and peer-role challenges through `vouchers`, so that
+    /// either proves the peer role on a channel bound to a peering (ADR 0075
+    /// decision 5).
+    #[must_use]
+    pub fn with_voucher_evidence(mut self, vouchers: Arc<dyn VoucherEvidence>) -> Self {
+        self.vouchers = Some(vouchers);
+        self
     }
 
     /// §6.4: ask `peer_id` to flush `channel_id` on the next response.
@@ -206,18 +220,34 @@ impl PeerHttpState {
         // than one claim header on one request is refused, not resolved --
         // never the first, never the last, never a concatenation. `400`,
         // with no ILP body.
-        if request.headers.get_all(CLAIM_HEADER).len() > 1 {
+        //
+        // The same for the peer-role challenge (ADR 0075 decision 5), and a
+        // claim beside a challenge is refused too: two pieces of
+        // authentication material, and "which did we check?" has no answer.
+        let Some(evidence) = evidence_on(&request) else {
             return PeerResponse::refused(400);
-        }
+        };
 
-        // **Role, from this request's own claim** (§1.2, §1.5): decoded and
-        // verified before anything is judged, routed, charged or journaled.
-        // Decoded once, here, and reused for the price-coverage check
-        // further down.
-        let claim = claim_on(&request);
-        let (role, refusal) =
-            role_gate::decide(&self.connector, &self.auth, claim.as_ref()).into_parts();
+        // **Role, from this request's own evidence** (§1.2, §1.5): decoded
+        // and verified before anything is judged, routed, charged or
+        // journaled. Decoded once, here, and reused for the price-coverage
+        // check further down.
+        let (role, refusal) = role_gate::decide_frame(
+            &self.connector,
+            &self.auth,
+            self.vouchers.as_deref(),
+            &evidence,
+        )
+        .await
+        .into_parts();
         self.report_refusal(refusal.as_ref());
+        // Only a `toon-channel` claim is judged below: a voucher that
+        // decided the role is not a `WireClaim`, and judging one on the peer
+        // wire is the receiving half's (#1378).
+        let claim = match evidence.claim {
+            Some(PresentedPeerClaim::Channel(claim)) => Some(claim),
+            Some(PresentedPeerClaim::Voucher(_)) | None => None,
+        };
 
         // §1.10: on a dedicated peer listener a failure is refused outright
         // rather than downgraded, because such a listener serves no clients.
@@ -445,6 +475,49 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Everything a peer request presents that could prove the peer role (ADR
+/// 0075 decision 5): its claim header -- a `toon-channel` claim or a voucher
+/// -- its peer-role challenge header, and whether its body is a PREPARE that
+/// moves no value.
+///
+/// `None` is §1.5's ambiguity, which the caller refuses `400`: more than one
+/// claim header, more than one challenge header, or a claim beside a
+/// challenge. An unreadable claim or challenge is not ambiguity; it proves
+/// nothing, and the request is judged as if it were absent.
+#[must_use]
+pub fn evidence_on(request: &PeerRequest) -> Option<FrameEvidence> {
+    let claims = request.headers.get_all(CLAIM_HEADER).len();
+    let challenges = request.headers.get_all(PEER_CHALLENGE_HEADER).len();
+    if claims > 1 || challenges > 1 || (claims == 1 && challenges == 1) {
+        return None;
+    }
+    let claim = match headers::claim_json(&request.headers) {
+        None => None,
+        Some(Ok(raw)) => claim_json::parse_presented(&raw)
+            .inspect_err(|error| {
+                tracing::warn!(%error, "peer claim could not be decoded; not acknowledged");
+            })
+            .ok(),
+        Some(Err(_)) => {
+            tracing::warn!("peer claim header is not base64; not acknowledged");
+            None
+        }
+    };
+    let challenge = match headers::peer_challenge_json(&request.headers) {
+        None => None,
+        Some(Ok(raw)) => role_gate::decode_challenge(&raw),
+        Some(Err(_)) => {
+            tracing::warn!("peer-role challenge header is not base64; it proves nothing");
+            None
+        }
+    };
+    Some(FrameEvidence {
+        claim,
+        challenge,
+        moves_no_value: role_gate::moves_no_value(&request.body),
+    })
 }
 
 /// The claim a peer request carries, decoded -- exposed so a caller that

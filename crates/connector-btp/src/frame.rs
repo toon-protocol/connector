@@ -44,6 +44,14 @@ pub const PAYOUT_CLAIM_PROTOCOL: &str = "payout-claim";
 /// the RESPONSE that already answers the claim-bearing MESSAGE or TRANSFER,
 /// never a frame of its own. Its HTTP twin is `Toon-Claim-Ack` (#728).
 pub const CLAIM_ACK_PROTOCOL: &str = "claim-ack";
+/// The **peer-role challenge** (ADR 0075 decision 5, `peer-carriage-spec.md`
+/// §1.4): the voucher claim-state challenge a peer's packet that moves no
+/// value carries in place of a voucher, to prove the peer role. Raw UTF-8
+/// JSON, like the claim entry. Its own entry rather than the claim's,
+/// because it is not a claim: it moves nothing and advances no watermark,
+/// and a slot that could hold either would make "was this a payment?" a
+/// question about the bytes rather than about where they rode.
+pub const PEER_CHALLENGE_PROTOCOL: &str = "peer-role-challenge";
 /// The HTTP twin of each entry name above, in its canonical lower-case form
 /// (`peer-carriage-spec.md` §3; header names match case-insensitively per
 /// RFC 9110, and the canonical form is the one the vectors pin).
@@ -73,6 +81,9 @@ pub const CLAIM_ACK_PROTOCOL: &str = "claim-ack";
 pub const CLAIM_HEADER: &str = "ilp-payment-channel-claim";
 /// The HTTP twin of [`CLAIM_ACK_PROTOCOL`] (§3, §6.1).
 pub const CLAIM_ACK_HEADER: &str = "toon-claim-ack";
+/// The HTTP twin of [`PEER_CHALLENGE_PROTOCOL`] (§1.4): the same JSON,
+/// base64 in the header as the claim's is.
+pub const PEER_CHALLENGE_HEADER: &str = "toon-peer-role-challenge";
 /// The HTTP twin of [`ACCUMULATED_COST_PROTOCOL`] (§3, §5.2) -- already
 /// implemented on the client edge and reused verbatim.
 pub const ACCUMULATED_COST_HEADER: &str = "toon-accumulated-cost";
@@ -134,6 +145,11 @@ pub const CARRIAGE_NAMES: &[CarriageNames] = &[
         concept: "payment-required",
         btp_protocol_entry: PAYMENT_REQUIRED_PROTOCOL,
         http_header: PAYMENT_REQUIRED_HEADER,
+    },
+    CarriageNames {
+        concept: "peer-role-challenge",
+        btp_protocol_entry: PEER_CHALLENGE_PROTOCOL,
+        http_header: PEER_CHALLENGE_HEADER,
     },
 ];
 
@@ -630,6 +646,14 @@ mod tests {
         assert_eq!(
             by_concept("payment-required").http_header,
             PAYMENT_REQUIRED_HEADER
+        );
+        assert_eq!(
+            by_concept("peer-role-challenge").btp_protocol_entry,
+            PEER_CHALLENGE_PROTOCOL
+        );
+        assert_eq!(
+            by_concept("peer-role-challenge").http_header,
+            PEER_CHALLENGE_HEADER
         );
     }
 

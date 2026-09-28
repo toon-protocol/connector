@@ -83,6 +83,15 @@
 //! ([`VerifiedVoucherChannelState`]). Without the discriminator, an entry
 //! is a `toon-channel` one and a voucher channel is never found.
 //!
+//! **A peer's voucher channel too (ADR 0075, issue #1377).** Since ADR 0075
+//! decision 5 a voucher proves the peer role on a channel whose voucher
+//! signer is bound to a peering, and decision 6 makes this endpoint the
+//! watermark authority a paying peer restores from. So a batch-settlement
+//! entry is answered for a peer-bound channel exactly as for a client's --
+//! the channel is found, and its signer read, by the same lookups -- and its
+//! watermark is the higher of the two books', as a `toon-channel` entry's
+//! already is, not the client edge's alone.
+//!
 //! **The admission path is untouched.** This handler only reads --
 //! [`crate::ClientClaimGate::watermark`], [`crate::ClientClaimGate::channels`],
 //! [`crate::ClientClaimGate::last_claim_time`] -- and a channel lookup that
@@ -579,11 +588,13 @@ async fn resolve_evm_voucher(
     log_outcome("evm", &channel_id_text, "verified");
     let channel_id_hex = format!("0x{}", hex_encode(&channel_id));
     let channel_key = format!("evm:{channel_id_hex}");
+    let peer_watermark = state.connector.peer_channel_watermark(&channel_id_hex);
     verified_voucher_state(
         "evm",
         channel_id_hex,
         state,
         &channel_key,
+        peer_watermark,
         channel.max_cumulative,
     )
 }
@@ -622,30 +633,43 @@ async fn resolve_solana_voucher(
     }
     log_outcome("solana", &channel_account_text, "verified");
     let channel_key = format!("solana:{channel_account_text}");
+    let peer_watermark = state
+        .connector
+        .peer_channel_watermark(&channel_account_text);
     verified_voucher_state(
         "solana",
         channel_account_text,
         state,
         &channel_key,
+        peer_watermark,
         channel.max_cumulative,
     )
 }
 
-/// A verified voucher channel's figures (issue #1364). The watermark is the
-/// client edge's book alone: a voucher is never a peer claim (ADR 0074
-/// decision 1), so the peer book [`verified_state`] also consults never
-/// holds one.
+/// A verified voucher channel's figures (issue #1364).
+///
+/// The watermark is [`Watermark::highest`] of the client edge's book and
+/// the peer book's (`peer_watermark`, as [`verified_state`] takes it). Until
+/// ADR 0075 it was the client edge's alone, because a voucher was never a
+/// peer claim (ADR 0074 decision 1). Decision 5 makes a voucher the peer
+/// role's proof on a bound channel, and the ADR's Prerequisites require
+/// this answer widen to the peer book with it (issue #1377). A voucher's
+/// cumulative amount is a property of its channel, not of the book that
+/// journaled it -- the reason `verified_state` answers the higher of two
+/// books (#1257/#1258) -- and a peer restoring its outbound watermark from
+/// here must never be told less than the channel stands at, or it signs a
+/// voucher that fails to advance.
 fn verified_voucher_state(
     blockchain: &'static str,
     channel_id: String,
     state: &ClientEdgeState,
     channel_key: &str,
+    peer_watermark: Option<Watermark>,
     max_cumulative: u64,
 ) -> ChannelStateResult {
-    let cumulative_claimed = state
-        .claim_gate
-        .watermark(channel_key)
-        .map_or(0, |watermark| watermark.cumulative_amount);
+    let cumulative_claimed =
+        Watermark::highest(peer_watermark, state.claim_gate.watermark(channel_key))
+            .map_or(0, |watermark| watermark.cumulative_amount);
     ChannelStateResult::VerifiedVoucher(VerifiedVoucherChannelState {
         blockchain,
         channel_id,
