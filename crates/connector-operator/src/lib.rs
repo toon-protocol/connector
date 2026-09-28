@@ -22,9 +22,11 @@
 //! `POST /channels/:id/land` (land the latest voucher held on an inbound
 //! channel now) -- are this crate's write endpoints, beside the peering and
 //! route writes. The `toon-channel` writes `redeem`, `redeem-latest`,
-//! `close`, `settle` and `cooperative-close` are deleted; only the Solana
-//! `toon-channel` branch of `POST /channels` and `/fund` is still served,
-//! for `local/keys.sh` until #1383. Every one calls
+//! `close`, `settle` and `cooperative-close` are deleted, and so is the EVM
+//! `toon-channel` open. `POST /channels` still opens a Solana `toon-channel`
+//! for `local/keys.sh` until #1383, and `/fund` still funds a `toon-channel`
+//! on either chain -- on EVM for a `POST /peers` peering, until #1378.
+//! Every one calls
 //! [`write_auth::authenticate_write`] first and nothing else in this
 //! crate accepts a body, so a write cannot reach [`Connector`] without a
 //! valid, allowlisted, unexpired, non-replayed signature. Bearer tokens
@@ -881,8 +883,8 @@ struct FundChannelRequest {
 
 /// The refusal a request for the retired EVM `toon-channel` writes gets.
 const EVM_TOON_CHANNEL_RETIRED: &str =
-    "EVM toon-channel channels are no longer opened or funded here (ADR 0075, #1376): open an \
-     outbound x402 batch-settlement channel by posting the counterparty's `terms` instead";
+    "EVM toon-channel channels are no longer opened here (ADR 0075, #1376): open an outbound \
+     x402 batch-settlement channel by posting the counterparty's `terms` instead";
 
 fn channel_operation_response(result: Result<ChannelView, ChannelOperationError>) -> Response {
     match result {
@@ -1076,8 +1078,10 @@ async fn open_outbound_channel(state: &OperatorState, body: &Bytes) -> Response 
 
 /// `POST /channels/:id/fund`: top up a channel this node pays on, by an
 /// increment (ADR 0075 decision 11). An outbound x402 channel takes
-/// `{"amount": n}`; a Solana `toon-channel` -- the retained branch
-/// `local/keys.sh` funds through until #1383 -- takes either form.
+/// `{"amount": n}`. A `toon-channel` takes either form: on Solana
+/// `local/keys.sh` funds through it until #1383, and on EVM a `POST /peers`
+/// peering, whose channel that write opens, is collateralised through it
+/// until #1378 moves the peering to x402.
 async fn fund_channel(
     State(state): State<OperatorState>,
     Path(channel_id): Path<String>,
@@ -1113,13 +1117,6 @@ async fn fund_channel(
         };
     }
 
-    match state.connector.settlement_chain_for_channel(&channel_id) {
-        Ok(SettlementChain::Solana) => {}
-        Ok(SettlementChain::Evm) => {
-            return (StatusCode::BAD_REQUEST, EVM_TOON_CHANNEL_RETIRED).into_response()
-        }
-        Err(error) => return channel_operation_error_response(error),
-    }
     let result =
         match (request.amount, request.total) {
             (Some(amount), None) => state.connector.fund_channel(&channel_id, amount).await,
@@ -2578,11 +2575,13 @@ mod tests {
         }
 
         /// ADR 0075, #1376: the EVM `toon-channel` branch of `POST /channels`
-        /// and `/fund` is deleted, and refused by name rather than served --
-        /// and a `toon-channel` open that names no chain is refused too,
-        /// since the one it could mean is no longer a choice.
+        /// is deleted, and refused by name rather than served -- and a
+        /// `toon-channel` open that names no chain is refused too, since the
+        /// one it could mean is no longer a choice. (`/fund` keeps its EVM
+        /// branch: an EVM `POST /peers` peering is collateralised through it
+        /// until #1378 moves the peering to x402.)
         #[tokio::test]
-        async fn the_evm_toon_channel_writes_are_refused_by_name() {
+        async fn the_evm_toon_channel_open_is_refused_by_name() {
             let keypair = keypair();
             let app = router_with(vec![keypair.public.to_bytes()]);
             for body in [
@@ -2607,19 +2606,9 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                assert!(String::from_utf8_lossy(&body).contains("toon-channel"));
             }
-            let response = app
-                .oneshot(signed(
-                    &keypair,
-                    "POST",
-                    &format!("/channels/0x{}/fund", "ab".repeat(32)),
-                    serde_json::to_vec(&serde_json::json!({ "amount": 1 })).unwrap(),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-            assert!(String::from_utf8_lossy(&body).contains("ADR 0075"));
         }
 
         /// `POST /channels/:id/fund` with a `total` is the retry-safe form

@@ -274,12 +274,12 @@ node writes the channel's record — on EVM the whole `ChannelConfig`, `salt` in
 payer-signed `open` — to `outbound-channels.log` under `state_dir` before its opening transaction is
 sent, and every voucher it signs before the voucher leaves the process. So:
 
-| the node stopped between                      | on the next attempt                                                                           |
-| --------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| journaling the channel and sending its open   | a `POST /channels` toward the same receiver sends **that** channel's open, and says `resumed` |
-| sending the open and seeing it confirm        | boot adopts the channel if it landed; a retry re-sends a form that can land only once         |
-| the open confirming and the journal saying so | boot finds it on chain and records that it opened                                             |
-| signing a voucher and journaling it           | the voucher never left the node, so the watermark restored is still an honest one             |
+| the node stopped between                      | on the next attempt                                                                                                  |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| journaling the channel and sending its open   | a `POST /channels` toward the same receiver, for the same deposit, sends **that** channel's open, and says `resumed` |
+| sending the open and seeing it confirm        | boot adopts the channel if it landed; a retry re-sends a form that can land only once                                |
+| the open confirming and the journal saying so | boot finds it on chain and records that it opened                                                                    |
+| signing a voucher and journaling it           | the voucher never left the node, so the watermark restored is still an honest one                                    |
 
 "A form that can land only once": on EVM the opening deposit's authorisation is derived from the
 channel's own salt, and the token spends an authorisation once; on Solana the journaled bytes are the
@@ -291,13 +291,16 @@ journaled — never below what the chain shows landed — so its watermark never
 channel's open is unconfirmed it is listed `opening`, and funding or withdrawing it answers `409`.
 
 **The `toon-channel` writes are gone.** `redeem`, `redeem-latest`, `settle`, `close` and
-`cooperative-close` are deleted (#1376), and so is the EVM `toon-channel` branch of `POST /channels`
-and `/fund`, which answers `400` by name. Automatic landing of `toon-channel` claims is untouched. A node
-draining live TOON channels does so on the last release that still has these writes (ADR 0075,
-"Draining a node with live TOON channels"). **One `toon-channel` branch remains**: a body carrying
-`counterparty_hex` with `"chain": "solana"` still opens a Solana `toon-channel`, and `/fund` still
-funds one by `amount` or by `total`, because `local/keys.sh`'s `solana-channels` stage opens and funds
-its channels through them until #1383 moves the local stack to x402.
+`cooperative-close` are deleted (#1376), and so is the EVM `toon-channel` open through `POST
+/channels`, which answers `400` by name. **This build no longer lands a `toon-channel` claim on chain
+at all**: nothing on it redeemed one but these writes (#1376 found no automatic path, though the issue
+assumed one). A node draining live TOON channels does so on the last release that still has these
+writes (ADR 0075, "Draining a node with live TOON channels"). **Two `toon-channel` branches remain.**
+A body carrying `counterparty_hex` with `"chain": "solana"` still opens a Solana `toon-channel`,
+because `local/keys.sh`'s `solana-channels` stage opens its channels through it until #1383 moves the
+local stack to x402. And `/fund` still funds a `toon-channel` on either chain, by `amount` or by
+`total`: on Solana for the same stage, and on EVM because a `POST /peers` peering, whose channel that
+write opens, is collateralised through it until #1378 moves the peering to x402.
 
 ### 2.3 What an operator can see
 

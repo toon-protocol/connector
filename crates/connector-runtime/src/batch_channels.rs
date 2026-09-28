@@ -63,6 +63,9 @@ use crate::journal::{Journal, JournalError};
 use crate::operator_view::{ClaimBookKind, ClaimDirection, ClaimScheme, ClaimView};
 use crate::SettlementChain;
 
+/// The `scheme` every row here carries: an x402 voucher's, as the wire names it.
+const BATCH_SETTLEMENT: &str = "batch-settlement";
+
 /// Which way value moves on a channel, as this node sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -415,9 +418,9 @@ impl OutboundChannels {
     /// 11), and say whether it resumed an earlier open.
     ///
     /// **A retried open finds the journaled channel.** If an open toward the
-    /// same receiver on the same chain is journaled and not yet known to be
+    /// same receiver, on the same chain and for the same deposit, is journaled and not yet known to be
     /// on chain -- a crash, a lost confirmation, a sponsor that did not
-    /// answer -- this resumes **that** record, with its own deposit, rather
+    /// answer -- this resumes **that** record rather
     /// than building a second channel. Once no such record is pending, an
     /// open is a new channel: several toward one receiver are legal (ADR
     /// 0075 decision 4).
@@ -433,11 +436,18 @@ impl OutboundChannels {
             ReceiverTerms::Evm(evm) => evm.receiver.to_vec(),
             ReceiverTerms::Solana(solana) => solana.receiver.to_vec(),
         };
+        // The same open: same chain, same receiver, same deposit. A request
+        // that differs is a different open, so a stale pending record --
+        // one whose terms the counterparty has since changed, say -- never
+        // traps every later open toward that receiver.
         let pending = self
             .channels()
             .values()
             .find(|tracked| {
-                tracked.chain == chain && !tracked.opened && tracked.record.receiver() == receiver
+                tracked.chain == chain
+                    && !tracked.opened
+                    && tracked.record.receiver() == receiver
+                    && tracked.record.deposit() == deposit
             })
             .map(|tracked| tracked.record.clone());
         let (mut record, mut resumed) = match pending {
@@ -583,7 +593,7 @@ impl OutboundChannels {
             let counterparty = spell(tracked.chain, &tracked.record.receiver());
             let base = BatchChannelView {
                 id: id.clone(),
-                scheme: "batch-settlement".to_string(),
+                scheme: BATCH_SETTLEMENT.to_string(),
                 chain: tracked.chain.name().to_string(),
                 direction: ChannelDirection::Outbound,
                 status: BatchChannelViewStatus::Opening,
@@ -593,7 +603,9 @@ impl OutboundChannels {
                 watermark: tracked.signed,
                 detail: None,
             };
-            if !tracked.opened {
+            // An open still pending may have landed since boot: ask the
+            // chain, which journals it opened if it has.
+            if !tracked.opened && self.restore_one(&id).await.is_err() {
                 views.push(base);
                 continue;
             }
@@ -722,7 +734,7 @@ impl BatchChannels {
             let id = held.presentation.channel().0.clone();
             let base = BatchChannelView {
                 id,
-                scheme: "batch-settlement".to_string(),
+                scheme: BATCH_SETTLEMENT.to_string(),
                 chain: chain.name().to_string(),
                 direction: ChannelDirection::Inbound,
                 status: BatchChannelViewStatus::Unreadable,
@@ -779,7 +791,7 @@ impl BatchChannels {
             .await?;
         Ok(BatchChannelView {
             id,
-            scheme: "batch-settlement".to_string(),
+            scheme: BATCH_SETTLEMENT.to_string(),
             chain: chain.name().to_string(),
             direction: ChannelDirection::Inbound,
             status: state.status.into(),
@@ -823,7 +835,7 @@ impl OutboundChannels {
         };
         BatchChannelView {
             id: state.on_chain.id.0.clone(),
-            scheme: "batch-settlement".to_string(),
+            scheme: BATCH_SETTLEMENT.to_string(),
             chain: chain.name().to_string(),
             direction: ChannelDirection::Outbound,
             status: state.on_chain.status.into(),
@@ -1139,6 +1151,34 @@ mod tests {
             assert_ne!(second.on_chain.id, state.on_chain.id);
             assert_eq!(outbound.views().await.len(), 2);
         }
+    }
+
+    /// A pending open resumes only for the same open: a request with another
+    /// deposit is another channel, so a stale record never traps every
+    /// later open toward that receiver.
+    #[tokio::test]
+    async fn only_the_same_open_resumes_a_pending_one() {
+        let world = World::new(PayerExit::Withdrawal);
+        let journal = Arc::new(InMemoryJournal::new());
+        let record = world
+            .payer()
+            .prepare_open(world.receiver.published_terms(), 1_000)
+            .await
+            .expect("prepare");
+        journal
+            .append(&JournalEntry::OutboundChannelOpening {
+                channel_id: journal_key(SettlementChain::Evm, record.channel()),
+                record: record.encode(),
+            })
+            .unwrap();
+        let outbound = world.boot(Arc::clone(&journal) as Arc<dyn Journal>).await;
+        let (state, resumed) = outbound
+            .open(world.receiver.published_terms(), 2_000)
+            .await
+            .expect("another open");
+        assert!(!resumed);
+        assert_ne!(&state.on_chain.id, record.channel());
+        assert_eq!(world.balance(), 8_000);
     }
 
     /// Crash after the open landed and before `opened` was journaled: the

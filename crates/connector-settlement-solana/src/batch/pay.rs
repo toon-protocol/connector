@@ -278,6 +278,13 @@ impl SolanaBatchSettlement {
     /// record's receiver as the one recipient, and at least the record's
     /// deposit. What an open landed as, or what a crash left on chain to
     /// adopt.
+    ///
+    /// The counterparty's `payee` seat is checked too, by the address: the
+    /// PDA's seeds include `payee`, so an account at the address the record
+    /// derived names the payee this node built the open with. `rent_payer`
+    /// is not a seed and is not checked; it is the counterparty's own
+    /// concern, not this node's money. The deposit is at least, not exactly,
+    /// the record's, since an adopted channel may have been topped up.
     fn built_as_recorded(
         &self,
         address: &Pubkey,
@@ -487,6 +494,18 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
             finished: None,
         });
 
+        // The height is read **before** the account. Read after it, an open
+        // that landed between the two reads could be judged lapsed while
+        // the chain holds it with this node's deposit in it -- and a lapsed
+        // record is abandoned. Read first, a height past the blockhash's
+        // last valid one means nothing can land after it, so an account
+        // absent at the later read is absent for good.
+        let height = retry_read(|| {
+            self.rpc
+                .get_block_height_with_commitment(CommitmentConfig::confirmed())
+        })
+        .await
+        .map_err(backend_error)?;
         if let Some(account) = self.read(&channel).await? {
             if !self.built_as_recorded(&channel, &account, &receiver, deposit_units) {
                 return Err(not_as_built(&account));
@@ -494,12 +513,6 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
             self.set_backed(&channel, state_of(&id, &account).voucher_ceiling());
             return Ok(opened(&account));
         }
-        let height = retry_read(|| {
-            self.rpc
-                .get_block_height_with_commitment(CommitmentConfig::confirmed())
-        })
-        .await
-        .map_err(backend_error)?;
         if height > *last_valid_block_height {
             self.outbound().remove(&channel);
             return Err(BatchSettlementError::OpenLapsed(id));

@@ -3922,10 +3922,8 @@ impl Connector {
 
     /// The chain whose backend [`Self::settlement_for_channel`] routes
     /// `channel_id` to, by the same rule: the one backend on a node with one,
-    /// the id's own namespace otherwise. What the operator surface reads to
-    /// refuse a write on a chain whose `toon-channel` writes ADR 0075 retired
-    /// (#1376) before it reaches a backend.
-    pub fn settlement_chain_for_channel(
+    /// the id's own namespace otherwise.
+    fn settlement_chain_for_channel(
         &self,
         channel_id: &str,
     ) -> Result<SettlementChain, ChannelOperationError> {
