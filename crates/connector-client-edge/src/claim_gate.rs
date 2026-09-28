@@ -1110,7 +1110,7 @@ impl ClientClaimGate {
     /// * **The signer** comes from the backend's verified channel, never from
     ///   the voucher; on EVM the gate re-hashes that channel's config and
     ///   refuses one that is not the channel the voucher signs.
-    async fn admit_voucher(
+    pub(crate) async fn admit_voucher(
         &self,
         claim: ClientClaim,
         price: u64,

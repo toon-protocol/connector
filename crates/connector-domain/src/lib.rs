@@ -60,7 +60,8 @@ pub use identity::{
 pub use journal_entry::JournalEntry;
 pub use node::{
     agreed_required_transport, published_required_transport, EdgeIdentity, NodeFacts,
-    NodeSelfDescription, RoutePrice, CLIENT_EDGE_DEFAULT_VERSION, CLIENT_EDGE_SUPPORTED_VERSIONS,
+    NodeSelfDescription, RoutePrice, VoucherSignerFact, CLIENT_EDGE_DEFAULT_VERSION,
+    CLIENT_EDGE_SUPPORTED_VERSIONS,
 };
 pub use packet::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 pub use price::Price;

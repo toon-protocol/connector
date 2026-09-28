@@ -241,10 +241,10 @@ impl PeerHttpState {
         .await
         .into_parts();
         self.report_refusal(refusal.as_ref());
-        // Only a `toon-channel` claim is judged below: a voucher that
-        // decided the role is not a `WireClaim`, and judging one on the peer
-        // wire is the receiving half's (#1378).
-        let carries_voucher = evidence.carries_voucher();
+        // A voucher is judged by the receiving half and a `toon-channel`
+        // claim by `ClaimBook`, below the role (ADR 0075 decision 6); one
+        // request never carries both (§1.5).
+        let voucher = evidence.voucher().cloned();
         let claim = evidence.into_channel_claim();
 
         // §1.10: on a dedicated peer listener a failure is refused outright
@@ -265,12 +265,23 @@ impl PeerHttpState {
         // replays its journal and the record does not, so the first priced
         // peer PREPARE after a restart was credited with its claim's whole
         // cumulative amount as new payment (issue #1104).
-        let prior_watermark = role
-            .peer_id()
-            .and(claim.as_ref())
-            .and_then(|claim| self.connector.peer_channel_watermark(&claim.channel_id));
-
-        let ack = self.judge_claim(&role, claim.as_ref());
+        let (ack, claimed, prior_watermark) =
+            match role_gate::judge_voucher(&role, self.vouchers.as_deref(), voucher.as_ref()).await
+            {
+                Some(judged) => (judged.ack, judged.claimed, judged.prior),
+                None => {
+                    let prior_watermark = role
+                        .peer_id()
+                        .and(claim.as_ref())
+                        .and_then(|claim| self.connector.peer_channel_watermark(&claim.channel_id));
+                    let ack = self.judge_claim(&role, claim.as_ref());
+                    (
+                        ack,
+                        claim.as_ref().map(|claim| claim.cumulative_amount),
+                        prior_watermark,
+                    )
+                }
+            };
 
         // FLUSH (§3): a POST with an **empty ILP body** plus the claim
         // header. The ack rides the response that already answers it -- HTTP
@@ -319,9 +330,9 @@ impl PeerHttpState {
             &peer_id,
             &prepare,
             ack,
-            claim.as_ref(),
+            claimed,
             prior_watermark,
-            role_gate::forwarded_enforcement(carries_voucher, self.enforcement.mode(&peer_id)),
+            self.enforcement.mode(&peer_id),
         ) {
             return self.finish(&role, payment_required_response(refusal), ack);
         }

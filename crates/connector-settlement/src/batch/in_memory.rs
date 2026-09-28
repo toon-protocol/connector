@@ -969,6 +969,26 @@ impl BatchSettlementPayer for InMemoryBatchSettlement {
         let signed = self.signed(channel)?;
         self.outbound_state_of(&self.chain.ledger(), channel, signed)
     }
+
+    /// A stand-in signature, as [`Self::sign_voucher`]'s is: this node's
+    /// byte, at the chain's signature length, with the expiry's low byte in
+    /// the last position so two expiries never sign alike. Nothing verifies
+    /// it; the fake holds only which channels this node opened.
+    async fn sign_claim_state_challenge(
+        &self,
+        channel: &ChannelId,
+        expires: u64,
+    ) -> Result<Vec<u8>, BatchSettlementError> {
+        self.signed(channel)?;
+        let mut signature = match self.chain.exit {
+            PayerExit::Withdrawal => vec![self.node; 65],
+            PayerExit::Close => vec![self.node; 64],
+        };
+        if let Some(last) = signature.last_mut() {
+            *last = expires.to_le_bytes()[0];
+        }
+        Ok(signature)
+    }
 }
 
 #[cfg(test)]

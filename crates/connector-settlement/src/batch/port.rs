@@ -962,6 +962,25 @@ pub trait BatchSettlementPayer: Send + Sync {
         &self,
         channel: &ChannelId,
     ) -> Result<OutboundChannelState, BatchSettlementError>;
+
+    /// Sign the voucher claim-state challenge for a channel this node
+    /// opened, valid until `expires` (unix seconds), with the key the chain
+    /// records as its voucher signer: EVM `ClaimStateChallenge(bytes32
+    /// channelId,uint256 expires)` under the `x402BatchSettlement` domain,
+    /// Solana Ed25519 over `"toon-voucher-claim-state-challenge-v1" ‖
+    /// channelAccount ‖ expires`.
+    ///
+    /// Two uses, one message (ADR 0075 decisions 5 and 6): asking the
+    /// receiver's `POST /ilp/claim-state` where this channel's watermark
+    /// stands, and proving the peer role on a packet that moves no value.
+    /// Never a voucher: the message is domain-separated from one, so it
+    /// moves nothing and advances no watermark. Refuses a channel this node
+    /// did not open ([`NotOutbound`](BatchSettlementError::NotOutbound)).
+    async fn sign_claim_state_challenge(
+        &self,
+        channel: &ChannelId,
+        expires: u64,
+    ) -> Result<Vec<u8>, BatchSettlementError>;
 }
 
 #[cfg(test)]

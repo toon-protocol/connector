@@ -26,18 +26,29 @@
 //!
 //! The `toon-channel` claim still proves the peer role too, verified against
 //! the counterparty key `[[peer_channels]]` configures
-//! ([`connector_runtime::ClaimBook`]): every peering in the tree still
-//! proves itself that way, and #1380 deletes it once the last one has moved.
+//! ([`connector_runtime::ClaimBook`]): config-declared peerings still prove
+//! themselves that way, and #1380 deletes it once the last one has moved.
+//!
+//! # Judging a peer's voucher (ADR 0075 decision 6, issue #1378)
+//!
+//! Once a voucher has decided the role, it is judged as payment by the same
+//! receiving half ([`VoucherEvidence::judge_peer_voucher`]): admitted by the
+//! rules a client's is, held to the channel's **one** amount watermark
+//! whichever role its vouchers arrive under (`peer-carriage-spec.md` §1.8),
+//! and journaled. Its verdict rides back in the `claim-ack` exactly as a
+//! `toon-channel` claim's does, and [`crate::price_gate`] measures coverage
+//! by the advance it made ([`judge_voucher`]).
 
 use async_trait::async_trait;
 use connector_btp::{BtpFrame, BTP_MESSAGE, CLAIM_PROTOCOL, PEER_CHALLENGE_PROTOCOL};
-use connector_config::ForwardedClaimEnforcement;
 use connector_domain::client_claim::ClientClaim;
+use connector_domain::{Watermark, VOUCHER_WATERMARK_NONCE};
+use connector_peer_auth::SessionRole;
 use connector_peer_auth::{
     decide_role, decide_voucher_role, ClaimVerification, PeerAuthPolicy, PresentedClaim,
     PresentedVoucher, RoleDecision, VoucherVerification,
 };
-use connector_runtime::{ClaimRejectReason, Connector, VoucherSigner, WireClaim};
+use connector_runtime::{ClaimAckOutcome, ClaimRejectReason, Connector, VoucherSigner, WireClaim};
 
 use crate::challenge_json::PeerRoleChallenge;
 use crate::claim_json::PresentedPeerClaim;
@@ -75,15 +86,32 @@ pub enum VoucherCheck {
     Unresolved,
 }
 
-/// The receiving half, as the role gate asks it (ADR 0075 decisions 3 and
-/// 5): resolve the x402 channel a voucher or a challenge names, read its
-/// voucher signer from what the backend admitted, and check the signature.
+/// What judging a peer's voucher as payment produced (ADR 0075 decision
+/// 6): the verdict the `claim-ack` carries, and the channel's watermark
+/// just before it -- what coverage is measured from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerVoucherVerdict {
+    pub ack: ClaimAckOutcome,
+    /// The channel's accepted cumulative amount before this voucher was
+    /// judged, zero for a channel nothing was accepted on yet.
+    pub prior: u64,
+}
+
+/// The receiving half, as the peer carriages ask it (ADR 0075 decisions 3,
+/// 5 and 6).
 ///
-/// **Nothing is admitted, advanced or journaled.** Like
-/// [`Connector::verify_peer_claim`] this is verification only: §1.5 fixes
-/// role before any watermark moves. `connector-client-edge`'s claim gate is
-/// the implementation, because it holds the batch-settlement backends and
-/// the journaled configs an EVM voucher without one is resolved from.
+/// For the **role** ([`Self::check_voucher`], [`Self::check_challenge`]):
+/// resolve the x402 channel a voucher or a challenge names, read its voucher
+/// signer from what the backend admitted, and check the signature. Nothing
+/// is admitted, advanced or journaled -- §1.5 fixes role before any
+/// watermark moves.
+///
+/// For the **payment**, downstream of a role already decided `peer`
+/// ([`Self::judge_peer_voucher`]): admit, advance and journal, by exactly
+/// the rules a client's voucher is judged by, against the channel's one
+/// watermark (§1.8). `connector-client-edge`'s claim gate is the
+/// implementation, because it holds the batch-settlement backends, the
+/// journaled configs, and that watermark.
 #[async_trait]
 pub trait VoucherEvidence: Send + Sync {
     /// A voucher (`ClientClaim::EvmVoucher` or `ClientClaim::SolanaVoucher`).
@@ -92,6 +120,46 @@ pub trait VoucherEvidence: Send + Sync {
     /// A peer-role challenge. Its `expires` is the role gate's to judge,
     /// not this method's.
     async fn check_challenge(&self, challenge: &PeerRoleChallenge) -> VoucherCheck;
+
+    /// Judge a voucher that proved the peer role as payment: accepted and
+    /// durably journaled, or refused naming why. A voucher the channel's
+    /// watermark already holds, resent byte-identically, is accepted and
+    /// advances nothing.
+    async fn judge_peer_voucher(&self, voucher: &ClientClaim) -> PeerVoucherVerdict;
+}
+
+/// What a frame paid, as judged below the role: the claim ack, the
+/// cumulative amount the judged evidence names, and the channel's
+/// watermark just before it -- the three figures
+/// [`crate::price_gate::payment_required`] measures coverage by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Judged {
+    pub ack: ClaimAckOutcome,
+    pub claimed: Option<u64>,
+    pub prior: Option<Watermark>,
+}
+
+/// Judge a peer frame's voucher as payment (ADR 0075 decision 6), or
+/// `None` when there is none to judge here: no voucher, a frame that is not
+/// a peer's (a client's voucher is the client edge's to judge, never this
+/// pipeline's, §1.7), or a carriage built without the receiving half.
+pub async fn judge_voucher(
+    role: &SessionRole,
+    vouchers: Option<&dyn VoucherEvidence>,
+    voucher: Option<&ClientClaim>,
+) -> Option<Judged> {
+    let (Some(_), Some(voucher), Some(vouchers)) = (role.peer_id(), voucher, vouchers) else {
+        return None;
+    };
+    let verdict = vouchers.judge_peer_voucher(voucher).await;
+    Some(Judged {
+        ack: verdict.ack,
+        claimed: Some(voucher.transferred_amount()),
+        prior: Some(Watermark {
+            nonce: VOUCHER_WATERMARK_NONCE,
+            cumulative_amount: verdict.prior,
+        }),
+    })
 }
 
 /// Everything one frame presents that could prove the peer role.
@@ -112,44 +180,25 @@ pub struct FrameEvidence {
 }
 
 impl FrameEvidence {
-    /// Whether the claim slot held a voucher.
+    /// The voucher, if that is what the claim slot held: judged below the
+    /// role by the receiving half ([`judge_voucher`]).
     #[must_use]
-    pub fn carries_voucher(&self) -> bool {
-        matches!(self.claim, Some(PresentedPeerClaim::Voucher(_)))
+    pub fn voucher(&self) -> Option<&ClientClaim> {
+        match &self.claim {
+            Some(PresentedPeerClaim::Voucher(voucher)) => Some(voucher),
+            Some(PresentedPeerClaim::Channel(_)) | None => None,
+        }
     }
 
     /// The `toon-channel` claim, if that is what the claim slot held: the
-    /// one kind of evidence `ClaimBook` judges below the role. A voucher
-    /// that decided the role is not a `WireClaim`, and judging one on the
-    /// peer wire is the receiving half's (#1378).
+    /// one kind of evidence `ClaimBook` judges below the role. A voucher is
+    /// judged by the receiving half instead ([`judge_voucher`]).
     #[must_use]
     pub fn into_channel_claim(self) -> Option<WireClaim> {
         match self.claim {
             Some(PresentedPeerClaim::Channel(claim)) => Some(claim),
             Some(PresentedPeerClaim::Voucher(_)) | None => None,
         }
-    }
-}
-
-/// The forwarded-claim enforcement a peer PREPARE is priced under.
-///
-/// A voucher can decide the peer role (ADR 0075 decision 5) before anything
-/// on the peer wire can judge one as payment (#1378): below the role only a
-/// `toon-channel` claim reaches `ClaimBook`. So a PREPARE whose covering
-/// evidence is a voucher is always priced under
-/// [`ForwardedClaimEnforcement::Enforce`], whatever the peering's own
-/// `claim_enforcement` says. Under the default `Observe` it would otherwise
-/// be forwarded covered by nothing, and a voucher that proves who is paying
-/// must never be what lets a packet ride for free.
-#[must_use]
-pub fn forwarded_enforcement(
-    carries_voucher: bool,
-    configured: ForwardedClaimEnforcement,
-) -> ForwardedClaimEnforcement {
-    if carries_voucher {
-        ForwardedClaimEnforcement::Enforce
-    } else {
-        configured
     }
 }
 
@@ -374,23 +423,6 @@ fn as_presented(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Until #1378 judges a peer's voucher, a voucher proves who pays and
-    /// buys nothing: a forward it covers is priced as if enforcement were
-    /// on, so the default `Observe` cannot carry it for free.
-    #[test]
-    fn a_voucher_covered_forward_is_always_enforced() {
-        for configured in [
-            ForwardedClaimEnforcement::Observe,
-            ForwardedClaimEnforcement::Enforce,
-        ] {
-            assert_eq!(
-                forwarded_enforcement(true, configured),
-                ForwardedClaimEnforcement::Enforce
-            );
-            assert_eq!(forwarded_enforcement(false, configured), configured);
-        }
-    }
 
     #[test]
     fn ambiguous_evidence_is_counted_across_both_slots() {

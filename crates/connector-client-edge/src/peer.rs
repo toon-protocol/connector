@@ -108,10 +108,15 @@ impl PeerCarriages {
     /// Build the carriages `expose` names over this node's configured
     /// peerings, resolving vouchers and peer-role challenges through
     /// `vouchers` (ADR 0075 decision 5), or `None` when there is no peer
-    /// handling to mount:
-    /// `peer_expose = "neither"` (the default, and the NAT'd operator's
-    /// case -- §2.1), or a node with no `[[peers]]` at all, on which every
-    /// interaction is a client and nothing can be otherwise.
+    /// handling to mount: `peer_expose = "neither"` (the default, and the
+    /// NAT'd operator's case -- §2.1).
+    ///
+    /// A node with no `[[peers]]` table still mounts them: a peering
+    /// established at runtime (`POST /peers`, ADR 0058) proves itself with a
+    /// voucher whose signer it binds then (ADR 0075 decision 4), and a
+    /// carriage built only for config peerings would never hear it. With no
+    /// peering of either kind every interaction still decides `client`, and
+    /// asks the receiving half nothing (`role_gate::decide_frame`).
     #[must_use]
     pub fn from_config(
         connector: Arc<Connector>,
@@ -120,7 +125,7 @@ impl PeerCarriages {
         expose: PeerExposure,
         vouchers: Option<Arc<dyn VoucherEvidence>>,
     ) -> Option<Arc<PeerCarriages>> {
-        if expose.is_empty() || peers.is_empty() {
+        if expose.is_empty() {
             return None;
         }
         let auth = Arc::new(PeerAuthPolicy::from_config(peers, peer_channels));

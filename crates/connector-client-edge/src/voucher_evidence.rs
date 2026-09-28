@@ -16,20 +16,30 @@
 //! the role exactly as it is found for a read, and metered the same way
 //! against the unresolvable-lookup budget (issue #613).
 //!
-//! # What it never does
+//! # What the role check never does
 //!
 //! Admit, advance or journal. Role is fixed before any watermark moves
 //! (`peer-carriage-spec.md` §1.5), so a voucher that proves the peer role
-//! here has not been accepted by anything; judging it is downstream of the
-//! role (#1378).
+//! here has not been accepted by anything.
+//!
+//! # Judging a peer's voucher, downstream of the role (#1378)
+//!
+//! [`VoucherEvidence::judge_peer_voucher`] is the one place that does admit
+//! one: through this gate's own voucher admission, with no price of its own
+//! (the peer carriages measure coverage themselves, `price_gate`), so a
+//! peer's voucher is held to exactly the rules, the watermark and the
+//! journal a client's is. That is `peer-carriage-spec.md` §1.8's
+//! requirement: a voucher channel keeps **one** watermark, whichever role
+//! its vouchers arrive under -- a peer bound after it paid as a client
+//! continues from where the channel stands, never from zero.
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use connector_domain::client_claim::ClientClaim;
 use connector_peer_btp::challenge_json::PeerRoleChallenge;
-use connector_peer_btp::role_gate::{VoucherCheck, VoucherEvidence};
-use connector_runtime::VoucherSigner;
+use connector_peer_btp::role_gate::{PeerVoucherVerdict, VoucherCheck, VoucherEvidence};
+use connector_runtime::{ClaimAckOutcome, ClaimRejectReason, VoucherSigner};
 use connector_signer::{
     evm_voucher_signer, verify_evm_voucher, verify_evm_voucher_claim_state_challenge,
     verify_solana_voucher, verify_solana_voucher_claim_state_challenge, BatchChannelConfig,
@@ -37,7 +47,30 @@ use connector_signer::{
 
 use crate::channels::{decode_base58_bytes, decode_hex_bytes};
 use crate::claim_gate::decode_evm_channel_config;
-use crate::ClientClaimGate;
+use crate::{ClaimIngestRejection, ClientClaimGate};
+
+/// A refused peer voucher's verdict, in the `claim-ack`'s one refusal
+/// taxonomy (`peer-carriage-spec.md` §6.1). A refusal that is this node's
+/// own and temporary -- the journal could not be written, the chain could
+/// not be asked -- is **not acknowledged** rather than refused, so the
+/// payer's voucher stays pending and its resend is judged afresh (§6.3).
+fn voucher_ack(rejection: &ClaimIngestRejection) -> ClaimAckOutcome {
+    match rejection {
+        ClaimIngestRejection::NotDurable
+        | ClaimIngestRejection::ChannelLookupFailed(_)
+        | ClaimIngestRejection::LookupBudgetExhausted { .. } => ClaimAckOutcome::NotSent,
+        ClaimIngestRejection::SignatureInvalid => {
+            ClaimAckOutcome::Rejected(ClaimRejectReason::SignatureInvalid)
+        }
+        ClaimIngestRejection::AmountNotAdvancing
+        | ClaimIngestRejection::NonceNotAdvancing
+        | ClaimIngestRejection::Underpayment { .. }
+        | ClaimIngestRejection::Undercollateralized { .. } => {
+            ClaimAckOutcome::Rejected(ClaimRejectReason::AmountNotAdvancing)
+        }
+        _ => ClaimAckOutcome::Rejected(ClaimRejectReason::UnknownChannel),
+    }
+}
 
 /// What an EVM channel's signature is checked over: a voucher's cumulative
 /// amount, or a challenge's expiry. Two messages under two typehashes, so a
@@ -194,6 +227,30 @@ impl VoucherEvidence for ClientClaimGate {
             // A `toon-channel` claim is `ClaimBook`'s to verify, never this.
             ClientClaim::Evm(_) | ClientClaim::Solana(_) => VoucherCheck::Unresolved,
         }
+    }
+
+    async fn judge_peer_voucher(&self, voucher: &ClientClaim) -> PeerVoucherVerdict {
+        let prior = self
+            .watermark(&voucher.channel_key())
+            .map_or(0, |watermark| watermark.cumulative_amount);
+        // No price: coverage is the peer carriage's to measure, from `prior`
+        // (`connector_peer_btp::price_gate`). The watermark, the collateral
+        // check and the journal are this gate's, exactly as for a client.
+        let ack = match self.admit_voucher(voucher.clone(), 0).await {
+            Ok((_, ticket)) => match ticket.durable().await {
+                Ok(()) => ClaimAckOutcome::Accepted,
+                Err(rejection) => voucher_ack(&rejection),
+            },
+            Err(rejection) => {
+                tracing::info!(
+                    channel = %voucher.channel_key(),
+                    reason = %rejection.message(),
+                    "a peer's voucher was not accepted"
+                );
+                voucher_ack(&rejection)
+            }
+        };
+        PeerVoucherVerdict { ack, prior }
     }
 
     async fn check_challenge(&self, challenge: &PeerRoleChallenge) -> VoucherCheck {

@@ -62,6 +62,7 @@ use connector_btp::{
     OutboundRequests, ProtocolData, SessionGone, BTP_ERROR, BTP_MESSAGE, BTP_RESPONSE,
     BTP_TRANSFER,
 };
+use connector_domain::client_claim::ClientClaim;
 use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 use connector_peer_auth::{
     claim_ack_to_emit, PeerAuthPolicy, PeerAuthRefusal, PeerAuthRefusalLog, SessionRole,
@@ -422,7 +423,7 @@ impl PeerSession {
         .await
         .into_parts();
         self.report_refusal(refusal.as_ref());
-        let carries_voucher = evidence.carries_voucher();
+        let voucher = evidence.voucher().cloned();
         let claim = evidence.into_channel_claim();
 
         // §1.10: on a dedicated peer listener a failure is refused
@@ -453,7 +454,7 @@ impl PeerSession {
                     frame.request_id,
                     &role,
                     claim,
-                    carries_voucher,
+                    voucher.as_ref(),
                     &frame.ilp_packet,
                 )
                 .await?;
@@ -529,9 +530,16 @@ impl PeerSession {
         request_id: u32,
         role: &SessionRole,
         claim: Option<WireClaim>,
-        carries_voucher: bool,
+        voucher: Option<&ClientClaim>,
         ilp_packet: &[u8],
     ) -> Result<(), SessionGone> {
+        // A peer's voucher (ADR 0075 decision 6): judged by the receiving
+        // half, against the channel's one watermark, inline and in arrival
+        // order like a claim (§7.1). A `toon-channel` claim takes the path
+        // below instead; one frame never carries both (§1.5).
+        let judged_voucher =
+            role_gate::judge_voucher(role, self.state.vouchers.as_deref(), voucher).await;
+
         // Peeked before `judge_claim` below may advance this channel's
         // watermark, so the price-coverage check further down judges the
         // claim's own advance past the watermark it rode in on, not the one
@@ -548,15 +556,25 @@ impl PeerSession {
         // The peer role gates the read (§1.5 does not read a client's
         // claim at all) and is no part of it: a channel's watermark is a
         // property of the channel, which is how `ClaimBook` keys it.
-        let prior_watermark = role.peer_id().and(claim.as_ref()).and_then(|claim| {
-            self.state
-                .connector
-                .peer_channel_watermark(&claim.channel_id)
-        });
-
-        // Claims are judged **inline, in arrival order** (§7.1) -- before
-        // the packet is even decoded, and before anything is spawned.
-        let ack = self.judge_claim(role, claim.as_ref());
+        let (ack, claimed, prior_watermark) = match judged_voucher {
+            Some(judged) => (judged.ack, judged.claimed, judged.prior),
+            None => {
+                let prior_watermark = role.peer_id().and(claim.as_ref()).and_then(|claim| {
+                    self.state
+                        .connector
+                        .peer_channel_watermark(&claim.channel_id)
+                });
+                // Claims are judged **inline, in arrival order** (§7.1) --
+                // before the packet is even decoded, and before anything is
+                // spawned.
+                let ack = self.judge_claim(role, claim.as_ref());
+                (
+                    ack,
+                    claim.as_ref().map(|claim| claim.cumulative_amount),
+                    prior_watermark,
+                )
+            }
+        };
 
         if ilp_packet.is_empty() {
             let entries: Vec<ProtocolData> = self.claim_ack_entry(role, ack).into_iter().collect();
@@ -611,12 +629,9 @@ impl PeerSession {
             &peer_id,
             &prepare,
             ack,
-            claim.as_ref(),
+            claimed,
             prior_watermark,
-            role_gate::forwarded_enforcement(
-                carries_voucher,
-                self.state.enforcement.mode(&peer_id),
-            ),
+            self.state.enforcement.mode(&peer_id),
         ) {
             return self
                 .send(self.payment_required_response(role, request_id, refusal, ack))

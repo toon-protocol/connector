@@ -48,7 +48,7 @@ use crate::peer_route_store::RuntimePeering;
 use connector_domain::x402::X402PaymentRequired;
 use connector_domain::{PacketResponse, Prepare, Reject, RejectCode};
 
-use crate::claim::{ClaimAckOutcome, WireClaim};
+use crate::claim::{ClaimAckOutcome, Covering, WireClaim};
 use crate::connector::Connector;
 
 /// What one forward to a peer produced.
@@ -134,11 +134,12 @@ impl PeerForward {
 
 /// Forwards a [`Prepare`] to the connector reachable at `peer_id` and
 /// returns whatever that peer answered, unchanged -- a reject originated at
-/// the far end reaches the caller exactly as that peer sent it. `claim`
-/// piggybacks whatever this connector currently owes `peer_id`
-/// (peer-semantics-pre-868.md §3.2), and is what bounds erosion across the
-/// path now that no declared floor rides beside the packet (ADR 0057,
-/// issue #1143).
+/// the far end reaches the caller exactly as that peer sent it. `covering`
+/// is what pays for the packet (ADR 0042): a `toon-channel` claim, an x402
+/// voucher, or -- for a packet that moves no value on an x402 peering --
+/// the peer-role challenge (ADR 0075 decision 5); see [`Covering`]. It is
+/// what bounds erosion across the path now that no declared floor rides
+/// beside the packet (ADR 0057, issue #1143).
 ///
 /// See [`PeerForward`] for what comes back, and in particular for why a
 /// carriage that read x402 terms off a refusal must report them rather than
@@ -149,7 +150,7 @@ pub trait PeerTransport: Send + Sync {
         &self,
         peer_id: &str,
         prepare: Prepare,
-        claim: Option<WireClaim>,
+        covering: Option<Covering>,
     ) -> PeerForward;
 
     /// Send `claim` with no packet to ride -- the flush mechanism
@@ -207,7 +208,7 @@ pub(crate) fn peer_unreachable(peer_id: &str) -> PacketResponse {
 enum PeerMessage {
     Prepare {
         prepare: Prepare,
-        claim: Option<WireClaim>,
+        claim: Option<Covering>,
         respond_to: oneshot::Sender<(PacketResponse, ClaimAckOutcome)>,
     },
     Flush {
@@ -254,6 +255,11 @@ impl PeerLink {
                         // has no crossing to miss, and a dealing node is
                         // reached over a real carriage that does
                         // authenticate the peer (issue #1295).
+                        // A voucher or a challenge reaches no judge here:
+                        // this stand-in has no receiving half, which lives
+                        // in the client edge above the port. Only a
+                        // `toon-channel` claim is judged in process.
+                        let claim = claim.and_then(Covering::into_claim);
                         let result = connector.handle_peer_prepare(None, prepare, claim).await;
                         let _ = respond_to.send(result);
                     }
@@ -271,7 +277,7 @@ impl PeerLink {
         &self,
         peer_id: &str,
         prepare: Prepare,
-        claim: Option<WireClaim>,
+        claim: Option<Covering>,
     ) -> PeerForward {
         let (respond_to, receiver) = oneshot::channel();
         if self
@@ -339,7 +345,7 @@ impl PeerTransport for InProcessPeerTransport {
         &self,
         peer_id: &str,
         prepare: Prepare,
-        claim: Option<WireClaim>,
+        claim: Option<Covering>,
     ) -> PeerForward {
         match self.peers.get(peer_id) {
             Some(link) => link.forward(peer_id, prepare, claim).await,
@@ -527,7 +533,7 @@ mod tests {
         let claim = sign_wire_claim(&signer, 1, 1, 50);
 
         let PeerForward { response, ack, .. } = transport
-            .forward("peer-b", prepare("g.nowhere"), Some(claim))
+            .forward("peer-b", prepare("g.nowhere"), Some(claim.into()))
             .await;
 
         // The claim is judged independently of the packet: no route exists

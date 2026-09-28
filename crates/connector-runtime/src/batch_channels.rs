@@ -573,6 +573,73 @@ impl OutboundChannels {
         Ok(voucher)
     }
 
+    /// Sign the voucher claim-state challenge for an outbound channel,
+    /// valid until `expires` (ADR 0075 decisions 5 and 6): what this node
+    /// asks the receiver's `POST /ilp/claim-state` with, and what proves the
+    /// peer role on a packet that moves no value. Nothing is journaled: a
+    /// challenge moves no value and advances no watermark.
+    pub async fn sign_challenge(
+        &self,
+        id: &str,
+        expires: u64,
+    ) -> Result<Vec<u8>, BatchChannelError> {
+        let (channel, payer) = self.ready(id).await?;
+        Ok(payer.sign_claim_state_challenge(&channel, expires).await?)
+    }
+
+    /// An open outbound channel on `chain` toward `receiver` (its raw
+    /// address or key), if this node has one: "is there a live channel with
+    /// this peer?" as a lookup of this node's own channels rather than a
+    /// derivation (ADR 0075 decision 4). Several are legal; the one with the
+    /// highest signed watermark answers, so a repeat finds the channel the
+    /// peering has been paying on.
+    pub fn open_toward(&self, chain: SettlementChain, receiver: &[u8]) -> Option<String> {
+        self.channels()
+            .iter()
+            .filter(|(_, tracked)| {
+                tracked.chain == chain && tracked.opened && tracked.record.receiver() == receiver
+            })
+            .max_by_key(|(_, tracked)| tracked.signed)
+            .map(|(id, _)| id.clone())
+    }
+
+    /// The highest amount this node has signed a voucher for on `id`, or
+    /// `None` for a channel it does not hold.
+    pub fn signed(&self, id: &str) -> Option<u128> {
+        self.channels()
+            .get(&canonical_id(id))
+            .map(|tracked| tracked.signed)
+    }
+
+    /// Raise an outbound channel's signed watermark to `amount`, where the
+    /// receiver reports holding a voucher that high (ADR 0075 decision 6:
+    /// the receiver's `POST /ilp/claim-state` is the watermark authority on
+    /// restore). A node that lost its journal would otherwise sign a voucher
+    /// that fails to advance; one that did not already stands at least this
+    /// high, and nothing changes.
+    ///
+    /// Journaled as a signed voucher before it is believed, because it is
+    /// one: the receiver holds a voucher at `amount` only if this node's key
+    /// signed it.
+    pub async fn raise_watermark(&self, id: &str, amount: u128) -> Result<u128, BatchChannelError> {
+        let id = canonical_id(id);
+        let tracked = self.tracked(&id)?;
+        if amount <= tracked.signed {
+            return Ok(tracked.signed);
+        }
+        let payer = Arc::clone(self.payer(tracked.chain)?);
+        self.append(JournalEntry::OutboundVoucherSigned {
+            channel_id: journal_key(tracked.chain, tracked.record.channel()),
+            cumulative_amount: amount,
+        })?;
+        payer.restore_outbound(&tracked.record, amount).await?;
+        if let Some(tracked) = self.channels().get_mut(&id) {
+            tracked.signed = tracked.signed.max(amount);
+            tracked.restored = true;
+        }
+        Ok(amount)
+    }
+
     /// The channel as its receiver is shown it -- on EVM with the config its
     /// first voucher carries.
     pub fn presentation(&self, id: &str) -> Option<ChannelPresentation> {

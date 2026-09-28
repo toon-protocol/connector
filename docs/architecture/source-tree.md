@@ -150,6 +150,10 @@ connector-runtime                the packet plane and its ports
   ├─ peering.rs, self_description.rs  establishing a peering from a URL (ADR 0058) by
   │                               reading the other node's self-description (ADR 0050)
   ├─ outbound_client.rs          paying a next hop as an ordinary client of it
+  ├─ batch_channels.rs           the x402 channels this node pays on, journaled (ADR 0075)
+  ├─ outbound_voucher.rs         a voucher or peer-role challenge on this node's own
+  │                               x402 channel, and the next hop's claim-state asked
+  │                               where it stands (ADR 0075 decisions 5 and 6)
   ├─ attribution.rs              what a terminating connector tells the app about the
   │                               payment (ADR 0040)
   ├─ rate_table.rs, rate_poller.rs  the handle a converting forward reads its rate off,

@@ -22,10 +22,11 @@
 //! `POST /channels/:id/land` (land the latest voucher held on an inbound
 //! channel now) -- are this crate's write endpoints, beside the peering and
 //! route writes. The `toon-channel` writes `redeem`, `redeem-latest`,
-//! `close`, `settle` and `cooperative-close` are deleted, and so is the EVM
-//! `toon-channel` open. `POST /channels` still opens a Solana `toon-channel`
-//! for `local/keys.sh` until #1383, and `/fund` still funds a `toon-channel`
-//! on either chain -- on EVM for a `POST /peers` peering, until #1378.
+//! `close`, `settle` and `cooperative-close` are deleted, and so are the
+//! EVM `toon-channel` open and top-up (#1376, #1378): an EVM peering opens
+//! and funds its outbound x402 channel through `POST /peers` itself. `POST
+//! /channels` and `/fund` still serve a Solana `toon-channel` for
+//! `local/keys.sh` until #1383.
 //! Every one calls
 //! [`write_auth::authenticate_write`] first and nothing else in this
 //! crate accepts a body, so a write cannot reach [`Connector`] without a
@@ -597,7 +598,8 @@ fn peer_route_table_error_response(error: PeerRouteTableError) -> Response {
 /// { "id": "apex-relay-2",
 ///   "url": "https://relay.example/ilp",
 ///   "fee": 100,
-///   "max_packet_amount": 5000 }
+///   "max_packet_amount": 5000,
+///   "deposit": 100000 }
 /// ```
 ///
 /// * `url` is the counterparty's connector URL. The node `GET`s the
@@ -627,6 +629,12 @@ fn peer_route_table_error_response(error: PeerRouteTableError) -> Response {
 ///   settling on more than one chain in common. Left out, a single shared
 ///   chain is used and several are refused by name rather than resolved
 ///   silently, the same posture `POST /channels` takes.
+/// * `deposit` is what an EVM peering's outbound x402 channel is opened
+///   with, in base units of the shared token (ADR 0075 decision 4): this
+///   node opens and funds its own channel toward the counterparty and
+///   nothing else. Required only when this node has no open channel toward
+///   it yet -- a repeat finds that channel and spends nothing; top it up
+///   with `POST /channels/:id/fund`.
 ///
 /// `fee` and `max_packet_amount` are the operator's policy about this
 /// counterparty, and are in this request precisely because no document can
@@ -641,6 +649,8 @@ struct UpsertPeerRequest {
     max_packet_amount: u64,
     #[serde(default)]
     chain: Option<String>,
+    #[serde(default)]
+    deposit: Option<u128>,
 }
 
 /// Appended to the `502` when the URL that failed to answer a
@@ -674,12 +684,20 @@ fn establish_peering_error_response(error: EstablishPeeringError) -> Response {
         | EstablishPeeringError::NoDialableEndpoint { .. }
         | EstablishPeeringError::NoDialableClientEdge { .. }
         | EstablishPeeringError::NoSharedChain { .. }
-        | EstablishPeeringError::UnreadableSettlementAddress { .. } => {
+        | EstablishPeeringError::UnreadableSettlementAddress { .. }
+        | EstablishPeeringError::NetworkMismatch { .. }
+        | EstablishPeeringError::NoVoucherSigner { .. }
+        | EstablishPeeringError::InvalidTerms { .. } => {
             (StatusCode::BAD_GATEWAY, error.to_string()).into_response()
         }
-        EstablishPeeringError::AmbiguousChain { .. } => {
+        EstablishPeeringError::AmbiguousChain { .. }
+        | EstablishPeeringError::DepositRequired { .. } => {
             (StatusCode::BAD_REQUEST, error.to_string()).into_response()
         }
+        EstablishPeeringError::Binding(_) => {
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
+        EstablishPeeringError::Outbound(error) => batch_channel_error_response(error),
         EstablishPeeringError::Channel(error) => channel_operation_error_response(error),
         EstablishPeeringError::Table(error) => peer_route_table_error_response(error),
     }
@@ -690,11 +708,13 @@ fn establish_peering_error_response(error: EstablishPeeringError) -> Response {
 /// nothing else in this handler accepts the request until that succeeds.
 /// No bearer token reaches it: establishing a peering moves value.
 ///
-/// **This endpoint can spend gas.** It may open a payment channel and wait
-/// for it to confirm, so it is deliberately safe to retry: repeating the
-/// same request against a peering already established finds the same
-/// channel and is a success, not a second channel (ADR 0059's derivation
-/// makes that structural). The answer says which branch it took --
+/// **This endpoint can spend gas.** It may open and fund this node's own
+/// outbound channel and wait for it to confirm, so it is deliberately safe
+/// to retry: repeating the same request against a peering already
+/// established finds this node's open channel toward the counterparty and
+/// is a success, not a second channel (ADR 0075 decision 4; an open
+/// journaled but unconfirmed is resumed). The answer says which branch it
+/// took --
 /// `channel: { id, status: "found" | "created" }` -- so an unintended
 /// second channel is visible in the operator's own output rather than
 /// discovered later on a block explorer.
@@ -737,6 +757,7 @@ async fn upsert_peer(
             request.fee,
             request.max_packet_amount,
             chain,
+            request.deposit,
         )
         .await
     {
@@ -880,6 +901,12 @@ struct FundChannelRequest {
     #[serde(default)]
     total: Option<u128>,
 }
+
+/// The refusal a top-up of an EVM `toon-channel` gets (ADR 0075, #1378).
+const EVM_TOON_CHANNEL_NOT_FUNDED: &str =
+    "EVM toon-channel channels are no longer funded here (ADR 0075, #1378): an EVM peering pays \
+     over its own outbound x402 channel, which POST /peers opens and funds -- top that one up \
+     instead";
 
 /// The refusal a request for the retired EVM `toon-channel` writes gets.
 const EVM_TOON_CHANNEL_RETIRED: &str =
@@ -1078,10 +1105,10 @@ async fn open_outbound_channel(state: &OperatorState, body: &Bytes) -> Response 
 
 /// `POST /channels/:id/fund`: top up a channel this node pays on, by an
 /// increment (ADR 0075 decision 11). An outbound x402 channel takes
-/// `{"amount": n}`. A `toon-channel` takes either form: on Solana
-/// `local/keys.sh` funds through it until #1383, and on EVM a `POST /peers`
-/// peering, whose channel that write opens, is collateralised through it
-/// until #1378 moves the peering to x402.
+/// `{"amount": n}`. A Solana `toon-channel` takes either form, because
+/// `local/keys.sh` funds through it until #1383. An EVM `toon-channel` is
+/// refused by name (#1378): an EVM peering pays over its own x402 channel,
+/// which `POST /peers` opens and funds.
 async fn fund_channel(
     State(state): State<OperatorState>,
     Path(channel_id): Path<String>,
@@ -1117,6 +1144,9 @@ async fn fund_channel(
         };
     }
 
+    if state.connector.toon_channel_chain(&channel_id) == Some(SettlementChain::Evm) {
+        return (StatusCode::BAD_REQUEST, EVM_TOON_CHANNEL_NOT_FUNDED).into_response();
+    }
     let result =
         match (request.amount, request.total) {
             (Some(amount), None) => state.connector.fund_channel(&channel_id, amount).await,
@@ -2401,9 +2431,13 @@ mod tests {
     mod runtime_peer_route_writes {
         use super::*;
         use crate::rfc9421::sign_request;
-        use connector_domain::x402::{X402ChainSettlementTerms, X402SettlementTerms};
-        use connector_domain::{EdgeIdentity, NodeFacts, NodeSelfDescription};
-        use connector_runtime::{BoundedHttpSelfDescription, PeerRouteView};
+        use connector_domain::x402::{X402BatchSettlementEvmTerms, X402BatchSettlementTerms};
+        use connector_domain::{EdgeIdentity, NodeFacts, NodeSelfDescription, VoucherSignerFact};
+        use connector_runtime::{BoundedHttpSelfDescription, OutboundChannels, PeerRouteView};
+        use connector_settlement::batch::{
+            BatchSettlementPayer, InMemoryBatchChain, InMemoryBatchSettlement, PayerExit,
+            ReceiverTerms,
+        };
         use connector_settlement::InMemorySettlementBackend;
         use ed25519_dalek::Keypair;
         use rand::rngs::OsRng;
@@ -2422,22 +2456,42 @@ mod tests {
         /// is the behaviour under test. A fake handing back a value would
         /// skip the fetch, which is the half that is new.
         fn serve_self_description(settlement_address: &str) -> SocketAddr {
+            // The fake chain's settled token: what the counterparty's x402
+            // terms must name for this node's paying half to open on them.
+            let ReceiverTerms::Evm(fake) =
+                InMemoryBatchSettlement::new(PayerExit::Withdrawal, 0).published_terms()
+            else {
+                unreachable!("an EVM-shaped fake publishes EVM terms");
+            };
+            let token = format!(
+                "0x{}",
+                fake.token
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
             let document = NodeSelfDescription::describe(
                 &NodeFacts {
                     ilp_addresses: vec!["g.example.counterparty".to_string()],
                     http_endpoint: Some("http://counterparty.example/ilp".to_string()),
                     btp_endpoint: None,
                     peer_carriages: vec!["http".to_string()],
-                    settlements: vec![X402ChainSettlementTerms::Evm(X402SettlementTerms {
-                        chain: "evm:31337".to_string(),
-                        settlement_address: settlement_address.to_string(),
-                        token_network_registry: "0x00000000000000000000000000000000000000cc"
-                            .to_string(),
-                        token_network: "0x00000000000000000000000000000000000000bb".to_string(),
-                        token_address: "0x00000000000000000000000000000000000000dd".to_string(),
-                        decimals: 6,
-                    })],
-                    batch_settlements: Vec::new(),
+                    settlements: Vec::new(),
+                    batch_settlements: vec![X402BatchSettlementTerms::Evm(
+                        X402BatchSettlementEvmTerms {
+                            network: NETWORK.to_string(),
+                            asset: token,
+                            pay_to: settlement_address.to_string(),
+                            receiver_authorizer: settlement_address.to_string(),
+                            min_withdraw_delay_secs: 86_400,
+                            name: "USDC".to_string(),
+                            version: "2".to_string(),
+                        },
+                    )],
+                    voucher_signers: vec![VoucherSignerFact {
+                        network: NETWORK.to_string(),
+                        signer: settlement_address.to_string(),
+                    }],
                 },
                 Some(EdgeIdentity {
                     key_id: "counterparty-key".to_string(),
@@ -2468,20 +2522,42 @@ mod tests {
         /// address of the chain in question.
         const COUNTERPARTY_SETTLEMENT: &str = "0x00000000000000000000000000000000000000aa";
 
+        /// The CAIP-2 network both nodes' x402 terms name.
+        const NETWORK: &str = "eip155:31337";
+
         /// A `POST /peers` body: the operator's label, the counterparty's
-        /// URL, and the operator's own policy about them.
+        /// URL, and the operator's own policy about them -- with the
+        /// deposit this node's own outbound channel is opened with (ADR
+        /// 0075 decision 4).
         fn peer_body(id: &str, addr: SocketAddr, fee: u64) -> Vec<u8> {
             serde_json::to_vec(&serde_json::json!({
                 "id": id,
                 "url": format!("http://{addr}/ilp"),
                 "fee": fee,
+                "deposit": 1_000,
             }))
             .unwrap()
         }
 
-        fn router_with(write_keys: Vec<[u8; 32]>) -> Router {
+        async fn router_with(write_keys: Vec<[u8; 32]>) -> Router {
             let app_client = Arc::new(FakeAppClient::new());
             let clock = Arc::new(TestClock::new(chrono::Utc::now()));
+            // This node's paying half, over the settlement port's in-memory
+            // fake -- the fake that passes the paying contract suite, so
+            // the open these tests drive is the one a chain-backed payer
+            // takes (ADR 0007).
+            let payer = Arc::new(InMemoryBatchSettlement::on(
+                InMemoryBatchChain::new(PayerExit::Withdrawal),
+                0x01,
+                86_400,
+            ));
+            payer.fund(10_000);
+            let outbound = OutboundChannels::restore(
+                Arc::new(connector_runtime::InMemoryJournal::new()),
+                vec![(SettlementChain::Evm, payer as Arc<dyn BatchSettlementPayer>)],
+            )
+            .await
+            .expect("an empty journal replays");
             let connector = Arc::new(
                 Connector::new(
                     vec![],
@@ -2490,24 +2566,12 @@ mod tests {
                     Arc::new(InProcessPeerTransport::new()),
                     clock,
                 )
-                // The in-memory backend is the first implementation to
-                // pass the settlement port's contract suite, `live_channel_with`
-                // included -- so the derive-or-open branch these tests
-                // drive is the same one a chain-backed backend takes.
-                .with_settlement(
-                    SettlementChain::Evm,
-                    Arc::new(InMemorySettlementBackend::new()),
+                // ADR 0075 decision 4: an EVM peering opens this node's own
+                // outbound x402 channel, on these channels.
+                .with_outbound_channels(
+                    Arc::new(outbound),
+                    vec![(SettlementChain::Evm, NETWORK.to_string())],
                 )
-                // Issue #1217: the settlement key `establish_peering` signs
-                // this node's outbound CLIENT-role claims with, the same key
-                // a real node's `[settlement.evm.key]` supplies. Without
-                // one, `POST /peers` still writes the peering row but
-                // registers no payable hop for it -- a node with no
-                // settlement signer cannot pay a client-role claim on any
-                // chain, matching how it cannot open a channel on one
-                // either -- and every route write below would be refused
-                // `PeerHasNoPayChannel`.
-                .with_signer(Arc::new(LocalSigner::generate("node-settlement")))
                 // Loopback is `http://`, so these tests are a node that
                 // opted into plaintext peer endpoints -- the same opt-in
                 // every `local/` topology takes for the same reason.
@@ -2577,13 +2641,11 @@ mod tests {
         /// ADR 0075, #1376: the EVM `toon-channel` branch of `POST /channels`
         /// is deleted, and refused by name rather than served -- and a
         /// `toon-channel` open that names no chain is refused too, since the
-        /// one it could mean is no longer a choice. (`/fund` keeps its EVM
-        /// branch: an EVM `POST /peers` peering is collateralised through it
-        /// until #1378 moves the peering to x402.)
+        /// one it could mean is no longer a choice.
         #[tokio::test]
         async fn the_evm_toon_channel_open_is_refused_by_name() {
             let keypair = keypair();
-            let app = router_with(vec![keypair.public.to_bytes()]);
+            let app = router_with(vec![keypair.public.to_bytes()]).await;
             for body in [
                 serde_json::json!({
                     "counterparty_hex": COUNTERPARTY_SETTLEMENT,
@@ -2608,6 +2670,66 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::BAD_REQUEST);
                 let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
                 assert!(String::from_utf8_lossy(&body).contains("toon-channel"));
+            }
+        }
+
+        /// ADR 0075, #1378: an EVM `toon-channel` is no longer topped up
+        /// here -- an EVM peering pays over its own x402 channel, which
+        /// `POST /peers` opens and funds -- and the refusal says so by name
+        /// rather than reaching the backend. Both forms are refused.
+        #[tokio::test]
+        async fn an_evm_toon_channel_top_up_is_refused_by_name() {
+            let keypair = keypair();
+            let connector = Arc::new(
+                Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(TestClock::new(chrono::Utc::now())),
+                )
+                .with_settlement(
+                    SettlementChain::Evm,
+                    Arc::new(InMemorySettlementBackend::new()),
+                ),
+            );
+            let app = router(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                vec![keypair.public.to_bytes()],
+                None,
+            );
+            let path = format!("/channels/0x{}/fund", "ab".repeat(32));
+            for (created, body) in [
+                (1_000, serde_json::json!({ "amount": 500 })),
+                (1_001, serde_json::json!({ "total": 500 })),
+            ] {
+                let body = serde_json::to_vec(&body).unwrap();
+                let (sig_input, sig, digest) =
+                    sign_request(&keypair, "POST", &path, &body, created, Some(9_999_999_999));
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(&path)
+                            .header("signature-input", sig_input)
+                            .header("signature", sig)
+                            .header("content-digest", digest)
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("no longer funded here"),
+                    "{}",
+                    String::from_utf8_lossy(&body)
+                );
             }
         }
 
@@ -2688,7 +2810,7 @@ mod tests {
 
         #[tokio::test]
         async fn upserting_a_peer_requires_a_valid_write_signature() {
-            let app = router_with(vec![]);
+            let app = router_with(vec![]).await;
             let addr = serve_self_description(COUNTERPARTY_SETTLEMENT);
 
             let response = app
@@ -2705,7 +2827,7 @@ mod tests {
         #[tokio::test]
         async fn a_validly_signed_write_creates_a_peer_visible_over_the_read_surface() {
             let keypair = keypair();
-            let app = router_with(vec![keypair.public.to_bytes()]);
+            let app = router_with(vec![keypair.public.to_bytes()]).await;
             let addr = serve_self_description(COUNTERPARTY_SETTLEMENT);
 
             let write_response = app
@@ -2725,8 +2847,8 @@ mod tests {
             let established: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(established["id"], "runtime-hop");
             assert_eq!(established["source"], "runtime");
-            // The answer says which branch the derive-or-open took, so an
-            // unintended second channel is visible here (ADR 0058).
+            // The answer says which branch the find-or-open took, so an
+            // unintended second channel is visible here (ADR 0058, ADR 0075).
             assert_eq!(established["channel"]["status"], "created");
             assert_eq!(established["channel"]["chain"], "evm");
             let created: PeerView = serde_json::from_value(established).unwrap();
@@ -2743,7 +2865,7 @@ mod tests {
         #[tokio::test]
         async fn a_validly_signed_write_creates_a_peer_route_visible_over_the_read_surface() {
             let keypair = keypair();
-            let app = router_with(vec![keypair.public.to_bytes()]);
+            let app = router_with(vec![keypair.public.to_bytes()]).await;
             let addr = serve_self_description(COUNTERPARTY_SETTLEMENT);
             app.clone()
                 .oneshot(signed(
@@ -2791,7 +2913,7 @@ mod tests {
         #[tokio::test]
         async fn a_peer_route_naming_an_unknown_peer_id_is_a_bad_request() {
             let keypair = keypair();
-            let app = router_with(vec![keypair.public.to_bytes()]);
+            let app = router_with(vec![keypair.public.to_bytes()]).await;
             let body = serde_json::to_vec(&serde_json::json!({
                 "prefix": "g.example.runtime",
                 "peer_id": "nobody",
@@ -2811,7 +2933,7 @@ mod tests {
         #[tokio::test]
         async fn a_validly_signed_delete_removes_a_peer() {
             let keypair = keypair();
-            let app = router_with(vec![keypair.public.to_bytes()]);
+            let app = router_with(vec![keypair.public.to_bytes()]).await;
             let addr = serve_self_description(COUNTERPARTY_SETTLEMENT);
             app.clone()
                 .oneshot(signed(
@@ -2840,7 +2962,7 @@ mod tests {
 
         #[tokio::test]
         async fn deleting_a_peer_requires_a_valid_write_signature() {
-            let app = router_with(vec![]);
+            let app = router_with(vec![]).await;
 
             let response = app
                 .oneshot(unsigned("DELETE", "/peers/runtime-hop", Vec::new()))
@@ -2855,7 +2977,7 @@ mod tests {
         #[tokio::test]
         async fn a_validly_signed_delete_removes_a_peer_route() {
             let keypair = keypair();
-            let app = router_with(vec![keypair.public.to_bytes()]);
+            let app = router_with(vec![keypair.public.to_bytes()]).await;
             let addr = serve_self_description(COUNTERPARTY_SETTLEMENT);
             app.clone()
                 .oneshot(signed(
@@ -2903,7 +3025,7 @@ mod tests {
         #[tokio::test]
         async fn deleting_a_peer_still_referenced_by_a_route_is_a_conflict() {
             let keypair = keypair();
-            let app = router_with(vec![keypair.public.to_bytes()]);
+            let app = router_with(vec![keypair.public.to_bytes()]).await;
             let addr = serve_self_description(COUNTERPARTY_SETTLEMENT);
             app.clone()
                 .oneshot(signed(

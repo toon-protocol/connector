@@ -242,6 +242,7 @@ Update states what changes when they do.
 channel, or a challenge (expiring within 300 seconds) for a zero-value packet, now decides `peer` on
 both carriages (`connector_peer_btp::role_gate::decide_frame`, `connector_peer_auth::decide_voucher_role`),
 and binding a voucher signer to a peering is a runtime operation (`Connector::bind_voucher_signer`).
-The `toon-channel` proof stays until #1380 moves the last peering off it, and no node binds a signer
-until #1378 (the self-description's key) or #1380 (a config row) supplies one.
+The `toon-channel` proof stays until #1380 moves the last peering off it. #1378 supplies the first
+source of a binding: `POST /peers` on EVM binds the key the peer's self-description publishes, and a
+restart rebinds it from the durable row; #1380 adds a config row's.
 `peer-carriage-spec.md` §1.2 states both proofs.

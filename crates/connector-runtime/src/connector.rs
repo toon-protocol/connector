@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use arc_swap::ArcSwap;
@@ -28,8 +29,9 @@ use url::Url;
 
 use crate::app_client::{AppClient, AppOutcome};
 use crate::attribution::{apply_payment_attribution, PaymentAttribution};
+use crate::batch_channels::OutboundChannels;
 use crate::claim::{
-    ChannelDomain, ClaimAckOutcome, ClaimBook, ClaimRejectReason, InvalidChannelId,
+    ChannelDomain, ClaimAckOutcome, ClaimBook, ClaimRejectReason, Covering, InvalidChannelId,
     InvalidSolanaChannel, WireClaim,
 };
 use crate::clock::Clock;
@@ -41,6 +43,9 @@ use crate::operator_view::{
 use crate::outbound_client::{
     ClaimStateChallengeSigner, ClaimStateSource, EvmDomain, OutboundClaimBinding,
     OutboundClientLedger, OwnedHttpClaimState, SolanaDomain,
+};
+use crate::outbound_voucher::{
+    challenge_entry, voucher_json, HttpVoucherState, VoucherStateSource, PEER_CHALLENGE_TTL_SECS,
 };
 use crate::peer_route_store::{
     PeerRouteStore, PeerRouteStoreError, RuntimePeerChannel, RuntimePeering, RuntimePeers,
@@ -557,6 +562,25 @@ pub struct Connector {
     /// before this, which is exactly why a runtime peering could accept but
     /// never pay.
     outbound_client_hops: ArcSwap<HashMap<String, OutboundClientHop>>,
+    /// The next hops this node pays over its **own outbound x402 channel**
+    /// (ADR 0075 decisions 4 and 6), keyed by peer id: a runtime EVM
+    /// peering established by `POST /peers` since #1378. Checked before
+    /// `outbound_client_hops` on every forward, and never both for one
+    /// peer: a peering is either on x402 or on a `toon-channel`.
+    ///
+    /// Copy-on-write for the reason `outbound_client_hops` is: an operator
+    /// write registers and removes one while the packet path reads it.
+    outbound_voucher_hops: ArcSwap<HashMap<String, VoucherHop>>,
+    /// The x402 channels this node pays on (ADR 0075 decisions 8 and 11):
+    /// what `POST /peers` opens a peering's outbound channel through, and
+    /// what every voucher a forward carries is signed and journaled
+    /// through. `None` on a node with no x402 backend, which then peers on
+    /// EVM with nobody.
+    outbound_channels: Option<Arc<OutboundChannels>>,
+    /// This node's own CAIP-2 network on each chain it pays x402 on, as its
+    /// greeting publishes it: a counterparty's terms must name the same one
+    /// before this node opens a channel on them.
+    x402_networks: Vec<(SettlementChain, String)>,
     /// Peer ids this node's config file names (`[[peers]]`), threaded in
     /// via [`Connector::with_config_peer_ids`) purely as a reservation
     /// list (issue #884): the routing table IS the relationship set
@@ -786,6 +810,25 @@ struct OutboundClientHop {
     domain: OutboundClientDomain,
 }
 
+/// One next hop this connector pays over its own outbound x402 channel
+/// (ADR 0075 decisions 4 and 6): a runtime EVM peering.
+#[derive(Clone)]
+struct VoucherHop {
+    /// This node's outbound channel toward the hop, as
+    /// [`OutboundChannels`] keys it.
+    channel_id: String,
+    /// The hop's own `POST /ilp/claim-state`: the watermark authority on
+    /// restore (decision 6).
+    claim_state: Arc<dyn VoucherStateSource>,
+    /// Whether this process has asked `claim_state` where the channel
+    /// stands since it last had cause to -- once per process, and again
+    /// after a voucher the hop did not accept.
+    synced: Arc<AtomicBool>,
+    /// Serialises reading the signed watermark and signing above it, so two
+    /// concurrent forwards never both sign the same next amount.
+    signing: Arc<tokio::sync::Mutex<()>>,
+}
+
 /// [`Connector`]'s default probe rate limit absent
 /// [`Connector::with_probe_rate_limit`] -- a deliberately conservative
 /// figure (issue #426): probing costs a sender nothing, so the safe default
@@ -797,6 +840,20 @@ const DEFAULT_PROBE_LIMIT: u32 = 60;
 /// `bytes` as lower-case hex, no `0x`.
 fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The `senderId` a voucher this node signs carries: its own voucher signer
+/// in the chain's spelling -- a label, as every `senderId` is, since the
+/// receiver reads the signer from the chain. On EVM the channel's
+/// `payerAuthorizer`, which is this node's settlement address (ADR 0075
+/// decision 3).
+fn voucher_sender(presentation: &connector_settlement::batch::ChannelPresentation) -> String {
+    match presentation {
+        connector_settlement::batch::ChannelPresentation::Evm { config, .. } => {
+            format!("0x{}", hex_lower(&config.payer_authorizer))
+        }
+        connector_settlement::batch::ChannelPresentation::Solana { channel } => channel.0.clone(),
+    }
 }
 
 fn default_probe_window() -> Duration {
@@ -830,6 +887,9 @@ impl Connector {
             recognized_channels: RwLock::new(HashSet::new()),
             outbound_client: None,
             outbound_client_hops: ArcSwap::from_pointee(HashMap::new()),
+            outbound_voucher_hops: ArcSwap::from_pointee(HashMap::new()),
+            outbound_channels: None,
+            x402_networks: Vec::new(),
             config_peer_ids: HashSet::new(),
             runtime_peers: ArcSwap::from_pointee(RuntimePeers::new()),
             voucher_bindings: VoucherSignerBindings::new(),
@@ -911,9 +971,18 @@ impl Connector {
         wanted: Option<SettlementChain>,
         url: &url::Url,
     ) -> Result<crate::peering::SharedSettlement, crate::peering::EstablishPeeringError> {
+        // EVM peers over x402 only (ADR 0075 decision 4): a node with no
+        // x402 channels to pay on shares no EVM with anybody. Solana still
+        // peers over its `toon-channel` backend, until #1379.
         crate::peering::shared_settlement_of(
             document,
-            |chain| self.settlement_on(chain).is_ok(),
+            |chain| match chain {
+                SettlementChain::Evm => {
+                    self.outbound_channels.is_some()
+                        && self.x402_network(SettlementChain::Evm).is_some()
+                }
+                SettlementChain::Solana => self.settlement_on(chain).is_ok(),
+            },
             wanted,
             url,
         )
@@ -940,36 +1009,11 @@ impl Connector {
     /// that does not exist.
     pub(crate) fn bind_runtime_peer_channel(&self, peer_id: &str, binding: &RuntimePeerChannel) {
         match binding {
-            RuntimePeerChannel::Evm {
-                channel_id,
-                counterparty_key,
-                chain_id,
-                token_network,
-            } => {
-                let (Some(counterparty), Some(token_network_address)) = (
-                    crate::peering::parse_evm_address(counterparty_key),
-                    crate::peering::parse_evm_address(token_network),
-                ) else {
-                    tracing::warn!(
-                        peer_id,
-                        "peering published an EVM address this node cannot read; \
-                         its channel is not bound"
-                    );
-                    return;
-                };
-                if let Err(error) = self.claims.set_channel_domain(
-                    channel_id,
-                    ChannelDomain {
-                        chain_id: *chain_id,
-                        token_network_address,
-                    },
-                ) {
-                    tracing::warn!(peer_id, %error, "peering's channel id is not bindable");
-                    return;
-                }
-                self.claims.set_verification_key(channel_id, counterparty);
-                self.claims.set_outbound_channel(peer_id, channel_id);
-            }
+            // A `TokenNetwork` peering is refused at boot by name
+            // (`PeerRouteStoreError::TokenNetworkPeering`) and never
+            // written since #1378, and an x402 one is bound by its voucher
+            // signer instead (`bind_runtime_voucher_signer`).
+            RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::EvmVoucher { .. } => {}
             RuntimePeerChannel::Solana {
                 channel_account,
                 counterparty_key,
@@ -1021,49 +1065,10 @@ impl Connector {
             .build()
             .expect("a reqwest client with only a timeout set always builds");
         let hop = match binding {
-            RuntimePeerChannel::Evm {
-                channel_id,
-                chain_id,
-                token_network,
-                ..
-            } => {
-                let Some(signer) = self.claims.signer().cloned() else {
-                    tracing::warn!(
-                        peer_id,
-                        "no EVM settlement signer configured; cannot pay this peer as a client"
-                    );
-                    return;
-                };
-                let Some(token_network) = crate::peering::parse_evm_address(token_network) else {
-                    tracing::warn!(
-                        peer_id,
-                        "peering's token network is not an address this node can read; its \
-                         outbound client hop is not registered"
-                    );
-                    return;
-                };
-                let Ok(channel) = crate::claim::parse_channel_id(channel_id) else {
-                    tracing::warn!(
-                        peer_id,
-                        "peering's channel id is not bindable; its outbound client hop is not \
-                         registered"
-                    );
-                    return;
-                };
-                OutboundClientHop {
-                    channel,
-                    channel_id: channel_id.clone(),
-                    claim_state: Arc::new(OwnedHttpClaimState::new(
-                        client,
-                        client_edge_url,
-                        ClaimStateChallengeSigner::Evm(signer),
-                    )),
-                    domain: OutboundClientDomain::Evm(EvmDomain {
-                        chain_id: *chain_id,
-                        token_network,
-                    }),
-                }
-            }
+            // An x402 peering is paid on its own outbound channel
+            // (`register_voucher_hop`), and a `TokenNetwork` one is never
+            // paid on since #1378: its row is refused at boot.
+            RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::EvmVoucher { .. } => return,
             RuntimePeerChannel::Solana {
                 channel_account,
                 program_id,
@@ -1308,8 +1313,12 @@ impl Connector {
         for (id, peering) in &peers {
             for binding in &peering.channels {
                 self.bind_runtime_peer_channel(id, binding);
+                if let Err(error) = self.bind_runtime_voucher_signer(id, binding) {
+                    tracing::warn!(peer_id = %id, %error, "peering's voucher signer is not bound");
+                }
                 if let Some(client_edge_url) = &peering.client_edge_url {
                     self.register_outbound_client_hop(id, binding, client_edge_url);
+                    self.register_voucher_hop(id, binding, client_edge_url);
                 }
             }
             self.register_runtime_peering(id, peering);
@@ -1339,6 +1348,116 @@ impl Connector {
     /// [`Connector::with_outbound_client_ledger`].
     pub fn outbound_client_ledger(&self) -> Option<&Arc<OutboundClientLedger>> {
         self.outbound_client.as_ref()
+    }
+
+    /// Give this node the x402 channels it pays on (ADR 0075 decisions 8
+    /// and 11), and its own CAIP-2 network on each chain they are on: what
+    /// `POST /peers` opens an EVM peering's outbound channel through, and
+    /// what every forward over such a peering signs its voucher through.
+    ///
+    /// Call before [`Connector::with_runtime_peer_route_store`]: a durable
+    /// x402 peering is rehydrated onto these channels, and one replayed
+    /// before them could not pay.
+    pub fn with_outbound_channels(
+        mut self,
+        outbound: Arc<OutboundChannels>,
+        networks: Vec<(SettlementChain, String)>,
+    ) -> Self {
+        self.outbound_channels = Some(outbound);
+        self.x402_networks = networks;
+        self
+    }
+
+    /// The x402 channels this node pays on, if it has any.
+    pub(crate) fn outbound_channels(&self) -> Option<&Arc<OutboundChannels>> {
+        self.outbound_channels.as_ref()
+    }
+
+    /// This node's own CAIP-2 network on `chain`, if it pays x402 there.
+    pub(crate) fn x402_network(&self, chain: SettlementChain) -> Option<&str> {
+        self.x402_networks
+            .iter()
+            .find(|(configured, _)| *configured == chain)
+            .map(|(_, network)| network.as_str())
+    }
+
+    /// Register an x402 peering's outbound channel as the hop `peer_id` is
+    /// paid on (ADR 0075 decision 6): from here every forward to `peer_id`
+    /// carries a voucher on that channel, or the peer-role challenge when
+    /// it moves no value. `client_edge_url` is the peer's own `POST /ilp`,
+    /// whose `claim-state` is the watermark authority on restore.
+    ///
+    /// Anything but an [`RuntimePeerChannel::EvmVoucher`] binding registers
+    /// nothing.
+    pub(crate) fn register_voucher_hop(
+        &self,
+        peer_id: &str,
+        binding: &RuntimePeerChannel,
+        client_edge_url: &str,
+    ) {
+        let RuntimePeerChannel::EvmVoucher {
+            outbound_channel_id,
+            ..
+        } = binding
+        else {
+            return;
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(
+                connector_config::DEFAULT_PEER_TIMEOUT_MS,
+            ))
+            .build()
+            .expect("a reqwest client with only a timeout set always builds");
+        self.insert_voucher_hop(
+            peer_id,
+            outbound_channel_id,
+            Arc::new(HttpVoucherState::new(client, client_edge_url)),
+        );
+    }
+
+    /// Pay `peer_id` over this node's outbound x402 channel `channel_id`,
+    /// asking `claim_state` where it stands (ADR 0075 decision 6).
+    pub(crate) fn insert_voucher_hop(
+        &self,
+        peer_id: &str,
+        channel_id: &str,
+        claim_state: Arc<dyn VoucherStateSource>,
+    ) {
+        let hop = VoucherHop {
+            channel_id: channel_id.to_ascii_lowercase(),
+            claim_state,
+            synced: Arc::new(AtomicBool::new(false)),
+            signing: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        self.outbound_voucher_hops.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(peer_id.to_string(), hop.clone());
+            next
+        });
+    }
+
+    /// Bind the voucher signer an x402 peering's row names to `peer_id`
+    /// (ADR 0075 decision 4), so the peer's channel toward this node is the
+    /// peer's when it shows up. Nothing for any other binding.
+    pub(crate) fn bind_runtime_voucher_signer(
+        &self,
+        peer_id: &str,
+        binding: &RuntimePeerChannel,
+    ) -> Result<(), VoucherBindingError> {
+        let RuntimePeerChannel::EvmVoucher { voucher_signer, .. } = binding else {
+            return Ok(());
+        };
+        let Some(signer) = crate::peering::parse_evm_address(voucher_signer) else {
+            tracing::warn!(
+                peer_id,
+                voucher_signer,
+                "peering names a voucher signer this node cannot read; its inbound channel is \
+                 not bound"
+            );
+            return Ok(());
+        };
+        self.voucher_bindings
+            .bind(peer_id, VoucherSigner::Evm(signer))
     }
 
     /// Configure how this node pays `peer_id` **as an ordinary client of
@@ -1742,6 +1861,14 @@ impl Connector {
         // with its vouchers (ADR 0075 decision 5): a signer left bound would
         // keep deciding `peer` for a relation that no longer exists.
         self.voucher_bindings.unbind_peer(id);
+        // ADR 0075 decision 4: removing a peering stops signing on its
+        // outbound channel, which stays journaled and open for the operator
+        // to withdraw (`POST /channels/:id/withdraw`).
+        self.outbound_voucher_hops.rcu(|current| {
+            let mut next = (**current).clone();
+            next.remove(id);
+            next
+        });
         // ADR 0060 named `DELETE /peers` as the kill switch that replaced
         // revoking a shared secret: "immediate, does not require a
         // restart". It is only immediate if the carriage goes with the row.
@@ -1856,7 +1983,10 @@ impl Connector {
         if !self.config_peer_ids.contains(&peer_id) {
             match self.runtime_peers_snapshot().get(&peer_id) {
                 None => return Err(PeerRouteTableError::UnknownPeerId { prefix, peer_id }),
-                Some(_) if !self.outbound_client_hops.load_full().contains_key(&peer_id) => {
+                Some(_)
+                    if !self.outbound_client_hops.load_full().contains_key(&peer_id)
+                        && !self.outbound_voucher_hops.load().contains_key(&peer_id) =>
+                {
                     return Err(PeerRouteTableError::PeerHasNoPayChannel { prefix, peer_id })
                 }
                 Some(_) => {}
@@ -2901,8 +3031,8 @@ impl Connector {
         // either: the claim's watermark authority is the RECEIVER, asked
         // over `claim_state`, and the peer book knows nothing of it (see
         // `crate::outbound_client`'s header).
-        let riding_claim = match self.cover_forward(peer_id, forwarded_amount).await {
-            Ok(claim) => claim,
+        let riding = match self.cover_forward(peer_id, forwarded_amount).await {
+            Ok(covering) => covering,
             Err(reason) => {
                 tracing::warn!(
                     peer_id,
@@ -2919,24 +3049,30 @@ impl Connector {
                 });
             }
         };
+        let rode_a_voucher = matches!(riding, Covering::Voucher(_));
         let mut answer = self
             .peer_transport
-            .forward(peer_id, outgoing.clone(), Some(riding_claim))
+            .forward(peer_id, outgoing.clone(), Some(riding))
             .await;
+        if rode_a_voucher {
+            self.note_voucher_ack(peer_id, answer.ack);
+        }
 
         if let Some(terms) = answer.payment_required.take() {
             if let Some(covering) = self.cover_greeted_packet(peer_id, &terms).await {
                 tracing::info!(
                     peer_id,
-                    nonce = covering.nonce,
-                    cumulative = covering.cumulative_amount,
                     price = terms.price().unwrap_or_default(),
                     "covering a greeted forward and retrying it once"
                 );
+                let retried_a_voucher = matches!(covering, Covering::Voucher(_));
                 answer = self
                     .peer_transport
                     .forward(peer_id, outgoing, Some(covering))
                     .await;
+                if retried_a_voucher {
+                    self.note_voucher_ack(peer_id, answer.ack);
+                }
                 // Bounded: whatever the retry answered is the answer. A
                 // second greeting is logged with its terms and relayed, not
                 // covered again.
@@ -3016,7 +3152,12 @@ impl Connector {
     /// greeting: `amount` and [`OutboundClientHop::domain`] are both known
     /// locally, which is exactly what lets this run proactively rather
     /// than only once a refusal has already taught this node a price.
-    async fn cover_forward(&self, peer_id: &str, amount: u64) -> Result<WireClaim, String> {
+    async fn cover_forward(&self, peer_id: &str, amount: u64) -> Result<Covering, String> {
+        // ADR 0075 decision 6: a peering on x402 is paid on this node's own
+        // outbound channel, and no `toon-channel` hop is consulted for it.
+        if let Some(hop) = self.outbound_voucher_hops.load().get(peer_id).cloned() {
+            return self.cover_with_voucher(peer_id, &hop, amount).await;
+        }
         let hops = self.outbound_client_hops.load_full();
         let Some(hop) = hops.get(peer_id) else {
             // Neither populator of `outbound_client_hops` has armed this
@@ -3095,7 +3236,7 @@ impl Connector {
                 claim.cumulative
             ));
         };
-        Ok(WireClaim {
+        Ok(Covering::Claim(WireClaim {
             channel_id: hop.channel_id.clone(),
             nonce: claim.nonce,
             cumulative_amount,
@@ -3103,7 +3244,122 @@ impl Connector {
             // ed25519 signature is never re-labelled as an EVM one on its
             // way to the carriage (issue #732's rule, issue #1146's arm).
             signature: claim.signature,
-        })
+        }))
+    }
+
+    /// Cover a forward to `peer_id` over this node's own outbound x402
+    /// channel (ADR 0075 decisions 5 and 6): a voucher for the channel's
+    /// signed watermark plus `amount`, signed and journaled before the
+    /// packet leaves -- or, for a packet that moves no value, no voucher at
+    /// all and the voucher claim-state challenge instead, which proves the
+    /// peer role at the far end and moves nothing.
+    ///
+    /// The watermark signed above is this node's own journaled one, raised
+    /// first to whatever the receiver's `POST /ilp/claim-state` reports
+    /// when this process has not asked yet, or has had a voucher refused
+    /// since: the receiver is the authority on restore, and a node restored
+    /// from an older journal would otherwise sign a voucher that fails to
+    /// advance. A receiver that cannot be asked leaves the journaled
+    /// watermark standing -- it is never behind what this node signed -- and
+    /// is asked again next time.
+    async fn cover_with_voucher(
+        &self,
+        peer_id: &str,
+        hop: &VoucherHop,
+        amount: u64,
+    ) -> Result<Covering, String> {
+        let Some(outbound) = self.outbound_channels.as_ref() else {
+            return Err(format!(
+                "peer '{peer_id}' is paid over x402 channel {} and this node has no x402 \
+                 batch-settlement backend to sign on",
+                hop.channel_id
+            ));
+        };
+        let Some(presentation) = outbound.presentation(&hop.channel_id) else {
+            return Err(format!(
+                "peer '{peer_id}' is paid over x402 channel {}, which this node's outbound \
+                 channel journal does not hold",
+                hop.channel_id
+            ));
+        };
+        let now = self.now_unix();
+        let _signing = hop.signing.lock().await;
+        if !hop.synced.load(Ordering::Acquire) {
+            let expires = now + PEER_CHALLENGE_TTL_SECS;
+            let synced = match outbound.sign_challenge(&hop.channel_id, expires).await {
+                Ok(signature) => match hop
+                    .claim_state
+                    .watermark(&presentation, expires, &signature)
+                    .await
+                {
+                    Ok(remote) => outbound
+                        .raise_watermark(&hop.channel_id, remote)
+                        .await
+                        .map(|_| true)
+                        .map_err(|error| error.to_string()),
+                    Err(reason) => Err(reason),
+                },
+                Err(error) => Err(error.to_string()),
+            };
+            match synced {
+                Ok(_) => hop.synced.store(true, Ordering::Release),
+                Err(reason) => tracing::warn!(
+                    peer_id,
+                    channel = %hop.channel_id,
+                    %reason,
+                    "could not ask the next hop where this channel's watermark stands; signing \
+                     above this node's own journaled watermark, and asking again next time"
+                ),
+            }
+        }
+        if amount == 0 {
+            // ADR 0075 decision 5: a packet that moves no value carries no
+            // voucher, and carries the challenge so the far end can still
+            // attribute it to this peering.
+            let expires = now + PEER_CHALLENGE_TTL_SECS;
+            let signature = outbound
+                .sign_challenge(&hop.channel_id, expires)
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(Covering::Challenge(
+                challenge_entry(&presentation, expires, &signature).to_string(),
+            ));
+        }
+        let signed = outbound.signed(&hop.channel_id).unwrap_or(0);
+        let voucher = outbound
+            .sign_voucher(&hop.channel_id, signed + u128::from(amount))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(Covering::Voucher(voucher_json(
+            &presentation,
+            &voucher,
+            &voucher_sender(&presentation),
+            &self
+                .clock
+                .now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+        )))
+    }
+
+    /// A voucher's verdict, as the next hop acknowledged it (ADR 0075
+    /// decision 6): one it did not accept sends the next forward to ask
+    /// the hop's `POST /ilp/claim-state` where the channel stands before
+    /// signing again, rather than signing above a watermark the hop
+    /// disagrees with. `NotSent` -- no ack read at all -- changes nothing.
+    fn note_voucher_ack(&self, peer_id: &str, ack: ClaimAckOutcome) {
+        if let ClaimAckOutcome::Rejected(reason) = ack {
+            if let Some(hop) = self.outbound_voucher_hops.load().get(peer_id) {
+                tracing::warn!(
+                    peer_id,
+                    channel = %hop.channel_id,
+                    ?reason,
+                    "the next hop refused this node's voucher; asking it where the channel \
+                     stands before the next one"
+                );
+                hop.synced.store(false, Ordering::Release);
+            }
+        }
     }
 
     /// Sign a claim covering the terms `peer_id` just quoted, ready to ride
@@ -3136,7 +3392,21 @@ impl Connector {
         &self,
         peer_id: &str,
         terms: &X402PaymentRequired,
-    ) -> Option<WireClaim> {
+    ) -> Option<Covering> {
+        // An x402 peering: the voucher this forward rode was not enough for
+        // the far end, so ask it where the channel stands and cover its own
+        // quoted price once, on the same channel.
+        if let Some(hop) = self.outbound_voucher_hops.load().get(peer_id).cloned() {
+            hop.synced.store(false, Ordering::Release);
+            let price = terms.price()?;
+            return match self.cover_with_voucher(peer_id, &hop, price).await {
+                Ok(covering) => Some(covering),
+                Err(reason) => {
+                    tracing::warn!(peer_id, %reason, "could not sign a voucher covering the peer's terms");
+                    None
+                }
+            };
+        }
         let Some(ledger) = self.outbound_client.as_ref() else {
             tracing::warn!(
                 peer_id,
@@ -3230,12 +3500,12 @@ impl Connector {
             );
             return None;
         };
-        Some(WireClaim {
+        Some(Covering::Claim(WireClaim {
             channel_id: hop.channel_id.clone(),
             nonce: claim.nonce,
             cumulative_amount,
             signature: claim.signature,
-        })
+        }))
     }
 
     /// Issue #545: a reject this connector originates because the packet
@@ -3917,6 +4187,15 @@ impl Connector {
     ) -> Result<&Arc<dyn SettlementBackend>, ChannelOperationError> {
         let chain = self.settlement_chain_for_channel(channel_id)?;
         self.settlement_on(chain)
+    }
+
+    /// The chain a `toon-channel` write on `channel_id` would reach, by
+    /// [`Self::settlement_chain_for_channel`]'s rule, or `None` when no
+    /// backend would take it. What the operator surface refuses an EVM
+    /// `toon-channel` top-up by (ADR 0075, #1378).
+    #[must_use]
+    pub fn toon_channel_chain(&self, channel_id: &str) -> Option<SettlementChain> {
+        self.settlement_chain_for_channel(channel_id).ok()
     }
 
     /// The chain whose backend [`Self::settlement_for_channel`] routes
@@ -5794,11 +6073,15 @@ mod tests {
             &self,
             _peer_id: &str,
             prepare: Prepare,
-            claim: Option<WireClaim>,
+            claim: Option<Covering>,
         ) -> PeerForward {
             let (response, ack) = self
                 .downstream
-                .handle_peer_prepare(Some(&self.arrives_as), prepare, claim)
+                .handle_peer_prepare(
+                    Some(&self.arrives_as),
+                    prepare,
+                    claim.and_then(Covering::into_claim),
+                )
                 .await;
             PeerForward::answered(response, ack)
         }
@@ -5824,7 +6107,7 @@ mod tests {
             &self,
             _peer_id: &str,
             _prepare: Prepare,
-            _claim: Option<WireClaim>,
+            _claim: Option<Covering>,
         ) -> PeerForward {
             self.clock.advance(self.elapsed);
             PeerForward::answered(
@@ -6807,7 +7090,7 @@ mod tests {
             &self,
             _peer_id: &str,
             _prepare: Prepare,
-            _claim: Option<WireClaim>,
+            _claim: Option<Covering>,
         ) -> PeerForward {
             PeerForward::answered(self.0.clone(), ClaimAckOutcome::NotSent)
         }
@@ -6909,10 +7192,13 @@ mod tests {
             &self,
             _peer_id: &str,
             prepare: Prepare,
-            claim: Option<WireClaim>,
+            claim: Option<Covering>,
         ) -> PeerForward {
             self.carried.lock().unwrap().push(prepare);
-            self.covered_by.lock().unwrap().push(claim);
+            self.covered_by
+                .lock()
+                .unwrap()
+                .push(claim.and_then(Covering::into_claim));
             PeerForward::answered(
                 PacketResponse::Reject(Reject {
                     code: RejectCode::f02_unreachable(),
@@ -7441,8 +7727,9 @@ mod tests {
                 &self,
                 _peer_id: &str,
                 _prepare: Prepare,
-                claim: Option<WireClaim>,
+                claim: Option<Covering>,
             ) -> PeerForward {
+                let claim = claim.and_then(Covering::into_claim);
                 let covered = claim
                     .as_ref()
                     .is_some_and(|claim| claim.cumulative_amount >= PRICE);
@@ -9644,11 +9931,10 @@ mod tests {
                 endpoint: Some("https://peer.example/ilp".to_string()),
                 edge_identity: Some("0x04ab".to_string()),
                 client_edge_url: Some("https://peer.example/ilp".to_string()),
-                channels: vec![RuntimePeerChannel::Evm {
-                    channel_id: format!("0x{:064x}", fee + 1),
-                    counterparty_key: "0x00000000000000000000000000000000000000aa".to_string(),
-                    chain_id: 31337,
-                    token_network: "0x00000000000000000000000000000000000000bb".to_string(),
+                channels: vec![RuntimePeerChannel::EvmVoucher {
+                    outbound_channel_id: format!("0x{:064x}", fee + 1),
+                    voucher_signer: format!("0x{:040x}", fee + 1),
+                    network: "eip155:31337".to_string(),
                 }],
             }
         }
@@ -10283,6 +10569,260 @@ mod tests {
                 connector.remove_runtime_peer_route("g.nowhere"),
                 Err(PeerRouteTableError::RouteNotFound(prefix)) if prefix == "g.nowhere"
             ));
+        }
+    }
+
+    /// ADR 0075 decisions 5 and 6 on the forwarding path: a peering on x402
+    /// covers every forward with a voucher on this node's own outbound
+    /// channel, and a forward that moves no value with the peer-role
+    /// challenge; the receiver's claim-state is the watermark authority on
+    /// restore, and a refused voucher sends the next forward back to it.
+    /// Over the in-memory paying half, which the paying contract suite holds
+    /// to the chains' behaviour (ADR 0007).
+    mod x402_peering_covers {
+        use super::*;
+        use crate::batch_channels::OutboundChannels;
+        use crate::journal::InMemoryJournal;
+        use crate::outbound_voucher::VoucherStateSource;
+        use connector_domain::client_claim::{parse_client_claim, ClientClaim};
+        use connector_settlement::batch::{
+            BatchSettlementPayer, ChannelPresentation, InMemoryBatchChain, InMemoryBatchSettlement,
+            PayerExit,
+        };
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+        const FEE: u64 = 10;
+
+        /// The receiver, as a claim-state source: reports `watermark`, and
+        /// counts how often it was asked.
+        struct Receiver {
+            watermark: AtomicU64,
+            asked: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl VoucherStateSource for Receiver {
+            async fn watermark(
+                &self,
+                _presentation: &ChannelPresentation,
+                _expires: u64,
+                signature: &[u8],
+            ) -> Result<u128, String> {
+                assert!(!signature.is_empty(), "the ask is signed");
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                Ok(u128::from(self.watermark.load(Ordering::SeqCst)))
+            }
+        }
+
+        /// The next hop: records what covered each packet, and answers with
+        /// `ack` for a voucher.
+        struct NextHop {
+            covered: Mutex<Vec<Covering>>,
+            ack: Mutex<ClaimAckOutcome>,
+        }
+
+        #[async_trait]
+        impl PeerTransport for NextHop {
+            async fn forward(
+                &self,
+                _peer_id: &str,
+                _prepare: Prepare,
+                covering: Option<Covering>,
+            ) -> PeerForward {
+                let covering = covering.expect("every forward is covered (ADR 0042)");
+                let ack = match covering {
+                    Covering::Voucher(_) => *self.ack.lock().unwrap(),
+                    _ => ClaimAckOutcome::NotSent,
+                };
+                self.covered.lock().unwrap().push(covering);
+                PeerForward::answered(
+                    PacketResponse::Fulfill(Fulfill {
+                        fulfillment: [7; 32],
+                        data: Vec::new(),
+                    }),
+                    ack,
+                )
+            }
+
+            async fn flush(&self, _peer_id: &str, _claim: WireClaim) -> ClaimAckOutcome {
+                ClaimAckOutcome::NotSent
+            }
+        }
+
+        async fn peered() -> (
+            Connector,
+            Arc<NextHop>,
+            Arc<Receiver>,
+            Arc<OutboundChannels>,
+            String,
+        ) {
+            let chain = InMemoryBatchChain::new(PayerExit::Withdrawal);
+            let payer = Arc::new(InMemoryBatchSettlement::on(
+                Arc::clone(&chain),
+                0x01,
+                86_400,
+            ));
+            payer.fund(100_000);
+            let counterparty = InMemoryBatchSettlement::on(chain, 0x02, 86_400);
+            let outbound = Arc::new(
+                OutboundChannels::restore(
+                    Arc::new(InMemoryJournal::new()),
+                    vec![(SettlementChain::Evm, payer as Arc<dyn BatchSettlementPayer>)],
+                )
+                .await
+                .expect("an empty journal"),
+            );
+            let (opened, _) = outbound
+                .open(counterparty.published_terms(), 50_000)
+                .await
+                .expect("open");
+            let channel = opened.on_chain.id.0.clone();
+            let next_hop = Arc::new(NextHop {
+                covered: Mutex::new(Vec::new()),
+                ack: Mutex::new(ClaimAckOutcome::Accepted),
+            });
+            let receiver = Arc::new(Receiver {
+                watermark: AtomicU64::new(0),
+                asked: AtomicUsize::new(0),
+            });
+            let connector = Connector::new(
+                vec![],
+                vec![PeerRoute::new("g.example.next", "next-hop")],
+                Arc::new(FakeAppClient::new()),
+                Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
+                test_clock(),
+            )
+            .with_peer_fees([("next-hop".to_string(), FEE)])
+            .with_outbound_channels(
+                Arc::clone(&outbound),
+                vec![(SettlementChain::Evm, "eip155:31337".to_string())],
+            );
+            connector.insert_voucher_hop(
+                "next-hop",
+                &channel,
+                Arc::clone(&receiver) as Arc<dyn VoucherStateSource>,
+            );
+            (connector, next_hop, receiver, outbound, channel)
+        }
+
+        fn prepare(amount: u64) -> Prepare {
+            Prepare {
+                amount,
+                expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
+                greeting: false,
+                destination: "g.example.next.app".to_string(),
+                data: Vec::new(),
+            }
+        }
+
+        fn voucher_amount(covering: &Covering) -> u64 {
+            let Covering::Voucher(json) = covering else {
+                panic!("expected a voucher, got {covering:?}");
+            };
+            let ClientClaim::EvmVoucher(voucher) = parse_client_claim(json).expect("parses") else {
+                panic!("an EVM voucher");
+            };
+            assert!(voucher.channel_config.is_some(), "the config rides it");
+            voucher.max_claimable_amount
+        }
+
+        /// Every forward is covered by a voucher for the channel's signed
+        /// watermark plus what this packet forwards -- its amount less this
+        /// hop's fee (ADR 0042, ADR 0061) -- and the receiver is asked where
+        /// the channel stands once, not on every packet.
+        #[tokio::test]
+        async fn each_forward_carries_a_voucher_advanced_by_the_forwarded_amount() {
+            let (connector, next_hop, receiver, outbound, channel) = peered().await;
+            for _ in 0..3 {
+                assert!(matches!(
+                    connector.handle_prepare(prepare(110)).await,
+                    PacketResponse::Fulfill(_)
+                ));
+            }
+            let covered = next_hop.covered.lock().unwrap().clone();
+            let amounts: Vec<u64> = covered.iter().map(voucher_amount).collect();
+            assert_eq!(amounts, vec![100, 200, 300]);
+            assert_eq!(outbound.signed(&channel), Some(300), "journaled as signed");
+            assert_eq!(receiver.asked.load(Ordering::SeqCst), 1);
+        }
+
+        /// ADR 0075 decision 6: after a restart or a lost journal the
+        /// receiver's claim-state is the authority -- a node whose journal
+        /// is behind what the receiver holds signs above the receiver's
+        /// figure, never a voucher that fails to advance.
+        #[tokio::test]
+        async fn the_receivers_watermark_is_the_authority_on_restore() {
+            let (connector, next_hop, receiver, outbound, channel) = peered().await;
+            receiver.watermark.store(5_000, Ordering::SeqCst);
+            connector.handle_prepare(prepare(110)).await;
+            assert_eq!(voucher_amount(&next_hop.covered.lock().unwrap()[0]), 5_100);
+            assert_eq!(outbound.signed(&channel), Some(5_100));
+        }
+
+        /// A refused voucher sends the next forward back to the receiver
+        /// before it signs again.
+        #[tokio::test]
+        async fn a_refused_voucher_resyncs_the_watermark_before_the_next() {
+            let (connector, next_hop, receiver, _outbound, _channel) = peered().await;
+            *next_hop.ack.lock().unwrap() =
+                ClaimAckOutcome::Rejected(ClaimRejectReason::AmountNotAdvancing);
+            connector.handle_prepare(prepare(110)).await;
+            assert_eq!(receiver.asked.load(Ordering::SeqCst), 1);
+            receiver.watermark.store(9_000, Ordering::SeqCst);
+            *next_hop.ack.lock().unwrap() = ClaimAckOutcome::Accepted;
+            connector.handle_prepare(prepare(110)).await;
+            assert_eq!(receiver.asked.load(Ordering::SeqCst), 2, "asked again");
+            assert_eq!(voucher_amount(&next_hop.covered.lock().unwrap()[1]), 9_100);
+        }
+
+        /// ADR 0075 decision 5: a packet that moves no value carries no
+        /// voucher, and carries the peer-role challenge so the next hop can
+        /// attribute it to the peering; nothing is signed or journaled.
+        #[tokio::test]
+        async fn a_zero_value_forward_carries_the_challenge_and_no_voucher() {
+            let (connector, next_hop, _receiver, outbound, channel) = peered().await;
+            let connector = connector.with_peer_fees([("next-hop".to_string(), 0)]);
+            assert!(matches!(
+                connector.handle_prepare(prepare(0)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            let covered = next_hop.covered.lock().unwrap().clone();
+            let [Covering::Challenge(json)] = covered.as_slice() else {
+                panic!("expected one challenge, got {covered:?}");
+            };
+            let challenge: serde_json::Value = serde_json::from_str(json).expect("json");
+            assert_eq!(challenge["scheme"], "batch-settlement");
+            assert_eq!(challenge["channelId"], channel.as_str());
+            assert!(challenge["channelConfig"].is_object());
+            assert_eq!(outbound.signed(&channel), Some(0), "nothing was signed");
+        }
+
+        /// Removing the peering stops signing on its outbound channel, which
+        /// stays open to withdraw from (ADR 0075 decision 4).
+        #[tokio::test]
+        async fn a_removed_peering_signs_nothing_more() {
+            let (connector, next_hop, _receiver, outbound, channel) = peered().await;
+            connector
+                .upsert_runtime_peer(
+                    "next-hop",
+                    RuntimePeering {
+                        channels: vec![RuntimePeerChannel::EvmVoucher {
+                            outbound_channel_id: channel.clone(),
+                            voucher_signer: format!("0x{}", "02".repeat(20)),
+                            network: "eip155:31337".to_string(),
+                        }],
+                        ..RuntimePeering::default()
+                    },
+                )
+                .expect("the peering's row");
+            connector.remove_runtime_peer("next-hop").expect("removed");
+            let response = connector.handle_prepare(prepare(110)).await;
+            assert!(
+                matches!(response, PacketResponse::Reject(_)),
+                "{response:?}"
+            );
+            assert!(next_hop.covered.lock().unwrap().is_empty());
+            assert!(outbound.knows(&channel));
         }
     }
 }

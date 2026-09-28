@@ -116,9 +116,10 @@ payment are therefore read from the same bytes, on the same packet, every time.
 > decision 5**, which amends [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md).
 > Under ADR 0075 a peering is two one-way x402 `batch-settlement` channels, and the inbound one is
 > **admitted, not configured** — so the proof above, which needs a `[[peer_channels]]` row naming the
-> channel, cannot reach it. P2 and P3 still decide for a `toon-channel` claim, because every peering
-> in the tree still proves itself that way; #1378 and #1379 move runtime peerings and #1380 moves
-> config-declared ones, and #1380 deletes P2/P3 with the last of them.
+> channel, cannot reach it. P2 and P3 still decide for a `toon-channel` claim, because
+> config-declared peerings (#1380) and runtime Solana ones (#1379) still prove themselves that way;
+> runtime EVM peerings moved to x402 with #1378 (§1.11), and #1380 deletes P2/P3 with the last of
+> them.
 
 An interaction also has role `peer` **if and only if** it carries either of:
 
@@ -139,10 +140,11 @@ signer rather than by channel because a peer may hold several live channels towa
 none of their ids is known before the peer opens it; the one fact both sides know in advance is the
 key the peer signs with. One signer proves one relation: binding a signer already bound to another
 peering is refused, by name, and binding to a peer id no peering holds is refused too. Removing a
-runtime peering (`DELETE /peers`, ADR 0060's kill switch) unbinds its signers with the row. **The two
-sources of a binding come later**: the key a peer's self-description publishes, bound when `POST
-/peers` establishes the peering (#1378, #1379), and the key a `[[peer_channels]]` row names (#1380).
-Until one lands, a node binds nothing and no voucher decides `peer` on it.
+runtime peering (`DELETE /peers`, ADR 0060's kill switch) unbinds its signers with the row. **A
+binding has two sources.** The first is built (#1378): the key a peer's self-description publishes
+as its `voucherSigners` entry for the shared network (`self-description-spec.md` ND-17), bound when
+`POST /peers` establishes an EVM peering and rebound from the durable row at every boot. The second,
+the key a `[[peer_channels]]` row names, is #1380; Solana's first source is #1379.
 
 **Why 300 seconds.** Within `expires` a challenge is a bearer proof for zero-value traffic (ADR 0075,
 Consequences): it names one channel, so only that channel's receiver can use it, but that receiver
@@ -154,14 +156,13 @@ left the bound to this step.
 
 **What stays exactly as it was.** Nothing is admitted, advanced or journaled by X1 or X2: role is
 still fixed before a watermark moves (§1.5). A voucher that decides `peer` is not a `WireClaim` and
-is not judged by `ClaimBook`; judging a peer's voucher — its watermark, its ack, its journal entry —
-is the receiving half's, and lands with the peerings that send one (#1378). Until then a voucher on
-a bound channel proves the role and pays nothing on the peer wire, so a priced peer PREPARE covered
-only by a voucher is answered with the greeting, as an uncovered one is -- on a forwarded route too,
-whatever the peering's `claim_enforcement`: a voucher-covered forward is always priced under
-`enforce` (`role_gate::forwarded_enforcement`), so the default `observe` cannot carry it for free.
-A zero-value peer packet carries no voucher (below); one that does still proves the role by it. The
-implementation is
+is not judged by `ClaimBook`. **It is judged below the role by the receiving half** (#1378, §1.11):
+admitted by the rules a client's voucher is, held to the channel's one amount watermark (§1.8),
+journaled, and answered in the `claim-ack`; price coverage (§3.1) is its advance past that watermark,
+under the peering's own forwarded-claim enforcement exactly as a claim's is. (Until #1378 a voucher
+proved the role and paid nothing, so a voucher-covered forward was priced under `enforce` whatever
+the peering said; with the voucher judged that override is gone.) A zero-value peer packet carries
+no voucher (below); one that does still proves the role by it. The implementation is
 `connector_peer_btp::role_gate::decide_frame`, which both carriages and the client edge's front door
 call; it asks the receiving half (`connector_peer_btp::role_gate::VoucherEvidence`, implemented by
 the client edge's claim gate over the same lookups `POST /ilp/claim-state` makes) for the channel's
@@ -604,8 +605,11 @@ can never describe the same money.
 voucher's cumulative amount is a property of its channel, so a connector MUST NOT judge a peer's
 voucher against a watermark that starts again at zero: two watermarks over one voucher channel would
 count the same money twice. `POST /ilp/claim-state` already answers a voucher channel with the higher
-of the two books (`client-edge-spec.md` §1.10), and the step that judges a peer's vouchers (#1378)
-inherits this requirement.
+of the two books (`client-edge-spec.md` §1.10). **Built (#1378):** a peer's voucher is judged by the
+very book a client's is — the client edge's claim gate, keyed by the channel — so there is one
+watermark and one journal (`client-edge-claims.log`) per voucher channel, whichever role its
+vouchers arrive under, and a peer bound after its channel paid as a client continues from where the
+channel stands.
 
 ### 1.9 The named regression
 
@@ -661,6 +665,43 @@ listener with mandatory authentication**. If it does:
   no client to downgrade to and no oracle to leak (the peer ids it protects are the ones already
   advertised to the peer that dials it);
 - it MUST still be BTP or ILP-over-HTTP. Never a bespoke wire, never raw TCP.
+
+### 1.11 A runtime EVM peering is two x402 channels (ADR 0075 decisions 4–6, issue #1378)
+
+`POST /peers` on EVM opens and funds only this node's **outbound** `x402BatchSettlement` channel
+toward the counterparty, and binds the counterparty's **inbound** channel by its published voucher
+signer (§1.2). Each side does the same with the other's URL. What rides the wire:
+
+- **Every forward to the peer carries a voucher** on this node's outbound channel, in the claim slot
+  (§4), for the channel's signed watermark plus the forwarded amount (`amount_after_fee(amount,
+fee)`, ADR 0042). The voucher is signed by the settlement key (`payerAuthorizer == payer`, ADR 0075
+  decision 3) and journaled before it leaves (`outbound-channels.log`). An EVM voucher from this
+  connector always carries its `channelConfig`, not only the channel's first, so a receiver that
+  restarted or never saw the first admits the channel from any of them.
+- **A forward that moves no value carries no voucher** and carries the peer-role challenge (§1.4)
+  instead, signed for 60 seconds, so the receiver attributes it to the peering (X2). It is possible
+  only over a peering whose `fee` is zero: a fee leaves nothing to forward (`R01`).
+- **The receiver judges it** against the channel's one watermark (§1.8) and answers in the `claim-ack`
+  (§6): `accepted`; `amount_not_advancing` for a voucher at or below the watermark, one above what the
+  channel backs, or one that under-covers a price; `signature_invalid`; or `unknown_channel` for a
+  channel it does not admit. A refusal that is the receiver's own and temporary — its journal could not
+  be written, its chain could not be read — is **not acknowledged**, so the payer's voucher stays
+  pending. A byte-identical resend at the watermark is `accepted` and advances nothing (ADR 0074
+  decision 3).
+- **The receiver's `POST /ilp/claim-state` (`scheme: "batch-settlement"`) is the watermark authority
+  on restore** (ADR 0075 decision 6). The payer asks it once per process for each hop, and again after
+  any voucher the receiver did not accept, and only ever raises its signed watermark to the answer; a
+  receiver that cannot be asked leaves the journaled watermark (never behind what was signed) standing,
+  and is asked again on the next forward.
+- **On ILP-over-HTTP, at most one voucher-bearing request is in flight per relation** (§7.2's rule,
+  applied to a peering's one outbound channel), so two cumulative vouchers cannot overtake each other.
+- **Removing the peering** (`DELETE /peers/:id`) unbinds the peer's signer and stops signing on the
+  outbound channel, which stays open for `POST /channels/:id/withdraw` (ADR 0075 decision 4).
+- **A durable runtime EVM peering naming a `TokenNetwork` channel** — written before #1378 — is refused
+  at boot by name, pointing at ADR 0075's drain procedure; it is never replayed and never dropped.
+
+The peer carriages are mounted wherever `peer_expose` names one, whether or not the config file
+declares a `[[peers]]` table: a runtime peering proves itself on them.
 
 ---
 
@@ -942,6 +983,10 @@ both edges, and why a change to the claim shape cannot land on one and not the o
 - **HTTP**: the `ILP-Payment-Channel-Claim` request header carries `base64(JSON.stringify(claim))`.
   Base64 is a header artifact and nothing more.
 
+**A voucher rides the same slot** (ADR 0075, #1378): the client edge's own `batch-settlement`
+voucher JSON (`client-edge-spec.md` §1.3), verbatim, on both carriages. It is judged by the receiving
+half rather than §4.1's `toon-channel` gate (§1.11).
+
 **The privacy-wrapped carriage (`ILP-Payment-Channel-Claim-Wrapped`, NIP-59) is not part of the
 peer carriage on either wire.** A peering relation is configured on both ends by operators who know
 each other's channel identity, so the anonymity it buys has no peer use. A connector MUST ignore
@@ -1119,6 +1164,8 @@ The body in both cases is the same JSON, raw UTF-8 on BTP and `base64(JSON)` in 
 
 `reason` is exactly one of `peer-semantics-pre-868.md` §3.4's four, unchanged and not extensible without a
 spec change: `signature_invalid`, `nonce_not_advancing`, `amount_not_advancing`, `unknown_channel`.
+A voucher's verdict rides the same field in the same four spellings (§1.11); `nonce_not_advancing`
+never answers one, since a voucher has no nonce.
 These are the wire spellings of `connector_runtime::ClaimRejectReason`'s four variants; a fifth
 variant added to that enum without a corresponding change here and to the vectors is a wire break.
 

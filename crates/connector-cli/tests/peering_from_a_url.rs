@@ -1,80 +1,91 @@
 //! **A peering established from a URL, against a real chain** (ADR 0058,
-//! issue #1160).
+//! as ADR 0075 decision 4 amends it; issues #1160, #1378).
 //!
-//! Nothing here injects a settlement backend or hands the node a
-//! pre-opened channel. A config-driven `connector_cli::run` node is given
-//! one authenticated write -- `POST /peers { id, url, fee,
-//! max_packet_amount }` -- pointed at a real HTTP server answering a real
-//! self-description, and everything else is read off the document or off
-//! anvil: the endpoint, the edge identity, the counterparty's settlement
-//! address, and the channel derived from it.
+//! Nothing here injects a settlement backend or hands a node a pre-opened
+//! channel. Config-driven nodes -- built by `connector_cli::build` and
+//! served by `connector_cli::router`, the production boot path -- are given
+//! one authenticated write each, `POST /peers { id, url, fee,
+//! max_packet_amount, deposit }`, pointed at a real self-description on a
+//! real socket, over one disposable `anvil` holding x402's real
+//! `x402BatchSettlement` at its canonical address and a Circle FiatToken as
+//! USDC.
 //!
-//! The three claims this file exists to hold:
+//! The claims this file exists to hold:
 //!
-//! 1. **The channel derives from the settlement address of the chain in
-//!    question, never from the edge identity.** Asserted against the chain
-//!    itself -- `TokenNetwork.channels(id)` reports both participants, and
-//!    they are the two nodes' settlement addresses. `claimFromChannel`
-//!    recovers a balance proof's signer and requires it to *be* a
-//!    participant, so a channel derived from a secp256k1 edge key would
-//!    name a participant no chain holds and every claim on it would be
-//!    unredeemable.
-//! 2. **The endpoint is safely retryable.** It spends gas, so a repeat of
-//!    the same request must find the channel the first opened rather than
-//!    open a second. ADR 0059's derivation makes that structural, and the
-//!    answer says which branch it took.
-//! 3. **Trust-on-first-use.** Whatever the URL serves is who the peering
-//!    is with. The document below is served by this test, is signed by
-//!    nobody, and is checked against nothing the operator supplied --
-//!    which is the property ADR 0058 states plainly and declines to
-//!    strengthen.
+//! 1. **A peering is two one-way x402 channels, one opened by each side.**
+//!    `POST /peers` opens and funds only this node's outbound channel, and
+//!    never a `TokenNetwork` channel -- asserted against the chain.
+//! 2. **The other half is admitted, not configured.** Each node binds the
+//!    peer's channel toward it by the voucher signer the peer's
+//!    self-description publishes; nobody exchanges a channel id.
+//! 3. **Every forwarded PREPARE carries a voucher, both ways, over both
+//!    carriages**, each payee journals it, and its verdict rides back in the
+//!    ack. A packet that moves no value carries the peer-role challenge
+//!    instead and is still attributed to the peering.
+//! 4. **The peering survives a restart of either node**, with both
+//!    watermarks restored.
+//! 5. **The endpoint is safely retryable**: a repeat finds this node's own
+//!    channel rather than opening a second, and says which branch it took.
+//! 6. **Trust-on-first-use.** Whatever the URL serves is who the peering is
+//!    with.
+
+mod support;
 
 use std::io::Write;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
-use ed25519_dalek::Keypair;
-use libsecp256k1::{PublicKey, SecretKey};
-use rand::rngs::OsRng;
-use tower::ServiceExt;
-
-use connector_domain::x402::{X402ChainSettlementTerms, X402SettlementTerms};
+use connector_domain::x402::{X402BatchSettlementEvmTerms, X402BatchSettlementTerms};
 use connector_domain::{
     EdgeIdentity, EnvelopeRequest, EnvelopeResponse, Fulfill, NodeFacts, NodeSelfDescription,
-    Prepare, Reject,
+    Prepare, Reject, VoucherSignerFact,
 };
 use connector_operator::test_support::sign_request;
 use connector_runtime::PeerView;
+use connector_settlement::batch::{ChannelPresentation, Voucher};
+use connector_settlement::ChannelId;
+use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
 use connector_settlement_evm::EvmSettlementBackend;
 use connector_signer::giftwrap::{open_response, seal_request};
-use connector_signer::{
-    derive_evm_address, to_hex, verify_evm_balance_proof, EvmBalanceProof, LocalSigner,
-    PublicKeyBytes, Signer,
-};
-
-/// `anvil`'s own default chain id (`Anvil::spawn`'s `--chain-id 31337`),
-/// and so what the served document must publish as `evm:<chainId>` for the
-/// peering's claims to be signed under a domain that verifies.
-const ANVIL_CHAIN_ID: u64 = 31_337;
+use connector_signer::PublicKeyBytes;
+use ed25519_dalek::Keypair;
+use ethers::signers::{LocalWallet, Signer as _};
+use ethers::types::Address;
+use rand::rngs::OsRng;
+use tower::ServiceExt;
 
 /// This test binary's own base port for [`Anvil::spawn`]. Every other test
-/// binary that spawns one has its own base (`connector-bin` 18_500,
-/// `connector-settlement-evm` 18_600, `connector-cli`'s unit tests 18_700,
-/// `settlement_lifecycle` 18_800, `connector-client-edge` 18_900), so
-/// binaries running concurrently under `cargo test --workspace` never
-/// contend for a port.
+/// binary that spawns one has its own base, so binaries running
+/// concurrently under `cargo test --workspace` never contend for a port.
 const ANVIL_BASE_PORT: u16 = 19_000;
 
+/// What each node's own app route charges, and so what every covering
+/// voucher must advance the payee's watermark by.
+const APP_PRICE: u64 = 1_000;
+/// The fee each node's peering with the other retains per packet (ADR
+/// 0061). Non-zero on purpose: it is what makes "advanced by exactly the
+/// forwarded amount" a measurement of the fee rather than of the request.
+const PEER_FEE: u64 = 50;
+/// What a packet originated at one node carries to leave `APP_PRICE` at the
+/// other after the peering fee (ADR 0010, ADR 0028).
+const AMOUNT: u64 = APP_PRICE + PEER_FEE;
+/// The opening deposit each node puts behind its own outbound channel.
+const DEPOSIT: u128 = 10_000;
+/// Each node's settlement account's USDC.
+const FUNDED: u128 = 1_000_000;
+
 /// A distinct `created` per signed request: the operator surface rejects a
-/// replayed signature (ADR 0008's #1067 amendment), and the *point* of two
-/// of the writes below is that they are byte-identical.
+/// replayed signature (ADR 0008's #1067 amendment).
 static NEXT_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2_000);
 
 fn signed(keypair: &Keypair, method: Method, path: &str, body: Vec<u8>) -> Request<Body> {
@@ -97,67 +108,779 @@ fn signed(keypair: &Keypair, method: Method, path: &str, body: Vec<u8>) -> Reque
         .unwrap()
 }
 
-/// The raw bytes of a `0x`-optional hex private key.
-fn hex_bytes(hex: &str) -> Vec<u8> {
-    let hex = hex.trim_start_matches("0x");
-    (0..hex.len() / 2)
-        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("key is hex"))
-        .collect()
+fn bearer_get(path: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .header("authorization", "Bearer operator-secret")
+        .body(Body::empty())
+        .unwrap()
 }
 
-fn address_of(private_key: &str) -> [u8; 20] {
-    let secret = SecretKey::parse_slice(&hex_bytes(private_key))
-        .expect("an anvil dev key is a valid secret");
-    derive_evm_address(&PublicKey::from_secret_key(&secret).serialize())
-}
-
-fn channel_id_bytes(id: &str) -> [u8; 32] {
-    let hex = id.trim_start_matches("0x");
+fn hex32(text: &str) -> [u8; 32] {
+    let text = text.trim_start_matches("0x");
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .expect("a channel id is 0x-prefixed 64-hex");
+        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).expect("hex");
     }
     out
 }
 
+fn wallet_of(key: &str) -> LocalWallet {
+    LocalWallet::from_bytes(&hex32(key)).expect("key")
+}
+
+fn address_of(key: &str) -> Address {
+    wallet_of(key).address()
+}
+
+fn spelled(address: Address) -> String {
+    format!("{address:#x}")
+}
+
+fn write_key_hex(keypair: &Keypair) -> String {
+    keypair
+        .public
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+async fn answer(router: &Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+    let response = router.clone().oneshot(request).await.expect("an answer");
+    let status = response.status();
+    let bytes = hyper::body::to_bytes(response.into_body())
+        .await
+        .expect("the body");
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into()));
+    (status, body)
+}
+
+/// A PREPARE to `destination` carrying `amount`, sealed to `receiver`
+/// (ADR 0018), with the secret its answer is opened with.
+fn sealed_prepare(
+    destination: &str,
+    amount: u64,
+    receiver: &PublicKeyBytes,
+    body: &[u8],
+) -> (Prepare, [u8; 32]) {
+    let plaintext = EnvelopeRequest {
+        method: "POST".to_string(),
+        target: "/".to_string(),
+        headers: vec![],
+        body: body.to_vec(),
+    }
+    .encode();
+    let (data, shared_secret) = seal_request(&plaintext, receiver).expect("seal");
+    (
+        Prepare {
+            amount,
+            expires_at: Utc::now() + ChronoDuration::minutes(5),
+            greeting: false,
+            destination: destination.to_string(),
+            data,
+        },
+        shared_secret,
+    )
+}
+
+/// One chain for the whole test: anvil, x402 placed, a FiatToken USDC, the
+/// `TokenNetwork` registry the `[settlement.evm]` table still names until
+/// #1382, and both nodes' settlement accounts holding [`FUNDED`] USDC.
+struct Chain {
+    anvil: Anvil,
+    x402: X402Chain,
+    token: Address,
+    registry: Address,
+}
+
+impl Chain {
+    async fn spawn(offset: u16) -> Chain {
+        let anvil = Anvil::spawn(ANVIL_BASE_PORT + offset).await;
+        let mut x402 = X402Chain::place(&anvil.rpc_url).await;
+        let token = x402.deploy_fiat_token().await;
+        let registry = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
+            .await
+            .expect("a TokenNetwork registry for the settlement table")
+            .registry_address();
+        for key in [DEPLOYER_PRIVATE_KEY, COUNTERPARTY_PRIVATE_KEY] {
+            x402.mint(token, address_of(key), FUNDED).await;
+        }
+        Chain {
+            anvil,
+            x402,
+            token,
+            registry,
+        }
+    }
+
+    /// Whether `TokenNetwork` holds a channel between the two anvil keys --
+    /// what `POST /peers` opened on EVM before ADR 0075, and must not now.
+    async fn token_network_channel_between_the_nodes(&self) -> bool {
+        let reader = EvmSettlementBackend::connect(
+            &connector_settlement_evm::RpcTransport::direct(&self.anvil.rpc_url)
+                .expect("rpc transport"),
+            COUNTERPARTY_PRIVATE_KEY,
+            self.registry,
+            self.token,
+            6,
+        )
+        .await
+        .expect("a TokenNetwork reader");
+        reader
+            .channel_with(address_of(DEPLOYER_PRIVATE_KEY))
+            .await
+            .expect("ask TokenNetwork")
+            .is_some()
+    }
+}
+
+/// A router behind a socket that can be swapped for another: how a node
+/// **restarts** here. A new runtime is built from the same config file and
+/// `state_dir` through the production boot path and takes over the socket
+/// the peer's durable row names; the old one stops being reached.
+#[derive(Clone)]
+struct Swappable(Arc<Mutex<Router>>);
+
+impl Swappable {
+    fn serve(listener: std::net::TcpListener, router: Router) -> Swappable {
+        let swappable = Swappable(Arc::new(Mutex::new(router)));
+        let inner = swappable.clone();
+        let service = tower::service_fn(move |request: Request<Body>| {
+            let router = inner.0.lock().expect("router lock").clone();
+            async move { router.oneshot(request).await }
+        });
+        tokio::spawn(async move {
+            let _ = axum::Server::from_tcp(listener)
+                .expect("serve the bound listener")
+                .serve(tower::make::Shared::new(service))
+                .await;
+        });
+        swappable
+    }
+
+    fn router(&self) -> Router {
+        self.0.lock().expect("router lock").clone()
+    }
+
+    fn swap(&self, router: Router) {
+        *self.0.lock().expect("router lock") = router;
+    }
+}
+
+/// Which carriage the two nodes peer over: each exposes and publishes
+/// that one, and `POST /peers` dials whatever the other publishes.
+#[derive(Clone, Copy, Debug)]
+enum Carriage {
+    Http,
+    Btp,
+}
+
+/// One config-driven node on a real socket: its key files, its state, its
+/// config, and its router behind a swappable socket.
+struct Node {
+    name: &'static str,
+    settlement_key: &'static str,
+    addr: SocketAddr,
+    operator: Keypair,
+    state_dir: tempfile::TempDir,
+    _signer_key: tempfile::NamedTempFile,
+    _settlement_key: tempfile::NamedTempFile,
+    config: connector_config::Config,
+    runtime: connector_cli::Runtime,
+    socket: Swappable,
+}
+
+impl Node {
+    /// Node `name` settling as `settlement_key`, answering to
+    /// `g.example.<name>`, with a priced app route under it and a free one
+    /// **pinned to the carriage it does not peer over**: a client arriving
+    /// over the peering's carriage is refused that route (ADR 0072), and a
+    /// peer is not held to a client's pin -- which is how a zero-value
+    /// packet's attribution is observable below.
+    async fn boot(
+        name: &'static str,
+        settlement_key: &'static str,
+        signer_seed: u8,
+        chain: &Chain,
+        carriage: Carriage,
+        app: &str,
+    ) -> Node {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the node");
+        let addr = listener.local_addr().expect("the node's address");
+        let operator = Keypair::generate(&mut OsRng);
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let mut signer_key = tempfile::NamedTempFile::new().expect("signer key");
+        signer_key.write_all(&[signer_seed; 32]).expect("write");
+        let mut settlement_key_file = tempfile::NamedTempFile::new().expect("settlement key");
+        settlement_key_file
+            .write_all(settlement_key.as_bytes())
+            .expect("write");
+        let (expose, btp_endpoint, pinned) = match carriage {
+            Carriage::Http => ("http", String::new(), "btp"),
+            Carriage::Btp => (
+                "btp",
+                format!("btp_endpoint = \"ws://{addr}/ilp/btp\""),
+                "http",
+            ),
+        };
+        let config = support::load_config(&format!(
+            r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+peer_allow_plaintext_endpoints = true
+peer_expose = "{expose}"
+
+[node]
+addresses     = ["g.example.{name}"]
+http_endpoint = "http://{addr}/ilp"
+{btp_endpoint}
+
+[signer]
+key_file = "{signer_key}"
+
+[operator]
+bearer_token = "operator-secret"
+write_keys = ["{write_key}"]
+
+[[routes]]
+prefix = "g.example.{name}.app"
+handler_url = "http://{app}/"
+price = {APP_PRICE}
+
+[[routes]]
+prefix = "g.example.{name}.pinned"
+handler_url = "http://{app}/pinned"
+price = 0
+transport = "{pinned}"
+
+[settlement.evm]
+rpc_url = "{rpc_url}"
+contract_address = "{registry:?}"
+token_address = "{token:?}"
+decimals = 6
+
+[settlement.evm.key]
+key_file = "{settlement_key}"
+
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+"#,
+            state_dir = state_dir.path().display(),
+            signer_key = signer_key.path().display(),
+            settlement_key = settlement_key_file.path().display(),
+            write_key = write_key_hex(&operator),
+            rpc_url = chain.anvil.rpc_url,
+            registry = chain.registry,
+            token = chain.token,
+        ));
+        let runtime = connector_cli::build(&config).await.expect("build the node");
+        let router = connector_cli::router(&runtime, &config).expect("the node's router");
+        let socket = Swappable::serve(listener, router);
+        Node {
+            name,
+            settlement_key,
+            addr,
+            operator,
+            state_dir,
+            _signer_key: signer_key,
+            _settlement_key: settlement_key_file,
+            config,
+            runtime,
+            socket,
+        }
+    }
+
+    /// Restart from the same config file and `state_dir`, through the
+    /// production boot path, on the same socket.
+    async fn restart(&mut self) {
+        self.runtime = connector_cli::build(&self.config)
+            .await
+            .expect("rebuild the node");
+        self.socket
+            .swap(connector_cli::router(&self.runtime, &self.config).expect("the node's router"));
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/ilp", self.addr)
+    }
+
+    fn settlement_address(&self) -> Address {
+        address_of(self.settlement_key)
+    }
+
+    /// The key a payload for this node is sealed to (ADR 0018).
+    fn identity(&self) -> PublicKeyBytes {
+        self.runtime
+            .signer
+            .public_key()
+            .expect("a local signer has a public key")
+    }
+
+    async fn write(
+        &self,
+        method: Method,
+        path: &str,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        let (status, answer) = answer(
+            &self.socket.router(),
+            signed(
+                &self.operator,
+                method,
+                path,
+                serde_json::to_vec(&body).expect("json"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{} {path}: {answer}", self.name);
+        answer
+    }
+
+    async fn read(&self, path: &str) -> serde_json::Value {
+        let (status, answer) = answer(&self.socket.router(), bearer_get(path)).await;
+        assert_eq!(status, StatusCode::OK, "{} {path}: {answer}", self.name);
+        answer
+    }
+
+    /// `POST /peers` naming `other`, at `fee`, with this node's own opening
+    /// deposit.
+    async fn peer_with(&self, other: &Node, fee: u64) -> serde_json::Value {
+        self.write(
+            Method::POST,
+            "/peers",
+            serde_json::json!({
+                "id": other.name,
+                "url": other.url(),
+                "fee": fee,
+                "max_packet_amount": 5_000,
+                "deposit": DEPOSIT,
+            }),
+        )
+        .await
+    }
+
+    /// Route everything under `other`'s addresses to the peering with it.
+    async fn route_to(&self, other: &Node) {
+        self.write(
+            Method::POST,
+            "/routes/peers",
+            serde_json::json!({
+                "prefix": format!("g.example.{}", other.name),
+                "peer_id": other.name,
+                "price": AMOUNT,
+            }),
+        )
+        .await;
+    }
+
+    /// Originate one packet over `POST /packets`, sealed to `payee`: the
+    /// app's own answer, or the reject.
+    async fn originate(
+        &self,
+        payee: &Node,
+        route: &str,
+        amount: u64,
+        body: &[u8],
+    ) -> Result<Vec<u8>, Reject> {
+        let (prepare, shared_secret) = sealed_prepare(
+            &format!("g.example.{}.{route}", payee.name),
+            amount,
+            &payee.identity(),
+            body,
+        );
+        let response = self
+            .socket
+            .router()
+            .oneshot(signed(
+                &self.operator,
+                Method::POST,
+                "/packets",
+                prepare.encode(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        match Fulfill::decode(&bytes) {
+            Ok(fulfill) => {
+                let opened =
+                    open_response(&shared_secret, &fulfill.data).expect("open the response");
+                let envelope = EnvelopeResponse::decode(&opened).expect("an envelope");
+                assert_eq!(envelope.status, 200);
+                Ok(envelope.body)
+            }
+            Err(_) => Err(Reject::decode(&bytes).expect("a FULFILL or a REJECT")),
+        }
+    }
+
+    /// The highest voucher this node accepted on inbound channel `id`, as
+    /// `GET /channels` reports it; zero for one it has accepted none on.
+    async fn inbound_watermark(&self, id: &str) -> u64 {
+        let channels = self.read("/channels").await;
+        channels
+            .as_array()
+            .expect("a list")
+            .iter()
+            .find(|row| row["id"] == id && row["direction"] == "inbound")
+            .map_or(0, |row| row["watermark"].as_u64().expect("a watermark"))
+    }
+
+    /// Every voucher this node's client-edge journal recorded on channel
+    /// `id`, in order: the durable record a restart replays and a landing
+    /// submits (ADR 0005). A voucher channel keeps one watermark whichever
+    /// role its vouchers arrive under (`peer-carriage-spec.md` §1.8), so a
+    /// peer's are journaled beside a client's.
+    fn journaled(&self, id: &str) -> Vec<u64> {
+        let journal =
+            std::fs::read_to_string(self.state_dir.path().join(support::CLIENT_EDGE_JOURNAL))
+                .unwrap_or_default();
+        journal
+            .lines()
+            .filter(|line| line.starts_with("inbound_claim_accepted\t"))
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split('\t').collect();
+                (fields[1] == format!("evm:{id}")).then(|| fields[3].parse().expect("an amount"))
+            })
+            .collect()
+    }
+}
+
+fn channel_of(established: &serde_json::Value) -> String {
+    established["channel"]["id"]
+        .as_str()
+        .expect("the channel's id")
+        .to_string()
+}
+
+/// An app answering every write with 200 "delivered".
+fn spawn_app() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind app");
+    let addr = listener.local_addr().expect("app addr");
+    let app = Router::new()
+        .route("/", post(|| async { "delivered" }))
+        .route("/pinned", post(|| async { "delivered" }));
+    tokio::spawn(async move {
+        let _ = axum::Server::from_tcp(listener)
+            .expect("serve the app")
+            .serve(app.into_make_service())
+            .await;
+    });
+    addr.to_string()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Seam 2: two nodes, each `POST /peers` the other.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn two_nodes_peer_over_two_x402_channels_over_http() {
+    two_nodes_peer_over_two_x402_channels(Carriage::Http, 40).await;
+}
+
+#[tokio::test]
+async fn two_nodes_peer_over_two_x402_channels_over_btp() {
+    two_nodes_peer_over_two_x402_channels(Carriage::Btp, 50).await;
+}
+
+async fn two_nodes_peer_over_two_x402_channels(carriage: Carriage, offset: u16) {
+    // `require_anvil`, not a bare availability check: it panics when `CI`
+    // is set and skips only on a developer machine without Foundry.
+    if !require_anvil() {
+        return;
+    }
+    let chain = Chain::spawn(offset).await;
+    let app = spawn_app();
+    let mut a = Node::boot(
+        "nodea",
+        COUNTERPARTY_PRIVATE_KEY,
+        0x0a,
+        &chain,
+        carriage,
+        &app,
+    )
+    .await;
+    let mut b = Node::boot("nodeb", DEPLOYER_PRIVATE_KEY, 0x0b, &chain, carriage, &app).await;
+
+    // ── Each self-description publishes its node's voucher signer ───────
+    // (ADR 0075 decision 10): the EVM settlement address, which every
+    // channel the node opens names as `payerAuthorizer`.
+    let described = a.read("/ilp").await;
+    assert_eq!(
+        described["voucherSigners"],
+        serde_json::json!([{
+            "network": format!("eip155:{}", chain.x402.chain_id()),
+            "signer": spelled(a.settlement_address()),
+        }]),
+        "{described}"
+    );
+
+    // ── Each node writes `POST /peers` naming the other ─────────────────
+    let b_established = b.peer_with(&a, PEER_FEE).await;
+    let a_established = a.peer_with(&b, PEER_FEE).await;
+    for established in [&a_established, &b_established] {
+        assert_eq!(established["channel"]["status"], "created");
+        assert_eq!(established["channel"]["chain"], "evm");
+        assert_eq!(established["fee"], PEER_FEE);
+    }
+    let b_to_a = channel_of(&b_established);
+    let a_to_b = channel_of(&a_established);
+    assert_ne!(b_to_a, a_to_b, "a peering is two channels, one each way");
+    // Each opened and funded only its own, on x402, and nothing on
+    // `TokenNetwork` (ADR 0075 decision 4).
+    assert_eq!(
+        chain.x402.channel(&ChannelId(b_to_a.clone())).await,
+        (DEPOSIT, 0)
+    );
+    assert_eq!(
+        chain.x402.channel(&ChannelId(a_to_b.clone())).await,
+        (DEPOSIT, 0)
+    );
+    for node in [&a, &b] {
+        assert_eq!(
+            chain
+                .x402
+                .balance_of(chain.token, node.settlement_address())
+                .await,
+            FUNDED - DEPOSIT,
+            "{} funded its own channel and nothing else",
+            node.name
+        );
+    }
+    assert!(
+        !chain.token_network_channel_between_the_nodes().await,
+        "POST /peers on EVM no longer opens a TokenNetwork channel"
+    );
+    b.route_to(&a).await;
+    a.route_to(&b).await;
+
+    // ── B pays A, twice: each forward carries a voucher ─────────────────
+    for (crossing, body) in [(1, b"first".as_slice()), (2, b"second".as_slice())] {
+        let delivered = b
+            .originate(&a, "app", AMOUNT, body)
+            .await
+            .unwrap_or_else(|reject| panic!("B→A crossing {crossing}: {reject:?}"));
+        assert_eq!(delivered, b"delivered");
+        assert_eq!(
+            a.inbound_watermark(&b_to_a).await,
+            crossing * APP_PRICE,
+            "A's watermark on B's channel advanced by exactly what B forwarded: the packet \
+             carried {AMOUNT}, B kept its {PEER_FEE} fee (ADR 0061), and {APP_PRICE} reached A"
+        );
+    }
+    assert_eq!(a.journaled(&b_to_a), vec![APP_PRICE, 2 * APP_PRICE]);
+
+    // ── A pays B, on its own channel ─────────────────────────────────────
+    a.originate(&b, "app", AMOUNT, b"back the other way")
+        .await
+        .unwrap_or_else(|reject| panic!("A→B: {reject:?}"));
+    assert_eq!(b.inbound_watermark(&a_to_b).await, APP_PRICE);
+    assert_eq!(b.journaled(&a_to_b), vec![APP_PRICE]);
+
+    // ── A zero-value packet carries the challenge, and no voucher ───────
+    // Only a peering with no fee can carry one (a fee leaves nothing to
+    // forward, R01), so B reprices its peering -- a repeat of the write,
+    // which finds its channel and opens nothing.
+    let repriced = b.peer_with(&a, 0).await;
+    assert_eq!(repriced["channel"]["status"], "found");
+    assert_eq!(repriced["channel"]["id"], b_to_a.as_str());
+    if let Carriage::Http = carriage {
+        // Control: the same zero-value packet from a client, over HTTP, is
+        // refused the route pinned to BTP.
+        let (prepare, _) =
+            sealed_prepare("g.example.nodea.pinned", 0, &a.identity(), b"from a client");
+        let response = a
+            .socket
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ilp")
+                    .body(Body::from(prepare.encode()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        assert!(
+            Fulfill::decode(&bytes).is_err(),
+            "control: a client is refused the pinned route over this carriage"
+        );
+    }
+    // Delivered over the carriage the route is NOT pinned to: only a peer
+    // is not held to that pin, and with no voucher on the packet only the
+    // peer-role challenge can have made it one (ADR 0075 decision 5).
+    b.originate(&a, "pinned", 0, b"no value")
+        .await
+        .unwrap_or_else(|reject| {
+            panic!("a zero-value packet is attributed to the peering by the challenge: {reject:?}")
+        });
+    assert_eq!(
+        a.journaled(&b_to_a),
+        vec![APP_PRICE, 2 * APP_PRICE],
+        "a zero-value packet carries no voucher and journals nothing"
+    );
+    b.peer_with(&a, PEER_FEE).await;
+
+    // ── Each voucher's verdict rides back in the ack ────────────────────
+    if let Carriage::Http = carriage {
+        the_ack_carries_each_vouchers_verdict(&chain, &a, &b, &b_to_a).await;
+    }
+    let settled = a.inbound_watermark(&b_to_a).await;
+
+    // ── The payer restarts, and pays on from its restored watermark ─────
+    b.restart().await;
+    b.originate(&a, "app", AMOUNT, b"after the payer restarted")
+        .await
+        .unwrap_or_else(|reject| panic!("B→A after B restarted: {reject:?}"));
+    assert_eq!(a.inbound_watermark(&b_to_a).await, settled + APP_PRICE);
+
+    // ── The payee restarts, and judges from its restored watermark ──────
+    // Over HTTP, where each request reaches whichever process holds the
+    // socket; a BTP session dialled before a restart would still reach the
+    // old one here, which the swappable socket cannot sever.
+    if let Carriage::Http = carriage {
+        a.restart().await;
+        b.originate(&a, "app", AMOUNT, b"after the payee restarted")
+            .await
+            .unwrap_or_else(|reject| panic!("B→A after A restarted: {reject:?}"));
+        assert_eq!(a.inbound_watermark(&b_to_a).await, settled + 2 * APP_PRICE);
+        // ...and, restarted, pays too: its outbound watermark came back with
+        // its channel.
+        a.originate(&b, "app", AMOUNT, b"from the restarted node")
+            .await
+            .unwrap_or_else(|reject| panic!("A→B after A restarted: {reject:?}"));
+        assert_eq!(b.inbound_watermark(&a_to_b).await, 2 * APP_PRICE);
+    }
+
+    // ── One peering, whatever the retries ───────────────────────────────
+    let peers: Vec<PeerView> = serde_json::from_value(b.read("/peers").await).unwrap();
+    assert_eq!(peers.len(), 1, "{peers:?}");
+    assert_eq!(peers[0].fee, PEER_FEE);
+    assert_eq!(
+        chain.x402.channel(&ChannelId(b_to_a)).await.0,
+        DEPOSIT,
+        "no repeat deposited anything more"
+    );
+}
+
+/// §6.1 over ILP-over-HTTP: the ack answers the voucher, independently of
+/// the packet. B's next voucher on its channel toward A is accepted; the
+/// same bytes again are accepted and advance nothing (§6.3's resend), so the
+/// packet they ride is refused as uncovered; and a voucher below the
+/// channel's watermark is refused `amount_not_advancing`.
+async fn the_ack_carries_each_vouchers_verdict(chain: &Chain, a: &Node, b: &Node, b_to_a: &str) {
+    let outbound = b.runtime.outbound_channels.clone().expect("B pays on x402");
+    let presentation = outbound.presentation(b_to_a).expect("B's channel");
+    assert!(matches!(presentation, ChannelPresentation::Evm { .. }));
+    let stale = outbound.signed(b_to_a).expect("B's channel");
+    let voucher = outbound
+        .sign_voucher(b_to_a, stale + u128::from(APP_PRICE))
+        .await
+        .expect("sign");
+    let as_json = |voucher: &Voucher| {
+        connector_runtime::voucher_json(
+            &presentation,
+            voucher,
+            &spelled(b.settlement_address()),
+            "2026-09-28T00:00:00.000Z",
+        )
+    };
+    let send = |json: String, body: &'static [u8]| {
+        let (prepare, _) = sealed_prepare("g.example.nodea.app", APP_PRICE, &a.identity(), body);
+        let router = a.socket.router();
+        async move {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/ilp")
+                        .header("ilp-payment-channel-claim", BASE64.encode(json))
+                        .body(Body::from(prepare.encode()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let ack = response
+                .headers()
+                .get("toon-claim-ack")
+                .map(|value| {
+                    String::from_utf8(BASE64.decode(value.as_bytes()).expect("base64"))
+                        .expect("utf-8")
+                })
+                .expect("a peer's voucher is acknowledged");
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            (ack, Fulfill::decode(&bytes).is_ok())
+        }
+    };
+
+    let (ack, delivered) = send(as_json(&voucher), b"acked").await;
+    assert!(ack.contains("\"accepted\""), "{ack}");
+    assert!(delivered, "a fresh voucher covering the price delivers");
+
+    let (ack, delivered) = send(as_json(&voucher), b"resent").await;
+    assert!(
+        ack.contains("\"accepted\""),
+        "a byte-identical resend is accepted: {ack}"
+    );
+    assert!(!delivered, "...and pays for nothing new");
+
+    // A genuine voucher by B's key, below the channel's one watermark.
+    let below = Voucher {
+        cumulative_amount: stale,
+        signature: chain.x402.sign_voucher(
+            &wallet_of(b.settlement_key),
+            &ChannelId(b_to_a.to_string()),
+            stale,
+        ),
+    };
+    let (ack, delivered) = send(as_json(&below), b"stale").await;
+    assert!(
+        ack.contains("\"rejected\"") && ack.contains("amount_not_advancing"),
+        "{ack}"
+    );
+    assert!(!delivered);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The write itself, against a served document.
+// ─────────────────────────────────────────────────────────────────────────
+
 /// A **real** self-description on a **real** socket, exactly as ADR 0050
-/// says a connector answers a `GET` on its own URL with.
-///
-/// Nothing signs it and nothing vouches for it. That is the record's own
-/// position: whoever answers the URL the operator named is who the peering
-/// is with, and the operator's vetting of the URL is the whole of the
-/// assurance.
-fn serve_self_description(
-    settlement_address: [u8; 20],
-    token_network: [u8; 20],
-    registry: [u8; 20],
-    token: [u8; 20],
-) -> SocketAddr {
+/// says a connector answers a `GET` on its own URL with: x402 terms naming
+/// `receiver`, and `receiver` as the voucher signer. Nothing signs it and
+/// nothing vouches for it: whoever answers the URL the operator named is who
+/// the peering is with.
+fn serve_self_description(chain: &Chain, receiver: Address) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
+    let network = format!("eip155:{}", chain.x402.chain_id());
     let document = NodeSelfDescription::describe(
         &NodeFacts {
             ilp_addresses: vec!["g.example.counterparty".to_string()],
-            // The peering's endpoint *and* the counterparty's client edge:
-            // on ILP-over-HTTP they are the same URL, which is what every
-            // `local/` topology already writes twice by hand.
             http_endpoint: Some(format!("http://{addr}/ilp")),
             btp_endpoint: None,
             peer_carriages: vec!["http".to_string()],
-            settlements: vec![X402ChainSettlementTerms::Evm(X402SettlementTerms {
-                chain: format!("evm:{ANVIL_CHAIN_ID}"),
-                settlement_address: to_hex(&settlement_address),
-                token_network_registry: to_hex(&registry),
-                token_network: to_hex(&token_network),
-                token_address: to_hex(&token),
-                decimals: 6,
+            settlements: Vec::new(),
+            batch_settlements: vec![X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
+                network: network.clone(),
+                asset: spelled(chain.token),
+                pay_to: spelled(receiver),
+                receiver_authorizer: spelled(receiver),
+                min_withdraw_delay_secs: 86_400,
+                name: "USDC".to_string(),
+                version: "2".to_string(),
             })],
-            batch_settlements: Vec::new(),
+            voucher_signers: vec![VoucherSignerFact {
+                network,
+                signer: spelled(receiver),
+            }],
         },
         // A secp256k1 edge identity, deliberately a different value from
-        // the settlement address above: the two are not interchangeable,
-        // and a build that confused them would derive the channel here.
+        // the settlement address above: the two are not interchangeable.
         Some(EdgeIdentity {
             key_id: "counterparty-edge-key".to_string(),
             public_key: "0x04".to_string() + &"cd".repeat(64),
@@ -181,602 +904,237 @@ fn serve_self_description(
     addr
 }
 
-async fn body_json(response: axum::response::Response) -> serde_json::Value {
-    let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-    serde_json::from_slice(&bytes).expect("a JSON body")
-}
-
+/// **One operator write opens this node's own channel, and repeating it
+/// finds that channel** (ADR 0075 decisions 4 and 8). The endpoint spends
+/// gas, so a repeat must be a success rather than a second channel -- and
+/// the answer says which branch it took.
 #[tokio::test]
-async fn one_operator_write_establishes_a_peering_and_repeating_it_finds_the_same_channel() {
-    // `require_anvil`, not a bare availability check: a guard that returns
-    // early and reports `passed` in CI is worse than a missing test. It
-    // panics when `CI` is set and skips only on a developer machine
-    // without Foundry.
+async fn one_operator_write_opens_this_nodes_own_channel_and_repeating_it_finds_it() {
     if !require_anvil() {
         return;
     }
-
-    let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
-    let token =
-        EvmSettlementBackend::deploy_mock_token(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, 1_000_000)
-            .await
-            .expect("deploy mock USDC");
-    let deployed = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("deploy a TokenNetwork through a fresh registry");
-    let registry_address = deployed.registry_address();
-    let token_network_address = deployed.address();
-    drop(deployed);
-
-    // The node settles as anvil's first genesis account; the counterparty
-    // it is about to peer with is the second. Two real addresses, each able
-    // to sign a balance proof `claimFromChannel` recovers -- which is what
-    // makes "the channel derives from the settlement address" a claim with
-    // consequences rather than a naming preference.
-    let node_settlement = address_of(DEPLOYER_PRIVATE_KEY);
-    let counterparty_settlement = address_of(COUNTERPARTY_PRIVATE_KEY);
-    assert_ne!(node_settlement, counterparty_settlement);
-
-    let peer_addr = serve_self_description(
-        counterparty_settlement,
-        token_network_address.into(),
-        registry_address.into(),
-        token.into(),
-    );
-
-    let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
-    key_file
-        .write_all(DEPLOYER_PRIVATE_KEY.as_bytes())
-        .expect("write key file");
-    let state_dir = tempfile::tempdir().expect("temp state dir");
-
-    let keypair = Keypair::generate(&mut OsRng);
-    let write_key_hex = keypair
-        .public
-        .to_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-
-    // A node with **no `[[peers]]` table at all**: every peering below is
-    // established over the operator surface, which is the whole of what
-    // ADR 0058 adds. `peer_allow_plaintext_endpoints` is the same opt-in
-    // every `local/` topology takes -- there is no TLS terminator in front
-    // of a loopback socket.
-    let mut config_file = tempfile::NamedTempFile::new().expect("temp config file");
-    write!(
-        config_file,
-        r#"
-client_edge_addr = "127.0.0.1:0"
-state_dir = "{state_dir}"
-peer_allow_plaintext_endpoints = true
-
-[signer]
-key_file = "{key_path}"
-
-[operator]
-bearer_token = "operator-secret"
-write_keys = ["{write_key_hex}"]
-
-[settlement.evm]
-rpc_url = "{rpc_url}"
-contract_address = "{registry_address:?}"
-token_address = "{token:?}"
-decimals = 6
-
-[settlement.evm.key]
-key_file = "{key_path}"
-"#,
-        state_dir = state_dir.path().display(),
-        key_path = key_file.path().display(),
-        rpc_url = anvil.rpc_url,
+    let chain = Chain::spawn(0).await;
+    let app = spawn_app();
+    let node = Node::boot(
+        "nodeb",
+        DEPLOYER_PRIVATE_KEY,
+        0x0b,
+        &chain,
+        Carriage::Http,
+        &app,
     )
-    .expect("write config file");
-
-    let command = connector_cli::run(&[
-        "connector".to_string(),
-        config_file.path().display().to_string(),
-    ])
-    .await
-    .expect("run: a config-driven node with EVM settlement and no peering");
-    let connector_cli::Command::Serve(node) = command else {
-        panic!("a config path must produce a servable node");
-    };
-    let app = node.router;
-
-    let peer_body = serde_json::to_vec(&serde_json::json!({
+    .await;
+    let counterparty = address_of(COUNTERPARTY_PRIVATE_KEY);
+    let served = serve_self_description(&chain, counterparty);
+    let body = serde_json::json!({
         "id": "apex-relay-2",
-        "url": format!("http://{peer_addr}/ilp"),
+        "url": format!("http://{served}/ilp"),
         "fee": 100,
         "max_packet_amount": 5_000,
-    }))
-    .unwrap();
+    });
 
-    // ── The write ────────────────────────────────────────────────────────
-    let response = app
-        .clone()
-        .oneshot(signed(&keypair, Method::POST, "/peers", peer_body.clone()))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let established = body_json(response).await;
+    // No channel toward the counterparty yet, and no deposit named: refused
+    // by name, before anything is spent.
+    let (status, refused) = answer(
+        &node.socket.router(),
+        signed(
+            &node.operator,
+            Method::POST,
+            "/peers",
+            serde_json::to_vec(&body).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(refused.to_string().contains("deposit"), "{refused}");
 
+    let mut with_deposit = body.clone();
+    with_deposit["deposit"] = serde_json::json!(DEPOSIT);
+    let established = node
+        .write(Method::POST, "/peers", with_deposit.clone())
+        .await;
     assert_eq!(established["id"], "apex-relay-2");
     assert_eq!(established["source"], "runtime");
-    // The operator's own policy, read back: the fee this hop retains and
-    // the cap it enforces (ADR 0049, ADR 0061). Neither could come from
-    // the document, which is why both are in the request.
     assert_eq!(established["fee"], 100);
     assert_eq!(established["max_packet_amount"], 5_000);
-    // No channel existed for this pair, so the write opened one and waited
-    // for it. The branch is in the answer so an unintended second channel
-    // is visible here rather than on a block explorer later.
     assert_eq!(established["channel"]["status"], "created");
     assert_eq!(established["channel"]["chain"], "evm");
-    let channel_id = established["channel"]["id"]
-        .as_str()
-        .expect("the channel's id")
-        .to_string();
+    let channel_id = channel_of(&established);
 
-    // ── The channel is the two SETTLEMENT addresses' ────────────────────
-    // Read off the chain, not off the answer: `TokenNetwork.channels(id)`
-    // carries both participants, and a channel derived from anything but
-    // the settlement addresses would name someone else here.
-    let reader = EvmSettlementBackend::connect(
-        &connector_settlement_evm::RpcTransport::direct(&anvil.rpc_url).expect("rpc transport"),
-        COUNTERPARTY_PRIVATE_KEY,
-        registry_address,
-        token,
-        6,
-    )
-    .await
-    .expect("a second backend under the counterparty's own key");
-    let counterparty_view = reader
-        .channel_counterparty(channel_id_bytes(&channel_id))
-        .await
-        .expect("read the channel back off the chain")
-        .expect("the channel exists and this backend is a participant");
+    // The channel is this node's, toward the published receiver, on x402 --
+    // read off the chain and off this node's own channel list.
     assert_eq!(
-        <[u8; 20]>::from(counterparty_view),
-        node_settlement,
-        "seen from the counterparty's side, the other participant is the node's SETTLEMENT \
-         address -- never its edge identity, which is a secp256k1 key on the client edge and \
-         could not be a TokenNetwork participant at all"
+        chain.x402.channel(&ChannelId(channel_id.clone())).await,
+        (DEPOSIT, 0)
+    );
+    let channels = node.read("/channels").await;
+    let row = channels
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|row| row["id"] == channel_id.as_str())
+        .expect("the channel is listed");
+    assert_eq!(row["direction"], "outbound");
+    assert_eq!(row["counterparty"], spelled(counterparty));
+    assert!(
+        !chain.token_network_channel_between_the_nodes().await,
+        "no TokenNetwork channel is opened"
     );
 
-    // ...and it is the id ADR 0059's derivation names, computed here from
-    // the two participants alone with no help from the answer above.
-    let derived = reader
-        .channel_with(node_settlement.into())
-        .await
-        .expect("ask the chain whether this pair has a channel")
-        .expect("it does");
-    assert_eq!(derived.0, channel_id);
-
-    // ── Repeating the identical request finds it ────────────────────────
-    let response = app
-        .clone()
-        .oneshot(signed(&keypair, Method::POST, "/peers", peer_body))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let repeated = body_json(response).await;
-    assert_eq!(
-        repeated["channel"]["status"], "found",
-        "a repeat must land on the channel the first attempt opened"
-    );
+    // Repeating the identical request finds it, and deposits nothing more.
+    let repeated = node.write(Method::POST, "/peers", with_deposit).await;
+    assert_eq!(repeated["channel"]["status"], "found");
     assert_eq!(repeated["channel"]["id"], channel_id.as_str());
-
-    // The chain agrees that there is still exactly one: the pair's epoch
-    // has not moved, so their current derived id is still this channel's.
-    let still = reader
-        .channel_with(node_settlement.into())
-        .await
-        .expect("ask again")
-        .expect("still one");
     assert_eq!(
-        still.0, channel_id,
-        "a retry must not open a second channel"
+        chain.x402.channel(&ChannelId(channel_id)).await,
+        (DEPOSIT, 0)
+    );
+    assert_eq!(
+        chain
+            .x402
+            .balance_of(chain.token, node.settlement_address())
+            .await,
+        FUNDED - DEPOSIT
     );
 
-    // ── The peering is one row, readable back ───────────────────────────
-    let read = Request::builder()
-        .method(Method::GET)
-        .uri("/peers")
-        .header("authorization", "Bearer operator-secret")
-        .body(Body::empty())
-        .unwrap();
-    let response = app.clone().oneshot(read).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-    let peers: Vec<PeerView> = serde_json::from_slice(&bytes).unwrap();
+    let peers: Vec<PeerView> = serde_json::from_value(node.read("/peers").await).unwrap();
     assert_eq!(peers.len(), 1, "one write, one peering: {peers:?}");
-    assert_eq!(peers[0].id, "apex-relay-2");
-    assert_eq!(peers[0].fee, 100);
-    assert_eq!(peers[0].max_packet_amount, 5_000);
 
-    // ── A route through it is now a second, separate write ──────────────
-    // ADR 0058: "onboarding becomes three calls, and two of them already
-    // exist". The route is accepted because the peering it names has a
-    // channel to pay from -- the runtime twin of ADR 0042's load rule.
-    let route_body = serde_json::to_vec(&serde_json::json!({
-        "prefix": "g.example.counterparty",
-        "peer_id": "apex-relay-2",
-        "price": 1_100,
-    }))
-    .unwrap();
-    let response = app
-        .clone()
-        .oneshot(signed(&keypair, Method::POST, "/routes/peers", route_body))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    // A route through it is a second, separate write, accepted because the
+    // peering has a channel to pay from (ADR 0042's load rule, at runtime).
+    node.write(
+        Method::POST,
+        "/routes/peers",
+        serde_json::json!({
+            "prefix": "g.example.counterparty",
+            "peer_id": "apex-relay-2",
+            "price": 1_100,
+        }),
+    )
+    .await;
 }
 
 /// The document is taken as served, and nothing in the request is compared
-/// against it.
-///
-/// A **second** node, given a document that publishes a *different*
-/// counterparty at the same URL, establishes a peering with that
-/// counterparty instead -- no refusal, no warning, and a channel opened
-/// against whoever the URL said. That is trust-on-first-use, and it is
-/// asserted here so a later change that quietly adds a pin, a fingerprint
-/// or a confirmation step fails a test rather than passing one.
+/// against it: a document publishing a **stranger** -- an address nobody
+/// here holds a key for -- gets a channel opened toward that stranger. That
+/// is trust-on-first-use (ADR 0058, unchanged by ADR 0075 decision 4), and
+/// it is asserted so a later change that quietly adds a pin fails a test
+/// rather than passing one.
 #[tokio::test]
 async fn whatever_the_url_serves_is_who_the_peering_is_with() {
     if !require_anvil() {
         return;
     }
-
-    let anvil = Anvil::spawn(ANVIL_BASE_PORT + 10).await;
-    let token =
-        EvmSettlementBackend::deploy_mock_token(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, 1_000_000)
-            .await
-            .expect("deploy mock USDC");
-    let deployed = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("deploy a TokenNetwork through a fresh registry");
-    let registry_address = deployed.registry_address();
-    let token_network_address = deployed.address();
-    drop(deployed);
-
-    // Not an anvil dev key at all -- an address nobody in this test holds
-    // a key for. The node has no way to tell, and does not try: it opens a
-    // channel against whoever the document named.
-    let stranger = [0x5au8; 20];
-    let peer_addr = serve_self_description(
-        stranger,
-        token_network_address.into(),
-        registry_address.into(),
-        token.into(),
-    );
-
-    let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
-    key_file
-        .write_all(DEPLOYER_PRIVATE_KEY.as_bytes())
-        .expect("write key file");
-    let state_dir = tempfile::tempdir().expect("temp state dir");
-    let keypair = Keypair::generate(&mut OsRng);
-    let write_key_hex = keypair
-        .public
-        .to_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-
-    let mut config_file = tempfile::NamedTempFile::new().expect("temp config file");
-    write!(
-        config_file,
-        r#"
-client_edge_addr = "127.0.0.1:0"
-state_dir = "{state_dir}"
-peer_allow_plaintext_endpoints = true
-
-[signer]
-key_file = "{key_path}"
-
-[operator]
-bearer_token = "operator-secret"
-write_keys = ["{write_key_hex}"]
-
-[settlement.evm]
-rpc_url = "{rpc_url}"
-contract_address = "{registry_address:?}"
-token_address = "{token:?}"
-decimals = 6
-
-[settlement.evm.key]
-key_file = "{key_path}"
-"#,
-        state_dir = state_dir.path().display(),
-        key_path = key_file.path().display(),
-        rpc_url = anvil.rpc_url,
-    )
-    .expect("write config file");
-
-    let command = connector_cli::run(&[
-        "connector".to_string(),
-        config_file.path().display().to_string(),
-    ])
-    .await
-    .expect("run: a config-driven node");
-    let connector_cli::Command::Serve(node) = command else {
-        panic!("a config path must produce a servable node");
-    };
-
-    let body = serde_json::to_vec(&serde_json::json!({
-        "id": "whoever-answers",
-        "url": format!("http://{peer_addr}/ilp"),
-    }))
-    .unwrap();
-    let response = node
-        .router
-        .oneshot(signed(&keypair, Method::POST, "/peers", body))
-        .await
-        .unwrap();
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "the identity a URL serves is not checked against anything the operator supplied"
-    );
-
-    let established = body_json(response).await;
-    assert_eq!(established["channel"]["status"], "created");
-    let channel_id = established["channel"]["id"].as_str().expect("a channel id");
-
-    // The channel really is with the address the document named.
-    let reader = EvmSettlementBackend::connect(
-        &connector_settlement_evm::RpcTransport::direct(&anvil.rpc_url).expect("rpc transport"),
+    let chain = Chain::spawn(10).await;
+    let app = spawn_app();
+    let node = Node::boot(
+        "nodeb",
         DEPLOYER_PRIVATE_KEY,
-        registry_address,
-        token,
-        6,
+        0x0b,
+        &chain,
+        Carriage::Http,
+        &app,
     )
-    .await
-    .expect("connect a reader");
-    let other = reader
-        .channel_counterparty(channel_id_bytes(channel_id))
-        .await
-        .expect("read the channel")
-        .expect("it exists");
-    assert_eq!(
-        <[u8; 20]>::from(other),
-        stranger,
-        "the counterparty is whoever the URL said, and the operator's vetting of that URL is \
-         the whole of the assurance"
-    );
+    .await;
+    let stranger = Address::from([0x5a; 20]);
+    let served = serve_self_description(&chain, stranger);
+    let established = node
+        .write(
+            Method::POST,
+            "/peers",
+            serde_json::json!({
+                "id": "whoever-answers",
+                "url": format!("http://{served}/ilp"),
+                "deposit": DEPOSIT,
+            }),
+        )
+        .await;
+    assert_eq!(established["channel"]["status"], "created");
+    let channel_id = channel_of(&established);
 
-    // ...and it is that node's SETTLEMENT address, not the edge identity
-    // the same document published beside it. The two are different keys
-    // on different curves for different jobs, and this is where confusing
-    // them would show: a channel derived from the edge key names a
-    // participant `claimFromChannel` can never recover a signer to.
-    let published_edge_key: [u8; 65] = hex_bytes(&("04".to_string() + &"cd".repeat(64)))
-        .try_into()
-        .expect("an uncompressed secp256k1 public key is 65 bytes");
-    let edge_identity_as_an_address = derive_evm_address(&published_edge_key);
-    assert_ne!(
-        <[u8; 20]>::from(other),
-        edge_identity_as_an_address,
-        "the channel derives from the settlement address of the chain in question, never from \
-         the edge identity a payload is sealed to"
+    let channels = node.read("/channels").await;
+    let row = channels
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|row| row["id"] == channel_id.as_str())
+        .expect("the channel is listed");
+    assert_eq!(
+        row["counterparty"],
+        spelled(stranger),
+        "the receiver is whoever the URL said, and the operator's vetting of that URL is the \
+         whole of the assurance"
     );
     assert_ne!(
-        <[u8; 20]>::from(other),
-        address_of(DEPLOYER_PRIVATE_KEY),
-        "and never from this node's own address either"
+        row["counterparty"],
+        spelled(node.settlement_address()),
+        "and never this node itself"
     );
 }
 
-/// Issue #1220, limb 2's motivating case: an HTTP-only node --
-/// `peer_expose = "http"`, `[node] http_endpoint` set and `btp_endpoint`
-/// simply absent -- publishes a self-description a stranger can actually
-/// dial, and a peering established against it lands over that one
-/// carriage.
-///
-/// Node A here is a REAL config-driven node bound to a real socket, not
-/// the hand-built fixture [`serve_self_description`] serves for the two
-/// tests above: this is the exact shape issue #1220 reported broken (the
-/// README's minimal config publishes no endpoint at all), so the
-/// self-description under test is the one `connector_cli` itself produces
-/// from a loaded `[node]` section, not one assembled by hand in this file.
+/// Issue #1220's case, on x402: an HTTP-only node -- `peer_expose =
+/// "http"`, `[node] http_endpoint` set, no `btp_endpoint` -- publishes a
+/// self-description a stranger can dial, with its voucher signer in it (ADR
+/// 0075 decision 10), and a counterparty's `POST /peers` against it lands
+/// over that one carriage.
 #[tokio::test]
 async fn an_http_only_nodes_self_description_is_dialable_and_a_counterparty_peers_with_it() {
     if !require_anvil() {
         return;
     }
-
-    let anvil = Anvil::spawn(ANVIL_BASE_PORT + 20).await;
-    let token =
-        EvmSettlementBackend::deploy_mock_token(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, 1_000_000)
-            .await
-            .expect("deploy mock USDC");
-    let deployed = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("deploy a TokenNetwork through a fresh registry");
-    let registry_address = deployed.registry_address();
-    drop(deployed);
-
-    // ── Node A: HTTP-only, on a real socket, describing itself for real ──
-    let mut node_a_key_file = tempfile::NamedTempFile::new().expect("temp key file");
-    node_a_key_file
-        .write_all(COUNTERPARTY_PRIVATE_KEY.as_bytes())
-        .expect("write key file");
-    let node_a_state_dir = tempfile::tempdir().expect("temp state dir");
-    let node_a_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let node_a_addr = node_a_listener.local_addr().expect("local addr");
-
-    let mut node_a_config_file = tempfile::NamedTempFile::new().expect("temp config file");
-    write!(
-        node_a_config_file,
-        r#"
-client_edge_addr = "127.0.0.1:0"
-state_dir = "{state_dir}"
-peer_expose = "http"
-
-[signer]
-key_file = "{key_path}"
-
-[node]
-addresses     = ["g.example.nodea"]
-http_endpoint = "http://{node_a_addr}/ilp"
-
-[settlement.evm]
-rpc_url = "{rpc_url}"
-contract_address = "{registry_address:?}"
-token_address = "{token:?}"
-decimals = 6
-
-[settlement.evm.key]
-key_file = "{key_path}"
-"#,
-        state_dir = node_a_state_dir.path().display(),
-        key_path = node_a_key_file.path().display(),
-        rpc_url = anvil.rpc_url,
+    let chain = Chain::spawn(20).await;
+    let app = spawn_app();
+    let a = Node::boot(
+        "nodea",
+        COUNTERPARTY_PRIVATE_KEY,
+        0x0a,
+        &chain,
+        Carriage::Http,
+        &app,
     )
-    .expect("write config file");
+    .await;
+    let b = Node::boot(
+        "nodeb",
+        DEPLOYER_PRIVATE_KEY,
+        0x0b,
+        &chain,
+        Carriage::Http,
+        &app,
+    )
+    .await;
 
-    let command = connector_cli::run(&[
-        "connector".to_string(),
-        node_a_config_file.path().display().to_string(),
-    ])
-    .await
-    .expect("run: an HTTP-only, config-driven node");
-    let connector_cli::Command::Serve(node_a) = command else {
-        panic!("a config path must produce a servable node");
-    };
-
-    let node_a_router = node_a.router.clone();
-    tokio::spawn(async move {
-        let _ = axum::Server::from_tcp(node_a_listener)
-            .expect("serve node A's bound listener")
-            .serve(node_a_router.into_make_service())
-            .await;
-    });
-
-    // Node A's own self-description, read straight off its router: exactly
-    // `httpEndpoint`, no `btpEndpoint` at all, and `peerCarriages` naming
-    // only the one carriage `peer_expose = "http"` opened.
-    let description_response = node_a
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/ilp")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(description_response.status(), StatusCode::OK);
-    let document = body_json(description_response).await;
-    assert_eq!(
-        document["httpEndpoint"],
-        serde_json::json!(format!("http://{node_a_addr}/ilp"))
-    );
+    let document = a.read("/ilp").await;
+    assert_eq!(document["httpEndpoint"], serde_json::json!(a.url()));
     assert!(
         document.get("btpEndpoint").is_none(),
         "an HTTP-only node must publish no btpEndpoint at all, not a null one: {document}"
     );
     assert_eq!(document["peerCarriages"], serde_json::json!(["http"]));
-
-    // ── Node B: the counterparty, making the one authenticated write ─────
-    let mut node_b_key_file = tempfile::NamedTempFile::new().expect("temp key file");
-    node_b_key_file
-        .write_all(DEPLOYER_PRIVATE_KEY.as_bytes())
-        .expect("write key file");
-    let node_b_state_dir = tempfile::tempdir().expect("temp state dir");
-    let keypair = Keypair::generate(&mut OsRng);
-    let write_key_hex = keypair
-        .public
-        .to_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-
-    let mut node_b_config_file = tempfile::NamedTempFile::new().expect("temp config file");
-    write!(
-        node_b_config_file,
-        r#"
-client_edge_addr = "127.0.0.1:0"
-state_dir = "{state_dir}"
-peer_allow_plaintext_endpoints = true
-
-[signer]
-key_file = "{key_path}"
-
-[operator]
-bearer_token = "operator-secret"
-write_keys = ["{write_key_hex}"]
-
-[settlement.evm]
-rpc_url = "{rpc_url}"
-contract_address = "{registry_address:?}"
-token_address = "{token:?}"
-decimals = 6
-
-[settlement.evm.key]
-key_file = "{key_path}"
-"#,
-        state_dir = node_b_state_dir.path().display(),
-        key_path = node_b_key_file.path().display(),
-        rpc_url = anvil.rpc_url,
-    )
-    .expect("write config file");
-
-    let command = connector_cli::run(&[
-        "connector".to_string(),
-        node_b_config_file.path().display().to_string(),
-    ])
-    .await
-    .expect("run: the counterparty node");
-    let connector_cli::Command::Serve(node_b) = command else {
-        panic!("a config path must produce a servable node");
-    };
-
-    let peer_body = serde_json::to_vec(&serde_json::json!({
-        "id": "node-a",
-        "url": format!("http://{node_a_addr}/ilp"),
-        "fee": 50,
-        "max_packet_amount": 2_000,
-    }))
-    .unwrap();
-
-    let response = node_b
-        .router
-        .oneshot(signed(&keypair, Method::POST, "/peers", peer_body))
-        .await
-        .unwrap();
     assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "a counterparty's POST /peers against an HTTP-only node's real, \
-         dialed self-description must succeed over HTTP"
+        document["voucherSigners"][0]["signer"],
+        spelled(a.settlement_address()),
+        "{document}"
     );
-    let established = body_json(response).await;
-    assert_eq!(established["id"], "node-a");
+
+    let established = b.peer_with(&a, PEER_FEE).await;
+    assert_eq!(established["id"], "nodea");
     assert_eq!(established["channel"]["status"], "created");
     assert_eq!(established["channel"]["chain"], "evm");
 }
 
 /// The near-miss ADR 0050 gives a name to: `POST /peers` takes a
-/// connector's self-description URL, not its origin. No anvil chain is
-/// needed here at all -- `establish_peering` fails while fetching the
-/// self-description, before it ever reaches settlement, so this test
-/// asserts only the 502 and its hint (issue #1219).
+/// connector's self-description URL, not its origin. No chain is needed --
+/// `establish_peering` fails while fetching the self-description, before it
+/// ever reaches settlement -- so this asserts only the 502 and its hint
+/// (issue #1219).
 #[tokio::test]
 async fn an_origin_without_ilp_answers_502_naming_the_fix() {
-    // A real socket serving nothing: a GET on its bare origin 404s, the
-    // way any host that has not mounted a self-description at that exact
-    // path does.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
-    let empty = Router::new();
     tokio::spawn(async move {
         let _ = axum::Server::from_tcp(listener)
             .expect("serve the bound listener")
-            .serve(empty.into_make_service())
+            .serve(Router::new().into_make_service())
             .await;
     });
 
@@ -786,16 +1144,7 @@ async fn an_origin_without_ilp_answers_502_naming_the_fix() {
         .expect("write key file");
     let state_dir = tempfile::tempdir().expect("temp state dir");
     let keypair = Keypair::generate(&mut OsRng);
-    let write_key_hex = keypair
-        .public
-        .to_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-
-    let mut config_file = tempfile::NamedTempFile::new().expect("temp config file");
-    write!(
-        config_file,
+    let config = support::load_config(&format!(
         r#"
 client_edge_addr = "127.0.0.1:0"
 state_dir = "{state_dir}"
@@ -810,590 +1159,33 @@ write_keys = ["{write_key_hex}"]
 "#,
         state_dir = state_dir.path().display(),
         key_path = key_file.path().display(),
-    )
-    .expect("write config file");
+        write_key_hex = write_key_hex(&keypair),
+    ));
+    let runtime = connector_cli::build(&config)
+        .await
+        .expect("a node with no settlement backend at all");
+    let router = connector_cli::router(&runtime, &config).expect("router");
 
-    let command = connector_cli::run(&[
-        "connector".to_string(),
-        config_file.path().display().to_string(),
-    ])
-    .await
-    .expect("run: a config-driven node with no settlement backend at all");
-    let connector_cli::Command::Serve(node) = command else {
-        panic!("a config path must produce a servable node");
-    };
-
-    // The README's failing spelling: an origin, no `/ilp`.
-    let peer_body = serde_json::to_vec(&serde_json::json!({
+    let body = serde_json::to_vec(&serde_json::json!({
         "id": "near-miss",
         "url": format!("http://{addr}"),
         "fee": 100,
         "max_packet_amount": 5_000,
     }))
     .unwrap();
-
-    let response = node
-        .router
-        .oneshot(signed(&keypair, Method::POST, "/peers", peer_body))
+    let response = router
+        .oneshot(signed(&keypair, Method::POST, "/peers", body))
         .await
         .unwrap();
     assert_eq!(
         response.status(),
         StatusCode::BAD_GATEWAY,
-        "the counterparty's host answered 404, which is the counterparty's problem, not this \
-         request's"
+        "the counterparty's host answered 404, which is the counterparty's problem"
     );
     let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
     let message = String::from_utf8(bytes.to_vec()).expect("a UTF-8 error body");
     assert!(
         message.contains("/ilp"),
         "the 502 must name the fix -- POST /peers takes the self-description URL: {message}"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// The routing table and the money, on EVM.
-// ─────────────────────────────────────────────────────────────────────────
-
-/// What node A's app route charges, and so what every covering claim
-/// below must advance A's watermark by.
-const APP_PRICE: u64 = 1_000;
-/// The fee B's peering with A retains per packet (ADR 0061). Non-zero on
-/// purpose: it is what makes "advanced by exactly the forwarded amount"
-/// a measurement of the fee rather than of the request.
-const PEER_FEE: u64 = 50;
-/// What a packet originated at B has to carry to leave `APP_PRICE` at A
-/// after B's own peering fee comes out of it (ADR 0010, ADR 0028).
-const AMOUNT: u64 = APP_PRICE + PEER_FEE;
-const PEERING_ID: &str = "node-a";
-const NODE_A_PREFIX: &str = "g.example.nodea";
-const NODE_A_APP_PREFIX: &str = "g.example.nodea.app";
-
-fn bearer_get(path: &str) -> Request<Body> {
-    Request::builder()
-        .method(Method::GET)
-        .uri(path)
-        .header("authorization", "Bearer operator-secret")
-        .body(Body::empty())
-        .unwrap()
-}
-
-async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
-    hyper::body::to_bytes(response.into_body())
-        .await
-        .unwrap()
-        .to_vec()
-}
-
-fn write_key_hex(keypair: &Keypair) -> String {
-    keypair
-        .public
-        .to_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-/// Serve `router` on an already-bound listener, so its port could be
-/// written into a config file before the node behind it existed.
-fn serve(listener: std::net::TcpListener, router: Router) {
-    tokio::spawn(async move {
-        let _ = axum::Server::from_tcp(listener)
-            .expect("serve the bound listener")
-            .serve(router.into_make_service())
-            .await;
-    });
-}
-
-/// Boot a config-driven node through the production boot path and hand
-/// back its merged router.
-async fn boot(config_path: &std::path::Path) -> Router {
-    let command = connector_cli::run(&["connector".to_string(), config_path.display().to_string()])
-        .await
-        .expect("run: a config-driven node with EVM settlement");
-    let connector_cli::Command::Serve(node) = command else {
-        panic!("a config path must produce a servable node");
-    };
-    node.router
-}
-
-/// `GET /routes/peers`: the peer-forwarding routing table as the operator
-/// surface reports it, config-file and runtime rows alike.
-async fn peer_routes(router: &Router) -> serde_json::Value {
-    let response = router
-        .clone()
-        .oneshot(bearer_get("/routes/peers"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    body_json(response).await
-}
-
-/// The payee's client book, read over its operator surface: every
-/// `(channel key, nonce, cumulative)` accepted at its client edge.
-async fn client_claims(router: &Router) -> Vec<(String, u64, u64)> {
-    let response = router.clone().oneshot(bearer_get("/claims")).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    body_json(response)
-        .await
-        .as_array()
-        .expect("GET /claims answers a list")
-        .iter()
-        .filter(|row| row["book"] == "client")
-        .map(|row| {
-            (
-                row["channel_id"]
-                    .as_str()
-                    .expect("a channel id")
-                    .to_string(),
-                row["nonce"].as_u64().expect("a nonce"),
-                row["cumulative_amount"].as_u64().expect("an amount"),
-            )
-        })
-        .collect()
-}
-
-/// The last claim the payee accepted at its client edge, straight off its
-/// own durable journal (`client-edge-claims.log`): `(channel key, nonce,
-/// cumulative, signature)`. The signature is what `GET /claims` does not
-/// carry, and what an on-chain redemption would submit.
-fn last_journalled_client_claim(state_dir: &std::path::Path) -> (String, u64, u64, Vec<u8>) {
-    let journal = std::fs::read_to_string(state_dir.join("client-edge-claims.log"))
-        .expect("the payee keeps a client-edge claim journal in its state_dir");
-    let line = journal
-        .lines()
-        .rfind(|line| line.starts_with("inbound_claim_accepted\t"))
-        .expect("at least one accepted claim is journalled");
-    let fields: Vec<&str> = line.split('\t').collect();
-    (
-        fields[1].to_string(),
-        fields[2].parse().expect("a nonce"),
-        fields[3].parse().expect("an amount"),
-        hex_bytes(fields[4]),
-    )
-}
-
-/// Originate one packet over node B's operator surface, addressed to node
-/// A's app route and gift-wrapped to A's edge identity (ADR 0018), and
-/// require the app's own answer back out of the FULFILL.
-async fn originate_and_expect_fulfil(
-    b: &Router,
-    write_key: &Keypair,
-    payee_identity: &PublicKeyBytes,
-    body: &[u8],
-) {
-    let plaintext = EnvelopeRequest {
-        method: "POST".to_string(),
-        target: "/".to_string(),
-        headers: vec![],
-        body: body.to_vec(),
-    }
-    .encode();
-    let (data, shared_secret) = seal_request(&plaintext, payee_identity).expect("seal");
-    let prepare = Prepare {
-        amount: AMOUNT,
-        expires_at: Utc::now() + ChronoDuration::minutes(5),
-        greeting: false,
-        destination: NODE_A_APP_PREFIX.to_string(),
-        data,
-    };
-    let response = b
-        .clone()
-        .oneshot(signed(
-            write_key,
-            Method::POST,
-            "/packets",
-            prepare.encode(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = body_bytes(response).await;
-    let fulfill = match Fulfill::decode(&bytes) {
-        Ok(fulfill) => fulfill,
-        Err(_) => {
-            let reject = Reject::decode(&bytes).expect("a packet answer is a FULFILL or a REJECT");
-            panic!(
-                "expected a fulfil -- issue #1217's bug answers a T00 naming a missing \
-                 '[[pay_channels]]' row here instead: {:?} {} (from {})",
-                reject.code, reject.message, reject.triggered_by
-            );
-        }
-    };
-    let opened = open_response(&shared_secret, &fulfill.data).expect("open the sealed response");
-    let envelope = EnvelopeResponse::decode(&opened).expect("decode envelope response");
-    assert_eq!(envelope.status, 200);
-    assert_eq!(envelope.body, b"delivered");
-}
-
-/// **A runtime peering lands in the routing table and pays for what it
-/// forwards, on a real EVM chain** -- the anvil twin of
-/// `solana_peering_from_a_url.rs`'s payment proof (issues #1217/#1230,
-/// #1233). Until this test, the EVM leg's *payment* half was proved only
-/// against a fake backend
-/// (`connector-client-edge/tests/runtime_peering_can_pay_the_forward_it_accepted.rs`);
-/// the tests above prove the channel half and stop at "`POST /routes/peers`
-/// answered 200".
-///
-/// Two config-driven nodes on one spawned `anvil`. Node A is served on a
-/// real socket so node B's `POST /peers` reads A's **own** self-description,
-/// exactly as a counterparty on a public chain would. Then:
-///
-/// 1. **The routing table.** `GET /routes/peers` is empty before the
-///    route write, holds exactly the posted row tagged `runtime` after it,
-///    and still does after B is booted again from the same `state_dir`.
-/// 2. **The money.** A packet originated over B's `POST /packets` crosses
-///    the peering and fulfils with the app's own answer, and A's client
-///    book shows B's claim under `evm:<channel>` advancing by exactly
-///    `AMOUNT - PEER_FEE` per crossing. That is ADR 0061's fee -- attached
-///    to the peering by `POST /peers`, never to the route -- measured on
-///    claims a chain-backed channel will redeem rather than restated from
-///    the request.
-/// 3. **The restart.** After B comes back, a third crossing advances the
-///    same watermark: the durable row rehydrates a *payable* hop, not a
-///    name (#1217).
-/// 4. **The signature.** What A journalled is an EIP-712 balance proof
-///    under anvil's chain id and the deployed `TokenNetwork`, recovering
-///    to B's *settlement* address -- and to nobody under any other domain.
-#[tokio::test]
-async fn an_evm_runtime_peering_is_routed_and_pays_the_forward_it_accepted_and_still_can_after_a_restart(
-) {
-    if !require_anvil() {
-        return;
-    }
-
-    let anvil = Anvil::spawn(ANVIL_BASE_PORT + 30).await;
-    // B is the deployer: it holds the mock USDC supply, so it is the side
-    // that can genuinely collateralise the channel it will sign claims on.
-    let token =
-        EvmSettlementBackend::deploy_mock_token(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, 1_000_000)
-            .await
-            .expect("deploy mock USDC");
-    let deployed = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("deploy a TokenNetwork through a fresh registry");
-    let registry_address = deployed.registry_address();
-    let token_network_address = <[u8; 20]>::from(deployed.address());
-    drop(deployed);
-
-    // ── The app behind A: answers every POST with 200 "delivered" ────────
-    let app_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind app");
-    let app_addr = app_listener.local_addr().expect("app addr");
-    serve(
-        app_listener,
-        Router::new().route("/", post(|| async { "delivered" })),
-    );
-
-    // ── Node A: the payee, on a real socket, describing itself for real ──
-    let mut node_a_key_file = tempfile::NamedTempFile::new().expect("temp key file");
-    node_a_key_file
-        .write_all(COUNTERPARTY_PRIVATE_KEY.as_bytes())
-        .expect("write key file");
-    let node_a_state_dir = tempfile::tempdir().expect("temp state dir");
-    let node_a_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind node A");
-    let node_a_addr = node_a_listener.local_addr().expect("node A addr");
-    let node_a_write_key = Keypair::generate(&mut OsRng);
-
-    let mut node_a_config_file = tempfile::NamedTempFile::new().expect("temp config file");
-    write!(
-        node_a_config_file,
-        r#"
-client_edge_addr = "127.0.0.1:0"
-state_dir = "{state_dir}"
-peer_expose = "http"
-
-[node]
-addresses     = ["{NODE_A_PREFIX}"]
-http_endpoint = "http://{node_a_addr}/ilp"
-
-[signer]
-key_file = "{key_path}"
-
-[operator]
-bearer_token = "operator-secret"
-write_keys = ["{write_key_hex}"]
-
-[[routes]]
-prefix = "{NODE_A_APP_PREFIX}"
-handler_url = "http://{app_addr}/"
-price = {APP_PRICE}
-
-[settlement.evm]
-rpc_url = "{rpc_url}"
-contract_address = "{registry_address:?}"
-token_address = "{token:?}"
-decimals = 6
-
-[settlement.evm.key]
-key_file = "{key_path}"
-"#,
-        state_dir = node_a_state_dir.path().display(),
-        key_path = node_a_key_file.path().display(),
-        write_key_hex = write_key_hex(&node_a_write_key),
-        rpc_url = anvil.rpc_url,
-    )
-    .expect("write config file");
-    let router_a = boot(node_a_config_file.path()).await;
-    serve(node_a_listener, router_a.clone());
-
-    // The identity a payload for A is sealed to: A's `[signer]` key, which
-    // is the same file as its settlement key here -- two curves, one seed.
-    let payee_identity = LocalSigner::from_secret_bytes(
-        "node-a-edge",
-        hex_bytes(COUNTERPARTY_PRIVATE_KEY)
-            .try_into()
-            .expect("a 32-byte secret"),
-    )
-    .expect("a raw secret is a valid secp256k1 key")
-    .public_key()
-    .expect("a local signer has a public key");
-
-    // ── Node B: the payer, with no `[[peers]]` table at all ──────────────
-    let mut node_b_key_file = tempfile::NamedTempFile::new().expect("temp key file");
-    node_b_key_file
-        .write_all(DEPLOYER_PRIVATE_KEY.as_bytes())
-        .expect("write key file");
-    let node_b_state_dir = tempfile::tempdir().expect("temp state dir");
-    let node_b_write_key = Keypair::generate(&mut OsRng);
-    let mut node_b_config_file = tempfile::NamedTempFile::new().expect("temp config file");
-    write!(
-        node_b_config_file,
-        r#"
-client_edge_addr = "127.0.0.1:0"
-state_dir = "{state_dir}"
-peer_allow_plaintext_endpoints = true
-
-[signer]
-key_file = "{key_path}"
-
-[operator]
-bearer_token = "operator-secret"
-write_keys = ["{write_key_hex}"]
-
-[settlement.evm]
-rpc_url = "{rpc_url}"
-contract_address = "{registry_address:?}"
-token_address = "{token:?}"
-decimals = 6
-
-[settlement.evm.key]
-key_file = "{key_path}"
-"#,
-        state_dir = node_b_state_dir.path().display(),
-        key_path = node_b_key_file.path().display(),
-        write_key_hex = write_key_hex(&node_b_write_key),
-        rpc_url = anvil.rpc_url,
-    )
-    .expect("write config file");
-    let router_b = boot(node_b_config_file.path()).await;
-
-    // ── Before: nothing is routed anywhere ───────────────────────────────
-    assert_eq!(
-        peer_routes(&router_b).await,
-        serde_json::json!([]),
-        "a node with no `[[routes]]` peer form and no runtime writes forwards nothing"
-    );
-
-    // ── Establish ────────────────────────────────────────────────────────
-    let peer_body = serde_json::to_vec(&serde_json::json!({
-        "id": PEERING_ID,
-        "url": format!("http://{node_a_addr}/ilp"),
-        "fee": PEER_FEE,
-        "max_packet_amount": 5_000,
-    }))
-    .unwrap();
-    let response = router_b
-        .clone()
-        .oneshot(signed(&node_b_write_key, Method::POST, "/peers", peer_body))
-        .await
-        .unwrap();
-    let status = response.status();
-    let established = body_bytes(response).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "POST /peers: {}",
-        String::from_utf8_lossy(&established)
-    );
-    let established: serde_json::Value = serde_json::from_slice(&established).unwrap();
-    assert_eq!(established["channel"]["status"], "created");
-    assert_eq!(established["channel"]["chain"], "evm");
-    assert_eq!(established["fee"], PEER_FEE);
-    let channel_id = established["channel"]["id"]
-        .as_str()
-        .expect("the channel's id")
-        .to_string();
-
-    // ── Collateralise: B's own deposit behind B's own claims (#1118) ─────
-    let fund_body = serde_json::to_vec(&serde_json::json!({ "amount": 3 * APP_PRICE })).unwrap();
-    let response = router_b
-        .clone()
-        .oneshot(signed(
-            &node_b_write_key,
-            Method::POST,
-            &format!("/channels/{channel_id}/fund"),
-            fund_body,
-        ))
-        .await
-        .unwrap();
-    let status = response.status();
-    let funded = body_bytes(response).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "POST /channels/:id/fund: {}",
-        String::from_utf8_lossy(&funded)
-    );
-    let funded: serde_json::Value = serde_json::from_slice(&funded).unwrap();
-    assert_eq!(funded["own_deposited"], 3 * APP_PRICE);
-
-    // ── Route, and read the table back ───────────────────────────────────
-    let route_body = serde_json::to_vec(&serde_json::json!({
-        "prefix": NODE_A_PREFIX,
-        "peer_id": PEERING_ID,
-        "price": AMOUNT,
-    }))
-    .unwrap();
-    let response = router_b
-        .clone()
-        .oneshot(signed(
-            &node_b_write_key,
-            Method::POST,
-            "/routes/peers",
-            route_body,
-        ))
-        .await
-        .unwrap();
-    let status = response.status();
-    let route = body_bytes(response).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "POST /routes/peers must accept a route through a peering that can pay (#1217): {}",
-        String::from_utf8_lossy(&route)
-    );
-    let expected_table = serde_json::json!([{
-        "prefix": NODE_A_PREFIX,
-        "peer_id": PEERING_ID,
-        "price": AMOUNT,
-        "source": "runtime",
-    }]);
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&route).unwrap(),
-        expected_table[0],
-        "the write answers with the row it landed"
-    );
-    assert_eq!(
-        peer_routes(&router_b).await,
-        expected_table,
-        "GET /routes/peers is the routing table: exactly the posted row, tagged `runtime`"
-    );
-
-    // ── The money ────────────────────────────────────────────────────────
-    // A's client book keys the channel by chain namespace and canonical
-    // lowercase id; nothing is on it yet.
-    let channel_key = format!("evm:{}", channel_id.to_lowercase());
-    assert!(
-        client_claims(&router_a).await.is_empty(),
-        "nothing has been paid over the peering yet"
-    );
-
-    originate_and_expect_fulfil(&router_b, &node_b_write_key, &payee_identity, b"first").await;
-    assert_eq!(
-        client_claims(&router_a).await,
-        vec![(channel_key.clone(), 1, APP_PRICE)],
-        "the payee's client book must show B's claim advanced by exactly what B forwarded: \
-         the packet carried {AMOUNT}, B kept its {PEER_FEE} peering fee (ADR 0061), and \
-         {APP_PRICE} reached A"
-    );
-
-    originate_and_expect_fulfil(&router_b, &node_b_write_key, &payee_identity, b"second").await;
-    assert_eq!(
-        client_claims(&router_a).await,
-        vec![(channel_key.clone(), 2, 2 * APP_PRICE)],
-        "each crossing advances the watermark by the forwarded amount -- a claim that merely \
-         repeats crossing 1's cumulative at a fresh nonce is issue #1102, and buys nothing"
-    );
-
-    // ── The restart ──────────────────────────────────────────────────────
-    // Same config file, same `state_dir`: the runtime peer row, the route
-    // and the outbound client ledger all come back through the production
-    // boot path, not through any test seam.
-    drop(router_b);
-    let router_b = boot(node_b_config_file.path()).await;
-
-    let response = router_b
-        .clone()
-        .oneshot(bearer_get("/peers"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let peers: Vec<PeerView> = serde_json::from_slice(&body_bytes(response).await).unwrap();
-    assert_eq!(peers.len(), 1, "the peering itself survived the restart");
-    assert_eq!(peers[0].id, PEERING_ID);
-    assert_eq!(peers[0].fee, PEER_FEE);
-    assert_eq!(
-        peer_routes(&router_b).await,
-        expected_table,
-        "the routing table survives the restart with the row still tagged `runtime`"
-    );
-
-    originate_and_expect_fulfil(&router_b, &node_b_write_key, &payee_identity, b"third").await;
-    assert_eq!(
-        client_claims(&router_a).await,
-        vec![(channel_key.clone(), 3, 3 * APP_PRICE)],
-        "the same channel's watermark keeps advancing after the payer's restart -- a restart \
-         must not turn a payable peering back into an accept-only one (#1217)"
-    );
-
-    // ── The signature ────────────────────────────────────────────────────
-    // What A journalled is what an on-chain redemption submits: an EIP-712
-    // balance proof under anvil's chain id and the deployed TokenNetwork,
-    // signed by B's SETTLEMENT key -- never its edge identity, which is a
-    // different key `claimFromChannel` could never recover a participant to.
-    let (journalled_key, nonce, cumulative, signature) =
-        last_journalled_client_claim(node_a_state_dir.path());
-    assert_eq!(journalled_key, channel_key);
-    assert_eq!((nonce, cumulative), (3, 3 * APP_PRICE));
-    let proof = EvmBalanceProof {
-        channel_id: channel_id_bytes(&channel_id),
-        nonce,
-        transferred_amount: u128::from(cumulative),
-        locked_amount: 0,
-        locks_root: [0u8; 32],
-        chain_id: ANVIL_CHAIN_ID,
-        token_network_address,
-    };
-    let payer_settlement = address_of(DEPLOYER_PRIVATE_KEY);
-    assert!(
-        verify_evm_balance_proof(&proof, &signature, &payer_settlement),
-        "the accepted claim is a balance proof under the deployed TokenNetwork's domain, \
-         signed by the payer's settlement key"
-    );
-    assert!(
-        !verify_evm_balance_proof(
-            &EvmBalanceProof {
-                chain_id: ANVIL_CHAIN_ID + 1,
-                ..proof
-            },
-            &signature,
-            &payer_settlement
-        ),
-        "the same signature verifies under no other chain id (ADR 0024)"
-    );
-    assert!(
-        !verify_evm_balance_proof(
-            &EvmBalanceProof {
-                token_network_address: [0x99u8; 20],
-                ..proof
-            },
-            &signature,
-            &payer_settlement
-        ),
-        "nor under any other TokenNetwork"
-    );
-    assert!(
-        !verify_evm_balance_proof(&proof, &signature, &address_of(COUNTERPARTY_PRIVATE_KEY)),
-        "and it is the payer's signature, not the payee's own"
     );
 }

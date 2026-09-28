@@ -320,5 +320,8 @@ transaction rather than on derivation. The inbound half is admitted when the pee
 (EVM) or sponsored `open` (Solana) arrives, and bound by the voucher signer the peer's document
 publishes. Trust-on-first-use is unchanged.
 
-Until #1371's implementing steps land, the binary behaves as this record describes above; this
-Update states what changes when they do.
+**Built on EVM by #1378.** `POST /peers` takes a `deposit`, opens and funds this node's outbound
+`x402BatchSettlement` channel (or finds it on a repeat), binds the peer's `voucherSigners` key, and
+writes an `evm-voucher` row; no `TokenNetwork` channel is derived or opened, and a runtime EVM row
+naming one is refused at boot by name. Solana peerings still follow this record's derivation until
+#1379.

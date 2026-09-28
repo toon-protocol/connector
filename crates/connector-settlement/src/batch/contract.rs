@@ -727,6 +727,29 @@ where
         payer.finish_withdrawal(&not_outbound).await.unwrap_err(),
         not_outbound_error
     );
+    // The claim-state challenge proves control of a channel's voucher
+    // signer (ADR 0075 decisions 5 and 6), so only a channel this node
+    // opened is its to sign one for -- and on one it did, two expiries are
+    // two different signatures, neither of them a voucher's.
+    assert_eq!(
+        payer
+            .sign_claim_state_challenge(&not_outbound, 1_800_000_000)
+            .await
+            .unwrap_err(),
+        not_outbound_error
+    );
+    let challenge = payer
+        .sign_claim_state_challenge(&second_channel, 1_800_000_000)
+        .await
+        .expect("a challenge on a channel this node opened");
+    assert_ne!(
+        challenge,
+        payer
+            .sign_claim_state_challenge(&second_channel, 1_800_000_001)
+            .await
+            .expect("a second challenge"),
+        "a challenge signs its expiry"
+    );
 
     // -- Surviving a crash and a restart (ADR 0075 decision 8) --
 
