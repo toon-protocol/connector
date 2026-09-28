@@ -97,7 +97,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::batch_channels::{receiver_terms, BatchChannelError};
-use crate::connector::{ChannelOperationError, Connector, PeerRouteTableError};
+use crate::connector::{hex_lower, ChannelOperationError, Connector, PeerRouteTableError};
 use crate::operator_view::PeerView;
 use crate::peer_route_store::{RuntimePeerChannel, RuntimePeering};
 use crate::self_description::SelfDescriptionError;
@@ -368,7 +368,10 @@ impl Connector {
             .outbound_channels()
             .ok_or(BatchChannelError::NoBackend(SettlementChain::Evm))?;
 
-        let (channel_id, status) = match outbound.open_toward(SettlementChain::Evm, &receiver) {
+        let (channel_id, status) = match outbound
+            .live_toward(SettlementChain::Evm, &receiver)
+            .await?
+        {
             Some(channel_id) => (channel_id, ChannelBranch::Found),
             None => {
                 let deposit = deposit.ok_or_else(|| EstablishPeeringError::DepositRequired {
@@ -438,10 +441,6 @@ impl Connector {
             },
         ))
     }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The endpoint this connector dials a counterparty on, read off its
@@ -1055,10 +1054,22 @@ mod tests {
             connector.voucher_signer_peer(&VoucherSigner::Evm(signer)),
             None
         );
-        assert!(connector
-            .outbound_channels()
-            .expect("x402")
-            .knows(&established.channel.id));
+        let outbound = connector.outbound_channels().expect("x402");
+        assert!(outbound.knows(&established.channel.id));
+
+        // A channel being wound down is not live: re-establishing the
+        // peering after a withdrawal has started opens a fresh channel
+        // rather than paying on one that backs nothing new.
+        outbound
+            .withdraw(&established.channel.id)
+            .await
+            .expect("start the withdrawal");
+        let again = connector
+            .establish_peering("node-b", &url(), 5, 0, None, Some(1_000))
+            .await
+            .expect("re-establish");
+        assert_eq!(again.channel.status, ChannelBranch::Created);
+        assert_ne!(again.channel.id, established.channel.id);
     }
 
     /// A counterparty that publishes no voucher signer could never have its

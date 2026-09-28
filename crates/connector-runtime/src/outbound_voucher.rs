@@ -1,4 +1,4 @@
-//! What this node puts on the peer wire when it pays a next hop over one of
+//! What this node puts on a peer carriage when it pays a next hop over one of
 //! its own outbound x402 channels (ADR 0075 decisions 5 and 6): a voucher,
 //! or -- for a packet that moves no value -- the voucher claim-state
 //! challenge, and the receiver's `POST /ilp/claim-state` asked where the
@@ -6,7 +6,7 @@
 //!
 //! # One wire shape each, and it is the receiving half's
 //!
-//! A voucher rides the peer wire as the client edge's own voucher JSON
+//! A voucher rides a peer carriage as the client edge's own voucher JSON
 //! (`client-edge-spec.md` §1.3, `peer-carriage-spec.md` §4): the same object
 //! `connector_domain::client_claim::parse_client_claim` reads, so the peer
 //! wire gains no second voucher codec. The challenge is a `POST
@@ -29,6 +29,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use connector_settlement::batch::{ChannelPresentation, EvmChannelConfig, Voucher};
 
+use crate::batch_channels::hex;
+
 /// How long a challenge this node signs is valid for, in seconds. Short on
 /// purpose: within it a challenge is a bearer proof for zero-value traffic
 /// (ADR 0075, Consequences), and it is signed for the one request that
@@ -36,15 +38,6 @@ use connector_settlement::batch::{ChannelPresentation, EvmChannelConfig, Voucher
 /// (`peer-carriage-spec.md` §1.2), which absorbs clock skew between two
 /// operators' hosts.
 pub const PEER_CHALLENGE_TTL_SECS: u64 = 60;
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(2 + 2 * bytes.len());
-    out.push_str("0x");
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
 
 fn config_json(config: &EvmChannelConfig) -> serde_json::Value {
     serde_json::json!({

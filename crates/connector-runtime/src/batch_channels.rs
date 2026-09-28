@@ -220,7 +220,8 @@ fn chain_of(name: &str) -> SettlementChain {
     SettlementChain::from_str(name).expect("the settlement port names only evm and solana")
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// `bytes` as `0x` and lowercase hex.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(2 + 2 * bytes.len());
     out.push_str("0x");
     for byte in bytes {
@@ -553,8 +554,9 @@ impl OutboundChannels {
     /// voucher is never handed out, so the watermark a restart restores is
     /// still an honest one.
     ///
-    /// The seam `[[pay_channels]]` and client payouts sign through (issues
-    /// #1378, #1380); nothing in this build calls it on the packet path yet.
+    /// The seam the packet path signs through: a runtime EVM peering's
+    /// every forward since #1378 (`Connector::cover_forward`), and
+    /// `[[pay_channels]]` and client payouts once #1380 and #1381 land.
     pub async fn sign_voucher(
         &self,
         id: &str,
@@ -587,20 +589,38 @@ impl OutboundChannels {
         Ok(payer.sign_claim_state_challenge(&channel, expires).await?)
     }
 
-    /// An open outbound channel on `chain` toward `receiver` (its raw
+    /// A **live** outbound channel on `chain` toward `receiver` (its raw
     /// address or key), if this node has one: "is there a live channel with
     /// this peer?" as a lookup of this node's own channels rather than a
-    /// derivation (ADR 0075 decision 4). Several are legal; the one with the
+    /// derivation (ADR 0075 decision 4). Live is read from the chain now: a
+    /// channel whose withdrawal or close has started backs nothing new, so a
+    /// peering re-established after one is given a fresh channel rather than
+    /// the one being wound down. Several are legal; the live one with the
     /// highest signed watermark answers, so a repeat finds the channel the
-    /// peering has been paying on.
-    pub fn open_toward(&self, chain: SettlementChain, receiver: &[u8]) -> Option<String> {
-        self.channels()
+    /// peering has been paying on. A channel whose chain cannot be read now
+    /// is not live, and an error is never mistaken for an absence -- it
+    /// answers `Err`.
+    pub async fn live_toward(
+        &self,
+        chain: SettlementChain,
+        receiver: &[u8],
+    ) -> Result<Option<String>, BatchChannelError> {
+        let mut candidates: Vec<(String, u128)> = self
+            .channels()
             .iter()
             .filter(|(_, tracked)| {
                 tracked.chain == chain && tracked.opened && tracked.record.receiver() == receiver
             })
-            .max_by_key(|(_, tracked)| tracked.signed)
-            .map(|(id, _)| id.clone())
+            .map(|(id, tracked)| (id.clone(), tracked.signed))
+            .collect();
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
+        for (id, _) in candidates {
+            let (channel, payer) = self.ready(&id).await?;
+            if payer.outbound_state(&channel).await?.on_chain.status == BatchChannelStatus::Open {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 
     /// The highest amount this node has signed a voucher for on `id`, or

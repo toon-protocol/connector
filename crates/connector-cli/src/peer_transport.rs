@@ -52,7 +52,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use connector_config::{Config, PeerCarriage, DEFAULT_PEER_TIMEOUT_MS};
 use connector_domain::Prepare;
-use connector_peer_btp::{BtpPeerTransport, PeerClaimDomain, TungsteniteDialer};
+use connector_peer_btp::{BtpPeerTransport, TungsteniteDialer};
 use connector_peer_http::{HttpPeerTransport, ReqwestPeerClient};
 use connector_runtime::{
     ClaimAckOutcome, Clock, Covering, InProcessPeerTransport, PeerForward, PeerRegistrar,
@@ -211,7 +211,9 @@ impl PeerRegistrar for ConfiguredPeerTransport {
             self.deregister(peer_id);
             return;
         };
-        let (domains, programs) = claim_bindings(peering);
+        // A runtime peering's `toon-channel` claims are Solana ones only
+        // since #1378, so it binds no EIP-712 domain.
+        let (domains, programs) = (HashMap::new(), solana_programs(peering));
         let answer_timeout = Duration::from_millis(DEFAULT_PEER_TIMEOUT_MS);
         match carriage {
             PeerCarriage::Btp => self.btp.add_peer(connector_peer_btp::PeerRelation::new(
@@ -248,20 +250,16 @@ impl PeerRegistrar for ConfiguredPeerTransport {
     }
 }
 
-/// The EIP-712 domains a runtime peering's `toon-channel` claims sign
-/// under, and the programs its Solana channels bind to (ADR 0053) -- the
-/// same two maps `PeerRelation::from_config` builds out of
-/// `[[peer_channels]]`, built instead out of the durable row.
+/// The programs a runtime peering's Solana channels bind to (ADR 0053) --
+/// the map `PeerRelation::from_config` builds out of `[[peer_channels]]`,
+/// built instead out of the durable row, until #1379.
 ///
-/// The domain map is always empty: a runtime EVM peering pays with
-/// vouchers on its own x402 channel since #1378, which arrive at the
-/// carriage already rendered and need no domain from it, and a row naming
-/// a `TokenNetwork` channel is refused at boot. The Solana map is the one
-/// runtime peerings still fill, until #1379.
-fn claim_bindings(
-    peering: &RuntimePeering,
-) -> (HashMap<String, PeerClaimDomain>, HashMap<String, String>) {
-    let programs = peering
+/// There is no EVM counterpart: a runtime EVM peering pays with vouchers on
+/// its own x402 channel since #1378, which reach the carriage already
+/// rendered and need no EIP-712 domain from it, and a row naming a
+/// `TokenNetwork` channel is refused at boot.
+fn solana_programs(peering: &RuntimePeering) -> HashMap<String, String> {
+    peering
         .channels
         .iter()
         .filter_map(|binding| match binding {
@@ -272,8 +270,7 @@ fn claim_bindings(
             } => Some((channel_account.clone(), program_id.clone())),
             RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::EvmVoucher { .. } => None,
         })
-        .collect();
-    (HashMap::new(), programs)
+        .collect()
 }
 
 #[async_trait]

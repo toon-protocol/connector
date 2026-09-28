@@ -51,7 +51,7 @@ pub struct WireClaim {
 /// carries its claim), as the [`crate::PeerTransport`] port hands it to a
 /// carriage.
 ///
-/// Two schemes ride the peer wire until #1380 retires the first: a
+/// Two schemes ride the peer carriages until #1380 retires the first: a
 /// `toon-channel` [`WireClaim`], which the carriage renders itself, and an
 /// x402 **voucher** (ADR 0075 decision 6), which arrives rendered -- the
 /// client edge's own voucher JSON (`client-edge-spec.md` §1.3), exactly the

@@ -68,7 +68,20 @@ fn voucher_ack(rejection: &ClaimIngestRejection) -> ClaimAckOutcome {
         | ClaimIngestRejection::Undercollateralized { .. } => {
             ClaimAckOutcome::Rejected(ClaimRejectReason::AmountNotAdvancing)
         }
-        _ => ClaimAckOutcome::Rejected(ClaimRejectReason::UnknownChannel),
+        // Every other refusal is about the channel or the voucher's shape:
+        // there is no channel this node will take it on. Listed rather than
+        // caught by a wildcard, so a new refusal has to be placed here.
+        ClaimIngestRejection::Malformed(_)
+        | ClaimIngestRejection::Mina
+        | ClaimIngestRejection::UnknownChannel
+        | ClaimIngestRejection::ChannelTerminal(_)
+        | ClaimIngestRejection::WrapUnsupported
+        | ClaimIngestRejection::WrapFailed(_)
+        | ClaimIngestRejection::SolanaClusterMismatch { .. }
+        | ClaimIngestRejection::BatchSettlementNotAccepted
+        | ClaimIngestRejection::VoucherChannelConfigMismatch => {
+            ClaimAckOutcome::Rejected(ClaimRejectReason::UnknownChannel)
+        }
     }
 }
 

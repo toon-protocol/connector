@@ -838,15 +838,15 @@ const DEFAULT_PROBE_LIMIT: u32 = 60;
 /// [`Connector`]'s default probe rate limit window, paired with
 /// [`DEFAULT_PROBE_LIMIT`].
 /// `bytes` as lower-case hex, no `0x`.
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The `senderId` a voucher this node signs carries: its own voucher signer
-/// in the chain's spelling -- a label, as every `senderId` is, since the
-/// receiver reads the signer from the chain. On EVM the channel's
-/// `payerAuthorizer`, which is this node's settlement address (ADR 0075
-/// decision 3).
+/// The `senderId` a voucher this node signs carries -- a label, as every
+/// `senderId` is, since the receiver reads the signer from the chain. On
+/// EVM the channel's `payerAuthorizer`, which is this node's settlement
+/// address (ADR 0075 decision 3). A Solana presentation names no payer, so
+/// its label is the channel account until #1379 pays over Solana.
 fn voucher_sender(presentation: &connector_settlement::batch::ChannelPresentation) -> String {
     match presentation {
         connector_settlement::batch::ChannelPresentation::Evm { config, .. } => {

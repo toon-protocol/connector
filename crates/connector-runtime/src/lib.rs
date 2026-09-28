@@ -68,7 +68,7 @@ pub use outbound_client::{
     HttpClaimState, OutboundClaim, OutboundClaimBinding, OutboundClientError, OutboundClientLedger,
     OwnedHttpClaimState, SolanaDomain,
 };
-// What this node puts on the peer wire when it pays over one of its own
+// What this node puts on a peer carriage when it pays over one of its own
 // x402 channels (ADR 0075 decisions 5 and 6), and how it asks the receiver
 // where that channel's watermark stands.
 pub use outbound_voucher::{
