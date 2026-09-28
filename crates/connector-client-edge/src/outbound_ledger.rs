@@ -119,11 +119,17 @@ impl ClientPayoutLedger {
     ///
     /// A no-op -- nothing signed, `None` -- when this exact
     /// `(payee, job_id)` pair has already been paid (issue #770's AC3), so a
-    /// retransmitted FULFILL of one job pays once. The check-and-mark is
-    /// atomic under one lock. If nothing could be signed -- no channel is
-    /// open toward `payee`, or none backs the new amount -- the mark is
-    /// released, and the failure is logged by name: nothing was paid, so a
-    /// later attempt for the same job must not find it "already done".
+    /// retransmitted FULFILL of one job pays once. **The check, the sign
+    /// attempt and the mark's release on failure are one critical section**,
+    /// under [`Self::signing`] (issue #1397): a concurrent call for the same
+    /// pair waits for the first attempt's outcome rather than observing the
+    /// mark mid-attempt and giving up on it. Payouts were already
+    /// serialised on that mutex -- one signed at a time -- so this widens
+    /// no bottleneck; it only moves where the mark is checked. If nothing
+    /// could be signed -- no channel is open toward `payee`, or none backs
+    /// the new amount -- the mark is released before the lock is, and the
+    /// failure is logged by name, so a later attempt for the same job finds
+    /// it not "already done".
     pub async fn record_payout_once(
         &self,
         payee: VoucherSigner,
@@ -131,6 +137,7 @@ impl ClientPayoutLedger {
         amount: u64,
     ) -> Option<PayoutVoucher> {
         let key = (payee, *job_id);
+        let _signing = self.signing.lock().await;
         if !self
             .credited_jobs
             .lock()
@@ -150,9 +157,10 @@ impl ClientPayoutLedger {
     }
 
     /// Sign `amount` more to `payee` on the first opened channel toward it
-    /// that backs the new cumulative amount.
+    /// that backs the new cumulative amount. Called only from
+    /// [`Self::record_payout_once`], which already holds
+    /// [`Self::signing`] for the whole check-sign-release section.
     async fn sign_payout(&self, payee: VoucherSigner, amount: u128) -> Option<PayoutVoucher> {
-        let _signing = self.signing.lock().await;
         let channels = self.outbound.opened_toward(&payee);
         if channels.is_empty() {
             tracing::warn!(
@@ -251,6 +259,15 @@ impl ClientPayoutLedger {
             pending.remove(channel_id);
         }
     }
+
+    /// Test-only: hold [`Self::signing`] open, the way a real attempt would
+    /// while it is checking or signing, so a test can deterministically
+    /// drive a concurrent [`Self::record_payout_once`] into the window
+    /// issue #1397 closed instead of racing the scheduler for it.
+    #[cfg(test)]
+    async fn test_hold_signing(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.signing.lock().await
+    }
 }
 
 /// A payout ledger over a fake EVM-shaped chain on which the connector
@@ -292,6 +309,9 @@ pub(crate) async fn test_ledger_paying(payee: [u8; 20]) -> Arc<ClientPayoutLedge
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
     use super::*;
     use connector_runtime::{InMemoryJournal, Journal, SettlementChain};
     use connector_settlement::batch::{
@@ -511,5 +531,114 @@ mod tests {
             400,
             "the voucher after a restart carries on from the journaled watermark"
         );
+    }
+
+    // ─── issue #1397: a concurrent attempt waits for the first's outcome ───
+    //
+    // The fake never waits on anything of its own accord (`covering_fake`'s
+    // `complete`), so two concurrent `record_payout_once` calls do not
+    // interleave on their own -- one runs to completion before the other is
+    // even polled. `hold_signing` reproduces the window this issue closes
+    // deterministically instead: it holds `ClientPayoutLedger::signing`
+    // open the way a real in-flight attempt would, so a manual poll of each
+    // call can be driven to the exact point that matters -- past the mark
+    // check, short of the outcome -- with no reliance on how the runtime
+    // happens to schedule two spawned tasks.
+
+    /// One poll, with a waker that does nothing: a future the test drives
+    /// by hand is never woken automatically, so a `Poll::Pending` here means
+    /// the ledger's own `signing` lock is genuinely contended, not that the
+    /// test forgot to poll again.
+    fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// The AC1 window: two concurrent calls for one job, the first finding
+    /// no channel yet toward the payee. Before issue #1397's fix, the
+    /// second observed the first's mark and returned at once, and by the
+    /// time the channel opened -- between the two attempts, as a client's
+    /// retry and an operator's `POST /channels` can genuinely race -- no
+    /// caller was left to retry: the job was paid zero times. The fix makes
+    /// the second wait for the first's outcome instead, so it is the one
+    /// that lands the payout once the channel exists.
+    #[tokio::test]
+    async fn a_concurrent_attempt_still_pays_once_a_channel_opens_between_the_attempts() {
+        let (outbound, _, _) = world(Arc::new(InMemoryJournal::new())).await;
+        // No channel toward `payee()` yet: the first attempt has nothing to
+        // sign on.
+        let ledger = ClientPayoutLedger::new(Arc::clone(&outbound));
+
+        let hold = ledger.test_hold_signing().await;
+        let mut first = std::pin::pin!(ledger.record_payout_once(payee(), &[7; 32], 500));
+        let mut second = std::pin::pin!(ledger.record_payout_once(payee(), &[7; 32], 500));
+
+        assert!(
+            poll_once(first.as_mut()).is_pending(),
+            "the first attempt blocks taking the signing lock before it ever reaches its own \
+             mark check"
+        );
+        // Fixed: also blocks on the same lock, never having reached the
+        // mark check. Unfixed: the first already ran its mark check before
+        // blocking on the lock, so this returns `None` right here, before
+        // the channel ever opens.
+        let second_polled_early = poll_once(second.as_mut());
+
+        drop(hold);
+        let first_paid = first.await;
+        // The channel opens strictly between the two attempts: after the
+        // first has committed to failing, before the second's own check.
+        outbound.open(client_terms(), 1_000).await.expect("open");
+        let second_paid = match second_polled_early {
+            Poll::Ready(paid) => paid,
+            Poll::Pending => second.await,
+        };
+
+        assert!(
+            first_paid.is_none(),
+            "the first attempt found no channel and signed nothing"
+        );
+        let paid = second_paid.expect(
+            "the fix: a concurrent attempt waits for the first's failure and its released mark, \
+             so it -- not a third caller -- lands the payout once the channel exists",
+        );
+        assert_eq!(paid.cumulative_amount(), 500);
+        assert_eq!(
+            ledger.signed_toward(&payee()),
+            500,
+            "paid exactly once, not twice"
+        );
+    }
+
+    /// AC2, the existing guarantee restated over the same driving: two
+    /// concurrent calls where the first can sign still pay the job exactly
+    /// once. This holds with or without issue #1397's fix -- the second
+    /// attempt has always found the mark set once the first succeeds -- and
+    /// stays here as the regression guard for it.
+    #[tokio::test]
+    async fn a_concurrent_attempt_pays_once_when_the_first_succeeds() {
+        let (outbound, _, _) = world(Arc::new(InMemoryJournal::new())).await;
+        outbound.open(client_terms(), 1_000).await.expect("open");
+        let ledger = ClientPayoutLedger::new(Arc::clone(&outbound));
+
+        let hold = ledger.test_hold_signing().await;
+        let mut first = std::pin::pin!(ledger.record_payout_once(payee(), &[7; 32], 500));
+        let mut second = std::pin::pin!(ledger.record_payout_once(payee(), &[7; 32], 500));
+
+        assert!(poll_once(first.as_mut()).is_pending());
+        let second_polled_early = poll_once(second.as_mut());
+
+        drop(hold);
+        let first_paid = first.await.expect("the channel already backs this payout");
+        let second_paid = match second_polled_early {
+            Poll::Ready(paid) => paid,
+            Poll::Pending => second.await,
+        };
+
+        assert_eq!(first_paid.cumulative_amount(), 500);
+        assert!(
+            second_paid.is_none(),
+            "the concurrent attempt found the job already paid"
+        );
+        assert_eq!(ledger.signed_toward(&payee()), 500);
     }
 }
