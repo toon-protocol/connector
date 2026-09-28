@@ -237,3 +237,11 @@ unchanged.
 
 Until #1371's implementing steps land, the binary behaves as this record describes above; this
 Update states what changes when they do.
+
+**#1377 builds the rule, beside the one above rather than in place of it.** A voucher on a bound
+channel, or a challenge (expiring within 300 seconds) for a zero-value packet, now decides `peer` on
+both carriages (`connector_peer_btp::role_gate::decide_frame`, `connector_peer_auth::decide_voucher_role`),
+and binding a voucher signer to a peering is a runtime operation (`Connector::bind_voucher_signer`).
+The `toon-channel` proof stays until #1380 moves the last peering off it, and no node binds a signer
+until #1378 (the self-description's key) or #1380 (a config row) supplies one.
+`peer-carriage-spec.md` §1.2 states both proofs.

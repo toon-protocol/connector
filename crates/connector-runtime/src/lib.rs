@@ -16,6 +16,7 @@ mod rate_poller;
 mod rate_table;
 mod route;
 mod self_description;
+mod voucher_binding;
 // Behind a feature rather than `#[cfg(test)]`, unlike `test_support` below:
 // both peer-carriage crates need it and a `#[cfg(test)]` item is invisible
 // outside its own crate -- but it binds a listener, so the shipped binary
@@ -86,5 +87,8 @@ pub use self_description::{
     BoundedHttpSelfDescription, SelfDescriptionError, SelfDescriptionSource,
     UnreachableSelfDescription, FETCH_TIMEOUT, MAX_DOCUMENT_BYTES,
 };
+// ADR 0075 decision 4 (issue #1377): an inbound x402 channel is a peer's
+// when its voucher signer is bound to that peering.
 #[cfg(any(test, feature = "test-support"))]
 pub use socks5_test_server::{Socks5TestServer, SocksConnect};
+pub use voucher_binding::{VoucherBindingError, VoucherSigner, VoucherSignerBindings};

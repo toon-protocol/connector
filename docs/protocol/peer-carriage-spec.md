@@ -110,6 +110,64 @@ There is no third case left to decide. Under #868 a peer PREPARE carrying no cov
 admitted at all — it is answered with the same 402 greeting the client edge already gives. Role and
 payment are therefore read from the same bytes, on the same packet, every time.
 
+#### The x402 proof: a voucher, or a challenge (ADR 0075, issue #1377)
+
+> **Amended 2026-09-27 by [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+> decision 5**, which amends [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md).
+> Under ADR 0075 a peering is two one-way x402 `batch-settlement` channels, and the inbound one is
+> **admitted, not configured** — so the proof above, which needs a `[[peer_channels]]` row naming the
+> channel, cannot reach it. P2 and P3 still decide for a `toon-channel` claim, because every peering
+> in the tree still proves itself that way; #1378 and #1379 move runtime peerings and #1380 moves
+> config-declared ones, and #1380 deletes P2/P3 with the last of them.
+
+An interaction also has role `peer` **if and only if** it carries either of:
+
+- **X1 — a voucher on a channel bound to that peer.** An x402 `batch-settlement` voucher
+  (`client-edge-spec.md` §1.3) whose channel this node's receiving half resolves, whose signature
+  verifies against the **voucher signer the chain records for that channel** — EVM
+  `payerAuthorizer`, Solana `authorized_signer`, read from what the batch-settlement backend
+  admitted and never from the voucher — and whose signer is **bound** to peer `p`.
+- **X2 — for a packet that moves no value, the voucher claim-state challenge.** The PREPARE's
+  `amount` is zero, and the frame carries #1364's challenge (§1.4) naming a channel as in X1, signed
+  by that channel's voucher signer, and **inside its window**: `expires` has not passed and lies no
+  more than **300 seconds** ahead of this node's clock. A challenge on any other packet — one that
+  moves value, or none at all — proves nothing.
+
+**A binding is a runtime operation, keyed by signer.** A node binds a voucher signer to one of its
+peerings, and every channel that signer's vouchers verify on is then that peer's. It is keyed by
+signer rather than by channel because a peer may hold several live channels toward this node and
+none of their ids is known before the peer opens it; the one fact both sides know in advance is the
+key the peer signs with. One signer proves one relation: binding a signer already bound to another
+peering is refused, by name, and binding to a peer id no peering holds is refused too. Removing a
+runtime peering (`DELETE /peers`, ADR 0060's kill switch) unbinds its signers with the row. **The two
+sources of a binding come later**: the key a peer's self-description publishes, bound when `POST
+/peers` establishes the peering (#1378, #1379), and the key a `[[peer_channels]]` row names (#1380).
+Until one lands, a node binds nothing and no voucher decides `peer` on it.
+
+**Why 300 seconds.** Within `expires` a challenge is a bearer proof for zero-value traffic (ADR 0075,
+Consequences): it names one channel, so only that channel's receiver can use it, but that receiver
+can replay it until it lapses. Five minutes absorbs clock skew between two operators' hosts and a
+dialer that signs one challenge per several packets, and is short enough that a captured challenge
+is stale before it matters — it moves no value either way. A challenge signed further ahead than the
+bound is treated as expired, so a peer cannot mint one long-lived proof and step around it. ADR 0075
+left the bound to this step.
+
+**What stays exactly as it was.** Nothing is admitted, advanced or journaled by X1 or X2: role is
+still fixed before a watermark moves (§1.5). A voucher that decides `peer` is not a `WireClaim` and
+is not judged by `ClaimBook`; judging a peer's voucher — its watermark, its ack, its journal entry —
+is the receiving half's, and lands with the peerings that send one (#1378). Until then a voucher on
+a bound channel proves the role and pays nothing on the peer wire, so a priced peer PREPARE covered
+only by a voucher is answered with the greeting, as an uncovered one is -- on a forwarded route too,
+whatever the peering's `claim_enforcement`: a voucher-covered forward is always priced under
+`enforce` (`role_gate::forwarded_enforcement`), so the default `observe` cannot carry it for free.
+A zero-value peer packet carries no voucher (below); one that does still proves the role by it. The
+implementation is
+`connector_peer_btp::role_gate::decide_frame`, which both carriages and the client edge's front door
+call; it asks the receiving half (`connector_peer_btp::role_gate::VoucherEvidence`, implemented by
+the client edge's claim gate over the same lookups `POST /ilp/claim-state` makes) for the channel's
+signer and verdict, and hands `connector_peer_auth::decide_voucher_role` the bound peer and that
+verdict — nothing a carriage could weight (§1.3).
+
 **Why a verified claim proves more than a bearer token does.** A claim's signature is checked
 against this connector's **own** record of the channel — `counterparties` for an EVM channel, a
 `SolanaChannel`'s `counterparty_public_key` for a Solana one — populated from `[[peer_channels]]`,
@@ -354,7 +412,7 @@ A connector MUST NOT infer, weight or override role from any of:
 - the shape of what the interaction sent — an inbound TRANSFER, or any carriage-layer entry;
 - anything the interaction did earlier, or that another interaction from the same address did.
 
-Role is decided by P2 and a verified claim, or it is `client`.
+Role is decided by P2 and a verified claim, or by X1 or X2 (§1.2), or it is `client`.
 
 > **Withdrawn 2026-08-07 by #868.** The fifth bullet used to end "…or a claim naming a channel that
 > happens to be in `[[peer_channels]]`". That prohibition is now the exact inverse of the rule:
@@ -390,6 +448,39 @@ this section constrains the client role, and an interaction that proves no peeri
 
 Because HTTP has no session, a request is judged on its own claim. A request carrying none is a
 client request, whatever the previous request from the same connection carried.
+
+**The peer-role challenge (ADR 0075 decision 5, issue #1377).** A voucher rides the claim slot above,
+exactly as a client's does. A zero-value peer packet carries no voucher (ADR 0074 decision 3, extended
+to the peer wire), and when it needs the role it carries the voucher claim-state challenge instead,
+**in a slot of its own** — never the claim's, because a challenge is not a claim: it moves nothing and
+advances no watermark, and a slot that could hold either would make "was this a payment?" a question
+about the bytes rather than about where they rode.
+
+| Carriage      | Where                                                                  |
+| ------------- | ---------------------------------------------------------------------- |
+| BTP           | `peer-role-challenge` protocolData entry, **raw UTF-8 JSON**           |
+| ILP-over-HTTP | `Toon-Peer-Role-Challenge` request header, `base64(JSON)` (as a claim) |
+
+The JSON is a `POST /ilp/claim-state` entry's (`client-edge-spec.md` §1.10), so a peer that can prove a
+channel to that endpoint proves it here with the same code, and what is signed is the same message:
+EVM `ClaimStateChallenge(bytes32 channelId,uint256 expires)` under `x402BatchSettlement`'s EIP-712
+domain; Solana Ed25519 over `"toon-voucher-claim-state-challenge-v1" ‖ channelAccount ‖ expires (u64
+LE)`.
+
+```json
+{"blockchain": "evm", "scheme": "batch-settlement", "channelId": "0x…", "expires": 1800000000,
+ "signature": "0x…(65 bytes)", "channelConfig": {…}}
+{"blockchain": "solana", "scheme": "batch-settlement", "channelAccount": "<base58>",
+ "expires": 1800000000, "signature": "<base64 of 64 bytes>"}
+```
+
+One narrowing: `scheme` is **required** and MUST be `"batch-settlement"`. A claim-state entry
+without it asks about a `toon-channel` channel, and a `toon-channel` challenge never proves the peer
+role, so it is refused rather than defaulted. `channelConfig` is optional, as it is there: an EVM
+channel nothing has been paid on yet has no record at the receiver, and the config is re-hashed to
+`channelId` before anything is asked of the chain. An unreadable challenge proves nothing and is not
+refused for it; the packet is simply not a peer's. The wire form is prose-normative until #1384 adds
+its vector case (ADR 0075 decision 14; ADR 0045).
 
 ### 1.5 Binding, and the anti-escalation rules
 
@@ -427,7 +518,10 @@ client request, whatever the previous request from the same connection carried.
   or more than one claim header on a single HTTP request, MUST refuse the frame or request — BTP:
   an ERROR frame as above; HTTP: `400`, with no ILP body. The connector MUST NOT pick the first,
   the last, or a concatenation. This is the smuggling defence, and its absence is how "which claim
-  did we verify?" becomes unanswerable.
+  did we verify?" becomes unanswerable. The same holds for the peer-role challenge (§1.4): more
+  than one challenge entry or header is refused, and so is **a claim beside a challenge** on one
+  frame or request — two pieces of authentication material, and "which one did we check?" has no
+  answer (ADR 0075, issue #1377).
 
 > **Restated by [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)
 > (issue #1157).** The ambiguity bullet used to protect the `auth` entry and the `Toon-Peer-Auth`
@@ -457,6 +551,14 @@ The two failures are deliberately **not** one bucket, because they have differen
 disagree, which is this node's wiring rather than the caller's. **P3** (`SignatureInvalid`) means a
 record exists and the signature did not recover to the counterparty key that row configures — a
 rotated key, or somebody else's claim. A shared secret gave one message for both.
+
+**X1 and X2 report the same way (ADR 0075, issue #1377).** A voucher or a challenge on a channel
+whose chain-recorded voucher signer is **bound** to a peering, and whose signature does not recover
+to that signer, is `P3`. A challenge whose signature does verify but whose `expires` is outside its
+window (§1.2) is `P3-expires` — the key is right and the clock or the challenge's lifetime is not, a
+different fix. A voucher or challenge on a channel whose signer is bound to no peering is silent, for
+the reason a claim on an unbound channel is: every client paying with a voucher presents one. So is
+one on a channel this node cannot resolve, which has no chain-recorded signer to attribute it by.
 
 ### 1.7 What each role grants
 
@@ -496,6 +598,15 @@ MUST NOT also appear in `[[client_channels]]`, and a configuration containing bo
 load** (§11, `ChannelInBothNamespaces`). Disjointness is enforced in config, so the two namespaces
 can never describe the same money.
 
+**An x402 channel is not disjoint by config, and its watermark is the channel's (ADR 0075, issue
+#1377).** Whether a voucher channel is a peer's is decided by a runtime binding of its signer
+(§1.2), which can be made after that channel's vouchers were already accepted as a client's. A
+voucher's cumulative amount is a property of its channel, so a connector MUST NOT judge a peer's
+voucher against a watermark that starts again at zero: two watermarks over one voucher channel would
+count the same money twice. `POST /ilp/claim-state` already answers a voucher channel with the higher
+of the two books (`client-edge-spec.md` §1.10), and the step that judges a peer's vouchers (#1378)
+inherits this requirement.
+
 ### 1.9 The named regression
 
 The invariant exists because the TypeScript fleet violated it. `toon-sandbox` admitted an
@@ -520,6 +631,17 @@ following is classified `client` and reaches no peer handling whatsoever:
 > All five still classify `client`; three of them stopped being **expressible** when the credential
 > was deleted, so the cases are restated in terms of the claim that now decides. The invariant and
 > the reason for it are unchanged, and so is the requirement that both carriages carry the test.
+
+**The x402 cases (ADR 0075, issue #1377)**, classified `client` on both carriages the same way:
+
+6. a voucher on a channel whose voucher signer is bound to no peering — every client paying with a
+   voucher;
+7. a voucher on a bound channel signed by a key that is not the channel's voucher signer;
+8. a peer-role challenge that has expired, lies further ahead than the window, or is signed by a
+   key that is not the channel's voucher signer;
+9. a peer-role challenge on a packet that moves value;
+10. a challenge's signature presented as a voucher, or a voucher's as a challenge — neither message
+    verifies as the other (`connector-signer`'s separation tests).
 
 "Reaches no peer handling" is testable as: no peer watermark moved, nothing was appended to the
 peer claim ledger, and no `claim-ack` was emitted. (Before ADR 0033 this list also named
@@ -680,6 +802,7 @@ ride on each carriage.
 | **CLAIM_ACK** (§3.4)                  | `claim-ack` protocolData entry on the RESPONSE that already answers the claim-bearing frame (§5)                                           | `Toon-Claim-Ack` response header on the response that already answers the claim-bearing request (§5)                |
 | `accumulatedCost` (§5.2)              | `toon-accumulated-cost` entry on the REJECT's RESPONSE, decimal-uint64 UTF-8 — **already implemented on the client edge, reused verbatim** | `Toon-Accumulated-Cost` response header — **already implemented on the client edge, reused verbatim**               |
 | flush prompt (§6.4)                   | _(none — the payee can originate on BTP)_                                                                                                  | `Toon-Flush-Requested` response header, optional (§6.4)                                                             |
+| peer-role challenge (§1.4, ADR 0075)  | `peer-role-challenge` protocolData entry on a zero-value MESSAGE, **raw UTF-8 JSON**                                                       | `Toon-Peer-Role-Challenge` request header, `base64(JSON)`                                                           |
 
 Header names are matched case-insensitively per RFC 9110; the canonical lower-case forms are the
 ones the vectors pin.
