@@ -600,18 +600,20 @@ impl OutboundChannels {
     /// peering has been paying on. A channel whose chain cannot be read now
     /// is not live, and an error is never mistaken for an absence -- it
     /// answers `Err`.
+    ///
+    /// Narrows [`Self::opened_toward`], the journal's own "channels toward
+    /// this party", to the ones the chain still shows open.
     pub async fn live_toward(
         &self,
-        chain: SettlementChain,
-        receiver: &[u8],
+        receiver: &VoucherSigner,
     ) -> Result<Option<String>, BatchChannelError> {
         let mut candidates: Vec<(String, u128)> = self
-            .channels()
-            .iter()
-            .filter(|(_, tracked)| {
-                tracked.chain == chain && tracked.opened && tracked.record.receiver() == receiver
+            .opened_toward(receiver)
+            .into_iter()
+            .map(|id| {
+                let signed = self.signed(&id).unwrap_or(0);
+                (id, signed)
             })
-            .map(|(id, tracked)| (id.clone(), tracked.signed))
             .collect();
         candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
         for (id, _) in candidates {
@@ -621,14 +623,6 @@ impl OutboundChannels {
             }
         }
         Ok(None)
-    }
-
-    /// The highest amount this node has signed a voucher for on `id`, or
-    /// `None` for a channel it does not hold.
-    pub fn signed(&self, id: &str) -> Option<u128> {
-        self.channels()
-            .get(&canonical_id(id))
-            .map(|tracked| tracked.signed)
     }
 
     /// Raise an outbound channel's signed watermark to `amount`, where the

@@ -368,9 +368,7 @@ impl Connector {
             .outbound_channels()
             .ok_or(BatchChannelError::NoBackend(SettlementChain::Evm))?;
 
-        let (channel_id, status) = match outbound
-            .live_toward(SettlementChain::Evm, &receiver)
-            .await?
+        let (channel_id, status) = match outbound.live_toward(&VoucherSigner::Evm(receiver)).await?
         {
             Some(channel_id) => (channel_id, ChannelBranch::Found),
             None => {
