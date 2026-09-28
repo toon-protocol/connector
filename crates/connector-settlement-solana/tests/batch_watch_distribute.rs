@@ -79,6 +79,7 @@ async fn a_distribute_that_pays_the_node_and_refunds_the_payer_reaches_distribut
             &RpcTransport::direct(&validator.rpc_url).expect("transport"),
             &seed,
             mint,
+            6,
             u64::from(GRACE),
             1,
         )

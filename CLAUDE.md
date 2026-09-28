@@ -15,11 +15,11 @@ disagree, the ADR wins too (`docs/adr/`).
 The connector is the Rust workspace under `crates/`, built as the `connector`
 binary. Nothing else in this repository is the connector:
 
-- `packages/contracts` — the Solidity `TokenNetwork` / `TokenNetworkRegistry` the
-  EVM backend binds to.
-- `packages/solana-program` — the payment-channel program the Solana backend drives.
-  A Cargo workspace member, excluded from the workspace test gate; it has its own
-  `cargo test-sbf` job.
+- `packages/contracts` — TOON's retired Solidity `TokenNetwork` / `TokenNetworkRegistry`.
+  The connector no longer binds to them (ADR 0075, #1385); #1386 removes them.
+- `packages/solana-program` — TOON's retired payment-channel program, likewise unused by
+  the connector. A Cargo workspace member, excluded from the workspace test gate; it has
+  its own `cargo test-sbf` job until #1386.
 - `packages/faucet`, `packages/announcer` — devnet tooling and a standalone
   announcer sidecar. These are the only reason npm and `package.json` still exist
   here. `npm test` runs them; it does not test the connector.
@@ -63,7 +63,7 @@ subject; a stub that asserts a sequence of calls is not (ADR 0007). The three ti
 1. **Property tests over `connector-domain`** — no I/O, no clock. Route selection,
    claim validation, nonce and watermark rules, fee arithmetic, expiry.
 2. **Contract suites**, defined once per port and run against every implementation
-   of it. `connector-settlement`'s `assert_upholds_the_contract` is the model.
+   of it. `connector-settlement`'s `batch::contract` suites are the model.
 3. **Integration tests against a real chain**, only where chain behaviour is the
    subject: gas estimation, nonce conflicts, confirmation semantics.
 
@@ -74,16 +74,12 @@ disposable chain per test** and tears it down on drop:
 
 - `connector_settlement_evm::test_support::Anvil::spawn` forks `anvil` on its own port.
 - `connector_settlement_solana::test_support::SolanaValidator::spawn` forks
-  `solana-test-validator` and loads `payment_channel.so` into genesis at a fixed
-  program id, rebuilding the `.so` first unless it is byte-for-byte the one the
-  harness itself last built from these sources — `target/deploy` is a drop box
-  `make solana-test` and a hand-run `cargo build-sbf` write to as well. It also
-  loads solana-foundation's `payment-channels` (ADR 0074) at its canonical id
-  `CHNLx…`, from a committed mainnet-beta dump under
-  `crates/connector-settlement-solana/fixtures/` whose hash a test pins — and,
-  from the same directory and pinned the same way, mainnet-beta's Token program
-  (p-token) at the SPL Token id, because the bundled SPL Token refuses the
-  `Batch` a two-payout `distribute` sends (#1358).
+  `solana-test-validator` and loads solana-foundation's `payment-channels` (ADR 0074) into genesis at its canonical id `CHNLx…`, from a committed mainnet-beta
+  dump under `crates/connector-settlement-solana/fixtures/` whose hash a test
+  pins — and, from the same directory and pinned the same way, mainnet-beta's
+  Token program (p-token) at the SPL Token id, because the bundled SPL Token
+  refuses the `Batch` a two-payout `distribute` sends (#1358). Nothing is built
+  first: TOON's `payment_channel.so` is no longer loaded (#1385).
 
 Nothing under `crates/` dials `localhost:8545` or `localhost:8899`. Starting
 `make anvil-up` before `cargo test` changes nothing. The containers exist for
@@ -94,9 +90,8 @@ A missing chain binary **fails CI and skips locally**. `require_anvil()` /
 returns early and reports `passed` in `0.00s` is worse than a missing test.
 Never add a skip-when-unavailable branch that can go green in CI.
 
-Install Foundry (`anvil`, `forge`, `cast`) and the Solana CLI to run the full gate
-locally. `forge` is needed for `abi_provenance`, which rebuilds the contracts and
-diffs the committed ABI.
+Install Foundry (`anvil`, `cast`) and the Solana CLI to run the full gate
+locally.
 
 ### What the containers ARE for
 
@@ -163,7 +158,7 @@ Every key is a file path in the config; no key is ever inline, and there is no
 environment-variable layer to smuggle one through.
 
 The connector holds a **signer**, not a wallet. ADR 0012's treasury half was deleted
-(#556) — collateral is `SettlementBackend`'s job. There is no mnemonic recovery, no
+(#556) — collateral is the settlement port's job. There is no mnemonic recovery, no
 seed management and no wallet database, and none should be reintroduced; end-user
 key handling belongs to `toon-client`.
 
@@ -175,11 +170,13 @@ A node reads these:
 | `[settlement.evm.key] key_file`    | `settlement.key`        | EVM settlement transactions and EVM claims, client-payout vouchers included (ADR 0075)       |
 | `[settlement.solana.key] key_file` | `settlement-solana.key` | Solana settlement transactions and Solana claims, client-payout vouchers included (ADR 0075) |
 
-ADR 0075 (accepted, partly built — #1371) makes each chain's settlement key the signer of every
-voucher on that chain and leaves `[signer]` as identity only, with no spending authority. Client
-payouts (#1381) and peer claims (#1378, #1379, #1380) already follow it: both are vouchers signed by
-the chain's settlement key. Since #1384 every claim at the client edge is a voucher too; a
-`toon-channel` claim is refused by name.
+ADR 0075 (built — #1371) makes each chain's settlement key the signer of every voucher on that
+chain and leaves `[signer]` as identity only, with no spending authority: client payouts and peer
+claims are vouchers signed by the chain's settlement key, and every claim at the client edge is a
+voucher too; a `toon-channel` claim is refused by name. Each `[settlement.<chain>]` table carries
+that chain's x402 terms directly (the old `batch_settlement` sub-table, `contract_address` and
+`program_id` are refused by name), and a node boots only on a chain where the x402 contract or
+program is deployed (#1385).
 
 `[announce]` is gone (ADR 0046 / #1074): the section is now `[node]`, holding only `addresses`,
 `http_endpoint` and `btp_endpoint` — the facts a node cannot introspect about itself — and no key of
@@ -233,17 +230,15 @@ to the other.
 **Local EVM (anvil).** Genesis funds 10 accounts with 10,000 ETH each; account 0
 (`0xf39F…2266`) is the deployer everything uses. `infra/anvil/seed.sh` places x402's
 `x402BatchSettlement` and its collectors at their canonical addresses and deploys
-Circle's FiatToken v2.2 as USDC (6 decimals), with account 1 as its minter — plus
-the one `TokenNetworkRegistry` the connector still boots through until #1385, on
-which no channel is opened. USDC is **minted on demand** (`FiatToken.mint` from
+Circle's FiatToken v2.2 as USDC (6 decimals), with account 1 as its minter, and
+nothing of TOON's (#1385). USDC is **minted on demand** (`FiatToken.mint` from
 account 1 in `local/keys.sh`; `X402Chain::mint` in tests), never dripped. No
 faucet is involved.
 
 **Local Solana.** The validator entrypoint loads solana-foundation's
 `payment-channels` at `CHNLx…` and mainnet's p-token from the pinned fixtures
-under `crates/connector-settlement-solana/fixtures/` (and TOON's own program only
-for the boot requirement, until #1385) into genesis, so no keypair is committed
-for any of them.
+under `crates/connector-settlement-solana/fixtures/` into genesis, so no keypair
+is committed for either.
 `infra/solana/create-usdc-mint.sh` creates a deterministic mock USDC mint and seeds
 a treasury from `infra/solana/usdc-authority.json`. That script refuses any RPC URL
 containing "mainnet" — it mints unlimited supply of a mock token from a committed
@@ -260,11 +255,13 @@ there is no separate deployer key to lose — which is what happened to the mint
 before 2026-08, killing that leg with no repair path. The faucet is a separate
 service and is not part of the connector.
 
-**Mainnet.** The contracts are live on Base mainnet (2026-09-01,
-`packages/contracts/deployments/base-mainnet.md`) and the payment-channel program on
+**Mainnet.** TOON's contracts are live on Base mainnet (2026-09-01,
+`packages/contracts/deployments/base-mainnet.md`) and its payment-channel program on
 Solana mainnet-beta (2026-08-14, `packages/solana-program/deployments/mainnet-beta.md`),
 both against Circle's native USDC and both deployed by hand. One third-party operator's
-node — Drew Pierson's — uses them; this repository's fleet does not. Nothing here funds
+node — Drew Pierson's — uses them; this repository's fleet does not. This build no longer
+settles on them (ADR 0075): such a node drains its TOON channels on the last TOON-capable
+release before upgrading, and a journal still holding them is refused at boot by name. Nothing here funds
 a mainnet node: it funds itself. The Solana mint script and the local topology are
 devnet-and-below only.
 
@@ -291,10 +288,9 @@ contract" half false before any successor record landed. Its fleet half still ho
 Do not fill the skeleton in, and do not put it under `infra/`: those are gate-checked
 fixtures, not a place to add a file that must never load.
 `crates/connector-bin/tests/production_skeleton_is_inert.rs` fails the build on either.
-A node pointed at mainnet takes its addresses from the deployment records, never from
-the devnet table: ADR 0053 binds the settlement program into a claim's signed message,
-and the mainnet program id (`8e7Bhzyd…`) is unrelated to the devnet one, so a mainnet
-node naming the devnet program takes money for claims it can never redeem.
+A node pointed at mainnet takes its token and mint from mainnet's records, never from
+the devnet tables. The x402 contract and program are constants of the binary, the same
+on every network (ADR 0075), so there is no program id left to get wrong.
 
 **Nothing in this repository moves a tag onto any devnet node (ADR 0068).**
 `:rust-release` used to be a promotion tag, moved only by an explicit

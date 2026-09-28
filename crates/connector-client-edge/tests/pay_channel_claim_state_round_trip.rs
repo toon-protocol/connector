@@ -64,7 +64,6 @@ use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
-use connector_settlement_evm::EvmSettlementBackend;
 use connector_signer::giftwrap::{open_response, seal_request};
 use connector_signer::{
     BatchChannelConfig, BatchSettlementDomain, LocalSigner, PublicKeyBytes, Signer,
@@ -219,14 +218,12 @@ fn sealed_prepare(body: &[u8], receiver: &PublicKeyBytes) -> (Prepare, [u8; 32])
     )
 }
 
-/// One chain for a test: anvil, x402 placed, a FiatToken USDC the payer
-/// holds, and the `TokenNetwork` registry the settlement key still connects
-/// through until #1385.
+/// One chain for a test: anvil, x402 placed, and a FiatToken USDC the
+/// payer holds.
 struct Chain {
     anvil: Anvil,
     x402: X402Chain,
     token: Address,
-    registry: Address,
 }
 
 impl Chain {
@@ -234,34 +231,22 @@ impl Chain {
         let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
         let mut x402 = X402Chain::place(&anvil.rpc_url).await;
         let token = x402.deploy_fiat_token().await;
-        let registry = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-            .await
-            .expect("a TokenNetwork registry to connect the settlement key through")
-            .registry_address();
         x402.mint(token, address_of(DEPLOYER_PRIVATE_KEY), 1_000_000)
             .await;
-        Chain {
-            anvil,
-            x402,
-            token,
-            registry,
-        }
+        Chain { anvil, x402, token }
     }
 
     /// The payer's x402 channels, over the real paying half and a journal
     /// file at `journal`: what a booting node restores.
     async fn outbound_channels(&self, journal: &std::path::Path) -> Arc<OutboundChannels> {
-        let payer = EvmSettlementBackend::connect(
+        let payer = connector_settlement_evm::EvmBatchSettlementBackend::connect(
             &connector_settlement_evm::RpcTransport::direct(&self.anvil.rpc_url)
                 .expect("rpc transport"),
             DEPLOYER_PRIVATE_KEY,
-            self.registry,
             self.token,
             6,
+            86_400,
         )
-        .await
-        .expect("connect the payer's settlement key")
-        .batch_settlement(86_400)
         .await
         .expect("the payer's x402 half");
         let journal: Arc<dyn Journal> =

@@ -92,14 +92,14 @@ services:
     # or a `cast send ... mint(...)` to a codeless address that does not
     # revert and funds nobody.
     #
-    # The address is the LAST thing seed.sh creates -- the TokenNetwork the
-    # connector still boots through until #1385 -- and seed.sh runs under
-    # `set -e`, so code there means every step before it landed too.
+    # The check is the LAST thing seed.sh does -- account 1 becoming USDC's
+    # minter -- and seed.sh runs under `set -e`, so a true answer there means
+    # every step before it landed too.
     healthcheck:
       test:
         [
           'CMD-SHELL',
-          "cast code 0x75537828f2ce51be7289709686A69CbFDbB714F1 --rpc-url http://localhost:8545 2>/dev/null | grep -Eq '^0x[0-9a-fA-F]+$$' || exit 1",
+          "cast call 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 'isMinter(address)(bool)' 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --rpc-url http://localhost:8545 2>/dev/null | grep -q true || exit 1",
         ]
       interval: 5s
       timeout: 5s
@@ -160,7 +160,7 @@ services:
       start_period: 10s
 
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  # Solana Test Validator - Local Solana with Auto-Deployed Programs
+  # Solana Test Validator - Local Solana with payment-channels in genesis
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   solana-validator:
     image: ghcr.io/beeman/solana-test-validator:latest
@@ -172,12 +172,6 @@ services:
       - /entrypoint.sh
     volumes:
       - ./infra/solana/entrypoint.sh:/entrypoint.sh:ro
-      # No committed fee-payer keypair: the entrypoint reuses the genesis-funded
-      # validator-identity keypair the validator writes into its ledger dir as the
-      # deploy fee-payer (the beeman image has no solana-keygen). The program id
-      # stays deterministic via the mounted program keypair in /programs.
-      # See infra/solana/entrypoint.sh.
-      - ./target/deploy:/programs:ro
       # solana-foundation's `payment-channels` and mainnet's p-token, the
       # programs every local channel lives on (ADR 0075 decision 13): the same
       # pinned, hash-checked dumps the in-process harness loads.

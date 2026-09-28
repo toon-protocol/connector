@@ -75,16 +75,17 @@ use crate::bindings::x402_batch_settlement::{
     ChannelConfig, ChannelsCall, ChannelsReturn, PendingWithdrawalsCall, PendingWithdrawalsReturn,
     Voucher as X402Voucher, VoucherClaim, X402BatchSettlement,
 };
+use crate::bindings::Erc20;
 use crate::channel_id::format_channel_id;
 use crate::send::{confirm, ConfirmPolicy, Sender};
-use crate::{EvmClient, EvmSettlementBackend};
+use crate::{build_client, EvmClient, RpcTransport};
+use ethers::middleware::Middleware;
 
 /// Both halves of the batch-settlement port over `x402BatchSettlement`:
 /// [`BatchSettlementBackend`] (ADR 0074) and, in [`crate::batch_payer`],
 /// [`BatchSettlementPayer`](connector_settlement::batch::BatchSettlementPayer)
-/// (ADR 0075). Built from the node's [`EvmSettlementBackend`] by
-/// [`EvmSettlementBackend::batch_settlement`], and sharing its RPC client,
-/// its settlement key and that key's nonce count: this node's receiving
+/// (ADR 0075), built by [`EvmBatchSettlementBackend::connect`] from the
+/// `[settlement.evm]` table's transport and key: this node's receiving
 /// identity on a batch-settlement channel is its settlement address, and
 /// `claim` is sent from it as the channel's `receiverAuthorizer`. As payer
 /// it is the same address, as both `payer` and `payerAuthorizer`, and the
@@ -120,37 +121,78 @@ pub struct EvmBatchSettlementBackend {
     pub(crate) paying: tokio::sync::Mutex<()>,
 }
 
-impl EvmSettlementBackend {
-    /// This node's backend for x402 `batch-settlement` channels, both
-    /// halves (ADR 0074, ADR 0075), over `x402BatchSettlement` at the one address
-    /// the record fixes ([`X402_BATCH_SETTLEMENT_ADDRESS`]), admitting
-    /// channels whose `withdrawDelay` is at least `min_withdraw_delay_secs`:
-    /// what `[settlement.evm.batch_settlement]` holds. Everything else a
-    /// channel must name is this backend's: its settlement address as
-    /// `receiver` and `receiverAuthorizer`, and its token.
+impl EvmBatchSettlementBackend {
+    /// This node's backend for x402 `batch-settlement` channels on EVM, both
+    /// halves (ADR 0074, ADR 0075), over `x402BatchSettlement` at the one
+    /// address the record fixes ([`X402_BATCH_SETTLEMENT_ADDRESS`]), signing
+    /// with `private_key` (the `[settlement.evm]` key, hex), settling in
+    /// `token` and admitting channels whose `withdrawDelay` is at least
+    /// `min_withdraw_delay_secs`. Everything else a channel must name is
+    /// this node's: its settlement address as `receiver` and
+    /// `receiverAuthorizer`, and as `payer` and `payerAuthorizer` of every
+    /// channel it opens.
     ///
-    /// Refuses unless the contract at that address computes the same
-    /// channel id for a probe config as this node does, which checks in one
-    /// `eth_call` that something is deployed there and that it is
-    /// `x402BatchSettlement` under the domain vouchers will be checked
-    /// against: this chain, this address, its EIP-712 name and version, and
-    /// the `ChannelConfig` type hash.
-    pub async fn batch_settlement(
-        &self,
+    /// Refuses, in order:
+    ///
+    /// * [`BatchSettlementError::NotDeployed`] when no code is at that
+    ///   address: a chain x402 has not deployed to (ADR 0075 decision 1);
+    /// * a `decimals` the token's own `decimals()` disagrees with (issue
+    ///   #564): nothing scales by it, so it is checked rather than applied;
+    /// * a contract at that address that does not compute the same channel
+    ///   id for a probe config as this node does, which checks in one
+    ///   `eth_call` that it is `x402BatchSettlement` under the domain
+    ///   vouchers will be checked against: this chain, this address, its
+    ///   EIP-712 name and version, and the `ChannelConfig` type hash.
+    ///
+    /// Every read here is retried with backoff before it fails the node
+    /// (ADR 0073 decision 5), and none of them can hang: the transport
+    /// bounds each one.
+    pub async fn connect(
+        transport: &RpcTransport,
+        private_key: &str,
+        token: Address,
+        expected_decimals: u8,
         min_withdraw_delay_secs: u64,
-    ) -> Result<EvmBatchSettlementBackend, BatchSettlementError> {
+    ) -> Result<Self, BatchSettlementError> {
+        let built = build_client(transport, private_key)
+            .await
+            .map_err(BatchSettlementError::Backend)?;
+        let client = built.client;
         let contract_address = Address::from(X402_BATCH_SETTLEMENT_ADDRESS);
-        let contract = X402BatchSettlement::new(contract_address, Arc::clone(&self.client));
+        let code = connector_chain_rpc::retry_read(|| client.get_code(contract_address, None))
+            .await
+            .map_err(backend_error)?;
+        if code.as_ref().is_empty() {
+            return Err(BatchSettlementError::NotDeployed(format!(
+                "x402BatchSettlement ({contract_address:?})"
+            )));
+        }
+        let on_chain_decimals = connector_chain_rpc::retry_read(|| async {
+            Erc20::new(token, Arc::clone(&client))
+                .decimals()
+                .call()
+                .await
+        })
+        .await
+        .map_err(backend_error)?;
+        if on_chain_decimals != expected_decimals {
+            return Err(BatchSettlementError::Backend(format!(
+                "[settlement.evm] decimals is {expected_decimals}, but token {token:?} \
+                 reports decimals() = {on_chain_decimals}"
+            )));
+        }
+        let own_address = built.sender.address();
+        let contract = X402BatchSettlement::new(contract_address, Arc::clone(&client));
         let domain = BatchSettlementDomain {
-            chain_id: self.chain_id,
+            chain_id: built.chain_id,
             verifying_contract: contract_address.to_fixed_bytes(),
         };
         let probe = EvmChannelConfig {
             payer: [0x01; 20],
             payer_authorizer: [0x02; 20],
-            receiver: self.own_address.to_fixed_bytes(),
-            receiver_authorizer: self.own_address.to_fixed_bytes(),
-            token: self.token.address().to_fixed_bytes(),
+            receiver: own_address.to_fixed_bytes(),
+            receiver_authorizer: own_address.to_fixed_bytes(),
+            token: token.to_fixed_bytes(),
             withdraw_delay: min_withdraw_delay_secs,
             salt: [0x03; 32],
         };
@@ -169,18 +211,18 @@ impl EvmSettlementBackend {
                 "the contract at {contract_address:?} computes channel ids under another \
                  EIP-712 domain than x402BatchSettlement on chain {} at that address; it is not \
                  the contract vouchers here are signed for",
-                self.chain_id
+                built.chain_id
             )));
         }
         Ok(EvmBatchSettlementBackend {
             contract,
             domain,
-            own_address: self.own_address,
-            token: self.token.address(),
+            own_address,
+            token,
             min_withdraw_delay_secs,
-            client: Arc::clone(&self.client),
-            sender: Arc::clone(&self.sender),
-            confirm: self.confirm,
+            client,
+            sender: built.sender,
+            confirm: built.confirm,
             admitted: Mutex::new(HashMap::new()),
             outbound: Mutex::new(HashMap::new()),
             deposit_route: tokio::sync::OnceCell::new(),

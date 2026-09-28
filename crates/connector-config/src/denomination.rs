@@ -350,11 +350,8 @@ impl DenominationConfig {
 /// quote on its own settlement chain precisely because that is the one
 /// chain a peering already guarantees RPC for, so a quote on a chain with
 /// no table is a poller that could never take its first reading.
-fn settles_on(tables: SettlementTables<'_>, chain: AssetChain) -> bool {
-    match SettlementChain::from(chain) {
-        SettlementChain::Evm => tables.evm(),
-        SettlementChain::Solana => tables.solana_program_id().is_some(),
-    }
+fn settles_on(tables: SettlementTables, chain: AssetChain) -> bool {
+    tables.x402(SettlementChain::from(chain))
 }
 
 /// A pool address in the one spelling its chain has: lowercase `0x` hex for
@@ -428,7 +425,7 @@ fn resolve_guard_override(row: &str, raw: &mut RawRateRow) -> Result<GuardOverri
 /// two numeraires has no right one at all.
 fn resolve_tokens(
     raw: Vec<RawToken>,
-    tables: SettlementTables<'_>,
+    tables: SettlementTables,
 ) -> Result<(Vec<DeclaredToken>, Option<AssetId>), ConfigError> {
     let mut assets = Vec::with_capacity(raw.len());
     let mut seen = HashSet::with_capacity(raw.len());
@@ -490,7 +487,7 @@ fn resolve_quote(
     asset: &AssetId,
     legs: Vec<RawQuoteLeg>,
     numeraire: Option<&AssetId>,
-    tables: SettlementTables<'_>,
+    tables: SettlementTables,
 ) -> Result<QuotePath, ConfigError> {
     if legs.is_empty() {
         return Err(ConfigError::TokenQuoteEmpty {
@@ -649,7 +646,7 @@ pub(crate) fn resolve_denomination(
     raw_tokens: Vec<RawToken>,
     raw_rates: Vec<RawRateRow>,
     raw_guards: Option<RawRateGuards>,
-    tables: SettlementTables<'_>,
+    tables: SettlementTables,
 ) -> Result<DenominationConfig, ConfigError> {
     if raw_tokens.is_empty() && raw_rates.is_empty() && raw_guards.is_none() {
         return Ok(DenominationConfig::default());
@@ -705,8 +702,8 @@ mod tests {
 
     /// A node with both settlement tables, which is what `local/solo`
     /// runs; the per-chain refusals below narrow it.
-    fn both_chains() -> SettlementTables<'static> {
-        SettlementTables::for_tests(true, Some("2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip"))
+    fn both_chains() -> SettlementTables {
+        SettlementTables::for_tests(true, true)
     }
 
     fn asset(text: &str) -> AssetId {
@@ -965,10 +962,7 @@ quote = [
         ));
         // A Solana-only node: it has RPC for no EVM chain, so it can never
         // take this reading.
-        let solana_only = SettlementTables::for_tests(
-            false,
-            Some("2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip"),
-        );
+        let solana_only = SettlementTables::for_tests(false, true);
         let error = resolve_denomination(tokens, vec![], guards(), solana_only)
             .expect_err("a quote needs RPC for its own chain");
         assert!(

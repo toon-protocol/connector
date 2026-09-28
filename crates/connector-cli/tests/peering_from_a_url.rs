@@ -55,7 +55,6 @@ use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
-use connector_settlement_evm::EvmSettlementBackend;
 use connector_signer::giftwrap::{open_response, seal_request};
 use connector_signer::PublicKeyBytes;
 use ed25519_dalek::Keypair;
@@ -186,14 +185,12 @@ fn sealed_prepare(
     )
 }
 
-/// One chain for the whole test: anvil, x402 placed, a FiatToken USDC, the
-/// `TokenNetwork` registry the `[settlement.evm]` table still names until
-/// #1382, and both nodes' settlement accounts holding [`FUNDED`] USDC.
+/// One chain for the whole test: anvil, x402 placed, a FiatToken USDC, and
+/// both nodes' settlement accounts holding [`FUNDED`] USDC.
 struct Chain {
     anvil: Anvil,
     x402: X402Chain,
     token: Address,
-    registry: Address,
 }
 
 impl Chain {
@@ -201,39 +198,10 @@ impl Chain {
         let anvil = Anvil::spawn(ANVIL_BASE_PORT + offset).await;
         let mut x402 = X402Chain::place(&anvil.rpc_url).await;
         let token = x402.deploy_fiat_token().await;
-        let registry = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-            .await
-            .expect("a TokenNetwork registry for the settlement table")
-            .registry_address();
         for key in [DEPLOYER_PRIVATE_KEY, COUNTERPARTY_PRIVATE_KEY] {
             x402.mint(token, address_of(key), FUNDED).await;
         }
-        Chain {
-            anvil,
-            x402,
-            token,
-            registry,
-        }
-    }
-
-    /// Whether `TokenNetwork` holds a channel between the two anvil keys --
-    /// what `POST /peers` opened on EVM before ADR 0075, and must not now.
-    async fn token_network_channel_between_the_nodes(&self) -> bool {
-        let reader = EvmSettlementBackend::connect(
-            &connector_settlement_evm::RpcTransport::direct(&self.anvil.rpc_url)
-                .expect("rpc transport"),
-            COUNTERPARTY_PRIVATE_KEY,
-            self.registry,
-            self.token,
-            6,
-        )
-        .await
-        .expect("a TokenNetwork reader");
-        reader
-            .channel_with(address_of(DEPLOYER_PRIVATE_KEY))
-            .await
-            .expect("ask TokenNetwork")
-            .is_some()
+        Chain { anvil, x402, token }
     }
 }
 
@@ -358,23 +326,20 @@ transport = "{pinned}"
 
 [settlement.evm]
 rpc_url = "{rpc_url}"
-contract_address = "{registry:?}"
 token_address = "{token:?}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{settlement_key}"
 
-[settlement.evm.batch_settlement]
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
 "#,
             state_dir = state_dir.path().display(),
             signer_key = signer_key.path().display(),
             settlement_key = settlement_key_file.path().display(),
             write_key = write_key_hex(&operator),
             rpc_url = chain.anvil.rpc_url,
-            registry = chain.registry,
             token = chain.token,
         ));
         let runtime = connector_cli::build(&config).await.expect("build the node");
@@ -650,10 +615,6 @@ async fn two_nodes_peer_over_two_x402_channels(carriage: Carriage, offset: u16) 
             node.name
         );
     }
-    assert!(
-        !chain.token_network_channel_between_the_nodes().await,
-        "POST /peers on EVM no longer opens a TokenNetwork channel"
-    );
     b.route_to(&a).await;
     a.route_to(&b).await;
 
@@ -975,10 +936,6 @@ async fn one_operator_write_opens_this_nodes_own_channel_and_repeating_it_finds_
         .expect("the channel is listed");
     assert_eq!(row["direction"], "outbound");
     assert_eq!(row["counterparty"], spelled(counterparty));
-    assert!(
-        !chain.token_network_channel_between_the_nodes().await,
-        "no TokenNetwork channel is opened"
-    );
 
     // Repeating the identical request finds it, and deposits nothing more.
     let repeated = node.write(Method::POST, "/peers", with_deposit).await;

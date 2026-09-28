@@ -15,9 +15,7 @@ use connector_settlement::batch::{
 };
 use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
-use connector_settlement_evm::{
-    Claimed, EvmBatchSettlementBackend, EvmBatchWatcher, EvmSettlementBackend,
-};
+use connector_settlement_evm::{Claimed, EvmBatchSettlementBackend, EvmBatchWatcher, RpcTransport};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::Address;
 
@@ -43,13 +41,15 @@ impl Chain {
         let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
         let mut x402 = X402Chain::place(&anvil.rpc_url).await;
         let token = x402.deploy_fiat_token().await;
-        let settlement = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-            .await
-            .expect("this node's settlement backend");
-        let backend = settlement
-            .batch_settlement(ONE_DAY)
-            .await
-            .expect("bound to x402BatchSettlement");
+        let backend = EvmBatchSettlementBackend::connect(
+            &RpcTransport::direct(&anvil.rpc_url).expect("transport"),
+            DEPLOYER_PRIVATE_KEY,
+            token,
+            6,
+            ONE_DAY,
+        )
+        .await
+        .expect("bound to x402BatchSettlement");
         let payer = LocalWallet::from_bytes(&[0x71; 32]).expect("key");
         let session = LocalWallet::from_bytes(&[0x72; 32]).expect("key");
         x402.fund_gas(payer.address()).await;

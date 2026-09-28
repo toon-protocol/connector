@@ -83,9 +83,10 @@ this file exists for — someone configuring themselves from it — was pointed 
 a contract the live registry does not resolve. Two guards now stand where
 memory did: `devnet_configs_load.rs`'s
 `the_public_endpoints_document_names_the_fleets_live_evm_deployment` holds both
-blocks to the fleet's addresses on every push, and
-`.github/workflows/base-sepolia-redeem-gate.yml` asks Base Sepolia itself
-whether the registry still resolves to the address published here.
+blocks to the fleet's addresses on every push. (A dispatch-only workflow,
+`base-sepolia-redeem-gate.yml`, also asked Base Sepolia itself whether the
+registry still resolved to the address published here; it was deleted with
+the connector's `TokenNetwork` redeem path, ADR 0075, #1385.)
 `docs/evm-deployment.md`'s repoint checklist names this file now; it did not
 then, which is the whole of why the repoint half-finished.
 

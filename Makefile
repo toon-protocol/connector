@@ -110,14 +110,11 @@ anvil-down:
 anvil-logs:
 	docker compose --profile evm logs -f
 
-# Local Blockchain — Solana (Test Validator + Program Deploy)
-# solana-build first: the validator loads target/deploy/payment_channel.so into
-# GENESIS (infra/solana/entrypoint.sh's --bpf-program), so the .so must exist
-# before the container starts. No channel lives on it -- every local channel is
-# a `payment-channels` one, loaded from committed fixtures -- but the connector
-# still boots through `[settlement.solana] program_id` until #1385, and a
-# validator without it refuses every node that settles on Solana.
-solana-up: solana-build
+# Local Blockchain — Solana (Test Validator)
+# The validator loads `payment-channels` and p-token into GENESIS from the
+# committed fixtures (infra/solana/entrypoint.sh's --bpf-program), so nothing
+# is built first: TOON's own program is no longer loaded (ADR 0075, #1385).
+solana-up:
 	docker compose --profile solana up -d
 	$(MAKE) solana-mint-usdc
 
@@ -171,7 +168,7 @@ solana-mint-usdc:
 # (ADR 0002 had already dropped it from the connector).
 #
 # infra-down intentionally does NOT pass -v (preserves existing per-profile volumes).
-infra-up: solana-build
+infra-up:
 	docker compose --profile evm --profile solana up -d
 	$(MAKE) solana-mint-usdc
 
@@ -252,7 +249,7 @@ local-build:
 # writes the forwarding routes with `POST /routes/peers`, and reads every
 # channel back off its chain, failing this target if the chain disagrees. It
 # is a no-op on `solo`, which has no peering.
-local-up: local-preflight local-build solana-build
+local-up: local-preflight local-build
 	@test -n "$(LOCAL_NODES)" || { \
 		echo "ERROR: LOCAL_TOPOLOGY='$(LOCAL_TOPOLOGY)' has no LOCAL_NODES_ entry in this Makefile."; \
 		echo "       Known topologies: solo two-hop mixed-chain onion dealing."; \

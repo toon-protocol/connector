@@ -25,10 +25,9 @@
 # ── Settlement ─────────────────────────────────────────────────────────────
 # Deliberately identical to the store box's (infra/linode-store/) -- and,
 # while it still ran, the apex's (infra/linode-node/, removed by issue #872):
-# the same Base Sepolia `TokenNetworkRegistry` and USDC, the same Solana
-# payment-channel program and mint, both at 6 decimals. A claim resolves
-# against one deployment, so every node that might ever accept one has to
-# agree on which. This box's client edge already accepts unaffiliated
+# the same Base Sepolia USDC and the same Solana mint, both at 6 decimals,
+# on the x402 contract and program the binary fixes (ADR 0075). Every node
+# that might ever accept a voucher has to agree on which token it is in. This box's client edge already accepts unaffiliated
 # buyers' own on-chain channels (issue #556/#611), and those buyers pick the
 # deployment by what the fleet advertises, not by which box answers.
 #
@@ -134,18 +133,19 @@ transport = "btp"
 
 [settlement.evm]
 rpc_url = "https://base-sepolia-rpc.publicnode.com"
-contract_address = "0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5"
 token_address = "0x0C996d7c934c79a6255254875607Fe69df25C0E1"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
 
 [settlement.solana]
 rpc_url = "https://api.devnet.solana.com"
-program_id = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip"
 token_address = "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU"
 decimals = 6
+min_sponsored_deposit = 1000000
 
 [settlement.solana.key]
 key_file = "/app/data/settlement-solana.key"

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::port::ChannelId;
+use crate::ChannelId;
 
 /// Where a batch-settlement channel stands in its payer's lifecycle, as the
 /// chain reports it (ADR 0074 decision 5). The union of both chains' states,
@@ -674,6 +674,13 @@ pub enum BatchSettlementError {
     #[error("the open of batch-settlement channel '{0}' lapsed: the chain never took it")]
     OpenLapsed(ChannelId),
 
+    /// Boot found no x402 contract (EVM) or program (Solana) at the address
+    /// the binary fixes: a chain x402 has not deployed to, which this node
+    /// refuses to settle on (ADR 0075 decision 1). Names what was looked for
+    /// and where.
+    #[error("{0} is not deployed on this chain")]
+    NotDeployed(String),
+
     #[error("batch-settlement backend error: {0}")]
     Backend(String),
 }
@@ -684,11 +691,9 @@ pub enum BatchSettlementError {
 /// vouchers on it. [`BatchSettlementPayer`] is the other half, this node as
 /// the payer.
 ///
-/// It is **not** [`SettlementBackend`](crate::SettlementBackend) bent to fit.
-/// A batch-settlement channel moves value one way and has a different
-/// lifecycle on each chain, so `own_deposited`, `fund` and `close` would
-/// mean nothing here. `SettlementBackend` is deleted once nothing calls it
-/// (ADR 0075 decision 2, issue #1385).
+/// TOON's own two-sided `SettlementBackend` port was never bent to fit a
+/// one-way channel; with every channel an x402 one it is deleted (ADR 0075
+/// decision 2, issue #1385).
 ///
 /// Implementations live in `connector-settlement-evm` (issue #1342) and
 /// `connector-settlement-solana` (issue #1343), as modules beside the

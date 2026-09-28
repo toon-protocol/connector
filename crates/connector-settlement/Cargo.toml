@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Exposes `contract::assert_upholds_the_contract` outside this crate's own
+# Exposes `batch::contract`'s suites outside this crate's own
 # tests, so `connector-settlement-evm`/`-solana` can hold their real
 # implementations to the same suite from their own dev-dependencies
 # without shipping the assertion helpers in a normal build.

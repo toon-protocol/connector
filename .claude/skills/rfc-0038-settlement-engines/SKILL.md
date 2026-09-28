@@ -7,7 +7,7 @@ description: Expert knowledge of Interledger RFC 0038 - Settlement Engines. Use 
 
 ## This connector does not implement it
 
-TOON settles in-process through `SettlementBackend` (EVM and Solana), not through a sidecar behind an HTTP API. There is no settlement-engine interface to implement.
+TOON settles in-process through its x402 settlement port (EVM and Solana, ADR 0075), not through a sidecar behind an HTTP API. There is no settlement-engine interface to implement.
 
 RFC 0038 is therefore **not vendored** into `docs/rfcs/`
 ([ADR 0062](../../../docs/adr/0062-an-rfc-is-vendored-verbatim-and-profiled-never-forked.md)

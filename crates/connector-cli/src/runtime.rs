@@ -30,10 +30,8 @@ use connector_runtime::{
 use connector_settlement::batch::{
     BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer, HeldVouchers,
 };
-use connector_settlement::{SettlementBackend, SettlementError};
-use connector_settlement_evm::{EvmBatchSettlementBackend, EvmBatchWatcher, EvmSettlementBackend};
+use connector_settlement_evm::{EvmBatchSettlementBackend, EvmBatchWatcher};
 use connector_settlement_solana::batch::{SolanaBatchSettlement, SolanaBatchWatcher};
-use connector_settlement_solana::SolanaSettlementBackend;
 use connector_signer::{LocalSigner, Signer, SignerError};
 
 use crate::batch_settlement::{
@@ -81,10 +79,18 @@ pub enum RuntimeError {
     /// `[signer]`'s own `kms_key_id`; use `settlement.key.key_file`
     /// instead.
     UnsupportedSettlementKeyLocation,
-    /// Constructing the configured settlement backend failed -- e.g. the
-    /// RPC endpoint was unreachable, or the contract address named in
-    /// config has no code at it.
-    Settlement(SettlementError),
+    /// A `[settlement.<chain>]` table names a chain on which the x402
+    /// contract (EVM, `x402BatchSettlement`) or program (Solana,
+    /// `payment-channels`) the binary fixes is not deployed (ADR 0075
+    /// decision 1): a network x402 has not deployed to is unsupported,
+    /// loudly, rather than a node that admits nothing and says nothing.
+    X402NotDeployed { table: &'static str, what: String },
+    /// A journal under `state_dir` holds `toon-channel` entries: claims on
+    /// TOON's own retired channels this build can neither judge, land nor
+    /// drain (ADR 0075 decision 8, issue #1385). Refused by name, never
+    /// skipped: a skipped entry is a claim somebody could still redeem that
+    /// this node has forgotten it accepted.
+    ToonChannelJournal { path: PathBuf, channel: String },
     /// `state_dir` names a directory this node cannot create or write a
     /// journal file in (issue #605) -- typically a read-only mount, or a
     /// directory owned by another uid than the one the container runs as.
@@ -146,11 +152,12 @@ pub enum RuntimeError {
         table: &'static str,
         message: String,
     },
-    /// A `[settlement.<chain>.batch_settlement]` table's backend could not
-    /// be bound (ADR 0074): the contract or program it names is not the
-    /// x402 one, or the chain could not be asked. A refusal to start, for
-    /// ADR 0009's reason -- the alternative is a node whose greeting offers
-    /// `batch-settlement` and whose every voucher fails.
+    /// A `[settlement.<chain>]` table's x402 backend could not be bound (ADR
+    /// 0074, ADR 0075): the contract or program at the fixed address is not
+    /// the x402 one, the token disagrees with the table, or the chain could
+    /// not be asked. A refusal to start, for ADR 0009's reason -- the
+    /// alternative is a node whose greeting offers `batch-settlement` and
+    /// whose every voucher fails.
     BatchSettlementUnusable {
         table: &'static str,
         source: BatchSettlementError,
@@ -195,12 +202,25 @@ impl fmt::Display for RuntimeError {
                  service backend is wired into this binary yet -- use \
                  settlement.key.key_file"
             ),
-            RuntimeError::Settlement(source) => {
-                write!(
-                    f,
-                    "failed to construct the configured settlement backend: {source}"
-                )
-            }
+            RuntimeError::X402NotDeployed { table, what } => write!(
+                f,
+                "[settlement.{table}] names a chain on which {what} is not deployed. Every \
+                 channel is an x402 channel on the contract or program the binary fixes (ADR \
+                 0075 decision 1), so a chain without it cannot be settled on -- point rpc_url at \
+                 a chain x402 is deployed to, or remove the table"
+            ),
+            RuntimeError::ToonChannelJournal { path, channel } => write!(
+                f,
+                "the claim journal at {} holds toon-channel entries (channel '{channel}'), and \
+                 this build settles on x402 channels only (ADR 0075, issue #1385): it can \
+                 neither land nor drain a claim on TOON's own channels. Drain the node on the \
+                 last release that supports TOON channels -- land every inbound channel's \
+                 latest claim, close and settle every TOON channel, confirm on chain none is \
+                 still open (ADR 0075, \"Draining a node with live TOON channels\"; \
+                 docs/operators/draining-toon-channels.md) -- then move this journal out of \
+                 state_dir and start this build",
+                path.display()
+            ),
             RuntimeError::StateDirUnusable { path, source } => write!(
                 f,
                 "state_dir {} is not usable for this node's claim journals: {source} -- \
@@ -236,9 +256,8 @@ impl fmt::Display for RuntimeError {
             ),
             RuntimeError::BatchSettlementUnusable { table, source } => write!(
                 f,
-                "[settlement.{table}.batch_settlement] could not be bound: {source}. A node that \
-                 opts in to x402 batch-settlement channels must reach the contract or program \
-                 its vouchers are signed for (ADR 0074)"
+                "[settlement.{table}] could not be bound: {source}. A node must reach the x402 \
+                 contract or program its vouchers are signed for (ADR 0074, ADR 0075)"
             ),
         }
     }
@@ -249,12 +268,6 @@ impl std::error::Error for RuntimeError {}
 impl From<SignerError> for RuntimeError {
     fn from(source: SignerError) -> Self {
         RuntimeError::Signer(source)
-    }
-}
-
-impl From<SettlementError> for RuntimeError {
-    fn from(source: SettlementError) -> Self {
-        RuntimeError::Settlement(source)
     }
 }
 
@@ -312,7 +325,7 @@ fn build_signer(location: &SecretLocation) -> Result<Arc<dyn Signer>, RuntimeErr
 
 /// Encode 32 raw bytes as 64 lowercase hex characters -- what
 /// `ethers::signers::LocalWallet`'s `FromStr` impl expects,
-/// [`EvmSettlementBackend::connect`]'s `private_key` argument.
+/// [`EvmBatchSettlementBackend::connect`]'s `private_key` argument.
 fn hex_encode_32(bytes: [u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -320,9 +333,9 @@ fn hex_encode_32(bytes: [u8; 32]) -> String {
 /// Resolve the `[settlement.key]` section to the raw 32-byte secret key
 /// material it points at -- the same "32 raw bytes or 64 hex characters"
 /// key-file shape [`build_signer`] already reads for `[signer]`, since both
-/// are just secret-key pointers. `EvmSettlementBackend` wants that hex
-/// encoded ([`read_settlement_private_key`]); `SolanaSettlementBackend`
-/// wants it as an ed25519 seed, raw (issue #630).
+/// are just secret-key pointers. The EVM backend wants that hex encoded
+/// ([`read_settlement_private_key`]); the Solana one wants it as an ed25519
+/// seed, raw (issue #630).
 pub(crate) fn read_settlement_key_bytes(
     location: &SecretLocation,
 ) -> Result<[u8; 32], RuntimeError> {
@@ -341,109 +354,47 @@ pub(crate) fn read_settlement_key_bytes(
     }
 }
 
-/// Resolve the `[settlement.key]` section to the hex-encoded secp256k1
-/// private key `EvmSettlementBackend` signs with.
+/// Resolve the `[settlement.evm.key]` section to the hex-encoded secp256k1
+/// private key the EVM backend signs with.
 fn read_settlement_private_key(location: &SecretLocation) -> Result<String, RuntimeError> {
     read_settlement_key_bytes(location).map(hex_encode_32)
 }
 
-/// Parse a `[settlement.solana]` base58 field (`program_id` or
-/// `token_address`) into the `Pubkey` `SolanaSettlementBackend::connect`
-/// wants. Refused -- naming the field and the value -- rather than
-/// unwrapped: `connector-config` only checks these fields are non-empty
-/// (issue #628), since a value that merely fails to parse as base58 is a
-/// different failure from one that parses but names no executable program
-/// or no SPL mint, and both must refuse startup rather than panic (issue
-/// #630, ADR 0009).
-fn parse_solana_pubkey(field: &'static str, value: &str) -> Result<Pubkey, RuntimeError> {
-    Pubkey::from_str(value).map_err(|error| {
-        RuntimeError::Settlement(SettlementError::Backend(format!(
-            "[settlement.solana] {field} '{value}' is not a valid base58 Solana pubkey: {error}"
-        )))
-    })
+/// Map a backend that would not bind to its refusal: by name when the x402
+/// contract or program is absent from the chain (ADR 0075 decision 1).
+fn unbound(table: &'static str, source: BatchSettlementError) -> RuntimeError {
+    match source {
+        BatchSettlementError::NotDeployed(what) => RuntimeError::X402NotDeployed { table, what },
+        source => RuntimeError::BatchSettlementUnusable { table, source },
+    }
 }
 
-/// Construct the settlement backend a `[settlement.evm]` (or legacy flat
-/// `[settlement]`) table describes, connecting to the already-deployed
-/// `TokenNetworkRegistry` it names (issue #576) -- `contract_address` -- and
-/// resolving the `TokenNetwork` it actually drives through `token_address`,
-/// rather than deploying a fresh one (issue #542).
-///
-/// Every field of the table reaches the chain here: `decimals` is handed to
-/// [`EvmSettlementBackend::connect`], which refuses to connect when the
-/// configured scale and the token's own `decimals()` disagree (issue #564).
-/// An EVM table that names a scale the deployed token does not agree with is
-/// a startup failure, not a line with no effect (ADR 0009).
-async fn build_evm_settlement_backend(
-    settlement: &EvmSettlementConfig,
-    transport: &RpcTransport,
-) -> Result<Arc<EvmSettlementBackend>, RuntimeError> {
-    let private_key = read_settlement_private_key(settlement.key())?;
-    let registry_address = ethers::types::Address::from(settlement.contract_address());
-    let token_address = ethers::types::Address::from(settlement.token_address());
-    let backend = EvmSettlementBackend::connect(
-        transport,
-        &private_key,
-        registry_address,
-        token_address,
-        settlement.decimals(),
-    )
-    .await?;
-    Ok(Arc::new(backend))
-}
-
-/// Construct the settlement backend a `[settlement.solana]` table
-/// describes, binding to the already-deployed `payment-channel` program it
-/// names (`program_id`) and settling in the SPL mint it names
-/// (`token_address`) -- the fail-closed identity checks issue #630 wires
-/// in: an unreachable RPC endpoint, a `program_id` naming no executable
-/// account, a `token_address` not owned by the SPL Token program, or a
-/// `decimals` the mint's own `decimals` field disagrees with are all a
-/// startup failure here, not a line with no effect (the `#564` pattern,
-/// Solana-flavored, ADR 0009).
-async fn build_solana_settlement_backend(
-    settlement: &SolanaSettlementConfig,
-    transport: &RpcTransport,
-) -> Result<Arc<SolanaSettlementBackend>, RuntimeError> {
-    let payer_seed = read_settlement_key_bytes(settlement.key())?;
-    let program_id = parse_solana_pubkey("program_id", settlement.program_id())?;
-    let token_mint = parse_solana_pubkey("token_address", settlement.token_address())?;
-    let backend = SolanaSettlementBackend::connect(
-        transport,
-        &payer_seed,
-        program_id,
-        token_mint,
-        settlement.decimals(),
-    )
-    .await?;
-    Ok(Arc::new(backend))
-}
-
-/// This node's receive-only backend for x402 `batch-settlement` channels on
-/// EVM (ADR 0074), when `[settlement.evm.batch_settlement]` is written: built
-/// from the table's own [`EvmSettlementBackend`], so it shares that backend's
-/// client -- and so its one transport (ADR 0073) -- its settlement key and
-/// that key's nonce count. `None` when the table is absent.
+/// This node's x402 settlement backend on EVM, both halves (ADR 0074, ADR
+/// 0075), built from its `[settlement.evm]` table over the table's one
+/// transport (ADR 0073): refuses, by name, a chain without
+/// `x402BatchSettlement` (ADR 0075 decision 1), and a `decimals` the token
+/// disagrees with (issue #564).
 async fn build_evm_batch_settlement(
     settlement: &EvmSettlementConfig,
-    backend: &EvmSettlementBackend,
-) -> Result<Option<Arc<EvmBatchSettlementBackend>>, RuntimeError> {
-    let Some(batch) = settlement.batch_settlement() else {
-        return Ok(None);
-    };
-    let backend = backend
-        .batch_settlement(batch.min_withdraw_delay_secs())
-        .await
-        .map_err(|source| RuntimeError::BatchSettlementUnusable {
-            table: SettlementChain::Evm.name(),
-            source,
-        })?;
-    Ok(Some(Arc::new(backend)))
+    transport: &RpcTransport,
+) -> Result<Arc<EvmBatchSettlementBackend>, RuntimeError> {
+    let private_key = read_settlement_private_key(settlement.key())?;
+    let backend = EvmBatchSettlementBackend::connect(
+        transport,
+        &private_key,
+        ethers::types::Address::from(settlement.token_address()),
+        settlement.decimals(),
+        settlement.batch_settlement().min_withdraw_delay_secs(),
+    )
+    .await
+    .map_err(|source| unbound(SettlementChain::Evm.name(), source))?;
+    Ok(Arc::new(backend))
 }
 
 /// The Solana twin of [`build_evm_batch_settlement`]: bound over the table's
 /// one transport, under its settlement key as the sponsor (ADR 0074
-/// decision 5), in its `token_address` mint.
+/// decision 5), in its `token_address` mint; refuses, by name, a chain
+/// without `payment-channels`.
 ///
 /// Given the node's `socks_proxy`, if any, for its paying half's posts to a
 /// counterparty's sponsor endpoint (ADR 0070, issue #1379): an onion
@@ -454,45 +405,78 @@ async fn build_solana_batch_settlement(
     settlement: &SolanaSettlementConfig,
     transport: &RpcTransport,
     socks_proxy: Option<&url::Url>,
-) -> Result<Option<Arc<SolanaBatchSettlement>>, RuntimeError> {
-    let Some(batch) = settlement.batch_settlement() else {
-        return Ok(None);
-    };
-    let unusable = |source| RuntimeError::BatchSettlementUnusable {
-        table: SettlementChain::Solana.name(),
-        source,
-    };
+) -> Result<Arc<SolanaBatchSettlement>, RuntimeError> {
+    let table = SettlementChain::Solana.name();
+    let batch = settlement.batch_settlement();
     let sponsor_seed = read_settlement_key_bytes(settlement.key())?;
-    let mint = parse_solana_pubkey("token_address", settlement.token_address())?;
+    let mint = Pubkey::from_str(settlement.token_address()).map_err(|error| {
+        RuntimeError::BatchSettlementUnusable {
+            table,
+            source: BatchSettlementError::Backend(format!(
+                "token_address '{}' is not a valid base58 Solana pubkey: {error}",
+                settlement.token_address()
+            )),
+        }
+    })?;
     let backend = SolanaBatchSettlement::connect(
         transport,
         &sponsor_seed,
         mint,
+        settlement.decimals(),
         batch.min_grace_period_secs(),
         batch.min_sponsored_deposit(),
     )
     .await
-    .map_err(unusable)?;
+    .map_err(|source| unbound(table, source))?;
     let backend = match socks_proxy {
-        Some(proxy) => backend.with_socks_proxy(proxy).map_err(unusable)?,
+        Some(proxy) => backend
+            .with_socks_proxy(proxy)
+            .map_err(|source| unbound(table, source))?,
         None => backend,
     };
-    Ok(Some(Arc::new(backend)))
+    Ok(Arc::new(backend))
 }
 
-/// The two journal files a node keeps under its `state_dir` (issue #605).
-/// Two files rather than one because they are two different books --
-/// `ClaimBook`'s channel ids are peer channels, the client edge's are
-/// chain-namespaced client channels -- and because each is replayed by a
-/// different owner at startup; sharing one file would mean each replaying
-/// the other's entries and each holding a second writer's file handle on
-/// the same path.
+/// Refuse a `state_dir` whose claim journals hold `toon-channel` entries
+/// (ADR 0075 decision 8, issue #1385), before anything is served.
+///
+/// Both files are read: `peer-claims.log`, which only an older build wrote
+/// and nothing opens any more, and `client-edge-claims.log`, which holds
+/// vouchers now and may hold a pre-ADR 0075 client's `toon-channel` claims
+/// beside them. A file that does not exist holds nothing. One that cannot
+/// be read is [`RuntimeError::JournalUnreplayable`], as it always was.
+fn refuse_toon_channel_journals(state_dir: &Path) -> Result<(), RuntimeError> {
+    for name in [PEER_CLAIM_JOURNAL, CLIENT_EDGE_JOURNAL] {
+        let path = state_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let unreplayable = |source| RuntimeError::JournalUnreplayable {
+            path: path.clone(),
+            source,
+        };
+        let entries = FileJournal::open(&path)
+            .and_then(|journal| journal.read_all())
+            .map_err(unreplayable)?;
+        if let Some(channel) = connector_client_edge::first_toon_channel_entry(&entries) {
+            return Err(RuntimeError::ToonChannelJournal { path, channel });
+        }
+    }
+    Ok(())
+}
+
+/// The peer claim journal an older build kept under `state_dir` (issue
+/// #605): the `toon-channel` claims its peers paid it with. Nothing writes
+/// or replays it since ADR 0075; it is read only so that one holding such
+/// claims is refused at boot ([`refuse_toon_channel_journals`]).
 const PEER_CLAIM_JOURNAL: &str = "peer-claims.log";
+/// The client edge's claim journal: every voucher it accepted, and each
+/// x402 channel it admitted.
 const CLIENT_EDGE_JOURNAL: &str = "client-edge-claims.log";
 /// The third book (ADR 0075 decision 8): the x402 channels this node pays
 /// on -- each one's record, journaled before its opening transaction is
-/// sent, and every voucher signed on it. A file of its own for the same
-/// reason as the two above: its own owner, [`OutboundChannels`], replays it.
+/// sent, and every voucher signed on it. A file of its own, because its own
+/// owner, [`OutboundChannels`], replays it.
 const OUTBOUND_CHANNEL_JOURNAL: &str = "outbound-channels.log";
 /// Issue #884's runtime peer/route table -- a whole-table JSON snapshot,
 /// not an append-only journal line format like the two above (see
@@ -635,6 +619,12 @@ pub struct Runtime {
 /// peer transport port and was untouched by #679's deletion.
 pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     let signer = build_signer(config.signer_key())?;
+    // ADR 0075 decision 8, issue #1385: a node whose journals still hold
+    // claims on TOON's own channels is refused by name before any chain is
+    // dialed -- this build could neither land nor drain them.
+    if let Some(state_dir) = config.state_dir() {
+        refuse_toon_channel_journals(state_dir)?;
+    }
     // Issue #678 gap 3, said once and loudly. A plaintext peering could not
     // have loaded unless somebody wrote `peer_allow_plaintext_endpoints`,
     // and the whole point of a loopback-and-test opt-in is that a node that
@@ -743,96 +733,80 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         match settlement {
             SettlementConfig::Evm(evm) => {
                 let transport = transports.for_chain(SettlementChain::Evm)?;
-                let backend = build_evm_settlement_backend(evm, transport).await?;
-                // The chain connection proved the settlement address and the
-                // live chain id; the token comes from the config line
-                // `connect` just verified against that chain (issue #564).
+                // ADR 0075 decision 1: bound before anything is served, and
+                // refused by name on a chain without `x402BatchSettlement`.
+                let backend = build_evm_batch_settlement(evm, transport).await?;
+                let batch = evm.batch_settlement();
+                let network = format!("eip155:{}", backend.domain().chain_id);
+                // The connection proved the settlement address and the live
+                // chain id; the token comes from the config line `connect`
+                // just verified against that chain (issue #564).
                 let settlement_address = format!("{:#x}", backend.own_address());
                 let token_address =
                     format!("{:#x}", ethers::types::Address::from(evm.token_address()));
+                // ADR 0075 decisions 3 and 10: the settlement key signs this
+                // node's vouchers (`payerAuthorizer == payer`), so the
+                // settlement address is the voucher signer a peer binds this
+                // node's channel toward it by.
+                voucher_signers.push(connector_domain::VoucherSignerFact {
+                    network: network.clone(),
+                    signer: settlement_address.clone(),
+                });
                 // ADR 0074 decision 8, issue #1345: this chain's
-                // batch-settlement facts, present only when this table
-                // opted in.
-                if let Some(batch) = evm.batch_settlement() {
-                    // ADR 0075 decisions 3 and 10: the settlement key signs
-                    // this node's vouchers (`payerAuthorizer == payer`), so
-                    // the settlement address is the voucher signer a peer
-                    // binds this node's channel toward it by.
-                    voucher_signers.push(connector_domain::VoucherSignerFact {
-                        network: format!("eip155:{}", backend.chain_id()),
-                        signer: settlement_address.clone(),
-                    });
-                    batch_settlements.push(connector_client_edge::X402BatchSettlementTerms::Evm(
-                        connector_client_edge::X402BatchSettlementEvmTerms {
-                            network: format!("eip155:{}", backend.chain_id()),
-                            asset: token_address,
-                            pay_to: settlement_address.clone(),
-                            receiver_authorizer: settlement_address,
-                            min_withdraw_delay_secs: batch.min_withdraw_delay_secs(),
-                            name: batch.asset_eip712_name().to_string(),
-                            version: batch.asset_eip712_version().to_string(),
-                        },
-                    ));
-                }
-                // ADR 0074: the opt-in, bound before anything is served.
-                batch_settlement_evm = build_evm_batch_settlement(evm, &backend).await?;
-                connector = connector
-                    .with_settlement(SettlementChain::Evm, backend as Arc<dyn SettlementBackend>);
+                // batch-settlement facts, the greeting's `accepts[]` entry.
+                batch_settlements.push(connector_client_edge::X402BatchSettlementTerms::Evm(
+                    connector_client_edge::X402BatchSettlementEvmTerms {
+                        network,
+                        asset: token_address,
+                        pay_to: settlement_address.clone(),
+                        receiver_authorizer: settlement_address,
+                        min_withdraw_delay_secs: batch.min_withdraw_delay_secs(),
+                        name: batch.asset_eip712_name().to_string(),
+                        version: batch.asset_eip712_version().to_string(),
+                    },
+                ));
+                batch_settlement_evm = Some(backend);
             }
             SettlementConfig::Solana(solana) => {
-                // Constructed and attached exactly as the EVM leg is (issue
-                // #630) -- `SolanaSettlementBackend::connect`'s own
-                // fail-closed identity checks (program reachable,
-                // executable and proven to behave like the deployed
-                // payment-channel program, mint owned by the SPL Token
-                // program, configured decimals agreeing with the mint's
-                // own) run before this node serves any traffic.
                 let transport = transports.for_chain(SettlementChain::Solana)?;
-                let backend = build_solana_settlement_backend(solana, transport).await?;
-                // ADR 0074: the opt-in, over the same transport (ADR 0073).
-                batch_settlement_solana =
+                // ADR 0075 decision 1: bound before anything is served, and
+                // refused by name on a chain without `payment-channels`;
+                // the mint must be the SPL Token program's and agree with
+                // `decimals`.
+                let backend =
                     build_solana_batch_settlement(solana, transport, config.socks_proxy()).await?;
-                // ADR 0074 decision 8, issue #1345: this node's Solana
-                // batch-settlement facts, present only when this table
-                // opted in. `payTo` and `feePayer` are both this backend's
-                // own pubkey (decision 5's sponsor-is-the-receiving-operator
-                // rule), and `network` is read off the chain's own genesis
-                // hash (`caip2_network`), never guessed from the RPC URL.
-                // The two minimums are the batch backend's own: what it
-                // admits by and what its sponsor co-signs above are what is
-                // published, with no second read of the config. Issue #1357
-                // adds x402's required `tokenProgram`, the program `connect`
-                // proved owns the mint, and where the sponsor is served.
-                if let Some(batch) = &batch_settlement_solana {
-                    // ADR 0075 decisions 3 and 10: the Solana settlement key
-                    // is `authorized_signer` on every channel this node
-                    // opens, and what a peer binds that channel by (#1379).
-                    voucher_signers.push(connector_domain::VoucherSignerFact {
+                // ADR 0074 decision 8, issue #1345: `payTo` and `feePayer`
+                // are both the sponsor key (decision 5's
+                // sponsor-is-the-receiving-operator rule), and `network` is
+                // read off the chain's own genesis hash, never guessed from
+                // the RPC URL. The two minimums are the backend's own: what
+                // it admits by and what its sponsor co-signs above are what
+                // is published. Issue #1357 adds x402's required
+                // `tokenProgram` and where the sponsor is served.
+                let sponsor = backend.sponsor().to_string();
+                // ADR 0075 decisions 3 and 10: the Solana settlement key is
+                // `authorized_signer` on every channel this node opens, and
+                // what a peer binds that channel by (#1379).
+                voucher_signers.push(connector_domain::VoucherSignerFact {
+                    network: backend.caip2_network(),
+                    signer: sponsor.clone(),
+                });
+                batch_settlements.push(connector_client_edge::X402BatchSettlementTerms::Solana(
+                    connector_client_edge::X402BatchSettlementSolanaTerms {
                         network: backend.caip2_network(),
-                        signer: backend.own_pubkey().to_string(),
-                    });
-                    batch_settlements.push(
-                        connector_client_edge::X402BatchSettlementTerms::Solana(
-                            connector_client_edge::X402BatchSettlementSolanaTerms {
-                                network: backend.caip2_network(),
-                                asset: backend.token_mint().to_string(),
-                                pay_to: backend.own_pubkey().to_string(),
-                                fee_payer: backend.own_pubkey().to_string(),
-                                min_grace_period_secs: batch.min_grace_period_secs(),
-                                token_program: backend.token_program().to_string(),
-                                min_deposit: batch.min_sponsored_deposit().to_string(),
-                                // The path `sponsor::router` mounts, from
-                                // the one constant, so the greeting can
-                                // never name a path nothing serves.
-                                sponsor_endpoint: crate::sponsor::SPONSOR_PATH.to_string(),
-                            },
-                        ),
-                    );
-                }
-                connector = connector.with_settlement(
-                    SettlementChain::Solana,
-                    backend as Arc<dyn SettlementBackend>,
-                );
+                        asset: backend.mint().to_string(),
+                        pay_to: sponsor.clone(),
+                        fee_payer: sponsor,
+                        min_grace_period_secs: backend.min_grace_period_secs(),
+                        token_program: backend.token_program().to_string(),
+                        min_deposit: backend.min_sponsored_deposit().to_string(),
+                        // The path `sponsor::router` mounts, from the one
+                        // constant, so the greeting can never name a path
+                        // nothing serves.
+                        sponsor_endpoint: crate::sponsor::SPONSOR_PATH.to_string(),
+                    },
+                ));
+                batch_settlement_solana = Some(backend);
             }
         }
     }
@@ -861,29 +835,17 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // `[[pay_channels]]` row names one of; before the runtime table below,
     // so a durable runtime row cannot take a signer a config row binds.
     connector = wire_config_peerings(connector, config)?;
-    // The peer semantics's own claim watermarks, made durable by the same
-    // `state_dir` the client edge's are (issue #605, and #556's
-    // reconciliation row "Journal: `ClaimBook::new(None, ..)` installs the
-    // in-memory journal ... watermarks reset on restart; spent nonces
-    // respend"). Both surfaces are the same sentence -- a watermark must
-    // outlive the process -- so they get the same answer rather than two,
-    // and arming one while leaving the other in memory would mean shipping
-    // the fix and the bug side by side.
     if let Some(state_dir) = config.state_dir() {
-        let journal = open_journal(state_dir, PEER_CLAIM_JOURNAL)?;
-        connector = connector.with_journal(journal).map_err(|source| {
-            RuntimeError::JournalUnreplayable {
-                path: state_dir.join(PEER_CLAIM_JOURNAL),
-                source,
-            }
-        })?;
         // Issue #884: replay this node's durable runtime peer/route table,
         // and arm the connector to persist future writes back to the same
-        // file -- the same `state_dir` scoping as the two journals above,
-        // so an operator restoring a node from `state_dir` alone restores
-        // this table too. `open_journal` just created `state_dir` itself,
-        // so a node with nowhere writable has already failed above with
-        // the path in the message.
+        // file -- the same `state_dir` scoping as the journals, so an
+        // operator restoring a node from `state_dir` alone restores this
+        // table too. `create_dir_all` first, so a node with nowhere
+        // writable fails here with the path in the message.
+        std::fs::create_dir_all(state_dir).map_err(|source| RuntimeError::StateDirUnusable {
+            path: state_dir.to_path_buf(),
+            source,
+        })?;
         let table_path = state_dir.join(RUNTIME_PEER_ROUTE_TABLE);
         let (store, runtime_peers, runtime_peer_routes) = PeerRouteStore::open(&table_path)
             .map_err(|source| RuntimeError::RuntimePeerRouteTableUnusable {
@@ -2407,12 +2369,11 @@ key_file = "{key_path}"
         assert!(matches!(error, RuntimeError::JournalUnreplayable { .. }));
     }
 
-    /// The peer semantics's own journal is armed off the same `state_dir`
-    /// (issue #605, #556's "Journal" row): one answer for both surfaces,
-    /// not a fix for the client edge and the same bug left standing on the
-    /// wire between connectors.
+    /// Nothing writes the peer claim journal since ADR 0075 (#1380, #1385):
+    /// a node built on a fresh `state_dir` does not create one. An older
+    /// build's is only read, to be refused if it holds `toon-channel` claims.
     #[tokio::test]
-    async fn a_configured_state_dir_also_arms_the_peer_claim_journal() {
+    async fn a_fresh_state_dir_gets_no_peer_claim_journal() {
         let state_dir = tempfile::tempdir().expect("temp state dir");
         let (config, _key_path) = config_with_raw_key_file(|key_path| {
             format!(
@@ -2429,7 +2390,7 @@ key_file = "{key_path}"
         });
 
         let _runtime = build(&config).await.expect("build");
-        assert!(state_dir.path().join(PEER_CLAIM_JOURNAL).exists());
+        assert!(!state_dir.path().join(PEER_CLAIM_JOURNAL).exists());
     }
 
     /// A node with no `state_dir` still builds -- config load has already
@@ -2536,23 +2497,20 @@ key_file = "{}"
 
     mod settlement_construction {
         use super::*;
-        use chrono::Duration;
+        use connector_settlement_evm::test_support::x402::X402Chain;
         use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
         use connector_settlement_solana::test_support::{
-            fund, require_solana_test_validator, SolanaValidator, LOCAL_TEST_PROGRAM_ID,
+            create_mint, fund, require_solana_test_validator, SolanaValidator,
         };
-        use connector_settlement_solana::SolanaSettlementBackend;
         use ethers::signers::Signer as EvmSigner;
         use solana_rpc_client::nonblocking::rpc_client::RpcClient;
         use solana_sdk::commitment_config::CommitmentConfig;
         use solana_sdk::signature::{Keypair, Signer as SolanaSigner};
 
         /// This test binary's own base port for [`Anvil::spawn`] -- distinct
-        /// from other test binaries' bases (`connector-settlement-evm`'s own
-        /// tests use 18_600; `connector-bin`'s use 18_500;
-        /// `connector-cli`'s own `settlement_lifecycle` integration test
-        /// uses 18_800) so that binaries running concurrently under `cargo
-        /// test --workspace` don't contend for the same port range.
+        /// from other test binaries' bases so that binaries running
+        /// concurrently under `cargo test --workspace` don't contend for the
+        /// same port range.
         const ANVIL_BASE_PORT: u16 = 18_700;
 
         fn key_file_with(contents: &str) -> tempfile::TempPath {
@@ -2561,486 +2519,209 @@ key_file = "{}"
             file.into_temp_path()
         }
 
-        /// A `[settlement.solana]` (or `[settlement.solana.key]`) key file
-        /// carrying `seed` as 32 raw bytes -- the ed25519 seed
-        /// [`SolanaSettlementBackend::connect`] signs with, the Solana
-        /// twin of [`key_file_with`]'s hex-encoded secp256k1 key.
+        /// A `[settlement.solana.key]` key file carrying `seed` as 32 raw
+        /// bytes -- the ed25519 seed the Solana backend signs with, the
+        /// Solana twin of [`key_file_with`]'s hex-encoded secp256k1 key.
         fn raw_key_file(seed: [u8; 32]) -> tempfile::TempPath {
             let mut file = tempfile::NamedTempFile::new().expect("temp key file");
             file.write_all(&seed).expect("write raw key file");
             file.into_temp_path()
         }
 
-        /// AC: "`connector-cli::runtime::build` constructs the configured
-        /// backend and passes it to `Connector::with_settlement`, so a node
-        /// with settlement configured never answers `NoSettlementBackend`" --
-        /// driven against a real, disposable `anvil` chain end to end:
-        /// `build` reads the `[settlement]` section from a config file (no
-        /// backend injected directly), and the resulting `Connector` opens a
-        /// real channel against a real, freshly deployed `TokenNetwork`,
-        /// resolved through a freshly deployed registry.
-        #[tokio::test]
-        async fn a_configured_settlement_section_is_constructed_and_attached() {
-            if !require_anvil() {
-                return;
-            }
+        fn evm_table(
+            rpc_url: &str,
+            token: ethers::types::Address,
+            decimals: u8,
+            key: &str,
+        ) -> String {
+            format!(
+                r#"
+[settlement.evm]
+rpc_url = "{rpc_url}"
+token_address = "{token:?}"
+decimals = {decimals}
+min_withdraw_delay_secs = 3600
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
-            let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
-            let token = EvmSettlementBackend::deploy_mock_token(
-                &anvil.rpc_url,
-                DEPLOYER_PRIVATE_KEY,
-                1_000_000,
+[settlement.evm.key]
+key_file = "{key}"
+"#
             )
-            .await
-            .expect("deploy mock USDC");
-            let settlement_backend =
-                EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-                    .await
-                    .expect("deploy a TokenNetwork through a fresh registry");
-            let registry_address = settlement_backend.registry_address();
-            drop(settlement_backend);
+        }
 
-            let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
-            let config = load_config(&format!(
+        fn solana_table(rpc_url: &str, mint: Pubkey, decimals: u8, key: &str) -> String {
+            format!(
+                r#"
+[settlement.solana]
+rpc_url = "{rpc_url}"
+token_address = "{mint}"
+decimals = {decimals}
+min_sponsored_deposit = 1000000
+min_grace_period_secs = 3600
+
+[settlement.solana.key]
+key_file = "{key}"
+"#
+            )
+        }
+
+        fn node_config(signer_key: &str, tables: &str) -> Config {
+            load_config(&format!(
                 r#"
 client_edge_addr = "127.0.0.1:0"
 
 [signer]
-key_file = "{key_path}"
-
-[settlement]
-chain = "evm"
-rpc_url = "{rpc_url}"
-contract_address = "{registry_address:?}"
-token_address = "{token:?}"
-decimals = 6
-
-[settlement.key]
-key_file = "{key_path}"
-"#,
-                key_path = key_path.display(),
-                rpc_url = anvil.rpc_url,
-                registry_address = registry_address,
-                token = token,
-            ));
-
-            let runtime = build(&config).await.expect("build");
-            let connector = runtime.connector.clone();
-            // A real 20-byte EVM address (issue #576): `TokenNetwork`
-            // requires a counterparty able to sign balance proofs, not an
-            // arbitrary peer name.
-            let counterparty =
-                ethers::signers::LocalWallet::new(&mut ethers::core::rand::thread_rng())
-                    .address()
-                    .as_bytes()
-                    .to_vec();
-            let opened = connector
-                .open_channel(None, counterparty, Duration::seconds(3600))
-                .await
-                .expect("a settlement backend was constructed and attached");
-            assert_eq!(opened.deposited, 0);
+key_file = "{signer_key}"
+{tables}
+"#
+            ))
         }
 
-        /// AC (issue #564): "`decimals` is honoured: ... startup compares
-        /// it with the token contract's own `decimals()` and refuses to
-        /// start when the two disagree, naming both". The mock USDC
-        /// deployed below is 6-decimal, as every token in this fleet is
-        /// (`docs/usdc-cross-chain-settlement.md`); a config file claiming
-        /// `decimals = 18` against it must fail to build rather than load
-        /// clean and settle at a scale nobody consults.
+        /// A validator with a funded settlement key and a 6-decimal mint.
+        async fn solana_chain(validator: &SolanaValidator, seed: [u8; 32]) -> Pubkey {
+            let rpc = RpcClient::new_with_commitment(
+                validator.rpc_url.clone(),
+                CommitmentConfig::confirmed(),
+            );
+            let authority = Keypair::new();
+            fund(&rpc, &authority.pubkey()).await;
+            let payer =
+                solana_sdk::signer::keypair::keypair_from_seed(&seed).expect("derive keypair");
+            fund(&rpc, &payer.pubkey()).await;
+            create_mint(&rpc, &authority, 6).await
+        }
+
+        /// A node with no `[settlement]` section settles on no chain: it
+        /// builds, holds no x402 backend and offers no `accepts[]` entry.
+        #[tokio::test]
+        async fn no_settlement_section_still_builds_with_no_backend() {
+            let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let config = node_config(&key_path.display().to_string(), "");
+            let runtime = build(&config).await.expect("builds with no settlement");
+            assert!(runtime.batch_settlement_evm.is_none());
+            assert!(runtime.batch_settlement_solana.is_none());
+            assert!(runtime.batch_settlements.is_empty());
+        }
+
+        /// ADR 0075 decision 1: a `[settlement.evm]` table pointed at a chain
+        /// without `x402BatchSettlement` refuses to build, by name.
+        #[tokio::test]
+        async fn an_evm_chain_without_x402_refuses_to_build_by_name() {
+            if !require_anvil() {
+                return;
+            }
+            let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+            let token = connector_settlement_evm::test_support::deploy_plain_token(
+                &anvil.rpc_url,
+                DEPLOYER_PRIVATE_KEY,
+                0,
+            )
+            .await;
+            let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let key = key_path.display().to_string();
+            let config = node_config(&key, &evm_table(&anvil.rpc_url, token, 6, &key));
+
+            let Err(error) = build(&config).await else {
+                panic!("built on a chain without x402BatchSettlement");
+            };
+            assert!(
+                matches!(&error, RuntimeError::X402NotDeployed { table: "evm", what } if what.contains("x402BatchSettlement")),
+                "{error}"
+            );
+            assert!(error.to_string().contains("[settlement.evm]"), "{error}");
+        }
+
+        /// ADR 0075 decision 1, Solana: a chain without `payment-channels`
+        /// refuses to build, by name.
+        #[tokio::test]
+        async fn a_solana_chain_without_payment_channels_refuses_to_build_by_name() {
+            if !require_solana_test_validator() {
+                return;
+            }
+            let validator = SolanaValidator::spawn_without_payment_channels().await;
+            let seed = [21u8; 32];
+            let mint = solana_chain(&validator, seed).await;
+            let signer_key = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let solana_key = raw_key_file(seed);
+            let config = node_config(
+                &signer_key.display().to_string(),
+                &solana_table(
+                    &validator.rpc_url,
+                    mint,
+                    6,
+                    &solana_key.display().to_string(),
+                ),
+            );
+
+            let Err(error) = build(&config).await else {
+                panic!("built on a chain without payment-channels");
+            };
+            assert!(
+                matches!(&error, RuntimeError::X402NotDeployed { table: "solana", what } if what.contains("payment-channels")),
+                "{error}"
+            );
+        }
+
+        /// Issue #564: a `decimals` the token disagrees with refuses to
+        /// build rather than being a line with no effect.
         #[tokio::test]
         async fn settlement_decimals_the_token_disagrees_with_refuses_to_build() {
             if !require_anvil() {
                 return;
             }
-
             let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
-            let token = EvmSettlementBackend::deploy_mock_token(
-                &anvil.rpc_url,
-                DEPLOYER_PRIVATE_KEY,
-                1_000_000,
-            )
-            .await
-            .expect("deploy mock USDC");
-            let settlement_backend =
-                EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-                    .await
-                    .expect("deploy a TokenNetwork through a fresh registry");
-            let registry_address = settlement_backend.registry_address();
-            drop(settlement_backend);
-
+            let mut x402 = X402Chain::place(&anvil.rpc_url).await;
+            let token = x402.deploy_fiat_token().await;
             let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
-            let config = load_config(&format!(
-                r#"
-client_edge_addr = "127.0.0.1:0"
+            let key = key_path.display().to_string();
+            let config = node_config(&key, &evm_table(&anvil.rpc_url, token, 18, &key));
 
-[signer]
-key_file = "{key_path}"
-
-[settlement]
-chain = "evm"
-rpc_url = "{rpc_url}"
-contract_address = "{registry_address:?}"
-token_address = "{token:?}"
-decimals = 18
-
-[settlement.key]
-key_file = "{key_path}"
-"#,
-                key_path = key_path.display(),
-                rpc_url = anvil.rpc_url,
-                registry_address = registry_address,
-                token = token,
-            ));
-
-            let error = build(&config)
-                .await
-                .err()
-                .expect("a decimals the token disagrees with refuses to build");
+            let Err(error) = build(&config).await else {
+                panic!("built over a decimals the token disagrees with");
+            };
             let message = error.to_string();
-            // Both values are named, so an operator reading the failure can
-            // tell which side is wrong without opening a block explorer.
             assert!(
-                message.contains("decimals is 18") && message.contains("decimals() = 6"),
-                "the failure must name both the configured and the on-chain decimals: {message}"
+                message.contains("decimals") && message.contains("18"),
+                "{message}"
             );
         }
 
-        /// AC: "a node with no settlement section still starts and still
-        /// serves, degrading exactly as an absent `[operator]` section
-        /// does" -- no anvil needed here, since nothing should even try to
-        /// connect to a chain.
-        #[tokio::test]
-        async fn no_settlement_section_still_builds_and_degrades_to_no_backend() {
-            let (config, _key_path) = config_with_raw_key_file(|key_path| {
-                format!(
-                    r#"
-client_edge_addr = "127.0.0.1:0"
-
-[signer]
-key_file = "{}"
-"#,
-                    key_path.display()
-                )
-            });
-
-            let runtime = build(&config).await.expect("build");
-            let result = runtime
-                .connector
-                .open_channel(
-                    None,
-                    b"no-settlement-peer".to_vec(),
-                    Duration::seconds(3600),
-                )
-                .await;
-            assert!(matches!(
-                result,
-                Err(connector_runtime::ChannelOperationError::NoSettlementBackend)
-            ));
-        }
-
-        /// AC (issue #630): "Node with `[settlement.solana]` starts against
-        /// the devnet validator" -- driven end to end through `build`
-        /// reading a config file (no backend injected directly), the
-        /// Solana twin of
-        /// `a_configured_settlement_section_is_constructed_and_attached`
-        /// above: a real, disposable `solana-test-validator` running the
-        /// real `packages/solana-program` artifact, and the resulting
-        /// `Connector` opens a real channel through it.
-        #[tokio::test]
-        async fn a_solana_only_settlement_section_is_constructed_and_attached() {
-            if !require_solana_test_validator() {
-                return;
-            }
-
-            let validator = SolanaValidator::spawn().await;
-            let program_id =
-                Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
-            let deployed = SolanaSettlementBackend::deploy(&validator.rpc_url, program_id)
-                .await
-                .expect("bind to the genesis-loaded payment-channel program");
-            let token_mint = deployed.token_mint();
-            drop(deployed);
-
-            let seed = [11u8; 32];
-            let payer =
-                solana_sdk::signer::keypair::keypair_from_seed(&seed).expect("derive keypair");
-            let rpc = RpcClient::new_with_commitment(
-                validator.rpc_url.clone(),
-                CommitmentConfig::confirmed(),
-            );
-            fund(&rpc, &payer.pubkey()).await;
-
-            let key_path = raw_key_file(seed);
-            let config = load_config(&format!(
-                r#"
-client_edge_addr = "127.0.0.1:0"
-
-[signer]
-key_file = "{key_path}"
-
-[settlement.solana]
-rpc_url = "{rpc_url}"
-program_id = "{program_id}"
-token_address = "{token_mint}"
-decimals = 6
-
-[settlement.solana.key]
-key_file = "{key_path}"
-"#,
-                key_path = key_path.display(),
-                rpc_url = validator.rpc_url,
-            ));
-
-            let runtime = build(&config).await.expect("build");
-            let connector = runtime.connector.clone();
-            // A real 32-byte Solana pubkey (issue #567's `open` accepts
-            // nothing else): a fresh identity this test holds no key for,
-            // exactly as `a_configured_settlement_section_is_constructed_and_attached`
-            // generates an arbitrary EVM counterparty above.
-            let counterparty = Keypair::new().pubkey().to_bytes().to_vec();
-            let opened = connector
-                .open_channel(None, counterparty, Duration::seconds(3600))
-                .await
-                .expect("a solana settlement backend was constructed and attached");
-            assert_eq!(opened.deposited, 0);
-        }
-
-        /// AC (issue #630): "... decimals/asset-scale mismatch refuses
-        /// startup with a clear error" -- the Solana twin of
-        /// `settlement_decimals_the_token_disagrees_with_refuses_to_build`
-        /// above. `deploy` mints a fresh 6-decimal SPL mint; a config file
-        /// claiming `decimals = 9` against it must fail to build rather
-        /// than load clean and settle at a scale nobody consults.
         #[tokio::test]
         async fn solana_decimals_the_mint_disagrees_with_refuses_to_build() {
             if !require_solana_test_validator() {
                 return;
             }
-
             let validator = SolanaValidator::spawn().await;
-            let program_id =
-                Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
-            let deployed = SolanaSettlementBackend::deploy(&validator.rpc_url, program_id)
-                .await
-                .expect("bind to the genesis-loaded payment-channel program");
-            let token_mint = deployed.token_mint();
-            drop(deployed);
-
-            let seed = [12u8; 32];
-            let payer =
-                solana_sdk::signer::keypair::keypair_from_seed(&seed).expect("derive keypair");
-            let rpc = RpcClient::new_with_commitment(
-                validator.rpc_url.clone(),
-                CommitmentConfig::confirmed(),
+            let seed = [22u8; 32];
+            let mint = solana_chain(&validator, seed).await;
+            let signer_key = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let solana_key = raw_key_file(seed);
+            let config = node_config(
+                &signer_key.display().to_string(),
+                &solana_table(
+                    &validator.rpc_url,
+                    mint,
+                    9,
+                    &solana_key.display().to_string(),
+                ),
             );
-            fund(&rpc, &payer.pubkey()).await;
 
-            let key_path = raw_key_file(seed);
-            let config = load_config(&format!(
-                r#"
-client_edge_addr = "127.0.0.1:0"
-
-[signer]
-key_file = "{key_path}"
-
-[settlement.solana]
-rpc_url = "{rpc_url}"
-program_id = "{program_id}"
-token_address = "{token_mint}"
-decimals = 9
-
-[settlement.solana.key]
-key_file = "{key_path}"
-"#,
-                key_path = key_path.display(),
-                rpc_url = validator.rpc_url,
-            ));
-
-            let error = build(&config)
-                .await
-                .err()
-                .expect("a decimals the mint disagrees with refuses to build");
+            let Err(error) = build(&config).await else {
+                panic!("built over a decimals the mint disagrees with");
+            };
             let message = error.to_string();
             assert!(
-                message.contains("decimals is 9") && message.contains("decimals = 6"),
-                "the failure must name both the configured and the on-chain decimals: {message}"
+                message.contains("decimals") && message.contains('9'),
+                "{message}"
             );
         }
 
-        /// A config naming both `[settlement.evm]` and `[settlement.solana]`
-        /// constructs both real backends and the built `Connector` holds
-        /// *both*, each reachable on its own chain (issue #630, and its
-        /// review's merge blocker: `Connector`'s settlement slot was
-        /// last-one-wins, so on exactly this config every operator channel
-        /// op silently targeted Solana -- an EVM `open_channel` here
-        /// answered "a packages/solana-program counterparty must be a
-        /// 32-byte Solana pubkey, got 20 bytes"). Driven end to end
-        /// through `build` reading a config file: an EVM operator op lands
-        /// on the EVM backend (a real channel opens on the anvil chain), a
-        /// Solana one on the Solana backend, and per-channel-id ops route
-        /// each id to its own chain.
-        #[tokio::test]
-        async fn a_both_chains_config_attaches_and_routes_both_backends() {
-            if !require_anvil() {
-                return;
-            }
-            if !require_solana_test_validator() {
-                return;
-            }
-
-            let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
-            let token = EvmSettlementBackend::deploy_mock_token(
-                &anvil.rpc_url,
-                DEPLOYER_PRIVATE_KEY,
-                1_000_000,
-            )
-            .await
-            .expect("deploy mock USDC");
-            let settlement_backend =
-                EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-                    .await
-                    .expect("deploy a TokenNetwork through a fresh registry");
-            let registry_address = settlement_backend.registry_address();
-            drop(settlement_backend);
-
-            let validator = SolanaValidator::spawn().await;
-            let program_id =
-                Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
-            let deployed = SolanaSettlementBackend::deploy(&validator.rpc_url, program_id)
-                .await
-                .expect("bind to the genesis-loaded payment-channel program");
-            let token_mint = deployed.token_mint();
-            drop(deployed);
-
-            let seed = [13u8; 32];
-            let payer =
-                solana_sdk::signer::keypair::keypair_from_seed(&seed).expect("derive keypair");
-            let rpc = RpcClient::new_with_commitment(
-                validator.rpc_url.clone(),
-                CommitmentConfig::confirmed(),
-            );
-            fund(&rpc, &payer.pubkey()).await;
-
-            let evm_key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
-            let solana_key_path = raw_key_file(seed);
-            let config = load_config(&format!(
-                r#"
-client_edge_addr = "127.0.0.1:0"
-
-[signer]
-key_file = "{evm_key_path}"
-
-[settlement.evm]
-rpc_url = "{evm_rpc_url}"
-contract_address = "{registry_address:?}"
-token_address = "{token:?}"
-decimals = 6
-
-[settlement.evm.key]
-key_file = "{evm_key_path}"
-
-[settlement.solana]
-rpc_url = "{solana_rpc_url}"
-program_id = "{program_id}"
-token_address = "{token_mint}"
-decimals = 6
-
-[settlement.solana.key]
-key_file = "{solana_key_path}"
-"#,
-                evm_key_path = evm_key_path.display(),
-                solana_key_path = solana_key_path.display(),
-                evm_rpc_url = anvil.rpc_url,
-                solana_rpc_url = validator.rpc_url,
-                registry_address = registry_address,
-                token = token,
-            ));
-
-            let runtime = build(&config)
-                .await
-                .expect("both legs construct and attach without either refusing startup");
-            let connector = runtime.connector.clone();
-
-            // The regression op: an EVM channel open on a both-chains node
-            // must reach the EVM backend. On the last-one-wins slot this
-            // exact call hit the Solana backend and refused the 20-byte
-            // counterparty.
-            let evm_counterparty =
-                ethers::signers::LocalWallet::new(&mut ethers::core::rand::thread_rng())
-                    .address()
-                    .as_bytes()
-                    .to_vec();
-            let evm_channel = connector
-                .open_channel(
-                    Some(SettlementChain::Evm),
-                    evm_counterparty,
-                    Duration::seconds(3600),
-                )
-                .await
-                .expect("an EVM open on a both-chains node reaches the EVM backend");
-            assert!(
-                evm_channel.id.starts_with("0x"),
-                "a TokenNetwork bytes32 channel id, not a Solana account: {}",
-                evm_channel.id
-            );
-
-            // The Solana twin.
-            let solana_counterparty = Keypair::new().pubkey().to_bytes().to_vec();
-            let solana_channel = connector
-                .open_channel(
-                    Some(SettlementChain::Solana),
-                    solana_counterparty,
-                    Duration::seconds(3600),
-                )
-                .await
-                .expect("a Solana open on a both-chains node reaches the Solana backend");
-            assert!(
-                Pubkey::from_str(&solana_channel.id).is_ok(),
-                "a channel PDA account address, not a TokenNetwork bytes32: {}",
-                solana_channel.id
-            );
-
-            // Both backends are attached and reachable: the operator's
-            // channel list reports each channel fresh from its own chain.
-            let channels = connector.channels().await;
-            assert_eq!(channels.len(), 2);
-            assert!(channels.iter().any(|view| view.id == evm_channel.id));
-            assert!(channels.iter().any(|view| view.id == solana_channel.id));
-
-            // Per-channel-id ops route by the id's own namespace: reading
-            // each channel lands on the chain that opened it (on the
-            // last-one-wins slot, reading the EVM id asked Solana, which
-            // knows no such channel).
-            connector
-                .channel_view(&evm_channel.id)
-                .await
-                .expect("reading the EVM channel routes to the EVM backend");
-            connector
-                .channel_view(&solana_channel.id)
-                .await
-                .expect("reading the Solana channel routes to the Solana backend");
-
-            // And an open that names no chain is ambiguous here, not
-            // silently resolved to either backend.
-            let ambiguous = connector
-                .open_channel(
-                    None,
-                    Keypair::new().pubkey().to_bytes().to_vec(),
-                    Duration::seconds(3600),
-                )
-                .await;
-            assert!(matches!(
-                ambiguous,
-                Err(connector_runtime::ChannelOperationError::AmbiguousSettlementChain)
-            ));
-        }
-
-        /// ADR 0074 decision 8, issue #1345, end to end: a node that opts
-        /// into `batch_settlement` on both chains composes both chains'
-        /// x402 batch-settlement facts, read off the very backends
-        /// `settlements` is composed from -- so the two lists can never
-        /// name two different deployments of "this chain" (CF-26).
+        /// ADR 0074 decision 8, issue #1345, end to end: a node settling on
+        /// both chains composes both chains' x402 batch-settlement facts and
+        /// voucher signers, read off the very backends it connected -- so
+        /// the greeting can never name a deployment the node is not on
+        /// (CF-26).
         #[tokio::test]
         async fn a_both_chains_config_composes_both_chains_batch_settlement_facts() {
             if !require_anvil() {
@@ -3051,100 +2732,48 @@ key_file = "{solana_key_path}"
             }
 
             let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
-            // x402's contracts at their canonical addresses: the EVM batch backend
-            // refuses to bind unless x402BatchSettlement answers there.
-            connector_settlement_evm::test_support::x402::X402Chain::place(&anvil.rpc_url).await;
-            let token = EvmSettlementBackend::deploy_mock_token(
-                &anvil.rpc_url,
-                DEPLOYER_PRIVATE_KEY,
-                1_000_000,
-            )
-            .await
-            .expect("deploy mock USDC");
-            let settlement_backend =
-                EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-                    .await
-                    .expect("deploy a TokenNetwork through a fresh registry");
-            let registry_address = settlement_backend.registry_address();
-            let evm_settlement_address = settlement_backend.own_address();
-            drop(settlement_backend);
+            let mut x402 = X402Chain::place(&anvil.rpc_url).await;
+            let token = x402.deploy_fiat_token().await;
+            let evm_settlement_address = DEPLOYER_PRIVATE_KEY
+                .parse::<ethers::signers::LocalWallet>()
+                .expect("key")
+                .address();
 
             let validator = SolanaValidator::spawn().await;
-            let program_id =
-                Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
-            let deployed = SolanaSettlementBackend::deploy(&validator.rpc_url, program_id)
-                .await
-                .expect("bind to the genesis-loaded payment-channel program");
-            let token_mint = deployed.token_mint();
-            drop(deployed);
-
             let seed = [23u8; 32];
-            let payer =
-                solana_sdk::signer::keypair::keypair_from_seed(&seed).expect("derive keypair");
-            let rpc = RpcClient::new_with_commitment(
-                validator.rpc_url.clone(),
-                CommitmentConfig::confirmed(),
-            );
-            fund(&rpc, &payer.pubkey()).await;
+            let token_mint = solana_chain(&validator, seed).await;
+            let sponsor = solana_sdk::signer::keypair::keypair_from_seed(&seed)
+                .expect("derive keypair")
+                .pubkey();
 
             let evm_key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let evm_key = evm_key_path.display().to_string();
             let solana_key_path = raw_key_file(seed);
-            let config = load_config(&format!(
-                r#"
-client_edge_addr = "127.0.0.1:0"
-
-[signer]
-key_file = "{evm_key_path}"
-
-[settlement.evm]
-rpc_url = "{evm_rpc_url}"
-contract_address = "{registry_address:?}"
-token_address = "{token:?}"
-decimals = 6
-
-[settlement.evm.key]
-key_file = "{evm_key_path}"
-
-[settlement.evm.batch_settlement]
-min_withdraw_delay_secs = 3600
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
-
-[settlement.solana]
-rpc_url = "{solana_rpc_url}"
-program_id = "{program_id}"
-token_address = "{token_mint}"
-decimals = 6
-
-[settlement.solana.key]
-key_file = "{solana_key_path}"
-
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = 1000000
-min_grace_period_secs = 3600
-"#,
-                evm_key_path = evm_key_path.display(),
-                solana_key_path = solana_key_path.display(),
-                evm_rpc_url = anvil.rpc_url,
-                solana_rpc_url = validator.rpc_url,
-                registry_address = registry_address,
-                token = token,
-            ));
+            let config = node_config(
+                &evm_key,
+                &format!(
+                    "{}{}",
+                    evm_table(&anvil.rpc_url, token, 6, &evm_key),
+                    solana_table(
+                        &validator.rpc_url,
+                        token_mint,
+                        6,
+                        &solana_key_path.display().to_string()
+                    )
+                ),
+            );
 
             let runtime = build(&config)
                 .await
-                .expect("both legs opt into batch settlement without either refusing startup");
+                .expect("both chains bind without either refusing startup");
+            assert!(runtime.batch_settlement_evm.is_some());
+            assert!(runtime.batch_settlement_solana.is_some());
 
             // No `{:?}` of the facts: they carry keys derived from the
             // settlement key files (rust/cleartext-logging).
-            assert_eq!(
-                runtime.batch_settlements.len(),
-                2,
-                "both configured chains opted in"
-            );
+            assert_eq!(runtime.batch_settlements.len(), 2, "both chains");
+            assert_eq!(runtime.voucher_signers.len(), 2, "both chains");
 
-            // anvil's own chain id: what the connected backend read.
-            let evm_chain_id = "31337";
             let evm_batch = runtime
                 .batch_settlements
                 .iter()
@@ -3156,8 +2785,7 @@ min_grace_period_secs = 3600
                 })
                 .expect("the batch-settlement list carries an EVM entry");
             assert_eq!(
-                evm_batch.network,
-                format!("eip155:{evm_chain_id}"),
+                evm_batch.network, "eip155:31337",
                 "the chain id the connected backend read, spelled CAIP-2"
             );
             assert_eq!(evm_batch.asset, format!("{token:#x}"));
@@ -3188,6 +2816,7 @@ min_grace_period_secs = 3600
                 solana_batch.network
             );
             assert_eq!(solana_batch.asset, token_mint.to_string());
+            assert_eq!(solana_batch.pay_to, sponsor.to_string());
             assert_eq!(
                 solana_batch.pay_to, solana_batch.fee_payer,
                 "the sponsor is the receiving operator (ADR 0074 decision 5): one settlement \
@@ -3209,77 +2838,6 @@ min_grace_period_secs = 3600
                 crate::sponsor::SPONSOR_PATH,
                 "the greeting names the path the router actually mounts (issue #1357)"
             );
-        }
-
-        /// Issue #630's review, finding 2: a `[settlement.solana]`
-        /// `program_id` that names a real, executable program which is
-        /// *not* the deployed payment-channel program (here: SPL Token
-        /// itself, executable on every cluster) must refuse startup naming
-        /// the program id -- not pass a mere "exists and is executable"
-        /// check and fail lazily at the first settle.
-        #[tokio::test]
-        async fn a_solana_program_id_naming_some_other_program_refuses_to_build() {
-            if !require_solana_test_validator() {
-                return;
-            }
-
-            let validator = SolanaValidator::spawn().await;
-            let program_id =
-                Pubkey::from_str(LOCAL_TEST_PROGRAM_ID).expect("valid local test program id");
-            let deployed = SolanaSettlementBackend::deploy(&validator.rpc_url, program_id)
-                .await
-                .expect("bind to the genesis-loaded payment-channel program");
-            let token_mint = deployed.token_mint();
-            drop(deployed);
-
-            let seed = [14u8; 32];
-            let payer =
-                solana_sdk::signer::keypair::keypair_from_seed(&seed).expect("derive keypair");
-            let rpc = RpcClient::new_with_commitment(
-                validator.rpc_url.clone(),
-                CommitmentConfig::confirmed(),
-            );
-            fund(&rpc, &payer.pubkey()).await;
-
-            let key_path = raw_key_file(seed);
-            let wrong_program_id = spl_token_program_id();
-            let config = load_config(&format!(
-                r#"
-client_edge_addr = "127.0.0.1:0"
-
-[signer]
-key_file = "{key_path}"
-
-[settlement.solana]
-rpc_url = "{rpc_url}"
-program_id = "{wrong_program_id}"
-token_address = "{token_mint}"
-decimals = 6
-
-[settlement.solana.key]
-key_file = "{key_path}"
-"#,
-                key_path = key_path.display(),
-                rpc_url = validator.rpc_url,
-            ));
-
-            let error = build(&config)
-                .await
-                .err()
-                .expect("a program_id naming some other executable program refuses to build");
-            let message = error.to_string();
-            assert!(
-                message.contains(&wrong_program_id.to_string()),
-                "the failure must name the configured program id: {message}"
-            );
-        }
-
-        /// The SPL Token program id -- a program that exists, is
-        /// executable, and is definitely not the payment-channel program,
-        /// on every Solana cluster including a fresh test validator.
-        fn spl_token_program_id() -> Pubkey {
-            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-                .expect("the canonical SPL Token program id")
         }
     }
 
@@ -3309,9 +2867,6 @@ key_file = "{key_path}"
         const SOL_DEALT: &str = "5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX";
         /// A base58 32-byte pool name, which is all a Solana pool is here.
         const POOL_SOL_DEALT_USDC: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
-        /// The payment-channel program id the local topology names. Nothing
-        /// in these tests dials it.
-        const SOL_PROGRAM_ID: &str = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR";
 
         fn asset(text: &str) -> AssetId {
             text.parse::<AssetId>().expect("a declared asset")
@@ -3411,9 +2966,10 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
 token_address = "{USDC}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
@@ -3497,9 +3053,10 @@ key_file = "{key_file}"
 
 [settlement.evm]
 rpc_url = "http://127.0.0.1:8545"
-contract_address = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
 token_address = "{USDC}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key_file}"
@@ -3561,9 +3118,9 @@ key_file = "{key_file}"
 
 [settlement.solana]
 rpc_url = "http://127.0.0.1:8899"
-program_id = "{SOL_PROGRAM_ID}"
 token_address = "{USDC_SOLANA}"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key_file}"
@@ -3706,20 +3263,21 @@ key_file = "{key}"
 
 [settlement.evm]
 rpc_url = "http://{EVM_HOST}/"
-contract_address = "0x00000000000000000000000000000000000000aa"
 token_address = "0x00000000000000000000000000000000000000bb"
 decimals = 6
 rpc_via_socks_proxy = {evm_proxied}
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{key}"
 
 [settlement.solana]
 rpc_url = "http://{SOLANA_HOST}/"
-program_id = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip"
 token_address = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
 decimals = 6
 rpc_via_socks_proxy = true
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{key}"
