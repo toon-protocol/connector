@@ -30,6 +30,8 @@
 //! proves itself that way, and #1380 deletes it once the last one has moved.
 
 use async_trait::async_trait;
+use connector_btp::{BtpFrame, BTP_MESSAGE, CLAIM_PROTOCOL, PEER_CHALLENGE_PROTOCOL};
+use connector_config::ForwardedClaimEnforcement;
 use connector_domain::client_claim::ClientClaim;
 use connector_peer_auth::{
     decide_role, decide_voucher_role, ClaimVerification, PeerAuthPolicy, PresentedClaim,
@@ -107,6 +109,137 @@ pub struct FrameEvidence {
     /// challenge proves the role only for such a packet (ADR 0075 decision
     /// 5); on anything else it proves nothing.
     pub moves_no_value: bool,
+}
+
+impl FrameEvidence {
+    /// Whether the claim slot held a voucher.
+    #[must_use]
+    pub fn carries_voucher(&self) -> bool {
+        matches!(self.claim, Some(PresentedPeerClaim::Voucher(_)))
+    }
+
+    /// The `toon-channel` claim, if that is what the claim slot held: the
+    /// one kind of evidence `ClaimBook` judges below the role. A voucher
+    /// that decided the role is not a `WireClaim`, and judging one on the
+    /// peer wire is the receiving half's (#1378).
+    #[must_use]
+    pub fn into_channel_claim(self) -> Option<WireClaim> {
+        match self.claim {
+            Some(PresentedPeerClaim::Channel(claim)) => Some(claim),
+            Some(PresentedPeerClaim::Voucher(_)) | None => None,
+        }
+    }
+}
+
+/// The forwarded-claim enforcement a peer PREPARE is priced under.
+///
+/// A voucher can decide the peer role (ADR 0075 decision 5) before anything
+/// on the peer wire can judge one as payment (#1378): below the role only a
+/// `toon-channel` claim reaches `ClaimBook`. So a PREPARE whose covering
+/// evidence is a voucher is always priced under
+/// [`ForwardedClaimEnforcement::Enforce`], whatever the peering's own
+/// `claim_enforcement` says. Under the default `Observe` it would otherwise
+/// be forwarded covered by nothing, and a voucher that proves who is paying
+/// must never be what lets a packet ride for free.
+#[must_use]
+pub fn forwarded_enforcement(
+    carries_voucher: bool,
+    configured: ForwardedClaimEnforcement,
+) -> ForwardedClaimEnforcement {
+    if carries_voucher {
+        ForwardedClaimEnforcement::Enforce
+    } else {
+        configured
+    }
+}
+
+/// §1.5's smuggling defence, over both evidence slots: which duplicated
+/// authentication material a frame or request carried. Refused, never
+/// resolved -- "which one did we check?" has no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbiguousEvidence {
+    /// More than one claim.
+    Claims,
+    /// More than one peer-role challenge.
+    Challenges,
+    /// A claim beside a challenge (ADR 0075 decision 5).
+    ClaimAndChallenge,
+}
+
+impl AmbiguousEvidence {
+    /// The one rule, from how many of each slot were presented. Counted
+    /// before anything is parsed, so an undecodable second entry cannot be
+    /// discarded to leave one unambiguous one standing.
+    ///
+    /// # Errors
+    ///
+    /// The ambiguity, when there is one.
+    pub fn check(claims: usize, challenges: usize) -> Result<(), AmbiguousEvidence> {
+        match (claims, challenges) {
+            (claims, _) if claims > 1 => Err(AmbiguousEvidence::Claims),
+            (_, challenges) if challenges > 1 => Err(AmbiguousEvidence::Challenges),
+            (1, 1) => Err(AmbiguousEvidence::ClaimAndChallenge),
+            _ => Ok(()),
+        }
+    }
+
+    /// What a BTP ERROR frame says about it.
+    #[must_use]
+    pub fn message(self) -> &'static [u8] {
+        match self {
+            AmbiguousEvidence::Claims => b"more than one claim entry on one frame",
+            AmbiguousEvidence::Challenges => {
+                b"more than one peer-role challenge entry on one frame"
+            }
+            AmbiguousEvidence::ClaimAndChallenge => {
+                b"a claim and a peer-role challenge on one frame"
+            }
+        }
+    }
+}
+
+/// Everything a BTP frame presents, decoded -- the one reading both the
+/// peer session and the client edge's front door make of a frame.
+///
+/// # Errors
+///
+/// [`AmbiguousEvidence`] when the frame carries duplicated evidence (§1.5).
+pub fn btp_evidence(frame: &BtpFrame) -> Result<FrameEvidence, AmbiguousEvidence> {
+    let count = |name: &str| {
+        frame
+            .protocol_data
+            .iter()
+            .filter(|entry| entry.name == name)
+            .count()
+    };
+    AmbiguousEvidence::check(count(CLAIM_PROTOCOL), count(PEER_CHALLENGE_PROTOCOL))?;
+    let slot = |name: &str| {
+        frame
+            .protocol_data
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.data.as_slice())
+    };
+    Ok(FrameEvidence {
+        claim: slot(CLAIM_PROTOCOL).and_then(decode_claim),
+        challenge: slot(PEER_CHALLENGE_PROTOCOL).and_then(decode_challenge),
+        moves_no_value: frame.frame_type == BTP_MESSAGE && moves_no_value(&frame.ilp_packet),
+    })
+}
+
+/// A claim slot's raw JSON, decoded; `None`, with a warning, when it does
+/// not decode. An undecodable claim is *not acknowledged* (§6.3) rather than
+/// rejected, so the payer's claim stays pending and its retransmission is
+/// read the same way.
+#[must_use]
+pub fn decode_claim(raw: &[u8]) -> Option<PresentedPeerClaim> {
+    crate::claim_json::parse_presented(raw)
+        .inspect_err(|error| {
+            // No peer id to name: the claim *is* what would have named one,
+            // and it did not decode.
+            tracing::warn!(%error, "peer claim could not be decoded; not acknowledged");
+        })
+        .ok()
 }
 
 /// The role of one frame, from the `toon-channel` claim that frame carries.
@@ -241,6 +374,42 @@ fn as_presented(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Until #1378 judges a peer's voucher, a voucher proves who pays and
+    /// buys nothing: a forward it covers is priced as if enforcement were
+    /// on, so the default `Observe` cannot carry it for free.
+    #[test]
+    fn a_voucher_covered_forward_is_always_enforced() {
+        for configured in [
+            ForwardedClaimEnforcement::Observe,
+            ForwardedClaimEnforcement::Enforce,
+        ] {
+            assert_eq!(
+                forwarded_enforcement(true, configured),
+                ForwardedClaimEnforcement::Enforce
+            );
+            assert_eq!(forwarded_enforcement(false, configured), configured);
+        }
+    }
+
+    #[test]
+    fn ambiguous_evidence_is_counted_across_both_slots() {
+        assert_eq!(AmbiguousEvidence::check(0, 0), Ok(()));
+        assert_eq!(AmbiguousEvidence::check(1, 0), Ok(()));
+        assert_eq!(AmbiguousEvidence::check(0, 1), Ok(()));
+        assert_eq!(
+            AmbiguousEvidence::check(2, 0),
+            Err(AmbiguousEvidence::Claims)
+        );
+        assert_eq!(
+            AmbiguousEvidence::check(0, 2),
+            Err(AmbiguousEvidence::Challenges)
+        );
+        assert_eq!(
+            AmbiguousEvidence::check(1, 1),
+            Err(AmbiguousEvidence::ClaimAndChallenge)
+        );
+    }
 
     #[test]
     fn a_challenge_is_in_window_only_until_it_expires_and_no_further_ahead_than_the_bound() {

@@ -24,6 +24,8 @@
 //! role (#1378).
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use connector_domain::client_claim::ClientClaim;
 use connector_peer_btp::challenge_json::PeerRoleChallenge;
 use connector_peer_btp::role_gate::{VoucherCheck, VoucherEvidence};
@@ -49,6 +51,14 @@ enum EvmMessage {
 enum SolanaMessage {
     Voucher { cumulative: u64 },
     Challenge { expires: u64 },
+}
+
+/// Whose lookup a peer-role check is metered as, against the
+/// unresolvable-lookup budget (issue #613): the signature as it rode the
+/// wire, under one prefix, as `POST /ilp/claim-state` keys its own
+/// challenge lookups.
+fn requester(wire_signature: &str) -> String {
+    format!("peer-role:{wire_signature}")
 }
 
 impl ClientClaimGate {
@@ -160,7 +170,7 @@ impl VoucherEvidence for ClientClaimGate {
                         max_claimable_amount: voucher.max_claimable_amount,
                     },
                     &signature,
-                    &format!("peer-role-voucher:{}", voucher.signature),
+                    &requester(&voucher.signature),
                 )
                 .await
             }
@@ -177,7 +187,7 @@ impl VoucherEvidence for ClientClaimGate {
                         cumulative: voucher.max_claimable_amount,
                     },
                     &signature,
-                    &format!("peer-role-voucher:{}", voucher.signature),
+                    &requester(&voucher.signature),
                 )
                 .await
             }
@@ -207,7 +217,7 @@ impl VoucherEvidence for ClientClaimGate {
                     presented,
                     EvmMessage::Challenge { expires: *expires },
                     signature,
-                    &format!("peer-role-challenge:0x{}", hex::encode(signature)),
+                    &requester(&format!("0x{}", hex::encode(signature))),
                 )
                 .await
             }
@@ -220,7 +230,7 @@ impl VoucherEvidence for ClientClaimGate {
                     *channel_account,
                     SolanaMessage::Challenge { expires: *expires },
                     signature,
-                    &format!("peer-role-challenge:{}", hex::encode(signature)),
+                    &requester(&BASE64.encode(signature)),
                 )
                 .await
             }

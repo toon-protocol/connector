@@ -157,7 +157,11 @@ still fixed before a watermark moves (§1.5). A voucher that decides `peer` is n
 is not judged by `ClaimBook`; judging a peer's voucher — its watermark, its ack, its journal entry —
 is the receiving half's, and lands with the peerings that send one (#1378). Until then a voucher on
 a bound channel proves the role and pays nothing on the peer wire, so a priced peer PREPARE covered
-only by a voucher is answered with the greeting, as an uncovered one is. The implementation is
+only by a voucher is answered with the greeting, as an uncovered one is -- on a forwarded route too,
+whatever the peering's `claim_enforcement`: a voucher-covered forward is always priced under
+`enforce` (`role_gate::forwarded_enforcement`), so the default `observe` cannot carry it for free.
+A zero-value peer packet carries no voucher (below); one that does still proves the role by it. The
+implementation is
 `connector_peer_btp::role_gate::decide_frame`, which both carriages and the client edge's front door
 call; it asks the receiving half (`connector_peer_btp::role_gate::VoucherEvidence`, implemented by
 the client edge's claim gate over the same lookups `POST /ilp/claim-state` makes) for the channel's

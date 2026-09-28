@@ -77,9 +77,9 @@ use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 use connector_peer_auth::{
     claim_ack_to_emit, Capability, PeerAuthPolicy, PeerAuthRefusal, PeerAuthRefusalLog, SessionRole,
 };
-use connector_peer_btp::claim_json::{self, PresentedPeerClaim};
+use connector_peer_btp::claim_json;
 use connector_peer_btp::price_gate::{self, ClaimEnforcementPolicy, PaymentRequired};
-use connector_peer_btp::role_gate::{self, FrameEvidence, VoucherEvidence};
+use connector_peer_btp::role_gate::{self, AmbiguousEvidence, FrameEvidence, VoucherEvidence};
 use connector_peer_btp::AcceptedClaims;
 use connector_runtime::{ClaimAckOutcome, Connector, WireClaim};
 
@@ -244,10 +244,8 @@ impl PeerHttpState {
         // Only a `toon-channel` claim is judged below: a voucher that
         // decided the role is not a `WireClaim`, and judging one on the peer
         // wire is the receiving half's (#1378).
-        let claim = match evidence.claim {
-            Some(PresentedPeerClaim::Channel(claim)) => Some(claim),
-            Some(PresentedPeerClaim::Voucher(_)) | None => None,
-        };
+        let carries_voucher = evidence.carries_voucher();
+        let claim = evidence.into_channel_claim();
 
         // §1.10: on a dedicated peer listener a failure is refused outright
         // rather than downgraded, because such a listener serves no clients.
@@ -323,7 +321,7 @@ impl PeerHttpState {
             ack,
             claim.as_ref(),
             prior_watermark,
-            self.enforcement.mode(&peer_id),
+            role_gate::forwarded_enforcement(carries_voucher, self.enforcement.mode(&peer_id)),
         ) {
             return self.finish(&role, payment_required_response(refusal), ack);
         }
@@ -488,18 +486,14 @@ fn now_ms() -> u64 {
 /// nothing, and the request is judged as if it were absent.
 #[must_use]
 pub fn evidence_on(request: &PeerRequest) -> Option<FrameEvidence> {
-    let claims = request.headers.get_all(CLAIM_HEADER).len();
-    let challenges = request.headers.get_all(PEER_CHALLENGE_HEADER).len();
-    if claims > 1 || challenges > 1 || (claims == 1 && challenges == 1) {
-        return None;
-    }
+    AmbiguousEvidence::check(
+        request.headers.get_all(CLAIM_HEADER).len(),
+        request.headers.get_all(PEER_CHALLENGE_HEADER).len(),
+    )
+    .ok()?;
     let claim = match headers::claim_json(&request.headers) {
         None => None,
-        Some(Ok(raw)) => claim_json::parse_presented(&raw)
-            .inspect_err(|error| {
-                tracing::warn!(%error, "peer claim could not be decoded; not acknowledged");
-            })
-            .ok(),
+        Some(Ok(raw)) => role_gate::decode_claim(&raw),
         Some(Err(_)) => {
             tracing::warn!("peer claim header is not base64; not acknowledged");
             None

@@ -70,10 +70,9 @@ use connector_runtime::{ClaimAckOutcome, Connector, WireClaim};
 use tokio::sync::mpsc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::claim_json::PresentedPeerClaim;
 use crate::price_gate::{self, ClaimEnforcementPolicy, PaymentRequired};
-use crate::role_gate::{FrameEvidence, VoucherEvidence};
-use crate::{ack, challenge_json, claim_json, fields, role_gate};
+use crate::role_gate::VoucherEvidence;
+use crate::{ack, fields, role_gate};
 
 /// How many completed replies may queue for the socket's writer before a
 /// finishing frame waits its turn -- burst smoothing between out-of-order
@@ -392,59 +391,28 @@ impl PeerSession {
 
         // §1.5's smuggling defence, counted before anything is parsed:
         // more than one claim entry on one frame is refused, not resolved
-        // -- never the first, never the last, never a concatenation.
-        let raw = match claim_json::present_from_protocol_data(&frame.protocol_data) {
-            Ok(raw) => raw,
-            Err(_) => {
+        // -- never the first, never the last, never a concatenation. The
+        // same holds for the peer-role challenge (ADR 0075 decision 5), and
+        // for a claim beside a challenge: two pieces of authentication
+        // material, and "which one did we check?" has no answer.
+        let evidence = match role_gate::btp_evidence(&frame) {
+            Ok(evidence) => evidence,
+            Err(ambiguous) => {
                 self.send(encode_error(
                     frame.request_id,
                     "F00",
                     "NotAcceptedError",
-                    b"more than one claim entry on one frame",
+                    ambiguous.message(),
                 ))
                 .await?;
                 return Ok(None);
             }
         };
-
-        // The same defence for the peer-role challenge (ADR 0075 decision
-        // 5), and one more: a claim and a challenge on one frame are two
-        // pieces of authentication material, and "which one did we check?"
-        // is refused rather than answered.
-        let raw_challenge = match challenge_json::present_from_protocol_data(&frame.protocol_data) {
-            Ok(raw_challenge) => raw_challenge,
-            Err(_) => {
-                self.send(encode_error(
-                    frame.request_id,
-                    "F00",
-                    "NotAcceptedError",
-                    b"more than one peer-role challenge entry on one frame",
-                ))
-                .await?;
-                return Ok(None);
-            }
-        };
-        if raw.is_some() && raw_challenge.is_some() {
-            self.send(encode_error(
-                frame.request_id,
-                "F00",
-                "NotAcceptedError",
-                b"a claim and a peer-role challenge on one frame",
-            ))
-            .await?;
-            return Ok(None);
-        }
 
         // **Role, from this frame's own evidence** (§1.2, §1.5): decoded and
         // verified before anything is judged, routed, charged or journaled,
         // and re-decided on every frame because a claim, a voucher or a
         // challenge proves the frame it rides on and no other.
-        let evidence = FrameEvidence {
-            claim: raw.and_then(|raw| self.decode_claim(raw)),
-            challenge: raw_challenge.and_then(role_gate::decode_challenge),
-            moves_no_value: frame.frame_type == BTP_MESSAGE
-                && role_gate::moves_no_value(&frame.ilp_packet),
-        };
         let (role, refusal) = role_gate::decide_frame(
             &self.state.connector,
             &self.state.auth,
@@ -454,13 +422,8 @@ impl PeerSession {
         .await
         .into_parts();
         self.report_refusal(refusal.as_ref());
-        // Only a `toon-channel` claim is judged below: a voucher that
-        // decided the role is not a `WireClaim`, and judging one on the peer
-        // wire is the receiving half's (#1378).
-        let claim = match evidence.claim {
-            Some(PresentedPeerClaim::Channel(claim)) => Some(claim),
-            Some(PresentedPeerClaim::Voucher(_)) | None => None,
-        };
+        let carries_voucher = evidence.carries_voucher();
+        let claim = evidence.into_channel_claim();
 
         // §1.10: on a dedicated peer listener a failure is refused
         // outright rather than downgraded, because such a listener serves
@@ -486,27 +449,15 @@ impl PeerSession {
                 Ok(None)
             }
             _ => {
-                self.handle_message(frame.request_id, &role, claim, &frame.ilp_packet)
-                    .await?;
+                self.handle_message(
+                    frame.request_id,
+                    &role,
+                    claim,
+                    carries_voucher,
+                    &frame.ilp_packet,
+                )
+                .await?;
                 Ok(None)
-            }
-        }
-    }
-
-    /// The claim this frame carries, decoded (§4). `None` when the frame
-    /// carries no claim entry at all, and also when it carries one this
-    /// connector could not read -- an undecodable claim is *not
-    /// acknowledged* (§6.3) rather than rejected, so the payer's claim
-    /// stays pending and its retransmission is read the same way instead of
-    /// being recorded as a verdict that was never reached.
-    fn decode_claim(&self, raw: &[u8]) -> Option<PresentedPeerClaim> {
-        match claim_json::parse_presented(raw) {
-            Ok(claim) => Some(claim),
-            Err(error) => {
-                // No peer id to name: the claim *is* what would have named
-                // one, and it did not decode.
-                tracing::warn!(%error, "peer claim could not be decoded; not acknowledged");
-                None
             }
         }
     }
@@ -578,6 +529,7 @@ impl PeerSession {
         request_id: u32,
         role: &SessionRole,
         claim: Option<WireClaim>,
+        carries_voucher: bool,
         ilp_packet: &[u8],
     ) -> Result<(), SessionGone> {
         // Peeked before `judge_claim` below may advance this channel's
@@ -661,7 +613,10 @@ impl PeerSession {
             ack,
             claim.as_ref(),
             prior_watermark,
-            self.state.enforcement.mode(&peer_id),
+            role_gate::forwarded_enforcement(
+                carries_voucher,
+                self.state.enforcement.mode(&peer_id),
+            ),
         ) {
             return self
                 .send(self.payment_required_response(role, request_id, refusal, ack))

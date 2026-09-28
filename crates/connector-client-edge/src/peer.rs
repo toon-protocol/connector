@@ -55,8 +55,7 @@ use connector_config::{PeerCarriage, PeerChannelConfig, PeerConfig, PeerExposure
 use connector_peer_auth::{PeerAuthPolicy, PeerAuthRefusal, PeerAuthRefusalLog};
 use connector_peer_btp::role_gate::{self, FrameEvidence, VoucherEvidence};
 use connector_peer_btp::{
-    challenge_json, claim_json, AcceptedClaims, ClaimEnforcementPolicy, PeerAcceptPolicy,
-    PeerCarriageState,
+    AcceptedClaims, ClaimEnforcementPolicy, PeerAcceptPolicy, PeerCarriageState,
 };
 use connector_peer_http::{FlushHints, Headers, PeerHttpPolicy, PeerHttpState, PeerRequest};
 use connector_runtime::Connector;
@@ -224,15 +223,10 @@ impl PeerCarriages {
         if self.btp.is_none() {
             return BtpClaimVerdict::Client;
         }
-        let evidence = FrameEvidence {
-            claim: claim_json::from_protocol_data(&frame.protocol_data)
-                .and_then(|raw| claim_json::parse_presented(raw).ok()),
-            challenge: challenge_json::present_from_protocol_data(&frame.protocol_data)
-                .ok()
-                .flatten()
-                .and_then(|raw| challenge_json::parse(raw).ok()),
-            moves_no_value: frame.frame_type == connector_btp::BTP_MESSAGE
-                && role_gate::moves_no_value(&frame.ilp_packet),
+        // Ambiguous evidence proves no peering here; a peer session would
+        // refuse the frame (§1.5), and the client path answers it instead.
+        let Ok(evidence) = role_gate::btp_evidence(frame) else {
+            return BtpClaimVerdict::Client;
         };
         let (role, refusal) = self.decide(&evidence).await.into_parts();
         self.log_refusal(refusal.as_ref());
@@ -397,7 +391,7 @@ mod tests {
     /// That claim as the §4 JSON both carriages carry, in the two encodings
     /// §1.9 pins: raw on BTP, `base64` in the HTTP header.
     fn claim_json(claim: &WireClaim, signer: &dyn Signer) -> String {
-        claim_json::encode(
+        connector_peer_btp::claim_json::encode(
             claim,
             &derive_evm_address(&signer.public_key().unwrap()),
             None,
