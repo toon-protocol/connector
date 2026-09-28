@@ -69,12 +69,9 @@ write_keys_file = "/app/data/operator-write-keys"
 # line; `decimals = 9` is checked against the mint's own at boot.
 [settlement.solana]
 rpc_url = "http://solana-validator:8899"
-program_id = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR"
 token_address = "5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX"
 decimals = 9
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "/app/data/settlement-solana.key"
-
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = 1

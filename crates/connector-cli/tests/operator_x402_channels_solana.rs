@@ -30,7 +30,6 @@ use connector_runtime::BatchChannelError;
 use connector_settlement::batch::BatchSettlementError;
 use connector_settlement_solana::test_support::{
     create_mint, fund, mint_to, require_solana_test_validator, SolanaValidator,
-    LOCAL_TEST_PROGRAM_ID,
 };
 use ed25519_dalek::Keypair;
 use rand::rngs::OsRng;
@@ -86,15 +85,12 @@ write_keys = ["{write_key}"]
 
 [settlement.solana]
 rpc_url = "{rpc_url}"
-program_id = "{LOCAL_TEST_PROGRAM_ID}"
 token_address = "{mint}"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "{settlement_key}"
-
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = 1
 
 {route}
 "#,

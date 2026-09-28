@@ -134,8 +134,8 @@ fn the_templates_peering_example_loads() {
     );
 
     // Not part of the template: the example's EVM `[[peer_channels]]` row
-    // requires a `[settlement.evm]` table with x402 batch settlement switched
-    // on to bind against (issue #1138, issue #1380),
+    // requires a `[settlement.evm]` table to bind against (issue #1138,
+    // issue #1380),
     // and the template names no settlement chain at all -- rightly, since
     // which chain an operator settles on is theirs to pick. Supplied here
     // so this test proves the PEERING example loads, not that the template
@@ -143,11 +143,8 @@ fn the_templates_peering_example_loads() {
     doc.push_str(&format!(
         "\n[settlement.evm]\n\
          rpc_url = \"http://127.0.0.1:8545\"\n\
-         contract_address = \"0x1234567890123456789012345678901234567890\"\n\
          token_address = \"0x49beE1Bca5d15Fb0963117923403F9498119a9Ce\"\n\
          decimals = 6\n\
-         \n\
-         [settlement.evm.batch_settlement]\n\
          asset_eip712_name = \"USD Coin\"\n\
          asset_eip712_version = \"2\"\n\
          \n\

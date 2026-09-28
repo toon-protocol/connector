@@ -22,7 +22,6 @@ use connector_settlement::batch::{
 };
 use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
-use connector_settlement_evm::EvmSettlementBackend;
 use ethers::signers::{LocalWallet, Signer};
 
 use support::{evm_voucher, paid_prepare, post_ilp, spawn_recording_app, CLIENT_EDGE_JOURNAL};
@@ -60,18 +59,15 @@ async fn an_evm_voucher_is_accepted_journaled_and_landed_after_a_restart() {
         return;
     }
 
-    // The chain: x402's contracts, an ERC-3009 USDC, and a TokenNetwork
-    // registry over it for the node's `[settlement.evm]` table.
+    // The chain: x402's contracts and an ERC-3009 USDC.
     let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
     let mut x402 = X402Chain::place(&anvil.rpc_url).await;
     let token = x402.deploy_fiat_token().await;
-    let settlement = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("a TokenNetwork over the FiatToken");
-    let registry = settlement.registry_address();
-    let node = settlement.own_address().to_fixed_bytes();
-    // Everything the deployer key sends from here on, the node sends.
-    drop(settlement);
+    let node = DEPLOYER_PRIVATE_KEY
+        .parse::<LocalWallet>()
+        .expect("the node's settlement key")
+        .address()
+        .to_fixed_bytes();
 
     // The client: a funding key and the session key that signs vouchers.
     let payer = LocalWallet::from_bytes(&[0x61; 32]).expect("key");
@@ -97,16 +93,13 @@ key_file = "{signer_key}"
 
 [settlement.evm]
 rpc_url = "{rpc_url}"
-contract_address = "{registry:?}"
 token_address = "{token:?}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{settlement_key}"
-
-[settlement.evm.batch_settlement]
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
 
 [[routes]]
 prefix = "{ROUTE}"

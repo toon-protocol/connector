@@ -101,28 +101,22 @@ write_keys_file = "/app/data/operator-write-keys"
 # `payee` seat.
 [settlement.evm]
 rpc_url = "http://anvil:8545"
-contract_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
 token_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
 
-[settlement.evm.batch_settlement]
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
-
 [settlement.solana]
 rpc_url = "http://solana-validator:8899"
-program_id = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR"
 token_address = "H8HSreUF2s8r8hem4qMttE3bWYCpFuh71jbuos5bA77H"
 decimals = 6
+min_sponsored_deposit = 1
 
 [settlement.solana.key]
 key_file = "/app/data/settlement-solana.key"
-
-[settlement.solana.batch_settlement]
-min_sponsored_deposit = 1
 
 # ── A's peering, config-declared (ADR 0075 decision 9, issue #1380) ──────────
 # The id is the one `local/keys.sh`'s topology table names, so the `channels`

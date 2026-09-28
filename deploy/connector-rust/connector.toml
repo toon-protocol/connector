@@ -317,9 +317,9 @@ write_keys = ["REPLACE-WITH-A-64-HEX-CHARACTER-ED25519-PUBLIC-KEY-SEE-README-STE
 # # outbound_channel: a peering is two one-way channels, and
 # # one channel in two roles would let the same money be counted twice.
 # #
-# # A row REQUIRES that chain's [settlement.<chain>.batch_settlement] table:
-# # that is what makes this node accept x402 channels at all. Refused by name
-# # at load, per chain.
+# # A row REQUIRES that chain's [settlement.<chain>] table: that is where
+# # this node's x402 terms and key on the chain come from. Refused by name at
+# # load, per chain.
 # #
 # # The toon-channel row shape (channel_id, counterparty_key, chain_id,
 # # token_network, channel_account) is retired (ADR 0075, issue #1380): each

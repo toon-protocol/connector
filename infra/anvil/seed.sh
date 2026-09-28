@@ -22,28 +22,22 @@
 #     and initialised, because a FiatToken's initialisers write the state that
 #     makes it work. It is what gives a deposit ERC-3009's
 #     `receiveWithAuthorization`. Named "USDC", version "2", 6 decimals, as
-#     Base's is -- the EIP-712 domain every `[settlement.evm.batch_settlement]`
-#     table under `local/` names.
+#     Base's is -- the EIP-712 domain every `[settlement.evm]` table under
+#     `local/` names.
 #
 # USDC IS MINTED ON DEMAND, NEVER DRIPPED. Anvil's account 1 is the token's
 # owner, master minter and a minter with an unlimited allowance, so
 # `local/keys.sh` mints each node's USDC with `cast send ... mint(...)` from
 # that account, the way it minted `MockERC20` before. No faucet is involved.
 #
-# ── The one TOON deployment left, and why ────────────────────────────────────
+# ── No TOON deployment ───────────────────────────────────────────────────────
 #
-# The connector on this tree still BOOTS through `[settlement.evm]
-# contract_address`: `EvmSettlementBackend::connect` resolves
-# `TokenNetworkRegistry.getTokenNetwork(token_address)` and refuses to start
-# when that answers zero. So this chain still carries a registry with a
-# `TokenNetwork` for the FiatToken, and nothing else of TOON's -- no
-# `MockERC20`, no ERC-2771 forwarder, no `RollingSwapChannel`, and no channel
-# is ever opened on it. It exists only so a node boots, and it goes with the
-# boot dependency in #1385 ("a node boots only if the x402 contract or
-# program is present on its chain"). Deployed from the committed registry
-# bytecode the backend's own bindings are generated from, rather than by
-# `forge` out of `packages/contracts`, so this chain needs neither a Solidity
-# toolchain nor the contracts' git submodules.
+# Every channel is an x402 channel (ADR 0075), and the connector boots only
+# if `x402BatchSettlement` is present on its chain (decision 1), so this
+# chain carries nothing of TOON's -- no `TokenNetworkRegistry`, no
+# `TokenNetwork`, no `MockERC20`, no ERC-2771 forwarder, no
+# `RollingSwapChannel` (#1385) -- and needs neither a Solidity toolchain nor
+# the contracts' git submodules.
 #
 # ── Deterministic addresses ──────────────────────────────────────────────────
 #
@@ -53,11 +47,11 @@
 #
 #   account 0, nonce 0   FiatToken v2.2 implementation   0x5FbDB2315678afecb367f032d93F642f64180aa3
 #   account 0, nonce 1   FiatTokenProxy -- THE USDC       0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512
-#   account 0, nonce 2   TokenNetworkRegistry (boot)      0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0
-#   registry,  nonce 1   its TokenNetwork for the USDC    0x75537828f2ce51be7289709686A69CbFDbB714F1
 #
 # `crates/connector-bin/tests/local_topologies_load.rs` holds this table to
-# the committed configs and the healthcheck in docker-compose.yml.
+# the committed configs. The healthcheck in docker-compose.yml waits on the
+# LAST step below -- account 1 becoming USDC's minter -- so a healthy anvil
+# is a fully seeded one.
 #
 # The proxy's admin is account 0, which a transparent proxy then refuses
 # every token call from; the token's roles are therefore account 1's.
@@ -86,8 +80,6 @@ PERMIT2=0x000000000022D473030F116dDEE9F6B43aC78BA3
 SIGNATURE_CHECKER=0xbA3b60c21e28C41df4bABd90f228e1D368627DA6
 
 USDC=0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512
-TOKEN_NETWORK_REGISTRY=0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0
-TOKEN_NETWORK=0x75537828f2ce51be7289709686A69CbFDbB714F1
 
 # The committed hex, `0x`-prefixed, whitespace stripped.
 hex() {
@@ -140,20 +132,3 @@ owner_send 'initializeV2_2(address[],string)' '[]' USDC
 owner_send 'configureMinter(address,uint256)' "$TOKEN_OWNER" \
   115792089237316195423570985008687907853269984665640564039457584007913129639935
 echo "  USDC at $USDC (FiatToken v2.2, 6 decimals; minter $TOKEN_OWNER)"
-
-echo "Deploying the TokenNetworkRegistry the connector still boots through (#1385)..."
-# The committed artifact is formatted JSON with the creation code on the
-# line after `"bytecode": {`; read with sed because this image has no jq.
-registry_code="$(sed -n '/"bytecode"/{n;s/.*"object": *"\(0x[0-9a-fA-F]*\)".*/\1/p;}' \
-  "$EVM/TokenNetworkRegistry.json")"
-if [ -z "$registry_code" ]; then
-  echo "No creation code found in $EVM/TokenNetworkRegistry.json." >&2
-  exit 1
-fi
-registry="$(deploy "$DEPLOYER_KEY" "$registry_code")"
-expect_address "$registry" "$TOKEN_NETWORK_REGISTRY" "The TokenNetworkRegistry"
-cast send --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" "$registry" \
-  'createTokenNetwork(address)' "$USDC" >/dev/null
-network="$(cast call --rpc-url "$RPC" "$registry" 'getTokenNetwork(address)(address)' "$USDC")"
-expect_address "$network" "$TOKEN_NETWORK" "The USDC TokenNetwork"
-echo "  registry $registry, TokenNetwork $network (boot only: no channel is opened on it)"

@@ -25,9 +25,7 @@ use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
-use connector_settlement_evm::{
-    DepositRoute, EvmBatchSettlementBackend, EvmSettlementBackend, RpcTransport,
-};
+use connector_settlement_evm::{DepositRoute, EvmBatchSettlementBackend, RpcTransport};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, Signature, H256};
 
@@ -73,13 +71,15 @@ impl Peering {
                 x402.mint(token, payer_address, FUNDED).await;
                 token
             }
-            Token::Plain => EvmSettlementBackend::deploy_mock_token(
-                &anvil.rpc_url,
-                DEPLOYER_PRIVATE_KEY,
-                FUNDED,
-            )
-            .await
-            .expect("a token with no EIP-3009, minted to the payer"),
+            // A token with no EIP-3009, minted to the payer.
+            Token::Plain => {
+                connector_settlement_evm::test_support::deploy_plain_token(
+                    &anvil.rpc_url,
+                    DEPLOYER_PRIVATE_KEY,
+                    FUNDED,
+                )
+                .await
+            }
         };
         let payer = build_node(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token).await;
         let receiver = build_node(&anvil.rpc_url, COUNTERPARTY_PRIVATE_KEY, token).await;
@@ -133,12 +133,15 @@ impl Peering {
 }
 
 async fn build_node(rpc_url: &str, key: &str, token: Address) -> EvmBatchSettlementBackend {
-    EvmSettlementBackend::deploy(rpc_url, key, token)
-        .await
-        .expect("a node's settlement backend")
-        .batch_settlement(ONE_DAY)
-        .await
-        .expect("its batch-settlement backend")
+    EvmBatchSettlementBackend::connect(
+        &RpcTransport::direct(rpc_url).expect("transport"),
+        key,
+        token,
+        6,
+        ONE_DAY,
+    )
+    .await
+    .expect("a node's batch-settlement backend")
 }
 
 fn hex32(text: &str) -> [u8; 32] {
@@ -504,18 +507,13 @@ async fn an_opening_deposit_that_lands_behind_a_lost_confirmation_is_kept() {
     let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
     let mut x402 = X402Chain::place(&anvil.rpc_url).await;
     let token = x402.deploy_fiat_token().await;
-    let settlement = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("the payer's settlement backend");
-    x402.mint(token, settlement.own_address(), FUNDED).await;
-    let receiver = EvmSettlementBackend::deploy(&anvil.rpc_url, COUNTERPARTY_PRIVATE_KEY, token)
-        .await
-        .expect("the receiver's settlement backend")
-        .batch_settlement(ONE_DAY)
-        .await
-        .expect("its batch-settlement backend");
+    let payer_own = LocalWallet::from_bytes(&hex32(DEPLOYER_PRIVATE_KEY))
+        .expect("key")
+        .address();
+    x402.mint(token, payer_own, FUNDED).await;
+    let receiver = build_node(&anvil.rpc_url, COUNTERPARTY_PRIVATE_KEY, token).await;
 
-    let payer_address = format!("{:?}", settlement.own_address());
+    let payer_address = format!("{payer_own:?}");
     let lying = FakeRpc::spawn_in_front_of(&anvil.rpc_url, move |call| {
         if call.method != "eth_getTransactionReceipt" {
             return RpcReply::Forward;
@@ -531,18 +529,15 @@ async fn an_opening_deposit_that_lands_behind_a_lost_confirmation_is_kept() {
         }))
     })
     .await;
-    let payer = EvmSettlementBackend::connect(
+    let payer = EvmBatchSettlementBackend::connect(
         &RpcTransport::direct(&lying.url()).expect("transport"),
         DEPLOYER_PRIVATE_KEY,
-        settlement.registry_address(),
         token,
         6,
+        ONE_DAY,
     )
     .await
-    .expect("the payer, over the lying endpoint")
-    .batch_settlement(ONE_DAY)
-    .await
-    .expect("its batch-settlement backend");
+    .expect("the payer, over the lying endpoint");
 
     let opened = payer
         .open(

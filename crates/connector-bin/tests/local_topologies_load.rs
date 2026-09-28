@@ -39,7 +39,6 @@ use std::process::Command;
 use connector_config::{Config, PeerExposure, SettlementChain, SettlementConfig, TransportPolicy};
 use connector_domain::{amount_after_rate_and_fee, AssetId, Price};
 use connector_runtime::SharedRateTable;
-use connector_settlement_solana::test_support::LOCAL_TEST_PROGRAM_ID;
 
 const SOLO_CONFIG: &str = include_str!("../../../local/solo/connector.toml");
 const SOLO_COMPOSE: &str = include_str!("../../../local/solo/compose.yml");
@@ -626,15 +625,11 @@ fn the_mixed_chain_middle_hop_enforces_a_config_declared_peering() {
 ///
 /// The EVM token is the FiatToken `infra/anvil/seed.sh` deploys, under its own
 /// EIP-712 domain ("USDC", "2"); the Solana table carries the sponsor minimum
-/// that makes this node an x402 receiver. The two TOON facts left --
-/// `contract_address` and `program_id` -- are what the connector still BOOTS
-/// through until #1385, and must name exactly the registry and program the
-/// chains still carry for that and nothing else.
+/// that makes this node an x402 receiver. No TOON fact is left in either
+/// table: `contract_address` and `program_id` are refused by name (#1385).
 #[test]
 fn every_local_settlement_table_is_an_x402_one_on_the_seeded_chain() {
     let usdc = script_word(ANVIL_SEED, "infra/anvil/seed.sh", "USDC").to_lowercase();
-    let registry =
-        script_word(ANVIL_SEED, "infra/anvil/seed.sh", "TOKEN_NETWORK_REGISTRY").to_lowercase();
     for (name, raw) in EVERY_CONFIG
         .iter()
         .copied()
@@ -651,15 +646,7 @@ fn every_local_settlement_table_is_an_x402_one_on_the_seeded_chain() {
                         "{name}'s EVM token must be the FiatToken infra/anvil/seed.sh deploys"
                     );
                     assert_eq!(evm.decimals(), 6, "{name}: FiatToken v2.2 has 6 decimals");
-                    assert_eq!(
-                        hex20(evm.contract_address()),
-                        registry,
-                        "{name}'s contract_address must be the boot-only TokenNetworkRegistry \
-                         infra/anvil/seed.sh deploys (until #1385)"
-                    );
-                    let batch = evm.batch_settlement().unwrap_or_else(|| {
-                        panic!("{name} settles on EVM without [settlement.evm.batch_settlement]")
-                    });
+                    let batch = evm.batch_settlement();
                     assert_eq!(
                         (batch.asset_eip712_name(), batch.asset_eip712_version()),
                         ("USDC", "2"),
@@ -669,14 +656,9 @@ fn every_local_settlement_table_is_an_x402_one_on_the_seeded_chain() {
                 }
                 SettlementConfig::Solana(solana) => {
                     assert_eq!(solana.rpc_url(), "http://solana-validator:8899", "{name}");
-                    assert_eq!(
-                        solana.program_id(),
-                        LOCAL_TEST_PROGRAM_ID,
-                        "{name}: the boot-only program infra/solana/entrypoint.sh still loads"
-                    );
                     assert!(
-                        solana.batch_settlement().is_some(),
-                        "{name} settles on Solana without [settlement.solana.batch_settlement]"
+                        solana.batch_settlement().min_sponsored_deposit() > 0,
+                        "{name}: a sponsor minimum bounds the public sponsor endpoint"
                     );
                 }
             }
@@ -716,8 +698,8 @@ fn no_local_config_carries_a_literal_credential() {
 /// The connector binds `x402BatchSettlement` and its collectors as constants
 /// of the binary, so `infra/anvil/seed.sh` placing them anywhere else would
 /// boot every node and open no channel. And no TOON contract is deployed
-/// beyond the one registry the connector still boots through (#1385): no
-/// `MockERC20`, no forwarder, no `RollingSwapChannel`, and no `forge` at all.
+/// (#1385): no `TokenNetworkRegistry`, no `TokenNetwork`, no `MockERC20`, no
+/// forwarder, no `RollingSwapChannel`, and no `forge` at all.
 #[test]
 fn the_local_anvil_places_x402_where_the_binary_binds_it() {
     let seed = |name: &str| script_word(ANVIL_SEED, "infra/anvil/seed.sh", name).to_lowercase();
@@ -776,6 +758,7 @@ fn the_local_anvil_places_x402_where_the_binary_binds_it() {
         for line in executable_lines(text) {
             for gone in [
                 "DeployLocal",
+                "TokenNetwork",
                 "MockERC20",
                 "RollingSwapChannel",
                 "forge ",
@@ -784,19 +767,29 @@ fn the_local_anvil_places_x402_where_the_binary_binds_it() {
                 assert!(
                     !line.contains(gone),
                     "{file} still runs `{gone}`: `{line}`. The local chain carries no TOON \
-                     deployment but the boot-only registry (ADR 0075, #1383)."
+                     deployment (ADR 0075, #1385)."
                 );
             }
         }
     }
 
-    // The healthcheck waits on the LAST thing the seed creates, under
-    // `set -e`, so code there means every step before it landed.
-    let token_network = script_word(ANVIL_SEED, "infra/anvil/seed.sh", "TOKEN_NETWORK");
+    // The healthcheck waits on the LAST thing the seed does -- account 1
+    // becoming USDC's minter -- under `set -e`, so a true answer there means
+    // every step before it landed.
+    let minter = script_word(ANVIL_SEED, "infra/anvil/seed.sh", "TOKEN_OWNER");
     assert!(
-        ROOT_COMPOSE.contains(&format!("cast code {token_network} ")),
-        "docker-compose.yml's anvil healthcheck must wait on {token_network}, the last contract \
-         infra/anvil/seed.sh creates"
+        ROOT_COMPOSE.contains(&format!(
+            "cast call {} 'isMinter(address)(bool)' {minter} ",
+            script_word(ANVIL_SEED, "infra/anvil/seed.sh", "USDC")
+        )),
+        "docker-compose.yml's anvil healthcheck must wait on USDC's minter, the last step \
+         infra/anvil/seed.sh takes"
+    );
+    assert!(
+        executable_lines(ANVIL_SEED)
+            .last()
+            .is_some_and(|line| line.contains("USDC at")),
+        "the minter is configured last, so the healthcheck can wait on it"
     );
     assert!(
         code(ANVIL_ENTRYPOINT).contains("sh -eu /anvil/seed.sh"),
@@ -846,9 +839,10 @@ fn the_local_validator_loads_payment_channels_and_p_token_from_the_pinned_fixtur
          second copy is a second program to drift"
     );
     assert!(
-        code(SOLANA_ENTRYPOINT).contains(LOCAL_TEST_PROGRAM_ID),
-        "TOON's own program is still loaded at {LOCAL_TEST_PROGRAM_ID} while the connector boots \
-         through `[settlement.solana] program_id` (#1385)"
+        !code(SOLANA_ENTRYPOINT).contains("payment_channel.so")
+            && !ROOT_COMPOSE.contains("target/deploy"),
+        "the local validator loads no TOON program (ADR 0075, #1385): a node boots on \
+         payment-channels alone"
     );
 }
 
@@ -954,15 +948,9 @@ fn every_peered_node_publishes_itself_and_can_be_written_to() {
                         "{file} reads a plaintext self-description in POST /peers (CF-18)"
                     );
                 }
-                let x402 = match settlement(&config, peering.chain) {
-                    SettlementConfig::Evm(evm) => evm.batch_settlement().is_some(),
-                    SettlementConfig::Solana(solana) => solana.batch_settlement().is_some(),
-                };
-                assert!(
-                    x402,
-                    "{file} must turn on x402 batch-settlement on '{}'s chain",
-                    peering.id
-                );
+                // The peering's chain has a settlement table, which is its
+                // x402 terms (ADR 0075 decision 9).
+                let _ = settlement(&config, peering.chain);
             }
         }
     }

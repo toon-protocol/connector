@@ -34,7 +34,6 @@ use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
-use connector_settlement_evm::EvmSettlementBackend;
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::Address;
 
@@ -71,7 +70,6 @@ fn node_files(
     settlement_key_hex: &str,
     signer_seed: u8,
     rpc_url: &str,
-    registry: Address,
     token: Address,
 ) -> NodeFiles {
     let state_dir = tempfile::tempdir().expect("state dir");
@@ -91,16 +89,14 @@ key_file = "{signer_key}"
 
 [settlement.evm]
 rpc_url = "{rpc_url}"
-contract_address = "{registry:?}"
 token_address = "{token:?}"
 decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
 
 [settlement.evm.key]
 key_file = "{settlement_key}"
 
-[settlement.evm.batch_settlement]
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
 "#,
         state_dir = state_dir.path().display(),
         signer_key = signer_key.path().display(),
@@ -136,23 +132,13 @@ async fn a_client_is_paid_an_evm_voucher_it_lands_on_chain_itself() {
     let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
     let mut x402 = X402Chain::place(&anvil.rpc_url).await;
     let token = x402.deploy_fiat_token().await;
-    let registry = EvmSettlementBackend::deploy(&anvil.rpc_url, DEPLOYER_PRIVATE_KEY, token)
-        .await
-        .expect("a TokenNetwork registry for the settlement table")
-        .registry_address();
     let connector_key = address_of(DEPLOYER_PRIVATE_KEY);
     let client_key = address_of(COUNTERPARTY_PRIVATE_KEY);
     x402.mint(token, connector_key, FUNDED).await;
     x402.mint(token, client_key, FUNDED).await;
 
-    let a = node_files(DEPLOYER_PRIVATE_KEY, 0x0a, &anvil.rpc_url, registry, token);
-    let b = node_files(
-        COUNTERPARTY_PRIVATE_KEY,
-        0x0b,
-        &anvil.rpc_url,
-        registry,
-        token,
-    );
+    let a = node_files(DEPLOYER_PRIVATE_KEY, 0x0a, &anvil.rpc_url, token);
+    let b = node_files(COUNTERPARTY_PRIVATE_KEY, 0x0b, &anvil.rpc_url, token);
     let a_runtime = connector_cli::build(&a.config).await.expect("build A");
     let a_addr = serve(connector_cli::router(&a_runtime, &a.config).expect("A's router"));
     let client = connector_cli::build(&b.config)

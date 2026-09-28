@@ -386,9 +386,9 @@ pub enum ConfigError {
 
     #[error(
         "'[[peer_channels]]' for peer '{peer_id}' names a voucher signer on {chain}, but this \
-         node takes no x402 voucher there: '[settlement.{chain}]' has no 'batch_settlement' \
-         sub-table (ADR 0074), so no channel the peer opens toward this node could ever be \
-         admitted. Add the sub-table, or peer over a chain this node takes vouchers on"
+         node has no '[settlement.{chain}]' table, so no channel the peer opens toward this \
+         node could ever be admitted (ADR 0075). Add the table, or peer over a chain this node \
+         settles on"
     )]
     PeerChannelWithoutX402 {
         peer_id: String,
@@ -461,9 +461,8 @@ pub enum ConfigError {
 
     #[error(
         "'[[pay_channels]]' for peer '{peer_id}' names an outbound channel on {chain}, but this \
-         node pays no x402 channel there: '[settlement.{chain}]' has no 'batch_settlement' \
-         sub-table (ADR 0074), so there is no paying half to sign a voucher with. Add the \
-         sub-table, or pay over a chain this node settles x402 on"
+         node has no '[settlement.{chain}]' table, so there is no paying half to sign a voucher \
+         with (ADR 0075). Add the table, or pay over a chain this node settles on"
     )]
     PayChannelWithoutX402 {
         peer_id: String,
@@ -639,11 +638,55 @@ pub enum ConfigError {
     )]
     PeerWireAddrRemoved,
 
+    /// The flat `[settlement]` shape (`chain`, `rpc_url`, `contract_address`,
+    /// ...), which named a `TokenNetworkRegistry` (ADR 0075 decision 9).
     #[error(
-        "the [settlement] section names chain '{value}', which this connector does not \
-         implement -- only 'evm' is recognized"
+        "the flat [settlement] shape (chain = \"evm\", contract_address, ...) was removed with \
+         TOON's own channels (ADR 0075, issue #1385): every channel is an x402 channel on a \
+         contract the binary fixes. Write a [settlement.evm] table instead -- rpc_url, \
+         token_address, decimals, asset_eip712_name, asset_eip712_version and \
+         [settlement.evm.key] -- and no contract_address"
     )]
-    SettlementUnknownChain { value: String },
+    SettlementLegacyShapeRemoved,
+
+    /// A settlement key that named TOON's own channel deployment:
+    /// `[settlement.evm] contract_address` (the `TokenNetworkRegistry`) or
+    /// `[settlement.solana] program_id` (TOON's payment-channel program)
+    /// (ADR 0075 decisions 1 and 9).
+    #[error(
+        "'[settlement.{table}] {field}' was removed with TOON's own channels (ADR 0075, issue \
+         #1385): every channel is an x402 channel, on x402BatchSettlement at \
+         0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003 (EVM) or payment-channels at \
+         CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX (Solana), both constants of the binary. \
+         Delete the line. A node with TOON channels still open drains them on the last release \
+         that supports them first (ADR 0075, \"Draining a node with live TOON channels\")"
+    )]
+    SettlementToonKeyRemoved {
+        table: &'static str,
+        field: &'static str,
+    },
+
+    /// The `[settlement.<chain>.batch_settlement]` sub-table, whose keys moved
+    /// up into `[settlement.<chain>]` (ADR 0075 decision 9).
+    #[error(
+        "'[settlement.{table}.batch_settlement]' was removed (ADR 0075, issue #1385): x402 \
+         channels are the only channels, so their terms are no longer an opt-in sub-table. Move \
+         its keys up into [settlement.{table}] unchanged and delete the sub-table's header"
+    )]
+    SettlementBatchSubTableRemoved { table: &'static str },
+
+    /// A key ADR 0075 decision 9 makes required wherever its settlement table
+    /// exists: `asset_eip712_name` and `asset_eip712_version` on EVM,
+    /// `min_sponsored_deposit` on Solana.
+    #[error(
+        "[settlement.{table}] has no {key}. Every channel is an x402 channel (ADR 0075), so \
+         accepting them is no longer an opt-in and this key has no safe default: add it to \
+         [settlement.{table}]"
+    )]
+    SettlementMissingRequiredKey {
+        table: &'static str,
+        key: &'static str,
+    },
 
     #[error("the [settlement] section's rpc_url is empty")]
     SettlementMissingRpcUrl,
@@ -657,12 +700,6 @@ pub enum ConfigError {
 
     #[error("settlement rpc_url '{value}' must be http or https")]
     SettlementUnsupportedRpcScheme { value: String },
-
-    #[error(
-        "invalid settlement contract_address '{value}': must be 40 hex characters \
-         (a 20-byte EVM address), optionally '0x'-prefixed"
-    )]
-    SettlementInvalidContractAddress { value: String },
 
     #[error(
         "invalid settlement token_address '{value}': must be 40 hex characters \
@@ -691,9 +728,6 @@ pub enum ConfigError {
     )]
     SettlementSectionEmpty,
 
-    #[error("the [settlement.solana] section's program_id is empty")]
-    SettlementMissingProgramId,
-
     #[error("the [settlement.solana] section's token_address is empty")]
     SettlementMissingSolanaTokenAddress,
 
@@ -708,10 +742,10 @@ pub enum ConfigError {
     )]
     SettlementChannelIndexKeyRemoved { field: &'static str },
 
-    /// A `batch_settlement` table published a minimum `withdrawDelay` or
+    /// A settlement table published a minimum `withdrawDelay` or
     /// `grace_period` below x402's 900 seconds (ADR 0074 decision 5).
     #[error(
-        "[settlement.{table}.batch_settlement] {key} = {value} is below the floor of 900 \
+        "[settlement.{table}] {key} = {value} is below the floor of 900 \
          seconds. ADR 0074 lets a connector publish its own minimum, but never one below \
          x402's; omit the key for the default of one day, the window a delayed claim still \
          has to land in"
@@ -722,33 +756,33 @@ pub enum ConfigError {
         value: u64,
     },
 
-    /// `[settlement.evm.batch_settlement] min_withdraw_delay_secs` above the
+    /// `[settlement.evm] min_withdraw_delay_secs` above the
     /// contract's own thirty-day `MAX_WITHDRAW_DELAY`: no channel could carry
     /// a `withdrawDelay` that meets it.
     #[error(
-        "[settlement.evm.batch_settlement] min_withdraw_delay_secs = {value} exceeds \
+        "[settlement.evm] min_withdraw_delay_secs = {value} exceeds \
          x402BatchSettlement's MAX_WITHDRAW_DELAY of 2592000 seconds (30 days). No channel \
          could ever meet it, so the opt-in would admit nothing"
     )]
     BatchSettlementWithdrawDelayAboveContractMaximum { value: u64 },
 
-    /// `[settlement.solana.batch_settlement] min_sponsored_deposit = 0`: the
+    /// `[settlement.solana] min_sponsored_deposit = 0`: the
     /// bound on the public sponsor endpoint would bound nothing (ADR 0074
     /// decision 5).
     #[error(
-        "[settlement.solana.batch_settlement] min_sponsored_deposit is 0. It bounds a public \
+        "[settlement.solana] min_sponsored_deposit is 0. It bounds a public \
          endpoint that spends this node's lamports on rent for every channel it sponsors, so \
          it must name a real opening deposit in the mint's base units"
     )]
     BatchSettlementZeroMinimumSponsoredDeposit,
 
-    /// `[settlement.evm.batch_settlement] asset_eip712_name` or
-    /// `asset_eip712_version` was written empty. Both are required as soon
-    /// as the table exists (ADR 0074 decision 8, issue #1345): the greeting
+    /// `[settlement.evm] asset_eip712_name` or
+    /// `asset_eip712_version` was written empty. Both are required wherever
+    /// the table exists (ADR 0074 decision 8, issue #1345): the greeting
     /// publishes them so a payer's deposit can be signed under the asset's
     /// real EIP-712 domain, and an empty value would be published as one.
     #[error(
-        "[settlement.evm.batch_settlement] {key} is empty. A client signs its deposit \
+        "[settlement.evm] {key} is empty. A client signs its deposit \
          authorization under this asset's real EIP-712 domain, so the greeting must publish \
          it -- there is no safe default for an arbitrary settlement token"
     )]

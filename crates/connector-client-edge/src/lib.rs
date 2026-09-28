@@ -97,8 +97,8 @@ mod session_route;
 pub(crate) mod test_support;
 mod voucher_evidence;
 pub use batch_settlement::{
-    journaled_batch_channels, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
-    BatchSettlementChannels, JournaledBatchChannel,
+    first_toon_channel_entry, journaled_batch_channels, AdmittedEvmVoucherChannel,
+    AdmittedSolanaVoucherChannel, BatchSettlementChannels, JournaledBatchChannel,
 };
 pub use channels::{ChannelLookupFailed, ChannelResolutionError, ChannelTerminal};
 pub use claim_gate::{ClaimIngestRejection, ClientClaimGate};

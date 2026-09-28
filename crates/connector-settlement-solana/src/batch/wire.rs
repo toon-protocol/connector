@@ -5,9 +5,9 @@
 //! Pinned at payment-channels `3ffa4d67` (ADR 0074's _Sources_), cited as
 //! **PC** plus a path under `program/payment_channels/src/`. That program
 //! ships a generated client, but it builds against a newer Solana SDK line
-//! than this workspace pins, so -- exactly as [`crate::wire`] does for TOON's
-//! own program -- the bytes are written here and pinned by this module's
-//! tests and by the tier-3 tests that run them against the deployed binary.
+//! than this workspace pins, so the bytes are written here and pinned by this
+//! module's tests and by the tier-3 tests that run them against the deployed
+//! binary.
 //!
 //! Nothing here signs. An instruction builder names the accounts that must
 //! sign; whoever submits the transaction supplies the signatures. That is
@@ -467,7 +467,7 @@ pub fn voucher_verify_instruction(
 ) -> Instruction {
     let message =
         connector_signer::solana_voucher_message(&channel.to_bytes(), cumulative_amount, 0);
-    crate::wire::ed25519_verify_instruction(authorized_signer, signature, &message)
+    ed25519_verify_instruction(authorized_signer, signature, &message)
 }
 
 /// `settle`: advance `settled` to the voucher's amount, only while Open. A
@@ -626,6 +626,59 @@ pub fn reclaim_instruction(
             AccountMeta::new(*rent_payer, false),
         ],
         data: vec![RECLAIM],
+    }
+}
+
+/// The Ed25519-precompile instruction a voucher's `settle` or
+/// `settle_and_seal` is preceded by, from a signature this node was handed
+/// rather than one it produces itself.
+///
+/// `solana_sdk::ed25519_instruction::new_ed25519_instruction` cannot be
+/// used here: it takes an `ed25519_dalek::Keypair` and signs the message
+/// itself, but the receiver only ever holds the payer's already-produced
+/// signature bytes. This mirrors that function's own instruction-data
+/// layout byte-for-byte (num_signatures=1, one padding byte, then the
+/// fixed-size `Ed25519SignatureOffsets`, all three `*_instruction_index`
+/// fields set to `u16::MAX` so every offset is read from this same
+/// instruction).
+pub(crate) fn ed25519_verify_instruction(
+    pubkey: &Pubkey,
+    signature: &[u8; 64],
+    message: &[u8],
+) -> Instruction {
+    const PUBKEY_SERIALIZED_SIZE: usize = 32;
+    const SIGNATURE_SERIALIZED_SIZE: usize = 64;
+    const SIGNATURE_OFFSETS_SERIALIZED_SIZE: usize = 14;
+    const SIGNATURE_OFFSETS_START: usize = 2;
+    const DATA_START: usize = SIGNATURE_OFFSETS_SERIALIZED_SIZE + SIGNATURE_OFFSETS_START;
+
+    let public_key_offset = DATA_START;
+    let signature_offset = public_key_offset + PUBKEY_SERIALIZED_SIZE;
+    let message_data_offset = signature_offset + SIGNATURE_SERIALIZED_SIZE;
+
+    let mut data = Vec::with_capacity(message_data_offset + message.len());
+    data.push(1u8); // num_signatures
+    data.push(0u8); // padding byte, unread by the verifier
+
+    data.extend_from_slice(&(signature_offset as u16).to_le_bytes());
+    data.extend_from_slice(&u16::MAX.to_le_bytes()); // signature_instruction_index
+    data.extend_from_slice(&(public_key_offset as u16).to_le_bytes());
+    data.extend_from_slice(&u16::MAX.to_le_bytes()); // public_key_instruction_index
+    data.extend_from_slice(&(message_data_offset as u16).to_le_bytes());
+    data.extend_from_slice(&(message.len() as u16).to_le_bytes());
+    data.extend_from_slice(&u16::MAX.to_le_bytes()); // message_instruction_index
+
+    debug_assert_eq!(data.len(), public_key_offset);
+    data.extend_from_slice(pubkey.as_ref());
+    debug_assert_eq!(data.len(), signature_offset);
+    data.extend_from_slice(signature);
+    debug_assert_eq!(data.len(), message_data_offset);
+    data.extend_from_slice(message);
+
+    Instruction {
+        program_id: solana_sdk::ed25519_program::id(),
+        accounts: vec![],
+        data,
     }
 }
 

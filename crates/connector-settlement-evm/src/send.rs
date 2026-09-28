@@ -58,12 +58,23 @@ use std::time::{Duration, Instant};
 
 use connector_chain_rpc::evm::{answered, EvmRpc};
 use connector_chain_rpc::{retry_read, RpcTransport};
-use connector_settlement::SettlementError;
 use ethers::providers::{Middleware, Provider, ProviderError};
 use ethers::signers::{LocalWallet, Signer as EvmSigner};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::types::{Address, BlockNumber, TransactionReceipt, TxHash, U256, U64};
 use ethers::utils::keccak256;
+
+/// Why a write could not be sent, or was not confirmed: the one failure
+/// this module reports, carried as its message so a caller's
+/// `BatchSettlementError::Backend` reads it once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SendError(pub(crate) String);
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// How [`confirm`] paces itself and when it stops.
 #[derive(Debug, Clone, Copy)]
@@ -139,11 +150,11 @@ impl Sender {
     /// authorisation and a Permit2 transfer are each signed with when this
     /// node is the payer (ADR 0075 decision 3). The key stays here, beside
     /// the nonce it also signs transactions under, and is never handed out.
-    pub(crate) fn sign_digest(&self, digest: [u8; 32]) -> Result<[u8; 65], SettlementError> {
+    pub(crate) fn sign_digest(&self, digest: [u8; 32]) -> Result<[u8; 65], SendError> {
         let signature = self
             .wallet
             .sign_hash(ethers::types::H256::from(digest))
-            .map_err(|error| SettlementError::Backend(error.to_string()))?;
+            .map_err(|error| SendError(error.to_string()))?;
         let bytes: [u8; 65] = signature.into();
         Ok(bytes)
     }
@@ -154,7 +165,7 @@ impl Sender {
     pub(crate) async fn send(
         &self,
         mut transaction: TypedTransaction,
-    ) -> Result<TxHash, SettlementError> {
+    ) -> Result<TxHash, SendError> {
         let own = self.wallet.address();
         let mut nonces = self.nonces.lock().await;
         let mut reseeded = false;
@@ -171,12 +182,12 @@ impl Sender {
             self.provider
                 .fill_transaction(&mut transaction, None)
                 .await
-                .map_err(|error| SettlementError::Backend(error.to_string()))?;
+                .map_err(|error| SendError(error.to_string()))?;
             let signature = self
                 .wallet
                 .sign_transaction(&transaction)
                 .await
-                .map_err(|error| SettlementError::Backend(error.to_string()))?;
+                .map_err(|error| SendError(error.to_string()))?;
             let raw = transaction.rlp_signed(&signature);
             let hash = TxHash::from(keccak256(&raw));
 
@@ -201,7 +212,7 @@ impl Sender {
                         reseeded = true;
                         continue;
                     }
-                    return Err(SettlementError::Backend(format!(
+                    return Err(SendError(format!(
                         "transaction {hash:#x} was refused by the node and never sent: {error}"
                     )));
                 }
@@ -235,7 +246,7 @@ impl Sender {
     /// write takes the nonce after it. That is what keeps a lagging
     /// backend's `pending` from rewinding the count onto a nonce that may
     /// already carry a transaction.
-    async fn seed_nonce(&self, nonces: &mut NonceState) -> Result<U256, SettlementError> {
+    async fn seed_nonce(&self, nonces: &mut NonceState) -> Result<U256, SendError> {
         let own = self.wallet.address();
         let pending = retry_read(|| {
             self.provider
@@ -243,7 +254,7 @@ impl Sender {
         })
         .await
         .map_err(|error| {
-            SettlementError::Backend(format!(
+            SendError(format!(
                 "could not read this account's pending nonce: {error}"
             ))
         })?;
@@ -300,7 +311,7 @@ pub(crate) async fn confirm(
     provider: &Provider<EvmRpc>,
     hash: TxHash,
     policy: ConfirmPolicy,
-) -> Result<TransactionReceipt, SettlementError> {
+) -> Result<TransactionReceipt, SendError> {
     let started = Instant::now();
     let mut observed = false;
     // When polls began answering "not found" without a failure in between.
@@ -314,7 +325,7 @@ pub(crate) async fn confirm(
         match provider.get_transaction_receipt(hash).await {
             Ok(Some(receipt)) => {
                 if receipt.status == Some(U64::zero()) {
-                    return Err(SettlementError::Backend(format!(
+                    return Err(SendError(format!(
                         "transaction {:#x} reverted on chain",
                         receipt.transaction_hash
                     )));
@@ -355,7 +366,7 @@ pub(crate) async fn confirm(
 
         let unseen_for = unseen_since.map(|since| since.elapsed());
         if !observed && unseen_for.is_some_and(|unseen| unseen >= policy.unobserved) {
-            return Err(SettlementError::Backend(format!(
+            return Err(SendError(format!(
                 "transaction {hash:#x} was not observed: this endpoint answered 'not found' for \
                  {}s -- this is not proof it was dropped, only that this endpoint has not \
                  confirmed it yet; check its status by hash (a block explorer or a fresh \
@@ -371,7 +382,7 @@ pub(crate) async fn confirm(
             } else {
                 "could not be confirmed"
             };
-            return Err(SettlementError::Backend(format!(
+            return Err(SendError(format!(
                 "transaction {hash:#x} {seen} within {}s (last RPC error: {last_error}); it may \
                  still mine, so check its status by hash before resubmitting, since a retry of a \
                  transaction that later mines is a double spend",
@@ -474,10 +485,7 @@ mod tests {
         let (provider, _) = sender(&anvil.rpc_url);
         let hash = TxHash::from_low_u64_be(1);
 
-        let SettlementError::Backend(message) = confirm(&provider, hash, FAST).await.unwrap_err()
-        else {
-            panic!("expected SettlementError::Backend");
-        };
+        let SendError(message) = confirm(&provider, hash, FAST).await.unwrap_err();
         assert!(!message.contains("dropped before mining"), "{message}");
         assert!(message.contains("not observed"), "{message}");
         assert!(message.contains(&format!("{hash:#x}")), "{message}");

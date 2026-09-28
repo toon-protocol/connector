@@ -241,7 +241,11 @@ channel in **any** of the three books" and missed the permissionless shape entir
 and a settlement backend, declaring no channel — which is both the configuration an operator should
 be running and the one most exposed to strangers. It MUST verify that location is writable at startup, naming the path when it is not; it
 MUST replay what is already there before it serves; and it MUST refuse to start on a record it cannot
-read or cannot decode, rather than starting at no watermarks. A watermark held only in process memory
+read or cannot decode, rather than starting at no watermarks. It MUST also refuse to start, by name,
+on a record holding claims on a channel kind it no longer settles -- since
+[ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 8
+(issue #1385), a `toon-channel` claim -- rather than skip them: a skipped entry is a claim somebody
+could still redeem that the connector has forgotten it accepted. A watermark held only in process memory
 is not a replay defence: after a restart every spent nonce reads as fresh, every claim a client has
 already spent buys service again, and nothing in a log shows that it did.
 ([issue #605](https://github.com/toon-protocol/connector/issues/605))
@@ -253,7 +257,14 @@ contracts, token and key.
 
 **CF-25** `[connector]` — A connector MUST verify its settlement configuration against the chain at
 startup and MUST refuse to boot on a disagreement — a token's decimals, a resolved contract. Nothing
-downstream may then ask whether these facts are true.
+downstream may then ask whether these facts are true. That includes the channel contract itself: a
+connector MUST refuse to boot, by name, on a chain on which the x402 contract (EVM) or program
+(Solana) its channels live on is not deployed.
+
+Amended by [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+decision 1 ([issue #1385](https://github.com/toon-protocol/connector/issues/1385)): every channel is
+an x402 channel, on a contract and program the binary fixes, so a network x402 has not deployed to is
+unsupported, loudly.
 
 **CF-26** `[connector]` — A fact the settlement backend already holds MUST NOT be declared a second
 time elsewhere in the configuration. Two declarations of one fact is how a mainnet node comes to
@@ -389,46 +400,50 @@ would fail its onion peerings at dial time instead of at the line an operator wr
 **The channel books** (CF-21) — `[[peer_channels]]` and `[[pay_channels]]` — are §2.4.
 `[[client_channels]]` was the third, and is a tombstone since issue #1384 (§2.3).
 
-**Settlement has two shapes** (issue #628). The legacy flat one — `chain`, `rpc_url`,
-`contract_address`, `token_address`, `decimals` and a key table, all directly under `[settlement]` —
-is **frozen at `chain = "evm"`** and never accepts `"solana"`; a node settling on Solana, or on both
-chains at once, writes the keyed shape in §2.1's table instead. `contract_address` is the
-**`TokenNetworkRegistry`**, the contract `getTokenNetwork(token)` is called on, and not a channel
-contract; `[settlement.solana]` names the deployed `payment-channel` `program_id` in its place. Mina
-is not a settlement chain in either shape
-([ADR 0002](../adr/0002-drop-mina-from-the-rust-connector.md)), and is no longer in this
-repository at all ([ADR 0065](../adr/0065-mina-leaves-the-repository.md)). An absent `[settlement]` is legal, and
-every channel operation then answers `503`; a present but wrong one is a startup failure, because a
-real backend is constructed for every chain configured before the node serves anything (CF-25).
+**Settlement is one table per chain** (issue #628): `[settlement.evm]` and `[settlement.solana]`,
+each with an `rpc_url`, a `token_address` (an ERC-20 address, or an SPL mint), its `decimals` and a
+key table, plus the chain's x402 terms below. Every channel is an x402 channel
+([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)), so there is
+no contract or program to name: the record fixes `x402BatchSettlement` at `0x4020074e…0003` and
+`payment-channels` at `CHNLx…yGsX`, the one address and program id each is deployed under on test and
+main networks alike (ADR 0074, _Sources_ and decision 4), so each is a constant of the connector and
+never a setting — and never read from a voucher. Boot reads each configured chain for it and refuses,
+by name, a chain it is not deployed to (CF-25). The flat `[settlement]` shape (`chain = "evm"`),
+`contract_address`, `program_id` and the `batch_settlement` sub-table are tombstones (§2.3). Mina is
+not a settlement chain ([ADR 0002](../adr/0002-drop-mina-from-the-rust-connector.md)), and is no
+longer in this repository at all ([ADR 0065](../adr/0065-mina-leaves-the-repository.md)). An absent
+`[settlement]` is legal, and such a node settles on no chain and takes no claim; a present but wrong
+one is a startup failure, because a real backend is constructed for every chain configured before the
+node serves anything (CF-25).
 
-**Accepting x402 batch-settlement channels is opted into per chain** ([ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
-decision 1), by writing a `batch_settlement` sub-table under that chain's keyed settlement table. It is
-**off unless written**: there is no `enabled` key, because the table's presence already says so, and
-the frozen legacy `[settlement]` shape has no such sub-table. Everything decision 2 fixes about an
-admissible channel comes from the enclosing table and is not declared again (CF-26): the receiver (or
-Solana sponsor) is that table's settlement key, and the token or mint is its `token_address`. What the
-sub-table holds is only the terms that are this node's to choose. The first column is the chain whose
-`[settlement.<chain>.batch_settlement]` takes the key — these are not top-level keys, which is why the
+**A chain's x402 terms sit in its settlement table** ([ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
+decisions 1 and 5, ADR 0075 decision 9). They are not an opt-in: x402 channels are the only channels,
+so every table carries them, and the terms with no safe default are required. Everything decision 2
+fixes about an admissible channel comes from the same table and is not declared again (CF-26): the
+receiver (or Solana sponsor) is that table's settlement key, and the token or mint is its
+`token_address`. What is listed here is only the terms that are this node's to choose. The first column
+is the chain whose `[settlement.<chain>]` takes the key — these are not top-level keys, which is why the
 table does not start with one:
 
 | chain  | key                       | default         | refused by name when                                            |
 | ------ | ------------------------- | --------------- | --------------------------------------------------------------- |
 | EVM    | `min_withdraw_delay_secs` | `86400` (a day) | below `900`, or above `2592000` (the contract's 30-day maximum) |
-| EVM    | `asset_eip712_name`       | **required**    | empty                                                           |
-| EVM    | `asset_eip712_version`    | **required**    | empty                                                           |
+| EVM    | `asset_eip712_name`       | **required**    | missing or empty                                                |
+| EVM    | `asset_eip712_version`    | **required**    | missing or empty                                                |
 | Solana | `min_grace_period_secs`   | `86400` (a day) | below `900`                                                     |
-| Solana | `min_sponsored_deposit`   | **required**    | `0`; it bounds a public endpoint that spends this node's rent   |
+| Solana | `min_sponsored_deposit`   | **required**    | missing, or `0`; it bounds a public endpoint that spends rent   |
 
 The two minimum delays are published in the greeting, and a channel whose `withdrawDelay` or
 `grace_period` falls short of them is not admitted. `min_sponsored_deposit` is published too, as the
 Solana entry's `extra.minDeposit`: ADR 0074 decision 5 has the sponsor refuse below a _published_
 minimum, so a client reads it before building an `open`. The floor of 900 seconds is x402's own; the day is the window a
-delayed `claim` or `settle_and_seal` still has to land in. Neither sub-table names **where** the
-channels live: the record fixes `x402BatchSettlement` at `0x4020074e…0003` and `payment-channels` at
-`CHNLx…yGsX`, the one address and program id each is deployed under on test and main networks alike
-(ADR 0074, _Sources_ and decision 4), so each is a constant of the connector and never a setting —
-and never read from a voucher. `payment-channels` is unrelated to `[settlement.solana] program_id`,
-which is TOON's own program.
+delayed `claim` or `settle_and_seal` still has to land in.
+
+**Breaking in #1385.** These keys sat in an opt-in `[settlement.<chain>.batch_settlement]` sub-table
+until ADR 0075 decision 9; the sub-table is now refused by name, and the keys move up a level
+unchanged. Because the binary and a node's TOML are a matched pair
+([ADR 0068](../adr/0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md)),
+a node repository bumping its pin past #1385 moves them in the same change.
 
 **`asset_eip712_name` and `asset_eip712_version`** are the EIP-712 domain `name` and `version` of
 `[settlement.evm] token_address` -- `"USDC"` and `"2"` for the devnet's Circle FiatToken v2.2 -- and
@@ -437,7 +452,7 @@ client can sign its deposit's ERC-3009/permit2 authorization under the asset's r
 rather than read off the chain: an arbitrary ERC-20 need not expose an EIP-712 `version()` the way
 Circle's FiatToken does, and this connector never itself signs or verifies under either value, so
 there is nothing here to prove against a live contract the way `decimals` is (issue #1345). Both are
-required as soon as `[settlement.evm.batch_settlement]` exists -- there is no safe default for an
+required wherever `[settlement.evm]` exists -- there is no safe default for an
 arbitrary settlement token, and publishing the wrong domain would build a deposit signature that
 never verifies. Solana carries no equivalent key: the x402 SVM scheme's asset transfer has no EIP-712
 domain of its own to publish.
@@ -490,8 +505,11 @@ an `ILP-Peer-Id` presented and _not_ authenticated is refused `401`, answered be
 looked up ([`client-edge-spec.md` §1.2](client-edge-spec.md)).
 
 **`state_dir`** is CF-39's durable location. Two append-only journals live there:
-`client-edge-claims.log`, the claims accepted at `POST /ilp`, and `peer-claims.log`, the peer
-carriage's own claim book. In a container it MUST be a **mounted volume** rather than a path in the
+`client-edge-claims.log`, the vouchers accepted at `POST /ilp` and on the peer carriages, and
+`outbound-channels.log`, this node's own outbound channels and the vouchers it signed on them. A
+`peer-claims.log` an older build wrote is read only to be refused if it holds `toon-channel` claims,
+as is a `client-edge-claims.log` holding any (CF-39; the refusal names the drain procedure, ADR 0075
+"Draining a node with live TOON channels"). In a container it MUST be a **mounted volume** rather than a path in the
 writable layer — a watermark that dies with the container is the same defect one indirection down. The
 image runs as uid `10001`, so a named volume, whose ownership follows, is simpler than a host bind
 mount, which has to be `chown 10001:10001`ed first.
@@ -507,8 +525,8 @@ use and belong in an operator's guide rather than a protocol specification.
 
 **`rpc_via_socks_proxy` sends one settlement table's RPC through `socks_proxy`**
 ([ADR 0073](../adr/0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md)). It
-is a boolean on `[settlement.evm]` and on `[settlement.solana]`, `false` when omitted, and not
-accepted by the frozen legacy `[settlement]` shape. When a table sets it:
+is a boolean on `[settlement.evm]` and on `[settlement.solana]`, `false` when omitted. When a table
+sets it:
 
 - every client of that table's `rpc_url` dials through the node's one `socks_proxy` as `socks5h`: the
   settlement backend, and on EVM the rate source too. None is left
@@ -538,23 +556,26 @@ it is not. _The limit is law, the number is policy._
 Parsed **solely to be rejected by name**, per CF-35. Finding one of these identifiers in the tree is
 finding a tombstone, not a live mechanism.
 
-| key                                                                                                                                                       | removed by                                                                                                                                                                                                                                                            |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `peer_wire_addr`                                                                                                                                          | [ADR 0027](../adr/0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md)                                                                                                                                                                      |
-| a peer's `addr`                                                                                                                                           | [ADR 0027](../adr/0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md) (#679) — the `SocketAddr` form of the same removal; a peer is reached by `endpoint` now                                                                              |
-| a Solana channel row's `program_id`                                                                                                                       | (#1082, #1128, #1146) — the program is `[settlement.solana]`'s, per CF-26; the field is spelled out on each Solana row only so writing one is named rather than lost in a shape mismatch                                                                              |
-| the `toon-channel` fields of `[[peer_channels]]` and `[[pay_channels]]`: `channel_id`, `channel_account`, `chain_id`, `token_network`, `counterparty_key` | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1380) — a peering is proven by a voucher signer and paid over this node's own outbound x402 channel                                                                            |
-| `ceiling`, `flush_interval_ms`                                                                                                                            | [ADR 0033](../adr/0033-the-exposure-machinery-is-retired-not-restated.md)                                                                                                                                                                                             |
-| a peer's `claim_ack_timeout_ms`                                                                                                                           | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1380) — it bounded the flush, which is deleted; a voucher's verdict rides the answer `peer_answer_timeout_ms` bounds                                                           |
-| `[peer_sale]`                                                                                                                                             | [ADR 0043](../adr/0043-purchasable-peering-is-removed.md)                                                                                                                                                                                                             |
-| `apex`, `[[children]]`                                                                                                                                    | [ADR 0009](../adr/0009-one-typed-config-file-no-environment-layer.md)'s update (#1057)                                                                                                                                                                                |
-| `claim_enforcement`                                                                                                                                       | [ADR 0042](../adr/0042-a-packet-carries-its-claim.md) item 4 (#1062 decided, #1077 deleted)                                                                                                                                                                           |
-| a peer's `credential`                                                                                                                                     | [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (#1157) — a claim proves a peering, so there is no shared secret to write                                                                                                        |
-| a route's `fee`                                                                                                                                           | [ADR 0061](../adr/0061-a-fee-attaches-to-a-peering-not-to-a-route.md) (#1159) — it moved to the `[[peers]]` row the route's `peer_id` names                                                                                                                           |
-| `[[client_channels]]`                                                                                                                                     | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384) — it declared the channels a `toon-channel` claim was paid on; a client's x402 channel is resolved from the chain when its voucher presents it (`ClientChannelsRemoved`) |
-| `channel_liveness_ttl_secs`, `channel_serve_stale_secs`, `channel_reattempt_interval_ms`                                                                  | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384) — they tuned the client-edge `toon-channel` channel registry's liveness memo, deleted with it (`ChannelLivenessKeyRemoved`)                                              |
-| `[settlement.evm]` `channel_index_from_block`, `channel_index_confirmations`                                                                              | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384, ahead of #1385) — they tuned the `TokenNetwork` channel index, deleted with its last caller (`SettlementChannelIndexKeyRemoved`)                                         |
-| `[announce]` and its announce-only keys                                                                                                                   | [ADR 0046](../adr/0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md) (#1074); the section's three surviving fields are `[node]`, per [ADR 0050](../adr/0050-a-connectors-url-resolves-to-its-self-description.md)                                 |
+| key                                                                                                                                                       | removed by                                                                                                                                                                                                                                                                    |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `peer_wire_addr`                                                                                                                                          | [ADR 0027](../adr/0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md)                                                                                                                                                                              |
+| a peer's `addr`                                                                                                                                           | [ADR 0027](../adr/0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md) (#679) — the `SocketAddr` form of the same removal; a peer is reached by `endpoint` now                                                                                      |
+| a Solana channel row's `program_id`                                                                                                                       | (#1082, #1128, #1146) — the program is `payment-channels`, a constant of the binary (ADR 0075); the field is spelled out on each Solana row only so writing one is named rather than lost in a shape mismatch                                                                 |
+| the `toon-channel` fields of `[[peer_channels]]` and `[[pay_channels]]`: `channel_id`, `channel_account`, `chain_id`, `token_network`, `counterparty_key` | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1380) — a peering is proven by a voucher signer and paid over this node's own outbound x402 channel                                                                                    |
+| `ceiling`, `flush_interval_ms`                                                                                                                            | [ADR 0033](../adr/0033-the-exposure-machinery-is-retired-not-restated.md)                                                                                                                                                                                                     |
+| a peer's `claim_ack_timeout_ms`                                                                                                                           | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1380) — it bounded the flush, which is deleted; a voucher's verdict rides the answer `peer_answer_timeout_ms` bounds                                                                   |
+| `[peer_sale]`                                                                                                                                             | [ADR 0043](../adr/0043-purchasable-peering-is-removed.md)                                                                                                                                                                                                                     |
+| `apex`, `[[children]]`                                                                                                                                    | [ADR 0009](../adr/0009-one-typed-config-file-no-environment-layer.md)'s update (#1057)                                                                                                                                                                                        |
+| `claim_enforcement`                                                                                                                                       | [ADR 0042](../adr/0042-a-packet-carries-its-claim.md) item 4 (#1062 decided, #1077 deleted)                                                                                                                                                                                   |
+| a peer's `credential`                                                                                                                                     | [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (#1157) — a claim proves a peering, so there is no shared secret to write                                                                                                                |
+| a route's `fee`                                                                                                                                           | [ADR 0061](../adr/0061-a-fee-attaches-to-a-peering-not-to-a-route.md) (#1159) — it moved to the `[[peers]]` row the route's `peer_id` names                                                                                                                                   |
+| `[[client_channels]]`                                                                                                                                     | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384) — it declared the channels a `toon-channel` claim was paid on; a client's x402 channel is resolved from the chain when its voucher presents it (`ClientChannelsRemoved`)         |
+| `channel_liveness_ttl_secs`, `channel_serve_stale_secs`, `channel_reattempt_interval_ms`                                                                  | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384) — they tuned the client-edge `toon-channel` channel registry's liveness memo, deleted with it (`ChannelLivenessKeyRemoved`)                                                      |
+| `[settlement.evm]` `channel_index_from_block`, `channel_index_confirmations`                                                                              | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384, ahead of #1385) — they tuned the `TokenNetwork` channel index, deleted with its last caller (`SettlementChannelIndexKeyRemoved`)                                                 |
+| `[settlement.evm]` `contract_address`, `[settlement.solana]` `program_id`                                                                                 | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1385) — they named TOON's `TokenNetworkRegistry` and payment-channel program; every channel is an x402 channel on a contract and program the binary fixes (`SettlementToonKeyRemoved`) |
+| the flat `[settlement]` shape (`chain`, `rpc_url`, `contract_address`, ... directly under `[settlement]`)                                                 | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1385) — it named a `TokenNetworkRegistry`; write `[settlement.evm]` (`SettlementLegacyShapeRemoved`)                                                                                   |
+| `[settlement.evm.batch_settlement]`, `[settlement.solana.batch_settlement]`                                                                               | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1385) — x402 terms are no longer an opt-in; its keys move up into `[settlement.<chain>]` unchanged (`SettlementBatchSubTableRemoved`)                                                  |
+| `[announce]` and its announce-only keys                                                                                                                   | [ADR 0046](../adr/0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md) (#1074); the section's three surviving fields are `[node]`, per [ADR 0050](../adr/0050-a-connectors-url-resolves-to-its-self-description.md)                                         |
 
 ### 2.4 The channel books
 
@@ -595,8 +616,8 @@ a voucher signer on the channel's chain, the channel must also pay that key — 
 key both signs its vouchers and receives this node's — or the node refuses to start, rather than
 signing vouchers the hop can never redeem.
 
-Both rows REQUIRE the chain's `[settlement.<chain>.batch_settlement]` table, which is what makes this
-node take part in x402 channels on that chain at all, and are refused by name without it (CF-36).
+Both rows REQUIRE the chain's `[settlement.<chain>]` table, which is what makes this node take part
+in x402 channels on that chain at all, and are refused by name without it (CF-36).
 The signing key is that chain's settlement key, `[settlement.evm]`'s or `[settlement.solana]`'s, and
 there is no second key to configure (CF-24,
 [ADR 0030](../adr/0030-an-operator-announces-a-node-the-node-still-does-not.md)).

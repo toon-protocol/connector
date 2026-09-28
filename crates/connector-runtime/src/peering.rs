@@ -1154,8 +1154,7 @@ mod tests {
     /// and funds only this node's outbound channel toward the counterparty's
     /// receiving key, binds the counterparty's published Solana settlement
     /// key as its voucher signer, writes an x402 row, and a repeat finds the
-    /// same channel. No `toon-channel` is derived or opened: this node has
-    /// no `SettlementBackend` at all.
+    /// same channel. No `toon-channel` is derived or opened.
     #[tokio::test]
     async fn a_solana_peering_opens_this_nodes_own_channel_and_binds_the_peers_signer() {
         let signer = [0x02; 32];
