@@ -191,7 +191,7 @@ async fn btp_session(socket: WebSocket, state: Arc<ClientEdgeState>) {
     // has already superseded it (issue #698's "may never say take over"):
     // `unbind` is a no-op if `binding`'s generation is no longer current.
     if let Some((address, generation)) = binding {
-        state.session_registry.unbind(&address, generation);
+        end_session(&state, &address, generation);
     }
     drop(replies);
     let _ = writer.await;
@@ -254,18 +254,25 @@ async fn window_slot(window: &Arc<Semaphore>) -> OwnedSemaphorePermit {
 /// finish durable -- a standalone claim message and a claim riding a
 /// packet -- so the two stay in lockstep.
 ///
-/// `session_address` is this socket's own binding in
-/// [`crate::session_registry::SessionRegistry`] (`None` if this session
-/// never sent a usable auth frame). When present, an accepted **voucher**
-/// -- already fully verified by [`crate::claim_gate::ClientClaimGate::admit`]
-/// by the time this runs -- teaches the gate who this session is paid as
-/// (issues #787, #1381): its channel's voucher signer, as the chain records
+/// `session` is this socket's own binding in
+/// [`crate::session_registry::SessionRegistry`] -- its address and the
+/// generation it was bound under -- `None` if this session never sent a
+/// usable auth frame. When present, an accepted **voucher** -- already
+/// fully verified by [`crate::claim_gate::ClientClaimGate::admit`] by the
+/// time this runs -- teaches the gate who *this session* is paid as (issues
+/// #787, #1381, #1396): its channel's voucher signer, as the chain records
 /// it, is the key a payout channel toward this client names as receiver
 /// (ADR 0075 decision 7). Every accepted claim is a voucher (#1384).
+///
+/// A voucher that changes the session's payee is also the moment a payout
+/// already owed to that key -- stranded by an earlier session of the same
+/// client that dropped before its delivery landed -- becomes deliverable to
+/// this one, so it is resent here, exactly as a `channelChallenge` at auth
+/// resends it ([`spawn_stranded_claim_resend`]).
 fn record_accepted_claim(
-    state: &ClientEdgeState,
+    state: &Arc<ClientEdgeState>,
     claim: &ClientClaim,
-    session_address: Option<&str>,
+    session: Option<&(String, u64)>,
 ) {
     let channel_key = claim.channel_key();
     state.connector.recognize_channel(&channel_key);
@@ -273,12 +280,26 @@ fn record_accepted_claim(
         .claim_gate
         .note_claim_time(&channel_key, crate::now_unix());
 
-    if let (Some(address), Some(payee)) = (
-        session_address,
-        state.claim_gate.voucher_signer(&channel_key),
-    ) {
-        state.claim_gate.record_session_payee(address, payee);
+    if let (Some((address, generation)), Some(payee)) =
+        (session, state.claim_gate.voucher_signer(&channel_key))
+    {
+        if state
+            .claim_gate
+            .record_session_payee(address, *generation, payee)
+        {
+            spawn_stranded_claim_resend(state, address, *generation);
+        }
     }
+}
+
+/// Close this socket's session `generation` at `address`: its binding in
+/// the [`crate::session_registry::SessionRegistry`] -- fenced, so a
+/// session already superseded by a reconnect cannot clear the newer
+/// binding -- and its payee (issue #1396), which belongs to this session
+/// alone and so is cleared whether or not it is still the current one.
+fn end_session(state: &ClientEdgeState, address: &str, generation: u64) {
+    state.session_registry.unbind(address, generation);
+    state.claim_gate.close_session(address, generation);
 }
 
 /// Best-effort extraction of an auth frame's declared identity (issue
@@ -366,12 +387,17 @@ fn auth_channel_challenge(auth_data: &[u8]) -> Option<PeerRoleChallenge> {
 /// [`connector_peer_btp::role_gate::MAX_PEER_CHALLENGE_LIFETIME_SECS`]:
 /// within it a challenge is a bearer proof, so it is kept short.
 ///
+/// The payee is this session's -- the one `generation` names -- and no
+/// other's (issue #1396): proving a channel here changes nothing about
+/// where any other session at the same `peerId` is paid.
+///
 /// Best-effort and silent on any failure, the same posture as the `peerId`
 /// bind it rides alongside: an expired, unresolvable or wrongly signed
 /// challenge leaves this session's payee exactly where it was.
 async fn verify_and_record_declared_channel(
     state: &ClientEdgeState,
     address: &str,
+    generation: u64,
     challenge: PeerRoleChallenge,
 ) {
     if !challenge_in_window(challenge.expires(), crate::now_unix()) {
@@ -389,7 +415,9 @@ async fn verify_and_record_declared_channel(
         );
         return;
     };
-    state.claim_gate.record_session_payee(address, payee);
+    state
+        .claim_gate
+        .record_session_payee(address, generation, payee);
     tracing::info!(
         address = %address,
         channel = %challenge.channel(),
@@ -415,7 +443,7 @@ fn spawn_stranded_claim_resend(state: &Arc<ClientEdgeState>, address: &str, gene
         crate::session_route::deliver_pending_claim(
             &state,
             &address,
-            Some(generation),
+            generation,
             crate::now_unix(),
         )
         .await;
@@ -587,13 +615,23 @@ async fn handle_frame(
             .await;
         }
         if let Some(address) = auth_peer_id(&entry.data) {
+            // A re-auth on this socket ends the session it replaces: nothing
+            // else would, since only the newest binding is closed when the
+            // socket goes.
+            if let Some((previous, generation)) = binding.take() {
+                end_session(state, &previous, generation);
+            }
             let handle = BtpSessionHandle::new(replies.clone(), Arc::clone(outbound));
             let generation =
                 state
                     .session_registry
                     .bind(address.clone(), handle, crate::now_unix());
+            // A new session is paid nowhere until it proves a key itself
+            // (issue #1396) -- whatever an earlier session that declared
+            // the same `peerId` proved.
+            state.claim_gate.open_session(&address, generation);
             if let Some(challenge) = auth_channel_challenge(&entry.data) {
-                verify_and_record_declared_channel(state, &address, challenge).await;
+                verify_and_record_declared_channel(state, &address, generation, challenge).await;
             }
             // After the channel challenge above, never before it: a session
             // whose payee this connector first learns at auth (issue #790)
@@ -643,13 +681,11 @@ async fn handle_frame(
                 Ok((claim, durability)) => {
                     let permit = window_slot(window).await;
                     let state = Arc::clone(state);
-                    let session_address = binding.as_ref().map(|(address, _)| address.clone());
+                    let session = binding.clone();
                     tokio::spawn(async move {
                         let _slot = permit;
                         match durability.durable().await {
-                            Ok(()) => {
-                                record_accepted_claim(&state, &claim, session_address.as_deref())
-                            }
+                            Ok(()) => record_accepted_claim(&state, &claim, session.as_ref()),
                             Err(rejection) => tracing::debug!(
                                 rejection = %rejection.message(),
                                 "standalone BTP claim accepted but not durably recorded"
@@ -844,7 +880,7 @@ async fn handle_frame(
     // `finish_frame` runs detached from it -- the same fact `handle_ilp`
     // reads inline on the HTTP carriage, through the same helper.
     let is_forwarded_route = crate::is_forwarded_route(client_route);
-    let session_address = binding.as_ref().map(|(address, _)| address.clone());
+    let session = binding.clone();
     let permit = window_slot(window).await;
     let task = finish_frame(
         Arc::clone(state),
@@ -856,7 +892,7 @@ async fn handle_frame(
         },
         frame.request_id,
         replies.clone(),
-        session_address,
+        session,
     );
     tokio::spawn(async move {
         let _slot = permit;
@@ -894,7 +930,7 @@ async fn finish_frame(
     matched: MatchedRoute,
     request_id: u32,
     replies: mpsc::Sender<Vec<u8>>,
-    session_address: Option<String>,
+    session: Option<(String, u64)>,
 ) {
     let MatchedRoute {
         prepare,
@@ -919,7 +955,7 @@ async fn finish_frame(
             // A claim that cleared the gate makes the sender eligible to
             // probe and notes the claim-state endpoint's liveness
             // timestamp -- see `record_accepted_claim`.
-            Ok(()) => record_accepted_claim(&state, &claim, session_address.as_deref()),
+            Ok(()) => record_accepted_claim(&state, &claim, session.as_ref()),
             Err(rejection) => {
                 let _ = reply(
                     &replies,
@@ -1082,7 +1118,7 @@ mod tests {
             reject.message
         );
         assert!(reject.message.contains("ADR 0075"), "{}", reject.message);
-        assert_eq!(state.claim_gate.session_payee("g.toon.agent"), None);
+        assert_eq!(state.claim_gate.session_payee("g.toon.agent", 1), None);
     }
 
     /// A [`ClientEdgeState`] around `claim_gate` and nothing else a BTP
@@ -1197,14 +1233,12 @@ mod tests {
             Some(serde_json::json!({ "channelChallenge": challenge })),
         );
         let (binding, _) = run_auth_frame(&state, &frame).await;
-        assert_eq!(
-            binding.map(|(address, _)| address),
-            Some("g.toon.agent".to_string())
-        );
+        let (address, generation) = binding.expect("the auth bound the session");
+        assert_eq!(address, "g.toon.agent");
 
         let payout = state
             .claim_gate
-            .credit_session_payout("g.toon.agent", &[9u8; 32], 500)
+            .credit_session_payout("g.toon.agent", generation, None, &[9u8; 32], 500)
             .await
             .expect("the auth-time challenge taught the session its payee with no voucher sent");
         assert_eq!(
@@ -1224,9 +1258,10 @@ mod tests {
             "g.toon.agent",
             Some(serde_json::json!({ "channelChallenge": challenge })),
         );
-        run_auth_frame(&state, &frame).await;
+        let (binding, _) = run_auth_frame(&state, &frame).await;
+        let (_, generation) = binding.expect("the auth bound the session");
         assert_eq!(
-            state.claim_gate.session_payee("g.toon.agent"),
+            state.claim_gate.session_payee("g.toon.agent", generation),
             Some(VoucherSigner::Solana(signer.public.to_bytes()))
         );
     }
@@ -1260,9 +1295,9 @@ mod tests {
                 Some(serde_json::json!({ "channelChallenge": challenge })),
             );
             let (binding, _) = run_auth_frame(&state, &frame).await;
-            assert!(binding.is_some(), "{case}: the bind itself stands");
+            let (_, generation) = binding.expect("the bind itself stands");
             assert_eq!(
-                state.claim_gate.session_payee("g.toon.agent"),
+                state.claim_gate.session_payee("g.toon.agent", generation),
                 None,
                 "{case}: taught nothing"
             );
@@ -1378,9 +1413,10 @@ mod tests {
         )
         .await
         .expect("the reply channel has a live receiver");
+        let bare_generation = binding.as_ref().expect("bound").1;
         assert!(state
             .claim_gate
-            .credit_session_payout("g.toon.agent", &[9u8; 32], 500)
+            .credit_session_payout("g.toon.agent", bare_generation, None, &[9u8; 32], 500)
             .await
             .is_none());
 
@@ -1404,11 +1440,19 @@ mod tests {
         .await
         .expect("the reply channel has a live receiver");
 
+        let generation = binding.as_ref().expect("bound").1;
         let payout = state
             .claim_gate
-            .credit_session_payout("g.toon.agent", &[9u8; 32], 500)
+            .credit_session_payout("g.toon.agent", generation, None, &[9u8; 32], 500)
             .await
             .expect("the re-auth's challenge taught the session its payee");
+        assert_eq!(
+            state
+                .claim_gate
+                .session_payee("g.toon.agent", bare_generation),
+            None,
+            "the session the re-auth replaced was closed"
+        );
         assert_eq!(
             payout.payee,
             VoucherSigner::Evm(test_support::address_of(&test_support::authorizer()))
@@ -1422,36 +1466,34 @@ mod tests {
     /// branch's [`spawn_stranded_claim_resend`] call is deleted, per the
     /// issue's own AC4.
     ///
-    /// `record_session_payee` is called up front to stand in for "this gate
-    /// already learned this session's payee before" -- exactly what a
-    /// genuine prior voucher or channel-control proof on an earlier
-    /// connection would have taught it; this test is about the resend, not
-    /// that association.
+    /// Issue #1396: the new session is resent the voucher because it proves
+    /// the key the voucher is owed to again, with a `channelChallenge` on
+    /// this auth -- a bare reconnect proves nothing and is resent nothing.
     #[tokio::test]
     async fn a_reconnecting_session_is_resent_its_stranded_payout_voucher() {
-        use crate::claim_gate::ClientClaimGate;
-        use connector_runtime::InMemoryJournal;
-
         let address = "g.toon.stranded";
-        let payee = VoucherSigner::Evm([0x21; 20]);
-        let ledger = ledger_paying([0x21; 20]).await;
+        let state = Arc::new(state_over_the_test_channels().await);
+        let payee = VoucherSigner::Evm(test_support::address_of(&test_support::authorizer()));
+        let ledger = Arc::clone(state.claim_gate.payout_ledger().expect("a payout ledger"));
         let stranded = ledger
             .record_payout_once(payee, &[1; 32], 1_234)
             .await
             .expect("a channel toward the payee is open");
-
-        let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
-            .expect("a fresh in-memory journal has nothing to replay")
-            .with_payout_ledger(Arc::clone(&ledger));
-        gate.record_session_payee(address, payee);
-        let state = Arc::new(test_state(gate));
 
         let (replies, mut reply_rx) = mpsc::channel::<Vec<u8>>(REPLY_QUEUE_DEPTH);
         let window = Arc::new(Semaphore::new(4));
         let outbound = Arc::new(OutboundRequests::new());
         let mut binding = None;
 
-        let frame = auth_message_frame(address, None);
+        let frame = auth_message_frame(
+            address,
+            Some(serde_json::json!({
+                "channelChallenge": test_support::evm_challenge(
+                    &test_support::authorizer(),
+                    crate::now_unix() + 60,
+                ),
+            })),
+        );
         handle_frame(&frame, &state, &window, &replies, &outbound, &mut binding)
             .await
             .expect("the reply channel has a live receiver");
@@ -1491,7 +1533,7 @@ mod tests {
         }
         assert!(
             saw_transfer,
-            "a session that reconnects with a known payee must be resent its stranded voucher"
+            "a session that reconnects and proves its payee again must be resent its stranded voucher"
         );
 
         // The resend's acknowledgement runs in the spawned task, after the
