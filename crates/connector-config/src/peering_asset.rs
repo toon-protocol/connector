@@ -96,17 +96,35 @@ impl PeeringAssets {
     /// [`ClientChannelAssets`](crate::ClientChannelAssets) rather than from
     /// this table (issue #1301).
     ///
-    /// The comparison itself lives here and only here, so that the two
-    /// kinds of arrival a forward can come out of cannot one day answer
-    /// "is this a crossing" differently. `incoming` borrows for the same
-    /// lifetime as this table because a caller holds both tables on one
-    /// value.
+    /// `incoming` borrows for the same lifetime as this table because a
+    /// caller holds both tables on one value. The compare itself is
+    /// [`Self::crosses`], not repeated here.
     pub fn boundary_from<'a>(
         &'a self,
         incoming: &'a AssetId,
         outgoing_peer_id: &str,
     ) -> Option<(&'a AssetId, &'a AssetId)> {
         let outgoing = self.asset(outgoing_peer_id)?;
+        Self::crosses(incoming, outgoing)
+    }
+
+    /// The bare comparison a denomination boundary is decided by: two
+    /// already-resolved assets, ordered as a forward reads them --
+    /// `Some((incoming, outgoing))` when they differ, `None` when they are
+    /// the same token.
+    ///
+    /// The comparison itself lives here and only here, so that the several
+    /// ways a peering's two legs get resolved cannot one day answer "is
+    /// this a crossing" differently. [`Self::boundary_from`] calls it once
+    /// both legs are config-resolved; a runtime x402 peering, which this
+    /// table never holds a row for (ADR 0075 decision 4, issue #1382),
+    /// resolves both legs some other way -- `Connector::peer_asset` in
+    /// `connector-runtime` -- and calls this directly rather than
+    /// re-deriving the compare.
+    pub fn crosses<'a>(
+        incoming: &'a AssetId,
+        outgoing: &'a AssetId,
+    ) -> Option<(&'a AssetId, &'a AssetId)> {
         (incoming != outgoing).then_some((incoming, outgoing))
     }
 }
