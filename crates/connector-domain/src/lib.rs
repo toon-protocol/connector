@@ -31,11 +31,11 @@ mod envelope;
 mod error;
 mod fee;
 pub mod identity;
+mod journal_entry;
 pub mod node;
 mod oer;
 mod packet;
 pub mod price;
-mod projection;
 pub mod rate;
 pub mod rate_table;
 mod route;
@@ -57,13 +57,13 @@ pub use fee::{amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_
 pub use identity::{
     anonymous_identity, resolve_identity, ConfiguredIdentity, SenderIdentity, UnauthorizedIdentity,
 };
+pub use journal_entry::JournalEntry;
 pub use node::{
     agreed_required_transport, published_required_transport, EdgeIdentity, NodeFacts,
     NodeSelfDescription, RoutePrice, CLIENT_EDGE_DEFAULT_VERSION, CLIENT_EDGE_SUPPORTED_VERSIONS,
 };
 pub use packet::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
 pub use price::Price;
-pub use projection::{JournalEntry, Projection};
 pub use rate::{Rate, RateError};
 pub use rate_table::{
     Freshness, GuardError, GuardOverride, Guards, MaxMove, RateLookup, RateTable, Refresh,

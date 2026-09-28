@@ -160,8 +160,7 @@ pub(crate) fn test_channel_id(n: u8) -> String {
 /// Register `n`'s channel on `connector`: `counterparty`'s address as the
 /// key an inbound claim on it must recover to, and [`test_channel_domain`]
 /// as its EIP-712 signing domain -- the pairing [`ClaimBook::accept_inbound`]
-/// and [`ClaimBook::record_fulfillment`] both require before a channel can
-/// accept or produce a claim at all (issue #575's AC3).
+/// requires before a channel can accept a claim at all (issue #575's AC3).
 pub(crate) fn with_test_channel(connector: Connector, n: u8, counterparty: Address) -> Connector {
     connector
         .with_channel_verification_key(test_channel_id(n), counterparty)
@@ -170,8 +169,8 @@ pub(crate) fn with_test_channel(connector: Connector, n: u8, counterparty: Addre
 }
 
 /// Sign a [`WireClaim`] for channel `n`'s `nonce`/`cumulative_amount` under
-/// [`test_channel_domain`] -- exactly the digest
-/// `ClaimBook::record_fulfillment` would compute for the same inputs.
+/// [`test_channel_domain`] -- exactly the digest a peer signs and
+/// [`ClaimBook::accept_inbound`] verifies.
 pub(crate) fn sign_wire_claim(
     signer: &dyn Signer,
     n: u8,

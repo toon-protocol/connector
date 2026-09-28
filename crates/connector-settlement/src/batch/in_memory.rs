@@ -718,9 +718,17 @@ impl BatchSettlementPayer for InMemoryBatchSettlement {
         let mut ledger = chain.ledger();
         let (channel, config) = chain.reserve(&mut ledger, &opening);
         Ok(match (terms, config) {
-            (ReceiverTerms::Evm(_), Some(config)) => OutboundChannelRecord::Evm {
+            // The config names the receiver's whole address, as a real one
+            // does: the fake keys its party by the first byte, and a caller
+            // that looks the channel up by the receiver it opened toward
+            // must find it by that address.
+            (ReceiverTerms::Evm(evm), Some(config)) => OutboundChannelRecord::Evm {
                 channel,
-                config,
+                config: EvmChannelConfig {
+                    receiver: evm.receiver,
+                    receiver_authorizer: evm.receiver,
+                    ..config
+                },
                 deposit,
             },
             (ReceiverTerms::Solana(solana), _) => OutboundChannelRecord::Solana {

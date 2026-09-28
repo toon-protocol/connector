@@ -333,24 +333,12 @@ never reaches the terminating app:
    credit decision, correctly located in config and theirs to make; an anonymous buyer resolved from
    chain (§1.2) never made any such deal, and gets the check.
 
-   **The ceiling nets a channel's own outbound payout ledger too** (issue #700,
-   `toon-meta#262` decision 9). A connector that has separately signed the channel's counterparty a
-   payout claim — for example, crediting an agent for factory work it completed, per §1.9 step 6's
-   TRANSFER — raises this ceiling by that amount: the bound this step checks a claim's cumulative
-   `transferredAmount` against is `deposit + credited`, not `deposit` alone, where `credited` is the
-   running total this connector has committed to pay the same channel's counterparty back
-   (`ClientPayoutLedger::credited`), not merely what is still unacknowledged. This is what makes
-   decision 9's promise literal — an agent that has earned enough spends against its own earnings
-   directly, with no on-chain round trip and no settlement — and it is a bounded, deliberate
-   extension of trust rather than a new on-chain fact: `credited` is this connector's own signed IOU,
-   redeemable against this connector's own deposit on the same channel, never the counterparty's.
-   `credited` is read once, before this step's own chain-refresh read, so a payout recorded while an
-   admission is already in flight cannot retroactively rescue it — the same "false refusal only,
-   never a false accept" property the cached deposit above already has, since a payout ledger's
-   running total is monotonic for exactly the same reason a deposit is. A channel with no payout
-   ledger configured nets `0`, exactly this step's behaviour before issue #700. Netting is
-   per-channel and never crosses a chain: a channel's `credited` figure comes from its own recorded
-   payout ledger entry, the same one issue #629 already keys by chain for the deposit side.
+   **A payout nets against nothing** ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+   decision 7, issue #1381). The ceiling is the deposit alone. From issue #700 until #1381 it was
+   `deposit + credited`, where `credited` was what this connector had signed the same channel's
+   counterparty in payout claims; a payout now rides a connector→client channel of its own (§1.9
+   step 7), so value paid out does not raise what the client may spend, and value the client pays in
+   does not fund its payouts.
 
 A claim that fails any check is a validation failure and the PREPARE is rejected before it
 reaches the terminating app or advances any watermark.
@@ -1168,7 +1156,11 @@ silently dropped exactly as it was before TRANSFER existed.
    an expired, malformed, unresolvable or wrongly-signed proof leaves the session exactly as
    uncreditable as it was, and `record_accepted_claim`'s inbound-claim path (issue #787) is
    untouched and stays the fallback for a session that pays before it ever declares. EVM only,
-   matching the payout ledger's own reach. `vectors/wire-vectors.json`'s
+   matching the payout ledger's own reach at the time. **Since issue #1381** a verified proof teaches
+   the session its _payee_ — the channel's recorded counterparty key, which a payout channel toward
+   this client names as receiver (step 7) — rather than a channel to pay on; the proof itself, and
+   its wire, are unchanged until #1384 replaces it with the voucher claim-state challenge.
+   `vectors/wire-vectors.json`'s
    `channel_control_declaration` section is the reproducible bytes — the exact `channelId`/
    `expires`/`signature` JSON, the EIP-712 digest they cover, and a wrong-key and an expired case
    alongside the valid one — for all of the above; this paragraph is orientation, not the thing to
@@ -1227,6 +1219,42 @@ silently dropped exactly as it was before TRANSFER existed.
    the lease" below) and `SessionRegistry::deliver` can originate a MESSAGE through it end to end,
    fenced against a stale generation — but nothing yet decides _when_ to call it for a payout or a
    job. That decision remains the next ticket's.
+
+   **Update (issue #1381, [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+   decision 7): a payout is a voucher on a connector→client channel.** The paragraphs above describe
+   the `toon-channel` payout claim that preceded it; nothing signs one any more.
+   - **The channel.** A client is paid on an x402 `batch-settlement` channel this connector opens
+     toward it with the paying half of its settlement port — one of its ordinary outbound channels,
+     opened and funded by the operator's signed `POST /channels` on the terms the client publishes
+     (the same `batchSettlements` entry shape a node's self-description carries: on EVM `payTo`, both
+     receiving seats the client's; on Solana the client's own `feePayer` and `sponsorEndpoint`, so the
+     client holds the `payee` and `rent_payer` seats, ADR 0075 decision 3). The channel is journaled
+     before its opening transaction is sent and every voucher on it before the voucher is handed out,
+     so the payout watermark survives a restart. This connector never opens or tops up a payout
+     channel on its own: funding stays an operator write (ADR 0075 decision 11).
+   - **Which client a channel pays.** A session is paid at its **payee key**, learned only from a
+     signature the claim gate has verified by that key: the voucher signer of the channel the session
+     pays this connector on (EVM `payerAuthorizer`, Solana `authorized_signer`, as the chain records
+     it), taught when a voucher on it is accepted on the session; or, until #1384, the counterparty an
+     `auth` channel-control proof (step 1) verified against. A payout is signed on this connector's
+     open outbound channel whose receiver is that key; a session with no payee, or a payee with no
+     open channel toward it, is paid nothing and the packet still answers as it would. A voucher is
+     landable only by its channel's receiver, so a payout delivered to the wrong socket pays nobody
+     else.
+   - **The signer.** Each chain's settlement key signs the voucher; `[signer]` signs none.
+   - **The wire.** The TRANSFER's `payout-claim` protocolData entry is the voucher as JSON, spelled
+     as a client spells its own voucher claim (§1.3) less the envelope fields: `blockchain`,
+     `scheme: "batch-settlement"`, `channelId`, `maxClaimableAmount` (decimal string) and `signature`
+     (`0x` + 130 hex on EVM, base58 of 64 bytes on Solana). An EVM payout always carries the
+     `channelConfig` `claim` needs; a Solana one carries `expiresAt: 0`. The TRANSFER's `amount` is
+     the voucher's cumulative amount. Everything the client needs to land the voucher itself is in the
+     entry. This entry is not covered by `vectors/wire-vectors.json`, as the rest of this dialect is
+     not (ADR 0026's #1073 correction).
+   - **Delivery and dedupe are unchanged**: one voucher per fulfilled job, deduped on the job this
+     connector asked for (issue #770), resent on the next delivery or reconnect until the client
+     answers the TRANSFER with a RESPONSE (issue #779). A voucher is cumulative, so the latest one
+     carries forward anything an earlier delivery failed to hand over.
+   - **No netting.** A payout raises nothing the client may spend (§1.3 step 5, §1.10).
 
 8. **A RESPONSE or ERROR whose requestId this connector itself originated** (issue #697): resolved
    against that outbound request rather than treated as inbound traffic. One this connector never
@@ -1383,11 +1411,11 @@ endpoint reports, not a hypothetical one.
   report. A resolved (chain-backed) channel always reports a number.
 - `cumulativeClaimed` — the channel's watermark, `"0"` if this connector has never accepted a
   claim on it.
-- `available` — `depositTotal - cumulativeClaimed + credited` (issue #700's netting: `credited` is
-  what this connector has separately committed to pay this channel's counterparty back, e.g. for
-  factory work it earned, `"0"` for a channel nothing has been paid out on) — the same spendable
-  headroom figure §1.3 step 5's collateral binding admits an inbound claim against, not a raw
-  on-chain balance. `null` exactly when `depositTotal` is.
+- `available` — `depositTotal - cumulativeClaimed`: the same headroom §1.3 step 5's collateral
+  binding admits an inbound claim against. `null` exactly when `depositTotal` is. _Until issue
+  #1381 this was `depositTotal - cumulativeClaimed + credited` (issue #700's payout netting), which
+  [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 7
+  retired: a payout rides a channel of its own and nets against nothing._
 - `nonce` — the watermark's nonce, `0` if none yet.
 - `lastClaimTime` — unix seconds this connector last accepted a claim on this channel (over
   **any** carrier — `POST /ilp`, `POST /ilp/probe`, or the BTP session), or `null` if it never

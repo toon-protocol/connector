@@ -48,12 +48,14 @@ use connector_btp::{
     BTP_ERROR, BTP_MESSAGE, BTP_RESPONSE, BTP_TRANSFER, CLAIM_PROTOCOL, CONTENT_TYPE_TEXT,
     PAYMENT_REQUIRED_PROTOCOL, PAYOUT_CLAIM_PROTOCOL,
 };
-use connector_domain::client_claim::{ClaimScheme, ClientClaim, EVM_NAMESPACE};
+use connector_domain::client_claim::{ClaimScheme, ClientClaim};
 use connector_domain::{PacketResponse, Prepare, Price, Reject, RejectCode};
+use connector_settlement::batch::{ChannelPresentation, VoucherSigner};
 use connector_signer::{verify_evm_claim_state_challenge, EvmClaimStateChallenge};
 
 use crate::channels::decode_hex_bytes;
 use crate::claim_gate::DurabilityTicket;
+use crate::outbound_ledger::PayoutVoucher;
 use crate::peer::BtpClaimVerdict;
 use crate::{claim_rejection_reject, x402_terms_body, ClaimIngestRejection, ClientEdgeState};
 
@@ -254,14 +256,13 @@ async fn window_slot(window: &Arc<Semaphore>) -> OwnedSemaphorePermit {
 ///
 /// `session_address` is this socket's own binding in
 /// [`crate::session_registry::SessionRegistry`] (`None` if this session
-/// never sent a usable auth frame). When present, this claim -- already
-/// fully verified by [`crate::claim_gate::ClientClaimGate::admit`] by the
-/// time this runs -- teaches the gate which channel this session speaks
-/// for (issue #787): the missing join between a session bound under its
-/// ILP address and a payout ledger keyed by channel id. EVM only, matching
-/// [`crate::outbound_ledger::ClientPayoutLedger`]'s own reach -- there is
-/// no Solana payout to resolve towards yet -- and `toon-channel` only: a
-/// voucher's channel is never paid out on (ADR 0074 decision 1).
+/// never sent a usable auth frame). When present, an accepted **voucher**
+/// -- already fully verified by [`crate::claim_gate::ClientClaimGate::admit`]
+/// by the time this runs -- teaches the gate who this session is paid as
+/// (issues #787, #1381): its channel's voucher signer, as the chain records
+/// it, is the key a payout channel toward this client names as receiver
+/// (ADR 0075 decision 7). A `toon-channel` claim teaches nothing: payouts
+/// no longer ride a `TokenNetwork` or TOON-program channel.
 fn record_accepted_claim(
     state: &ClientEdgeState,
     claim: &ClientClaim,
@@ -273,17 +274,14 @@ fn record_accepted_claim(
         .claim_gate
         .note_claim_time(&channel_key, crate::now_unix());
 
-    // A voucher never does (ADR 0074 decision 1): an x402 client is
-    // payer-only, and nothing is ever paid out on a batch-settlement channel.
-    if claim.scheme() != ClaimScheme::ToonChannel {
+    if claim.scheme() != ClaimScheme::BatchSettlement {
         return;
     }
-    if let (Some(address), Some((EVM_NAMESPACE, channel_id))) =
-        (session_address, channel_key.split_once(':'))
-    {
-        state
-            .claim_gate
-            .record_session_channel(address, channel_id.to_string());
+    if let (Some(address), Some(payee)) = (
+        session_address,
+        state.claim_gate.voucher_signer(&channel_key),
+    ) {
+        state.claim_gate.record_session_payee(address, payee);
     }
 }
 
@@ -306,7 +304,8 @@ fn auth_peer_id(auth_data: &[u8]) -> Option<String> {
 }
 
 /// A client's declared claim to control a channel, carried on the same
-/// auth frame as its `peerId` binding (issue #790). This is the BTP twin
+/// auth frame as its `peerId` binding (issue #790), deleted with the rest of
+/// the `toon-channel` client wire in #1384. This is the BTP twin
 /// of `/ilp/claim-state`'s own per-channel proof (`crate::claim_state`):
 /// reusing that endpoint's identical domain-separated challenge signature
 /// (`connector_signer::EvmClaimStateChallenge`) rather than inventing a
@@ -341,19 +340,23 @@ fn auth_channel_proof(auth_data: &[u8]) -> Option<DeclaredChannelProof> {
 /// against [`crate::channels::ClientChannelRegistry`]'s registered
 /// counterparty for the channel it names -- the identical check
 /// `/ilp/claim-state` runs for a read, reused here to teach
-/// [`crate::claim_gate::ClientClaimGate::record_session_channel`] a
-/// channel *before* this session has ever presented a claim. Without this,
+/// [`crate::claim_gate::ClientClaimGate::record_session_payee`] its payee
+/// *before* this session has ever presented a claim. Without this,
 /// an agent that only ever earns -- opens a channel, serves paid work,
 /// sends no claim of its own -- is never creditable at all:
 /// `record_accepted_claim` only learns the association from a genuinely
 /// verified inbound claim, which such an agent never sends.
 ///
+/// What it teaches since ADR 0075 decision 7 (issue #1381) is the session's
+/// **payee**: the key the proof verified against, the channel's recorded
+/// counterparty, which a payout channel toward this client names as its
+/// receiver. The `TokenNetwork` channel itself is never paid out on.
+///
 /// Best-effort and silent on any failure, same posture as the `peerId`
 /// bind it rides alongside: an expired, malformed, unresolvable or
-/// wrongly-signed proof simply leaves this session's channel association
-/// exactly where it was. `record_accepted_claim`'s own inbound-claim path
-/// is untouched and stays the fallback it always was; a session with
-/// neither a valid proof nor a claim yet is credited nothing, exactly as
+/// wrongly-signed proof simply leaves this session's payee exactly where
+/// it was. `record_accepted_claim`'s voucher path is untouched; a session
+/// with neither a valid proof nor a voucher yet is paid nothing, exactly as
 /// issue #787 already decided.
 async fn verify_and_record_declared_channel(
     state: &ClientEdgeState,
@@ -398,12 +401,12 @@ async fn verify_and_record_declared_channel(
     }
     state
         .claim_gate
-        .record_session_channel(address, format!("0x{}", hex::encode(channel_id)));
+        .record_session_payee(address, VoucherSigner::Evm(channel.counterparty));
     tracing::info!(
         address = %address,
         channel_id = %proof.channel_id,
-        "a BTP session proved control of a channel at auth -- it can now be credited without \
-         presenting a claim of its own first"
+        "a BTP session proved control of a channel at auth -- it can now be paid without \
+         presenting a voucher of its own first"
     );
 }
 
@@ -445,39 +448,55 @@ fn reject_response(request_id: u32, reject: Reject, extra: Vec<ProtocolData>) ->
     encode_response(request_id, &protocol_data, &reject.encode())
 }
 
-/// The protocolData entry a payout TRANSFER carries (issue #699): the
-/// signed cumulative claim this connector owes the client on that channel,
-/// as JSON -- `channelId`/`nonce`/`cumulativeAmount` matching
-/// `WireClaim`'s own fields, `signature` hex-encoded the same way
-/// `ClientClaimGate`'s inbound claim JSON already expects one
-/// (`0x`-prefixed 65-byte `r‖s‖recoveryId`). JSON rather than
-/// [`connector_runtime::WireClaim::encode`]'s peer-role binary shape,
-/// matching every other protocolData entry this dialect ever carries -- the
-/// auth secret, the inbound claim, the x402 terms, the accumulated-cost
-/// total -- all of which are raw UTF-8 text, never a second binary
-/// sub-format riding inside the frame's own binary envelope.
+/// The protocolData entry a payout TRANSFER carries (ADR 0075 decision 7,
+/// issue #1381): the payout **voucher**, as JSON, spelled exactly as a
+/// client spells its own voucher claim (client-edge-spec.md §1.3) less the
+/// envelope fields a claim carries for its payee's bookkeeping --
+/// `blockchain`, `scheme: "batch-settlement"`, `channelId`,
+/// `maxClaimableAmount` as a decimal string and `signature` in its chain's
+/// spelling (`0x` + 130 hex on EVM, base58 of 64 bytes on Solana). An EVM
+/// payout always carries its `channelConfig`, which `claim` needs and the
+/// client may not have kept; a Solana one carries `expiresAt: 0`, which
+/// its signed message commits to.
 ///
-/// There is no `signerAddress` field: unlike a client's self-declared one
-/// (never trusted -- see `ClientClaimGate`'s own doc), this claim's signer
-/// is the channel's own recorded counterparty from the client's point of
-/// view, implicit in which channel the TRANSFER arrived on, exactly as a
-/// peer-role `WireClaim` carries no signer field either.
+/// Everything a client needs to land the voucher on chain itself, with no
+/// further word from this connector: the channel pays the client, so only
+/// the client can land it.
 ///
-/// This is the mapping of a *claim* onto the grammar, so it stays with the
-/// client edge rather than moving into [`connector_btp`] with the codec
+/// This is the mapping of a *voucher* onto the grammar, so it stays with
+/// the client edge rather than moving into [`connector_btp`] with the codec
 /// (issue #713): the codec owns the entry's name and the bytes that carry
-/// it, and deliberately cannot see a claim type.
+/// it, and deliberately cannot see a voucher type.
 ///
-/// Production caller: `crate::session_route::route_prepare` (issue #770),
-/// once a client session's own PREPARE genuinely fulfills -- see that
-/// module for when a payout TRANSFER goes out.
-pub(crate) fn payout_claim_protocol_data(claim: &connector_runtime::WireClaim) -> ProtocolData {
-    let json = serde_json::json!({
-        "channelId": claim.channel_id,
-        "nonce": claim.nonce,
-        "cumulativeAmount": claim.cumulative_amount,
-        "signature": format!("0x{}", hex::encode(claim.signature.to_bytes())),
+/// Production caller: `crate::session_route` (issue #770), once a client
+/// session's own PREPARE genuinely fulfills, and on a session's (re)auth.
+pub(crate) fn payout_voucher_protocol_data(payout: &PayoutVoucher) -> ProtocolData {
+    let mut json = serde_json::json!({
+        "scheme": "batch-settlement",
+        "channelId": payout.channel_id(),
+        "maxClaimableAmount": payout.cumulative_amount().to_string(),
     });
+    match &payout.presentation {
+        ChannelPresentation::Evm { config, .. } => {
+            let address = |bytes: &[u8; 20]| format!("0x{}", hex::encode(bytes));
+            json["blockchain"] = "evm".into();
+            json["signature"] = format!("0x{}", hex::encode(&payout.voucher.signature)).into();
+            json["channelConfig"] = serde_json::json!({
+                "payer": address(&config.payer),
+                "payerAuthorizer": address(&config.payer_authorizer),
+                "receiver": address(&config.receiver),
+                "receiverAuthorizer": address(&config.receiver_authorizer),
+                "token": address(&config.token),
+                "withdrawDelay": config.withdraw_delay,
+                "salt": format!("0x{}", hex::encode(config.salt)),
+            });
+        }
+        ChannelPresentation::Solana { .. } => {
+            json["blockchain"] = "solana".into();
+            json["expiresAt"] = 0.into();
+            json["signature"] = bs58::encode(&payout.voucher.signature).into_string().into();
+        }
+    }
     ProtocolData {
         name: PAYOUT_CLAIM_PROTOCOL.to_string(),
         content_type: CONTENT_TYPE_TEXT,
@@ -936,176 +955,99 @@ async fn finish_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use connector_btp::{decode_frame, BtpFrame, BtpSessionHandle};
+    use connector_btp::{decode_frame, BtpFrame};
+    use connector_settlement::batch::{EvmChannelConfig, Voucher};
+    use connector_settlement::ChannelId;
 
-    /// Issue #699: a payout claim rides a TRANSFER's protocolData as JSON,
-    /// matching every other entry this dialect carries (all UTF-8 text,
-    /// never a second binary sub-format) rather than
-    /// [`connector_runtime::WireClaim::encode`]'s peer-role bytes.
+    use crate::outbound_ledger::test_ledger_paying as ledger_paying;
+
+    /// ADR 0075 decision 7: a payout rides a TRANSFER's protocolData as the
+    /// payout voucher's JSON, spelled as a client spells its own voucher,
+    /// with everything the client needs to land it: on EVM the config.
     #[test]
-    fn payout_claim_protocol_data_encodes_the_wire_claims_fields_as_json() {
-        let claim = connector_runtime::WireClaim {
-            channel_id: format!("0x{:064x}", 1),
-            nonce: 3,
-            cumulative_amount: 750,
-            signature: connector_runtime::ClaimSignature::Evm(connector_signer::Signature {
-                r: [0x11; 32],
-                s: [0x22; 32],
-                recovery_id: 1,
-            }),
+    fn a_payout_voucher_is_carried_as_the_json_a_client_lands_from() {
+        let config = EvmChannelConfig {
+            payer: [0x01; 20],
+            payer_authorizer: [0x01; 20],
+            receiver: [0x02; 20],
+            receiver_authorizer: [0x02; 20],
+            token: [0x70; 20],
+            withdraw_delay: 86_400,
+            salt: [0x66; 32],
+        };
+        let channel = format!("0x{}", "ab".repeat(32));
+        let payout = PayoutVoucher {
+            payee: VoucherSigner::Evm([0x02; 20]),
+            presentation: ChannelPresentation::Evm {
+                channel: ChannelId(channel.clone()),
+                config,
+            },
+            voucher: Voucher {
+                cumulative_amount: 750,
+                signature: vec![0x11; 65],
+            },
         };
 
-        let pd = payout_claim_protocol_data(&claim);
+        let pd = payout_voucher_protocol_data(&payout);
 
         assert_eq!(pd.name, PAYOUT_CLAIM_PROTOCOL);
         assert_eq!(pd.content_type, CONTENT_TYPE_TEXT);
         let json: serde_json::Value = serde_json::from_slice(&pd.data).expect("valid JSON");
-        assert_eq!(json["channelId"], claim.channel_id);
-        assert_eq!(json["nonce"], 3);
-        assert_eq!(json["cumulativeAmount"], 750);
+        assert_eq!(json["blockchain"], "evm");
+        assert_eq!(json["scheme"], "batch-settlement");
+        assert_eq!(json["channelId"], channel);
+        assert_eq!(json["maxClaimableAmount"], "750");
+        assert_eq!(json["signature"], format!("0x{}", "11".repeat(65)));
+        assert_eq!(
+            json["channelConfig"]["receiver"],
+            format!("0x{}", "02".repeat(20))
+        );
+        assert_eq!(json["channelConfig"]["withdrawDelay"], 86_400);
+        assert!(json.get("nonce").is_none(), "a voucher has no nonce");
+
+        let solana = PayoutVoucher {
+            payee: VoucherSigner::Solana([0x02; 32]),
+            presentation: ChannelPresentation::Solana {
+                channel: ChannelId(bs58::encode([0xc3; 32]).into_string()),
+            },
+            voucher: Voucher {
+                cumulative_amount: 42,
+                signature: vec![0x22; 64],
+            },
+        };
+        let json: serde_json::Value =
+            serde_json::from_slice(&payout_voucher_protocol_data(&solana).data).expect("JSON");
+        assert_eq!(json["blockchain"], "solana");
+        assert_eq!(json["expiresAt"], 0);
         assert_eq!(
             json["signature"],
-            format!("0x{}", hex::encode(claim.signature.to_bytes()))
+            bs58::encode([0x22; 64]).into_string(),
+            "a Solana voucher's signature is base58, as x402 spells it"
         );
+        assert!(json.get("channelConfig").is_none());
     }
 
-    /// Issue #699 end-to-end through the real production types: a
-    /// [`crate::outbound_ledger::ClientPayoutLedger`] signs a payout claim,
-    /// [`payout_claim_protocol_data`] carries it as a TRANSFER's
-    /// protocolData over [`BtpSessionHandle::send_transfer`], and a
-    /// stand-in client -- reading off the same wire `btp_session`'s writer
-    /// task would write to -- decodes the frame, parses the JSON claim
-    /// back out, and verifies its signature against the connector's own
-    /// public key. Nothing here is a fake shortcut: the ledger, the frame
-    /// codec and the origination path are exactly what a real session
-    /// runs today, driven by `crate::session_route::route_prepare` (issue
-    /// #770).
+    /// Issue #790, re-read under ADR 0075 decision 7: `record_accepted_claim`
+    /// teaches a session its payee from a voucher only. A `toon-channel`
+    /// claim teaches nothing, because nothing is paid out on a
+    /// `TokenNetwork` channel any more.
     #[tokio::test]
-    async fn a_signed_payout_claim_is_delivered_over_transfer_and_verifies() {
-        use crate::outbound_ledger::ClientPayoutLedger;
-        use connector_runtime::ChannelDomain;
-        use connector_signer::{
-            derive_evm_address, verify_evm_balance_proof, EvmBalanceProof, LocalSigner, Signer,
-        };
-
-        let signer = Arc::new(LocalSigner::generate("payout-key"));
-        let connector_address = derive_evm_address(&signer.public_key().unwrap());
-        let domain = ChannelDomain {
-            chain_id: 84_532,
-            token_network_address: [0x33; 20],
-        };
-        let channel_id = format!("0x{:064x}", 7);
-
-        let mut ledger = ClientPayoutLedger::new();
-        ledger.set_signer(signer);
-        ledger
-            .set_channel_domain(channel_id.clone(), domain)
-            .expect("valid channel id");
-        let claim = ledger
-            .record_payout(&channel_id, 42_000, "2030-01-01T00:00:00Z".parse().unwrap())
-            .expect("signer and domain configured");
-
-        let (replies, mut reply_rx) = mpsc::channel::<Vec<u8>>(1);
-        let outbound = Arc::new(OutboundRequests::new());
-        let handle = BtpSessionHandle::new(replies, Arc::clone(&outbound));
-
-        let expected_channel_id = channel_id.clone();
-        let peer = tokio::spawn(async move {
-            let sent = reply_rx.recv().await.expect("the TRANSFER was written");
-            let decoded = decode_frame(&sent).expect("the connector's own encoder");
-            assert_eq!(decoded.frame_type, BTP_TRANSFER);
-            assert_eq!(decoded.amount, Some(42_000));
-
-            let pd = decoded
-                .protocol_data
-                .iter()
-                .find(|pd| pd.name == PAYOUT_CLAIM_PROTOCOL)
-                .expect("the payout claim rode the TRANSFER");
-            let json: serde_json::Value = serde_json::from_slice(&pd.data).expect("valid JSON");
-            assert_eq!(json["channelId"], expected_channel_id);
-            assert_eq!(json["nonce"], 1);
-            assert_eq!(json["cumulativeAmount"], 42_000);
-            let signature_hex = json["signature"].as_str().unwrap();
-            let signature_bytes = hex::decode(signature_hex.strip_prefix("0x").unwrap()).unwrap();
-
-            let mut on_chain_id = [0u8; 32];
-            on_chain_id[31] = 7;
-            let proof = EvmBalanceProof {
-                channel_id: on_chain_id,
-                nonce: json["nonce"].as_u64().unwrap(),
-                transferred_amount: u128::from(json["cumulativeAmount"].as_u64().unwrap()),
-                locked_amount: 0,
-                locks_root: [0u8; 32],
-                chain_id: domain.chain_id,
-                token_network_address: domain.token_network_address,
-            };
-            assert!(verify_evm_balance_proof(
-                &proof,
-                &signature_bytes,
-                &connector_address
-            ));
-
-            outbound.resolve(BtpFrame {
-                frame_type: BTP_RESPONSE,
-                request_id: decoded.request_id,
-                amount: None,
-                protocol_data: Vec::new(),
-                ilp_packet: Vec::new(),
-            });
-        });
-
-        handle
-            .send_transfer(42_000, &[payout_claim_protocol_data(&claim)])
-            .await
-            .expect("the peer answered before the timeout");
-        peer.await.expect("the peer task");
-    }
-
-    /// Issue #787's production wiring, proven directly: once a claim has
-    /// cleared `ClientClaimGate::admit` on a session bound at `address`,
-    /// [`record_accepted_claim`] -- the shared call site both a standalone
-    /// claim message and a claim riding a packet finish through -- teaches
-    /// the gate that `address` speaks for this claim's channel. A later
-    /// fulfilment credited through
-    /// `ClientClaimGate::credit_session_payout` (`crate::session_route`'s
-    /// own caller) then finds it, rather than crediting nothing -- which
-    /// is exactly what happened on every real deployment before this fix,
-    /// since production binds a session under its ILP address, never a
-    /// channel id (issue #736/toon-client#503).
-    #[tokio::test]
-    async fn record_accepted_claim_teaches_the_session_channel_association() {
+    async fn a_toon_channel_claim_teaches_no_payee() {
         use crate::claim_gate::ClientClaimGate;
-        use crate::outbound_ledger::ClientPayoutLedger;
         use connector_domain::client_claim::{ClientClaimCommon, EvmClientClaim};
-        use connector_runtime::{ChannelDomain, InMemoryJournal};
-        use connector_signer::LocalSigner;
-
-        let channel_id = format!("0x{:064x}", 5);
-        let mut ledger = ClientPayoutLedger::new();
-        ledger.set_signer(Arc::new(LocalSigner::generate("payout-key")));
-        ledger
-            .set_channel_domain(
-                channel_id.clone(),
-                ChannelDomain {
-                    chain_id: 84_532,
-                    token_network_address: [0x77; 20],
-                },
-            )
-            .expect("valid channel id");
-        let ledger = Arc::new(ledger);
+        use connector_runtime::InMemoryJournal;
 
         let gate = ClientClaimGate::restore(Default::default(), Arc::new(InMemoryJournal::new()))
             .expect("a fresh in-memory journal has nothing to replay")
-            .with_payout_ledger(Arc::clone(&ledger));
+            .with_payout_ledger(ledger_paying([0x22; 20]).await);
         let state = test_state(gate);
-
         let claim = ClientClaim::Evm(EvmClientClaim {
             common: ClientClaimCommon {
                 message_id: "m1".to_string(),
                 timestamp: "2030-01-01T00:00:00Z".to_string(),
                 sender_id: "sender".to_string(),
             },
-            channel_id: channel_id.clone(),
+            channel_id: format!("0x{:064x}", 5),
             nonce: 1,
             transferred_amount: 500,
             locked_amount: "0".to_string(),
@@ -1119,61 +1061,10 @@ mod tests {
 
         record_accepted_claim(&state, &claim, Some("g.toon.agent"));
 
-        let fulfillment = [9u8; 32];
-        let payout = state
-            .claim_gate
-            .credit_session_payout("g.toon.agent", &fulfillment, 500, chrono::Utc::now())
-            .await
-            .expect("the session's channel was just taught by the claim above");
-        assert_eq!(payout.channel_id, channel_id);
-    }
-
-    /// ADR 0074 decision 1: an x402 client is payer-only, and
-    /// `ClientPayoutLedger` credits nothing to a batch-settlement channel.
-    /// So a voucher -- however verified -- never teaches a session which
-    /// channel to be paid on, even where the ledger could sign for that id.
-    #[tokio::test]
-    async fn an_accepted_voucher_never_teaches_a_payout_association() {
-        use crate::claim_gate::ClientClaimGate;
-        use crate::outbound_ledger::ClientPayoutLedger;
-        use connector_domain::client_claim::{ClientClaimCommon, EvmVoucher};
-        use connector_runtime::{ChannelDomain, InMemoryJournal};
-        use connector_signer::LocalSigner;
-
-        let channel_id = format!("0x{:064x}", 5);
-        let mut ledger = ClientPayoutLedger::new();
-        ledger.set_signer(Arc::new(LocalSigner::generate("payout-key")));
-        ledger
-            .set_channel_domain(
-                channel_id.clone(),
-                ChannelDomain {
-                    chain_id: 84_532,
-                    token_network_address: [0x77; 20],
-                },
-            )
-            .expect("valid channel id");
-        let gate = ClientClaimGate::restore(Default::default(), Arc::new(InMemoryJournal::new()))
-            .expect("a fresh in-memory journal has nothing to replay")
-            .with_payout_ledger(Arc::new(ledger));
-        let state = test_state(gate);
-
-        let voucher = ClientClaim::EvmVoucher(EvmVoucher {
-            common: ClientClaimCommon {
-                message_id: "m1".to_string(),
-                timestamp: "2030-01-01T00:00:00Z".to_string(),
-                sender_id: "sender".to_string(),
-            },
-            channel_id: channel_id.clone(),
-            max_claimable_amount: 500,
-            signature: format!("0x{}", "11".repeat(65)),
-            channel_config: None,
-        });
-
-        record_accepted_claim(&state, &voucher, Some("g.toon.x402"));
-
+        assert_eq!(state.claim_gate.session_payee("g.toon.agent"), None);
         assert!(state
             .claim_gate
-            .credit_session_payout("g.toon.x402", &[9u8; 32], 500, chrono::Utc::now())
+            .credit_session_payout("g.toon.agent", &[9u8; 32], 500)
             .await
             .is_none());
     }
@@ -1228,13 +1119,14 @@ mod tests {
     }
 
     /// Builds a [`ClientEdgeState`] over one EVM channel, declared with a
-    /// known counterparty keypair and a payout ledger already bound to its
-    /// domain -- everything [`verify_and_record_declared_channel`] and
+    /// known counterparty keypair, and a payout ledger with a channel open
+    /// toward that counterparty -- everything
+    /// [`verify_and_record_declared_channel`] and
     /// [`crate::claim_gate::ClientClaimGate::credit_session_payout`] need,
     /// without a chain: a declared (`record_evm`) channel is resolved from
     /// memory, exactly like a real node's `[[client_channels]]` config
     /// row.
-    fn state_over_one_declared_channel(
+    async fn state_over_one_declared_channel(
         channel_id: &str,
         counterparty: connector_signer::Address,
         chain_id: u64,
@@ -1242,9 +1134,7 @@ mod tests {
     ) -> ClientEdgeState {
         use crate::channels::{DepositFloor, EvmChannel};
         use crate::claim_gate::ClientClaimGate;
-        use crate::outbound_ledger::ClientPayoutLedger;
-        use connector_runtime::{ChannelDomain, InMemoryJournal};
-        use connector_signer::LocalSigner;
+        use connector_runtime::InMemoryJournal;
 
         let mut channels = crate::ClientChannelRegistry::new();
         channels
@@ -1259,21 +1149,9 @@ mod tests {
             )
             .expect("a valid 32-byte channel id");
 
-        let mut ledger = ClientPayoutLedger::new();
-        ledger.set_signer(Arc::new(LocalSigner::generate("payout-key")));
-        ledger
-            .set_channel_domain(
-                channel_id.to_string(),
-                ChannelDomain {
-                    chain_id,
-                    token_network_address,
-                },
-            )
-            .expect("valid channel id");
-
         let gate = ClientClaimGate::restore(channels, Arc::new(InMemoryJournal::new()))
             .expect("a fresh in-memory journal has nothing to replay")
-            .with_payout_ledger(Arc::new(ledger));
+            .with_payout_ledger(ledger_paying(counterparty).await);
 
         test_state(gate)
     }
@@ -1345,12 +1223,15 @@ mod tests {
         let chain_id = 84_532u64;
         let token_network_address = [0x77u8; 20];
 
-        let state = Arc::new(state_over_one_declared_channel(
-            &channel_id,
-            counterparty,
-            chain_id,
-            token_network_address,
-        ));
+        let state = Arc::new(
+            state_over_one_declared_channel(
+                &channel_id,
+                counterparty,
+                chain_id,
+                token_network_address,
+            )
+            .await,
+        );
 
         let expires = crate::now_unix() + 3600;
         let signature = sign_channel_control_proof(
@@ -1380,10 +1261,10 @@ mod tests {
         let fulfillment = [9u8; 32];
         let payout = state
             .claim_gate
-            .credit_session_payout("g.toon.agent", &fulfillment, 500, chrono::Utc::now())
+            .credit_session_payout("g.toon.agent", &fulfillment, 500)
             .await
-            .expect("the auth-time proof taught the session's channel with no claim ever sent");
-        assert_eq!(payout.channel_id, channel_id);
+            .expect("the auth-time proof taught the session its payee with no claim ever sent");
+        assert_eq!(payout.payee, VoucherSigner::Evm(counterparty));
     }
 
     /// Issue #790's own enforcement half: a session cannot cause payouts to
@@ -1406,12 +1287,15 @@ mod tests {
         let chain_id = 84_532u64;
         let token_network_address = [0x77u8; 20];
 
-        let state = Arc::new(state_over_one_declared_channel(
-            &channel_id,
-            counterparty,
-            chain_id,
-            token_network_address,
-        ));
+        let state = Arc::new(
+            state_over_one_declared_channel(
+                &channel_id,
+                counterparty,
+                chain_id,
+                token_network_address,
+            )
+            .await,
+        );
 
         let expires = crate::now_unix() + 3600;
         let forged_signature = sign_channel_control_proof(
@@ -1437,7 +1321,7 @@ mod tests {
         let fulfillment = [9u8; 32];
         let payout = state
             .claim_gate
-            .credit_session_payout("g.toon.agent", &fulfillment, 500, chrono::Utc::now())
+            .credit_session_payout("g.toon.agent", &fulfillment, 500)
             .await;
         assert!(
             payout.is_none(),
@@ -1464,12 +1348,15 @@ mod tests {
         let chain_id = 84_532u64;
         let token_network_address = [0x77u8; 20];
 
-        let state = Arc::new(state_over_one_declared_channel(
-            &channel_id,
-            counterparty,
-            chain_id,
-            token_network_address,
-        ));
+        let state = Arc::new(
+            state_over_one_declared_channel(
+                &channel_id,
+                counterparty,
+                chain_id,
+                token_network_address,
+            )
+            .await,
+        );
 
         let expires = crate::now_unix().saturating_sub(1);
         let signature = sign_channel_control_proof(
@@ -1495,7 +1382,7 @@ mod tests {
         let fulfillment = [9u8; 32];
         let payout = state
             .claim_gate
-            .credit_session_payout("g.toon.agent", &fulfillment, 500, chrono::Utc::now())
+            .credit_session_payout("g.toon.agent", &fulfillment, 500)
             .await;
         assert!(
             payout.is_none(),
@@ -1524,12 +1411,15 @@ mod tests {
         let chain_id = 84_532u64;
         let token_network_address = [0x77u8; 20];
 
-        let state = Arc::new(state_over_one_declared_channel(
-            &channel_id,
-            counterparty,
-            chain_id,
-            token_network_address,
-        ));
+        let state = Arc::new(
+            state_over_one_declared_channel(
+                &channel_id,
+                counterparty,
+                chain_id,
+                token_network_address,
+            )
+            .await,
+        );
 
         let (replies, _reply_rx) = mpsc::channel::<Vec<u8>>(REPLY_QUEUE_DEPTH);
         let window = Arc::new(Semaphore::new(4));
@@ -1556,7 +1446,7 @@ mod tests {
         assert!(
             state
                 .claim_gate
-                .credit_session_payout("g.toon.agent", &fulfillment, 500, chrono::Utc::now())
+                .credit_session_payout("g.toon.agent", &fulfillment, 500)
                 .await
                 .is_none(),
             "a bare bind with no declaration and no claim must not yet be creditable"
@@ -1599,10 +1489,10 @@ mod tests {
 
         let payout = state
             .claim_gate
-            .credit_session_payout("g.toon.agent", &fulfillment, 500, chrono::Utc::now())
+            .credit_session_payout("g.toon.agent", &fulfillment, 500)
             .await
-            .expect("the re-auth's declaration taught the session's channel");
-        assert_eq!(payout.channel_id, channel_id);
+            .expect("the re-auth's declaration taught the session its payee");
+        assert_eq!(payout.payee, VoucherSigner::Evm(counterparty));
     }
 
     /// [`auth_channel_proof`] requires all three fields; a partial
@@ -1624,48 +1514,35 @@ mod tests {
         assert_eq!(proof.signature, "0xcd");
     }
 
-    /// Issue #779: a session (re)establishing is resent a payout claim
+    /// Issue #779: a session (re)establishing is resent a payout voucher
     /// stranded by an earlier failed delivery, with no new job in sight --
     /// driven through the real `handle_frame` auth/bind path (not
     /// `deliver_pending_claim` called directly), so this fails if the auth
     /// branch's [`spawn_stranded_claim_resend`] call is deleted, per the
     /// issue's own AC4.
     ///
-    /// `record_session_channel` is called up front to stand in for "this
-    /// gate already learned this session's channel before" -- exactly what
-    /// a genuine prior claim or channel-control proof on an earlier
-    /// connection would have taught it (issues #787/#790); this test is
-    /// about the resend, not that association.
+    /// `record_session_payee` is called up front to stand in for "this gate
+    /// already learned this session's payee before" -- exactly what a
+    /// genuine prior voucher or channel-control proof on an earlier
+    /// connection would have taught it; this test is about the resend, not
+    /// that association.
     #[tokio::test]
-    async fn a_reconnecting_session_is_resent_its_stranded_payout_claim() {
+    async fn a_reconnecting_session_is_resent_its_stranded_payout_voucher() {
         use crate::claim_gate::ClientClaimGate;
-        use crate::outbound_ledger::ClientPayoutLedger;
-        use connector_runtime::{ChannelDomain, InMemoryJournal};
-        use connector_signer::LocalSigner;
+        use connector_runtime::InMemoryJournal;
 
         let address = "g.toon.stranded";
-        let channel_id = format!("0x{:064x}", 21);
-
-        let mut ledger = ClientPayoutLedger::new();
-        ledger.set_signer(Arc::new(LocalSigner::generate("payout-key")));
-        ledger
-            .set_channel_domain(
-                channel_id.clone(),
-                ChannelDomain {
-                    chain_id: 84_532,
-                    token_network_address: [0x99; 20],
-                },
-            )
-            .expect("valid channel id");
+        let payee = VoucherSigner::Evm([0x21; 20]);
+        let ledger = ledger_paying([0x21; 20]).await;
         let stranded = ledger
-            .record_payout(&channel_id, 12_345, "2030-01-01T00:00:00Z".parse().unwrap())
-            .expect("signer and domain configured");
-        let ledger = Arc::new(ledger);
+            .record_payout_once(payee, &[1; 32], 1_234)
+            .await
+            .expect("a channel toward the payee is open");
 
         let gate = ClientClaimGate::restore(Default::default(), Arc::new(InMemoryJournal::new()))
             .expect("a fresh in-memory journal has nothing to replay")
             .with_payout_ledger(Arc::clone(&ledger));
-        gate.record_session_channel(address, channel_id.clone());
+        gate.record_session_payee(address, payee);
         let state = Arc::new(test_state(gate));
 
         let (replies, mut reply_rx) = mpsc::channel::<Vec<u8>>(REPLY_QUEUE_DEPTH);
@@ -1692,15 +1569,15 @@ mod tests {
             let decoded = decode_frame(&sent).expect("the connector's own encoder");
             if decoded.frame_type == BTP_TRANSFER {
                 saw_transfer = true;
+                assert_eq!(decoded.amount, Some(1_234));
                 let pd = decoded
                     .protocol_data
                     .iter()
                     .find(|pd| pd.name == PAYOUT_CLAIM_PROTOCOL)
-                    .expect("the stranded claim rode this TRANSFER");
+                    .expect("the stranded voucher rode this TRANSFER");
                 let json: serde_json::Value = serde_json::from_slice(&pd.data).expect("valid JSON");
-                assert_eq!(json["channelId"], channel_id);
-                assert_eq!(json["nonce"], stranded.nonce);
-                assert_eq!(json["cumulativeAmount"], 12_345);
+                assert_eq!(json["channelId"], stranded.channel_id());
+                assert_eq!(json["maxClaimableAmount"], "1234");
 
                 outbound.resolve(BtpFrame {
                     frame_type: BTP_RESPONSE,
@@ -1713,7 +1590,7 @@ mod tests {
         }
         assert!(
             saw_transfer,
-            "a session that reconnects with a known channel must be resent its stranded claim"
+            "a session that reconnects with a known payee must be resent its stranded voucher"
         );
 
         // The resend's acknowledgement runs in the spawned task, after the
@@ -1721,7 +1598,7 @@ mod tests {
         // executor a chance to poll it to completion.
         let mut cleared = false;
         for _ in 0..1000 {
-            if ledger.pending_claim(&channel_id).is_none() {
+            if ledger.pending_for(&payee).is_empty() {
                 cleared = true;
                 break;
             }
@@ -1729,12 +1606,7 @@ mod tests {
         }
         assert!(
             cleared,
-            "a successfully delivered resend must acknowledge and clear pending_claim"
-        );
-        assert_eq!(
-            ledger.credited(&channel_id),
-            12_345,
-            "acknowledging a resend must never disturb credited"
+            "a successfully delivered resend must acknowledge and clear the pending voucher"
         );
     }
 

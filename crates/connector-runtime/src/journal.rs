@@ -1,9 +1,8 @@
 //! Durable persistence of money state (ADR 0005, issue #424): the [`Journal`]
 //! port and its two implementations. Per the ADR, only what is signed or
 //! irreversible is ever written here -- [`connector_domain::JournalEntry`]
-//! is the exact alphabet, and everything else (balances, exposure) stays a
-//! [`connector_domain::Projection`] recomputed from it, never stored
-//! directly. No ledger port, no database: [`FileJournal`] is a single
+//! is the exact alphabet, and everything else is recomputed from it by
+//! replay, never stored directly. No ledger port, no database: [`FileJournal`] is a single
 //! append-only file, matching "no separate accounting database exists" in
 //! the issue's own acceptance criteria.
 
@@ -50,8 +49,7 @@ pub trait Journal: Send + Sync {
     }
 
     /// Every entry ever appended, in the order they were written -- what a
-    /// node folds into a [`connector_domain::Projection`] and replays into
-    /// `ClaimBook` state on start.
+    /// node replays into its books' state on start.
     fn read_all(&self) -> Result<Vec<JournalEntry>, JournalError>;
 }
 

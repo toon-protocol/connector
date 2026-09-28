@@ -140,8 +140,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc, RwLock};
 
-use chrono::{DateTime, Utc};
-
 use connector_domain::client_claim::{
     canonical_channel_key, parse_client_claim, ClaimScheme, ClientClaim, ClientClaimError,
     EvmClientClaim, EvmVoucherChannelConfig, SolanaClientClaim, EVM_NAMESPACE, SOLANA_NAMESPACE,
@@ -150,7 +148,7 @@ use connector_domain::{
     advance_voucher_watermark, advance_watermark, validate_claim, validate_price, validate_voucher,
     ClaimError, JournalEntry, VoucherAdmission, VoucherWatermark, Watermark,
 };
-use connector_runtime::{ChannelDomain, Journal, JournalError, WireClaim};
+use connector_runtime::{Journal, JournalError};
 use connector_signer::{
     evm_batch_channel_id, evm_voucher_signer, verify_evm_balance_proof, verify_evm_voucher,
     verify_solana_balance_proof, verify_solana_voucher, BatchChannelConfig, BatchSettlementDomain,
@@ -166,7 +164,8 @@ use crate::channels::{
     DepositFloor,
 };
 use crate::lookup_budget::{LookupBudgetBound, LookupReservation, UnresolvableLookupBudget};
-use crate::outbound_ledger::ClientPayoutLedger;
+use crate::outbound_ledger::{ClientPayoutLedger, PayoutVoucher};
+use connector_settlement::batch::VoucherSigner;
 
 /// Why the gate refused a claim. [`ClaimIngestRejection::Mina`] and
 /// [`ClaimIngestRejection::Malformed`] are kept distinct on purpose: the
@@ -263,15 +262,9 @@ pub enum ClaimIngestRejection {
     /// contracts already document -- deposit more and resubmit the same
     /// claim, which nothing here has consumed.
     ///
-    /// As of issue #700, the ceiling this compares against is `deposited`
-    /// **plus** whatever this connector has separately credited the same
-    /// counterparty (a signed, unredeemed payout claim on this channel --
-    /// see `ClientPayoutLedger`), so a claim reaching this variant has
-    /// already failed against that raised ceiling too. `deposited` still
-    /// reports only the on-chain figure -- an honest fact about the
-    /// channel, unlike a combined number this connector alone vouches
-    /// for -- so "deposit at least `claimed`" remains true remedial
-    /// advice regardless of how much credit was already netted in.
+    /// The ceiling is the deposit alone: a payout this connector owes the
+    /// same client rides a channel of its own and nets against nothing
+    /// (ADR 0075 decision 7, retiring issue #700's netting).
     Undercollateralized {
         claimed: u64,
         deposited: u64,
@@ -417,10 +410,8 @@ impl ClaimIngestRejection {
 
 /// A channel's live watermark together with the exact claim bytes that
 /// produced it (issue #1218): a watermark alone says what was spent, but
-/// only the signature is redeemable -- the same reason the peer semantics's
-/// own `connector_runtime::ClaimBook` (via `connector_domain::Projection`'s
-/// `inbound_claim_signature`) retains one alongside its watermark rather
-/// than discarding it once the acceptance decision is made.
+/// only the signature is redeemable, so it is retained alongside the
+/// watermark rather than discarded once the acceptance decision is made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveClaim {
     watermark: Watermark,
@@ -478,35 +469,26 @@ pub struct ClientClaimGate {
     /// every dollar figure the claim-state endpoint reports) is unaffected
     /// either way, since that is still sourced from the durable journal.
     last_claim_seen: RwLock<HashMap<String, u64>>,
-    /// This connector's own outbound claim ledger for the same channels
-    /// this gate accepts an inbound claim on (issue #700's netting): what
-    /// this connector has separately committed to pay a channel's
-    /// counterparty, consulted by [`check_collateral`] so that credit
-    /// raises spendable headroom directly rather than only after an
-    /// on-chain round trip (`toon-meta#262` decision 9). `None` -- the
-    /// default every constructor leaves this at absent
-    /// [`Self::with_payout_ledger`] -- nets nothing: collateral binding is
-    /// exactly [`DepositFloor::covers`], this gate's behaviour before issue
-    /// #700.
+    /// What this connector pays clients back, as vouchers on its outbound
+    /// channels toward them (ADR 0075 decision 7, issue #1381). `None` --
+    /// every constructor's default -- pays nothing. Never consulted on the
+    /// admission path: a payout nets against nothing.
     payout_ledger: Option<Arc<ClientPayoutLedger>>,
-    /// A client session's bound ILP address -> the EVM channel id this
-    /// gate has associated it with (issue #787). A BTP session is keyed by
-    /// ILP address (issue #736/toon-client#503), not by channel id, so
-    /// nothing previously joined "which session earned this fulfilment" to
-    /// "which channel to credit". [`Self::record_session_channel`] is the
-    /// only writer, and it has two callers, neither of which is a
-    /// session's own unverified say-so: `crate::btp::record_accepted_claim`
-    /// once a claim has already cleared [`Self::admit`]'s full
-    /// verification (issue #787's original path -- a session that both
-    /// pays and earns), and `crate::btp::verify_and_record_declared_channel`
-    /// once a session's declared channel-control proof at BTP auth has
-    /// verified against [`Self::channels`]'s registered counterparty (issue
-    /// #790 -- a session that only ever earns and so never presents a
-    /// claim of its own). Learning is best-effort and non-durable: a
-    /// restart forgets it, same as [`Self::last_claim_seen`], and the next
-    /// accepted claim or verified proof from that session teaches it again
-    /// before any payout depends on it.
-    session_channels: RwLock<HashMap<String, String>>,
+    /// A client session's bound ILP address -> the key its payouts are
+    /// paid to (issues #787, #1381). A BTP session is keyed by ILP address
+    /// (issue #736/toon-client#503), so nothing else joins "which session
+    /// earned this fulfilment" to "which channel pays it".
+    /// [`Self::record_session_payee`] is the only writer, and each of its
+    /// callers has verified a signature by that key first -- never a
+    /// session's own say-so. Best-effort and non-durable, like
+    /// [`Self::last_claim_seen`]: the next accepted voucher or verified
+    /// proof from that session teaches it again.
+    session_payees: RwLock<HashMap<String, VoucherSigner>>,
+    /// The voucher signer of every batch-settlement channel this gate has
+    /// accepted a voucher on since it started, by canonical key: read from
+    /// the chain when the voucher was verified, never from the voucher. How
+    /// an accepted voucher teaches a session its payee.
+    voucher_signers: RwLock<HashMap<String, VoucherSigner>>,
     /// The x402 `batch-settlement` backend vouchers are admitted through
     /// (ADR 0074, issue #1341) -- `None`, every constructor's default, and
     /// every voucher is refused by name. **This is the seam** where a node
@@ -567,7 +549,8 @@ impl ClientClaimGate {
             committer,
             last_claim_seen: RwLock::new(HashMap::new()),
             payout_ledger: None,
-            session_channels: RwLock::new(HashMap::new()),
+            session_payees: RwLock::new(HashMap::new()),
+            voucher_signers: RwLock::new(HashMap::new()),
             batch_settlement: None,
             batch_channels: RwLock::new(batch_channels),
         })
@@ -586,167 +569,99 @@ impl ClientClaimGate {
         self
     }
 
-    /// Bind `ledger` -- this connector's outbound claim ledger -- to this
-    /// gate's channels (issue #700): a channel's inbound collateral check
-    /// and the claim-state endpoint's `available` figure both net what
-    /// `ledger` has credited that channel's counterparty against what this
-    /// gate has already accepted from them. `ledger` and this gate's own
-    /// [`ClientChannelRegistry`] MUST be configured with the same channel
-    /// ids for netting to mean anything -- `ledger`'s EVM channel id
-    /// (`0x` + 64 lower-case hex, [`ClientPayoutLedger::set_channel_domain`])
-    /// is looked up by exactly the on-chain bytes a resolved EVM claim's
-    /// channel already decoded to, so no separate configuration step is
-    /// needed here beyond calling this once at startup.
+    /// Pay clients back through `ledger` (ADR 0075 decision 7, issue
+    /// #1381): a client session's earnings are signed as vouchers on this
+    /// node's outbound channel toward the session's payee key
+    /// ([`Self::record_session_payee`]). Nothing a payout signs touches
+    /// this gate's own admission: a client's inbound collateral and its
+    /// payout channel are independent, and a payout no longer raises what
+    /// the client may spend (ADR 0026's #700 netting is retired).
     pub fn with_payout_ledger(mut self, ledger: Arc<ClientPayoutLedger>) -> ClientClaimGate {
         self.payout_ledger = Some(ledger);
         self
     }
 
-    /// This gate's own outbound payout ledger, if [`Self::with_payout_ledger`]
-    /// configured one -- the same instance [`Self::credited_evm`] and the
-    /// claim-state endpoint already net against.
+    /// This gate's payout ledger, if [`Self::with_payout_ledger`] configured
+    /// one.
     pub(crate) fn payout_ledger(&self) -> Option<&Arc<ClientPayoutLedger>> {
         self.payout_ledger.as_ref()
     }
 
-    /// Credit `channel_id` `amount` against `job_id` (issue #770), the
-    /// same as [`ClientPayoutLedger::record_payout_once`], except a channel
-    /// this gate's ledger has no domain for yet is first resolved through
-    /// this gate's own budgeted [`ClientChannelRegistry`] -- the one the
-    /// inbound claim path already uses (`verify_evm_claim_signature`) --
-    /// rather than being unpayable forever (issue #780). A self-opened
-    /// agent channel carries no `[[client_channels]]` row and so is never
-    /// in the ledger's pre-seeded set; without this it could never be
-    /// credited, no matter how many jobs it fulfilled.
-    ///
-    /// A channel the ledger already knows about (pre-seeded or previously
-    /// resolved) skips the lookup entirely. Resolution is EVM-only, same as
-    /// [`ClientPayoutLedger`]'s existing reach -- a `channel_id` that is not
-    /// a 32-byte hex channel id is left unresolved, and a resolution
-    /// failure (the channel does not exist, or the chain endpoint is down)
-    /// is likewise left unresolved rather than defaulted: the payout that
-    /// follows then simply produces nothing, exactly as it always has for
-    /// an unknown channel.
-    ///
-    /// Returns `None` if no payout ledger is configured at all, or under
-    /// any of the conditions [`ClientPayoutLedger::record_payout_once`]
-    /// itself already returns `None` for -- including its own dedupe, which
-    /// this does not affect.
-    pub(crate) async fn credit_payout(
-        &self,
-        channel_id: &str,
-        job_id: &[u8; 32],
-        amount: u64,
-        now: DateTime<Utc>,
-    ) -> Option<WireClaim> {
-        let ledger = self.payout_ledger()?;
-        if !ledger.has_channel_domain(channel_id) {
-            self.resolve_payout_domain(ledger, channel_id).await;
-        }
-        ledger.record_payout_once(channel_id, job_id, amount, now)
-    }
-
-    /// [`Self::credit_payout`]'s on-demand resolution step, split out so its
-    /// early-exit guards (not a 32-byte EVM channel id; the chain lookup
-    /// comes back empty or fails) read as a flat sequence rather than nested
-    /// `if let`s. Best-effort and silent either way: an id that cannot be
-    /// resolved, or a domain [`ClientPayoutLedger::ensure_channel_domain`]
-    /// itself declines, simply leaves `channel_id` unresolved for the
-    /// `record_payout_once` call that follows.
-    async fn resolve_payout_domain(&self, ledger: &ClientPayoutLedger, channel_id: &str) {
-        let Some(on_chain_id) = decode_hex_bytes::<32>(channel_id) else {
-            return;
-        };
-        let requester = format!("payout:{channel_id}");
-        let Ok(Some(channel)) = self.channels.evm(&on_chain_id, &requester).await else {
-            return;
-        };
-        let _ = ledger.ensure_channel_domain(
-            channel_id,
-            ChannelDomain {
-                chain_id: channel.chain_id,
-                token_network_address: channel.token_network_address,
-            },
-        );
-    }
-
     /// Learn that `address` -- a client session's own bound ILP address --
-    /// speaks for `channel_id` (issue #787). Both callers verify this
-    /// before calling: `crate::btp::record_accepted_claim`, once
-    /// [`Self::admit`] has fully verified a genuine claim naming
-    /// `channel_id`, and `crate::btp::verify_and_record_declared_channel`,
-    /// once a session's own channel-control proof at BTP auth has verified
-    /// against [`Self::channels`]'s registered counterparty (issue #790) --
-    /// so this is never a session's own unverified say-so either way.
-    /// Overwrites any previous association for `address` -- this is a
-    /// best-current-belief cache, not an append-only ledger like a
-    /// watermark, and a session that reconnects or a channel that closes
-    /// and reopens is still just taught its current fact the next time it
-    /// proves or pays.
-    pub(crate) fn record_session_channel(&self, address: &str, channel_id: String) {
-        self.session_channels
+    /// is paid at `payee`, the key a payout channel toward it names as
+    /// receiver. Every caller has verified a signature by `payee` first:
+    /// `crate::btp::record_accepted_claim`, once [`Self::admit`] has
+    /// accepted a voucher whose channel's voucher signer is `payee`, and
+    /// `crate::btp::verify_and_record_declared_channel`, once a session's
+    /// channel-control proof at BTP auth has verified against `payee`
+    /// (issue #790). Overwrites any previous association: a best-current
+    /// belief, not a ledger.
+    pub(crate) fn record_session_payee(&self, address: &str, payee: VoucherSigner) {
+        self.session_payees
             .write()
-            .expect("session channel map lock poisoned")
-            .insert(address.to_string(), channel_id);
+            .expect("session payee map lock poisoned")
+            .insert(address.to_string(), payee);
     }
 
-    /// The channel id [`Self::record_session_channel`] has associated with
-    /// `address`, if any.
-    fn session_channel(&self, address: &str) -> Option<String> {
-        self.session_channels
+    /// The payee [`Self::record_session_payee`] associated with `address`.
+    pub(crate) fn session_payee(&self, address: &str) -> Option<VoucherSigner> {
+        self.session_payees
             .read()
-            .expect("session channel map lock poisoned")
+            .expect("session payee map lock poisoned")
             .get(address)
-            .cloned()
+            .copied()
     }
 
-    /// `destination`'s associated channel id together with this gate's own
-    /// payout ledger (issue #779) -- what `session_route::deliver_pending_claim`
-    /// needs to look up `ClientPayoutLedger::pending_claim` and, once a
-    /// resend succeeds, acknowledge it. `None` if this gate has no payout
-    /// ledger configured at all, or if `destination` has no channel
-    /// association yet ([`Self::record_session_channel`]) -- both are
-    /// reasons there is nothing to resend, not an error.
-    pub(crate) fn payout_channel_for_session(
+    /// `destination`'s payee together with this gate's payout ledger (issue
+    /// #779): what `session_route::deliver_pending_claim` needs to resend a
+    /// stranded payout voucher. `None` if no ledger is configured or
+    /// `destination` has no payee yet -- both reasons there is nothing to
+    /// resend, not errors.
+    pub(crate) fn payout_for_session(
         &self,
         destination: &str,
-    ) -> Option<(String, Arc<ClientPayoutLedger>)> {
-        let channel_id = self.session_channel(destination)?;
+    ) -> Option<(VoucherSigner, Arc<ClientPayoutLedger>)> {
+        let payee = self.session_payee(destination)?;
         let ledger = Arc::clone(self.payout_ledger()?);
-        Some((channel_id, ledger))
+        Some((payee, ledger))
     }
 
-    /// [`Self::credit_payout`], resolving `destination` -- a client
-    /// session's own bound ILP address, exactly what
-    /// `crate::session_route::route_prepare` delivers a fulfilled PREPARE
-    /// through -- to a channel id via [`Self::record_session_channel`]'s
-    /// own map first (issue #787). Production binds a session under its
-    /// ILP address, never under a channel id (issue #736/toon-client#503),
-    /// so `destination` itself is never a payable key: without this
-    /// resolution step every credit attempt silently found nothing, on
-    /// every deployed connector.
+    /// Pay the client session bound at `destination` `amount` for the job
+    /// `job_id`, through [`ClientPayoutLedger::record_payout_once`] --
+    /// resolving `destination` (a session's bound ILP address, never a
+    /// channel id, issue #787) to its payee first.
     ///
-    /// `None`, logged rather than left silent (this issue's own AC), for a
-    /// destination this gate has never learned a channel for -- an earning
-    /// agent that has never itself presented a claim on this session has
-    /// no association yet, and crediting nothing is the explicit decision
-    /// for that case, not an oversight indistinguishable from any of
-    /// [`Self::credit_payout`]'s own reasons to decline.
+    /// `None`, logged rather than left silent, for a destination this gate
+    /// has never learned a payee for -- a session that has neither paid a
+    /// voucher nor proved a channel at auth -- and under every condition
+    /// `record_payout_once` itself declines on.
     pub(crate) async fn credit_session_payout(
         &self,
         destination: &str,
         job_id: &[u8; 32],
         amount: u64,
-        now: DateTime<Utc>,
-    ) -> Option<WireClaim> {
-        let Some(channel_id) = self.session_channel(destination) else {
+    ) -> Option<PayoutVoucher> {
+        let ledger = self.payout_ledger()?;
+        let Some(payee) = self.session_payee(destination) else {
             tracing::info!(
                 destination = %destination,
-                "no channel is associated with this session yet -- crediting nothing"
+                "no payee is associated with this session yet -- paying nothing"
             );
             return None;
         };
-        self.credit_payout(&channel_id, job_id, amount, now).await
+        ledger.record_payout_once(payee, job_id, amount).await
+    }
+
+    /// The voucher signer of the batch-settlement channel `channel_key`, as
+    /// the chain recorded it when this gate last accepted a voucher on it:
+    /// EVM `payerAuthorizer`, Solana `authorized_signer`. `None` for a
+    /// channel this process has accepted no voucher on.
+    pub(crate) fn voucher_signer(&self, channel_key: &str) -> Option<VoucherSigner> {
+        self.voucher_signers
+            .read()
+            .expect("voucher signers lock poisoned")
+            .get(&canonical_channel_key(channel_key))
+            .copied()
     }
 
     /// The watermark this gate currently holds for `channel_key` (the
@@ -768,10 +683,8 @@ impl ClientClaimGate {
 
     /// The highest-nonce claim this gate has ever accepted on `channel_key`,
     /// as `(nonce, cumulative_amount, signature)` -- exactly what an
-    /// on-chain redemption submits (issue #1218), mirroring
-    /// `connector_domain::Projection::latest_inbound_claim`, the peer
-    /// semantics's own equivalent read. `None` before any claim has been
-    /// accepted on this channel.
+    /// on-chain redemption submits (issue #1218). `None` before any claim
+    /// has been accepted on this channel.
     pub fn latest_inbound_claim(&self, channel_key: &str) -> Option<(u64, u64, Vec<u8>)> {
         self.watermarks
             .read()
@@ -936,39 +849,6 @@ impl ClientClaimGate {
         self.channels.lookup_budget()
     }
 
-    /// What this connector has separately committed to pay EVM channel
-    /// `channel_id`'s counterparty back (issue #700's "credited" term --
-    /// see [`Self::with_payout_ledger`]). `0` with no payout ledger
-    /// configured, or for a channel it has never paid out on -- exactly
-    /// this gate's pre-#700 behaviour. Exposed alongside [`Self::channels`]
-    /// and [`Self::watermark`] so the claim-state endpoint (§1.10) can net
-    /// the same figure [`check_collateral`] admits against.
-    pub(crate) fn credited_evm(&self, channel_id: &[u8; 32]) -> u64 {
-        self.payout_ledger.as_ref().map_or(0, |ledger| {
-            ledger.credited(&format!("0x{}", hex::encode(channel_id)))
-        })
-    }
-
-    /// [`Self::credited_evm`], dispatched on a [`ResolvedChannelKey`]
-    /// [`verify_claim_signature`] already resolved -- the collateral
-    /// check's own call site, so it never re-decodes an id it already has
-    /// in hand.
-    fn credited(&self, channel: &ResolvedChannelKey) -> u64 {
-        match channel {
-            ResolvedChannelKey::Evm(channel_id) => self.credited_evm(channel_id),
-            // `ClientPayoutLedger` wraps `connector_runtime::ClaimBook`,
-            // which only ever signs an EVM balance proof (issue #699) --
-            // there is no Solana payout to net against yet, so a Solana
-            // channel nets nothing rather than guessing at a key format no
-            // ledger will ever be registered under. Per the issue's own
-            // "do not net across chains" rule, this is the correct answer
-            // for a Solana channel forever, not just until support lands:
-            // Solana credit, if it ever exists, nets against a Solana
-            // channel's own floor, never an EVM one's.
-            ResolvedChannelKey::Solana(_) => 0,
-        }
-    }
-
     /// The unix-second timestamp [`Self::note_claim_time`] last recorded
     /// for `channel_key`, or `None` if this gate has not accepted a claim
     /// on it since the last restart. See [`Self::last_claim_seen`]'s own
@@ -1104,11 +984,10 @@ impl ClientClaimGate {
         // already fresh, value-covering and correctly signed can reach the
         // chain read this may provoke. It needs no re-check under the lock,
         // unlike freshness and value: the bound is absolute per claim
-        // rather than relative to the watermark, and both the deposit and
-        // the credited amount (issue #700) only ever grow, so no concurrent
-        // claim can turn an amount that fitted into one that does not.
-        let credited = self.credited(&verified.channel);
-        check_collateral(&self.channels, &claim, &verified, &requester, credited).await?;
+        // rather than relative to the watermark, and the deposit only ever
+        // grows, so no concurrent claim can turn an amount that fitted into
+        // one that does not.
+        check_collateral(&self.channels, &claim, &verified, &requester).await?;
 
         let mut watermarks = self
             .watermarks
@@ -1322,6 +1201,10 @@ impl ClientClaimGate {
             signature_bytes,
             channel_record,
         )?;
+        self.voucher_signers
+            .write()
+            .expect("voucher signers lock poisoned")
+            .insert(key.clone(), verified.signer);
         self.batch_channels
             .write()
             .expect("batch channels lock poisoned")
@@ -2118,6 +2001,8 @@ pub(crate) fn decode_evm_channel_config(
 struct VerifiedVoucher {
     max_cumulative: u64,
     channel: JournaledBatchChannel,
+    /// The key the voucher verified against, as the chain records it.
+    signer: VoucherSigner,
 }
 
 /// client-edge-spec.md §1.3 step 4 for a voucher (ADR 0074 decision 4):
@@ -2198,6 +2083,7 @@ async fn verify_voucher(
                         channel_id,
                         config: channel.config,
                     },
+                    signer: VoucherSigner::Evm(signer),
                 })
             } else {
                 Err(ClaimIngestRejection::SignatureInvalid)
@@ -2226,6 +2112,7 @@ async fn verify_voucher(
                 Ok(VerifiedVoucher {
                     max_cumulative: channel.max_cumulative,
                     channel: JournaledBatchChannel::Solana { channel_account },
+                    signer: VoucherSigner::Solana(channel.authorized_signer),
                 })
             } else {
                 Err(ClaimIngestRejection::SignatureInvalid)
@@ -2361,26 +2248,14 @@ enum ResolvedChannelKey {
 /// exactly the same reason; the only cost is that a counterparty who
 /// deposits mid-interval waits it out before their resubmission is
 /// honoured, seconds rather than a restart.
-///
-/// `credited` (issue #700) raises the ceiling the same way a deposit does:
-/// what this connector has separately committed to pay this channel's
-/// counterparty back, from [`ClientClaimGate::credited`]. `0` for a gate
-/// with no payout ledger configured, or for a channel nothing has ever been
-/// paid out on -- exactly this check's pre-#700 behaviour. Like the
-/// deposit, it only ever grows (a payout ledger's cumulative total is
-/// monotonic, `connector_runtime::ClaimBook::record_fulfillment`), so the
-/// same reasoning that makes a cached deposit safe to compare against
-/// applies to it too: it can only produce a false refusal, never a false
-/// accept.
 async fn check_collateral(
     channels: &ClientChannelRegistry,
     claim: &ClientClaim,
     verified: &VerifiedClaim,
     requester: &str,
-    credited: u64,
 ) -> Result<(), ClaimIngestRejection> {
     let claimed = claim.transferred_amount();
-    if verified.deposit_floor.covers_with_credit(claimed, credited) {
+    if verified.deposit_floor.covers(claimed) {
         return Ok(());
     }
 
@@ -2396,7 +2271,7 @@ async fn check_collateral(
     };
 
     match refreshed {
-        Ok(Some(floor)) if floor.covers_with_credit(claimed, credited) => Ok(()),
+        Ok(Some(floor)) if floor.covers(claimed) => Ok(()),
         Ok(Some(floor)) => Err(ClaimIngestRejection::Undercollateralized {
             claimed,
             // `Unknown` covers every amount, so a floor that reached this
@@ -4685,75 +4560,21 @@ mod tests {
         }
     }
 
-    // -- Netting: spendable headroom nets a channel's outbound payout
-    // ledger too (issue #700, `toon-meta#262` decision 9) --
-    mod netting {
+    // -- Payouts (ADR 0075 decision 7, issue #1381): a payout rides a
+    // connector->client channel of its own and nets against nothing --
+    mod payouts {
         use super::*;
         use crate::channels::test_source::FakeChannelSource;
-        use crate::channels::{
-            ChannelLivenessPolicy, ChannelLookupFailed, ClientChannelSource, DepositFloor,
-        };
-        use chrono::{DateTime, Utc};
-        use connector_runtime::ChannelDomain;
-        use connector_signer::LocalSigner;
-        use proptest::prelude::*;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::channels::{ChannelLivenessPolicy, DepositFloor};
+        use crate::outbound_ledger::test_ledger_paying;
         use std::time::Duration;
-        use tokio::sync::Notify;
 
-        fn now() -> DateTime<Utc> {
-            "2030-01-01T00:00:00Z".parse().unwrap()
-        }
-
-        fn payout_domain() -> ChannelDomain {
-            ChannelDomain {
-                chain_id: EVM_CHAIN_ID,
-                token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-            }
-        }
-
-        /// A ledger with `channel_id` registered and credited `amount` --
-        /// signed by its own dedicated key, since this connector's outbound
-        /// signer is never a channel's counterparty. `amount` of `0`
-        /// registers the channel (so [`ClientClaimGate::credited_evm`] can
-        /// find it) without recording a payout.
-        fn ledger_crediting(channel_id: &str, amount: u64) -> Arc<ClientPayoutLedger> {
-            let mut ledger = ClientPayoutLedger::new();
-            ledger.set_signer(Arc::new(LocalSigner::generate("payout-key")));
-            ledger
-                .set_channel_domain(channel_id, payout_domain())
-                .expect("test channel id is valid");
-            let ledger = Arc::new(ledger);
-            if amount > 0 {
-                ledger
-                    .record_payout(channel_id, amount, now())
-                    .expect("signer and domain configured");
-            }
-            ledger
-        }
-
-        /// The default liveness policy with the re-attempt interval
-        /// removed, matching `collateral::unsuppressed` -- these tests are
-        /// about the ceiling and the refresh, not the rate limiter.
-        fn unsuppressed() -> ChannelLivenessPolicy {
-            ChannelLivenessPolicy {
-                min_reattempt_interval: Duration::ZERO,
-                ..ChannelLivenessPolicy::default()
-            }
-        }
-
-        /// A gate over a chain-resolved EVM channel whose counterparty has
-        /// `deposit` on chain, with a payout ledger crediting the same
-        /// channel `credited` -- the shape every simple test in this module
-        /// needs.
-        fn chain_resolved_with_credit(
+        /// A gate over a chain-resolved EVM channel whose counterparty (the
+        /// client) has `deposit` on chain, and a payout ledger with a
+        /// channel open toward that same client.
+        async fn chain_resolved_with_payouts(
             deposit: u64,
-            credited: u64,
-        ) -> (
-            Arc<FakeChannelSource>,
-            Arc<ClientPayoutLedger>,
-            ClientClaimGate,
-        ) {
+        ) -> (Arc<ClientPayoutLedger>, VoucherSigner, ClientClaimGate) {
             let (_secret, address) = evm_signer();
             let source = Arc::new(FakeChannelSource::knowing(vec![(
                 decode_hex_bytes::<32>(&unrecorded_channel_id()).unwrap(),
@@ -4764,475 +4585,74 @@ mod tests {
                     deposit_floor: DepositFloor::AtLeast(deposit),
                 },
             )]));
-            let ledger = ledger_crediting(&unrecorded_channel_id(), credited);
+            let ledger = test_ledger_paying(address).await;
             let gate = gate_over(
                 ClientChannelRegistry::new()
-                    .with_source(source.clone())
-                    .with_liveness_policy(unsuppressed()),
+                    .with_source(source)
+                    .with_liveness_policy(ChannelLivenessPolicy {
+                        min_reattempt_interval: Duration::ZERO,
+                        ..ChannelLivenessPolicy::default()
+                    }),
             )
             .with_payout_ledger(Arc::clone(&ledger));
-            (source, ledger, gate)
+            (ledger, VoucherSigner::Evm(address), gate)
         }
 
-        /// A claim that would be refused against the raw deposit alone
-        /// (issue #646) is accepted once the channel's counterparty has
-        /// been credited enough to cover the difference -- decision 9 of
-        /// `toon-meta#262`: an inbound claim raises spendable headroom
-        /// directly.
+        /// The acceptance criterion: what this connector has paid a client
+        /// out raises nothing the client may spend. Before ADR 0075 a claim
+        /// up to `deposit + credited` was admitted (issue #700); now the
+        /// ceiling is the deposit, whatever has been paid out.
         #[tokio::test]
-        async fn a_claim_above_the_raw_deposit_is_accepted_once_credited_covers_the_rest() {
-            let (_source, _ledger, gate) = chain_resolved_with_credit(1_000, 500);
-
-            assert!(gate
-                .ingest(&evm_claim_json(&unrecorded_channel_id(), 1, 1_500), 100)
+        async fn a_payout_does_not_raise_what_the_client_may_spend() {
+            let (ledger, payee, gate) = chain_resolved_with_payouts(1_000).await;
+            gate.record_session_payee("g.toon.client", payee);
+            gate.credit_session_payout("g.toon.client", &[1; 32], 5_000)
                 .await
-                .is_ok());
-        }
-
-        /// The boundary this ceiling draws: one unit past `deposit +
-        /// credited` is still refused -- the same off-by-one discipline
-        /// `collateral::a_claim_exactly_equal_to_the_deposit_is_accepted`
-        /// holds the raw deposit alone to, checked from the other side.
-        #[tokio::test]
-        async fn one_unit_past_deposit_plus_credited_is_still_refused() {
-            let (_source, _ledger, gate) = chain_resolved_with_credit(1_000, 500);
-
-            assert_eq!(
-                gate.ingest(&evm_claim_json(&unrecorded_channel_id(), 1, 1_501), 100)
-                    .await,
-                Err(ClaimIngestRejection::Undercollateralized {
-                    claimed: 1_501,
-                    deposited: 1_000,
-                })
-            );
-        }
-        /// A gate with no payout ledger configured at all behaves exactly
-        /// as it did before issue #700 -- the default every constructor
-        /// leaves `payout_ledger` at.
-        #[tokio::test]
-        async fn no_payout_ledger_configured_nets_nothing() {
-            let (_secret, address) = evm_signer();
-            let source = Arc::new(FakeChannelSource::knowing(vec![(
-                decode_hex_bytes::<32>(&unrecorded_channel_id()).unwrap(),
-                EvmChannel {
-                    counterparty: address,
-                    chain_id: EVM_CHAIN_ID,
-                    token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-                    deposit_floor: DepositFloor::AtLeast(1_000),
-                },
-            )]));
-            // No `.with_payout_ledger(..)` call -- the pre-#700 default.
-            let gate = gate_over(
-                ClientChannelRegistry::new()
-                    .with_source(source)
-                    .with_liveness_policy(unsuppressed()),
-            );
+                .expect("the client is paid on its payout channel");
+            assert_eq!(ledger.signed_toward(&payee), 5_000);
 
             assert_eq!(
                 gate.ingest(&evm_claim_json(&unrecorded_channel_id(), 1, 1_001), 100)
                     .await,
                 Err(ClaimIngestRejection::Undercollateralized {
                     claimed: 1_001,
-                    deposited: 1_000,
-                })
-            );
-        }
-
-        /// A payout credited on a *different* channel does not leak
-        /// headroom across channels -- issue #700's explicit "do not net
-        /// across chains", applied at the channel granularity that rule's
-        /// own reasoning already implies.
-        #[tokio::test]
-        async fn credit_on_a_different_channel_does_not_raise_this_ones_headroom() {
-            let (_secret, address) = evm_signer();
-            let source = Arc::new(FakeChannelSource::knowing(vec![(
-                decode_hex_bytes::<32>(&unrecorded_channel_id()).unwrap(),
-                EvmChannel {
-                    counterparty: address,
-                    chain_id: EVM_CHAIN_ID,
-                    token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-                    deposit_floor: DepositFloor::AtLeast(1_000),
-                },
-            )]));
-            let mut ledger = ClientPayoutLedger::new();
-            ledger.set_signer(Arc::new(LocalSigner::generate("payout-key")));
-            ledger
-                .set_channel_domain(unrecorded_channel_id(), payout_domain())
-                .expect("test channel id is valid");
-            ledger
-                .set_channel_domain(second_channel_id(), payout_domain())
-                .expect("test channel id is valid");
-            let ledger = Arc::new(ledger);
-            ledger
-                .record_payout(&second_channel_id(), 10_000, now())
-                .expect("a channel this ledger's own domain covers");
-            let gate = gate_over(
-                ClientChannelRegistry::new()
-                    .with_source(source)
-                    .with_liveness_policy(unsuppressed()),
-            )
-            .with_payout_ledger(Arc::clone(&ledger));
-
-            assert_eq!(
-                gate.ingest(&evm_claim_json(&unrecorded_channel_id(), 1, 1_001), 100)
-                    .await,
-                Err(ClaimIngestRejection::Undercollateralized {
-                    claimed: 1_001,
-                    deposited: 1_000,
-                })
-            );
-        }
-
-        // -- Interleaved inbound/outbound advances (issue #700's own
-        // explicit ask: "at minimum: interleaved inbound/outbound
-        // advances") --
-
-        proptest! {
-            /// However inbound claims and outbound payouts interleave, an
-            /// inbound claim is admitted iff its cumulative amount is at
-            /// most `deposit + credited` at the moment it is judged, and
-            /// the gate's own watermark and the ledger's own credited
-            /// total always agree with what this test tracks by hand.
-            #[test]
-            fn netting_never_admits_beyond_deposit_plus_credited_however_interleaved(
-                ops in proptest::collection::vec((proptest::bool::ANY, 1u64..50_000u64), 1..15)
-            ) {
-                let runtime = tokio::runtime::Runtime::new().unwrap();
-                runtime.block_on(async move {
-                    const DEPOSIT: u64 = 500_000;
-                    let (_secret, address) = evm_signer();
-                    let mut channels = ClientChannelRegistry::new();
-                    channels
-                        .record_evm(
-                            &channel_id(),
-                            EvmChannel {
-                                counterparty: address,
-                                chain_id: EVM_CHAIN_ID,
-                                token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-                                deposit_floor: DepositFloor::AtLeast(DEPOSIT),
-                            },
-                        )
-                        .expect("valid channel id");
-                    let ledger = ledger_crediting(&channel_id(), 0);
-                    let gate = gate_over(channels).with_payout_ledger(Arc::clone(&ledger));
-
-                    let mut owed: u64 = 0;
-                    let mut credited: u64 = 0;
-                    let mut nonce: u64 = 0;
-
-                    for (is_payout, amount) in ops {
-                        if is_payout {
-                            ledger
-                                .record_payout(&channel_id(), amount, now())
-                                .expect("signer and domain configured");
-                            credited += amount;
-                        } else {
-                            nonce += 1;
-                            let new_cumulative = owed + amount;
-                            let result = gate
-                                .ingest(&evm_claim_json(&channel_id(), nonce, new_cumulative), 0)
-                                .await;
-                            if new_cumulative <= DEPOSIT + credited {
-                                prop_assert!(
-                                    result.is_ok(),
-                                    "{new_cumulative} <= {DEPOSIT} + {credited} must admit: {result:?}"
-                                );
-                                owed = new_cumulative;
-                            } else {
-                                prop_assert!(
-                                    matches!(
-                                        result,
-                                        Err(ClaimIngestRejection::Undercollateralized { .. })
-                                    ),
-                                    "{new_cumulative} > {DEPOSIT} + {credited} must refuse: {result:?}"
-                                );
-                            }
-                        }
-                    }
-
-                    let watermark = gate.watermark(&format!("evm:{}", channel_id()));
-                    prop_assert_eq!(
-                        watermark.map(|w| w.cumulative_amount).unwrap_or(0),
-                        owed
-                    );
-                    prop_assert_eq!(ledger.credited(&channel_id()), credited);
-                    Ok(())
-                })?;
-            }
-        }
-
-        // -- A credit arriving mid-flight during an in-flight admission --
-
-        /// A [`ClientChannelSource`] whose *second* lookup on `channel_id`
-        /// -- the collateral-breach refresh, never the first resolution --
-        /// rendezvouses with the test: it signals `entered_refresh` the
-        /// instant it is called, then waits on `release_refresh` before
-        /// answering. This is what lets a test inject a payout at the
-        /// exact point between `ClientClaimGate::credited`'s snapshot and
-        /// the refresh's own answer, deterministically, without racing
-        /// real wall-clock timing.
-        #[derive(Debug)]
-        struct RendezvousSource {
-            channel_id: [u8; 32],
-            channel: EvmChannel,
-            calls: AtomicUsize,
-            entered_refresh: Arc<Notify>,
-            release_refresh: Arc<Notify>,
-        }
-
-        #[async_trait::async_trait]
-        impl ClientChannelSource for RendezvousSource {
-            async fn evm_channel(
-                &self,
-                channel_id: &[u8; 32],
-            ) -> Result<Option<EvmChannel>, ChannelLookupFailed> {
-                if *channel_id != self.channel_id {
-                    return Ok(None);
-                }
-                if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
-                    self.entered_refresh.notify_one();
-                    self.release_refresh.notified().await;
-                }
-                Ok(Some(self.channel))
-            }
-        }
-
-        /// An inbound admission that has already taken its collateral
-        /// snapshot (issue #700) must not retroactively benefit from a
-        /// payout recorded while it is still awaiting the chain's answer
-        /// on refresh: `credited` is read once, before `check_collateral`'s
-        /// own await, exactly like the deposit it is added to. This is the
-        /// safe direction on purpose -- a race can only produce a false
-        /// refusal (which self-heals on resubmission, proven below) and
-        /// never lets a single payout be "spent" twice by two admissions
-        /// that individually raced past its snapshot.
-        #[tokio::test]
-        async fn a_payout_recorded_mid_admission_does_not_retroactively_cover_it() {
-            let (_secret, address) = evm_signer();
-            let entered_refresh = Arc::new(Notify::new());
-            let release_refresh = Arc::new(Notify::new());
-            let source = Arc::new(RendezvousSource {
-                channel_id: decode_hex_bytes::<32>(&unrecorded_channel_id()).unwrap(),
-                channel: EvmChannel {
-                    counterparty: address,
-                    chain_id: EVM_CHAIN_ID,
-                    token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-                    deposit_floor: DepositFloor::AtLeast(1_000),
-                },
-                calls: AtomicUsize::new(0),
-                entered_refresh: Arc::clone(&entered_refresh),
-                release_refresh: Arc::clone(&release_refresh),
-            });
-            let ledger = ledger_crediting(&unrecorded_channel_id(), 0);
-            let gate = Arc::new(
-                gate_over(
-                    ClientChannelRegistry::new()
-                        .with_source(source)
-                        .with_liveness_policy(unsuppressed()),
-                )
-                .with_payout_ledger(Arc::clone(&ledger)),
-            );
-
-            // Breaches the raw deposit (1_000 + 0 credited < 1_400), so
-            // `check_collateral` re-reads the chain -- the second lookup
-            // `RendezvousSource` gates.
-            let admitting = Arc::clone(&gate);
-            let admission = tokio::spawn(async move {
-                admitting
-                    .ingest(&evm_claim_json(&unrecorded_channel_id(), 1, 1_400), 100)
-                    .await
-            });
-
-            // Wait until the admission is inside the refresh read -- its
-            // `credited` snapshot (0) is already taken by construction,
-            // since that read happens synchronously before this refresh is
-            // ever reached.
-            entered_refresh.notified().await;
-            ledger
-                .record_payout(&unrecorded_channel_id(), 1_000, now())
-                .expect("signer and domain configured");
-            release_refresh.notify_one();
-
-            assert_eq!(
-                admission.await.unwrap(),
-                Err(ClaimIngestRejection::Undercollateralized {
-                    claimed: 1_400,
                     deposited: 1_000,
                 }),
-                "a payout recorded after this admission's credited snapshot must not rescue it"
+                "a payout nets against nothing"
             );
-
-            // The self-heal: the identical claim, resubmitted now that the
-            // payout is visible from the start, succeeds -- nothing about
-            // the race left the gate in a state where it can never be
-            // paid.
             assert!(gate
-                .ingest(&evm_claim_json(&unrecorded_channel_id(), 1, 1_400), 100)
+                .ingest(&evm_claim_json(&unrecorded_channel_id(), 1, 1_000), 100)
                 .await
                 .is_ok());
         }
 
-        // -- Reconnect mid-flight: a session reconnect must not lose
-        // either watermark --
-
-        fn reconnect_test_channels(address: Address) -> ClientChannelRegistry {
-            let mut channels = ClientChannelRegistry::new();
-            channels
-                .record_evm(
-                    &channel_id(),
-                    EvmChannel {
-                        counterparty: address,
-                        chain_id: EVM_CHAIN_ID,
-                        token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-                        deposit_floor: DepositFloor::AtLeast(1_000),
-                    },
-                )
-                .expect("valid channel id");
-            channels
-        }
-
-        /// A BTP session reconnect rebuilds only the [`ClientClaimGate`]
-        /// (`btp.rs`'s own doc: "the same `ClientClaimGate` instance, the
-        /// same watermarks and journal" -- here, a fresh gate over the
-        /// *same* journal, standing in for a reconnect within a process
-        /// that never restarted) while [`ClientPayoutLedger`] -- owned by
-        /// the longer-lived `ClientEdgeState`, not the session -- is
-        /// simply reattached via [`ClientClaimGate::with_payout_ledger`].
-        /// Both the client's already-accepted spend (owed) and this
-        /// connector's already-signed payout (credited) must still net
-        /// exactly as they did before the reconnect.
+        /// Issue #787 at the gate: a session is bound under its ILP address,
+        /// and `credit_session_payout` resolves it to the payee a verified
+        /// voucher or proof taught -- never taking the address itself as a
+        /// channel.
         #[tokio::test]
-        async fn a_reconnect_mid_sequence_preserves_both_owed_and_credited() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("client-edge-claims.log");
-            let channel = channel_id();
-            let (_secret, address) = evm_signer();
-            let ledger = ledger_crediting(&channel, 0);
+        async fn a_session_taught_its_payee_is_paid_by_its_address() {
+            let (ledger, payee, gate) = chain_resolved_with_payouts(1_000).await;
+            gate.record_session_payee("g.toon.provider", payee);
 
-            {
-                let gate = ClientClaimGate::restore(
-                    reconnect_test_channels(address),
-                    Arc::new(FileJournal::open(&path).expect("open the journal file")),
-                )
-                .expect("replay the journal")
-                .with_payout_ledger(Arc::clone(&ledger));
-
-                // Owed climbs to 800 against a 1_000 deposit and no credit
-                // yet.
-                gate.ingest(&evm_claim_json(&channel, 1, 800), 0)
-                    .await
-                    .expect("within the raw deposit");
-                // Mid-sequence, this connector credits the client 500 for
-                // earned work -- headroom is now 1_000 + 500 - 800 = 700.
-                ledger
-                    .record_payout(&channel, 500, now())
-                    .expect("signer and domain configured");
-            }
-
-            // Reconnect: a fresh gate over the same journal, the same
-            // ledger reattached -- the session dropped, the process did
-            // not.
-            let reconnected = ClientClaimGate::restore(
-                reconnect_test_channels(address),
-                Arc::new(FileJournal::open(&path).expect("open the journal file")),
-            )
-            .expect("replay the journal")
-            .with_payout_ledger(Arc::clone(&ledger));
-
-            // The client's own already-spent nonce is still spent.
-            assert_eq!(
-                reconnected
-                    .ingest(&evm_claim_json(&channel, 1, 800), 0)
-                    .await,
-                Err(ClaimIngestRejection::NonceNotAdvancing),
-            );
-
-            // Exactly the netted headroom survives the reconnect: 800 +
-            // 700 = 1_500 is good, one unit past it is not.
-            assert!(reconnected
-                .ingest(&evm_claim_json(&channel, 2, 1_500), 0)
+            let paid = gate
+                .credit_session_payout("g.toon.provider", &[3; 32], 5_000)
                 .await
-                .is_ok());
-            assert_eq!(
-                reconnected
-                    .ingest(&evm_claim_json(&channel, 3, 1_501), 0)
-                    .await,
-                Err(ClaimIngestRejection::Undercollateralized {
-                    claimed: 1_501,
-                    deposited: 1_000,
-                })
-            );
-        }
-    }
-
-    // -- Issue #787: a session bound under its ILP address resolves to
-    // the channel id an earlier inbound claim taught this gate --
-    mod session_channel_association {
-        use super::*;
-        use connector_runtime::ChannelDomain;
-        use connector_signer::LocalSigner;
-
-        fn payout_domain() -> ChannelDomain {
-            ChannelDomain {
-                chain_id: EVM_CHAIN_ID,
-                token_network_address: EVM_TOKEN_NETWORK_ADDRESS,
-            }
+                .expect("the session's payee has a channel toward it");
+            assert_eq!(paid.payee, payee);
+            assert_eq!(ledger.signed_toward(&payee), 5_000);
         }
 
-        /// The bug this issue fixes, reproduced directly at the gate: a
-        /// session is bound under its ILP address, never under a channel
-        /// id (issue #736/toon-client#503), so `credit_session_payout`
-        /// must resolve the one from the other rather than being handed a
-        /// channel id already. Before the fix there was no resolution
-        /// step at all -- `credit_payout` was called with the address
-        /// itself, which never decodes as a channel id, so nothing was
-        /// ever credited on any real deployment.
+        /// Issue #787's AC3: a destination this gate has never learned a
+        /// payee for is paid nothing, decided explicitly.
         #[tokio::test]
-        async fn a_session_taught_its_channel_is_credited_by_its_address() {
-            let address = "g.toon.provider";
-            let channel_id = format!("0x{:064x}", 1);
-
-            let mut ledger = ClientPayoutLedger::new();
-            ledger.set_signer(Arc::new(LocalSigner::generate("payout-key")));
-            ledger
-                .set_channel_domain(channel_id.clone(), payout_domain())
-                .expect("valid channel id");
-            let ledger = Arc::new(ledger);
-
-            let gate = gate().with_payout_ledger(Arc::clone(&ledger));
-            gate.record_session_channel(address, channel_id.clone());
-
-            let job_id = [3u8; 32];
-            let claim = gate
-                .credit_session_payout(address, &job_id, 5_000, now())
+        async fn a_destination_with_no_known_payee_is_paid_nothing() {
+            let (ledger, payee, gate) = chain_resolved_with_payouts(1_000).await;
+            assert!(gate
+                .credit_session_payout("g.toon.unpaid", &[4; 32], 5_000)
                 .await
-                .expect("the session's channel was known, and is payable");
-            assert_eq!(claim.channel_id, channel_id);
-            assert_eq!(ledger.credited(&channel_id), 5_000);
-        }
-
-        /// The issue's own AC3: a destination this gate has never learned a
-        /// channel for -- an earning agent that has never itself presented
-        /// a claim on this session -- must credit nothing, decided
-        /// explicitly rather than by some other path silently finding
-        /// nothing.
-        #[tokio::test]
-        async fn a_destination_with_no_known_channel_credits_nothing() {
-            let ledger = Arc::new(ClientPayoutLedger::new());
-            let gate = gate().with_payout_ledger(ledger);
-
-            let job_id = [4u8; 32];
-            let claim = gate
-                .credit_session_payout("g.toon.unpaid", &job_id, 5_000, now())
-                .await;
-            assert!(
-                claim.is_none(),
-                "no association was ever taught for this address"
-            );
-        }
-
-        fn now() -> DateTime<Utc> {
-            "2030-01-01T00:00:00Z".parse().unwrap()
+                .is_none());
+            assert_eq!(ledger.signed_toward(&payee), 0);
         }
     }
 
