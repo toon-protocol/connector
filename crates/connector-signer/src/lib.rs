@@ -6,16 +6,14 @@
 //! crate in this workspace holds key material or performs a signing
 //! operation directly -- anything that needs to sign a claim or a
 //! settlement transaction takes a `&dyn Signer`. It is also where a claim's
-//! signature is checked -- both a peer claim (issue #575, ADR 0024)
-//! and a client edge claim's chain-native wallet signature (issue #506) go
-//! through [`verify_evm_balance_proof`]/[`verify_solana_balance_proof`],
-//! neither needing key material of its own, only the public key or address
-//! a channel's counterparty is already known by. An x402 `batch-settlement`
-//! voucher (ADR 0074, issue #1341) is verified here too, through its own
-//! [`verify_evm_voucher`]/[`verify_solana_voucher`] and [`VoucherSignature`]
-//! -- a second claim scheme, never a variant of the first. [`verify`] is unrelated to
-//! either: it is the `Signer` contract suite's own "a signature recovers to
-//! its signer's own public key" check (`src/contract.rs`).
+//! signature is checked: every claim is an x402 `batch-settlement` voucher
+//! (ADR 0074, ADR 0075), verified through [`verify_evm_voucher`]/
+//! [`verify_solana_voucher`] and [`VoucherSignature`], needing no key
+//! material of its own, only the signer a channel names. TOON's own
+//! balance-proof claim and its verification are deleted (ADR 0075, issue
+//! #1385). [`verify`] is unrelated: it is the `Signer` contract suite's own
+//! "a signature recovers to its signer's own public key" check
+//! (`src/contract.rs`).
 //!
 //! Deliberately absent, per ADR 0012: mnemonic recovery, seed management,
 //! human wallet authentication, a wallet database, and any fraud or
@@ -32,17 +30,17 @@
 //! ADR 0012 also named a treasury component (`Treasury`/`ChainClient`) that
 //! spends and reports a balance through a `Signer`. It never had a caller
 //! outside its own `#[cfg(test)]` module on any running node -- the real,
-//! wired collateral path is `connector-settlement`'s `SettlementBackend`
-//! (`fund`/`redeem`/`channel_state`, constructed in `connector-cli::runtime`
-//! and integration-tested against a real chain). Issue #556 removed it, on
+//! wired collateral path is `connector-settlement`'s settlement port
+//! (constructed in `connector-cli::runtime` and integration-tested against a
+//! real chain). Issue #556 removed it, on
 //! ADR 0033's own precedent that a component whose job is already done
 //! elsewhere is removed rather than restated.
 
 mod address;
-mod claim_signature;
 mod claim_state_challenge;
 mod crypto;
 mod ed25519_signer;
+mod eip712;
 mod error;
 pub mod giftwrap;
 mod kms;
@@ -52,10 +50,6 @@ mod signer;
 mod voucher_signature;
 
 pub use address::{derive_evm_address, to_hex, Address};
-pub use claim_signature::{
-    evm_balance_proof_digest, solana_balance_proof_message, verify_evm_balance_proof,
-    verify_solana_balance_proof, EvmBalanceProof,
-};
 pub use claim_state_challenge::{
     evm_voucher_claim_state_challenge_digest, solana_voucher_claim_state_challenge_message,
     verify_evm_voucher_claim_state_challenge, verify_solana_voucher_claim_state_challenge,

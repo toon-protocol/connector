@@ -32,7 +32,7 @@
 //! `TokenNetwork`'s domain, and the `toon-claim-state-challenge-v1` Solana
 //! message -- is deleted with that claim scheme (ADR 0075, issue #1384).
 
-use crate::claim_signature::{keccak256, recover_evm_signer, word_u64_be};
+use crate::eip712::{keccak256, recover_evm_signer, word_u64_be};
 use crate::voucher_signature::BatchSettlementDomain;
 use crate::Address;
 

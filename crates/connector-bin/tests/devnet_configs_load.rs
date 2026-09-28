@@ -1871,13 +1871,10 @@ const ENDPOINTS_EVM_BLOCKS: [&str; 2] = ["evm", "baseSepolia"];
 /// `registry.getTokenNetwork(token) == tokenNetworkUsdc`, and that is an
 /// `eth_call`. The workspace gate runs on every push and must not need a
 /// chain (ADR 0009's fail-closed boot is exactly the network dependency the
-/// verbatim cases above substitute away), so the chain half lives in
-/// `.github/workflows/base-sepolia-redeem-gate.yml`, whose dry run already
-/// resolves the registry against Base Sepolia and now compares that answer
-/// to this very file. The two halves compose: this test pins the document to
-/// the constant, and that job pins the constant to the chain. Either alone
-/// would have missed this -- a chain check nothing dispatches, or a document
-/// check with nothing behind the number.
+/// verbatim cases above substitute away). The chain half lived in a
+/// dispatch-only workflow, `base-sepolia-redeem-gate.yml`, deleted with the
+/// connector's `TokenNetwork` redeem path (ADR 0075, #1385); this test still
+/// pins the document to the constant.
 #[test]
 fn the_public_endpoints_document_names_the_fleets_live_evm_deployment() {
     let endpoints: serde_json::Value =
