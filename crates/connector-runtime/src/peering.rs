@@ -11,19 +11,26 @@
 //!
 //! # A peering is two channels (ADR 0075 decision 4)
 //!
-//! On EVM every channel is a one-way x402 `batch-settlement` channel, so a
-//! peering is two of them: A→B carries A's vouchers to B, B→A carries B's to
-//! A. This write opens and funds only this node's own, and the other half
-//! is **admitted, not configured**: the counterparty opens it the same way,
-//! by writing `POST /peers` naming this node's URL, and its first voucher
-//! is admitted by the receiving half's rules. What makes that channel the
+//! On both chains every channel is a one-way x402 `batch-settlement`
+//! channel, so a peering is two of them: A→B carries A's vouchers to B, B→A
+//! carries B's to A. This write opens and funds only this node's own, and
+//! the other half is **admitted, not configured**: the counterparty opens it
+//! the same way, by writing `POST /peers` naming this node's URL, and it is
+//! admitted by the receiving half's rules. What makes that channel the
 //! counterparty's rather than a client's is its voucher signer -- EVM
-//! `payerAuthorizer` -- being the key the counterparty's self-description
-//! publishes (`voucherSigners`), which this write binds to the peering.
-//! Neither operator pastes the other's channel id anywhere.
+//! `payerAuthorizer`, Solana `authorized_signer` -- being the key the
+//! counterparty's self-description publishes (`voucherSigners`), which this
+//! write binds to the peering. Neither operator pastes the other's channel
+//! id anywhere.
 //!
-//! On Solana, until #1379, a peering is still one `toon-channel` held in
-//! both roles and derived from the two settlement keys (ADR 0059).
+//! **On Solana the open goes through the counterparty** (ADR 0075 decision
+//! 3): the `open` names the counterparty's sponsor key as fee payer,
+//! `rent_payer` and `payee`, and is posted to its `sponsorEndpoint`, which
+//! co-signs, submits and admits it. That is how each receiver keeps the
+//! `payee` seat, without which it could not land its latest voucher with
+//! `settle_and_seal` once this node asks to close (ADR 0074 decision 5).
+//! The channel therefore shows up at the counterparty when it is opened,
+//! not with its first voucher as on EVM.
 //!
 //! # Where each part of a peering comes from
 //!
@@ -49,8 +56,8 @@
 //! (ADR 0018). The **EVM settlement address** is 20 bytes, and is both the
 //! receiver this node's channel names and -- as the peer's voucher signer
 //! -- what the peer's channel toward this node is bound by. The **Solana
-//! settlement address** is a base58 ed25519 public key. None of them is
-//! ever read in place of another.
+//! settlement key** is a base58 ed25519 public key, in the same two roles
+//! on its chain. None of them is ever read in place of another.
 //!
 //! # Trust-on-first-use
 //!
@@ -86,31 +93,18 @@
 //! unintended second channel is visible in the operator's own output rather
 //! than discovered later on a block explorer.
 
-use chrono::Duration;
 use connector_config::{SettlementChain, DEFAULT_MAX_PACKET_AMOUNT};
-use connector_domain::x402::{
-    X402BatchSettlementEvmTerms, X402BatchSettlementTerms, X402ChainSettlementTerms,
-    X402SolanaSettlementTerms,
-};
+use connector_domain::x402::X402BatchSettlementTerms;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
 use crate::batch_channels::{receiver_terms, BatchChannelError};
-use crate::connector::{hex_lower, ChannelOperationError, Connector, PeerRouteTableError};
+use crate::connector::{hex_lower, Connector, PeerRouteTableError};
 use crate::operator_view::PeerView;
 use crate::peer_route_store::{RuntimePeerChannel, RuntimePeering};
 use crate::self_description::SelfDescriptionError;
 use crate::voucher_binding::{VoucherBindingError, VoucherSigner};
-
-/// The withdrawal-safety window a Solana `toon-channel` opened by
-/// establishing a peering gets (#1379 moves Solana to x402).
-///
-/// A day, which is comfortably past the program's minimum and is a window
-/// an operator can act inside without watching a clock. An EVM peering's
-/// channel takes the counterparty's own published minimum `withdrawDelay`
-/// instead (ADR 0075 decision 3).
-pub const PEERING_SETTLEMENT_TIMEOUT_SECONDS: i64 = 24 * 60 * 60;
 
 /// Which branch the find-or-open took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,8 +120,9 @@ pub enum ChannelBranch {
 /// The channel a peering was established on, and how it got there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EstablishedChannel {
-    /// The channel's on-chain identifier, as read back from the chain: on
-    /// EVM this node's own outbound x402 channel toward the counterparty.
+    /// This node's own outbound x402 channel toward the counterparty, as
+    /// read back from the chain: an EVM `channelId`, or a Solana channel
+    /// account.
     pub id: String,
     pub status: ChannelBranch,
     /// Which chain it lives on -- `"evm"` or `"solana"`.
@@ -165,11 +160,11 @@ pub enum EstablishPeeringError {
          watermark is restored from -- can never be asked"
     )]
     NoDialableClientEdge { url: String },
-    /// This node and the counterparty settle on no chain in common -- on
-    /// EVM, no x402 `batch-settlement` terms this node can pay on -- so no
-    /// channel can exist between them and no packet could ever be paid.
+    /// This node and the counterparty share no chain on which both pay and
+    /// are paid over x402 `batch-settlement`, so no channel can exist
+    /// between them and no packet could ever be paid.
     #[error(
-        "this connector and {url} settle on no chain in common (on EVM, a peering needs x402 \
+        "this connector and {url} settle on no chain in common (a peering needs x402 \
          batch-settlement on both nodes), so no channel can be opened"
     )]
     NoSharedChain { url: String },
@@ -215,17 +210,15 @@ pub enum EstablishPeeringError {
          of the shared token) to open one"
     )]
     DepositRequired { url: String },
-    /// Opening, reading or restoring this node's outbound channel failed.
+    /// Opening, reading or restoring this node's outbound channel failed --
+    /// on Solana including the counterparty's sponsor endpoint refusing the
+    /// `open`, which it names.
     #[error(transparent)]
     Outbound(#[from] BatchChannelError),
     /// The counterparty's voucher signer already proves another peering on
     /// this node: one signer, one relation (ADR 0075 decision 4).
     #[error(transparent)]
     Binding(#[from] VoucherBindingError),
-    /// The chain operation itself failed -- on Solana, reading whether a
-    /// channel exists, or opening one.
-    #[error(transparent)]
-    Channel(#[from] ChannelOperationError),
     /// The durable write was refused. Carries ADR 0034's precedence rules
     /// through unchanged.
     #[error(transparent)]
@@ -243,9 +236,9 @@ impl Connector {
     ///
     /// `chain` is an optional disambiguator for the one case that has no
     /// honest default: two nodes that settle on more than one chain in
-    /// common. `deposit` is what an EVM peering's outbound channel is
-    /// opened with when this node has none toward the counterparty yet;
-    /// with one already open it is not spent (top that channel up with
+    /// common. `deposit` is what the peering's outbound channel is opened
+    /// with when this node has none toward the counterparty yet; with one
+    /// already open it is not spent (top that channel up with
     /// `POST /channels/:id/fund` instead).
     pub async fn establish_peering(
         &self,
@@ -275,19 +268,10 @@ impl Connector {
             }
         })?;
 
-        let terms = self.shared_settlement(&document, chain, url)?;
-        let (binding, channel) = match terms {
-            SharedSettlement::Evm {
-                terms,
-                voucher_signer,
-            } => {
-                self.open_evm_peering_channel(&id, url, &terms, voucher_signer, deposit)
-                    .await?
-            }
-            SharedSettlement::Solana(terms) => {
-                self.open_solana_peering_channel(url, &terms).await?
-            }
-        };
+        let shared = self.shared_settlement(&document, chain, url)?;
+        let (binding, channel) = self
+            .open_peering_channel(&id, url, &shared, deposit)
+            .await?;
 
         let peering = RuntimePeering {
             fee,
@@ -304,11 +288,8 @@ impl Connector {
         // Wire the peering before the durable write, so a row that lands is
         // a row this node can already act on; and write the row last, so
         // the durable table never names a peering the running process has
-        // not wired up. On EVM that is the hop every forward to the peer is
-        // covered on (ADR 0075 decision 6); on Solana, until #1379, the one
-        // `toon-channel` in both roles (issue #1217).
-        self.bind_runtime_peer_channel(&id, &binding);
-        self.register_outbound_client_hop(&id, &binding, &client_edge_url);
+        // not wired up. The hop every forward to the peer is covered on (ADR
+        // 0075 decision 6), then the carriage, then the row.
         self.register_voucher_hop(&id, &binding, &client_edge_url);
         self.register_runtime_peering(&id, &peering);
         let peer = self.upsert_runtime_peer(id.clone(), peering)?;
@@ -319,68 +300,74 @@ impl Connector {
         Ok(PeeringEstablished { peer, channel })
     }
 
-    /// This node's own outbound x402 channel toward an EVM counterparty
-    /// (ADR 0075 decisions 3 and 4): the one it already has open toward the
-    /// counterparty's receiver, or a new one opened now on the terms the
-    /// counterparty publishes, with `deposit`.
-    async fn open_evm_peering_channel(
+    /// This node's own outbound x402 channel toward the counterparty (ADR
+    /// 0075 decisions 3 and 4), on either chain: the one it already has open
+    /// toward the counterparty's receiver, or a new one opened now on the
+    /// terms the counterparty publishes, with `deposit`. On Solana the open
+    /// is posted to the counterparty's sponsor endpoint (resolved against
+    /// `url` when published as a path), so the counterparty holds the
+    /// `payee` and `rent_payer` seats.
+    async fn open_peering_channel(
         &self,
         id: &str,
         url: &Url,
-        terms: &X402BatchSettlementEvmTerms,
-        voucher_signer: Option<String>,
+        shared: &SharedSettlement,
         deposit: Option<u128>,
     ) -> Result<(RuntimePeerChannel, EstablishedChannel), EstablishPeeringError> {
         let url_text = url.to_string();
-        let ours = self.x402_network(SettlementChain::Evm).unwrap_or_default();
-        if terms.network != ours {
+        let chain = shared.chain();
+        let network = shared.network();
+        let ours = self.x402_network(chain).unwrap_or_default();
+        if network != ours {
             return Err(EstablishPeeringError::NetworkMismatch {
                 url: url_text,
-                theirs: terms.network.clone(),
+                theirs: network.to_string(),
                 ours: ours.to_string(),
             });
         }
-        let voucher_signer =
-            voucher_signer.ok_or_else(|| EstablishPeeringError::NoVoucherSigner {
+        let published_signer = shared.voucher_signer.as_deref().ok_or_else(|| {
+            EstablishPeeringError::NoVoucherSigner {
                 url: url_text.clone(),
-                network: terms.network.clone(),
-            })?;
+                network: network.to_string(),
+            }
+        })?;
         let unreadable = |value: &str| EstablishPeeringError::UnreadableSettlementAddress {
             url: url_text.clone(),
-            chain: SettlementChain::Evm.to_string(),
+            chain: chain.to_string(),
             value: value.to_string(),
         };
-        let signer =
-            parse_evm_address(&voucher_signer).ok_or_else(|| unreadable(&voucher_signer))?;
+        let signer = parse_voucher_signer(chain, published_signer)
+            .ok_or_else(|| unreadable(published_signer))?;
         // One signer, one relation: refused before a channel is opened for
         // a peering that could then never be bound.
-        if let Some(bound_to) = self.voucher_signer_peer(&VoucherSigner::Evm(signer)) {
+        if let Some(bound_to) = self.voucher_signer_peer(&signer) {
             if bound_to != id {
                 return Err(VoucherBindingError::SignerBoundElsewhere {
-                    signer: voucher_signer,
+                    signer: published_signer.to_string(),
                     bound_to,
                 }
                 .into());
             }
         }
-        let receiver = parse_evm_address(&terms.pay_to).ok_or_else(|| unreadable(&terms.pay_to))?;
+        let pay_to = shared.pay_to();
+        let receiver = parse_voucher_signer(chain, pay_to).ok_or_else(|| unreadable(pay_to))?;
         let outbound = self
             .outbound_channels()
-            .ok_or(BatchChannelError::NoBackend(SettlementChain::Evm))?;
+            .ok_or(BatchChannelError::NoBackend(chain))?;
 
-        let (channel_id, status) = match outbound.live_toward(&VoucherSigner::Evm(receiver)).await?
-        {
+        let (channel_id, status) = match outbound.live_toward(&receiver).await? {
             Some(channel_id) => (channel_id, ChannelBranch::Found),
             None => {
                 let deposit = deposit.ok_or_else(|| EstablishPeeringError::DepositRequired {
                     url: url_text.clone(),
                 })?;
                 let receiver_terms =
-                    receiver_terms(&X402BatchSettlementTerms::Evm(terms.clone()), Some(url))
-                        .map_err(|reason| EstablishPeeringError::InvalidTerms {
+                    receiver_terms(&shared.terms, Some(url)).map_err(|reason| {
+                        EstablishPeeringError::InvalidTerms {
                             url: url_text.clone(),
                             reason,
-                        })?;
+                        }
+                    })?;
                 // The id comes back off the chain: `open` restores the
                 // channel from it before answering, so a row written here is
                 // a row backed by a channel the chain confirmed.
@@ -388,54 +375,24 @@ impl Connector {
                 (state.on_chain.id.0, ChannelBranch::Created)
             }
         };
-        Ok((
-            RuntimePeerChannel::EvmVoucher {
+        let binding = match signer {
+            VoucherSigner::Evm(signer) => RuntimePeerChannel::EvmVoucher {
                 outbound_channel_id: channel_id.clone(),
                 voucher_signer: format!("0x{}", hex_lower(&signer)),
-                network: terms.network.clone(),
+                network: network.to_string(),
             },
-            EstablishedChannel {
-                id: channel_id,
-                status,
-                chain: SettlementChain::Evm.to_string(),
+            VoucherSigner::Solana(signer) => RuntimePeerChannel::SolanaVoucher {
+                outbound_channel_id: channel_id.clone(),
+                voucher_signer: bs58::encode(signer).into_string(),
+                network: network.to_string(),
             },
-        ))
-    }
-
-    /// The one `toon-channel` a Solana peering holds in both roles, derived
-    /// from the two settlement keys and opened if absent (ADR 0059, until
-    /// #1379 moves Solana to x402).
-    async fn open_solana_peering_channel(
-        &self,
-        url: &Url,
-        terms: &X402SolanaSettlementTerms,
-    ) -> Result<(RuntimePeerChannel, EstablishedChannel), EstablishPeeringError> {
-        let counterparty = solana_key_bytes(&terms.settlement_address, url)?;
-        let settlement = self.settlement_on_chain(SettlementChain::Solana)?;
-        let (channel_id, status) = match settlement.live_channel_with(counterparty.clone()).await {
-            Ok(Some(existing)) => (existing.0, ChannelBranch::Found),
-            Ok(None) => {
-                let opened = self
-                    .open_channel(
-                        Some(SettlementChain::Solana),
-                        counterparty,
-                        Duration::seconds(PEERING_SETTLEMENT_TIMEOUT_SECONDS),
-                    )
-                    .await?;
-                (opened.id, ChannelBranch::Created)
-            }
-            Err(error) => return Err(ChannelOperationError::Settlement(error).into()),
         };
         Ok((
-            RuntimePeerChannel::Solana {
-                channel_account: channel_id.clone(),
-                counterparty_key: terms.settlement_address.clone(),
-                program_id: terms.program_id.clone(),
-            },
+            binding,
             EstablishedChannel {
                 id: channel_id,
                 status,
-                chain: SettlementChain::Solana.to_string(),
+                chain: chain.to_string(),
             },
         ))
     }
@@ -468,25 +425,37 @@ fn peer_endpoint(
     dialable(&document.btp_endpoint).or_else(|| dialable(&document.http_endpoint))
 }
 
-/// One chain's published settlement facts, narrowed to the chain this
-/// connector also settles on.
+/// One chain's published x402 terms, narrowed to a chain this connector
+/// also pays on: the counterparty's `batchSettlements` entry, and the
+/// voucher signer it publishes for that entry's network, if any.
 #[derive(Debug)]
-pub(crate) enum SharedSettlement {
-    /// The counterparty's x402 terms on EVM (its `batchSettlements` entry),
-    /// and the voucher signer it publishes for that network, if any.
-    Evm {
-        terms: X402BatchSettlementEvmTerms,
-        voucher_signer: Option<String>,
-    },
-    /// The counterparty's `toon-channel` terms on Solana, until #1379.
-    Solana(X402SolanaSettlementTerms),
+pub(crate) struct SharedSettlement {
+    terms: X402BatchSettlementTerms,
+    voucher_signer: Option<String>,
 }
 
 impl SharedSettlement {
     pub(crate) fn chain(&self) -> SettlementChain {
-        match self {
-            SharedSettlement::Evm { .. } => SettlementChain::Evm,
-            SharedSettlement::Solana(_) => SettlementChain::Solana,
+        match self.terms {
+            X402BatchSettlementTerms::Evm(_) => SettlementChain::Evm,
+            X402BatchSettlementTerms::Solana(_) => SettlementChain::Solana,
+        }
+    }
+
+    /// The CAIP-2 network the terms name.
+    fn network(&self) -> &str {
+        match &self.terms {
+            X402BatchSettlementTerms::Evm(evm) => &evm.network,
+            X402BatchSettlementTerms::Solana(solana) => &solana.network,
+        }
+    }
+
+    /// Who the terms pay: the receiver this node's channel names -- EVM
+    /// `receiver`, Solana the one distribution recipient.
+    fn pay_to(&self) -> &str {
+        match &self.terms {
+            X402BatchSettlementTerms::Evm(evm) => &evm.pay_to,
+            X402BatchSettlementTerms::Solana(solana) => &solana.pay_to,
         }
     }
 }
@@ -508,51 +477,52 @@ pub(crate) fn parse_evm_address(value: &str) -> Option<[u8; 20]> {
     Some(address)
 }
 
-/// A Solana settlement key as the 32 bytes the settlement backend takes, or
-/// a named refusal for anything that is not exactly that.
-fn solana_key_bytes(value: &str, url: &Url) -> Result<Vec<u8>, EstablishPeeringError> {
-    let unreadable = || EstablishPeeringError::UnreadableSettlementAddress {
-        url: url.to_string(),
-        chain: SettlementChain::Solana.to_string(),
-        value: value.to_string(),
-    };
-    let bytes = bs58::decode(value).into_vec().map_err(|_| unreadable())?;
-    if bytes.len() != 32 {
-        return Err(unreadable());
-    }
-    Ok(bytes)
+/// A 32-byte Solana key from its base58 spelling, or `None` for anything
+/// that is not exactly that -- never an EVM address read as one.
+pub(crate) fn parse_solana_key(value: &str) -> Option<[u8; 32]> {
+    bs58::decode(value)
+        .into_vec()
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
 }
 
-/// Narrow a document's published settlements to the one chain this
-/// connector will peer on: EVM from its x402 `batchSettlements` entry (ADR
-/// 0075), Solana from its `toon-channel` `settlements` entry (until #1379).
+/// A key or address in `chain`'s own shape, as the [`VoucherSigner`] a
+/// channel names it by: a voucher signer, or the receiver a channel pays.
+pub(crate) fn parse_voucher_signer(chain: SettlementChain, value: &str) -> Option<VoucherSigner> {
+    match chain {
+        SettlementChain::Evm => parse_evm_address(value).map(VoucherSigner::Evm),
+        SettlementChain::Solana => parse_solana_key(value).map(VoucherSigner::Solana),
+    }
+}
+
+/// Narrow a document's published x402 terms (`batchSettlements`, ADR 0075
+/// decision 10) to the one chain this connector will peer on, each with the
+/// voucher signer the document publishes for the same network. A
+/// `toon-channel` `settlements` entry is never read: no chain peers on one.
 pub(crate) fn shared_settlement_of(
     document: &connector_domain::NodeSelfDescription,
-    settles_on: impl Fn(SettlementChain) -> bool,
+    pays_on: impl Fn(SettlementChain) -> bool,
     wanted: Option<SettlementChain>,
     url: &Url,
 ) -> Result<SharedSettlement, EstablishPeeringError> {
-    let evm = document
+    let mut shared: Vec<SharedSettlement> = document
         .batch_settlements
         .iter()
-        .filter_map(|entry| match entry {
-            X402BatchSettlementTerms::Evm(evm) => Some(SharedSettlement::Evm {
+        .map(|terms| {
+            let network = match terms {
+                X402BatchSettlementTerms::Evm(evm) => &evm.network,
+                X402BatchSettlementTerms::Solana(solana) => &solana.network,
+            };
+            SharedSettlement {
                 voucher_signer: document
                     .voucher_signers
                     .iter()
-                    .find(|signer| signer.network == evm.network)
+                    .find(|signer| &signer.network == network)
                     .map(|signer| signer.signer.clone()),
-                terms: evm.clone(),
-            }),
-            X402BatchSettlementTerms::Solana(_) => None,
-        });
-    let solana = document.settlements.iter().filter_map(|entry| match entry {
-        X402ChainSettlementTerms::Solana(solana) => Some(SharedSettlement::Solana(solana.clone())),
-        X402ChainSettlementTerms::Evm(_) => None,
-    });
-    let mut shared: Vec<SharedSettlement> = evm
-        .chain(solana)
-        .filter(|entry| settles_on(entry.chain()))
+                terms: terms.clone(),
+            }
+        })
+        .filter(|entry| pays_on(entry.chain()))
         .collect();
     if let Some(wanted) = wanted {
         shared.retain(|entry| entry.chain() == wanted);
@@ -593,12 +563,12 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use connector_domain::x402::X402BatchSettlementEvmTerms;
+    use connector_domain::x402::{X402BatchSettlementEvmTerms, X402BatchSettlementSolanaTerms};
     use connector_domain::{EdgeIdentity, NodeFacts, NodeSelfDescription, VoucherSignerFact};
     use connector_settlement::batch::{
-        BatchSettlementPayer, InMemoryBatchChain, InMemoryBatchSettlement, PayerExit, ReceiverTerms,
+        BatchChannelStatus, BatchSettlementPayer, InMemoryBatchChain, InMemoryBatchSettlement,
+        PayerExit, ReceiverTerms,
     };
-    use connector_settlement::InMemorySettlementBackend;
 
     use crate::app_client::FakeAppClient;
     use crate::batch_channels::OutboundChannels;
@@ -625,20 +595,24 @@ mod tests {
         })
     }
 
-    fn solana() -> X402ChainSettlementTerms {
-        X402ChainSettlementTerms::Solana(X402SolanaSettlementTerms {
-            chain: "solana".to_string(),
-            settlement_address: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".to_string(),
-            program_id: "Toon11111111111111111111111111111111111111".to_string(),
-            token_address: "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi".to_string(),
-            decimals: 6,
+    const SOLANA_NETWORK: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+
+    fn solana_batch(pay_to: &str) -> X402BatchSettlementTerms {
+        X402BatchSettlementTerms::Solana(X402BatchSettlementSolanaTerms {
+            network: SOLANA_NETWORK.to_string(),
+            asset: "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi".to_string(),
+            pay_to: pay_to.to_string(),
+            fee_payer: pay_to.to_string(),
+            min_grace_period_secs: 86_400,
+            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            min_deposit: "1".to_string(),
+            sponsor_endpoint: "/ilp/batch-settlement/solana/open".to_string(),
         })
     }
 
     fn document(
         btp: Option<&str>,
         http: Option<&str>,
-        settlements: Vec<X402ChainSettlementTerms>,
         batch_settlements: Vec<X402BatchSettlementTerms>,
         voucher_signers: Vec<VoucherSignerFact>,
     ) -> NodeSelfDescription {
@@ -648,7 +622,7 @@ mod tests {
                 http_endpoint: http.map(str::to_string),
                 btp_endpoint: btp.map(str::to_string),
                 peer_carriages: vec!["http".to_string()],
-                settlements,
+                settlements: Vec::new(),
                 batch_settlements,
                 voucher_signers,
             },
@@ -662,7 +636,7 @@ mod tests {
     }
 
     fn endpoints(btp: Option<&str>, http: Option<&str>) -> NodeSelfDescription {
-        document(btp, http, Vec::new(), Vec::new(), Vec::new())
+        document(btp, http, Vec::new(), Vec::new())
     }
 
     /// §2.3 against §6.4: a dialed BTP session is symmetric once
@@ -712,15 +686,14 @@ mod tests {
         assert_eq!(peer_endpoint(&endpoints(None, None), true), None);
     }
 
-    /// EVM is shared on the counterparty's x402 terms (ADR 0075), never on
-    /// its `toon-channel` ones: a node that publishes only the latter on
-    /// EVM shares no chain this build can peer on.
+    /// A chain is shared on the counterparty's x402 terms (ADR 0075), never
+    /// on its `toon-channel` ones: a node that publishes only the latter
+    /// shares no chain this build can peer on.
     #[test]
     fn one_shared_chain_is_the_answer_and_none_is_a_named_refusal() {
         let evm_only = document(
             None,
             Some("https://peer.example/ilp"),
-            Vec::new(),
             vec![evm_batch("0x00000000000000000000000000000000000000aa")],
             Vec::new(),
         );
@@ -743,7 +716,6 @@ mod tests {
             Some("https://peer.example/ilp"),
             Vec::new(),
             Vec::new(),
-            Vec::new(),
         );
         assert!(matches!(
             shared_settlement_of(&no_x402, |_| true, Some(SettlementChain::Evm), &url()),
@@ -758,8 +730,10 @@ mod tests {
         let both = document(
             None,
             Some("https://peer.example/ilp"),
-            vec![solana()],
-            vec![evm_batch("0x00000000000000000000000000000000000000aa")],
+            vec![
+                evm_batch("0x00000000000000000000000000000000000000aa"),
+                solana_batch("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"),
+            ],
             Vec::new(),
         );
 
@@ -778,7 +752,7 @@ mod tests {
         assert_eq!(named.chain(), SettlementChain::Solana);
     }
 
-    /// The voucher signer read for an EVM peering is the one the document
+    /// The voucher signer read for a peering is the one the document
     /// publishes for the same network as its x402 terms -- never another
     /// chain's key, and never the edge identity.
     #[test]
@@ -786,7 +760,6 @@ mod tests {
         let published = document(
             None,
             Some("https://peer.example/ilp"),
-            Vec::new(),
             vec![evm_batch("0x00000000000000000000000000000000000000aa")],
             vec![
                 VoucherSignerFact {
@@ -799,33 +772,39 @@ mod tests {
                 },
             ],
         );
-        let SharedSettlement::Evm { voucher_signer, .. } =
-            shared_settlement_of(&published, |_| true, None, &url()).expect("shared")
-        else {
-            panic!("EVM is the shared chain");
-        };
+        let shared = shared_settlement_of(&published, |_| true, None, &url()).expect("shared");
+        assert_eq!(shared.chain(), SettlementChain::Evm);
         assert_eq!(
-            voucher_signer.as_deref(),
+            shared.voucher_signer.as_deref(),
             Some("0x00000000000000000000000000000000000000aa")
         );
     }
 
-    /// A Solana settlement key is read as exactly 32 bytes, and an EVM
-    /// address where it belongs is refused rather than coerced.
+    /// A signer is read in its own chain's shape: a Solana key as exactly
+    /// 32 bytes of base58, an EVM address as 20 bytes of hex, and each where
+    /// the other belongs is refused rather than coerced.
     #[test]
-    fn a_solana_settlement_key_is_read_in_its_own_shape_or_refused() {
+    fn a_voucher_signer_is_read_in_its_own_chains_shape_or_refused() {
         assert_eq!(
-            solana_key_bytes("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM", &url())
-                .expect("32 bytes")
-                .len(),
-            32
+            parse_voucher_signer(
+                SettlementChain::Solana,
+                "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
+            )
+            .map(|signer| matches!(signer, VoucherSigner::Solana(_))),
+            Some(true)
         );
-        assert!(matches!(
-            solana_key_bytes("0x00000000000000000000000000000000000000aa", &url()),
-            Err(EstablishPeeringError::UnreadableSettlementAddress { .. })
-        ));
         assert_eq!(
-            parse_evm_address("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"),
+            parse_voucher_signer(
+                SettlementChain::Solana,
+                "0x00000000000000000000000000000000000000aa"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_voucher_signer(
+                SettlementChain::Evm,
+                "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
+            ),
             None
         );
     }
@@ -841,11 +820,7 @@ mod tests {
             Arc::new(InProcessPeerTransport::new()),
             Arc::new(TestClock::new(chrono::Utc::now())),
         )
-        .with_config_peer_ids(["owned-by-config".to_string()])
-        .with_settlement(
-            SettlementChain::Evm,
-            Arc::new(InMemorySettlementBackend::new()),
-        );
+        .with_config_peer_ids(["owned-by-config".to_string()]);
 
         // The default source reaches no network at all, so a refusal that
         // named the host would prove the fetch happened first.
@@ -954,7 +929,6 @@ mod tests {
         let served = document(
             None,
             Some("http://127.0.0.1:1/ilp"),
-            Vec::new(),
             vec![published],
             signers,
         );
@@ -1104,5 +1078,188 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(payer.balance(), 9_000, "the refused write opened nothing");
+    }
+
+    // -- ADR 0075 decisions 3 and 4 on Solana, over the in-memory fake --
+
+    fn base58(bytes: &[u8]) -> String {
+        bs58::encode(bytes).into_string()
+    }
+
+    /// Node `0x01` paying, on one fake Solana-shaped chain (`request_close`,
+    /// then `distribute`) with node `0x02`, whose published terms -- its
+    /// sponsor, its receiving key, its sponsor endpoint -- and voucher signer
+    /// are in the document it serves.
+    async fn paying_solana_node(
+        voucher_signer: Option<[u8; 32]>,
+    ) -> (Connector, Arc<InMemoryBatchSettlement>) {
+        let chain = InMemoryBatchChain::new(PayerExit::Close);
+        let payer = Arc::new(InMemoryBatchSettlement::on(
+            Arc::clone(&chain),
+            0x01,
+            86_400,
+        ));
+        payer.fund(10_000);
+        let counterparty = Arc::new(InMemoryBatchSettlement::on(chain, 0x02, 86_400));
+        let ReceiverTerms::Solana(terms) = counterparty.published_terms() else {
+            panic!("a Solana-shaped chain");
+        };
+        let published = X402BatchSettlementTerms::Solana(X402BatchSettlementSolanaTerms {
+            network: SOLANA_NETWORK.to_string(),
+            asset: base58(&terms.mint),
+            pay_to: base58(&terms.receiver),
+            fee_payer: base58(&terms.sponsor),
+            min_grace_period_secs: terms.min_grace_period_secs,
+            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            min_deposit: terms.min_deposit.to_string(),
+            sponsor_endpoint: terms.sponsor_endpoint.clone(),
+        });
+        let signers = voucher_signer
+            .map(|signer| {
+                vec![VoucherSignerFact {
+                    network: SOLANA_NETWORK.to_string(),
+                    signer: base58(&signer),
+                }]
+            })
+            .unwrap_or_default();
+        let served = document(
+            None,
+            Some("http://127.0.0.1:1/ilp"),
+            vec![published],
+            signers,
+        );
+        let outbound = OutboundChannels::restore(
+            Arc::new(InMemoryJournal::new()),
+            vec![(
+                SettlementChain::Solana,
+                Arc::clone(&payer) as Arc<dyn BatchSettlementPayer>,
+            )],
+        )
+        .await
+        .expect("an empty journal replays");
+        let connector = Connector::new(
+            Vec::new(),
+            Vec::new(),
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            Arc::new(TestClock::new(chrono::Utc::now())),
+        )
+        .with_self_description_source(Arc::new(FixedSelfDescription(served)))
+        .with_peer_allow_plaintext_endpoints(true)
+        .with_outbound_channels(
+            Arc::new(outbound),
+            vec![(SettlementChain::Solana, SOLANA_NETWORK.to_string())],
+        );
+        (connector, payer)
+    }
+
+    /// ADR 0075 decisions 3 and 4 on Solana (#1379): `POST /peers` opens
+    /// and funds only this node's outbound channel toward the counterparty's
+    /// receiving key, binds the counterparty's published Solana settlement
+    /// key as its voucher signer, writes an x402 row, and a repeat finds the
+    /// same channel. No `toon-channel` is derived or opened: this node has
+    /// no `SettlementBackend` at all.
+    #[tokio::test]
+    async fn a_solana_peering_opens_this_nodes_own_channel_and_binds_the_peers_signer() {
+        let signer = [0x02; 32];
+        let (connector, payer) = paying_solana_node(Some(signer)).await;
+
+        let error = connector
+            .establish_peering("node-b", &url(), 5, 0, None, None)
+            .await
+            .expect_err("no channel yet and no deposit named");
+        assert!(
+            matches!(error, EstablishPeeringError::DepositRequired { .. }),
+            "{error:?}"
+        );
+        assert_eq!(payer.balance(), 10_000, "a refused write spends nothing");
+
+        let established = connector
+            .establish_peering("node-b", &url(), 5, 0, None, Some(1_000))
+            .await
+            .expect("establish");
+        assert_eq!(established.channel.status, ChannelBranch::Created);
+        assert_eq!(established.channel.chain, "solana");
+        assert_eq!(
+            payer.balance(),
+            9_000,
+            "the opening deposit is this node's own"
+        );
+        assert_eq!(
+            connector.voucher_signer_peer(&VoucherSigner::Solana(signer)),
+            Some("node-b".to_string()),
+            "the counterparty's published key proves this peering"
+        );
+        assert_eq!(
+            connector
+                .runtime_peering("node-b")
+                .expect("the row")
+                .channels,
+            vec![RuntimePeerChannel::SolanaVoucher {
+                outbound_channel_id: established.channel.id.clone(),
+                voucher_signer: base58(&signer),
+                network: SOLANA_NETWORK.to_string(),
+            }]
+        );
+        connector
+            .upsert_runtime_peer_route("g.example.peer", "node-b", connector_domain::Price::FREE)
+            .expect("a peering paid over its own outbound channel is routable");
+
+        let repeated = connector
+            .establish_peering(
+                "node-b",
+                &url(),
+                5,
+                0,
+                Some(SettlementChain::Solana),
+                Some(1_000),
+            )
+            .await
+            .expect("a repeat");
+        assert_eq!(repeated.channel.status, ChannelBranch::Found);
+        assert_eq!(repeated.channel.id, established.channel.id);
+        assert_eq!(
+            payer.balance(),
+            9_000,
+            "a repeat opens nothing and deposits nothing"
+        );
+
+        // A channel whose close has been requested backs nothing new: the
+        // peering re-established after it gets a fresh one.
+        let outbound = connector.outbound_channels().expect("x402");
+        outbound
+            .withdraw(&established.channel.id)
+            .await
+            .expect("request the close");
+        let closing = payer
+            .outbound_state(&connector_settlement::ChannelId(
+                established.channel.id.clone(),
+            ))
+            .await
+            .expect("read");
+        assert_eq!(closing.on_chain.status, BatchChannelStatus::Closing);
+        let again = connector
+            .establish_peering("node-b", &url(), 5, 0, None, Some(1_000))
+            .await
+            .expect("re-establish");
+        assert_eq!(again.channel.status, ChannelBranch::Created);
+        assert_ne!(again.channel.id, established.channel.id);
+    }
+
+    /// A Solana counterparty that publishes no voucher signer -- or one in
+    /// EVM's shape -- could never have its channel toward this node bound,
+    /// so the peering is refused before anything is spent.
+    #[tokio::test]
+    async fn a_solana_peering_needs_a_published_signer_in_its_own_shape() {
+        let (connector, payer) = paying_solana_node(None).await;
+        let error = connector
+            .establish_peering("node-b", &url(), 0, 0, None, Some(1_000))
+            .await
+            .expect_err("no voucher signer published");
+        assert!(
+            matches!(error, EstablishPeeringError::NoVoucherSigner { .. }),
+            "{error:?}"
+        );
+        assert_eq!(payer.balance(), 10_000);
     }
 }

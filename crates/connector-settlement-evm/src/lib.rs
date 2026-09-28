@@ -1008,20 +1008,6 @@ impl SettlementBackend for EvmSettlementBackend {
         let id = self.existing_channel_id(channel).await?;
         self.read_state(channel, id).await
     }
-
-    /// The port's ADR 0059 question, answered by
-    /// [`channel_with`](Self::channel_with) -- `channelEpoch` over the
-    /// sorted pair, then `channels` at the id that derives from it. The
-    /// counterparty is a 20-byte `TokenNetwork` participant address, the
-    /// same identity [`open`](SettlementBackend::open) takes and the same
-    /// one whose signature `claimFromChannel` recovers.
-    async fn live_channel_with(
-        &self,
-        counterparty: Vec<u8>,
-    ) -> Result<Option<ChannelId>, SettlementError> {
-        self.channel_with(counterparty_address(&counterparty)?)
-            .await
-    }
 }
 
 #[cfg(test)]

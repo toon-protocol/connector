@@ -323,5 +323,11 @@ publishes. Trust-on-first-use is unchanged.
 **Built on EVM by #1378.** `POST /peers` takes a `deposit`, opens and funds this node's outbound
 `x402BatchSettlement` channel (or finds it on a repeat), binds the peer's `voucherSigners` key, and
 writes an `evm-voucher` row; no `TokenNetwork` channel is derived or opened, and a runtime EVM row
-naming one is refused at boot by name. Solana peerings still follow this record's derivation until
-#1379.
+naming one is refused at boot by name.
+
+**Built on Solana by #1379.** The same write opens and funds this node's outbound
+`payment-channels` channel by posting the payer-signed `open` to the counterparty's sponsor
+endpoint (through `socks_proxy` for an onion host), binds the peer's `voucherSigners` key as the
+inbound channel's `authorized_signer`, and writes a `solana-voucher` row; no channel of TOON's own
+program is derived or opened, and a runtime Solana row naming one is refused at boot by name. No
+runtime peering follows this record's derivation any longer.

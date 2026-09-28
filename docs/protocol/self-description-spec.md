@@ -132,10 +132,12 @@ on Solana (base58). It is the key every channel it opens names as its voucher si
 `payerAuthorizer`, equal to `payer`; Solana `authorized_signer`), and what a peer binds this node's
 channel toward it by when `POST /peers` establishes the peering
 ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decisions 3, 4
-and 10, #1378). Derived from the backend the key was connected through, never declared (ND-07), and
-omitted — not an empty array — on a node that pays on no x402 channel. A peer reads the entry whose
-`network` is the one its own x402 terms name, and refuses by name to establish an EVM peering with a
-node that publishes none. `settlements` stays beside it until #1384 drops it.
+and 10, #1378, #1379). Derived from the backend the key was connected through, never declared
+(ND-07), and omitted — not an empty array — on a node that pays on no x402 channel. A peer reads the
+entry whose `network` is the one its own x402 terms name, and refuses by name to establish a peering,
+on either chain, with a node that publishes none, or one not in that chain's shape. A peering reads
+nothing from `settlements` on either chain; it stays beside `voucherSigners` only for clients until
+#1384 drops it.
 
 **ND-07a** `[connector]` — A route's `request` table is the one exception to ND-07's "derived, never
 declared" rule, and deliberately so: there is no backend this connector can ask what an arbitrary
@@ -247,7 +249,8 @@ Uses exactly the vocabulary of [`CONTEXT.md`](../../CONTEXT.md) and implements
 [ADR 0072](../adr/0072-a-carriage-pin-is-published-on-the-route-that-enforces-it.md).
 
 **Built (#1378):** `voucherSigners` (ND-17), published for EVM and Solana wherever the chain's
-x402 backend is configured; EVM peering reads it (Solana's is #1379).
+x402 backend is configured; peering reads it on both chains (EVM since #1378, Solana since
+#1379).
 
 **Built (#1080):** the endpoint. `GET /ilp` answers this document, free and unauthenticated,
 projected from live state on each request; the x402 greeting's `extra` node facts are read off the

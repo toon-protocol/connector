@@ -117,9 +117,8 @@ payment are therefore read from the same bytes, on the same packet, every time.
 > Under ADR 0075 a peering is two one-way x402 `batch-settlement` channels, and the inbound one is
 > **admitted, not configured** — so the proof above, which needs a `[[peer_channels]]` row naming the
 > channel, cannot reach it. P2 and P3 still decide for a `toon-channel` claim, because
-> config-declared peerings (#1380) and runtime Solana ones (#1379) still prove themselves that way;
-> runtime EVM peerings moved to x402 with #1378 (§1.11), and #1380 deletes P2/P3 with the last of
-> them.
+> config-declared peerings (#1380) still prove themselves that way; runtime peerings moved to x402
+> with #1378 on EVM and #1379 on Solana (§1.11), and #1380 deletes P2/P3 with the last of them.
 
 An interaction also has role `peer` **if and only if** it carries either of:
 
@@ -141,10 +140,10 @@ none of their ids is known before the peer opens it; the one fact both sides kno
 key the peer signs with. One signer proves one relation: binding a signer already bound to another
 peering is refused, by name, and binding to a peer id no peering holds is refused too. Removing a
 runtime peering (`DELETE /peers`, ADR 0060's kill switch) unbinds its signers with the row. **A
-binding has two sources.** The first is built (#1378): the key a peer's self-description publishes
-as its `voucherSigners` entry for the shared network (`self-description-spec.md` ND-17), bound when
-`POST /peers` establishes an EVM peering and rebound from the durable row at every boot. The second,
-the key a `[[peer_channels]]` row names, is #1380; Solana's first source is #1379.
+binding has two sources.** The first is built on both chains (#1378 on EVM, #1379 on Solana): the
+key a peer's self-description publishes as its `voucherSigners` entry for the shared network
+(`self-description-spec.md` ND-17), bound when `POST /peers` establishes a peering and rebound from
+the durable row at every boot. The second, the key a `[[peer_channels]]` row names, is #1380.
 
 **Why 300 seconds.** Within `expires` a challenge is a bearer proof for zero-value traffic (ADR 0075,
 Consequences): it names one channel, so only that channel's receiver can use it, but that receiver
@@ -666,18 +665,32 @@ listener with mandatory authentication**. If it does:
   advertised to the peer that dials it);
 - it MUST still be BTP or ILP-over-HTTP. Never a bespoke wire, never raw TCP.
 
-### 1.11 A runtime EVM peering is two x402 channels (ADR 0075 decisions 4–6, issue #1378)
+### 1.11 A runtime peering is two x402 channels (ADR 0075 decisions 3–6, issues #1378, #1379)
 
-`POST /peers` on EVM opens and funds only this node's **outbound** `x402BatchSettlement` channel
-toward the counterparty, and binds the counterparty's **inbound** channel by its published voucher
-signer (§1.2). Each side does the same with the other's URL. What rides the wire:
+`POST /peers` opens and funds only this node's **outbound** channel toward the counterparty — an
+`x402BatchSettlement` channel on EVM (#1378), a `payment-channels` channel on Solana (#1379) — and
+binds the counterparty's **inbound** channel by its published voucher signer (§1.2). Each side does
+the same with the other's URL. What rides the wire:
 
 - **Every forward to the peer carries a voucher** on this node's outbound channel, in the claim slot
   (§4), for the channel's signed watermark plus the forwarded amount (`amount_after_fee(amount,
 fee)`, ADR 0042). The voucher is signed by the settlement key (`payerAuthorizer == payer`, ADR 0075
   decision 3) and journaled before it leaves (`outbound-channels.log`). An EVM voucher from this
   connector always carries its `channelConfig`, not only the channel's first, so a receiver that
-  restarted or never saw the first admits the channel from any of them.
+  restarted or never saw the first admits the channel from any of them. A Solana voucher is the
+  50-byte message over the channel account, the cumulative amount and `expires_at = 0`, signed by
+  the Solana settlement key, which is the channel's `authorized_signer` (ADR 0075 decision 3).
+- **On Solana the channel is opened through the counterparty.** The `open` names the counterparty's
+  sponsor key as fee payer, `rent_payer` and `payee`, its receiving key as the one distribution
+  recipient at 10000 bps, and a `grace_period` of its published minimum; this node signs it as
+  payer and posts it to the counterparty's `sponsorEndpoint` (resolved against the counterparty's
+  URL when published as a path), which co-signs, submits and admits it. The inbound channel is
+  therefore known to its receiver from the moment it is opened, not from its first voucher, and its
+  receiver holds the `payee` seat: after the payer's `request_close` it still lands its latest
+  voucher with `settle_and_seal` inside the grace period (ADR 0074 decision 5), by its Closing
+  watcher or `POST /channels/:id/land`. The post leaves on the node's `socks_proxy` when the sponsor
+  is an onion host, by `connector_config::is_onion_endpoint` (ADR 0070); an onion sponsor on a node
+  with no proxy is refused by name, before any dial.
 - **A forward that moves no value carries no voucher** and carries the peer-role challenge (§1.4)
   instead, signed for 60 seconds, so the receiver attributes it to the peering (X2). It is possible
   only over a peering whose `fee` is zero: a fee leaves nothing to forward (`R01`).
@@ -692,13 +705,15 @@ fee)`, ADR 0042). The voucher is signed by the settlement key (`payerAuthorizer 
   on restore** (ADR 0075 decision 6). The payer asks it once per process for each hop, and again after
   any voucher the receiver did not accept, and only ever raises its signed watermark to the answer; a
   receiver that cannot be asked leaves the journaled watermark (never behind what was signed) standing,
-  and is asked again on the next forward.
+  and is asked again on the next forward. The ask leaves on `socks_proxy` when the peer's client edge
+  is an onion host, by the same host rule as the carriage.
 - **On ILP-over-HTTP, at most one voucher-bearing request is in flight per relation** (§7.2's rule,
   applied to a peering's one outbound channel), so two cumulative vouchers cannot overtake each other.
 - **Removing the peering** (`DELETE /peers/:id`) unbinds the peer's signer and stops signing on the
   outbound channel, which stays open for `POST /channels/:id/withdraw` (ADR 0075 decision 4).
-- **A durable runtime EVM peering naming a `TokenNetwork` channel** — written before #1378 — is refused
-  at boot by name, pointing at ADR 0075's drain procedure; it is never replayed and never dropped.
+- **A durable runtime peering naming a `toon-channel`** — an EVM `TokenNetwork` channel written before
+  #1378, a channel of TOON's own Solana program written before #1379 — is refused at boot by name,
+  pointing at ADR 0075's drain procedure; it is never replayed and never dropped.
 
 The peer carriages are mounted wherever `peer_expose` names one, whether or not the config file
 declares a `[[peers]]` table: a runtime peering proves itself on them.
@@ -931,20 +946,22 @@ additively extensible) and MUST NOT be emitted.
   includes a **leased** route: `Connector::client_route` excludes leases by construction (ADR 0028),
   so neither rule here reaches one. That is ADR 0028's own gap, unchanged by ADR 0042.
 
-  **Neither rule reaches a peering established at runtime, because on the accepting side there is
-  no peering** ([ADR 0058](../adr/0058-a-peering-is-established-from-a-url.md), whose dial half §2.1
-  already carries). `POST /peers` is one operator's own write on one node: it derives the channel,
-  binds it into that node's `ClaimBook` and registers the outbound client hop that pays over it
-  (`Connector::bind_runtime_peer_channel`, `Connector::register_outbound_client_hop`), and it puts
+  > **Amended by ADR 0075 (#1378 on EVM, #1379 on Solana).** A runtime peering is two x402 channels
+  > (§1.11), and when **both** operators write `POST /peers` naming each other, each side binds the
+  > other's published voucher signer: the accepting side then does hold a peering, a voucher on the
+  > bound channel decides `peer` (§1.2, X1) and is judged against the channel's one watermark, and
+  > the peer carriages mount wherever `peer_expose` names one. The paragraph below still describes
+  > an accepting side that has **not** written `POST /peers` naming the payer.
+
+  **Neither rule reaches a peering established at runtime on one side only, because on the
+  accepting side there is no peering** ([ADR 0058](../adr/0058-a-peering-is-established-from-a-url.md),
+  whose dial half §2.1 already carries). `POST /peers` is one operator's own write on one node: it
+  opens that node's own outbound channel and registers the hop that pays over it, and it puts
   nothing into the counterparty's configuration -- ADR 0058 makes a peering establishable **from** a
-  URL, not **on** somebody else's node. Role there is still §1.2's P2 and P3, and P2 reads
-  `[[peer_channels]]`: `PeerAuthPolicy::from_config` is built once from the loaded config and no
-  runtime write mutates it, so a claim naming a runtime-derived channel binds no peering and the
-  arrival is a **client** arrival. On a node whose own config declares no `[[peers]]` row at all,
-  no peer handling is even mounted (`PeerCarriages::from_config` answers `None`), whatever
-  `peer_expose` says. This is §1.2's "Peer role is not a prerequisite for paid carriage" reached
-  from the other direction: the payer is paying an ordinary client edge, which is the shape the
-  runtime peering was built to work in.
+  URL, not **on** somebody else's node. With no signer bound on the accepting side, the payer's
+  voucher decides no peering and the arrival is a **client** arrival. This is §1.2's "Peer role is
+  not a prerequisite for paid carriage" reached from the other direction: the payer is paying an
+  ordinary client edge.
 
   **So over a runtime peering the refusal is the client edge's, and it is not `F06`.** An arrival
   carrying no claim is greeted with the x402 terms of `client-edge-spec.md` §1.4 -- the same

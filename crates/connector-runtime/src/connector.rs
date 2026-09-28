@@ -41,8 +41,7 @@ use crate::operator_view::{
     ChannelView, ClaimView, LeasedRouteView, PeerRouteView, PeerView, RouteSource, RouteView,
 };
 use crate::outbound_client::{
-    ClaimStateChallengeSigner, ClaimStateSource, EvmDomain, OutboundClaimBinding,
-    OutboundClientLedger, OwnedHttpClaimState, SolanaDomain,
+    ClaimStateSource, EvmDomain, OutboundClaimBinding, OutboundClientLedger, SolanaDomain,
 };
 use crate::outbound_voucher::{
     challenge_entry, voucher_json, HttpVoucherState, VoucherStateSource, PEER_CHALLENGE_TTL_SECS,
@@ -555,18 +554,18 @@ pub struct Connector {
     /// `leased_routes` take.
     ///
     /// Held as an atomically-swapped immutable snapshot, like
-    /// `runtime_peers` (issue #1217): `POST /peers` (ADR 0058) registers a
-    /// hop live, from a handler running concurrently with the packet path,
-    /// so a plain `HashMap` behind `&self` was never soundly writable here
-    /// -- only construction-time `with_outbound_client_hop` ever wrote it
-    /// before this, which is exactly why a runtime peering could accept but
-    /// never pay.
+    /// `runtime_peers` (issue #1217), from when `POST /peers` registered a
+    /// `toon-channel` hop here live. Since ADR 0075 moved runtime peerings
+    /// to x402 (#1378, #1379) only construction-time
+    /// `with_outbound_client_hop` writes it, for the config file's
+    /// `[[pay_channels]]` rows, until #1380 moves those too.
     outbound_client_hops: ArcSwap<HashMap<String, OutboundClientHop>>,
     /// The next hops this node pays over its **own outbound x402 channel**
-    /// (ADR 0075 decisions 4 and 6), keyed by peer id: a runtime EVM
-    /// peering established by `POST /peers` since #1378. Checked before
-    /// `outbound_client_hops` on every forward, and never both for one
-    /// peer: a peering is either on x402 or on a `toon-channel`.
+    /// (ADR 0075 decisions 4 and 6), keyed by peer id: a runtime peering
+    /// established by `POST /peers`, on EVM since #1378 and on Solana since
+    /// #1379. Checked before `outbound_client_hops` on every forward, and
+    /// never both for one peer: a peering is either on x402 or on a
+    /// `toon-channel`.
     ///
     /// Copy-on-write for the reason `outbound_client_hops` is: an operator
     /// write registers and removes one while the packet path reads it.
@@ -574,13 +573,17 @@ pub struct Connector {
     /// The x402 channels this node pays on (ADR 0075 decisions 8 and 11):
     /// what `POST /peers` opens a peering's outbound channel through, and
     /// what every voucher a forward carries is signed and journaled
-    /// through. `None` on a node with no x402 backend, which then peers on
-    /// EVM with nobody.
+    /// through. `None` on a node with no x402 backend, which then peers
+    /// with nobody.
     outbound_channels: Option<Arc<OutboundChannels>>,
     /// This node's own CAIP-2 network on each chain it pays x402 on, as its
     /// greeting publishes it: a counterparty's terms must name the same one
     /// before this node opens a channel on them.
     x402_networks: Vec<(SettlementChain, String)>,
+    /// The node's one root-level `socks_proxy` (ADR 0070), if configured:
+    /// what a runtime peering's claim-state ask leaves on when the peer's
+    /// client edge is an onion host ([`Connector::register_voucher_hop`]).
+    socks_proxy: Option<url::Url>,
     /// Peer ids this node's config file names (`[[peers]]`), threaded in
     /// via [`Connector::with_config_peer_ids`) purely as a reservation
     /// list (issue #884): the routing table IS the relationship set
@@ -845,8 +848,9 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
 /// The `senderId` a voucher this node signs carries -- a label, as every
 /// `senderId` is, since the receiver reads the signer from the chain. On
 /// EVM the channel's `payerAuthorizer`, which is this node's settlement
-/// address (ADR 0075 decision 3). A Solana presentation names no payer, so
-/// its label is the channel account until #1379 pays over Solana.
+/// address (ADR 0075 decision 3). A Solana presentation names only the
+/// channel account -- the receiver reads `authorized_signer` off the
+/// account itself -- so that is its label.
 fn voucher_sender(presentation: &connector_settlement::batch::ChannelPresentation) -> String {
     match presentation {
         connector_settlement::batch::ChannelPresentation::Evm { config, .. } => {
@@ -890,6 +894,7 @@ impl Connector {
             outbound_voucher_hops: ArcSwap::from_pointee(HashMap::new()),
             outbound_channels: None,
             x402_networks: Vec::new(),
+            socks_proxy: None,
             config_peer_ids: HashSet::new(),
             runtime_peers: ArcSwap::from_pointee(RuntimePeers::new()),
             voucher_bindings: VoucherSignerBindings::new(),
@@ -955,166 +960,23 @@ impl Connector {
         Ok(())
     }
 
-    /// The settlement backend for `chain`, for the peering path.
-    pub(crate) fn settlement_on_chain(
-        &self,
-        chain: SettlementChain,
-    ) -> Result<Arc<dyn SettlementBackend>, ChannelOperationError> {
-        self.settlement_on(chain).cloned()
-    }
-
-    /// Narrow a fetched self-description's published settlements to the one
-    /// chain this connector will derive a channel on.
+    /// Narrow a fetched self-description's published x402 terms to the one
+    /// chain this connector will open its outbound channel on.
     pub(crate) fn shared_settlement(
         &self,
         document: &connector_domain::NodeSelfDescription,
         wanted: Option<SettlementChain>,
         url: &url::Url,
     ) -> Result<crate::peering::SharedSettlement, crate::peering::EstablishPeeringError> {
-        // EVM peers over x402 only (ADR 0075 decision 4): a node with no
-        // x402 channels to pay on shares no EVM with anybody. Solana still
-        // peers over its `toon-channel` backend, until #1379.
+        // A peering is two x402 channels on either chain (ADR 0075 decision
+        // 4, #1378 on EVM, #1379 on Solana): a node with no x402 channels to
+        // pay on a chain shares that chain with nobody.
         crate::peering::shared_settlement_of(
             document,
-            |chain| match chain {
-                SettlementChain::Evm => {
-                    self.outbound_channels.is_some()
-                        && self.x402_network(SettlementChain::Evm).is_some()
-                }
-                SettlementChain::Solana => self.settlement_on(chain).is_ok(),
-            },
+            |chain| self.outbound_channels.is_some() && self.x402_network(chain).is_some(),
             wanted,
             url,
         )
-    }
-
-    /// Register a runtime peering's channel binding with this node's claim
-    /// book, so a claim on it is judged from the moment the peering is
-    /// established rather than from the next boot.
-    ///
-    /// **PEER role only** -- a counterparty key and a signing domain for
-    /// what arrives on this channel. It also names this channel as the one
-    /// `ClaimBook`'s own (now inbound-only, issue #1145) `outbound_channel`
-    /// bookkeeping tracks for `peer_id`, but that is not the CLIENT role
-    /// ADR 0042 needs to pay a forward: this call alone leaves a runtime
-    /// peering able to accept a claim and unable to sign one. See
-    /// [`Connector::register_outbound_client_hop`] for the client-role half
-    /// (issue #1217) -- `establish_peering` and boot rehydration both call
-    /// this and that together, the same way `connector_config::pay_channel`
-    /// documents the deployed shape as both roles on one channel.
-    ///
-    /// A binding whose identifiers do not parse is skipped rather than
-    /// coerced: an unparseable channel id names no channel, and a book
-    /// entry filed under a mangled key would accept claims for a channel
-    /// that does not exist.
-    pub(crate) fn bind_runtime_peer_channel(&self, peer_id: &str, binding: &RuntimePeerChannel) {
-        match binding {
-            // A `TokenNetwork` peering is refused at boot by name
-            // (`PeerRouteStoreError::TokenNetworkPeering`) and never
-            // written since #1378, and an x402 one is bound by its voucher
-            // signer instead (`bind_runtime_voucher_signer`).
-            RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::EvmVoucher { .. } => {}
-            RuntimePeerChannel::Solana {
-                channel_account,
-                counterparty_key,
-                program_id,
-            } => {
-                if let Err(error) =
-                    self.claims
-                        .set_solana_channel(channel_account, counterparty_key, program_id)
-                {
-                    tracing::warn!(peer_id, %error, "peering's Solana channel is not bindable");
-                    return;
-                }
-                self.claims.set_outbound_channel(peer_id, channel_account);
-            }
-        }
-    }
-
-    /// Register a runtime peering's channel binding as an outbound CLIENT
-    /// hop (issue #1217, ADR 0042/0058): the missing counterpart of
-    /// [`Connector::bind_runtime_peer_channel`] that lets
-    /// [`Connector::cover_forward`] actually pay `peer_id` for a forward,
-    /// live from the moment the peering is established rather than only
-    /// after the next boot rewires `[[pay_channels]]` from a config file.
-    ///
-    /// `client_edge_url` is [`RuntimePeering::client_edge_url`] --
-    /// `POST /ilp/claim-state` is always asked over plain HTTP (issue
-    /// #1146's `OwnedHttpClaimState`), whichever carriage the packet
-    /// itself rides.
-    ///
-    /// Skipped -- with the reason logged, never silently -- for exactly the
-    /// failure modes `bind_runtime_peer_channel` already tolerates (an
-    /// address or channel id this node cannot read), plus one of its own:
-    /// no settlement signer configured for this binding's chain. A node
-    /// with no `[settlement.<chain>]` table cannot pay a next hop on that
-    /// chain as a client, the same way it cannot open a channel on it
-    /// either -- the peering is left accept-only on that chain rather than
-    /// refused outright, since the peer role this call does not touch may
-    /// still be perfectly usable.
-    pub(crate) fn register_outbound_client_hop(
-        &self,
-        peer_id: &str,
-        binding: &RuntimePeerChannel,
-        client_edge_url: &str,
-    ) {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(
-                connector_config::DEFAULT_PEER_TIMEOUT_MS,
-            ))
-            .build()
-            .expect("a reqwest client with only a timeout set always builds");
-        let hop = match binding {
-            // An x402 peering is paid on its own outbound channel
-            // (`register_voucher_hop`), and a `TokenNetwork` one is never
-            // paid on since #1378: its row is refused at boot.
-            RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::EvmVoucher { .. } => return,
-            RuntimePeerChannel::Solana {
-                channel_account,
-                program_id,
-                ..
-            } => {
-                let Some(signer) = self.claims.solana_signer().cloned() else {
-                    tracing::warn!(
-                        peer_id,
-                        "no Solana settlement signer configured; cannot pay this peer as a client"
-                    );
-                    return;
-                };
-                let Ok(channel) = crate::claim::parse_base58_32("channel account", channel_account)
-                else {
-                    tracing::warn!(
-                        peer_id,
-                        "peering's Solana channel account is not bindable; its outbound client \
-                         hop is not registered"
-                    );
-                    return;
-                };
-                let Ok(program_id) = crate::claim::parse_base58_32("program id", program_id) else {
-                    tracing::warn!(
-                        peer_id,
-                        "peering's Solana program id is not bindable; its outbound client hop \
-                         is not registered"
-                    );
-                    return;
-                };
-                OutboundClientHop {
-                    channel,
-                    channel_id: channel_account.clone(),
-                    claim_state: Arc::new(OwnedHttpClaimState::new(
-                        client,
-                        client_edge_url,
-                        ClaimStateChallengeSigner::Solana(signer),
-                    )),
-                    domain: OutboundClientDomain::Solana(SolanaDomain { program_id }),
-                }
-            }
-        };
-        self.outbound_client_hops.rcu(|current| {
-            let mut next = (**current).clone();
-            next.insert(peer_id.to_string(), hop.clone());
-            next
-        });
     }
 
     /// Make a runtime peering dialable, if this node holds a registrar.
@@ -1288,22 +1150,21 @@ impl Connector {
     /// store -- the two must always be given together, since a table
     /// replayed from `peers`/`routes` but not armed to persist further
     /// writes would silently stop being durable after the first mutation.
-    /// Every replayed peering is also **re-armed**: its channel binding
-    /// goes back into the claim book and its carriage back into the
-    /// registrar, exactly as establishing it did. A durable row that came
-    /// back as a name would be the hollow row ADR 0058 exists to remove,
-    /// one restart later. Call this after
-    /// [`Connector::with_peer_registrar`], or the carriages replay
-    /// nowhere.
+    /// Every replayed peering is also **re-armed**, exactly as establishing
+    /// it did: the peer's voucher signer is bound to it again, its outbound
+    /// x402 channel is registered again as the hop every forward to it is
+    /// covered on (ADR 0075 decision 6), and its carriage goes back into
+    /// the registrar. A durable row that came back as a name would be the
+    /// hollow row ADR 0058 exists to remove, one restart later. Call this
+    /// after [`Connector::with_peer_registrar`], or the carriages replay
+    /// nowhere, and after [`Connector::with_outbound_channels`], or the
+    /// forwards have no channel to be signed on.
     ///
-    /// Also re-registers each binding's outbound CLIENT hop (issue #1217),
-    /// so a restart does not turn a payable runtime peering back into an
-    /// accept-only one -- the same "everything establishing it did" claim
-    /// this doc already makes, extended to the role `establish_peering`
-    /// only started arming here. A row with channels but no
-    /// `client_edge_url` -- the shape every row written before issue #1217
-    /// has -- replays exactly as it always did: peer role bound, client
-    /// role absent, accept-only until re-peered.
+    /// A row with no `client_edge_url` -- the shape rows written before
+    /// issue #1217 have -- has no claim-state to restore its watermark from,
+    /// so it replays bound but unpaid, accept-only until re-peered. A row
+    /// naming a `toon-channel` never reaches here: [`PeerRouteStore::open`]
+    /// refuses it at boot by name (ADR 0075 decision 8).
     pub fn with_runtime_peer_route_store(
         mut self,
         store: PeerRouteStore,
@@ -1312,12 +1173,10 @@ impl Connector {
     ) -> Self {
         for (id, peering) in &peers {
             for binding in &peering.channels {
-                self.bind_runtime_peer_channel(id, binding);
                 if let Err(error) = self.bind_runtime_voucher_signer(id, binding) {
                     tracing::warn!(peer_id = %id, %error, "peering's voucher signer is not bound");
                 }
                 if let Some(client_edge_url) = &peering.client_edge_url {
-                    self.register_outbound_client_hop(id, binding, client_edge_url);
                     self.register_voucher_hop(id, binding, client_edge_url);
                 }
             }
@@ -1352,8 +1211,9 @@ impl Connector {
 
     /// Give this node the x402 channels it pays on (ADR 0075 decisions 8
     /// and 11), and its own CAIP-2 network on each chain they are on: what
-    /// `POST /peers` opens an EVM peering's outbound channel through, and
-    /// what every forward over such a peering signs its voucher through.
+    /// `POST /peers` opens a peering's outbound channel through, on either
+    /// chain, and what every forward over such a peering signs its voucher
+    /// through.
     ///
     /// Call before [`Connector::with_runtime_peer_route_store`]: a durable
     /// x402 peering is rehydrated onto these channels, and one replayed
@@ -1365,6 +1225,15 @@ impl Connector {
     ) -> Self {
         self.outbound_channels = Some(outbound);
         self.x402_networks = networks;
+        self
+    }
+
+    /// Give this node its `socks_proxy` (ADR 0070): the proxy a runtime
+    /// peering's claim-state ask leaves on when the peer's client edge is an
+    /// onion host. Call before [`Connector::with_runtime_peer_route_store`],
+    /// so a rehydrated onion peering is asked through it too.
+    pub fn with_socks_proxy(mut self, proxy: Option<url::Url>) -> Self {
+        self.socks_proxy = proxy;
         self
     }
 
@@ -1387,27 +1256,52 @@ impl Connector {
     /// it moves no value. `client_edge_url` is the peer's own `POST /ilp`,
     /// whose `claim-state` is the watermark authority on restore.
     ///
-    /// Anything but an [`RuntimePeerChannel::EvmVoucher`] binding registers
-    /// nothing.
+    /// Anything but an x402 binding ([`RuntimePeerChannel::EvmVoucher`],
+    /// [`RuntimePeerChannel::SolanaVoucher`]) registers nothing.
+    ///
+    /// The claim-state ask leaves on the node's `socks_proxy` when the
+    /// peer's client edge is an onion host (ADR 0070), by the one host rule
+    /// `connector_config::is_onion_endpoint` -- the same rule that decides
+    /// the peering's carriage and its self-description fetch -- so a peer
+    /// reachable only over a circuit can still be asked where its channel
+    /// stands. An onion client edge on a node with no proxy gets a direct
+    /// client, which fails at the dial like every other onion dial without
+    /// one, and the journaled watermark stands.
     pub(crate) fn register_voucher_hop(
         &self,
         peer_id: &str,
         binding: &RuntimePeerChannel,
         client_edge_url: &str,
     ) {
-        let RuntimePeerChannel::EvmVoucher {
+        let (RuntimePeerChannel::EvmVoucher {
             outbound_channel_id,
             ..
-        } = binding
+        }
+        | RuntimePeerChannel::SolanaVoucher {
+            outbound_channel_id,
+            ..
+        }) = binding
         else {
             return;
         };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(
-                connector_config::DEFAULT_PEER_TIMEOUT_MS,
-            ))
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_millis(
+            connector_config::DEFAULT_PEER_TIMEOUT_MS,
+        ));
+        let onion = url::Url::parse(client_edge_url)
+            .is_ok_and(|url| connector_config::is_onion_endpoint(&url));
+        if let (true, Some(proxy)) = (onion, self.socks_proxy.as_ref()) {
+            match reqwest::Proxy::all(proxy.as_str()) {
+                Ok(proxy) => builder = builder.proxy(proxy),
+                Err(error) => tracing::warn!(
+                    peer_id,
+                    %error,
+                    "socks_proxy could not be used for the peer's claim-state"
+                ),
+            }
+        }
+        let client = builder
             .build()
-            .expect("a reqwest client with only a timeout set always builds");
+            .expect("a reqwest client with a timeout and a SOCKS proxy always builds");
         self.insert_voucher_hop(
             peer_id,
             outbound_channel_id,
@@ -1417,6 +1311,10 @@ impl Connector {
 
     /// Pay `peer_id` over this node's outbound x402 channel `channel_id`,
     /// asking `claim_state` where it stands (ADR 0075 decision 6).
+    ///
+    /// The id is kept as given: [`OutboundChannels`] canonicalises an EVM
+    /// id itself, and a Solana channel account is base58, which is
+    /// case-sensitive -- lowercasing one names an account nobody holds.
     pub(crate) fn insert_voucher_hop(
         &self,
         peer_id: &str,
@@ -1424,7 +1322,7 @@ impl Connector {
         claim_state: Arc<dyn VoucherStateSource>,
     ) {
         let hop = VoucherHop {
-            channel_id: channel_id.to_ascii_lowercase(),
+            channel_id: channel_id.to_string(),
             claim_state,
             synced: Arc::new(AtomicBool::new(false)),
             signing: Arc::new(tokio::sync::Mutex::new(())),
@@ -1444,10 +1342,16 @@ impl Connector {
         peer_id: &str,
         binding: &RuntimePeerChannel,
     ) -> Result<(), VoucherBindingError> {
-        let RuntimePeerChannel::EvmVoucher { voucher_signer, .. } = binding else {
-            return Ok(());
+        let (chain, voucher_signer) = match binding {
+            RuntimePeerChannel::EvmVoucher { voucher_signer, .. } => {
+                (SettlementChain::Evm, voucher_signer)
+            }
+            RuntimePeerChannel::SolanaVoucher { voucher_signer, .. } => {
+                (SettlementChain::Solana, voucher_signer)
+            }
+            RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::Solana { .. } => return Ok(()),
         };
-        let Some(signer) = crate::peering::parse_evm_address(voucher_signer) else {
+        let Some(signer) = crate::peering::parse_voucher_signer(chain, voucher_signer) else {
             tracing::warn!(
                 peer_id,
                 voucher_signer,
@@ -1456,8 +1360,7 @@ impl Connector {
             );
             return Ok(());
         };
-        self.voucher_bindings
-            .bind(peer_id, VoucherSigner::Evm(signer))
+        self.voucher_bindings.bind(peer_id, signer)
     }
 
     /// Configure how this node pays `peer_id` **as an ordinary client of
@@ -1955,11 +1858,12 @@ impl Connector {
     /// pay from ([`PeerRouteTableError::PeerHasNoPayChannel`]) -- the
     /// runtime twin of ADR 0042's `[[pay_channels]]` load rule, which ADR
     /// 0058 requires enforced continuously rather than once at boot. That
-    /// checks the CLIENT-role hop (`outbound_client_hops`, issue #1217),
-    /// not `peering.channels` -- the PEER-role bindings, which are
-    /// non-empty for every peering `establish_peering` ever writes and so
-    /// never caught the gap this guard exists for: a peering that can
-    /// accept a claim but hold nothing to sign one with. A config-file
+    /// checks the hop a forward is paid on -- the x402 voucher hop a
+    /// runtime peering registers (ADR 0075), or a `toon-channel` client hop
+    /// (`outbound_client_hops`, issue #1217) -- not `peering.channels`,
+    /// which is non-empty for every peering `establish_peering` ever writes
+    /// and so never caught the gap this guard exists for: a peering that
+    /// can accept a claim but hold nothing to sign one with. A config-file
     /// peering is not re-checked here: `Config::load` already refused to
     /// start without the row, and this table cannot see it.
     pub fn upsert_runtime_peer_route(
@@ -3160,10 +3064,10 @@ impl Connector {
         }
         let hops = self.outbound_client_hops.load_full();
         let Some(hop) = hops.get(peer_id) else {
-            // Neither populator of `outbound_client_hops` has armed this
-            // peering -- no `[[pay_channels]]` row at boot, and no
-            // `register_outbound_client_hop` from a runtime peering (issue
-            // #1217) -- so there is nothing to pay it from, and since issue
+            // Nothing has armed this peering -- no `[[pay_channels]]` row
+            // at boot, and no x402 voucher hop from a runtime peering
+            // (`register_voucher_hop`, ADR 0075) -- so there is nothing to
+            // pay it from, and since issue
             // #1145 there is no postpay path to fall through to either.
             // `Config::load` refuses a configured route to an uncovered
             // peering by name (`ConfigError::PayChannelUnbound`), so a file
@@ -8587,16 +8491,6 @@ mod tests {
                     self.0
                 )))
             }
-
-            async fn live_channel_with(
-                &self,
-                _counterparty: Vec<u8>,
-            ) -> Result<Option<ChannelId>, SettlementError> {
-                Err(SettlementError::Backend(format!(
-                    "{}: live_channel_with",
-                    self.0
-                )))
-            }
         }
 
         fn bare_connector() -> Connector {
@@ -10656,7 +10550,25 @@ mod tests {
             Arc<OutboundChannels>,
             String,
         ) {
-            let chain = InMemoryBatchChain::new(PayerExit::Withdrawal);
+            peered_on(PayerExit::Withdrawal).await
+        }
+
+        /// [`peered`], on an EVM-shaped (`Withdrawal`) or Solana-shaped
+        /// (`Close`) fake chain.
+        async fn peered_on(
+            exit: PayerExit,
+        ) -> (
+            Connector,
+            Arc<NextHop>,
+            Arc<Receiver>,
+            Arc<OutboundChannels>,
+            String,
+        ) {
+            let settles_on = match exit {
+                PayerExit::Withdrawal => (SettlementChain::Evm, "eip155:31337"),
+                PayerExit::Close => (SettlementChain::Solana, "solana:test"),
+            };
+            let chain = InMemoryBatchChain::new(exit);
             let payer = Arc::new(InMemoryBatchSettlement::on(
                 Arc::clone(&chain),
                 0x01,
@@ -10667,7 +10579,7 @@ mod tests {
             let outbound = Arc::new(
                 OutboundChannels::restore(
                     Arc::new(InMemoryJournal::new()),
-                    vec![(SettlementChain::Evm, payer as Arc<dyn BatchSettlementPayer>)],
+                    vec![(settles_on.0, payer as Arc<dyn BatchSettlementPayer>)],
                 )
                 .await
                 .expect("an empty journal"),
@@ -10695,7 +10607,7 @@ mod tests {
             .with_peer_fees([("next-hop".to_string(), FEE)])
             .with_outbound_channels(
                 Arc::clone(&outbound),
-                vec![(SettlementChain::Evm, "eip155:31337".to_string())],
+                vec![(settles_on.0, settles_on.1.to_string())],
             );
             connector.insert_voucher_hop(
                 "next-hop",
@@ -10823,6 +10735,120 @@ mod tests {
             );
             assert!(next_hop.covered.lock().unwrap().is_empty());
             assert!(outbound.knows(&channel));
+        }
+
+        /// ADR 0075 decisions 3 and 6 on Solana (#1379): a Solana peering's
+        /// every forward carries a Solana voucher -- `expiresAt` zero --
+        /// advanced by the forwarded amount on this node's own outbound
+        /// channel. Read as JSON rather than through the client edge's
+        /// parser, because the fake's channel ids are not base58 accounts;
+        /// `outbound_voucher`'s own tests hold the shape to that parser, and
+        /// `solana_peering_from_a_url` holds it to a real receiver.
+        #[tokio::test]
+        async fn a_solana_peerings_forward_carries_a_solana_voucher() {
+            let (connector, next_hop, receiver, outbound, channel) =
+                peered_on(PayerExit::Close).await;
+            for _ in 0..2 {
+                assert!(matches!(
+                    connector.handle_prepare(prepare(110)).await,
+                    PacketResponse::Fulfill(_)
+                ));
+            }
+            let covered = next_hop.covered.lock().unwrap().clone();
+            let amounts: Vec<u64> = covered
+                .iter()
+                .map(|covering| {
+                    let Covering::Voucher(json) = covering else {
+                        panic!("expected a voucher, got {covering:?}");
+                    };
+                    let voucher: serde_json::Value = serde_json::from_str(json).expect("json");
+                    assert_eq!(voucher["blockchain"], "solana");
+                    assert_eq!(voucher["scheme"], "batch-settlement");
+                    assert_eq!(voucher["channelId"], channel.as_str());
+                    assert_eq!(voucher["expiresAt"], 0);
+                    voucher["maxClaimableAmount"]
+                        .as_str()
+                        .and_then(|amount| amount.parse().ok())
+                        .expect("an amount")
+                })
+                .collect();
+            assert_eq!(amounts, vec![100, 200]);
+            assert_eq!(outbound.signed(&channel), Some(200), "journaled as signed");
+            assert_eq!(receiver.asked.load(Ordering::SeqCst), 1);
+        }
+
+        /// ADR 0075 decision 5 on Solana: a zero-value forward carries the
+        /// Solana challenge -- the channel account, and a base64 Ed25519
+        /// signature -- and no voucher.
+        #[tokio::test]
+        async fn a_zero_value_solana_forward_carries_the_solana_challenge() {
+            let (connector, next_hop, _receiver, outbound, channel) =
+                peered_on(PayerExit::Close).await;
+            let connector = connector.with_peer_fees([("next-hop".to_string(), 0)]);
+            assert!(matches!(
+                connector.handle_prepare(prepare(0)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            let covered = next_hop.covered.lock().unwrap().clone();
+            let [Covering::Challenge(json)] = covered.as_slice() else {
+                panic!("expected one challenge, got {covered:?}");
+            };
+            let challenge: serde_json::Value = serde_json::from_str(json).expect("json");
+            assert_eq!(challenge["blockchain"], "solana");
+            assert_eq!(challenge["channelAccount"], channel.as_str());
+            assert_eq!(outbound.signed(&channel), Some(0), "nothing was signed");
+        }
+
+        /// ADR 0070, issue #1379: a runtime peering whose client edge is an
+        /// onion host is asked where its channel stands through the node's
+        /// `socks_proxy`, as a name -- the same host rule that decides the
+        /// peering's carriage -- so an onion peer's watermark is restored
+        /// over the circuit its packets ride. Asserted against a real SOCKS5
+        /// server and a real claim-state answer on loopback.
+        #[tokio::test]
+        async fn an_onion_peers_claim_state_is_asked_through_the_socks_proxy() {
+            use crate::Socks5TestServer;
+
+            const ONION: &str = "toonexampleconnectoraddress234567abcdefghijklmnopqrstuvw.onion";
+            let answering = axum::Router::new().route(
+                "/ilp/claim-state",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "channels": [{ "ok": true, "cumulativeClaimed": "7000" }]
+                    }))
+                }),
+            );
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let edge = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                let _ = axum::Server::from_tcp(listener)
+                    .expect("serve")
+                    .serve(answering.into_make_service())
+                    .await;
+            });
+            let proxy =
+                Socks5TestServer::spawn(HashMap::from([(format!("{ONION}:80"), edge)])).await;
+
+            let (connector, next_hop, _receiver, outbound, channel) = peered().await;
+            let connector = connector.with_socks_proxy(Some(proxy.proxy_url()));
+            connector.register_voucher_hop(
+                "next-hop",
+                &RuntimePeerChannel::EvmVoucher {
+                    outbound_channel_id: channel.clone(),
+                    voucher_signer: format!("0x{}", "02".repeat(20)),
+                    network: "eip155:31337".to_string(),
+                },
+                &format!("http://{ONION}/ilp"),
+            );
+            connector.handle_prepare(prepare(110)).await;
+
+            assert_eq!(proxy.targets(), vec![format!("{ONION}:80")]);
+            assert_eq!(
+                voucher_amount(&next_hop.covered.lock().unwrap()[0]),
+                7_100,
+                "signed above the watermark the onion peer reported"
+            );
+            assert_eq!(outbound.signed(&channel), Some(7_100));
         }
     }
 }

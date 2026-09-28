@@ -31,11 +31,12 @@
 //! [`RuntimePeering`] is that row grown into the thing ADR 0034's rules
 //! were always about: the endpoint to reach the counterparty on, the edge
 //! identity a payload is sealed to, the operator's own fee and cap, and
-//! the payment channel this peering's claims are judged against. Every one
-//! of those but the fee and the cap is read from the counterparty's own
-//! self-description (ADR 0050) or derived from it (ADR 0059); the fee and
-//! the cap are the operator's policy and no document can supply them
-//! (ADR 0006, ADR 0049, ADR 0061).
+//! the channels the peering pays and is paid on. The endpoint, the identity
+//! and the peer's voucher signer are read from the counterparty's own
+//! self-description (ADR 0050); the outbound channel is this node's own,
+//! opened on the terms that document publishes (ADR 0075); the fee and the
+//! cap are the operator's policy and no document can supply them (ADR 0006,
+//! ADR 0049, ADR 0061).
 //!
 //! **Nothing here is pinned, verified or attested.** The identity in a row
 //! is whatever the URL the operator named served at the moment they named
@@ -84,6 +85,27 @@ pub enum PeerRouteStoreError {
         peer_id: String,
         channel_id: String,
     },
+    /// The table holds a runtime Solana peering over a `toon-channel` of
+    /// TOON's own payment-channel program (ADR 0058 and 0059, before ADR
+    /// 0075). This build pays and is paid on `payment-channels` (x402)
+    /// channels only, so it cannot sign on that channel, judge a claim on
+    /// it, or land one -- and dropping the row would forget a channel that
+    /// may still hold unlanded claims. Refused by name at boot, never
+    /// skipped (ADR 0075 decision 8, issue #1379).
+    #[error(
+        "the runtime peer/route table at {path} holds peering '{peer_id}' over Solana \
+         toon-channel {channel_account} on TOON's own payment-channel program, and this build \
+         peers on Solana over payment-channels (x402) channels only (ADR 0075). Drain it \
+         on the last release that supports TOON channels -- land its latest claim, close and \
+         settle the channel, confirm on chain it is closed (ADR 0075, \"Draining a node with \
+         live TOON channels\") -- then remove the peering there (DELETE /peers/{peer_id}) and \
+         establish it again on this build with POST /peers"
+    )]
+    ToonProgramPeering {
+        path: PathBuf,
+        peer_id: String,
+        channel_account: String,
+    },
 }
 
 /// One runtime peering's binding to one payment channel, by chain.
@@ -96,11 +118,16 @@ pub enum PeerRouteStoreError {
 /// channel id is the one this node opened, and the key is the one the
 /// peer's self-description published.
 ///
-/// **Solana, until #1379.** Still the `toon-channel` shape: one channel held
-/// in both roles, derived from the two settlement keys (ADR 0059) -- the
-/// runtime twin of a `[[peer_channels]]` row plus its `[[pay_channels]]`
-/// counterpart. `counterparty_key` is the counterparty's settlement key on
-/// Solana, never its edge identity.
+/// **Solana (ADR 0075 decision 4, issue #1379).** The same shape on
+/// `payment-channels`: this node's own outbound channel, opened through the
+/// peer's sponsor endpoint so the peer holds the `payee` and `rent_payer`
+/// seats ([`RuntimePeerChannel::SolanaVoucher`]), and the Solana settlement
+/// key the peer signs its vouchers with -- the `authorized_signer` that
+/// binds the peer's channel toward this node.
+///
+/// The two `toon-channel` shapes a build before ADR 0075 wrote
+/// ([`RuntimePeerChannel::Evm`], [`RuntimePeerChannel::Solana`]) are parsed
+/// only to be refused at boot by name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "chain", rename_all = "lowercase")]
 pub enum RuntimePeerChannel {
@@ -132,26 +159,49 @@ pub enum RuntimePeerChannel {
         /// The CAIP-2 network the two share, `eip155:<chainId>`.
         network: String,
     },
+    /// A `toon-channel` on TOON's own payment-channel program that a
+    /// runtime Solana peering held before ADR 0075: one channel in both
+    /// roles, derived from the two settlement keys (ADR 0059). **Parsed only
+    /// to be refused by name** ([`PeerRouteStoreError::ToonProgramPeering`]):
+    /// no build since #1379 writes one, binds one or signs on one.
     Solana {
         /// The channel PDA, base58.
         channel_account: String,
         /// The peer's 32-byte ed25519 settlement public key, base58.
         counterparty_key: String,
-        /// The deployed `payment-channel` program a claim on this channel
-        /// binds its domain to (ADR 0053), base58.
+        /// The TOON program the channel lives under, base58.
         program_id: String,
+    },
+    /// An x402 Solana peering (ADR 0075 decisions 3, 4 and 6): this node's
+    /// outbound `payment-channels` channel toward the peer, and the peer's
+    /// voucher signer.
+    #[serde(rename = "solana-voucher")]
+    SolanaVoucher {
+        /// This node's outbound channel account toward the peer, base58:
+        /// the channel every forward to the peer is covered on.
+        outbound_channel_id: String,
+        /// The peer's voucher signer as its self-description published it
+        /// (its Solana settlement key), base58: a channel toward this node
+        /// whose `authorized_signer` it is, is the peer's.
+        voucher_signer: String,
+        /// The CAIP-2 network the two share, `solana:<genesis prefix>`.
+        network: String,
     },
 }
 
 impl RuntimePeerChannel {
-    /// The channel this binding names -- an EVM `channelId` (inbound and
-    /// outbound for a `TokenNetwork` one, outbound for an x402 one) or a
-    /// Solana `channelAccount`.
+    /// The channel this binding names -- an EVM `channelId` or a Solana
+    /// `channelAccount`: this node's outbound channel for an x402 binding,
+    /// the one channel in both roles for a refused `toon-channel` one.
     #[must_use]
     pub fn channel(&self) -> &str {
         match self {
             RuntimePeerChannel::Evm { channel_id, .. } => channel_id,
             RuntimePeerChannel::EvmVoucher {
+                outbound_channel_id,
+                ..
+            }
+            | RuntimePeerChannel::SolanaVoucher {
                 outbound_channel_id,
                 ..
             } => outbound_channel_id,
@@ -173,7 +223,8 @@ impl RuntimePeerChannel {
             | RuntimePeerChannel::Solana {
                 counterparty_key, ..
             } => counterparty_key,
-            RuntimePeerChannel::EvmVoucher { voucher_signer, .. } => voucher_signer,
+            RuntimePeerChannel::EvmVoucher { voucher_signer, .. }
+            | RuntimePeerChannel::SolanaVoucher { voucher_signer, .. } => voucher_signer,
         }
     }
 }
@@ -182,8 +233,9 @@ impl RuntimePeerChannel {
 /// write establishes.
 ///
 /// `endpoint` and `edge_identity` come from the counterparty's
-/// self-description; `channels` are derived from the two settlement
-/// addresses and read (or opened) on chain; `fee` and `max_packet_amount`
+/// self-description; each of `channels` names this node's own outbound
+/// channel, found among the ones it opened or opened on chain, and the
+/// voucher signer the counterparty publishes; `fee` and `max_packet_amount`
 /// are the operator's.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimePeering {
@@ -459,30 +511,47 @@ impl PeerRouteStore {
                 (peer.id, peer.peering)
             })
             .collect();
-        // ADR 0075 decision 8: a runtime EVM peering over a `TokenNetwork`
-        // channel is refused by name, never replayed and never dropped.
-        let mut toon: Vec<(&String, &str)> = peers
+        // ADR 0075 decision 8: a runtime peering over a `toon-channel` --
+        // a `TokenNetwork` channel on EVM, TOON's own program on Solana --
+        // is refused by name, never replayed and never dropped. The first
+        // by peer id and channel, so every boot names the same row.
+        let mut toon: Vec<(&String, &RuntimePeerChannel)> = peers
             .iter()
             .flat_map(|(id, peering)| {
                 peering
                     .channels
                     .iter()
-                    .filter_map(move |channel| match channel {
-                        RuntimePeerChannel::Evm { channel_id, .. } => {
-                            Some((id, channel_id.as_str()))
-                        }
-                        RuntimePeerChannel::EvmVoucher { .. }
-                        | RuntimePeerChannel::Solana { .. } => None,
+                    .filter(|channel| {
+                        matches!(
+                            channel,
+                            RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::Solana { .. }
+                        )
                     })
+                    .map(move |channel| (id, channel))
             })
             .collect();
-        toon.sort();
-        if let Some((peer_id, channel_id)) = toon.first() {
-            return Err(PeerRouteStoreError::TokenNetworkPeering {
-                path: path.to_path_buf(),
-                peer_id: (*peer_id).clone(),
-                channel_id: (*channel_id).to_string(),
-            });
+        toon.sort_by(|a, b| (a.0, a.1.channel()).cmp(&(b.0, b.1.channel())));
+        match toon.first() {
+            Some((peer_id, RuntimePeerChannel::Evm { channel_id, .. })) => {
+                return Err(PeerRouteStoreError::TokenNetworkPeering {
+                    path: path.to_path_buf(),
+                    peer_id: (*peer_id).clone(),
+                    channel_id: channel_id.clone(),
+                });
+            }
+            Some((
+                peer_id,
+                RuntimePeerChannel::Solana {
+                    channel_account, ..
+                },
+            )) => {
+                return Err(PeerRouteStoreError::ToonProgramPeering {
+                    path: path.to_path_buf(),
+                    peer_id: (*peer_id).clone(),
+                    channel_account: channel_account.clone(),
+                });
+            }
+            Some(_) | None => {}
         }
         let routes = snapshot
             .routes
@@ -773,18 +842,19 @@ mod tests {
         assert!(routes.is_empty());
     }
 
-    /// A Solana peering round-trips through its own chain shape: a channel
-    /// account and a program id, never an EVM channel id and a chain id.
+    /// A Solana x402 peering round-trips through its own chain shape: a
+    /// channel account, a base58 voucher signer and a `solana:` network,
+    /// never an EVM channel id and address.
     #[test]
     fn a_solana_binding_round_trips_in_its_own_shape() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("runtime_peers.json");
         let (store, _, _) = PeerRouteStore::open(&path).expect("open");
 
-        let solana = RuntimePeerChannel::Solana {
-            channel_account: "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi".to_string(),
-            counterparty_key: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".to_string(),
-            program_id: "Toon11111111111111111111111111111111111111".to_string(),
+        let solana = RuntimePeerChannel::SolanaVoucher {
+            outbound_channel_id: "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi".to_string(),
+            voucher_signer: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".to_string(),
+            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
         };
         let mut peers = RuntimePeers::new();
         peers.insert(
@@ -798,6 +868,56 @@ mod tests {
 
         let (_store, read_peers, _) = PeerRouteStore::open(&path).expect("re-open");
         assert_eq!(read_peers["solana-hop"].channels, vec![solana]);
+        let written = fs::read_to_string(&path).expect("read back");
+        assert!(
+            written.contains(r#""chain": "solana-voucher""#),
+            "{written}"
+        );
+    }
+
+    /// ADR 0075 decision 8, issue #1379: a runtime Solana peering written
+    /// before ADR 0075 names a `toon-channel` on TOON's own program, which
+    /// this build cannot sign on, judge a claim on or land. Dropping the row
+    /// would forget a channel that may still hold value, so the table is
+    /// refused by name, with the drain procedure in the message.
+    #[test]
+    fn a_runtime_solana_peering_over_a_toon_program_channel_is_refused_by_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("runtime_peers.json");
+        fs::write(
+            &path,
+            r#"{"peers":[{"id":"apex-sol","fee":1,"max_packet_amount":0,
+            "channels":[{"chain":"solana",
+            "channel_account":"4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+            "counterparty_key":"9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+            "program_id":"Toon11111111111111111111111111111111111111"}]}],"routes":[]}"#,
+        )
+        .expect("write a pre-ADR-0075 table");
+
+        let error = PeerRouteStore::open(&path).expect_err("a TOON Solana peering is refused");
+        let PeerRouteStoreError::ToonProgramPeering {
+            peer_id,
+            channel_account,
+            ..
+        } = &error
+        else {
+            panic!("expected the named refusal, got {error:?}");
+        };
+        assert_eq!(peer_id, "apex-sol");
+        assert_eq!(
+            channel_account,
+            "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
+        );
+        let message = error.to_string();
+        for named in [
+            "toon-channel",
+            "payment-channels",
+            "ADR 0075",
+            "Draining",
+            "/peers/apex-sol",
+        ] {
+            assert!(message.contains(named), "{named} in: {message}");
+        }
     }
 
     /// ADR 0075 decision 8, issue #1378: a runtime EVM peering written

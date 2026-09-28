@@ -559,17 +559,17 @@ anything you derived yourself. Fields a node has nothing to say about are
 table has no `ilpAddresses`, `httpEndpoint` or `routes` key at all — so parse
 this document for absent keys, not empty ones.
 
-Note what is _not_ there: no channel id, no peer list, no fee, no cap. On EVM a
-peering is **two one-way x402 channels**, one opened by each side
+Note what is _not_ there: no channel id, no peer list, no fee, no cap. On either
+chain a peering is **two one-way x402 channels**, one opened by each side
 ([ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)):
 you open and fund yours toward their `payTo`, they open theirs toward yours, and
 each node recognises the other's channel by the `voucherSigners` key the other
-publishes — so no identifier is ever exchanged. Both nodes need
-`[settlement.evm.batch_settlement]` configured. (On Solana a peering is still one
-channel **derived** from the two settlement keys,
-[ADR 0059](docs/adr/0059-a-channel-is-derived-from-its-participants.md), until
-#1379.) There is no shared secret either — a peer's role is proved per packet by
-its voucher or claim signature
+publishes — so no identifier is ever exchanged. Both nodes need the chain's
+`batch_settlement` sub-table configured (`[settlement.evm.batch_settlement]` or
+`[settlement.solana.batch_settlement]`). On Solana your node opens its channel
+**through their sponsor endpoint**, so they hold the `payee` seat and can always
+land your latest voucher, even after you ask to close. There is no shared secret
+either — a peer's role is proved per packet by its voucher signature
 ([ADR 0060](docs/adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)).
 
 ### The three writes
@@ -600,17 +600,17 @@ The script prints the three headers it computed, then the node's answer:
 ```
 
 Your node fetches that URL, picks the carriage from their endpoint's scheme,
-finds the settlement chain you share, and on EVM **opens and funds your own
-outbound x402 channel toward them** with `deposit` (base units of the shared
-token) — or finds the one you already have open, spending nothing. `"channel"`
+finds the settlement chain you share, and **opens and funds your own outbound
+x402 channel toward them** with `deposit` (base units of the shared token) — on
+Solana by posting the payer-signed `open` to their sponsor endpoint, through
+your `socks_proxy` if they are an onion host — or finds the one you already have
+open, spending nothing. `"channel"`
 is that channel, and `"status"` says which branch it took — `"created"` or
 `"found"` — so an unintended second channel shows up in your own output rather
 than on a block explorer later. `deposit` is needed only for `"created"`. Every
 packet you forward to them from then on carries a voucher on this channel. They
 do the same with your URL, and their channel toward you is recognised by the
-key they publish; until they do, their packets reach you as a client's. (On
-Solana the write still derives one shared channel and opens it if absent,
-until #1379.)
+key they publish; until they do, their packets reach you as a client's.
 
 `id` is your own local label for the relation; nothing puts it on the wire. `fee`
 is what you keep for carrying one packet over this peering — flat, per packet,
@@ -625,18 +625,16 @@ Two nodes that settle on **more than one chain in common** must say which: add
 `"chain": "evm"` or `"chain": "solana"`. Without it the write is refused by name
 rather than resolved silently.
 
-**2. Keep your own collateral behind your own vouchers.** On EVM the opening
-deposit came with the write above; top your channel up when it runs low. `fund`
-takes an **increment**, so posting the same write twice deposits twice:
+**2. Keep your own collateral behind your own vouchers.** The opening deposit
+came with the write above; top your channel up when it runs low. `fund` takes an
+**increment**, so posting the same write twice deposits twice:
 
 ```bash
 docs/operators/sign-write.sh -k operator-write.key -X POST -p /channels/0x…/fund \
   -u https://your-node.example -b '{"amount":3000}'
 ```
 
-It answers the channel, with its `collateral` raised by that amount. On Solana,
-until #1379, opening the derived channel does not fund it, and this same write is
-how you put your side behind it (`own_deposited`).
+It answers the channel, with its `collateral` raised by that amount.
 
 That is also the cure when a channel runs out of headroom and starts refusing
 packets `T00`, with one caveat worth knowing before you conclude the fund

@@ -153,27 +153,31 @@ POST /peers { "id": "...", "url": "https://…/ilp", "fee": 100, "max_packet_amo
 
 The node `GET`s that URL's self-description and takes from it the endpoint, the carriage that
 endpoint's scheme selects (`wss://` for BTP, `https://` for HTTP), the counterparty's edge identity,
-and its per-chain facts. **On EVM a peering is two one-way x402 channels**
+and its per-chain facts. **On either chain a peering is two one-way x402 channels**
 ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 4,
-#1378): the node opens and funds **only its own** outbound `x402BatchSettlement` channel toward the
-counterparty, on the terms its `batchSettlements` entry publishes, with `deposit` (in base units of
-the shared token), and binds the counterparty's channel toward it by the voucher signer its
-`voucherSigners` entry publishes. The counterparty does the same with this node's URL; neither
-operator exchanges a channel id, and every forward to the peer then carries a voucher on this node's
-channel. `deposit` is needed only when this node has no open channel toward the counterparty yet; a
-repeat finds that channel and spends nothing (top it up with `POST /channels/:id/fund`). **On Solana,
-until #1379**, the node still derives one `toon-channel` from the two settlement keys, opens it if
-absent, and holds it in both roles
-([ADR 0059](../adr/0059-a-channel-is-derived-from-its-participants.md)).
+#1378 on EVM, #1379 on Solana): the node opens and funds **only its own** outbound channel toward the
+counterparty — an `x402BatchSettlement` channel on EVM, a `payment-channels` channel on Solana — on
+the terms its `batchSettlements` entry publishes, with `deposit` (in base units of the shared token),
+and binds the counterparty's channel toward it by the voucher signer its `voucherSigners` entry
+publishes (EVM `payerAuthorizer`, Solana `authorized_signer`). **On Solana the `open` is posted to
+the counterparty's `sponsorEndpoint`**, which co-signs, submits and admits it as `payee` and
+`rent_payer` (ADR 0075 decision 3), so the counterparty can always land this node's latest voucher
+with `settle_and_seal`, even after this node requests a close; the post leaves on `socks_proxy` when
+the sponsor is an onion host (`connector_config::is_onion_endpoint`, ADR 0070). The counterparty
+does the same with this node's URL; neither operator exchanges a channel id, and every forward to the
+peer then carries a voucher on this node's channel. `deposit` is needed only when this node has no
+open channel toward the counterparty yet; a repeat finds that channel and spends nothing (top it up
+with `POST /channels/:id/fund`).
 
-**A runtime EVM peering written before #1378** names a `TokenNetwork` channel this build cannot
-sign on, and the node refuses to boot on it, by name, pointing at ADR 0075's drain procedure — never
-dropping the row.
+**A runtime peering written before ADR 0075** — an EVM one naming a `TokenNetwork` channel (before
+#1378), a Solana one naming a channel of TOON's own payment-channel program (before #1379) — names a
+channel this build cannot sign on, and the node refuses to boot on it, by name, pointing at ADR
+0075's drain procedure — never dropping the row.
 
 **There is nothing else to exchange out of band, and there is no shared secret.** Both halves an
 earlier bring-up had to hand over by hand are gone rather than merely documented. No **channel** id
-is copied between operators: on EVM each node opens its own and binds the other's by a published key
-(ADR 0075), and on Solana the channel is still derived from the two settlement keys (ADR 0059). The **peer credential** that had to be byte-identical in both data dirs is
+is copied between operators: each node opens its own and binds the other's by a published key
+(ADR 0075). The **peer credential** that had to be byte-identical in both data dirs is
 **deleted, with nothing replacing it**: a peer's role is proved per frame by its `[[peer_channels]]`
 binding and its claim signature
 ([ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)).

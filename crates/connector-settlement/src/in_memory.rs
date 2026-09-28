@@ -262,29 +262,6 @@ impl SettlementBackend for InMemorySettlementBackend {
             .ok_or_else(|| SettlementError::ChannelNotFound(channel.clone()))?;
         Ok(stored.state(channel))
     }
-
-    /// This fake has no chain to ask, so it answers ADR 0059's question
-    /// from the only state it has: the channel it opened to that
-    /// counterparty, if one is still live.
-    ///
-    /// A scan rather than a second index keyed by counterparty, because
-    /// this is a cold-path operator question and the map is however many
-    /// channels one test opened. What it must reproduce is the *rule* --
-    /// at most one live channel per counterparty, and a settled pair
-    /// reporting none so it can start again -- which the contract suite
-    /// holds every real backend to as well.
-    async fn live_channel_with(
-        &self,
-        counterparty: Vec<u8>,
-    ) -> Result<Option<ChannelId>, SettlementError> {
-        Ok(self
-            .channels()
-            .iter()
-            .find(|(_, stored)| {
-                stored.counterparty == counterparty && stored.status != ChannelStatus::Settled
-            })
-            .map(|(id, _)| id.clone()))
-    }
 }
 
 #[cfg(test)]

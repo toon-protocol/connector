@@ -134,35 +134,12 @@ where
     } = build().await;
     let timeout = Duration::seconds(3600);
 
-    // ADR 0059: "do I already have a channel with this counterparty?" is
-    // answerable *before* opening one, and the answer is no.
-    assert_eq!(
-        backend
-            .live_channel_with(counterparty.clone())
-            .await
-            .expect("live_channel_with on a pair with no channel"),
-        None,
-        "a pair that has never opened a channel must report none"
-    );
-
     // Opening a channel reports it open, unfunded, to the counterparty given.
     let channel = backend
         .open(counterparty.clone(), timeout)
         .await
         .expect("open");
 
-    // ...and now the same question finds it, from the participants alone.
-    // This is what makes establishing a peering from a URL idempotent
-    // (ADR 0058): a second attempt lands on the channel the first opened
-    // rather than opening a second one.
-    assert_eq!(
-        backend
-            .live_channel_with(counterparty.clone())
-            .await
-            .expect("live_channel_with after open"),
-        Some(channel.clone()),
-        "an open channel must be findable from its counterparty alone"
-    );
     let state = backend
         .channel_state(&channel)
         .await
@@ -401,18 +378,6 @@ where
     let err = backend.close(&channel).await.unwrap_err();
     assert_eq!(err, SettlementError::ChannelClosed(channel.clone()));
 
-    // A closed channel still occupies its pair's identifier: it holds
-    // collateral and still redeems, so reporting the pair as having none
-    // would hand a caller an `open` that fails.
-    assert_eq!(
-        backend
-            .live_channel_with(counterparty.clone())
-            .await
-            .expect("live_channel_with during the challenge window"),
-        Some(channel.clone()),
-        "a channel inside its challenge window is still the pair's live channel"
-    );
-
     // `timeout` above is a full hour and no real time has elapsed since
     // `close` -- settling this channel now must fail with the named
     // "not yet due" error (issue #574), not a generic backend string.
@@ -460,19 +425,6 @@ where
     let err = backend.settle(&immediate).await.unwrap_err();
     assert_eq!(err, SettlementError::ChannelSettled(immediate));
 
-    // ...and once it has settled, the pair reports no live channel again,
-    // which is what lets two parties who have finished one start another
-    // (`CONTEXT.md`, **Payment channel**; ADR 0059's epoch is the EVM
-    // mechanism, a freed PDA the Solana one).
-    assert_eq!(
-        backend
-            .live_channel_with(instant_counterparty.clone())
-            .await
-            .expect("live_channel_with after settlement"),
-        None,
-        "a settled pair must report no live channel, so it can start a fresh one"
-    );
-
     // A channel id from one open() call names only that channel -- a
     // second channel to a different counterparty has its own independent,
     // freshly-unfunded state.
@@ -485,14 +437,6 @@ where
     assert_eq!(other_state.status, ChannelStatus::Open);
     assert_eq!(other_state.counterparty_deposited, 0);
     assert_eq!(other_state.own_deposited, 0);
-    assert_eq!(
-        backend
-            .live_channel_with(other_counterparty.clone())
-            .await
-            .expect("live_channel_with for the second counterparty"),
-        Some(other.clone()),
-        "each pair's live channel is that pair's, not whichever was opened last"
-    );
 
     // Operating on an id nothing ever opened is reported, not panicked.
     let missing = ChannelId("does-not-exist".to_string());

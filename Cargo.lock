@@ -1406,6 +1406,8 @@ dependencies = [
  "bincode",
  "chrono",
  "connector-chain-rpc",
+ "connector-config",
+ "connector-runtime",
  "connector-settlement",
  "connector-settlement-solana",
  "connector-signer",
@@ -1424,6 +1426,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

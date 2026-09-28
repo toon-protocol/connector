@@ -50,12 +50,15 @@
 //! Restoring the watermark from the receiver's `POST /ilp/claim-state`, for
 //! a node that lost its journal, is the peering's (issue #1378).
 //!
-//! **Not yet through `socks_proxy`.** The sponsor endpoint is a peer's, so a
-//! counterparty on an onion endpoint (ADR 0070) needs its post dialed
-//! through the node's proxy by the host rule in
-//! `connector_config::is_onion_endpoint`. This backend is built with no
-//! config to read that from; wiring it is the runtime peering's (issue
-//! #1379), which builds the paying half with the node's proxy in hand.
+//! **An onion sponsor is posted to through `socks_proxy`** (ADR 0070, issue
+//! #1379). The sponsor endpoint is a peer's, not the chain's, so a
+//! counterparty on an onion host needs its post dialed through the node's
+//! one `socks_proxy` -- chosen by the one host rule,
+//! `connector_config::is_onion_endpoint`, which also decides that peer's
+//! carriage and its self-description fetch ([`SponsorClients`]). Every other
+//! sponsor is posted to direct. The settlement `rpc_url` is untouched by
+//! this: whether it rides the proxy is its own table's
+//! `rpc_via_socks_proxy` (ADR 0073).
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -91,12 +94,96 @@ const SPONSOR_POST_TIMEOUT: Duration = Duration::from_secs(120);
 /// ([`sponsor::SponsorRefusal::ClusterRentThresholdUnsupported`]).
 const RENT_SHORT: &str = "cluster_rent_threshold_unsupported";
 
-/// The client [`SolanaBatchSettlement`] posts opens with.
-pub(super) fn sponsor_http_client() -> Result<reqwest::Client, BatchSettlementError> {
-    reqwest::Client::builder()
-        .timeout(SPONSOR_POST_TIMEOUT)
-        .build()
-        .map_err(backend_error)
+/// Why an onion sponsor cannot be posted to on a node with no `socks_proxy`:
+/// an onion name resolves nowhere without one (ADR 0070).
+const NO_SOCKS_PROXY: &str = "the sponsor endpoint is an onion host, and this node configures no \
+     socks_proxy to reach it through (ADR 0070)";
+
+/// The clients [`SolanaBatchSettlement`] posts opens with: one direct, and
+/// one through the node's `socks_proxy` for a sponsor on an onion host.
+///
+/// Which one a post leaves on is read off the endpoint's host by
+/// [`connector_config::is_onion_endpoint`], never re-derived: the rule that
+/// decides a peering's carriage decides where its sponsor post goes, so a
+/// node cannot peer with an onion counterparty it could not open toward.
+pub(super) struct SponsorClients {
+    direct: reqwest::Client,
+    /// Built once from the proxy, or why there is none -- reported at the
+    /// post that needed it rather than at boot, since a node with no onion
+    /// counterparty never does.
+    onion: Result<reqwest::Client, String>,
+}
+
+impl SponsorClients {
+    /// A direct client, and one through `socks_proxy` when one is
+    /// configured.
+    pub(super) fn new(socks_proxy: Option<&url::Url>) -> Result<Self, BatchSettlementError> {
+        let bounded = || reqwest::Client::builder().timeout(SPONSOR_POST_TIMEOUT);
+        let direct = bounded().build().map_err(backend_error)?;
+        let onion = match socks_proxy {
+            None => Err(NO_SOCKS_PROXY.to_string()),
+            Some(proxy) => reqwest::Proxy::all(proxy.as_str())
+                .and_then(|socks| bounded().proxy(socks).build())
+                .map_err(|error| format!("socks_proxy '{proxy}' could not be used: {error}")),
+        };
+        Ok(SponsorClients { direct, onion })
+    }
+
+    /// The client a post to `endpoint` leaves on, or why there is none.
+    fn client_for(&self, endpoint: &str) -> Result<&reqwest::Client, String> {
+        let onion = url::Url::parse(endpoint)
+            .is_ok_and(|endpoint| connector_config::is_onion_endpoint(&endpoint));
+        if onion {
+            self.onion.as_ref().map_err(Clone::clone)
+        } else {
+            Ok(&self.direct)
+        }
+    }
+
+    /// Post `transaction` to `endpoint` and read back the channel the
+    /// sponsor made, or why it made none.
+    async fn post(&self, endpoint: &str, transaction: String) -> Result<Pubkey, SponsorFailure> {
+        let client = self.client_for(endpoint).map_err(|reason| {
+            SponsorFailure::Unreachable(format!(
+                "the sponsor endpoint {endpoint} could not be reached: {reason}"
+            ))
+        })?;
+        let response = client
+            .post(endpoint)
+            .json(&serde_json::json!({ "transaction": transaction }))
+            .send()
+            .await
+            .map_err(|error| {
+                SponsorFailure::Unreachable(format!(
+                    "the sponsor endpoint {endpoint} could not be reached: {error}"
+                ))
+            })?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.map_err(|error| {
+            SponsorFailure::Unreachable(format!(
+                "the sponsor endpoint {endpoint} answered {status} with no JSON: {error}"
+            ))
+        })?;
+        let text = |field: &str| body.get(field).and_then(serde_json::Value::as_str);
+        if !status.is_success() {
+            return Err(match text("error") {
+                Some(name) => SponsorFailure::Refused {
+                    name: name.to_string(),
+                    detail: text("detail").unwrap_or_default().to_string(),
+                },
+                None => SponsorFailure::Unreachable(format!(
+                    "the sponsor endpoint {endpoint} answered {status} without naming why: {body}"
+                )),
+            });
+        }
+        text("channelId")
+            .and_then(|channel| Pubkey::from_str(channel).ok())
+            .ok_or_else(|| {
+                SponsorFailure::Unreachable(format!(
+                    "the sponsor endpoint {endpoint} answered {status} with no channelId: {body}"
+                ))
+            })
+    }
 }
 
 /// What the paying half remembers about one channel it opened.
@@ -119,6 +206,7 @@ pub(super) struct Outbound {
 }
 
 /// Why a post to a sponsor endpoint produced no channel.
+#[derive(Debug)]
 enum SponsorFailure {
     /// The endpoint answered with a named refusal: its `error` and `detail`.
     Refused { name: String, detail: String },
@@ -302,48 +390,14 @@ impl SolanaBatchSettlement {
     }
 
     /// Post `transaction` to `endpoint` and read back the channel the
-    /// sponsor made, or why it made none.
+    /// sponsor made, or why it made none -- through `socks_proxy` for an
+    /// onion sponsor ([`SponsorClients`]).
     async fn post_to_sponsor(
         &self,
         endpoint: &str,
         transaction: String,
     ) -> Result<Pubkey, SponsorFailure> {
-        let response = self
-            .sponsor_http
-            .post(endpoint)
-            .json(&serde_json::json!({ "transaction": transaction }))
-            .send()
-            .await
-            .map_err(|error| {
-                SponsorFailure::Unreachable(format!(
-                    "the sponsor endpoint {endpoint} could not be reached: {error}"
-                ))
-            })?;
-        let status = response.status();
-        let body: serde_json::Value = response.json().await.map_err(|error| {
-            SponsorFailure::Unreachable(format!(
-                "the sponsor endpoint {endpoint} answered {status} with no JSON: {error}"
-            ))
-        })?;
-        let text = |field: &str| body.get(field).and_then(serde_json::Value::as_str);
-        if !status.is_success() {
-            return Err(match text("error") {
-                Some(name) => SponsorFailure::Refused {
-                    name: name.to_string(),
-                    detail: text("detail").unwrap_or_default().to_string(),
-                },
-                None => SponsorFailure::Unreachable(format!(
-                    "the sponsor endpoint {endpoint} answered {status} without naming why: {body}"
-                )),
-            });
-        }
-        text("channelId")
-            .and_then(|channel| Pubkey::from_str(channel).ok())
-            .ok_or_else(|| {
-                SponsorFailure::Unreachable(format!(
-                    "the sponsor endpoint {endpoint} answered {status} with no channelId: {body}"
-                ))
-            })
+        self.sponsor_http.post(endpoint, transaction).await
     }
 
     /// What a post that produced no channel means for `channel`, the one the
@@ -797,5 +851,103 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
             expires,
         );
         Ok(self.sponsor.sign_message(&message).as_ref().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Which socket a sponsor post leaves on (ADR 0070, issue #1379),
+    //! asserted against a **real SOCKS5 server** and a real HTTP listener on
+    //! loopback -- the only way to answer "where did that connection go".
+    //! No onion daemon and no validator: a `.onion` name resolves nowhere,
+    //! which is why finding it among the proxy's CONNECT targets proves the
+    //! post both went through the proxy and deferred resolution to it.
+
+    use std::collections::HashMap;
+
+    use connector_runtime::Socks5TestServer;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    const ONION_HOST: &str = "toonexampleconnectoraddress234567abcdefghijklmnopqrstuvw.onion";
+    const ANYONE_HOST: &str = "toonexampleconnectoraddress234567abcdefghijklmnopqrstuvw.anyone";
+
+    /// A sponsor that answers every post with `channel`, the way a real one
+    /// answers a co-signed `open`.
+    async fn sponsor_answering(channel: Pubkey) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = vec![0u8; 16 * 1024];
+                    let _ = socket.read(&mut request).await;
+                    let body = serde_json::json!({ "channelId": channel.to_string() }).to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: \
+                         {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn an_onion_sponsor_is_posted_to_through_the_proxy_as_a_name() {
+        let channel = Pubkey::new_unique();
+        let sponsor = sponsor_answering(channel).await;
+        for host in [ONION_HOST, ANYONE_HOST] {
+            let proxy =
+                Socks5TestServer::spawn(HashMap::from([(format!("{host}:80"), sponsor)])).await;
+            let clients = SponsorClients::new(Some(&proxy.proxy_url())).expect("clients");
+            let endpoint = format!("http://{host}/ilp/batch-settlement/solana/open");
+            let answered = clients
+                .post(&endpoint, "dHg=".to_string())
+                .await
+                .expect("the sponsor answered through the proxy");
+            assert_eq!(answered, channel);
+            assert_eq!(proxy.targets(), vec![format!("{host}:80")]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clearnet_sponsor_is_posted_to_direct_even_with_a_proxy_configured() {
+        let channel = Pubkey::new_unique();
+        let sponsor = sponsor_answering(channel).await;
+        let proxy = Socks5TestServer::spawn_recording_only().await;
+        let clients = SponsorClients::new(Some(&proxy.proxy_url())).expect("clients");
+        let answered = clients
+            .post(
+                &format!("http://{sponsor}/ilp/batch-settlement/solana/open"),
+                "dHg=".to_string(),
+            )
+            .await
+            .expect("the sponsor answered direct");
+        assert_eq!(answered, channel);
+        assert!(proxy.targets().is_empty(), "{:?}", proxy.targets());
+    }
+
+    #[tokio::test]
+    async fn an_onion_sponsor_on_a_node_with_no_proxy_is_refused_by_name_without_a_dial() {
+        let clients = SponsorClients::new(None).expect("clients");
+        let failure = clients
+            .post(
+                &format!("http://{ONION_HOST}/ilp/batch-settlement/solana/open"),
+                "dHg=".to_string(),
+            )
+            .await
+            .expect_err("no proxy to reach it through");
+        assert!(
+            matches!(&failure, SponsorFailure::Unreachable(reason) if reason.contains("socks_proxy")),
+            "{failure}"
+        );
     }
 }
