@@ -185,6 +185,101 @@ pub struct Voucher {
     pub signature: Vec<u8>,
 }
 
+/// What a counterparty publishes about the channels it will receive on (ADR
+/// 0075 decision 3): its self-description's `batchSettlements` entry for
+/// one chain, in plain bytes. The paying half opens a channel toward it on
+/// exactly these terms, so that the counterparty's receiving half admits
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiverTerms {
+    Evm(EvmReceiverTerms),
+    Solana(SolanaReceiverTerms),
+}
+
+impl ReceiverTerms {
+    /// The chain these terms are for, spelled as
+    /// [`ChannelPresentation::chain`] spells it.
+    pub fn chain(&self) -> &'static str {
+        match self {
+            ReceiverTerms::Evm(_) => "evm",
+            ReceiverTerms::Solana(_) => "solana",
+        }
+    }
+
+    /// The shortest delay the counterparty admits a channel with, in
+    /// seconds: EVM `withdrawDelay`, Solana `grace_period`. A channel this
+    /// node opens carries exactly this, which is how long winding it down
+    /// takes (ADR 0075, Consequences).
+    pub fn min_delay_secs(&self) -> u64 {
+        match self {
+            ReceiverTerms::Evm(terms) => terms.min_withdraw_delay_secs,
+            ReceiverTerms::Solana(terms) => terms.min_grace_period_secs,
+        }
+    }
+}
+
+/// An EVM counterparty's terms: what the `ChannelConfig` this node builds
+/// toward it must name (ADR 0075 decision 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvmReceiverTerms {
+    /// `payTo`: the counterparty's settlement address, which the config
+    /// names as both `receiver` and `receiverAuthorizer`.
+    pub receiver: [u8; 20],
+    /// `asset`: the token the counterparty settles in, which must be this
+    /// node's too.
+    pub token: [u8; 20],
+    /// `withdrawDelay`: the counterparty's published minimum, in seconds.
+    pub min_withdraw_delay_secs: u64,
+}
+
+/// A Solana counterparty's terms: what the `open` this node builds toward
+/// it must name, and where it goes to be co-signed (ADR 0075 decision 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SolanaReceiverTerms {
+    /// `feePayer`: the counterparty's sponsor key, which takes the fee
+    /// payer, `rent_payer` and `payee` seats.
+    pub sponsor: [u8; 32],
+    /// `payTo`: the owner of the counterparty's receiving account, the one
+    /// distribution entry at 10000 bps.
+    pub receiver: [u8; 32],
+    /// `asset`: the mint the counterparty settles in, which must be this
+    /// node's too.
+    pub mint: [u8; 32],
+    /// `withdrawDelay`: the counterparty's minimum `grace_period`, in
+    /// seconds.
+    pub min_grace_period_secs: u64,
+    /// `minDeposit`: the smallest opening deposit the counterparty's
+    /// sponsor co-signs, in base units.
+    pub min_deposit: u128,
+    /// `sponsorEndpoint`, resolved against the counterparty's URL: where
+    /// the payer-signed `open` is posted (ADR 0074 decision 9).
+    pub sponsor_endpoint: String,
+}
+
+/// A channel a payer opened, as the receiver is shown it, and the signer
+/// the chain recorded for it. What [`BatchSettlementPayer::open`] returns:
+/// on EVM the presentation carries the `ChannelConfig` the first voucher
+/// must carry (ADR 0075 decision 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedChannel {
+    pub presentation: ChannelPresentation,
+    pub voucher_signer: VoucherSigner,
+}
+
+/// A channel this node pays on, as its paying half sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundChannelState {
+    /// The channel as its chain reports it, in the terms the receiving half
+    /// uses: what the receiver has landed, and what still backs a voucher
+    /// above that.
+    pub on_chain: BatchChannelState,
+    /// The highest cumulative amount this node has signed a voucher for on
+    /// the channel: its own watermark, which the next voucher it signs must
+    /// exceed. It runs ahead of [`BatchChannelState::landed`] until the
+    /// receiver lands.
+    pub signed: u128,
+}
+
 /// Why an otherwise real channel is not one this node will accept vouchers
 /// on (ADR 0074 decisions 2, 4 and 5). Each names the rule it breaks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,19 +394,67 @@ pub enum BatchSettlementError {
     #[error("voucher signature is invalid: {0}")]
     InvalidVoucherSignature(String),
 
+    /// The paying half was asked to act on a channel this node did not open
+    /// as payer (ADR 0075 decision 2). A channel it only receives on is not
+    /// one it can fund, sign on or withdraw from.
+    #[error("batch-settlement channel '{0}' is not one this node opened")]
+    NotOutbound(ChannelId),
+
+    /// The counterparty's published terms name a token this node does not
+    /// settle in. The two ends of a channel must share one (ADR 0075
+    /// decision 4), and nothing was opened.
+    #[error("the counterparty settles in a token this node does not")]
+    TokenNotShared,
+
+    /// The counterparty declined to take part in the open, and said why by
+    /// name: on Solana, its sponsor endpoint's refusal (ADR 0074 decision 9),
+    /// such as a deposit below its published minimum. Nothing was opened.
+    #[error("the counterparty refused the open: {0}")]
+    OpenRefused(String),
+
+    /// A voucher this node would sign that does not exceed the highest it
+    /// has already signed on the channel. The receiver's watermark would
+    /// refuse it, so it is never signed (ADR 0075 decision 6).
+    #[error("a voucher for {amount} does not exceed the {signed} already signed")]
+    VoucherNotAdvancing { amount: u128, signed: u128 },
+
+    /// A voucher this node would sign above what its channel still backs:
+    /// the deposit, less any withdrawal it has begun. The receiver would
+    /// refuse it as unbacked, so it is never signed.
+    #[error("a voucher for {amount} exceeds the {backed} the channel backs")]
+    VoucherUnbacked { amount: u128, backed: u128 },
+
+    /// Finishing a withdrawal that was never started, or has already
+    /// finished.
+    #[error("batch-settlement channel '{0}' has no withdrawal to finish")]
+    NoWithdrawalPending(ChannelId),
+
+    /// Finishing a withdrawal before the chain lets it finish: the channel's
+    /// delay has not run, and on Solana the receiver has not sealed it
+    /// either. Retryable once `remaining_secs` have passed.
+    #[error(
+        "the withdrawal from batch-settlement channel '{channel}' is due in {remaining_secs}s"
+    )]
+    WithdrawalNotDue {
+        channel: ChannelId,
+        remaining_secs: u64,
+    },
+
     #[error("batch-settlement backend error: {0}")]
     Backend(String),
 }
 
-/// The receive-only settlement port for x402 `batch-settlement` channels
-/// (ADR 0074 decision 9).
+/// The receiving half of the settlement port for x402 `batch-settlement`
+/// channels (ADR 0074 decision 9, ADR 0075 decision 2): this node admits a
+/// channel a payer opened toward it, reads it, and lands the payer's
+/// vouchers on it. [`BatchSettlementPayer`] is the other half, this node as
+/// the payer.
 ///
 /// It is **not** [`SettlementBackend`](crate::SettlementBackend) bent to fit.
-/// A batch-settlement channel has no `open` this node calls, no side of its
-/// own and a different lifecycle on each chain, so `own_deposited`, `fund`
-/// and `close` would mean nothing here. This node never opens, funds or signs
-/// on such a channel; it admits one a client opened, reads it, and lands the
-/// client's vouchers on it.
+/// A batch-settlement channel moves value one way and has a different
+/// lifecycle on each chain, so `own_deposited`, `fund` and `close` would
+/// mean nothing here. `SettlementBackend` is deleted once nothing calls it
+/// (ADR 0075 decision 2, issue #1385).
 ///
 /// Implementations live in `connector-settlement-evm` (issue #1342) and
 /// `connector-settlement-solana` (issue #1343), as modules beside the
@@ -409,4 +552,125 @@ pub trait BatchSettlementBackend: Send + Sync {
         channel: &ChannelId,
         voucher: Voucher,
     ) -> Result<BatchChannelState, BatchSettlementError>;
+}
+
+/// The paying half of the settlement port (ADR 0075 decision 2): this node
+/// as the **payer** on a batch-settlement channel toward a counterparty,
+/// where [`BatchSettlementBackend`] is this node as the receiver. Each
+/// chain's backend implements both halves (issues #1374, #1375), over its
+/// table's one `RpcTransport` and its settlement key's one nonce sequence;
+/// [`InMemoryBatchSettlement`](super::InMemoryBatchSettlement) is the fake
+/// that implements both, and [`super::contract`] holds each half to its
+/// suite (ADR 0007).
+///
+/// **Which key.** The chain's settlement key pays, signs every transaction
+/// here, and signs every voucher: on EVM `payerAuthorizer == payer`, on
+/// Solana `authorized_signer` is the payer. `[signer]` is identity only and
+/// never appears (ADR 0075 decision 3).
+///
+/// **What is not here.** Journaling an outbound channel's config before its
+/// opening transaction is sent, and bringing an outbound channel back after
+/// a restart with its watermark from the receiver's `POST /ilp/claim-state`,
+/// belong to the operator surface and the peering (issues #1376, #1378):
+/// this half remembers what it opened, and what it signed, for the process
+/// lifetime.
+#[async_trait]
+pub trait BatchSettlementPayer: Send + Sync {
+    /// Open a channel toward the counterparty that published `terms`, and
+    /// deposit `deposit` into it, paying from this node's settlement
+    /// account. The channel names this node's settlement key as payer and
+    /// voucher signer, the counterparty in every seat its receiving half
+    /// requires, the shared token, the counterparty's minimum delay and a
+    /// fresh salt, so the counterparty admits it.
+    ///
+    /// On EVM a `deposit` this node sends and pays gas for; on Solana an
+    /// `open` this node signs and posts to the counterparty's sponsor
+    /// endpoint, which co-signs and submits it.
+    ///
+    /// Refuses, opening nothing, terms for another chain
+    /// ([`WrongChain`](BatchSettlementError::WrongChain)), terms in a token
+    /// this node does not settle in
+    /// ([`TokenNotShared`](BatchSettlementError::TokenNotShared)), and an
+    /// open the counterparty declines
+    /// ([`OpenRefused`](BatchSettlementError::OpenRefused)).
+    ///
+    /// Never idempotent: two opens on the same terms are two channels, both
+    /// live, as several channels to one receiver may be.
+    async fn open(
+        &self,
+        terms: ReceiverTerms,
+        deposit: u128,
+    ) -> Result<OpenedChannel, BatchSettlementError>;
+
+    /// Add `increment` to the deposit of a channel this node opened: EVM
+    /// another `deposit` into the same config, Solana `top_up`. An
+    /// increment, never a total. Returns the state after. Refuses a sealed
+    /// channel ([`ChannelSealed`](BatchSettlementError::ChannelSealed)).
+    async fn top_up(
+        &self,
+        channel: &ChannelId,
+        increment: u128,
+    ) -> Result<OutboundChannelState, BatchSettlementError>;
+
+    /// Sign a voucher for `cumulative_amount` on a channel this node opened,
+    /// with the key the chain records as its voucher signer, and raise this
+    /// node's watermark on the channel to it. EVM: EIP-712
+    /// `Voucher(channelId, maxClaimableAmount)` under the
+    /// `x402BatchSettlement` domain; Solana: the 50-byte message with
+    /// `expires_at = 0`.
+    ///
+    /// Refuses, signing nothing, an amount that does not exceed the highest
+    /// already signed ([`VoucherNotAdvancing`](BatchSettlementError::VoucherNotAdvancing))
+    /// and one above what the channel backs
+    /// ([`VoucherUnbacked`](BatchSettlementError::VoucherUnbacked)): the
+    /// receiver would refuse either. What the channel backs moves only by
+    /// this node's own top-ups and withdrawals, so an implementation may
+    /// answer from its own record rather than the chain.
+    async fn sign_voucher(
+        &self,
+        channel: &ChannelId,
+        cumulative_amount: u128,
+    ) -> Result<Voucher, BatchSettlementError>;
+
+    /// Begin taking back everything on a channel this node opened that the
+    /// receiver has not landed: EVM `initiateWithdraw` for `balance −
+    /// totalClaimed`, Solana `request_close`. From here the channel backs
+    /// no new voucher, and the receiver still has the delay in which to
+    /// land the latest one it holds. Returns the state after.
+    ///
+    /// Starting a withdrawal already started changes nothing, and returns
+    /// the state. A sealed channel has nothing left to withdraw
+    /// ([`ChannelSealed`](BatchSettlementError::ChannelSealed)).
+    async fn start_withdrawal(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<OutboundChannelState, BatchSettlementError>;
+
+    /// Finish a withdrawal this node started, returning to its settlement
+    /// account everything the receiver had not landed by then: EVM
+    /// `finalizeWithdraw`, Solana `distribute`. A voucher the receiver
+    /// landed inside the delay is the receiver's, whatever the withdrawal
+    /// asked for. Returns the state after.
+    ///
+    /// On Solana `distribute` is due once the receiver has sealed the
+    /// channel or the grace period has run. The `reclaim` that follows it
+    /// returns rent to the channel's `rent_payer`, which is the receiver's
+    /// sponsor key, so it is the receiver's sweep, not this node's
+    /// (ADR 0074 decision 5).
+    ///
+    /// Refuses a withdrawal never started
+    /// ([`NoWithdrawalPending`](BatchSettlementError::NoWithdrawalPending))
+    /// and one the chain does not yet let finish
+    /// ([`WithdrawalNotDue`](BatchSettlementError::WithdrawalNotDue)).
+    async fn finish_withdrawal(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<OutboundChannelState, BatchSettlementError>;
+
+    /// A channel this node opened, read from the chain now, with the
+    /// highest amount it has signed on it.
+    async fn outbound_state(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<OutboundChannelState, BatchSettlementError>;
 }

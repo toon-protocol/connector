@@ -1,14 +1,17 @@
-//! One contract suite (ADR 0007): the definition of the
-//! [`BatchSettlementBackend`] port, run unmodified against the in-memory
-//! fake here and against each chain's implementation from its own crate
-//! (issues #1342, #1343).
+//! The contract suites (ADR 0007) that define the batch-settlement port, one
+//! per half, run unmodified against the in-memory fake here and against each
+//! chain's implementation from its own crate. [`assert_upholds_the_contract`]
+//! is the receiving half ([`BatchSettlementBackend`], issues #1342, #1343);
+//! [`assert_upholds_the_paying_contract`] is the paying half
+//! ([`BatchSettlementPayer`], ADR 0075 decision 2), which the chain
+//! implementations join in issues #1374 and #1375.
 //!
 //! Gated behind `test-util` for the same reason as [`crate::contract`]: the
 //! real implementations live in other crates, which add this one under
-//! `[dev-dependencies]` with `features = ["test-util"]` and call
-//! [`assert_upholds_the_contract`] from their own tests.
+//! `[dev-dependencies]` with `features = ["test-util"]` and call the suites
+//! from their own tests.
 //!
-//! The suite asserts only what holds on **both** chains. Where they differ
+//! Each suite asserts only what holds on **both** chains. Where they differ
 //! -- an EVM payer's exit is a withdrawal the channel survives, a Solana
 //! payer's is a close that sealing ends -- it asserts the part they share:
 //! the exiting channel stops backing new vouchers, and the voucher already
@@ -20,11 +23,13 @@ use std::sync::Arc;
 
 use super::port::{
     AdmissionRefusal, BatchChannelStatus, BatchSettlementBackend, BatchSettlementError,
-    ChannelPresentation, Voucher,
+    BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, ReceiverTerms,
+    SolanaReceiverTerms, Voucher, VoucherSigner,
 };
 use crate::port::ChannelId;
 
-pub use super::in_memory::{ChannelTerms, OpenedChannel};
+pub use super::in_memory::ChannelTerms;
+pub use super::port::OpenedChannel;
 
 /// A boxed, `'static`, `Send` future, for the fixture's asynchronous
 /// capabilities.
@@ -360,10 +365,364 @@ where
     );
 }
 
+/// The shape of [`PayingContractFixture::payer_balance`].
+pub type BalanceFn = Box<dyn Fn() -> BoxFuture<'static, u128> + Send>;
+/// The shape of [`PayingContractFixture::let_delay_pass`].
+pub type LetDelayPassFn = Box<dyn Fn() -> BoxFuture<'static, ()> + Send>;
+
+/// Everything the paying half's suite needs: a payer, and a counterparty on
+/// the same chain for it to pay. Unlike [`BatchContractFixture`], nothing
+/// here stands in for a client: both ends are the implementation under test,
+/// because a peering is two nodes paying each other (ADR 0075 decision 4).
+pub struct PayingContractFixture {
+    /// The implementation under test, as payer. Its settlement account holds
+    /// at least 10,000 base units of the shared token.
+    pub payer: Arc<dyn BatchSettlementPayer>,
+    /// A second instance of the same implementation, with its own settlement
+    /// key, as the receiver that published [`terms`](Self::terms).
+    pub receiver: Arc<dyn BatchSettlementBackend>,
+    /// The receiver's published terms, in the token the payer settles in. On
+    /// Solana its minimum deposit is at most 1,000.
+    pub terms: ReceiverTerms,
+    /// The payer's settlement account's balance of the shared token, read
+    /// from the chain.
+    pub payer_balance: BalanceFn,
+    /// The payer's settlement key, as the chain names a voucher signer: its
+    /// settlement address on EVM, its Solana settlement key on Solana. Every
+    /// channel it opens must name this and nothing else, `[signer]` least of
+    /// all (ADR 0075 decision 3).
+    pub payer_settlement_key: VoucherSigner,
+    /// Let the receiver's minimum delay pass on the chain, so a withdrawal
+    /// started before it may finish: anvil moves its clock. The suite only
+    /// finishes a Solana close after the receiver has sealed it, which is
+    /// due at once, so on a validator, whose clock cannot be moved, this
+    /// may do nothing.
+    pub let_delay_pass: LetDelayPassFn,
+    /// A channel, in this chain's spelling, that the payer did not open.
+    pub not_outbound: ChannelId,
+}
+
+/// `terms`, naming a token no node settles in.
+fn in_another_token(terms: &ReceiverTerms) -> ReceiverTerms {
+    match terms.clone() {
+        ReceiverTerms::Evm(terms) => ReceiverTerms::Evm(EvmReceiverTerms {
+            token: terms.token.map(|byte| !byte),
+            ..terms
+        }),
+        ReceiverTerms::Solana(terms) => ReceiverTerms::Solana(SolanaReceiverTerms {
+            mint: terms.mint.map(|byte| !byte),
+            ..terms
+        }),
+    }
+}
+
+/// Terms for the chain `terms` is not for.
+fn for_the_other_chain(terms: &ReceiverTerms) -> ReceiverTerms {
+    match terms {
+        ReceiverTerms::Evm(terms) => ReceiverTerms::Solana(SolanaReceiverTerms {
+            sponsor: [0x5a; 32],
+            receiver: [0x5a; 32],
+            mint: [0x5b; 32],
+            min_grace_period_secs: terms.min_withdraw_delay_secs,
+            min_deposit: 0,
+            sponsor_endpoint: "https://elsewhere.example/ilp/batch-settlement/solana/open"
+                .to_string(),
+        }),
+        ReceiverTerms::Solana(terms) => ReceiverTerms::Evm(EvmReceiverTerms {
+            receiver: [0x5a; 20],
+            token: [0x5b; 20],
+            min_withdraw_delay_secs: terms.min_grace_period_secs,
+        }),
+    }
+}
+
+/// Run every assertion the paying half of the port makes, against a payer
+/// and a receiver both freshly built from one implementation. Passing it
+/// unmodified is what "upholds the contract" means for the paying half
+/// (ADR 0007).
+///
+/// The seams are #1371's: an open, then admission on the receiving side;
+/// deposit and top-up; a signed voucher landing; the watermark refusing a
+/// voucher that does not advance; and a withdrawal racing a landing, which
+/// the landing wins inside the delay.
+pub async fn assert_upholds_the_paying_contract<F, Fut>(build: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = PayingContractFixture>,
+{
+    let PayingContractFixture {
+        payer,
+        receiver,
+        terms,
+        payer_balance,
+        payer_settlement_key,
+        let_delay_pass,
+        not_outbound,
+    } = build().await;
+    if let ReceiverTerms::Solana(solana) = &terms {
+        assert!(
+            solana.min_deposit <= 1_000,
+            "the fixture's receiver must sponsor the suite's opening deposits"
+        );
+    }
+    let funded = payer_balance().await;
+    assert!(funded >= 10_000, "the fixture's payer must hold 10,000");
+
+    // -- Opening (ADR 0075 decision 3) --
+
+    // Terms this node cannot meet open nothing, and spend nothing.
+    assert_eq!(
+        payer
+            .open(in_another_token(&terms), 1_000)
+            .await
+            .unwrap_err(),
+        BatchSettlementError::TokenNotShared,
+        "a channel is opened only in a token both ends settle in"
+    );
+    let other_chain = for_the_other_chain(&terms);
+    assert_eq!(
+        payer.open(other_chain.clone(), 1_000).await.unwrap_err(),
+        BatchSettlementError::WrongChain {
+            presented: other_chain.chain(),
+            backend: terms.chain(),
+        }
+    );
+    assert_eq!(
+        payer_balance().await,
+        funded,
+        "a refused open spends nothing"
+    );
+
+    // An open on the receiver's own terms is a channel the receiver admits,
+    // by exactly the rules it admits a client's by: nothing is configured
+    // on its side, and the chain, not the payer, names the voucher signer.
+    let opened = payer.open(terms.clone(), 1_000).await.expect("open");
+    let channel = opened.presentation.channel().clone();
+    assert_eq!(opened.presentation.chain(), terms.chain());
+    assert_eq!(
+        opened.voucher_signer, payer_settlement_key,
+        "the payer's settlement key signs its vouchers: on EVM payerAuthorizer == payer"
+    );
+    assert_eq!(
+        payer_balance().await,
+        funded - 1_000,
+        "the opening deposit comes from the payer's own account"
+    );
+
+    let outbound = payer
+        .outbound_state(&channel)
+        .await
+        .expect("outbound state");
+    assert_eq!(outbound.on_chain.id, channel);
+    assert_eq!(outbound.on_chain.status, BatchChannelStatus::Open);
+    assert_eq!(outbound.on_chain.voucher_signer, opened.voucher_signer);
+    assert_eq!(outbound.on_chain.landed, 0);
+    assert_eq!(outbound.on_chain.collateral, 1_000);
+    assert_eq!(outbound.signed, 0, "nothing is signed by opening");
+
+    let admitted = receiver
+        .admit(opened.presentation.clone())
+        .await
+        .expect("the receiver admits a channel opened on its own terms");
+    assert_eq!(
+        admitted, outbound.on_chain,
+        "the two halves read one channel off one chain"
+    );
+
+    // Opening again is a second channel, both live: a node may hold several
+    // toward one receiver (ADR 0075 decision 4).
+    let second = payer.open(terms.clone(), 1_000).await.expect("open again");
+    let second_channel = second.presentation.channel().clone();
+    assert_ne!(second_channel, channel, "two opens are two channels");
+    receiver
+        .admit(second.presentation.clone())
+        .await
+        .expect("the second channel is admitted on its own merits");
+    assert_eq!(payer_balance().await, funded - 2_000);
+
+    // -- Topping up (ADR 0075 decision 11: an increment, never a total) --
+
+    let state = payer.top_up(&channel, 500).await.expect("top up");
+    assert_eq!(state.on_chain.collateral, 1_500);
+    assert_eq!(payer_balance().await, funded - 2_500);
+    assert_eq!(
+        receiver.channel_state(&channel).await.expect("state"),
+        state.on_chain,
+        "the receiver sees a top-up from the chain alone"
+    );
+
+    // -- Signing, and landing what was signed --
+
+    let first = payer.sign_voucher(&channel, 300).await.expect("sign");
+    assert_eq!(first.cumulative_amount, 300);
+    let landed = receiver
+        .land(&channel, first.clone())
+        .await
+        .expect("a voucher the payer signed lands on the receiver's side");
+    assert_eq!(landed.landed, 300);
+    assert_eq!(landed.collateral, 1_200);
+    let state = payer.outbound_state(&channel).await.expect("state");
+    assert_eq!(state.on_chain, landed);
+    assert_eq!(state.signed, 300);
+
+    // -- The watermark: a voucher that does not advance is refused --
+
+    // The payer never signs one: the receiver's watermark would refuse it,
+    // and the packet it paid for would go unpaid.
+    for stale in [300, 200] {
+        assert_eq!(
+            payer.sign_voucher(&channel, stale).await.unwrap_err(),
+            BatchSettlementError::VoucherNotAdvancing {
+                amount: stale,
+                signed: 300,
+            }
+        );
+    }
+    // ...and the receiver lands no voucher twice.
+    assert_eq!(
+        receiver.land(&channel, first).await.unwrap_err(),
+        BatchSettlementError::StaleVoucher {
+            amount: 300,
+            landed: 300,
+        }
+    );
+
+    // A voucher the channel does not back is not signed either, and leaves
+    // the watermark where it was.
+    assert_eq!(
+        payer.sign_voucher(&channel, 1_501).await.unwrap_err(),
+        BatchSettlementError::VoucherUnbacked {
+            amount: 1_501,
+            backed: 1_500,
+        }
+    );
+    assert_eq!(
+        payer.outbound_state(&channel).await.expect("state").signed,
+        300
+    );
+
+    // Channels are independent: the second one's watermark is its own.
+    let on_second = payer
+        .sign_voucher(&second_channel, 100)
+        .await
+        .expect("the second channel signs from nothing");
+    assert_eq!(on_second.cumulative_amount, 100);
+
+    // -- A withdrawal racing a landing (ADR 0074 decision 5) --
+
+    // The payer signs 400 and the receiver holds it, unlanded. The payer then
+    // starts to take back everything not landed.
+    let held = payer.sign_voucher(&channel, 400).await.expect("sign");
+    let state = payer
+        .start_withdrawal(&channel)
+        .await
+        .expect("start a withdrawal");
+    assert!(
+        matches!(
+            state.on_chain.status,
+            BatchChannelStatus::Withdrawing | BatchChannelStatus::Closing
+        ),
+        "a withdrawal is a withdrawal on EVM and a close on Solana, got {:?}",
+        state.on_chain.status
+    );
+    assert_eq!(
+        state.on_chain.collateral, 0,
+        "a channel being withdrawn from backs nothing new"
+    );
+    assert_eq!(state.signed, 400);
+    assert_eq!(
+        payer
+            .start_withdrawal(&channel)
+            .await
+            .expect("starting again"),
+        state,
+        "starting a withdrawal already started changes nothing"
+    );
+    assert_eq!(
+        receiver.channel_state(&channel).await.expect("state"),
+        state.on_chain,
+        "the receiver sees the withdrawal from the chain alone"
+    );
+
+    // Nothing new is signed on it...
+    assert_eq!(
+        payer.sign_voucher(&channel, 450).await.unwrap_err(),
+        BatchSettlementError::VoucherUnbacked {
+            amount: 450,
+            backed: 300,
+        }
+    );
+    // ...and it cannot finish inside the delay.
+    assert!(
+        matches!(
+            payer.finish_withdrawal(&channel).await.unwrap_err(),
+            BatchSettlementError::WithdrawalNotDue { channel: ref due, .. } if *due == channel
+        ),
+        "a withdrawal does not finish before its delay has run"
+    );
+
+    // Inside the delay the receiver lands what it holds. That is the whole
+    // of its protection, and it wins.
+    let landed = receiver
+        .land(&channel, held)
+        .await
+        .expect("the held voucher lands while the payer withdraws");
+    assert_eq!(landed.landed, 400);
+
+    let_delay_pass().await;
+    let before = payer_balance().await;
+    let state = payer
+        .finish_withdrawal(&channel)
+        .await
+        .expect("finish the withdrawal once it is due");
+    assert_eq!(state.on_chain.landed, 400, "what was landed stays landed");
+    assert_eq!(state.on_chain.collateral, 0);
+    assert_eq!(
+        payer_balance().await - before,
+        1_100,
+        "the payer gets back exactly what the receiver had not landed: 1,500 less 400"
+    );
+    assert_eq!(
+        payer.finish_withdrawal(&channel).await.unwrap_err(),
+        BatchSettlementError::NoWithdrawalPending(channel.clone()),
+        "a withdrawal finishes once"
+    );
+
+    // A withdrawal never started has nothing to finish.
+    assert_eq!(
+        payer.finish_withdrawal(&second_channel).await.unwrap_err(),
+        BatchSettlementError::NoWithdrawalPending(second_channel.clone())
+    );
+
+    // -- Only a channel this node opened is its to pay on --
+
+    let not_outbound_error = BatchSettlementError::NotOutbound(not_outbound.clone());
+    assert_eq!(
+        payer.outbound_state(&not_outbound).await.unwrap_err(),
+        not_outbound_error
+    );
+    assert_eq!(
+        payer.top_up(&not_outbound, 1).await.unwrap_err(),
+        not_outbound_error
+    );
+    assert_eq!(
+        payer.sign_voucher(&not_outbound, 1).await.unwrap_err(),
+        not_outbound_error
+    );
+    assert_eq!(
+        payer.start_withdrawal(&not_outbound).await.unwrap_err(),
+        not_outbound_error
+    );
+    assert_eq!(
+        payer.finish_withdrawal(&not_outbound).await.unwrap_err(),
+        not_outbound_error
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batch::in_memory::{InMemoryBatchSettlement, PayerExit};
+    use crate::batch::in_memory::{InMemoryBatchChain, InMemoryBatchSettlement, PayerExit};
 
     const ONE_DAY: u64 = 86_400;
 
@@ -377,7 +736,7 @@ mod tests {
                 let backend = Arc::clone(&backend);
                 Box::new(move |terms| {
                     let backend = Arc::clone(&backend);
-                    Box::pin(async move { backend.open(terms) })
+                    Box::pin(async move { backend.client_open(terms) })
                 })
             },
             deposit: {
@@ -385,7 +744,7 @@ mod tests {
                 Box::new(move |channel, amount| {
                     let backend = Arc::clone(&backend);
                     let channel = channel.clone();
-                    Box::pin(async move { backend.deposit(&channel, amount) })
+                    Box::pin(async move { backend.client_deposit(&channel, amount) })
                 })
             },
             begin_exit: {
@@ -393,7 +752,7 @@ mod tests {
                 Box::new(move |channel| {
                     let backend = Arc::clone(&backend);
                     let channel = channel.clone();
-                    Box::pin(async move { backend.begin_exit(&channel) })
+                    Box::pin(async move { backend.client_begin_exit(&channel) })
                 })
             },
             // The fake verifies no signature, so any bytes do.
@@ -414,5 +773,68 @@ mod tests {
     #[tokio::test]
     async fn the_in_memory_fake_with_a_close_exit_upholds_the_contract() {
         assert_upholds_the_contract(|| async { fixture(PayerExit::Close) }).await;
+    }
+
+    /// Two fake nodes on one chain: the first pays, the second receives.
+    fn paying_fixture(exit: PayerExit) -> PayingContractFixture {
+        let chain = InMemoryBatchChain::new(exit);
+        let payer = Arc::new(InMemoryBatchSettlement::on(
+            Arc::clone(&chain),
+            0x01,
+            ONE_DAY,
+        ));
+        let receiver = Arc::new(
+            InMemoryBatchSettlement::on(Arc::clone(&chain), 0x02, ONE_DAY)
+                .with_min_sponsored_deposit(1_000),
+        );
+        payer.fund(10_000);
+        let terms = receiver.published_terms();
+        // A client's channel toward the receiver: real, and not the payer's.
+        let not_outbound = receiver
+            .client_open(ChannelTerms {
+                deposit: 1_000,
+                delay_secs: ONE_DAY,
+                pays_this_node: true,
+                in_settled_token: true,
+            })
+            .presentation
+            .channel()
+            .clone();
+        PayingContractFixture {
+            payer: Arc::clone(&payer) as Arc<dyn BatchSettlementPayer>,
+            receiver: receiver as Arc<dyn BatchSettlementBackend>,
+            terms,
+            payer_balance: {
+                let payer = Arc::clone(&payer);
+                Box::new(move || {
+                    let payer = Arc::clone(&payer);
+                    Box::pin(async move { payer.balance() })
+                })
+            },
+            payer_settlement_key: match exit {
+                PayerExit::Withdrawal => VoucherSigner::Evm([0x01; 20]),
+                PayerExit::Close => VoucherSigner::Solana([0x01; 32]),
+            },
+            let_delay_pass: Box::new(move || {
+                let chain = Arc::clone(&chain);
+                Box::pin(async move { chain.advance_time(ONE_DAY) })
+            }),
+            not_outbound,
+        }
+    }
+
+    /// The fake's paying half on an EVM-shaped chain: a withdrawal the
+    /// channel survives.
+    #[tokio::test]
+    async fn the_in_memory_fake_with_a_withdrawal_exit_upholds_the_paying_contract() {
+        assert_upholds_the_paying_contract(|| async { paying_fixture(PayerExit::Withdrawal) })
+            .await;
+    }
+
+    /// The fake's paying half on a Solana-shaped chain: a close that the
+    /// receiver's landing seals and a distribution ends.
+    #[tokio::test]
+    async fn the_in_memory_fake_with_a_close_exit_upholds_the_paying_contract() {
+        assert_upholds_the_paying_contract(|| async { paying_fixture(PayerExit::Close) }).await;
     }
 }

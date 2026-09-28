@@ -13,8 +13,11 @@
 //! deliberately out of scope here (issue #458) and belongs to the two
 //! settlement crates above instead.
 //!
-//! [`batch`] is a second, receive-only port beside it, for x402
-//! `batch-settlement` channels a client opens (ADR 0074 decision 9).
+//! [`batch`] is a second port beside it, for x402 `batch-settlement`
+//! channels (ADR 0074 decision 9), with a receiving half and a paying half
+//! (ADR 0075 decision 2). It grows into the only port: `SettlementBackend`
+//! and its implementations are deleted once nothing calls them (issue
+//! #1385).
 
 pub mod batch;
 mod in_memory;
