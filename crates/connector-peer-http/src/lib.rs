@@ -111,7 +111,7 @@ pub mod client;
 pub mod dial;
 pub mod headers;
 
-pub use accept::{claim_on, FlushHints, PeerHttpPolicy, PeerHttpState};
+pub use accept::{claim_on, evidence_on, FlushHints, PeerHttpPolicy, PeerHttpState};
 pub use client::ReqwestPeerClient;
 pub use dial::{HttpDialError, HttpPeerTransport, PeerHttpClient, PeerRelation, NAT_NOTE};
 pub use headers::{Headers, PeerRequest, PeerResponse};

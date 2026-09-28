@@ -94,16 +94,20 @@ connector-settlement             the chain-agnostic settlement port + its contra
                                   state. Its own port.rs, a contract.rs suite per half,
                                   and in_memory.rs, a fake chain several nodes share,
                                   each implementing both halves; and held.rs: where the
-                                  watchers read the latest voucher. The chain backends
-                                  implement the paying half in #1374 and #1375
+                                  watchers read the latest voucher. The EVM backend
+                                  implements both halves; Solana's paying half is #1375
 connector-settlement-evm         real EVM backend: TokenNetworkRegistry → TokenNetwork,
                                   holding no local channel state; every method reads the
                                   chain fresh
-  ├─ batch_settlement.rs         the batch-settlement port over x402's
+  ├─ batch_settlement.rs         the batch-settlement port's receiving half over x402's
   │                               x402BatchSettlement (ADR 0074): admits a presented
   │                               ChannelConfig, `claim`s from the settlement key.
   │                               contracts/x402/ holds its ABI and the pinned bytecode
   │                               the tests place on anvil, with PROVENANCE.md
+  ├─ batch_payer.rs              its paying half (ADR 0075 decision 3): opens with
+  │                               payerAuthorizer == payer, deposits through the ERC-3009
+  │                               or Permit2 collector, signs vouchers with the settlement
+  │                               key, withdraws
   └─ batch_watch.rs              its watcher and sweep (ADR 0074 decision 5): claims at
                                   once on a WithdrawInitiated, and periodically claims
                                   every channel in one `claim`, then `settle`s

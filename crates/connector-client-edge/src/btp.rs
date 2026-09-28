@@ -146,7 +146,7 @@ async fn btp_session(socket: WebSocket, state: Arc<ClientEdgeState>) {
                 Ok(Some(_)) | Err(_) => break,
             }
         }
-        match peer_handover(&frame_bytes, &state) {
+        match peer_handover(&frame_bytes, &state).await {
             // Not consumed: the same frame is handed to the peer session,
             // which decides its own role from it and answers it.
             Some(BtpClaimVerdict::Peer) => {
@@ -196,9 +196,11 @@ async fn btp_session(socket: WebSocket, state: Arc<ClientEdgeState>) {
 }
 
 /// Whether this frame's claim hands the rest of the session to the peer
-/// carriage (`peer-carriage-spec.md` §1.2, §1.5, issue #678).
+/// carriage (`peer-carriage-spec.md` §1.2, §1.5, issue #678) -- or its
+/// voucher, or its peer-role challenge (ADR 0075 decision 5).
 ///
-/// `None` for every frame carrying no claim entry, and for every node that
+/// `None` for every frame carrying neither a claim nor a challenge entry,
+/// and for every node that
 /// mounts no BTP peer carriage -- which is the whole of what this costs a
 /// client session: one `find` over a frame's protocolData, and on the
 /// frames that do carry a claim, one signature check against a channel this
@@ -214,14 +216,23 @@ async fn btp_session(socket: WebSocket, state: Arc<ClientEdgeState>) {
 /// the listener, and this function inspects nothing but the frame's claim
 /// and the configured policy; the peer session decides again from this very
 /// frame.
-fn peer_handover(frame_bytes: &[u8], state: &Arc<ClientEdgeState>) -> Option<BtpClaimVerdict> {
+async fn peer_handover(
+    frame_bytes: &[u8],
+    state: &Arc<ClientEdgeState>,
+) -> Option<BtpClaimVerdict> {
     let peers = state.peers.as_ref()?;
     let frame = decode_frame(frame_bytes).ok()?;
     if frame.frame_type != BTP_MESSAGE && frame.frame_type != BTP_TRANSFER {
         return None;
     }
-    connector_peer_btp::claim_json::from_protocol_data(&frame.protocol_data)?;
-    Some(peers.btp_claim_verdict(&frame.protocol_data))
+    let presents_evidence = frame.protocol_data.iter().any(|entry| {
+        entry.name == connector_btp::CLAIM_PROTOCOL
+            || entry.name == connector_btp::PEER_CHALLENGE_PROTOCOL
+    });
+    if !presents_evidence {
+        return None;
+    }
+    Some(peers.btp_claim_verdict(&frame).await)
 }
 
 /// A slot in the session's in-flight window, holding the read loop back

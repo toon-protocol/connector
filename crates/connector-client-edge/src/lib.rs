@@ -94,6 +94,7 @@ mod outbound_ledger;
 mod peer;
 mod session_registry;
 mod session_route;
+mod voucher_evidence;
 pub use batch_settlement::{
     journaled_batch_channels, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
     BatchSettlementChannels, JournaledBatchChannel,

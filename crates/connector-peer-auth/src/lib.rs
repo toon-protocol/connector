@@ -95,8 +95,9 @@ pub mod policy;
 pub mod role;
 
 pub use decision::{
-    decide_role, ClaimVerification, PeerAuthRefusal, PeerAuthRefusalLog, PeerAuthRefusalReport,
-    PresentedClaim, RoleDecision, UnmetRequirement, PEER_AUTH_REFUSED_EVENT,
+    decide_role, decide_voucher_role, ClaimVerification, PeerAuthRefusal, PeerAuthRefusalLog,
+    PeerAuthRefusalReport, PresentedClaim, PresentedVoucher, RoleDecision, UnmetRequirement,
+    VoucherVerification, PEER_AUTH_REFUSED_EVENT,
 };
 pub use policy::PeerAuthPolicy;
 pub use role::{claim_ack_to_emit, Capability, SessionRole};

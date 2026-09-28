@@ -17,7 +17,10 @@
 //! on the very `POST /ilp` and `GET /ilp/btp` a client uses, and what tells
 //! the two apart is [`connector_peer_btp::role_gate::decide`] and nothing
 //! else: the claim on the arrival, resolved against `[[peer_channels]]` and
-//! verified against the counterparty key that row configures.
+//! verified against the counterparty key that row configures -- or, since
+//! ADR 0075 decision 5, a voucher (or, for a packet that moves no value, a
+//! peer-role challenge) whose x402 channel's voucher signer is bound to a
+//! peering, resolved through this node's own claim gate.
 //!
 //! # What this module does, in order
 //!
@@ -47,12 +50,12 @@ use std::sync::{Arc, Mutex};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use connector_btp::ProtocolData;
+use connector_btp::BtpFrame;
 use connector_config::{PeerCarriage, PeerChannelConfig, PeerConfig, PeerExposure};
 use connector_peer_auth::{PeerAuthPolicy, PeerAuthRefusal, PeerAuthRefusalLog};
+use connector_peer_btp::role_gate::{self, FrameEvidence, VoucherEvidence};
 use connector_peer_btp::{
-    claim_json, role_gate, AcceptedClaims, ClaimEnforcementPolicy, PeerAcceptPolicy,
-    PeerCarriageState,
+    AcceptedClaims, ClaimEnforcementPolicy, PeerAcceptPolicy, PeerCarriageState,
 };
 use connector_peer_http::{FlushHints, Headers, PeerHttpPolicy, PeerHttpState, PeerRequest};
 use connector_runtime::Connector;
@@ -86,6 +89,10 @@ pub(crate) enum BtpClaimVerdict {
 pub struct PeerCarriages {
     connector: Arc<Connector>,
     auth: Arc<PeerAuthPolicy>,
+    /// The receiving half vouchers and peer-role challenges are resolved
+    /// through (ADR 0075 decision 5) -- this node's claim gate, in a wired
+    /// node. `None`, and neither proves the peer role here.
+    vouchers: Option<Arc<dyn VoucherEvidence>>,
     /// `Some` when `peer_expose` names `http`.
     http: Option<Arc<PeerHttpState>>,
     /// `Some` when `peer_expose` names `btp`.
@@ -99,7 +106,9 @@ pub struct PeerCarriages {
 
 impl PeerCarriages {
     /// Build the carriages `expose` names over this node's configured
-    /// peerings, or `None` when there is no peer handling to mount:
+    /// peerings, resolving vouchers and peer-role challenges through
+    /// `vouchers` (ADR 0075 decision 5), or `None` when there is no peer
+    /// handling to mount:
     /// `peer_expose = "neither"` (the default, and the NAT'd operator's
     /// case -- §2.1), or a node with no `[[peers]]` at all, on which every
     /// interaction is a client and nothing can be otherwise.
@@ -109,6 +118,7 @@ impl PeerCarriages {
         peers: &[PeerConfig],
         peer_channels: &[PeerChannelConfig],
         expose: PeerExposure,
+        vouchers: Option<Arc<dyn VoucherEvidence>>,
     ) -> Option<Arc<PeerCarriages>> {
         if expose.is_empty() || peers.is_empty() {
             return None;
@@ -122,7 +132,7 @@ impl PeerCarriages {
         // other depending on which carriage a packet happened to arrive on.
         let enforcement = Arc::new(ClaimEnforcementPolicy::from_peers(peers));
         let http = expose.exposes(PeerCarriage::Http).then(|| {
-            Arc::new(PeerHttpState::new(
+            let state = PeerHttpState::new(
                 Arc::clone(&connector),
                 Arc::clone(&auth),
                 Arc::clone(&accepted),
@@ -135,10 +145,14 @@ impl PeerCarriages {
                 PeerHttpPolicy {
                     mandatory_auth: false,
                 },
-            ))
+            );
+            Arc::new(match &vouchers {
+                Some(vouchers) => state.with_voucher_evidence(Arc::clone(vouchers)),
+                None => state,
+            })
         });
         let btp = expose.exposes(PeerCarriage::Btp).then(|| {
-            Arc::new(PeerCarriageState::new(
+            let state = PeerCarriageState::new(
                 Arc::clone(&connector),
                 Arc::clone(&auth),
                 accepted,
@@ -147,11 +161,16 @@ impl PeerCarriages {
                     mandatory_auth: false,
                     ..PeerAcceptPolicy::default()
                 },
-            ))
+            );
+            Arc::new(match &vouchers {
+                Some(vouchers) => state.with_voucher_evidence(Arc::clone(vouchers)),
+                None => state,
+            })
         });
         Some(Arc::new(PeerCarriages {
             connector,
             auth,
+            vouchers,
             http,
             btp,
             refusals: Mutex::new(PeerAuthRefusalLog::default()),
@@ -182,13 +201,13 @@ impl PeerCarriages {
             headers: peer_headers(headers),
             body: body.to_vec(),
         };
-        // §1.2: the claim on this request, resolved and verified. The peer
-        // handler decides again from the same claim -- the decision is a
-        // pure function of it, so deciding twice costs nothing and lets
-        // that handler stand alone on its own listener (§1.10).
-        let claim = connector_peer_http::claim_on(&request);
-        let (role, refusal) =
-            role_gate::decide(&self.connector, &self.auth, claim.as_ref()).into_parts();
+        // §1.2: the evidence on this request, resolved and verified. The
+        // peer handler decides again from the same evidence, which lets
+        // that handler stand alone on its own listener (§1.10). A request
+        // whose evidence is ambiguous (§1.5) proves no peering here, and
+        // the client path answers it.
+        let evidence = connector_peer_http::evidence_on(&request)?;
+        let (role, refusal) = self.decide(&evidence).await.into_parts();
         self.log_refusal(refusal.as_ref());
         if !role.is_peer() {
             return None;
@@ -197,23 +216,37 @@ impl PeerCarriages {
         Some(into_axum(http.handle(request).await))
     }
 
-    /// What a BTP frame's claim means for a session that is still a client
-    /// (§1.2, §1.5). The frame is peeked, never consumed: see
-    /// [`BtpClaimVerdict`].
-    pub(crate) fn btp_claim_verdict(&self, protocol_data: &[ProtocolData]) -> BtpClaimVerdict {
+    /// What a BTP frame's claim, voucher or peer-role challenge means for a
+    /// session that is still a client (§1.2, §1.5). The frame is peeked,
+    /// never consumed: see [`BtpClaimVerdict`].
+    pub(crate) async fn btp_claim_verdict(&self, frame: &BtpFrame) -> BtpClaimVerdict {
         if self.btp.is_none() {
             return BtpClaimVerdict::Client;
         }
-        let claim = claim_json::from_protocol_data(protocol_data)
-            .and_then(|raw| claim_json::parse(raw).ok());
-        let (role, refusal) =
-            role_gate::decide(&self.connector, &self.auth, claim.as_ref()).into_parts();
+        // Ambiguous evidence proves no peering here; a peer session would
+        // refuse the frame (§1.5), and the client path answers it instead.
+        let Ok(evidence) = role_gate::btp_evidence(frame) else {
+            return BtpClaimVerdict::Client;
+        };
+        let (role, refusal) = self.decide(&evidence).await.into_parts();
         self.log_refusal(refusal.as_ref());
         if role.is_peer() {
             BtpClaimVerdict::Peer
         } else {
             BtpClaimVerdict::Client
         }
+    }
+
+    /// One arrival's role, from its evidence -- the same call both carriages
+    /// make (`role_gate::decide_frame`).
+    async fn decide(&self, evidence: &FrameEvidence) -> connector_peer_auth::RoleDecision {
+        role_gate::decide_frame(
+            &self.connector,
+            &self.auth,
+            self.vouchers.as_deref(),
+            evidence,
+        )
+        .await
     }
 
     /// §1.6: a claim naming a configured peer channel that fails P2 or P3
@@ -280,6 +313,7 @@ fn into_axum(response: connector_peer_http::PeerResponse) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use connector_btp::ProtocolData;
     use connector_runtime::{
         ChannelDomain, ClaimSignature, FakeAppClient, InProcessPeerTransport, SystemClock,
         WireClaim,
@@ -357,7 +391,7 @@ mod tests {
     /// That claim as the §4 JSON both carriages carry, in the two encodings
     /// §1.9 pins: raw on BTP, `base64` in the HTTP header.
     fn claim_json(claim: &WireClaim, signer: &dyn Signer) -> String {
-        claim_json::encode(
+        connector_peer_btp::claim_json::encode(
             claim,
             &derive_evm_address(&signer.public_key().unwrap()),
             None,
@@ -441,6 +475,7 @@ key_file = "{key_file}"
             config.peers(),
             config.peer_channels(),
             expose,
+            None,
         )
     }
 
@@ -540,23 +575,42 @@ key_file = "{key_file}"
     /// The BTP twin: the same shapes §1.9 enumerates, peeked off a frame
     /// rather than a header set. §9 makes a difference between the carriages
     /// a defect, so both are asserted or neither is.
-    #[test]
-    fn the_btp_verdict_admits_only_a_frame_whose_claim_proves_p2_and_p3() {
+    #[tokio::test]
+    async fn the_btp_verdict_admits_only_a_frame_whose_claim_proves_p2_and_p3() {
         let payer = LocalSigner::generate("payer");
         let carriages = carriages(PeerExposure::Both, &payer).expect("btp is exposed");
         let proven = claim_entry(&claim_json(&sign_claim(&payer, 1, 500), &payer));
 
         assert_eq!(
-            carriages.btp_claim_verdict(std::slice::from_ref(&proven)),
+            carriages
+                .btp_claim_verdict(&message(vec![proven], &[]))
+                .await,
             BtpClaimVerdict::Peer
         );
-        assert_eq!(carriages.btp_claim_verdict(&[]), BtpClaimVerdict::Client);
+        assert_eq!(
+            carriages.btp_claim_verdict(&message(vec![], &[])).await,
+            BtpClaimVerdict::Client
+        );
         for (case, json) in refused_claims(&payer) {
             assert_eq!(
-                carriages.btp_claim_verdict(&[claim_entry(&json)]),
+                carriages
+                    .btp_claim_verdict(&message(vec![claim_entry(&json)], &[]))
+                    .await,
                 BtpClaimVerdict::Client,
                 "{case} must leave the frame a client frame"
             );
+        }
+    }
+
+    /// A BTP MESSAGE carrying `protocol_data` and `ilp_packet`, as the front
+    /// door peeks one.
+    fn message(protocol_data: Vec<ProtocolData>, ilp_packet: &[u8]) -> BtpFrame {
+        BtpFrame {
+            frame_type: connector_btp::BTP_MESSAGE,
+            request_id: 1,
+            amount: None,
+            protocol_data,
+            ilp_packet: ilp_packet.to_vec(),
         }
     }
 
@@ -584,5 +638,709 @@ key_file = "{key_file}"
                 "not a claim".to_string(),
             ),
         ]
+    }
+
+    /// ADR 0075 decision 5 (issue #1377): the peer role proven by an x402
+    /// voucher, or -- for a packet that moves no value -- by the voucher
+    /// claim-state challenge, from a channel whose voucher signer is bound
+    /// to the peering. Over both carriages, through the real claim gate and
+    /// a fake of the batch-settlement seam that holds the one fact a backend
+    /// owns: which channels exist, and whose key signs on each.
+    mod x402 {
+        use super::*;
+
+        use async_trait::async_trait;
+        use base64::Engine;
+        use connector_domain::{Prepare, Reject};
+        use connector_peer_btp::challenge_json::{self, PeerRoleChallenge};
+        use connector_peer_btp::PeerSession;
+        use connector_runtime::{InMemoryJournal, VoucherSigner};
+        use connector_signer::{
+            derive_evm_address, evm_batch_channel_id, evm_voucher_claim_state_challenge_digest,
+            evm_voucher_digest, solana_voucher_claim_state_challenge_message,
+            solana_voucher_message, BatchChannelConfig, BatchSettlementDomain,
+        };
+        use ed25519_dalek::Signer as _;
+        use libsecp256k1::{Message, PublicKey, SecretKey};
+
+        use crate::{
+            AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
+            ChannelResolutionError, ClientChannelRegistry, ClientClaimGate,
+        };
+
+        const CHAIN: u64 = 84_532;
+
+        fn domain() -> BatchSettlementDomain {
+            BatchSettlementDomain::x402(CHAIN)
+        }
+
+        /// The peer's EVM settlement key: its channel's `payerAuthorizer`
+        /// (ADR 0075 decision 3, `payerAuthorizer == payer`).
+        fn peer_key() -> SecretKey {
+            SecretKey::parse(&[0x0a; 32]).expect("valid secret")
+        }
+
+        /// Somebody else, with a channel of their own toward this node.
+        fn stranger_key() -> SecretKey {
+            SecretKey::parse(&[0x0b; 32]).expect("valid secret")
+        }
+
+        fn address_of(secret: &SecretKey) -> [u8; 20] {
+            derive_evm_address(&PublicKey::from_secret_key(secret).serialize())
+        }
+
+        fn config_of(secret: &SecretKey) -> BatchChannelConfig {
+            let payer = address_of(secret);
+            BatchChannelConfig {
+                payer,
+                payer_authorizer: payer,
+                receiver: [0x33; 20],
+                receiver_authorizer: [0x33; 20],
+                token: [0x55; 20],
+                withdraw_delay: 86_400,
+                salt: [0x66; 32],
+            }
+        }
+
+        fn evm_channel(secret: &SecretKey) -> [u8; 32] {
+            evm_batch_channel_id(&domain(), &config_of(secret))
+        }
+
+        fn sign_evm(secret: &SecretKey, digest: &[u8; 32]) -> [u8; 65] {
+            let (signature, recovery) = libsecp256k1::sign(&Message::parse(digest), secret);
+            let mut bytes = [0u8; 65];
+            bytes[..64].copy_from_slice(&signature.serialize());
+            bytes[64] = recovery.serialize() + 27;
+            bytes
+        }
+
+        fn ed25519(seed: u8) -> ed25519_dalek::Keypair {
+            let secret = ed25519_dalek::SecretKey::from_bytes(&[seed; 32]).expect("seed");
+            let public = (&secret).into();
+            ed25519_dalek::Keypair { secret, public }
+        }
+
+        /// The peer's Solana settlement key, and the account of its channel.
+        fn peer_ed25519() -> ed25519_dalek::Keypair {
+            ed25519(0x21)
+        }
+        const PEER_ACCOUNT: [u8; 32] = [0xc3; 32];
+        const STRANGER_ACCOUNT: [u8; 32] = [0xc4; 32];
+
+        /// Two channels on each chain, one the peer's and one a stranger's.
+        #[derive(Debug)]
+        struct TwoChannelsEachChain;
+
+        #[async_trait]
+        impl BatchSettlementChannels for TwoChannelsEachChain {
+            fn evm_domain(&self) -> Option<BatchSettlementDomain> {
+                Some(domain())
+            }
+
+            fn accepts_solana(&self) -> bool {
+                true
+            }
+
+            async fn evm(
+                &self,
+                channel_id: &[u8; 32],
+                presented_config: Option<&BatchChannelConfig>,
+            ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
+                // An EVM channel is found from its config alone: the chain
+                // stores it by id.
+                let Some(config) = presented_config else {
+                    return Ok(None);
+                };
+                let known = [config_of(&peer_key()), config_of(&stranger_key())];
+                Ok(known
+                    .into_iter()
+                    .find(|known| {
+                        known == config && evm_batch_channel_id(&domain(), known) == *channel_id
+                    })
+                    .map(|config| AdmittedEvmVoucherChannel {
+                        config,
+                        max_cumulative: 1_000_000,
+                    }))
+            }
+
+            async fn solana(
+                &self,
+                channel_account: &[u8; 32],
+            ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
+                let signer = match *channel_account {
+                    PEER_ACCOUNT => peer_ed25519(),
+                    STRANGER_ACCOUNT => ed25519(0x22),
+                    _ => return Ok(None),
+                };
+                Ok(Some(AdmittedSolanaVoucherChannel {
+                    authorized_signer: signer.public.to_bytes(),
+                    max_cumulative: 1_000_000,
+                }))
+            }
+        }
+
+        fn config_json(config: &BatchChannelConfig) -> serde_json::Value {
+            serde_json::json!({
+                "payer": format!("0x{}", hex::encode(config.payer)),
+                "payerAuthorizer": format!("0x{}", hex::encode(config.payer_authorizer)),
+                "receiver": format!("0x{}", hex::encode(config.receiver)),
+                "receiverAuthorizer": format!("0x{}", hex::encode(config.receiver_authorizer)),
+                "token": format!("0x{}", hex::encode(config.token)),
+                "withdrawDelay": config.withdraw_delay,
+                "salt": format!("0x{}", hex::encode(config.salt)),
+            })
+        }
+
+        /// An EVM voucher on `owner`'s channel for `amount`, whose signature
+        /// is `signature`.
+        fn evm_voucher(owner: &SecretKey, amount: u64, signature: &[u8; 65]) -> String {
+            serde_json::json!({
+                "version": "1.0",
+                "blockchain": "evm",
+                "scheme": "batch-settlement",
+                "messageId": format!("voucher-{amount}"),
+                "timestamp": "2026-09-27T12:00:00.000Z",
+                "senderId": "peer",
+                "channelId": format!("0x{}", hex::encode(evm_channel(owner))),
+                "maxClaimableAmount": amount.to_string(),
+                "signature": format!("0x{}", hex::encode(signature)),
+                "channelConfig": config_json(&config_of(owner)),
+            })
+            .to_string()
+        }
+
+        /// `owner`'s genuine voucher on its own channel.
+        fn signed_evm_voucher(owner: &SecretKey, amount: u64) -> String {
+            let digest = evm_voucher_digest(&domain(), &evm_channel(owner), u128::from(amount));
+            evm_voucher(owner, amount, &sign_evm(owner, &digest))
+        }
+
+        fn solana_voucher(account: [u8; 32], amount: u64, signature: &[u8; 64]) -> String {
+            serde_json::json!({
+                "version": "1.0",
+                "blockchain": "solana",
+                "scheme": "batch-settlement",
+                "messageId": format!("voucher-{amount}"),
+                "timestamp": "2026-09-27T12:00:00Z",
+                "senderId": "peer",
+                "channelId": bs58::encode(account).into_string(),
+                "maxClaimableAmount": amount.to_string(),
+                "expiresAt": 0,
+                "signature": bs58::encode(signature).into_string(),
+            })
+            .to_string()
+        }
+
+        fn signed_solana_voucher(
+            signer: &ed25519_dalek::Keypair,
+            account: [u8; 32],
+            amount: u64,
+        ) -> String {
+            let signature = signer.sign(&solana_voucher_message(&account, amount, 0));
+            solana_voucher(account, amount, &signature.to_bytes())
+        }
+
+        /// `owner`'s channel, challenged until `expires`, over a signature
+        /// `signer` made of the challenge message.
+        fn evm_challenge(owner: &SecretKey, signer: &SecretKey, expires: u64) -> String {
+            let channel_id = evm_channel(owner);
+            let digest = evm_voucher_claim_state_challenge_digest(&domain(), &channel_id, expires);
+            challenge_json::encode(&PeerRoleChallenge::Evm {
+                channel_id,
+                expires,
+                signature: sign_evm(signer, &digest),
+                channel_config: Some(evm_challenge_config(owner)),
+            })
+        }
+
+        fn evm_challenge_config(
+            owner: &SecretKey,
+        ) -> connector_domain::client_claim::EvmVoucherChannelConfig {
+            connector_domain::client_claim::parse_evm_channel_config(&config_json(&config_of(
+                owner,
+            )))
+            .expect("a well-formed config")
+        }
+
+        fn solana_challenge(
+            signer: &ed25519_dalek::Keypair,
+            account: [u8; 32],
+            expires: u64,
+        ) -> String {
+            let message = solana_voucher_claim_state_challenge_message(&account, expires);
+            challenge_json::encode(&PeerRoleChallenge::Solana {
+                channel_account: account,
+                expires,
+                signature: signer.sign(&message).to_bytes(),
+            })
+        }
+
+        fn now() -> u64 {
+            crate::now_unix()
+        }
+
+        fn prepare(amount: u64) -> Vec<u8> {
+            Prepare {
+                amount,
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(30),
+                greeting: false,
+                destination: "g.nowhere.app".to_string(),
+                data: Vec::new(),
+            }
+            .encode()
+        }
+
+        /// A node with one peering, `store`, and the claim gate as its
+        /// receiving half. `bind` names the peer's settlement keys this node
+        /// binds to it -- the runtime operation this issue adds, whose
+        /// sources (#1378, #1380) come later.
+        fn node(bind: &[VoucherSigner]) -> (Arc<Connector>, Arc<PeerCarriages>) {
+            let config = peering([0x77; 20]);
+            let connector = Arc::new(
+                Connector::new(
+                    Vec::new(),
+                    Vec::new(),
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(SystemClock),
+                )
+                .with_config_peer_ids([PEER_ID.to_string()]),
+            );
+            for signer in bind {
+                connector
+                    .bind_voucher_signer(PEER_ID, *signer)
+                    .expect("store is a configured peering");
+            }
+            let gate = ClientClaimGate::restore(
+                ClientChannelRegistry::new(),
+                Arc::new(InMemoryJournal::new()),
+            )
+            .expect("an empty journal")
+            .with_batch_settlement(Arc::new(TwoChannelsEachChain));
+            let carriages = PeerCarriages::from_config(
+                Arc::clone(&connector),
+                config.peers(),
+                config.peer_channels(),
+                PeerExposure::Both,
+                Some(Arc::new(gate) as Arc<dyn VoucherEvidence>),
+            )
+            .expect("both carriages are exposed");
+            (connector, carriages)
+        }
+
+        fn bound() -> (Arc<Connector>, Arc<PeerCarriages>) {
+            node(&[
+                VoucherSigner::Evm(address_of(&peer_key())),
+                VoucherSigner::Solana(peer_ed25519().public.to_bytes()),
+            ])
+        }
+
+        /// What one arrival is, on each carriage: the front door's verdict
+        /// **and** the peer handler's own, so a handler that re-decided
+        /// differently from its front door would show here.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Seen {
+            Peer,
+            Client,
+        }
+
+        /// HTTP: `POST /ilp` carrying a claim slot or a challenge slot.
+        async fn over_http(
+            carriages: &PeerCarriages,
+            claim: Option<&str>,
+            challenge: Option<&str>,
+            body: &[u8],
+        ) -> Seen {
+            let mut headers = HeaderMap::new();
+            if let Some(claim) = claim {
+                headers.insert(
+                    connector_btp::CLAIM_HEADER,
+                    connector_peer_http::headers::claim_header_value(claim)
+                        .parse()
+                        .unwrap(),
+                );
+            }
+            if let Some(challenge) = challenge {
+                headers.insert(
+                    connector_btp::PEER_CHALLENGE_HEADER,
+                    connector_peer_http::headers::peer_challenge_header_value(challenge)
+                        .parse()
+                        .unwrap(),
+                );
+            }
+            let Some(response) = carriages.handle_http(&headers, body).await else {
+                return Seen::Client;
+            };
+            let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            assert!(
+                !answered_as_a_client(&body),
+                "the front door decided peer and the HTTP peer handler decided client"
+            );
+            Seen::Peer
+        }
+
+        /// BTP: a MESSAGE carrying `entries` and `packet`, through the front
+        /// door's verdict and then a peer session that answers it.
+        async fn over_btp(
+            carriages: &PeerCarriages,
+            entries: Vec<ProtocolData>,
+            packet: &[u8],
+        ) -> Seen {
+            let frame = message(entries, packet);
+            if carriages.btp_claim_verdict(&frame).await == BtpClaimVerdict::Client {
+                return Seen::Client;
+            }
+            let (replies, mut answers) = tokio::sync::mpsc::channel(4);
+            let mut session = PeerSession::new(carriages.btp_state().expect("btp"), replies);
+            session
+                .handle_frame(&connector_btp::encode_message(
+                    frame.request_id,
+                    &frame.protocol_data,
+                    &frame.ilp_packet,
+                ))
+                .await
+                .expect("the session is live");
+            let answer = answers.recv().await.expect("an answer");
+            let answer = connector_btp::decode_frame(&answer).expect("a frame");
+            assert!(
+                !answered_as_a_client(&answer.ilp_packet),
+                "the front door decided peer and the BTP peer session decided client"
+            );
+            Seen::Peer
+        }
+
+        /// Whether `packet` is the REJECT a peer carriage gives an
+        /// interaction it decided was a client's.
+        fn answered_as_a_client(packet: &[u8]) -> bool {
+            Reject::decode(packet)
+                .is_ok_and(|reject| reject.message == "no peer route for this interaction")
+        }
+
+        fn entry(name: &str, json: &str) -> ProtocolData {
+            ProtocolData {
+                name: name.to_string(),
+                content_type: connector_btp::CONTENT_TYPE_TEXT,
+                data: json.as_bytes().to_vec(),
+            }
+        }
+
+        /// A voucher, on both carriages: `(http, btp)`.
+        async fn voucher_role(carriages: &PeerCarriages, voucher: &str) -> (Seen, Seen) {
+            (
+                over_http(carriages, Some(voucher), None, &prepare(500)).await,
+                over_btp(
+                    carriages,
+                    vec![entry(connector_btp::CLAIM_PROTOCOL, voucher)],
+                    &prepare(500),
+                )
+                .await,
+            )
+        }
+
+        /// A challenge riding a PREPARE for `amount`, on both carriages.
+        async fn challenge_role(
+            carriages: &PeerCarriages,
+            challenge: &str,
+            amount: u64,
+        ) -> (Seen, Seen) {
+            (
+                over_http(carriages, None, Some(challenge), &prepare(amount)).await,
+                over_btp(
+                    carriages,
+                    vec![entry(connector_btp::PEER_CHALLENGE_PROTOCOL, challenge)],
+                    &prepare(amount),
+                )
+                .await,
+            )
+        }
+
+        const PEER: (Seen, Seen) = (Seen::Peer, Seen::Peer);
+        const CLIENT: (Seen, Seen) = (Seen::Client, Seen::Client);
+
+        #[tokio::test]
+        async fn a_voucher_on_a_bound_channel_decides_peer_on_btp_and_on_http() {
+            let (_, carriages) = bound();
+
+            assert_eq!(
+                voucher_role(&carriages, &signed_evm_voucher(&peer_key(), 500)).await,
+                PEER
+            );
+            assert_eq!(
+                voucher_role(
+                    &carriages,
+                    &signed_solana_voucher(&peer_ed25519(), PEER_ACCOUNT, 500)
+                )
+                .await,
+                PEER
+            );
+        }
+
+        /// A genuine voucher, correctly signed, on a channel whose signer is
+        /// bound to no peering: an ordinary client paying, on both chains.
+        #[tokio::test]
+        async fn a_voucher_on_a_channel_not_bound_to_any_peer_never_decides_peer() {
+            let (_, carriages) = bound();
+            assert_eq!(
+                voucher_role(&carriages, &signed_evm_voucher(&stranger_key(), 500)).await,
+                CLIENT
+            );
+            assert_eq!(
+                voucher_role(
+                    &carriages,
+                    &signed_solana_voucher(&ed25519(0x22), STRANGER_ACCOUNT, 500)
+                )
+                .await,
+                CLIENT
+            );
+
+            // And the peer's own channel, on a node that has bound nothing.
+            let (_, unbound) = node(&[]);
+            assert_eq!(
+                voucher_role(&unbound, &signed_evm_voucher(&peer_key(), 500)).await,
+                CLIENT
+            );
+        }
+
+        /// The chain's signer decides, never the voucher's: a voucher on the
+        /// peer's channel signed by somebody else is a client's.
+        #[tokio::test]
+        async fn a_voucher_on_a_bound_channel_signed_by_another_key_is_a_client() {
+            let (_, carriages) = bound();
+            let digest = evm_voucher_digest(&domain(), &evm_channel(&peer_key()), 500);
+            let forged = evm_voucher(&peer_key(), 500, &sign_evm(&stranger_key(), &digest));
+
+            assert_eq!(voucher_role(&carriages, &forged).await, CLIENT);
+        }
+
+        #[tokio::test]
+        async fn a_challenge_from_a_bound_channels_signer_decides_peer_for_a_zero_value_packet() {
+            let (_, carriages) = bound();
+            let expires = now() + 60;
+
+            assert_eq!(
+                challenge_role(
+                    &carriages,
+                    &evm_challenge(&peer_key(), &peer_key(), expires),
+                    0
+                )
+                .await,
+                PEER
+            );
+            assert_eq!(
+                challenge_role(
+                    &carriages,
+                    &solana_challenge(&peer_ed25519(), PEER_ACCOUNT, expires),
+                    0
+                )
+                .await,
+                PEER
+            );
+        }
+
+        #[tokio::test]
+        async fn an_expired_challenge_or_one_from_the_wrong_key_does_not_decide_peer() {
+            let (_, carriages) = bound();
+            let cases = [
+                (
+                    "expired",
+                    evm_challenge(&peer_key(), &peer_key(), now() - 1),
+                ),
+                (
+                    "further ahead than the node accepts",
+                    evm_challenge(
+                        &peer_key(),
+                        &peer_key(),
+                        now()
+                            + connector_peer_btp::role_gate::MAX_PEER_CHALLENGE_LIFETIME_SECS
+                            + 60,
+                    ),
+                ),
+                (
+                    "signed by a key that is not the channel's",
+                    evm_challenge(&peer_key(), &stranger_key(), now() + 60),
+                ),
+                (
+                    "on a Solana channel, signed by another key",
+                    solana_challenge(&ed25519(0x22), PEER_ACCOUNT, now() + 60),
+                ),
+                (
+                    "expired, on Solana",
+                    solana_challenge(&peer_ed25519(), PEER_ACCOUNT, now() - 1),
+                ),
+                (
+                    "from an unbound channel's own signer",
+                    evm_challenge(&stranger_key(), &stranger_key(), now() + 60),
+                ),
+            ];
+            for (case, challenge) in cases {
+                assert_eq!(
+                    challenge_role(&carriages, &challenge, 0).await,
+                    CLIENT,
+                    "{case}"
+                );
+            }
+        }
+
+        /// A challenge proves the role only for a packet that moves no value
+        /// (ADR 0075 decision 5): a paying packet carries a voucher.
+        #[tokio::test]
+        async fn a_challenge_on_a_packet_that_moves_value_does_not_decide_peer() {
+            let (_, carriages) = bound();
+            let challenge = evm_challenge(&peer_key(), &peer_key(), now() + 60);
+
+            assert_eq!(challenge_role(&carriages, &challenge, 1).await, CLIENT);
+        }
+
+        /// The connector-signer separation, now for the peer-role use: a
+        /// challenge signature presented as a voucher, and a voucher
+        /// signature presented as a challenge, each with the one number they
+        /// sign lined up, prove nothing -- on either chain.
+        #[tokio::test]
+        async fn a_challenge_is_never_accepted_as_a_voucher_nor_a_voucher_as_a_challenge() {
+            let (_, carriages) = bound();
+            let expires = now() + 60;
+            let channel_id = evm_channel(&peer_key());
+
+            let challenge_signature = sign_evm(
+                &peer_key(),
+                &evm_voucher_claim_state_challenge_digest(&domain(), &channel_id, expires),
+            );
+            let challenge_as_voucher = evm_voucher(&peer_key(), expires, &challenge_signature);
+            assert_eq!(
+                voucher_role(&carriages, &challenge_as_voucher).await,
+                CLIENT
+            );
+
+            let voucher_signature = sign_evm(
+                &peer_key(),
+                &evm_voucher_digest(&domain(), &channel_id, u128::from(expires)),
+            );
+            let voucher_as_challenge = challenge_json::encode(&PeerRoleChallenge::Evm {
+                channel_id,
+                expires,
+                signature: voucher_signature,
+                channel_config: Some(evm_challenge_config(&peer_key())),
+            });
+            assert_eq!(
+                challenge_role(&carriages, &voucher_as_challenge, 0).await,
+                CLIENT
+            );
+
+            let signer = peer_ed25519();
+            let solana_challenge_signature = signer
+                .sign(&solana_voucher_claim_state_challenge_message(
+                    &PEER_ACCOUNT,
+                    expires,
+                ))
+                .to_bytes();
+            assert_eq!(
+                voucher_role(
+                    &carriages,
+                    &solana_voucher(PEER_ACCOUNT, expires, &solana_challenge_signature)
+                )
+                .await,
+                CLIENT
+            );
+            let solana_voucher_signature = signer
+                .sign(&solana_voucher_message(&PEER_ACCOUNT, expires, 0))
+                .to_bytes();
+            let solana_voucher_as_challenge = challenge_json::encode(&PeerRoleChallenge::Solana {
+                channel_account: PEER_ACCOUNT,
+                expires,
+                signature: solana_voucher_signature,
+            });
+            assert_eq!(
+                challenge_role(&carriages, &solana_voucher_as_challenge, 0).await,
+                CLIENT
+            );
+        }
+
+        /// §1.5's smuggling defence, extended: a claim beside a challenge is
+        /// two pieces of authentication material, and a peer handler refuses
+        /// the request rather than choose one.
+        #[tokio::test]
+        async fn a_voucher_beside_a_challenge_is_refused_not_resolved() {
+            let (_, carriages) = bound();
+            let http = carriages.http.clone().expect("http is exposed");
+            let mut headers = connector_peer_http::Headers::new();
+            headers.push(
+                connector_btp::CLAIM_HEADER,
+                connector_peer_http::headers::claim_header_value(&signed_evm_voucher(
+                    &peer_key(),
+                    500,
+                )),
+            );
+            headers.push(
+                connector_btp::PEER_CHALLENGE_HEADER,
+                connector_peer_http::headers::peer_challenge_header_value(&evm_challenge(
+                    &peer_key(),
+                    &peer_key(),
+                    now() + 60,
+                )),
+            );
+            let response = http
+                .handle(connector_peer_http::PeerRequest {
+                    headers,
+                    body: prepare(0),
+                })
+                .await;
+            assert_eq!(response.status, 400);
+
+            let (replies, mut answers) = tokio::sync::mpsc::channel(4);
+            let mut session = PeerSession::new(carriages.btp_state().expect("btp"), replies);
+            session
+                .handle_frame(&connector_btp::encode_message(
+                    7,
+                    &[
+                        entry(
+                            connector_btp::CLAIM_PROTOCOL,
+                            &signed_evm_voucher(&peer_key(), 500),
+                        ),
+                        entry(
+                            connector_btp::PEER_CHALLENGE_PROTOCOL,
+                            &evm_challenge(&peer_key(), &peer_key(), now() + 60),
+                        ),
+                    ],
+                    &prepare(0),
+                ))
+                .await
+                .expect("the session is live");
+            let answer = connector_btp::decode_frame(&answers.recv().await.expect("an answer"))
+                .expect("a frame");
+            assert_eq!(answer.frame_type, connector_btp::BTP_ERROR);
+        }
+
+        /// A binding names a relation this node has: a signer bound to a peer
+        /// id no peering holds would decide a role that routes nowhere.
+        #[tokio::test]
+        async fn a_signer_can_only_be_bound_to_a_peering_that_exists() {
+            let (connector, _) = node(&[]);
+            assert_eq!(
+                connector.bind_voucher_signer("ghost", VoucherSigner::Evm([1; 20])),
+                Err(connector_runtime::VoucherBindingError::UnknownPeer(
+                    "ghost".to_string()
+                ))
+            );
+        }
+
+        #[test]
+        fn the_challenge_rides_its_own_slot_on_both_carriages() {
+            let names = connector_btp::CARRIAGE_NAMES
+                .iter()
+                .find(|names| names.concept == "peer-role-challenge")
+                .expect("declared as a pair");
+            assert_ne!(names.btp_protocol_entry, connector_btp::CLAIM_PROTOCOL);
+            assert_ne!(names.http_header, connector_btp::CLAIM_HEADER);
+            // The header carries base64 of the JSON, as the claim's does.
+            let json = solana_challenge(&peer_ed25519(), PEER_ACCOUNT, 1);
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(connector_peer_http::headers::peer_challenge_header_value(
+                        &json
+                    ))
+                    .unwrap(),
+                json.into_bytes()
+            );
+        }
     }
 }

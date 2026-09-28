@@ -35,6 +35,14 @@
 //! verifies as the other. On Solana it is a tagged message of its own
 //! ([`solana_voucher_claim_state_challenge_message`]), which starts with
 //! neither the voucher's `0x56 0x01` nor the `toon-channel` challenge's tag.
+//!
+//! **The same message proves the peer role** (ADR 0075 decision 5, issue
+//! #1377): a peer's packet that moves no value carries it, signed by a bound
+//! channel's voucher signer, in place of a voucher. Both uses say "I control
+//! this channel's voucher signer, until `expires`" to the channel's receiver
+//! and neither moves value, so one message serves both. What must stay apart
+//! is the challenge and the voucher, and the separation tests below hold in
+//! both directions for that use too.
 
 use crate::claim_signature::{domain_separator, keccak256, recover_evm_signer, word_u64_be};
 use crate::voucher_signature::BatchSettlementDomain;
@@ -510,6 +518,65 @@ mod tests {
             &signature,
             &keypair.public.to_bytes(),
         ));
+    }
+
+    /// ADR 0075 decision 5 makes the voucher-channel challenge the peer
+    /// role's proof for a packet that moves no value, beside a voucher for
+    /// one that moves some. The two must stay apart in the other direction
+    /// too: a challenge captured off the peer wire never pays, on either
+    /// chain, even with its `expires` lined up against the amount.
+    #[test]
+    fn a_peer_role_challenge_never_verifies_as_a_voucher_on_either_chain() {
+        let (secret, address) = generate_evm_keypair();
+        let digest =
+            evm_voucher_claim_state_challenge_digest(&voucher_domain(), &[1u8; 32], 1_800_000_000);
+        let challenge: [u8; 65] = sign_as_a_wallet_would(&secret, &digest)
+            .try_into()
+            .expect("65 bytes");
+        let voucher: [u8; 65] = sign_as_a_wallet_would(
+            &secret,
+            &crate::evm_voucher_digest(&voucher_domain(), &[1u8; 32], 1_800_000_000),
+        )
+        .try_into()
+        .expect("65 bytes");
+        let verifies_as_a_voucher = |signature: &[u8; 65]| {
+            crate::verify_evm_voucher(
+                &voucher_domain(),
+                &[1u8; 32],
+                1_800_000_000,
+                signature,
+                &address,
+            )
+        };
+        assert!(verifies_as_a_voucher(&voucher), "the control");
+        assert!(!verifies_as_a_voucher(&challenge));
+
+        let keypair = generate_solana_keypair();
+        let channel_account = [3u8; 32];
+        let challenge = keypair
+            .sign(&solana_voucher_claim_state_challenge_message(
+                &channel_account,
+                1_800_000_000,
+            ))
+            .to_bytes();
+        let voucher = keypair
+            .sign(&crate::solana_voucher_message(
+                &channel_account,
+                1_800_000_000,
+                0,
+            ))
+            .to_bytes();
+        let verifies_as_a_voucher = |signature: &[u8; 64]| {
+            crate::verify_solana_voucher(
+                &channel_account,
+                1_800_000_000,
+                0,
+                signature,
+                &keypair.public.to_bytes(),
+            )
+        };
+        assert!(verifies_as_a_voucher(&voucher), "the control");
+        assert!(!verifies_as_a_voucher(&challenge));
     }
 
     /// Neither a voucher nor a `toon-channel` challenge verifies as a

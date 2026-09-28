@@ -1483,7 +1483,13 @@ A verified voucher channel is answered in its own shape, with no `nonce`:
 
 - `cumulativeClaimed` — the amount watermark: the highest cumulative amount the connector has
   accepted a voucher for on this channel, `"0"` for none. The next voucher must strictly exceed it
-  (ADR 0074 decision 3). A voucher is never a peer claim, so only this edge's book is consulted.
+  (ADR 0074 decision 3). It is the higher of this edge's book and the peer book, as a
+  `toon-channel` entry's already is: since [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+  decision 5 a voucher proves the peer role on a channel whose voucher signer is bound to a
+  peering, and decision 6 makes this endpoint the watermark a paying peer restores from, so a
+  peer-bound channel is answered exactly as a client's is and never below where the channel stands
+  (issue #1377). _Before #1377 this read "a voucher is never a peer claim, so only this edge's book
+  is consulted" (ADR 0074 decision 1, superseded there by ADR 0075)._
 - `maxCumulative` — the highest cumulative amount a voucher may name and be accepted, as §1.3 step
   5 reads it now: the amount landed on chain plus what still backs a voucher above it, which is
   `balance − pendingWithdrawal` on EVM and `deposit` on an Open Solana channel (ADR 0074 decision 5).
