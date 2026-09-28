@@ -4,328 +4,116 @@
 # LOCAL / DEV ONLY. `infra/linode-*` owns devnet; nothing here is deployed,
 # published or SSH'd anywhere, and every chain this file names is disposable.
 #
-# This is the file the topology exists for. B accepts a peering whose claims
-# are EIP-712 balance proofs against a channel on anvil, and dials a peering
-# whose claims are ed25519 messages against a channel account on the local
-# Solana validator -- so ONE node, ONE packet path, and the money changes chain
-# in the middle of it.
+# This is the file the topology exists for. B is paid over a peering whose
+# vouchers are EIP-712 `Voucher`s on an `x402BatchSettlement` channel on
+# anvil, and pays over a peering whose vouchers are ed25519 messages on a
+# `payment-channels` channel on the local Solana validator -- so ONE node, ONE
+# packet path, and the money changes chain in the middle of it.
 #
-# Nothing in this file converts anything, and since ADR 0071 that is a fact
-# about this file rather than about the connector. Crossing a denomination is
-# core forwarding now; what keeps this hop out of it is the ABSENCE RULE
-# (decision 2), which this config obeys by declaring no `[[tokens]]` -- so
-# neither peering resolves to a token, this node sits on no boundary, and the
-# converting arm is never reached. The amount that leaves for C is the amount
-# that arrived from A minus this hop's FLAT fee (the `fee = 50` on the `b-c`
-# peering, see below): a fixed number of base units subtracted once, never a
-# share of what arrived. What the two peerings disagree about is only which
-# ledger a claim is redeemable on -- both hold the same 6-decimal mock USDC.
-# `local/dealing`'s B is this node with a rate table; that is the topology to
-# read for what a crossing looks like.
+# Nothing in this file converts anything: it declares no `[[tokens]]`, so
+# neither peering resolves to a token and this node sits on no boundary (ADR
+# 0071's absence rule). The amount that leaves for C is the amount that arrived
+# from A minus this hop's FLAT fee of 50 on the `b-c` peering (in
+# `local/keys.sh`'s table), never a share of what arrived. `local/dealing`'s B
+# is this node with a rate table.
 #
-# The shape has no coverage anywhere else in this repository.
-# `two_ledgers_never_merge.rs` proves the two backends stay separate inside one
-# process, and `local/solo` stands a node up with both attached -- but neither
-# has a second node on the far side of either chain, so neither can show a
-# packet crossing from one to the other.
+# THE MIDDLE IS DOUBLY MIXED (issue #1155). A reaches this node over BTP
+# (`peer_expose = "btp"` below, and the `btp_endpoint` B publishes, which
+# `POST /peers` prefers) and this node reaches C over ILP-over-HTTP, so one
+# packet crosses both carriages as well as both chains, and the hop that reads
+# it off one wire and writes it onto the other is this one.
 #
-# SINCE ISSUE #1155 THE MIDDLE IS DOUBLY MIXED. A reaches this node over BTP
-# (`ws://`, `peer_expose = "btp"` below) and this node reaches C over
-# ILP-over-HTTP (`http://`), so one packet crosses both carriages as well as
-# both chains, and the hop that reads it off one wire and writes it onto the
-# other is this one. That is what makes this file evidence for `CONTEXT.md`'s
-# claim rather than a restatement of it: "below the transport port there is one
-# pipeline ... peer behaviour that exists on one carriage and not the other is
-# a defect rather than a property of the carriage". The fee below is subtracted
-# once, between the two.
+# ── Two peerings, four channels, none of them in this file ───────────────────
+#
+# ADR 0075: each peering is two one-way x402 channels, and each node opens only
+# its own. `local/keys.sh mixed-chain channels` writes `POST /peers` to this
+# node twice -- naming A's URL (binding A's EVM voucher signer, and opening a
+# B->A channel nothing pays on) and naming C's URL (opening and funding B's
+# Solana channel toward C through C's sponsor endpoint, decision 3, and
+# binding C's) -- and then `POST /routes/peers` for `g.local.mixed.b.c`.
+#
+# One thing this file used to say that the runtime peering cannot: A's
+# peering here was `forwarded_claim_enforcement = "enforce"` (ADR 0042 item
+# 3), the only enforcing peering in the repository. A runtime peering has no
+# such knob and observes (the default), so an uncovered arrival from A would
+# now be forwarded and logged rather than refused `F06`. The rehearsal still
+# catches it -- B's journal must show exactly one 1100 voucher per crossing --
+# but the enforcing refusal itself no longer runs on a shipped image. It comes
+# back with config-declared x402 peerings (#1380).
 # =============================================================================
 
 client_edge_addr = "0.0.0.0:3000"
 
-# Two claim ledgers' worth of watermarks -- the EVM peering's inbound and the
-# Solana peering's outbound -- in one journal, keyed by channel. They do not
-# merge: an EVM `channel_id` is `0x` + 64 hex and a Solana `channel_account` is
-# base58, drawn from disjoint spellings, so no name either chain produces can
-# collide with the other's (`Connector::recognizes_solana_channel`).
+# B's inbound vouchers (A's, on EVM) are journaled here, and so are the
+# vouchers B signs on its own outbound channels (ADR 0075 decision 8).
 state_dir = "/app/state"
 
 # Both axes, because this node is on both ends of a peering: it ACCEPTS from A
-# (`peer_expose`) and DIALS C (`peer_allow_plaintext_endpoints`, since C is a
-# plain container port with no TLS terminator). Expose and dial are separate
-# settings with separate spellings for exactly this reason -- a carriage name
-# and a URL scheme (peer-carriage-spec.md §2.1).
+# over BTP (`peer_expose`), and reads A's and C's self-descriptions and dials C
+# over plaintext HTTP (`peer_allow_plaintext_endpoints`, since both are plain
+# container ports with no TLS terminator). A carriage name and a URL scheme
+# are separate settings for exactly this reason (peer-carriage-spec.md §2.1).
 #
-# AND SINCE ISSUE #1155 THEY DISAGREE, WHICH IS THE POINT. This node exposes
-# BTP and dials HTTP: A reaches it at `GET /ilp/btp` on the very listener
-# `client_edge_addr` binds, and it reaches C at C's `POST /ilp`. Exposure is
-# per CONNECTOR and dialling is per PEER, so those are not two answers to one
-# question -- and a config where they had to agree would have made the
-# separate spellings decoration. `local/two-hop` still exposes and dials HTTP,
-# so both readings are committed somewhere.
-#
-# `"btp"` and not `"both"`: this node accepts exactly one peering, A's, and
-# that peering is BTP. `"both"` would open an ILP-over-HTTP peer listener no
-# configured peer would ever reach -- a value-bearing surface with no
-# counterparty, which is what `peer_expose` defaulting to `"neither"` exists to
-# avoid. The narrower value is also what makes this topology's money check
-# evidence of the CARRIAGE: with no HTTP peer path mounted at all, a claim in
-# this node's peer journal can only have arrived over a BTP frame.
-#
-# Nothing about the CLIENT edge changes. `POST /ilp`, `GET /ilp/identity` and
-# `POST /ilp/claim-state` are served exactly as before -- `peer_expose` decides
-# which carriages may bind a PEER ROLE, never which routes exist -- which is
-# why A can still ask this node where its claims stand over plain HTTP while
-# peering with it over a websocket.
+# `"btp"` and not `"both"`, deliberately: no ILP-over-HTTP peer carriage is
+# mounted here at all, so A's packets can only have arrived on BTP frames.
 peer_expose = "btp"
 peer_allow_plaintext_endpoints = true
 
 [signer]
 key_file = "/app/data/signer.key"
 
-# ── Onward to C ──────────────────────────────────────────────────────────────
-# B terminates nothing. `g.local.mixed.b.c` is C's subtree under B's own, so
-# the destination `g.local.mixed.b.c.app` matches here and is forwarded, while
-# A's table matched the shorter `g.local.mixed.b` and forwarded to here.
-#
-# THIS HOP CHARGES (issue #1144), and it is the one hop in the repository that
-# charges a fee on a PEER arrival rather than on a packet an operator handed
-# it. 1100 arrives from A, 50 stays here, 1050 goes on to C -- `price - fee`
-# (1100 - 50) comfortably clears C's own `price = 0`, which is the invariant
-# ADR 0028 documents and nothing enforces. `connector-a.toml` writes the whole
-# path's arithmetic out in one block; this is its middle line.
-#
-# 50 rather than A's 100 on purpose: a fee buys carriage over ONE peering
-# relation and is bilateral configuration (ADR 0010), so the two hops on this
-# path are deliberately not the same number. It is written on the `b-c`
-# `[[peers]]` row rather than here, because it is what carrying to C costs
-# whichever prefix is addressed (ADR 0061).
-#
-# WHAT THIS NODE PAYS C IS THE 1050 IT FORWARDS, not the 1100 it received:
-# `forward_via_peer_route` covers the next hop for `amount_after_fee`, and the
-# difference IS this fee. That claim is signed and attached BEFORE the crossing
-# leaves (ADR 0042), from the `[[pay_channels]]` row below.
+# What B publishes at `GET /ilp` (ADR 0050). BOTH endpoints: the BTP one is
+# what A's `POST /peers` dials -- BTP is preferred where a node publishes
+# both -- and the HTTP one is where A asks B's claim-state, which is plain
+# HTTP whichever carriage the packets ride (ADR 0075 decision 6). BTP rides
+# `GET /ilp/btp` on the same listener `client_edge_addr` binds.
+[node]
+addresses = ["g.local.mixed.b"]
+http_endpoint = "http://connector-b:3000/ilp"
+btp_endpoint = "ws://connector-b:3000/ilp/btp"
+
+# ── The PEER-ROLE PROOF on the a-b leg ─────────────────────────────────────
+# B forwards everything else it is paid for, and a runtime forwarding route
+# cannot be pinned -- so a voucher on A's channel would pay for a forward just
+# as well if B had never bound that channel to the peering and admitted it as a
+# CLIENT's. This one terminated route closes that: it is pinned to
+# ILP-over-HTTP, A pays B over BTP, a client is refused a route pinned to
+# the other carriage (ADR 0072), and a peer is not held to a client's pin. The
+# rehearsal sends one packet here on the SAME channel as its forwards, so if it
+# reaches this app, A's channel is bound to the peering -- and every voucher on
+# it arrived in the peer role. Priced at exactly what A forwards (1100), so the
+# journal read holds it to the same figure as every other crossing.
 [[routes]]
-prefix = "g.local.mixed.b.c"
-peer_id = "b-c"
+prefix = "g.local.mixed.b.app"
+handler_url = "http://stub-app:3100/"
 price = 1100
+transport = "http"
 
-# ── The EVM peering: A dials in, over BTP ────────────────────────────────────
-# No `endpoint`: A dials us. Since issue #1155 it dials
-# `ws://connector-b:3000/ilp/btp`, and this row is unchanged by that -- WHICH
-# CARRIAGE A REACHES US ON IS A'S FILE'S BUSINESS AND NOT THIS ROW'S (§2.1).
-# The only thing on this node that names the carriage at all is `peer_expose`
-# above, and it names it once.
-#
-# BUT THE REASON THIS NODE IS THE PAYEE CHANGED, and the old comment here would
-# now be wrong. On ILP-over-HTTP the accept-only side is STRUCTURALLY the payee
-# (§6.4): only the dialing side can originate, so packets can only flow one way
-# and debt follows packets. BTP has no such asymmetry -- §2.3 makes a dialed
-# session symmetric once auth has bound it, and either side may originate on
-# it. This node is the payee of this peering because of ROUTING: A holds a
-# `[[routes]]` row forwarding to `a-b` and this node holds none pointing back.
-# The carriage stopped deciding it; the route tables always did.
-#
-# `forwarded_claim_enforcement = "enforce"` HERE, AND THIS IS THE ONLY ROW IN
-# THE REPOSITORY WHERE IT DOES ANYTHING. ADR 0042 item 3 (issue #1142) says a
-# forwarded arrival must carry a claim covering the ARRIVING amount, behind a
-# per-peer knob that defaults to `observe`; this is the only row anywhere here
-# that turns it on, and therefore the only place #1142's enforcing path is
-# proven against a running image at all. (`local/dealing`'s B forwards a peer
-# arrival too, and leaves the knob at its default on purpose -- one fact, one
-# home, and that topology's subject is the denomination boundary.)
-#
-# It could not be turned on until issue #1145. This peering used to be POSTPAY:
-# A had no `[[pay_channels]]` row, the claim covering crossing n rode crossing
-# n + 1, and crossing 1 arrived uncovered BY CONSTRUCTION -- enforcing would
-# have refused it `F06`, it would never have fulfilled, nothing would ever have
-# been owed, and crossing 2 would have arrived uncovered too. A `[[pay_channels]]`
-# row on the PAYER is what breaks that circle, A now has one (required, not
-# optional -- see that file), and the figure lines up exactly: A covers
-# `amount_after_fee(1200, 100)` and 1100 is what arrives here.
-#
-# What enforcing buys over observing is that the refusal is real. In observe
-# mode an uncovered arrival is admitted and logged, so a peering carrying
-# traffic for free looks identical to a paid one from the packet's answer --
-# the same nothing-asserted success `--expect-fulfill` alone would go green
-# over.
-[[peers]]
-id = "a-b"
-forwarded_claim_enforcement = "enforce"
-
-
-# ── The Solana peering: we dial C, over ILP-over-HTTP ────────────────────────
-# `http://` ON PURPOSE, AND IT IS HALF OF WHAT ISSUE #1155 BOUGHT. Moving both
-# peerings to BTP would have proven the carriage and lost the comparison: with
-# `a-b` on `ws://` and this one on `http://`, one packet arrives here on a
-# websocket frame and leaves on an HTTP POST, and every rule between the two --
-# the route match, the flat fee, the covering claim minted for the next hop --
-# runs once and knows about neither. A regression that made a peer arrival
-# behave differently by carriage cannot hide in a stack where the same hop does
-# both.
-#
-# Note also what this node does NOT have to say: it exposes BTP and dials HTTP,
-# and there is no key anywhere pairing those two answers. `peer_expose` is per
-# connector, this `endpoint` is per peer (§2.1).
-[[peers]]
-id = "b-c"
-endpoint = "http://connector-c:3000/ilp"
-# The 50 in the arithmetic above: what this node retains for carrying one
-# packet onward to C. It sits on this peering and not on the `a-b` one, because
-# a fee is charged by the hop that FORWARDS -- and this node forwards to C
-# only. `a-b` carries none for the same reason it holds no route: nothing here
-# routes back to A.
-fee = 50
-
-
-# The EVM row: A's claims, judged against the anvil channel A opened, under the
-# EIP-712 domain that channel's `TokenNetwork` verifies (ADR 0024).
-# `counterparty_key` is A's EVM SETTLEMENT address -- the channel's on-chain
-# participant -- never the signer address the claim declares about itself
-# (CF-23).
-[[peer_channels]]
-peer_id = "a-b"
-channel_id = "0x221b5e73fba2099b690a94e668d575a75d136c249795f5b20146bf7d0403e423"
-counterparty_key = "0x14dC79964da2C08b23698B3D3cc7Ca32193d9955"
-chain_id = 31337
-token_network = "0xCafac3dD18aC6c6e92c921884f9E4176737C052c"
-
-# The Solana row (issue #759), and the other side of the boundary. A different
-# SHAPE, not a different spelling of the same one: `channel_account` is a
-# program-derived address rather than an EVM-style `channel_id`, there is no
-# `chain_id` because Solana has no numeric chain id, and there is no
-# `token_network` because there is no per-token verifying contract -- the
-# channel account IS the whole of a Solana claim's signed message.
-#
-# There is no `program_id` here either, and that is the point of issue #1128:
-# since ADR 0053 the settlement program is BOUND INTO a Solana claim's signed
-# message, so the program this node verifies a peer claim under has to be the
-# program it redeems that claim through -- `[settlement.solana] program_id`
-# below, and nothing else. This row used to name its own, nothing compared the
-# two, and a stale row after a program redeploy bought carriage with claims
-# this node could never cash. Writing the key here now refuses the boot by
-# name. Same "no second declaration" rule `[[client_channels]]` got in #1082.
-#
-# `counterparty_key` is C's Solana settlement public key, and this node signs
-# its own outbound claims on this channel with `[settlement.solana]`'s key --
-# the same "the participant is the settlement identity" rule the EVM row above
-# follows, on the other curve.
-#
-# `channel_account` is the address `find_program_address(["channel", min, max,
-# mint])` produces for these two participants under this program
-# (packages/solana-program/src/processor.rs). `local/keys.sh` recomputes it and
-# refuses to proceed if this line disagrees, and its `solana-channels` stage
-# then OPENS AND FUNDS it -- through this node's own operator surface below,
-# because that is the only submitter of an `InitializeChannel` this repository
-# has, and because the program's `Deposit` credits strictly by signer, so only
-# this node can put its own collateral behind its own claims (issue #1118).
-[[peer_channels]]
-peer_id = "b-c"
-channel_account = "G5mXQzfZb4tXWX7cQvXP9ZJnDBcUo6irWTmGGtX3xpzL"
-counterparty_key = "93mxPHokL6EhVxzVicSyouEhvTVGUcKXKtHH1uTmw2Aw"
-
-# ── Paying C for the crossing, BEFORE it crosses (ADR 0042 item 2) ───────────
-# The Solana twin of A's row, and REQUIRED for the same reason: this node has a
-# `[[routes]]` entry forwarding to `b-c`, and since issue #1145 a peering a node
-# forwards to with no `[[pay_channels]]` row is refused at load by name
-# (`ConfigError::PayChannelUnbound`). ADR 0004's postpay convention -- which is
-# what paid this leg until now -- is deleted, so there is nothing to fall back
-# to.
-#
-# It could not be written at all until issue #1146: `[[pay_channels]]` had no
-# Solana shape, `OutboundClientLedger::next_claim` took an EIP-712 domain and a
-# secp256k1 signer, and `cover_forward` minted `ClaimSignature::Evm` and nothing
-# else. So the one leg in this repository that ADR 0042 could not cover was the
-# one this topology exists for.
-#
-# A DIFFERENT SHAPE, not a different spelling. `channel_account` rather than
-# `channel_id`; no `chain_id` because Solana has no numeric chain id; no
-# `token_network` because there is no per-token verifying contract. And no
-# `program_id`: ADR 0053 signs the settlement program into every claim on the
-# channel, and since #1128 that program is `[settlement.solana] program_id`
-# below and nothing else, so the program this node's covering claims are signed
-# under is by construction the one it would redeem them through. Writing the key
-# here is refused by name.
-#
-# IT NAMES THE SAME CHANNEL AS THE `[[peer_channels]]` ROW ABOVE, and on Solana
-# that is required rather than merely conventional
-# (`ConfigError::PayChannelSolanaWithoutPeerChannel`): `programId` is a REQUIRED
-# field of the Solana claim wire where an EVM claim's EIP-712 domain rides
-# absent, and both peer carriages render it from that peering's Solana peer
-# row. Without one, every claim this row minted would reach
-# `claim_json::encode` with nothing to write there -- a caller bug it panics on,
-# on the packet path, with the money already committed.
-#
-# `local/keys.sh <topology> solana-channels` opens AND funds that channel
-# through this node's own operator surface, with this node as the depositing
-# participant -- which is the side that has to hold collateral, because this is
-# the side signing claims on it (`ClaimFromChannel` bounds a claim by the
-# claimer's own deposit).
-#
-# `client_edge_url` is C's `POST /ilp`, where this node asks where its claims
-# stand on every covered packet. C answers out of its PEER book, because it
-# holds this channel as a `[[peer_channels]]` row -- issue #1102's fix, and the
-# reason a covering payer can exist on this leg at all.
-[[pay_channels]]
-peer_id = "b-c"
-channel_account = "G5mXQzfZb4tXWX7cQvXP9ZJnDBcUo6irWTmGGtX3xpzL"
-client_edge_url = "http://connector-c:3000/ilp"
-
-# ── The operator surface, and the one job it has here ────────────────────────
-# C has none, deliberately (CF-31): an absent table means the surface is not
-# started at all rather than started unauthenticated, and an unused one is two
-# more credentials to provision. This node has one for a reason C's comment
-# cannot claim -- it is the ONLY way the Solana channel above gets opened.
-#
-# `packages/solana-program`'s `InitializeChannel` is a positional account list
-# under an 8-byte discriminator; the Solana CLI cannot build an arbitrary
-# program instruction and `spl-token` knows only SPL Token, so no chain tool in
-# this repository can submit one. `POST /channels` (ADR 0008's third write,
-# issue #459) can: it reaches `SolanaSettlementBackend::open`, which signs with
-# `[settlement.solana]`'s key below -- the very identity `channel_account` is
-# derived from and the one that will sign every claim on it. `local/keys.sh
-# <topology> solana-channels` makes that write once the node is serving.
-#
-# Both values are paths, written into the gitignored key directory by
-# `local/keys.sh`: `write_keys` holds only PUBLIC halves, and `bearer_token`
-# gates reads alone -- no shared secret can move value (ADR 0008).
+# ── Operator surface (ADR 0008) ──────────────────────────────────────────────
+# keys.sh's `POST /peers`, `POST /routes/peers` and `POST /channels/:id/fund`
+# are signed with the allowlisted key; reads carry the bearer token.
 [operator]
 bearer_token_file = "/app/data/operator-bearer-token"
 write_keys_file = "/app/data/operator-write-keys"
 
-# ── Settlement: BOTH chains, and this is not decoration ──────────────────────
-# A `[[peer_channels]]` row can only be signed for if this node holds the
-# matching settlement key: `peer_claim_identity` reads `[settlement.evm]`'s and
-# `peer_claim_identity_solana` reads `[settlement.solana]`'s, and a node
-# missing one signs no claim on that chain at all. So the two tables below are
-# what make the two rows above live rather than inert.
-#
-# A present-but-unsatisfiable settlement table is a hard startup failure (ADR
-# 0009/CF-25), so this section coming up at all is itself an assertion: the
-# registry resolved a TokenNetwork for the token, the token's own `decimals()`
-# agreed with the 6 written here (issue #564), the Solana program was reachable
-# AND proven to behave like the deployed payment-channel program, and the mint
-# was owned by the SPL Token program with matching decimals.
-
+# ── Settlement: BOTH chains ──────────────────────────────────────────────────
+# `local/solo/connector.toml` has why each value is what it is. The EVM table
+# is where A's channel toward B lives; the Solana table is where B's channel
+# toward C lives, opened through C's sponsor endpoint so that C holds its
+# `payee` seat.
 [settlement.evm]
 rpc_url = "http://anvil:8545"
-contract_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-token_address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+contract_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+token_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals = 6
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
 
-# `program_id` is the id `infra/solana/entrypoint.sh` loads payment_channel.so
-# under at genesis, and equals
-# `connector_settlement_solana::test_support::LOCAL_TEST_PROGRAM_ID` --
-# `local_program_id_is_shared.rs` fails if those two drift. It is committable
-# precisely because the entrypoint passes a BARE `--bpf-program` id rather than
-# deploying against a per-machine keypair.
-#
-# `token_address` is the deterministic mock mint from
-# `infra/solana/create-usdc-mint.sh`, seeded by `make solana-mint-usdc`. That
-# target fails loudly rather than warning, because a validator without this
-# mint cannot satisfy this line and the node will refuse to start.
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+
 [settlement.solana]
 rpc_url = "http://solana-validator:8899"
 program_id = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR"
@@ -334,3 +122,6 @@ decimals = 6
 
 [settlement.solana.key]
 key_file = "/app/data/settlement-solana.key"
+
+[settlement.solana.batch_settlement]
+min_sponsored_deposit = 1

@@ -28,12 +28,13 @@ on:
     paths:
       - 'crates/**'
       - 'packages/solana-program/**'
-      - 'packages/contracts/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'deploy/connector-rust/Dockerfile'
       - 'docker-compose.yml'
+      - 'infra/anvil/**'
       - 'infra/solana/**'
+      - 'docs/operators/sign-write.sh'
       - 'local/**'
       - '.github/workflows/local-topologies.yml'
 
@@ -67,19 +68,18 @@ jobs:
       matrix:
         topology: [solo, two-hop, mixed-chain, dealing]
     steps:
+      # No submodules: nothing here compiles packages/contracts any more. The
+      # anvil service places committed x402 bytecode (infra/anvil/seed.sh, ADR
+      # 0075), so the Solidity libs are not an input to this job.
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          # packages/contracts' forge-std and openzeppelin-contracts. The
-          # compose anvil service self-heals with `forge install` if they are
-          # missing, but fetching them here is faster and keeps the failure
-          # mode "the submodule moved" rather than "the deploy timed out".
-          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # `cast` -- local/keys.sh funds the EVM settlement account with it.
+      # `cast` -- local/keys.sh funds the EVM settlement accounts with it (ETH,
+      # and a USDC `mint`) and reads every EVM channel back off
+      # `x402BatchSettlement` with it.
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:

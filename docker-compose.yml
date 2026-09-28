@@ -57,183 +57,49 @@ x-logging: &default-logging
 
 services:
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  # Anvil - Local Ethereum Node with Auto-Deployed Contracts
+  # Anvil - local Ethereum with x402 and an ERC-3009 USDC placed at start
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # ADR 0075 decision 13: `x402BatchSettlement` and its collectors at their
+  # canonical addresses and Circle's FiatToken v2.2 as USDC, placed from the
+  # committed bytecode under crates/connector-settlement-evm/contracts/ by
+  # infra/anvil/seed.sh -- the same bytes, placed the same way, as the tier-3
+  # tests' `X402Chain::place`. `seed.sh`'s header has the address table.
+  #
+  # No Solidity toolchain and no source tree: nothing is compiled here, so
+  # this service mounts only what it reads, READ-ONLY, and writes nothing a
+  # developer owns. (It used to bind-mount ./packages/contracts read-write and
+  # run `forge script DeployLocal.s.sol` against it, which is why it once had
+  # to run as the invoking user and install pinned foundry libs; none of that
+  # applies to a container that only reads committed hex.)
   anvil:
     image: ghcr.io/foundry-rs/foundry:latest
-    # Run as the user who INVOKED make, not as root and not as the image's own
-    # `foundry` user. This service bind-mounts ./packages/contracts read-write
-    # and `forge` writes four things into it — out/, cache/, broadcast/ and, on
-    # a checkout whose submodules are not initialized, lib/ — so whoever this
-    # container is decides who owns the developer's source tree afterwards.
-    #
-    # `user: root` was the previous answer, for the reason #104 records: the
-    # image's baked-in uid 1000 cannot write the mount when the host dir
-    # belongs to a different uid (a CI runner is 1001), and `forge script` then
-    # dies with `"/contracts/out": Permission denied`. Running as the OWNER of
-    # the mount solves that without handing root a writable path into the tree,
-    # and root cost two distinct failures that both looked like something else:
-    #
-    #   * The artefacts came back root-owned, so the next `cargo test` could
-    #     not rebuild them — `abi_provenance` runs a real `forge build` of
-    #     packages/contracts — and the developer could not even `rm -rf` the
-    #     directory to recover without sudo. Running the local environment
-    #     broke the unit-test gate, with nothing connecting the two.
-    #   * On a git worktree, or any checkout where `git submodule update
-    #     --init` has not run, lib/forge-std and lib/openzeppelin-contracts
-    #     exist and are EMPTY, owned by the developer. `forge install` clones
-    #     into them and git refuses as root — "detected dubious ownership in
-    #     repository at '/contracts/lib/forge-std'" — so the self-heal below
-    #     never completed, the deploy compiled against absent OpenZeppelin
-    #     sources, and every topology under local/ failed bring-up with
-    #     `container ... is unhealthy` and no other clue.
-    #
-    # HOST_UID/HOST_GID are exported by the Makefile (`id -u` / `id -g`), so
-    # every `make anvil-up` / `make infra-up` / `make local-*` gets this right.
-    # A hand-run `docker compose up` falls back to 1000:1000, the image's own
-    # user and the common single-developer case.
-    user: '${HOST_UID:-1000}:${HOST_GID:-1000}'
-    environment:
-      # An arbitrary uid has no /etc/passwd entry in this image, so $HOME would
-      # resolve to `/`, which is not writable. forge needs a writable home: it
-      # downloads the solc pinned by foundry.toml into ~/.svm on every start
-      # (the image ships none) and git wants somewhere for its config.
-      HOME: /tmp
     profiles:
       - evm
       - app # issue #221 — reused by the app profile
     entrypoint: []
-    command:
-      - sh
-      - -c
-      - |
-        echo "Starting Anvil..."
-        anvil --host 0.0.0.0 --port 8545 --chain-id 31337 --accounts 10 --balance 10000 &
-        ANVIL_PID=$$!
-
-        echo "Waiting for Anvil to be ready..."
-        until cast client --rpc-url http://localhost:8545 2>/dev/null | grep -q 'anvil'; do
-          sleep 1
-        done
-
-        echo "Deploying contracts..."
-        cd /contracts
-
-        # DeployLocal.s.sol imports forge-std + openzeppelin-contracts from
-        # lib/ (git submodules). In CI the checkout fetches them via
-        # `submodules: recursive`, and every `make anvil-up` / `make infra-up` /
-        # `make local-up` runs tools/contracts/init-libs.sh on the HOST first,
-        # which is the same thing done from the checkout that owns the pin. This
-        # is the LAST RESORT for the one caller neither covers: a hand-run
-        # `docker compose up` on a clone made without `--recursive`, which the
-        # headers under local/ document. Without it the stack comes up with no
-        # USDC token and no TokenNetworkRegistry. See issue #104.
-        #
-        # PINNED TO A REVISION, and that is the whole of issue #1121. `forge
-        # install <repo>` with no ref takes that repository's default branch:
-        # this installed OpenZeppelin 5.7.0 into a tree whose submodule names
-        # fcbae539 (5.5.0), and the next host-side `forge build` said so —
-        # `Warning: Dependency 'lib/openzeppelin-contracts' revision mismatch`,
-        # from inside abi_provenance's own passing test output. Two consumers
-        # then compile against a version nobody chose: this deploy, and
-        # `crates/connector-settlement-evm/tests/abi_provenance.rs`, which
-        # diffs the committed ABI against a fresh build. An upstream release
-        # that touched anything the ABI depends on would turn that gate red on
-        # a machine that changed nothing, days after the container ran, and it
-        # would read as "someone edited a contract".
-        #
-        # This installs only what is MISSING, so a tree an OLDER unpinned run
-        # already polluted is repaired by tools/contracts/init-libs.sh rather
-        # than here: it can tell an unregistered lib/ from a submodule, and this
-        # sentinel check cannot.
-        #
-        # The revisions below are `packages/contracts/foundry.lock`'s, which are
-        # the committed submodule shas.
-        # `local_topologies_load.rs::the_contract_libs_this_chain_installs_are_pinned_to_the_lockfile`
-        # holds these three copies to one figure, so the pin cannot rot in
-        # silence the way an unpinned install did.
-        #
-        # ONE LIB AT A TIME, and each one repaired rather than topped up. A
-        # single `forge install a b` fails as a unit, so a half-installed lib/
-        # took the other lib down with it; and `forge install` into a directory
-        # that already holds a partial clone errors instead of fixing it, which
-        # is exactly the state a previously-failed run leaves behind. Removing
-        # the directory first is what makes this idempotent on a broken tree as
-        # well as on a clean one — and it is only possible at all because this
-        # container runs as the owner of the mount (see `user:` above).
-        install_lib() {
-          if [ -f "$$3" ]; then
-            return 0
-          fi
-          echo "Foundry lib $$1 is missing — installing $$2..."
-          rm -rf "$$1"
-          forge install "$$2" --no-git
-        }
-        install_lib lib/forge-std \
-          foundry-rs/forge-std@rev=1801b0541f4fda118a10798fd3486bb7051c5dd6 \
-          lib/forge-std/src/Script.sol
-        install_lib lib/openzeppelin-contracts \
-          OpenZeppelin/openzeppelin-contracts@rev=fcbae5394ae8ad52d8e580a3477db99814b9d565 \
-          lib/openzeppelin-contracts/contracts/access/Ownable.sol
-
-        # Deploy must succeed: the faucet and the EVM settlement tests depend on
-        # the USDC token + TokenNetworkRegistry existing at deterministic
-        # addresses. A silent failure here (the old `|| echo non-fatal`) is what
-        # left the faucet reporting tokenReady:true with no token on-chain (#104).
-        #
-        # The success line is CONDITIONAL, which it was not. `sh -c` has no
-        # `set -e` here — it cannot have one, the whole point of the tail of
-        # this script is to keep anvil in the foreground — so a failed deploy
-        # printed "Anvil ready with contracts deployed!" and then served an
-        # empty chain forever. The healthcheck below still caught it, but what
-        # a developer read in the log said the opposite of what had happened.
-        if forge script script/DeployLocal.s.sol:DeployLocalScript \
-             --rpc-url http://localhost:8545 --broadcast --skip-simulation; then
-          echo "Anvil ready with contracts deployed!"
-        else
-          echo "============================================================"
-          echo "CONTRACT DEPLOY FAILED. This anvil is serving an EMPTY chain:"
-          echo "there is no MockERC20 USDC and no TokenNetworkRegistry on it,"
-          echo "so this container will never pass its healthcheck and nothing"
-          echo "that settles can start against it. The forge output above is"
-          echo "the reason; the container stays up so it can be read."
-          echo "============================================================"
-        fi
-
-        # Anvil stays in the foreground either way. Exiting here would let
-        # `restart: unless-stopped` crash-loop the container, which replaces a
-        # readable log with a scrolling one.
-        wait $$ANVIL_PID
+    command: ['sh', '/anvil/entrypoint.sh']
     volumes:
-      - ./packages/contracts:/contracts
+      - ./infra/anvil:/anvil:ro
+      - ./crates/connector-settlement-evm/contracts:/evm:ro
     ports:
       - '8545:8545'
     restart: unless-stopped
     logging: *default-logging
-    # Healthy means THE SETTLEMENT TOPOLOGY IS DEPLOYED, not merely that the
-    # RPC answers. `cast client` succeeds the moment anvil binds, which is
-    # seconds before `forge script` finishes deploying — and everything
-    # downstream that waits on this health gate then races the deploy:
+    # Healthy means THE CHAIN IS SEEDED, not merely that the RPC answers.
+    # `cast client` succeeds the moment anvil binds, seconds before seed.sh
+    # finishes -- and everything downstream that waits on this gate would
+    # then race the seed: a node refusing to start over a token with no code,
+    # or a `cast send ... mint(...)` to a codeless address that does not
+    # revert and funds nobody.
     #
-    #   * `EvmSettlementBackend::connect` resolves getTokenNetwork() through
-    #     the registry and refuses to start when it comes back empty, so the
-    #     connector dies with "failed to decode empty bytes" (observed
-    #     exactly this, via local/'s solo topology).
-    #   * a `cast send` of `mint(...)` to an address with NO CODE does not
-    #     revert — it is an ordinary call to a plain account — so funding
-    #     scripts report success having minted nothing.
-    #   * issue #104's original symptom was this same class: the faucet
-    #     reporting tokenReady:true with no token on-chain.
-    #
-    # `cast code` on the TokenNetworkRegistry returns `0x` until the deploy
-    # lands, and its bytecode after. The address is the deterministic output
-    # of DeployLocal.s.sol run by account 0 at a fixed nonce, which is the
-    # same reason a committed config can name it.
+    # The address is the LAST thing seed.sh creates -- the TokenNetwork the
+    # connector still boots through until #1385 -- and seed.sh runs under
+    # `set -e`, so code there means every step before it landed too.
     healthcheck:
       test:
         [
           'CMD-SHELL',
-          "test \"$$(cast code 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 --rpc-url http://localhost:8545 2>/dev/null)\" != '0x' || exit 1",
+          "cast code 0x75537828f2ce51be7289709686A69CbFDbB714F1 --rpc-url http://localhost:8545 2>/dev/null | grep -Eq '^0x[0-9a-fA-F]+$$' || exit 1",
         ]
       interval: 5s
       timeout: 5s
@@ -312,6 +178,10 @@ services:
       # stays deterministic via the mounted program keypair in /programs.
       # See infra/solana/entrypoint.sh.
       - ./target/deploy:/programs:ro
+      # solana-foundation's `payment-channels` and mainnet's p-token, the
+      # programs every local channel lives on (ADR 0075 decision 13): the same
+      # pinned, hash-checked dumps the in-process harness loads.
+      - ./crates/connector-settlement-solana/fixtures:/fixtures:ro
     # Validator ledger (genesis keypairs + state) lives in the container's
     # writable layer (DISK), not tmpfs. A RAM-backed tmpfs ledger fills under the
     # accounts/snapshot growth and the validator FREEZES after a few thousand

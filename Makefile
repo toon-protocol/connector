@@ -90,18 +90,10 @@ lint:
 	npm run lint
 
 # packages/contracts' two git submodules, at the revisions this repository
-# pins, before anything compiles them.
-#
-# A prerequisite of every target that starts the `anvil` service, because that
-# service deploys DeployLocal.s.sol out of the bind-mounted ./packages/contracts
-# and will install the libs ITSELF if they are missing. That container install
-# named no revision until #1121: it took OpenZeppelin's default branch (5.7.0
-# observed) into a tree whose submodule says fcbae539 (5.5.0), and because the
-# mount is the developer's own source tree the next host-side `forge build`
-# compiled against it too -- including `abi_provenance`, which diffs the
-# committed ABI against a fresh build. Doing it here means the pin comes from
-# the checkout that HOLDS the pin. The container's install is still there, now
-# pinned by revision as well, for a hand-run `docker compose up`.
+# pins, before anything compiles them -- which is now only a host-side
+# `forge build`, `abi_provenance` above all (issue #1121). No local chain
+# compiles them any more: the `anvil` service places committed x402 bytecode
+# (infra/anvil/seed.sh, ADR 0075), so no target that starts it needs this.
 #
 # Cheap and quiet when the tree is already right (~20ms), and it declines
 # rather than fails where there is no git checkout to read a pin out of.
@@ -109,7 +101,7 @@ contracts-libs:
 	@./tools/contracts/init-libs.sh
 
 # Local Blockchain — EVM (Anvil + Faucet)
-anvil-up: contracts-libs
+anvil-up:
 	docker compose --profile evm up -d
 
 anvil-down:
@@ -121,8 +113,10 @@ anvil-logs:
 # Local Blockchain — Solana (Test Validator + Program Deploy)
 # solana-build first: the validator loads target/deploy/payment_channel.so into
 # GENESIS (infra/solana/entrypoint.sh's --bpf-program), so the .so must exist
-# before the container starts. Without it the validator comes up with no
-# payment-channel program at all and every settlement call fails.
+# before the container starts. No channel lives on it -- every local channel is
+# a `payment-channels` one, loaded from committed fixtures -- but the connector
+# still boots through `[settlement.solana] program_id` until #1385, and a
+# validator without it refuses every node that settles on Solana.
 solana-up: solana-build
 	docker compose --profile solana up -d
 	$(MAKE) solana-mint-usdc
@@ -177,7 +171,7 @@ solana-mint-usdc:
 # (ADR 0002 had already dropped it from the connector).
 #
 # infra-down intentionally does NOT pass -v (preserves existing per-profile volumes).
-infra-up: contracts-libs solana-build
+infra-up: solana-build
 	docker compose --profile evm --profile solana up -d
 	$(MAKE) solana-mint-usdc
 
@@ -237,12 +231,11 @@ local-build:
 # is why this is not one `up`.
 # Both `--wait`s below are load-bearing rather than tidy.
 #
-# On the chains: anvil's health gate is "the TokenNetworkRegistry has code", so
-# waiting is what makes the deploy complete before keys.sh mints against it.
-# Without it `up -d` returns as soon as the containers start, and every step
-# after races DeployLocal.s.sol -- a `cast send` of `mint(...)` to a codeless
-# address does not revert, so the funding silently does nothing and the
-# connector then dies resolving getTokenNetwork().
+# On the chains: anvil's health gate is "the last contract infra/anvil/seed.sh
+# creates has code", so waiting is what makes the seed complete before keys.sh
+# mints against it. Without it `up -d` returns as soon as the containers start,
+# and every step after races the seed -- a `cast send` of `mint(...)` to a
+# codeless address does not revert, so the funding silently does nothing.
 #
 # On the connectors: this target's contract is that when it returns, the
 # topology can be SENT TO. Their health gate is a real request to the client
@@ -252,15 +245,14 @@ local-build:
 # each node also waits on the one it dials, so `--wait` here means every hop on
 # the path is serving, not just the one the packet is handed to.
 #
-# And that is why keys.sh runs TWICE. A Solana peering's channel cannot be
-# opened before its node is up: `InitializeChannel` is a positional account
-# list under an 8-byte discriminator, no chain CLI can build one, and the only
-# submitter in this repository is a running node's `POST /channels` (ADR 0008's
-# third write). The second call opens it and then reads it back off the
-# validator, failing this target if the deployed program's own account layout
-# disagrees with the committed config. It is a no-op on a topology with no
-# Solana peering, which is `solo` and `two-hop`.
-local-up: local-preflight contracts-libs local-build solana-build
+# And that is why keys.sh runs TWICE. Every local channel is an x402 channel,
+# a peering is two of them, and each is opened by its own payer's RUNNING node
+# (ADR 0075): the second call sends each end of every peering a signed
+# `POST /peers`, tops the payer's channel up with `POST /channels/:id/fund`,
+# writes the forwarding routes with `POST /routes/peers`, and reads every
+# channel back off its chain, failing this target if the chain disagrees. It
+# is a no-op on `solo`, which has no peering.
+local-up: local-preflight local-build solana-build
 	@test -n "$(LOCAL_NODES)" || { \
 		echo "ERROR: LOCAL_TOPOLOGY='$(LOCAL_TOPOLOGY)' has no LOCAL_NODES_ entry in this Makefile."; \
 		echo "       Known topologies: solo two-hop mixed-chain onion dealing."; \
@@ -272,9 +264,9 @@ local-up: local-preflight contracts-libs local-build solana-build
 		echo "         'address already in use'  -- something else already holds 8545 or"; \
 		echo "                                      8899. 'ss -tlnp | grep 8545' names it."; \
 		echo "         'is unhealthy'            -- the container started but never passed"; \
-		echo "                                      its gate. anvil's gate is 'the"; \
-		echo "                                      TokenNetworkRegistry has code', so an"; \
-		echo "                                      unhealthy anvil is a failed deploy."; \
+		echo "                                      its gate. anvil's gate is 'the seed's"; \
+		echo "                                      last contract has code', so an"; \
+		echo "                                      unhealthy anvil is a failed seed."; \
 		echo "       Whatever did start is still running; 'make local-down' clears it."; \
 		anvil_log=$$($(LOCAL_COMPOSE) logs --no-color --no-log-prefix anvil 2>/dev/null \
 			| grep -vE '^(eth_|net_|web3_|anvil_|debug_|trace_|txpool_)' | tail -40); \
@@ -289,7 +281,7 @@ local-up: local-preflight contracts-libs local-build solana-build
 	cargo build --release -p connector
 	./local/keys.sh $(LOCAL_TOPOLOGY)
 	$(LOCAL_COMPOSE) up -d --wait $(LOCAL_NODES)
-	./local/keys.sh $(LOCAL_TOPOLOGY) solana-channels
+	./local/keys.sh $(LOCAL_TOPOLOGY) channels
 
 # Is this machine's one local stack free for this topology to take? Run as the
 # FIRST prerequisite of `local-up`, and separately of `local-verify`, so a

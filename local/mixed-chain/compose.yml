@@ -17,8 +17,10 @@
 # and the money changes chain at B. Nothing in this repository covers that
 # shape: `two_ledgers_never_merge.rs` proves the two backends stay separate
 # in-process, `local/solo` boots one node with both attached, and
-# `two_connectors_peer.rs` peers two nodes on EVM -- none of them has a second
-# node on the far side of the OTHER chain.
+# `peering_from_a_url.rs` and `solana_peering_from_a_url.rs` each peer two
+# nodes on ONE chain -- none of them has a second node on the far side of the
+# OTHER chain. Both peerings are x402 ones, established by `local/keys.sh
+# mixed-chain channels` once the nodes are serving (ADR 0075).
 #
 # The CARRIAGE line under the arrows is issue #1155, and it needs no service of
 # its own: BTP rides the listener `client_edge_addr` already binds, on
@@ -155,39 +157,28 @@ services:
   # Its own profile so `up` never starts it: a one-shot that exits 0 or 1, run
   # by `make local-rehearse` via `docker compose run --rm`.
   #
-  # TWO packets, and NOT for the reason they used to be. This topology was
-  # postpay: the claim covering crossing n was signed after it fulfilled and
-  # rode crossing n + 1, so one packet proved delivery and could say nothing at
-  # all about payment. That model is deleted (issue #1145) and both legs now
-  # cover each PREPARE before it is sent, so crossing 1 is already paid for.
+  # First the chains: each peering's payer channel is read off the contract or
+  # program it lives in -- A's toward B off `x402BatchSettlement` on anvil, B's
+  # toward C off `payment-channels` on the validator -- and must still hold
+  # the collateral keys.sh topped it up to, before anything is sent.
   #
-  # The second crossing still earns its place, for `local/two-hop`'s reason
-  # instead (issue #1102): a covering payer asks its payee where its claims
-  # stand on every packet, and a payee answering out of the wrong book reports
-  # nonce 0 forever -- accepted every time, advancing nothing. One crossing
-  # cannot see that. Two can.
+  # TWO packets, for `local/two-hop`'s reason (issue #1102): a covering payer
+  # asks its payee where its watermark stands on every packet, and a payee
+  # answering out of the wrong book reports zero forever -- accepted every
+  # time, advancing nothing. One crossing cannot see that. Two can.
   #
-  # Then BOTH journals are read, and that pair is the whole topology in two
-  # greps: an EVM `channel_id` accepted at B, and a base58 Solana
-  # `channel_account` accepted at C. A packet that reached the app while either
-  # journal stayed empty crossed a chain boundary for free, and
-  # `--expect-fulfill` could not have noticed -- a peer claim's verdict rides
-  # back in `Toon-Claim-Ack` and never gates the packet.
+  # Then BOTH journals are read, and that pair is the whole topology: an EVM
+  # voucher channel at B advancing 1100 per crossing, a Solana one at C
+  # advancing 1050. The difference is B's flat fee, measured on a running
+  # image -- a fee back at zero, or doubled, moves one of those two numbers
+  # while fulfilling every packet regardless. A packet that reached the app
+  # while either journal stayed short crossed a chain boundary for free, and
+  # `--expect-fulfill` could not have noticed: a voucher's verdict rides back
+  # in the ack and never gates the packet.
   #
-  # Since issue #1155 the first of those two greps says one more thing, for
-  # free. B's `peer_expose = "btp"` mounts NO ILP-over-HTTP peer carriage at
-  # all, so a claim in B's peer journal cannot have arrived on an HTTP request
-  # -- there is nothing there to accept one, and an A that fell back to
-  # `POST /ilp` would be admitted as an ordinary client whose claims never
-  # reach the peer book (§1.8). An accepted peer claim at B is therefore
-  # evidence the packet was carried over a BTP frame, not merely that it
-  # arrived.
-  #
-  # Around those, one on-chain read: the Solana channel account exists and
-  # belongs to the payment-channel program. A journal grep proves a claim was
-  # ACCEPTED, which is a signature check against a configured key and reads no
-  # chain -- so it stays green against a channel nobody ever opened, which is
-  # exactly what this topology used to ship.
+  # And a packet that reached C's app at all arrived in the PEER role on the
+  # Solana leg: C's route is pinned to BTP and B pays C over HTTP
+  # (connector-c.toml).
   sender:
     image: connector-rust:local
     profiles: [sender]
@@ -195,93 +186,23 @@ services:
     command:
       - |
         set -e
-
-        # The Solana peering's channel, BEFORE anything is sent. Nothing on the
-        # peer path reads a chain -- `ClaimBook` checks a claim's signature
-        # against the configured `counterparty_key` and nothing else (CF-23) --
-        # so a topology whose channel account was never opened rehearses
-        # exactly as green as one whose channel is real, journal grep included.
-        # This is the one check that can tell them apart, and it runs first so
-        # the failure names the missing channel rather than a puzzling claim.
-        #
-        # Existence and owner establish the address is a real account of the
-        # payment-channel program: it is a PDA
-        # `find_program_address(["channel", min, max, mint])` produces, and only
-        # the program itself can create an account at its own derived address.
-        # `local/keys.sh <topology> solana-channels` opens it and checks the
-        # participants, mint and status; this checks that the thing it opened
-        # is still there when the packet flies.
-        #
-        # And that it still holds B's COLLATERAL, which is the second half and
-        # the newer one. An open channel with a zero deposit is a channel whose
-        # claims are cryptographically perfect and worth nothing, and it looks
-        # identical from the peer path and from both journals -- the Solana leg
-        # of this topology shipped exactly that until `fund` became a
-        # self-deposit (issue #1118) and `local/keys.sh` started using it. The
-        # figure comes off the program's own account rather than out of a log
-        # line, for the same reason the owner does.
-        #
-        # `deposit_b` (offset 112, `packages/solana-program/src/state.rs`) and
-        # not `deposit_a`, because a channel is two-sided: `ClaimFromChannel`
-        # bounds a claim by the CLAIMER's own deposit, and B is the payer here
-        # -- B signs the claims, so B's own side is the one that has to be
-        # funded. Which slot B holds is decided by the 32-byte sort the PDA is
-        # derived from, and B's key sorts after C's, so B is participant_b.
-        # That constant cannot pass by accident if the topology's Solana
-        # indices ever change the order: it would read C's side, which nothing
-        # here funds, and report zero.
-        #
-        # `commitment: confirmed`, named rather than defaulted, and load-bearing:
-        # getAccountInfo defaults to FINALIZED, which a channel opened seconds
-        # ago by `make local-up` is not yet -- so the default made this fail on
-        # a good topology and pass a minute later. Confirmed is also the level
-        # the Solana backend itself reads and writes at
-        # (`CommitmentConfig::confirmed()`), so this sees exactly what the node
-        # that opened it sees.
-        #
-        # `content-type: application/json` likewise: busybox wget sends
-        # `application/x-www-form-urlencoded` for a --post-data body, and the
-        # validator answers that with 415.
-        channel_open() {
-          if ! wget -q -O - --header 'content-type: application/json' \
-              --post-data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$$1\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]}" \
-              http://solana-validator:8899 >/tmp/channel.json; then
-            echo "NO CHANNEL: getAccountInfo for $$1 failed against the local validator." >&2
-            exit 1
-          fi
-          if ! grep -q "\"owner\":\"$$2\"" /tmp/channel.json; then
-            echo "NO CHANNEL: $$1 is not an account of the payment-channel program $$2 on the local validator." >&2
-            echo "            The Solana peering's claims would name a channel nobody could redeem." >&2
-            exit 1
-          fi
-          echo "--- the Solana peering's channel $$1 is live on chain, owned by $$2"
-
-          # The account's own bytes: base64 out of the JSON, then the u64 at
-          # $$3. busybox `od -tu8` reads it little-endian, which is the layout
-          # a Solana account is written in.
-          sed 's/.*"data":\["\([^"]*\)".*/\1/' /tmp/channel.json | base64 -d >/tmp/channel.bin
-          held=$$(od -An -tu8 -j"$$3" -N8 /tmp/channel.bin | tr -d ' ')
-          if [ -z "$$held" ] || [ "$$held" -lt "$$4" ]; then
-            echo "NO COLLATERAL: $$1 holds $$held base units at deposit offset $$3, not the $$4 the payer deposited." >&2
-            echo "               A claim against an unfunded channel is a signature, not a payment: the" >&2
-            echo "               program's ClaimFromChannel bounds a claim by the claimer's OWN deposit," >&2
-            echo "               so every claim this peering signs would be refused on redemption." >&2
-            echo "               'local/keys.sh mixed-chain solana-channels' is what deposits it." >&2
-            exit 1
-          fi
-          echo "--- it holds $$held base units of B's own collateral, at least the $$4 provisioning deposited"
-        }
-        channel_open G5mXQzfZb4tXWX7cQvXP9ZJnDBcUo6irWTmGGtX3xpzL HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR 112 100000000
-
+        . /app/rehearsal.sh
         # 1200 is this path's COST (`CONTEXT.md`), and equals A's own
         # client-edge `price`: A's fee of 100 plus B's fee of 50 plus the 1050
         # that reaches C's unpriced termination (issue #1144). Each hop takes a
         # FLAT number of base units and forwards the rest, so 1200 leaves the
         # sender, 1100 crosses the chain boundary and 1050 is delivered.
-        # `local_topologies_load.rs` holds this figure and the three committed
-        # configs to that one arithmetic -- nothing in this container can see a
-        # fee quietly dropped back to zero, because both journals below stay
-        # exactly as green when it is.
+        # `local_topologies_load.rs` holds these figures to keys.sh's table and
+        # C's committed price.
+        AMOUNT=1200
+        OWED_AT_B=1100
+        OWED_AT_C=1050
+        CROSSINGS=2
+        DEPOSIT=100000000
+        A_B=$$(peering_key a-b)
+        B_C=$$(peering_key b-c)
+        channel_holds "$$A_B" "$$DEPOSIT" a-b
+        channel_holds "$$B_C" "$$DEPOSIT" b-c
         send() {
           /usr/local/bin/connector send \
             --operator     http://connector-a:3000 \
@@ -289,67 +210,41 @@ services:
             --to           g.local.mixed.b.c.app \
             --seal-to      http://connector-c:3000/ilp \
             --target       / \
-            --amount       1200 \
+            --amount       "$$AMOUNT" \
             --body         /app/data/payload.json \
             --expect-fulfill
         }
-        echo '--- crossing 1: A -> B (EVM peering) -> C (Solana peering) -> the app'
+        echo '--- crossing 1: A -> B (EVM peering, BTP) -> C (Solana peering, HTTP) -> the app'
         send
         echo '--- crossing 2: a second covered crossing on BOTH peerings (issue #1102)'
         send
-
-        # $$1 state dir, $$2 channel, $$3 label, $$4 what ONE crossing must
-        # advance that channel by.
-        #
-        # The advance, not merely the existence of a claim, and that is new
-        # since issue #1145. This check could not ask for a figure while the
-        # legs were POSTPAY: the claim covering crossing n rode crossing
-        # n + 1, so after N crossings a journal legitimately held N - 1
-        # claims and the last crossing was unpaid by construction. Both legs
-        # cover before they send now, so N crossings owe exactly N advances
-        # and the arithmetic is checkable.
-        #
-        # What it catches that a grep cannot: a fee quietly changed on one
-        # hop. A hop covers `amount_after_fee(amount, fee)`, so B's fee is
-        # visibly the difference between the two figures below -- 1100
-        # accepted at B, 1050 accepted at C -- and a fee back at zero, or
-        # doubled, moves one of them while leaving both journals as green as
-        # ever. `local_topologies_load.rs` holds the committed configs to the
-        # same arithmetic from the other side; this is the running image's
-        # half of it.
-        #
-        # The last line for the channel is the highest cumulative: a claim
-        # book only ever advances, and only the highest-nonce claim is ever
-        # redeemable.
-        paid() {
-          if ! grep -q "$$2" "$$1/peer-claims.log" 2>/dev/null; then
-            echo "NOT PAID: $$3 records no accepted claim on $$2." >&2
-            cat "$$1/peer-claims.log" >&2 || echo '(the journal does not exist)' >&2
-            exit 1
-          fi
-          accepted=$$(grep -c "$$2" "$$1/peer-claims.log")
-          cumulative=$$(grep "$$2" "$$1/peer-claims.log" | tail -1 | cut -f4)
-          expected=$$((accepted * $$4))
-          if [ "$$cumulative" != "$$expected" ]; then
-            echo "UNDERPAID: $$3 accepted $$accepted claims on $$2 totalling $$cumulative," >&2
-            echo "           not the $$expected that $$accepted crossings at $$4 each owe it." >&2
-            echo "           Every hop covers amount_after_fee(amount, fee) BEFORE it sends" >&2
-            echo "           (ADR 0042), so a mismatch here is a fee that moved on one hop" >&2
-            echo "           without the committed figures moving with it." >&2
-            grep "$$2" "$$1/peer-claims.log" >&2
-            exit 1
-          fi
-          echo "--- $$3 accepted $$accepted claims on $$2, cumulative $$cumulative ($$4 per crossing)"
-        }
+        # The a-b leg's PEER-ROLE PROOF: B's own route, pinned to the carriage A
+        # does not pay B over (connector-b.toml). A client is refused it and a
+        # peer is not, so reaching this app says A's channel is bound to the
+        # peering -- the channel every voucher B's journal holds arrived on.
+        echo '--- crossing 3: A -> B only, to the route B pins against clients'
+        /usr/local/bin/connector send \
+          --operator     http://connector-a:3000 \
+          --operator-key /app/data/operator-send.key \
+          --to           g.local.mixed.b.app \
+          --seal-to      http://connector-b:3000/ilp \
+          --target       / \
+          --amount       "$$AMOUNT" \
+          --body         /app/data/payload.json \
+          --expect-fulfill
         # 1200 leaves the sender; A keeps 100 and covers B for 1100; B keeps
         # 50 and covers C for 1050. Two hops, two flat fees, one packet.
-        paid /app/b-state 0x221b5e73fba2099b690a94e668d575a75d136c249795f5b20146bf7d0403e423 "B (EVM)" 1100
-        paid /app/c-state G5mXQzfZb4tXWX7cQvXP9ZJnDBcUo6irWTmGGtX3xpzL "C (Solana)" 1050
+        paid /app/b-state "$$A_B" "B (EVM)" "$$((CROSSINGS + 1))" "$$OWED_AT_B"
+        paid /app/c-state "$$B_C" "C (Solana)" "$$CROSSINGS" "$$OWED_AT_C"
+        echo "--- both peerings paid for every crossing: $$OWED_AT_B at B, $$OWED_AT_C at C"
     volumes:
       # A's keys: the sender signs the operator write with A's allowlisted key
       # and posts the fixture body from the same directory.
       - ./local/.keys/mixed-chain/connector-a:/app/data:ro
-      # The two payees' state volumes, READ-ONLY, purely to read their claim
+      # The peerings keys.sh established on this run -- each one's channel key.
+      - ./local/.keys/mixed-chain/peerings:/app/peerings:ro
+      - ./local/rehearsal.sh:/app/rehearsal.sh:ro
+      # The two payees' state volumes, READ-ONLY, purely to read their voucher
       # journals. The sender runs as the same uid 10001 that wrote them.
       - mixed-chain-b-state:/app/b-state:ro
       - mixed-chain-c-state:/app/c-state:ro

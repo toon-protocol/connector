@@ -19,13 +19,14 @@
 #
 # So the pin is applied from the one place that HOLDS the pin: a git checkout,
 # where the submodule sha is a committed fact rather than a string somebody
-# retyped. The container's install stays as the last resort for a hand-run
-# `docker compose up`, and is pinned by revision there too (docker-compose.yml).
+# retyped. (The anvil container no longer compiles these contracts at all: it
+# places committed x402 bytecode, `infra/anvil/seed.sh`, ADR 0075 -- so the
+# host-side `forge build` is the only consumer left, until #1386 removes the
+# package.)
 #
 # This is a self-heal, not a gate. It is silent and cheap when the tree is
 # already correct (~20ms), and it declines rather than fails when there is no
-# git checkout to read a pin out of -- a source tarball has no submodule shas,
-# and the container's pinned fallback is what serves that case.
+# git checkout to read a pin out of -- a source tarball has no submodule shas.
 set -euo pipefail
 
 # The directory prefix this script is allowed to touch. Everything below --
@@ -35,14 +36,12 @@ readonly LIB_PREFIX="packages/contracts/lib/"
 
 if ! command -v git >/dev/null 2>&1; then
   echo "note: git is not on PATH, so $LIB_PREFIX cannot be pinned from the host."
-  echo "      The anvil container installs the same pinned revisions itself."
   exit 0
 fi
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
 if [ -z "$repo_root" ]; then
   echo "note: not a git checkout, so $LIB_PREFIX cannot be pinned from the host."
-  echo "      The anvil container installs the same pinned revisions itself."
   exit 0
 fi
 cd "$repo_root"
@@ -69,9 +68,7 @@ fi
 # with "destination path ... already exists and is not an empty directory",
 # naming neither forge nor the drift nor a way out. So the unregistered content
 # is removed first, loudly. It is disposable by construction -- a dependency
-# checkout, reinstalled below at the committed revision -- and removing it is
-# the same repair the anvil container's `install_lib` already performs on a
-# broken lib/ (docker-compose.yml).
+# checkout, reinstalled below at the committed revision.
 for path in "${lib_paths[@]}"; do
   status_line=$(git submodule status -- "$path" 2>/dev/null || true)
   case "$status_line" in

@@ -85,7 +85,7 @@ stale=$(docker volume ls -q --filter "label=com.docker.compose.project=$project"
 if [ -n "$stale" ]; then
   echo "ERROR: no '$project' containers are running, but its state volumes are still here:"
   sed 's/^/         /' <<<"$stale"
-  echo "       They hold the connectors' claim journals from a run that was killed rather"
+  echo "       They hold the connectors' voucher journals from a run that was killed rather"
   echo "       than torn down, and both local chains have wiped the history behind them."
   echo "       Reusing one makes the rehearsal's money assertion vacuous."
   echo ""

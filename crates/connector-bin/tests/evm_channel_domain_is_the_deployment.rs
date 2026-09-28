@@ -24,13 +24,12 @@
 //!    reason the declaration is kept and corroborated rather than derived
 //!    from the backend: a domain that exists only after an RPC dial cannot
 //!    be gate-checked here.
-//! 2. **`local/`'s domain is `local/`'s chain.** The local topologies are
-//!    run against a deterministic `anvil` whose committed state deploys the
-//!    `TokenNetwork` at a fixed address, recorded by
-//!    `packages/contracts/regen-anvil-state.sh`. Those configs hardcode that
-//!    address, and nothing held them to it -- a contract change that moved
-//!    it would have surfaced as `make local-verify` failing to boot, which
-//!    is a slow and confusing way to learn it.
+//!
+//! (It used to close a second part too: the `local/` topologies hardcoded the
+//! `TokenNetwork` their anvil deployed, and a test here held them to it. No
+//! local config declares a channel domain any more -- every local channel is
+//! an x402 channel, established by `POST /peers` (ADR 0075, issue #1383) --
+//! so that test asserted nothing and was deleted, as its own message asked.)
 //!
 //! Deliberately parsed as raw TOML rather than through `Config::load`: this
 //! is a drift gate over what the *files say*, it needs none of the key
@@ -45,30 +44,6 @@ use std::collections::BTreeSet;
 /// forgets its own test still has to touch this one.
 const EVERY_CONFIG: &[(&str, &str)] = &[
     (
-        "local/solo/connector.toml",
-        include_str!("../../../local/solo/connector.toml"),
-    ),
-    (
-        "local/two-hop/connector-a.toml",
-        include_str!("../../../local/two-hop/connector-a.toml"),
-    ),
-    (
-        "local/two-hop/connector-b.toml",
-        include_str!("../../../local/two-hop/connector-b.toml"),
-    ),
-    (
-        "local/mixed-chain/connector-a.toml",
-        include_str!("../../../local/mixed-chain/connector-a.toml"),
-    ),
-    (
-        "local/mixed-chain/connector-b.toml",
-        include_str!("../../../local/mixed-chain/connector-b.toml"),
-    ),
-    (
-        "local/mixed-chain/connector-c.toml",
-        include_str!("../../../local/mixed-chain/connector-c.toml"),
-    ),
-    (
         "infra/linode-relay/connector-rust.toml",
         include_str!("../../../infra/linode-relay/connector-rust.toml"),
     ),
@@ -77,15 +52,6 @@ const EVERY_CONFIG: &[(&str, &str)] = &[
         include_str!("../../../infra/linode-store/connector-rust.toml"),
     ),
 ];
-
-/// The chain compose `make local-up` merges every topology on top of -- the
-/// one place the local `anvil`'s chain id is actually set.
-const ROOT_COMPOSE: &str = include_str!("../../../docker-compose.yml");
-
-/// The script that produces `packages/contracts/anvil-state.json`, and the
-/// only committed record of which addresses that deterministic deploy lands
-/// the contracts at.
-const REGEN_ANVIL_STATE: &str = include_str!("../../../packages/contracts/regen-anvil-state.sh");
 
 /// One declared EIP-712 domain, in the spelling a comparison can use: the
 /// address lowercased, because EIP-55 checksum casing is presentation and
@@ -155,86 +121,4 @@ fn no_committed_config_declares_two_evm_domains() {
             distinct.len()
         );
     }
-}
-
-/// The chain id `docker-compose.yml` starts the local `anvil` with.
-fn local_chain_id() -> i64 {
-    let marker = "--chain-id ";
-    let index = ROOT_COMPOSE
-        .find(marker)
-        .expect("docker-compose.yml's anvil service must still pass --chain-id");
-    let rest = &ROOT_COMPOSE[index + marker.len()..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end]
-        .parse()
-        .expect("--chain-id is followed by a decimal chain id")
-}
-
-/// The `TokenNetwork` the committed anvil state's deterministic deploy lands
-/// at, as `regen-anvil-state.sh` records it.
-fn local_token_network() -> String {
-    let marker = "#   TokenNetwork (USDC)";
-    let index = REGEN_ANVIL_STATE.find(marker).expect(
-        "packages/contracts/regen-anvil-state.sh must still record the deterministic \
-         TokenNetwork address -- it is the only committed statement of what the local chain \
-         actually deploys, and this gate is worthless without it",
-    );
-    let rest = &REGEN_ANVIL_STATE[index + marker.len()..];
-    let line = rest
-        .lines()
-        .next()
-        .expect("a recorded address is on a line");
-    line.trim().to_lowercase()
-}
-
-/// The local topologies hardcode the `TokenNetwork` their `anvil` deploys,
-/// because `[settlement.evm]` names only the registry and nothing in a
-/// config file can name the resolved contract. Since #1136 a node refuses to
-/// start when those two disagree, so a contract change that moved the
-/// deterministic address would take `make local-verify` down at boot. This
-/// catches it in the workspace gate instead, where the change that moved it
-/// is still on screen.
-#[test]
-fn every_local_config_declares_the_domain_its_anvil_actually_deploys() {
-    let chain_id = local_chain_id();
-    let token_network = local_token_network();
-    assert!(
-        token_network.starts_with("0x") && token_network.len() == 42,
-        "the recorded local TokenNetwork `{token_network}` is not a 20-byte hex address -- \
-         regen-anvil-state.sh's comment block changed shape and this gate stopped reading it"
-    );
-
-    let mut checked = 0;
-    for (name, raw) in EVERY_CONFIG {
-        if !name.starts_with("local/") {
-            continue;
-        }
-        for domain in declared_domains(name, raw) {
-            assert_eq!(
-                domain.chain_id, chain_id,
-                "{name}'s {} declares chain id {}, but docker-compose.yml starts the local anvil \
-                 with --chain-id {chain_id}. A claim signed under the wrong chain id recovers to \
-                 a different address, and this node now refuses to boot rather than accept one \
-                 (issue #1136)",
-                domain.site, domain.chain_id
-            );
-            assert_eq!(
-                domain.token_network, token_network,
-                "{name}'s {} declares TokenNetwork {}, but the committed anvil state deploys it \
-                 at {token_network} (packages/contracts/regen-anvil-state.sh). This node would \
-                 verify peer and client claims under a contract it does not settle through, so \
-                 it refuses to boot (issue #1136) -- update the config, or regenerate the state \
-                 and its recorded addresses together",
-                domain.site, domain.token_network
-            );
-            checked += 1;
-        }
-    }
-    assert!(
-        checked > 0,
-        "no local config declared an EVM domain, so this gate asserted nothing -- if the local \
-         topologies stopped declaring one, delete this test rather than leaving it green"
-    );
 }

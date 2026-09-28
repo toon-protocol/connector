@@ -36,11 +36,12 @@ again; recreating it from this directory would not be a restoration.
 Two deterministic mock tokens belonged to that box and **do not exist on any
 live chain**: the anvil `MockERC20` USDC `0x5FbDB2315678afecb367f032d93F642f64180aa3`
 (with `TokenNetworkRegistry` `0xe7f1725E…`) and the Solana mock USDC SPL mint
-`H8HSreUF2s8r8hem4qMttE3bWYCpFuh71jbuos5bA77H`. Both addresses are still correct
-for the **local** disposable chains (`docker-compose.yml`, `local/`), which
-reproduce them from genesis on every run — that is a different thing at the same
+`H8HSreUF2s8r8hem4qMttE3bWYCpFuh71jbuos5bA77H`. The Solana one is still correct
+for the **local** disposable validator (`docker-compose.yml`, `local/`), which
+reproduces it from genesis on every run — a different thing at the same
 address, and `infra/solana/usdc-authority.json` is the authority for the local
-mint only.
+mint only. The local anvil no longer deploys the `MockERC20` at all: since #1383
+it holds Circle's FiatToken v2.2 as USDC at `0xe7f1725E…` (`infra/anvil/seed.sh`).
 
 ## What survives: `endpoints.json`
 

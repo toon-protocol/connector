@@ -336,15 +336,15 @@ fn the_repository_names_a_solana_program_id_in_exactly_the_known_places() {
         "infra/linode-store/connector-rust.toml",
         "infra/linode/endpoints.json",
         "infra/solana/entrypoint.sh",
-        // The two topologies that put a node on the validator: `mixed-chain`
-        // crosses a chain without crossing a denomination, and `dealing`
-        // (ADR 0071) crosses both. Each names the disposable validator's
-        // genesis id, never a deployed one.
-        "local/dealing/compose.yml",
+        // The configs that put a node on the local validator: `solo`,
+        // `mixed-chain` and `dealing` (ADR 0071). Each names the disposable
+        // validator's genesis id, never a deployed one -- and only because
+        // `[settlement.solana] program_id` is still a boot requirement
+        // (#1385). No local channel lives on it: every one is a
+        // `payment-channels` channel (ADR 0075), so neither `local/keys.sh`
+        // nor any rehearsal names TOON's program any more (#1383).
         "local/dealing/connector-b.toml",
         "local/dealing/connector-c.toml",
-        "local/keys.sh",
-        "local/mixed-chain/compose.yml",
         "local/mixed-chain/connector-b.toml",
         "local/mixed-chain/connector-c.toml",
         "local/solo/connector.toml",
@@ -411,7 +411,6 @@ fn the_fleet_and_the_wire_contract_name_the_deployed_devnet_program() {
 fn the_local_topologies_name_only_the_disposable_validators_program() {
     for (name, raw) in [
         ("infra/solana/entrypoint.sh", VALIDATOR_ENTRYPOINT),
-        ("local/keys.sh", LOCAL_KEYS),
         ("local/solo/connector.toml", LOCAL_SOLO),
         ("local/mixed-chain/connector-b.toml", LOCAL_MIXED_B),
         ("local/mixed-chain/connector-c.toml", LOCAL_MIXED_C),
@@ -425,15 +424,18 @@ fn the_local_topologies_name_only_the_disposable_validators_program() {
              a program that does not exist on its chain."
         );
     }
-    assert!(
-        LOCAL_MIXED_COMPOSE.contains(LOCAL_TEST_PROGRAM_ID)
-            && !LOCAL_MIXED_COMPOSE.contains(DEVNET_PUBLIC_PROGRAM_ID),
-        "local/mixed-chain/compose.yml's channel_open call must pass {LOCAL_TEST_PROGRAM_ID}. It \
-         passes the program positionally rather than as `program_id = …`, so the walk's value \
-         check cannot read it -- this is the assertion that covers it, and \
-         the_repository_names_a_solana_program_id_in_exactly_the_known_places is what notices if \
-         the literal stops being there at all."
-    );
+    // Neither the provisioning script nor a rehearsal names a TOON program:
+    // the local channels are `payment-channels` ones (ADR 0075, #1383), and
+    // a TOON id reappearing there would be a TOON channel coming back.
+    for (name, raw) in [
+        ("local/keys.sh", LOCAL_KEYS),
+        ("local/mixed-chain/compose.yml", LOCAL_MIXED_COMPOSE),
+    ] {
+        assert!(
+            !raw.contains(LOCAL_TEST_PROGRAM_ID) && !raw.contains(DEVNET_PUBLIC_PROGRAM_ID),
+            "{name} names TOON's payment-channel program, but no local channel lives on it"
+        );
+    }
 }
 
 #[test]

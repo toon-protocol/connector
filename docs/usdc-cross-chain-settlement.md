@@ -12,8 +12,10 @@
 > **deleted** — the devnet now settles on public chains (Base Sepolia, public
 > Solana devnet); see
 > [`infra/linode/endpoints.json`](../infra/linode/endpoints.json) for live
-> values. The addresses below remain valid for the **local** docker-compose
-> chains only.
+> values. The Solana mint below remains valid for the **local** docker-compose
+> validator only. The EVM `MockERC20` does not: since #1383 (ADR 0075) the local
+> anvil holds Circle's FiatToken v2.2 as USDC at `0xe7f1725E…` instead
+> (`infra/anvil/seed.sh`).
 > Driver: make the shared devnet (and protocol) settle **USDC** on every supported
 > chain — EVM, Solana, **and Mina** — with one canonical decimal scale.
 

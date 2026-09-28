@@ -37,12 +37,13 @@ need() {
 # `signer.key` is random: it is this node's edge identity for the run and
 # nothing outside the run refers to it. `settlement.key` is anvil account 3 --
 # it must be an account the local chain funded, because the connector reads
-# chain state through it. The payer is account 0, which is the one anvil's
-# default mnemonic funds with mock USDC.
+# chain state through it. The payer is account 0, whose USDC `up` MINTS once
+# anvil is seeded: the local USDC is Circle's FiatToken v2.2, whose minter is
+# anvil's account 1 (`infra/anvil/seed.sh`) -- minted on demand, never dripped.
 #
 # THAT LITERAL IS PUBLIC and every local chain ships with it -- it is anvil's
-# well-known default mnemonic, the same class of value `packages/contracts/script/DeployLocal.s.sol`
-# already writes in the clear for its deployer key. It is fine here and
+# well-known default mnemonic, the same class of value `infra/anvil/seed.sh` already
+# writes in the clear for its deployer and minter keys. It is fine here and
 # nowhere else. The generated files it lands in are written to
 # `local/.keys/`, which is gitignored (ADR 0012), so nothing key-shaped is
 # ever tracked.
@@ -105,6 +106,13 @@ up)
   chmod 644 "$KEYS/connector.toml"
 
   dc up -d --wait stub-app connector
+
+  # The payer's USDC, minted by the token's minter (anvil account 1) to the
+  # payer (account 0): 1000 USDC, 6 decimals.
+  docker exec "$(dc ps -q anvil)" cast send --rpc-url http://localhost:8545 \
+    --private-key 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d \
+    0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 'mint(address,uint256)' \
+    0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 1000000000 >/dev/null
   echo "--- up. The connector publishes no host port; the circuit is the only way in."
   ;;
 

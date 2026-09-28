@@ -8,228 +8,87 @@
 # topology is FOR is the middle: ONE node holding two settlement backends and a
 # peering on each, so a packet crosses a chain boundary between two hops.
 #
-# It is NOT a conversion, and what makes it one has changed. It used to be
-# exile: the connector had no exchange rate at all, ADR 0010 having replaced
-# the spread with a flat per-packet fee, and value conversion was the `swap`
-# repository's job. ADR 0071 ended that -- crossing a denomination is core
-# forwarding now -- and what keeps this path unconverted is the ABSENCE RULE
-# (decision 2): no config here declares `[[tokens]]`, so no hop resolves a
-# token for either of its peerings, no hop sits on a boundary, and every one of
-# them runs byte for byte the code it ran before the record. Both legs hold the
-# same 6-decimal mock USDC anyway, so there is nothing here to convert.
+# It is NOT a conversion. What keeps this path unconverted is ADR 0071's
+# ABSENCE RULE (decision 2): no config here declares `[[tokens]]`, so no hop
+# resolves a token for either of its peerings, no hop sits on a boundary, and
+# every one of them runs the code it ran before the record. Both legs hold
+# 6-decimal USDC anyway, so there is nothing here to convert.
 #
 # Every amount on this path is therefore the same 6-decimal USDC-shaped
 # integer, and the only thing that ever changes it between hops is a hop
-# subtracting its own FLAT fee (issue #1144): 1200 in, 1100 across the boundary,
-# 1050 delivered -- each step a fixed number of base units, never a rate applied
-# to what arrived. What differs between the legs is which chain each peering's
-# claims are written against. `local/dealing` is the same three-node shape with
+# subtracting its own FLAT fee (issue #1144): 1200 in, 1100 across the
+# boundary, 1050 delivered. `local/dealing` is the same three-node shape with
 # the middle node dealing, and the difference between the two directories is
 # exactly the `[[tokens]]` and `[[rates]]` blocks this one does not have.
 #
 # A's role in that is to be the ordinary end: one chain, one peering, no idea
-# that the hop after B is on a different one. Routing does not carry chain, and
-# a hop that had to know would be a hop that could disagree.
+# that the hop after B is on a different one. It is also the one node in this
+# repository whose peering rides BTP: B publishes a `btp_endpoint`, `POST
+# /peers` prefers BTP wherever a node publishes both, and B exposes nothing
+# else to a peer -- so `a-b` is a `ws://` peering while `b-c` is `http://`, and
+# the packet B forwards arrived over a different wire than the one it leaves
+# on (issue #1155).
 #
-# Since issue #1155 A is also the ordinary end in a SECOND sense: it is the
-# first node in this repository whose peering rides BTP. `a-b` is a `ws://`
-# peering and `b-c` is still `http://`, so this topology is mixed-CARRIAGE as
-# well as mixed-chain, and the packet B forwards arrived over a different wire
-# than the one it leaves on. That is the property `CONTEXT.md` asserts and
-# nothing here could previously show: below the transport port there is one
-# pipeline, and a PREPARE that arrived over BTP is indistinguishable from one
-# that arrived over HTTP.
+# ── The peering is not in this file ──────────────────────────────────────────
+#
+# ADR 0075: a peering is two one-way x402 channels, each opened by its own
+# payer, and it is established from a URL by a signed `POST /peers` on each
+# end (see `local/two-hop/connector-a.toml` for the long version). `local/keys.sh
+# mixed-chain channels` makes those writes, and it holds this path's peering
+# figures in its topology table: `a-b`'s fee of 100, and A's forwarding route
+# `g.local.mixed.b` at price 1200.
+#
+#     A collects 1200, retains 100, forwards 1100
+#     B collects 1100, retains  50, forwards 1050 to C's unpriced termination
+#
+# `local_topologies_load.rs` holds that table, C's committed price and the
+# rehearsal's figures to the one sum.
 # =============================================================================
 
 client_edge_addr = "0.0.0.0:3000"
 
-# The peer claim ledger's home (issue #605).
+# Where this node's outbound channel and its vouchers are journaled (ADR 0075
+# decision 8) and the runtime peering row is kept.
 state_dir = "/app/state"
 
 # Issue #678, gap 3. B is a plain container port with no TLS terminator in
-# front of it. Node-wide and default false (CF-18); every deployed config
-# leaves it unset, and a node that sets it logs a WARN naming every plaintext
-# peering at startup.
-#
-# It covers BOTH plaintext schemes and always did: `Config::plaintext_peerings`
-# matches `ws` and `http` alike, and `ws://` is exactly as plaintext as
-# `http://` -- a websocket that was never wrapped in TLS carries every claim
-# and packet in the clear. Since issue #1155 this node's peering is
-# a `ws://` one, so the WARN this switch produces at startup names
-# `a-b` at `ws://connector-b:3000/ilp/btp` rather than an `http://` URL.
-# It also still allows the `http://` `client_edge_url` further down, which is
-# checked by its own rule (`resolve_client_edge_url`) and is a different URL
-# reached over plain HTTP -- see that block.
+# front of it. Node-wide and default false (CF-18); it covers both plaintext
+# schemes -- `ws://` is exactly as plaintext as `http://` -- so it allows the
+# `ws://connector-b:3000/ilp/btp` carriage, B's `http://` self-description and
+# the `http://` claim-state ask alike.
 peer_allow_plaintext_endpoints = true
 
 [signer]
 key_file = "/app/data/signer.key"
 
-# ── The only path onward ─────────────────────────────────────────────────────
-# `g.local.mixed.b` is B's own subtree; the destination the rehearsal sends to
-# is `g.local.mixed.b.c.app`, three labels deeper. Longest-prefix matching does
-# the rest, and each hop's route is a prefix of the next hop's -- which is what
-# makes the address itself say where the packet went.
-#
-# A fee of zero was forced by how the packet is originated, not by the
-# peering: `POST /packets` passed `minimum_delivery = prepare.amount`, so
-# `amount_after_fee` refused any hop that would discount it. That lockout is
-# retired (ADR 0057, issue #1143) and every forwarding hop here now charges
-# (issue #1144). The fee itself lives on the `[[peers]]` row, not here (ADR
-# 0061). See `local/two-hop/connector-a.toml` for the longer note on where
-# each number lives; what is specific to this path is the arithmetic:
-#
-#     A collects 1200, retains 100, forwards 1100   <- this file
-#     B collects 1100, retains  50, forwards 1050   <- connector-b.toml
-#     C terminates the 1050, unpriced               <- connector-c.toml
-#
-# The two fees DIFFER on purpose. A fee is bilateral configuration for one
-# peering relation (ADR 0010, ADR 0061), not a network-wide constant, and two
-# identical figures on a three-node path cannot tell a hop charging its own fee
-# from a hop charging the one it was handed. That they vary by NODE and never
-# by prefix is exactly why each one is written on a `[[peers]]` row.
-#
-# The invariant that makes a path add up -- every hop's `price - fee` is at
-# least the next hop's `price` -- is documented (ADR 0028, "Consequences") and
-# ENFORCED BY NOTHING: a connector cannot know what the next hop charges. So
-# it is true here by construction, 1200 - 100 == 1100 and 1100 - 50 >= 0, and
-# `local_topologies_load.rs` is what holds it that way.
-#
-# 1200 is also what the rehearsal sends, which is this path's COST
-# (`CONTEXT.md`): the fees of every hop that carries the packet plus what the
-# route terminating it is paid. C's route is `price = 0` by choice rather than
-# by constraint -- pricing a peer termination is what `local/two-hop` exists to
-# prove, see that file -- so what the last leg is actually paid is the 1050
-# forwarded to it, and that is the figure this path delivers.
-[[routes]]
-prefix = "g.local.mixed.b"
-peer_id = "a-b"
-price = 1200
-
-# ── The carriage: BTP, and the first one in this repository ──────────────────
-# THE SCHEME IS THE CARRIAGE, AND NOTHING ELSE IS (peer-carriage-spec.md §2.1).
-# `ws://` selects `connector-peer-btp`; `http://` would select
-# `connector-peer-http`. There is no `carriage = ...` key and there must not be
-# one: `Config::load` reads the scheme, `PeerRelation::from_config` filters on
-# the same answer, and `ConfiguredPeerTransport` is built from it -- one fact,
-# read once.
-#
-# The path matters as well as the scheme. BTP rides THIS NODE'S ORDINARY
-# LISTENER (CF-17): B's `client_edge_addr` binds one port, `POST /ilp` serves
-# ILP-over-HTTP and `GET /ilp/btp` serves the websocket upgrade, and role is
-# decided by the covering claim the frame carries rather than by which port it
-# arrived on (§1.2, §1.3). So this change added no port, no service and no dependency to
-# `compose.yml`: A reaches B on the container port 3000 it always did, and
-# `POST /ilp/claim-state` further down still reaches the same listener.
-#
-# WHY THIS PEERING AND NOT ANOTHER (issue #1155). No shipped image had ever
-# carried a packet over BTP: all three topologies were ILP-over-HTTP, so
-# ADR 0027's first carriage was proven by `connector-peer-btp`'s in-process
-# suites and by nothing else. This is the peering worth spending on, because
-# it is the one whose arrival is FORWARDED THROUGH A GATE -- B's `a-b` row is
-# the only row in the repository where `forwarded_claim_enforcement` is turned
-# on (ADR 0042 item 3), so putting it on BTP proves the carriage moving a
-# covering claim through a gate that will refuse the packet without one, not
-# just moving bytes. `local/two-hop` stays on HTTP on purpose: it is the containerised
-# counterpart of `two_connectors_peer.rs` and already diverges from it in
-# exactly one deliberate place.
-#
-# WHAT DOES NOT CHANGE: everything above the transport port. The fee, the
-# route, the claim, the watermark and the answer are the same objects they
-# were on HTTP (spec I5), which is the whole point -- `b-c` below stays
-# `http://`, so ONE packet crosses both carriages and a hop's behaviour that
-# differed between them would show up here as a broken topology rather than as
-# a documented quirk.
-[[peers]]
-id = "a-b"
-endpoint = "ws://connector-b:3000/ilp/btp"
-# The 100 in the arithmetic above: what this node retains for carrying one
-# packet over this peering, flat and per packet (ADR 0010), and a property of
-# the counterparty rather than of any prefix routed to it (ADR 0061).
-fee = 100
-
-
-# The EVM half of the boundary. `counterparty_key` is B's EVM settlement
-# address; B's own file names A's. `channel_id` is a real channel on the local
-# anvil, opened and funded by `local/keys.sh`, which refuses to proceed if the
-# chain does not produce exactly this id.
-[[peer_channels]]
-peer_id = "a-b"
-channel_id = "0x221b5e73fba2099b690a94e668d575a75d136c249795f5b20146bf7d0403e423"
-counterparty_key = "0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f"
-chain_id = 31337
-token_network = "0xCafac3dD18aC6c6e92c921884f9E4176737C052c"
-
-# ── Paying for the crossing, BEFORE it crosses (ADR 0042 item 2) ─────────────
-# `[[pay_channels]]` makes this node cover the forwarded PREPARE with a
-# client-role claim before it is sent. It is REQUIRED here, not optional: this
-# node has a `[[routes]]` entry forwarding to `a-b`, and since issue #1145 a
-# peering a node forwards to with no row is refused at load by name
-# (`ConfigError::PayChannelUnbound`). There is nothing left to fall back to --
-# ADR 0004's postpay convention, where the claim covering crossing n rode
-# crossing n + 1, is deleted from the tree.
-#
-# ONE CHANNEL, TWO ROLES, WITH ONE HOP. This names the same `channel_id` the
-# `[[peer_channels]]` row above does, which `Config::load` permits on purpose
-# (`pay_channel.rs` calls it "the deployed shape"): the peer role for what
-# arrives, the client role for what this node sends. `local/keys.sh` opens and
-# funds that one channel on anvil, with A as the depositing participant --
-# which is the side that has to be collateralised, because A is the side
-# signing claims on it.
-#
-# Only the facts nothing can derive are written (ADR 0030's table): the SIGNING
-# KEY is `[settlement.evm]`'s, because the channel's on-chain participant IS
-# this node's settlement address; the NONCE AND CUMULATIVE AMOUNT are B's,
-# asked over `POST /ilp/claim-state` at `client_edge_url` on every covered
-# packet and never remembered; the CHANNEL ID and EIP-712 DOMAIN are the peer
-# row's own, because both roles sign against the very same on-chain channel.
-#
-# `client_edge_url` is B's `POST /ilp`, AND IT IS NOT THE URL THIS PEERING
-# DIALS -- since issue #1155 it visibly is not, because the peering dials
-# `ws://connector-b:3000/ilp/btp` and this is `http://connector-b:3000/ilp`.
-# `pay_channel.rs` has always said a peering's own endpoint "is not it: on a
-# `wss://` peering there is no HTTP URL there at all, and turning one into the
-# other by swapping scheme and appending a path is exactly the class of guess
-# ADR 0030 refuses for `btpEndpoint`". Until this peering moved to BTP the two
-# happened to be the same string in every committed config, which is the state
-# in which a derivation looks free; this is the first file where the claim-state
-# ask and the packet carriage genuinely part company, and the reason the key is
-# written out rather than computed.
-#
-# `http://` needs `peer_allow_plaintext_endpoints` above -- the same switch the
-# `ws://` endpoint needs, checked separately (`resolve_client_edge_url`) --
-# because the claim-state ask carries a signed EIP-712 challenge, a capability
-# to read this channel's state, in the clear.
-#
-# What this row buys the topology beyond paying for the crossing: it is what
-# lets B ENFORCE on the arrival. B's `a-b` row reads
-# `forwarded_claim_enforcement = "enforce"`, and a claim minted here for
-# `amount_after_fee(1200, 100)` is exactly the 1100 that arrives there.
-[[pay_channels]]
-peer_id = "a-b"
-channel_id = "0x221b5e73fba2099b690a94e668d575a75d136c249795f5b20146bf7d0403e423"
-chain_id = 31337
-token_network = "0xCafac3dD18aC6c6e92c921884f9E4176737C052c"
-client_edge_url = "http://connector-b:3000/ilp"
+# What A publishes at `GET /ilp` (ADR 0050): the document B's own
+# `POST /peers` reads to find A's voucher signer and bind A's channel.
+[node]
+addresses = ["g.local.mixed.a"]
+http_endpoint = "http://connector-a:3000/ilp"
 
 # ── Operator surface (ADR 0008) ──────────────────────────────────────────────
-# Only this node has one: `connector send` originates the rehearsal's packet
-# through `POST /packets` here, and nothing sends to B or C directly.
+# Both FILES, written by local/keys.sh: the bearer token gates reads, the
+# ed25519 PUBLIC-key allowlist gates every write -- keys.sh's `POST /peers`,
+# `POST /routes/peers` and `POST /channels/:id/fund`, and the rehearsal's
+# `POST /packets`.
 [operator]
 bearer_token_file = "/app/data/operator-bearer-token"
 write_keys_file = "/app/data/operator-write-keys"
 
 # ── Settlement: EVM only ─────────────────────────────────────────────────────
-# `contract_address` is the TokenNetworkRegistry, NOT the TokenNetwork the
-# peer channel above names (issue #576): `connect` resolves
-# `getTokenNetwork(token_address)` through the registry and refuses to start if
-# that comes back zero. The key here is also this node's peer-claim signing key
-# (ADR 0030), which is why its address is what B's `counterparty_key` names.
+# `local/solo/connector.toml` has why each value is what it is. The settlement
+# key signs A's vouchers (ADR 0075 decision 3), so its address is the voucher
+# signer A publishes and B binds.
 [settlement.evm]
 rpc_url = "http://anvil:8545"
-contract_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-token_address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+contract_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+token_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals = 6
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
+
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"

@@ -1,7 +1,12 @@
 ##=================== /etc/anon/anonrc -- local/onion, A's side ==============##
 #
-# The SOCKS5 proxy `connector-a` dials its onion peer through, and nothing
-# else. This daemon publishes no service and relays no traffic for anyone.
+# `connector-a`'s two ways across the network boundary, both over the onion
+# network: the SOCKS5 proxy A dials B through, and A's own hidden service,
+# which is how B reads A's self-description. A peering is established from
+# BOTH ends (ADR 0075 decision 4) -- B's `POST /peers` names A's URL to learn
+# the voucher signer A's channel is signed by -- and on this topology a circuit
+# is the only way B reaches anything of A's. This daemon relays no traffic for
+# anyone.
 #
 # Mounted READ-ONLY at /etc/anon/anonrc. The image's entrypoint appends a
 # `Nickname` line to that file when it finds none, so the `Nickname` below is
@@ -13,8 +18,7 @@
 # terms are accepted, and in a non-interactive container it fails fast --
 # "User has not agreed to the terms and conditions. Exiting." -- rather than
 # prompting. ADR 0070 decision 8 names it as one of the two things this
-# sidecar needs said out loud; the other is the persisted directory, which is
-# B's business rather than this daemon's.
+# sidecar needs said out loud; the other is the persisted HiddenServiceDir.
 AgreeToTerms 1
 
 # Drop from root to the image's own unprivileged user, whose home the
@@ -24,27 +28,36 @@ DataDirectory /var/lib/anon
 Nickname toonlocalonionA
 
 # A CLIENT, not a relay: no ORPort, no DirPort, and nothing anyone else can
-# route through. This node exists to open circuits, not to carry other
-# people's.
+# route through. A hidden service is published by a client; it needs no relay.
 ClientOnly 1
 ORPort 0
 DirPort 0
 ControlSocket 0
 
-# The one surface: SOCKS5 on this container's network address, because the
-# thing dialing it is another container. `SocksPolicy` keeps that to the
-# private ranges docker allocates from -- the network this daemon is attached
-# to is the only place a request can come from anyway, and saying so is
-# cheaper than reasoning about it later.
+# SOCKS5 on this container's network address, because the thing dialing it is
+# another container. `SocksPolicy` keeps that to the private ranges docker
+# allocates from.
 SocksPort 0.0.0.0:9050
 SocksPolicy accept 10.0.0.0/8
 SocksPolicy accept 172.16.0.0/12
 SocksPolicy accept 192.168.0.0/16
 SocksPolicy reject *
 
+# ── A's address ─────────────────────────────────────────────────────────────
+# Inside the named volume compose mounts at /var/lib/anon, so it survives a
+# restart (ADR 0070's Consequences); see `anonrc-b` for the long version,
+# which applies here word for word.
+HiddenServiceDir /var/lib/anon/hidden_service
+
+# A FIXED IP, for `anonrc-b`'s reason: `anon` resolves this target when it
+# PARSES its config, and `connector-a` does not exist yet -- its config names
+# an address only this daemon can generate. `compose.yml` pins `connector-a`
+# to it on the `onion-a` network, and `local_topologies_load.rs` holds the two
+# to one string.
+HiddenServicePort 80 172.29.0.10:3000
+
 # Twice, deliberately. stdout is where `docker compose logs` reads, and the
 # file is what the healthcheck greps for `Bootstrapped 100%` -- a container
-# that is Up is not a container that has a circuit, which is the same
-# distinction every connector healthcheck here draws.
+# that is Up is not a container that has a circuit.
 Log notice stdout
 Log notice file /var/lib/anon/notice.log

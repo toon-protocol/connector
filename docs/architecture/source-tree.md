@@ -271,23 +271,26 @@ packet. That is this, and only this.
 | Topology       | Nodes | What it proves                                                                                                                                                                                                                                          |
 | -------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `solo/`        | 1     | The image boots on a mounted config with **both** settlement backends live at once, and a real packet reaches the app behind its route.                                                                                                                 |
-| `two-hop/`     | 2     | Two images peered over ILP-over-HTTP on anvil. B prices the route it terminates; A covers each crossing with a real EIP-712 claim on a real funded channel.                                                                                             |
+| `two-hop/`     | 2     | Two images peered over ILP-over-HTTP on two x402 channels on anvil. B prices the route it terminates; A covers each crossing with a voucher on its own funded channel.                                                                                  |
 | `mixed-chain/` | 3     | A↔B on EVM over BTP, B↔C on Solana over ILP-over-HTTP, B holding both backends. One packet crosses two chains and two carriages.                                                                                                                        |
 | `dealing/`     | 3     | `mixed-chain`'s shape with the middle node **dealing**: 6-decimal mock USDC in, a 9-decimal mock SPL token out, converted at a declared rate (ADR 0071). The only place a shipped image converts, and the only fixture here that declares `[[tokens]]`. |
-| `onion/`       | 2     | B reachable only at a hidden-service address a real `anon` sidecar generates, the two on separate docker networks with no route between them. Not on the CI gate.                                                                                       |
+| `onion/`       | 2     | Each node reachable only at a hidden-service address a real `anon` sidecar generates, the two on separate docker networks with no route between them. Not on the CI gate.                                                                               |
 | `anyone/`      | 1     | The **client edge** over the same overlay: `toon-client` — a different repository's payer — discovering, pricing and paying this node over a circuit. Needs that repository built; not on the CI gate.                                                  |
 
 `LOCAL_TOPOLOGY` picks one (`solo` is the default); `make local-verify` runs the cycle and
 `.github/workflows/local-topologies.yml` runs the first four — `onion` needs a third-party
 anonymity network and is deliberately off that gate (ADR 0070), and `anyone` is run by its own
 `run.sh` rather than by `LOCAL_TOPOLOGY` at all. `anon-image/` builds the daemon both of those
-run: ghcr publishes none for the release whose hidden-service TLD is `.anyone` (issue #1284). The peered topologies cross more than
-once and then read the payee's own claim journal, because a peer claim's verdict rides back
-out of band and never gates the packet — `--expect-fulfill` alone would go green over a
-peering carrying traffic for free. `local/README.md` is the long version and is worth reading
-before editing anything here. `keys.sh` generates and funds a topology's keys into the
-gitignored `local/.keys/`, and has a second stage that opens and tops up Solana channels
-through a running node's operator surface, because only a running node can submit one.
+run: ghcr publishes none for the release whose hidden-service TLD is `.anyone` (issue #1284). Every
+channel here is an x402 channel (ADR 0075). The peered topologies read each payer's channel off
+the chain, cross more than once, and then read the payee's own voucher journal, because a
+voucher's verdict rides back out of band and never gates the packet — `--expect-fulfill` alone
+would go green over a peering carrying traffic for free. `local/README.md` is the long version
+and is worth reading before editing anything here. `keys.sh` generates and funds a topology's
+keys into the gitignored `local/.keys/`, and has a second stage that establishes every peering
+through the running nodes' own signed writes — `POST /peers` on both ends, then
+`POST /channels/:id/fund` and `POST /routes/peers` — because only a running node can open its
+own channel.
 
 ## `infra/` and `deploy/`
 
@@ -301,7 +304,9 @@ start. `linode-faucet/` is where the faucet deploys from, and is not a fixture �
 deploys from here. `linode/` is a retired chain box that now holds one live artefact,
 `endpoints.json`.
 `solana/` provisions chain-side state: the deterministic mock USDC mint, treasury funding, the
-local validator entrypoint.
+local validator entrypoint (which loads `payment-channels` and p-token from the pinned fixtures).
+`anvil/` seeds the local anvil: x402's contracts at their canonical addresses and Circle's
+FiatToken v2.2 as USDC.
 
 `deploy/` is the recipe: `connector-rust/` holds the `Dockerfile`, a commented
 `connector.toml` to fill in, and a README walking the key material and the first `up -d`.
