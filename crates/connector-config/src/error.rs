@@ -742,7 +742,7 @@ pub enum ConfigError {
     )]
     SettlementChannelIndexKeyRemoved { field: &'static str },
 
-    /// A `batch_settlement` table published a minimum `withdrawDelay` or
+    /// A settlement table published a minimum `withdrawDelay` or
     /// `grace_period` below x402's 900 seconds (ADR 0074 decision 5).
     #[error(
         "[settlement.{table}] {key} = {value} is below the floor of 900 \

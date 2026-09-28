@@ -41,9 +41,7 @@
 //!
 //! A client of the payer pays on an x402 channel of its own toward the payer
 //! (ADR 0075: every claim is a voucher, #1384), opened the way a stock x402
-//! client opens one. `[settlement.evm]` still names a `TokenNetworkRegistry`
-//! as a boot requirement until #1385, so [`Chain`] deploys one; nothing is
-//! opened on it.
+//! client opens one.
 //!
 //! # EVM only
 //!
@@ -195,8 +193,7 @@ impl Carriage {
 }
 
 /// One `anvil` holding x402's `x402BatchSettlement` at its canonical
-/// address, a Circle FiatToken as USDC, and the `TokenNetworkRegistry`
-/// `[settlement.evm]` still boots through (until #1385).
+/// address and a Circle FiatToken as USDC.
 struct Chain {
     anvil: Anvil,
     x402: X402Chain,

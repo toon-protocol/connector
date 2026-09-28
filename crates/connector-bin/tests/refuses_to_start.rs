@@ -794,6 +794,56 @@ async fn exits_non_zero_naming_x402_on_a_chain_without_the_x402_contract() {
     }
 }
 
+/// ADR 0075 decision 1, Solana, through the real binary: a node pointed at a
+/// chain on which `payment-channels` is not deployed refuses to start, by
+/// name.
+#[tokio::test]
+async fn exits_non_zero_naming_payment_channels_on_a_chain_without_it() {
+    if !connector_settlement_solana::test_support::require_solana_test_validator() {
+        return;
+    }
+    let validator =
+        connector_settlement_solana::test_support::SolanaValidator::spawn_without_payment_channels(
+        )
+        .await;
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let config_file = write_config(&format!(
+        r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement.solana]
+rpc_url = "{rpc_url}"
+token_address = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+decimals = 6
+min_sponsored_deposit = 1
+
+[settlement.solana.key]
+key_file = "{key_file}"
+"#,
+        key_file = key_file.path().display(),
+        state_dir = state_dir.path().display(),
+        rpc_url = validator.rpc_url,
+    ));
+
+    let output = run(Some(config_file.path()));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in [
+        "[settlement.solana]",
+        "payment-channels",
+        "not deployed",
+        "ADR 0075",
+    ] {
+        assert!(stderr.contains(named), "expected {named} in: {stderr}");
+    }
+}
+
 /// ADR 0075 decision 9, at the level an operator meets it: every
 /// settlement key or shape that named TOON's own channels is refused by
 /// name, never parsed and ignored.

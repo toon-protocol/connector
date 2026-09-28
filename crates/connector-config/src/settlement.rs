@@ -499,22 +499,11 @@ impl SettlementTables {
 
 /// A key a `TokenNetwork`-era settlement table wrote, refused by name (ADR
 /// 0075 decision 9, ADR 0009): never parsed and ignored.
-fn refuse_removed(
-    table: &'static str,
-    written: &[(&'static str, bool)],
-) -> Result<(), ConfigError> {
-    for (field, present) in written {
-        if *present {
-            return Err(match *field {
-                "batch_settlement" => ConfigError::SettlementBatchSubTableRemoved { table },
-                "channel_index_from_block" | "channel_index_confirmations" => {
-                    ConfigError::SettlementChannelIndexKeyRemoved { field }
-                }
-                field => ConfigError::SettlementToonKeyRemoved { table, field },
-            });
-        }
+fn refuse_removed(written: Vec<(bool, ConfigError)>) -> Result<(), ConfigError> {
+    match written.into_iter().find(|(present, _)| *present) {
+        Some((_, refusal)) => Err(refusal),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// A key ADR 0075 decision 9 makes required, written or refused by name.
@@ -523,21 +512,31 @@ fn required<T>(table: &'static str, key: &'static str, value: Option<T>) -> Resu
 }
 
 fn resolve_evm_fields(table: RawEvmSettlementTable) -> Result<EvmSettlementConfig, ConfigError> {
-    refuse_removed(
-        "evm",
-        &[
-            ("contract_address", table.contract_address.is_some()),
-            ("batch_settlement", table.batch_settlement.is_some()),
-            (
-                "channel_index_from_block",
-                table.channel_index_from_block.is_some(),
-            ),
-            (
-                "channel_index_confirmations",
-                table.channel_index_confirmations.is_some(),
-            ),
-        ],
-    )?;
+    refuse_removed(vec![
+        (
+            table.contract_address.is_some(),
+            ConfigError::SettlementToonKeyRemoved {
+                table: "evm",
+                field: "contract_address",
+            },
+        ),
+        (
+            table.batch_settlement.is_some(),
+            ConfigError::SettlementBatchSubTableRemoved { table: "evm" },
+        ),
+        (
+            table.channel_index_from_block.is_some(),
+            ConfigError::SettlementChannelIndexKeyRemoved {
+                field: "channel_index_from_block",
+            },
+        ),
+        (
+            table.channel_index_confirmations.is_some(),
+            ConfigError::SettlementChannelIndexKeyRemoved {
+                field: "channel_index_confirmations",
+            },
+        ),
+    ])?;
 
     let rpc_url = resolve_rpc_url(table.rpc_url)?;
     let token_address = parse_evm_address(&table.token_address).ok_or_else(|| {
@@ -568,13 +567,19 @@ fn resolve_evm_fields(table: RawEvmSettlementTable) -> Result<EvmSettlementConfi
 fn resolve_solana_fields(
     table: RawSolanaSettlementTable,
 ) -> Result<SolanaSettlementConfig, ConfigError> {
-    refuse_removed(
-        "solana",
-        &[
-            ("program_id", table.program_id.is_some()),
-            ("batch_settlement", table.batch_settlement.is_some()),
-        ],
-    )?;
+    refuse_removed(vec![
+        (
+            table.program_id.is_some(),
+            ConfigError::SettlementToonKeyRemoved {
+                table: "solana",
+                field: "program_id",
+            },
+        ),
+        (
+            table.batch_settlement.is_some(),
+            ConfigError::SettlementBatchSubTableRemoved { table: "solana" },
+        ),
+    ])?;
 
     let rpc_url = resolve_rpc_url(table.rpc_url)?;
     if table.token_address.trim().is_empty() {
