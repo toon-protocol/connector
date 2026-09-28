@@ -209,9 +209,11 @@ pub struct ClaimView {
     /// field: every row this crate itself produces is `Peer`.
     pub book: ClaimBookKind,
     /// Which claim scheme the row's claims are: a `toon-channel` claim or
-    /// an x402 voucher (ADR 0075). The peer book holds only the former; the
-    /// client book holds both until #1381 retires the first; the outbound
-    /// channels' book holds only vouchers.
+    /// an x402 voucher (ADR 0075). The peer book holds only the former, as
+    /// history an older build's journal replays; the client book accepts
+    /// only vouchers since #1384, and reports a `toon-channel` row only for
+    /// a watermark such a journal left behind; the outbound channels' book
+    /// holds only vouchers.
     pub scheme: ClaimScheme,
 }
 

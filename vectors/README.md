@@ -9,8 +9,8 @@ from this repository.
 
 Regenerate after any change to the envelope (`connector_domain::envelope`), the gift wrap
 (`connector_signer::giftwrap`), the fulfilment derivation
-(`connector_signer::giftwrap::derive_fulfillment`), or the claim signing scheme
-(`connector_signer::claim_signature`):
+(`connector_signer::giftwrap::derive_fulfillment`), or the voucher and challenge signing schemes
+(`connector_signer::voucher_signature`, `connector_signer::claim_state_challenge`):
 
 ```
 cargo run -p connector-vectors --bin generate-vectors
@@ -57,7 +57,7 @@ binding:
 | `FULFILL` | `peer_carriage.fulfill_ack_accepted.packet_hex`                                       |
 | `REJECT`  | `peer_carriage.reject_with_cost.packet_hex`                                           |
 
-`prepare_no_claim` carries the same PREPARE bytes with the claim removed, and
+`prepare_no_claim` carries the same PREPARE bytes with the voucher removed, and
 `forwarded_data_unchanged` carries a different PREPARE whose `data` is a real sealed gift wrap.
 There is no separate top-level `packet` section: replay these.
 
@@ -139,9 +139,21 @@ The other two, for completeness:
 
 ## Schema
 
-All byte fields are lowercase hex, no `0x` prefix. `schema_version` bumps only when a field's
-meaning changes in a way that would make existing replay code misread it; a purely additive field
-does not bump it.
+All byte fields are lowercase hex, no `0x` prefix, except where a section says a field is the
+literal string that rides the wire. `schema_version` bumps only when a field's meaning changes in a
+way that would make existing replay code misread it; a purely additive field does not bump it.
+
+**`schema_version` 7** (issue #1384,
+[ADR 0075](../docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision
+14): **every claim is a voucher.** The `toon-channel` claim scheme is retired, and every section
+that pinned it is gone: the top-level `claim` section (the EIP-712 `BalanceProof`),
+`peer_carriage`'s `claim_evm`, `claim_solana`, `claim_digest_hex`, `flush`, `flush_ack`,
+`flush_requested`, `claim_retransmit` and `claim_same_nonce_different_bytes`, and the whole
+`channel_control_declaration` section (the `TokenNetwork`-domain `auth_channel_proof`, replaced by
+the voucher claim-state challenge on the client BTP `auth` entry's `channelChallenge`). New:
+`peer_carriage.voucher_evm`/`voucher_solana`, `peer_carriage.zero_value_challenge`, and the
+top-level `toon_channel_refused` and `payout_voucher` sections. A claim with no `scheme` is now a
+claim every connector refuses by name -- which is why this is a bump, not an addition.
 
 ### `envelope`
 
@@ -262,210 +274,84 @@ no condition left to derive a fulfilment from or to check one against, so this s
   replaying SDK can check that its own derivation reproduces both rather than one it could get
   right by accident.
 
-### `claim`
-
-A signed EIP-712 `BalanceProof` (ADR 0024) -- the digest and signature scheme both a peer-role
-claim (`docs/protocol/peer-semantics-pre-868.md` §3.5) and a client-edge claim (`client-edge-spec.md` §1.3
-step 4) are checked against. This is the scheme that replaced a SHA-256 tuple nothing on chain ever
-verified; a client that still signs the old tuple has nothing else in this repository that would
-tell it.
-
-- `cases[]`: `{ name, chain_id, token_network_address_hex, channel_id_hex, nonce,
-transferred_amount, locked_amount, locks_root_hex, digest_hex, signer_secret_hex,
-signer_address_hex, signature_hex }`.
-- `chain_id` / `token_network_address_hex` are the EIP-712 domain's `chainId` and
-  `verifyingContract` -- configured **per channel** (`ClaimBook::set_channel_domain`), never a
-  node-wide default. A vector hardcoding one real chain's values is not evidence of what another
-  chain's channel signs; treat this case's `chain_id`/`token_network_address_hex` as one example
-  domain, not the only one a real claim can be signed under.
-- `channel_id_hex` is the channel's on-chain `bytes32` identifier -- the exact 32 bytes hashed into
-  the struct, not a peering relation's own string label for the channel.
-- `locked_amount` and `locks_root_hex` are always zero on the wire today (ADR 0004) but are still
-  part of the hashed struct -- omitting them computes a different digest than the one a real
-  signer signs.
-- `digest_hex` is the EIP-712 digest: `keccak256(0x1901 || domainSeparator || structHash)`, where
-
-  ```text
-  domainSeparator = keccak256(abi.encode(
-                        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-                        keccak256("TokenNetwork"), keccak256("1"), chainId, verifyingContract))
-  structHash       = keccak256(abi.encode(
-                        keccak256("BalanceProof(bytes32 channelId,uint256 nonce,uint256 transferredAmount,uint256 lockedAmount,bytes32 locksRoot)"),
-                        channelId, nonce, transferredAmount, lockedAmount, locksRoot))
-  ```
-
-  every integer field (`chainId`, `nonce`, `transferredAmount`, `lockedAmount`) is a 32-byte
-  big-endian ABI word, matching Solidity's `uint256` encoding, and `verifyingContract` is a 20-byte
-  address right-aligned into a 32-byte word.
-
-- `signer_secret_hex` / `signer_address_hex` are a fixture secp256k1 keypair -- not a real
-  operator or counterparty key -- so a replaying SDK can check both directions: that it computes
-  the same `digest_hex` from the other fields, and that a 65-byte `r || s || recovery_id` signature
-  over that digest (`signature_hex`; `recovery_id` is raw `0`/`1`, not the `27`/`28` a wallet's own
-  signature carries) recovers to `signer_address_hex`.
-
 ### `peer_carriage`
 
-Issue #729, [ADR 0021](../docs/adr/0021-vectors-are-normative-prose-is-not.md): the 20 items of
-`docs/protocol/peer-carriage-spec.md` §10, generated from one fixture set per concept and
-self-checked against the same functions -- `connector-peer-btp`'s codec and
-`connector-peer-http`'s wrappers over it -- that judge them at runtime. **Most items are a pair**:
-a BTP encoding and an HTTP encoding of the same fixture, and a replaying SDK should confirm both
-decode to the same value (§10.1, spec I1) rather than trust either encoding alone.
+Issue #729, [ADR 0021](../docs/adr/0021-vectors-are-normative-prose-is-not.md), as ADR 0075 decisions
+5 and 6 re-base it: the items of `docs/protocol/peer-carriage-spec.md` §10, generated from one fixture
+set per concept and self-checked against the same functions that emit and judge them at runtime --
+the paying side's own renderers (`connector_runtime::voucher_json`,
+`connector_runtime::challenge_entry`), `connector-peer-btp`'s codec and role gate, and
+`connector-peer-http`'s headers and evidence reader. **Most items are a pair**: a BTP encoding and
+an HTTP encoding of the same fixture, and a replaying SDK should confirm both decode to the same
+value (§10.1, spec I1) rather than trust either encoding alone.
 
-Every JSON claim, ack and credential value below is the plain string a real interaction carries; a
+Every JSON voucher, challenge and ack value below is the plain string a real interaction carries; a
 `btp_raw_hex` field is that string's raw UTF-8 bytes (the BTP `protocolData` entry payload), and an
-`http_base64` field is `base64` of the same bytes (the HTTP header value) -- never a second
-encoding of a different value (§4, §1.4). Header names throughout are the canonical lower-case
-forms `docs/protocol/peer-carriage-spec.md` §3 pins; header values in `http_headers` pair each
-name with its value as `[name, value]`, in the order a real response would carry them.
+`http_base64` field is `base64` of the same bytes (the HTTP header value). Header names throughout
+are the canonical lower-case forms `docs/protocol/peer-carriage-spec.md` §3 pins; `http_headers`
+pairs each name with its value as `[name, value]`.
 
-- **`credential`** (item 1) -- `{ name, peer_id, secret, btp_raw_hex, http_base64 }`: the peer
-  credential JSON of §1.4 (`{"peerId": ..., "secret": ...}`), on the `auth` protocolData entry and
-  the `Toon-Peer-Auth` header.
-- **`claim_evm`** (item 2) -- `{ name, blockchain, json, btp_raw_hex, http_base64, wire_channel_id,
-wire_nonce, wire_cumulative_amount, wire_signature_hex }`: an EVM peer claim, the same JSON shape
-  `client-edge-spec.md` §1.3 defines for a client claim (spec I4). `wire_*` fields are what the
-  claim decodes to in-process (`connector_runtime::WireClaim`) -- the value both carriage decoders
-  must agree on.
-- **`claim_digest_hex`** (item 3) -- the same string as this file's `claim.cases[0].digest_hex`,
-  repeated here rather than recomputed, demonstrating ADR 0024's EIP-712 digest is untouched by
-  carriage.
-- **`claim_solana`** (item 4) -- shaped like `claim_evm`, over a Solana claim, plus
-  `signed_message_hex`: the 96-byte balance proof ADR 0053 defines, which is what this claim's
-  `signature` covers (`TOON-BALPROOF-V2` || `programId` || `channelAccount` || `nonce` ||
-  `transferredAmount`). **Aspirational**
-  (`peer-semantics-pre-868.md` §3.5): this connector's outbound peer claims are EVM-only, so nothing today
-  emits this shape, but `claim_json::parse` already accepts it inbound (issue #732) and this vector
-  pins that shape before an emitter exists.
-
-  `programId` names **the settlement program the claim's `channelAccount` lives under**
-  (`docs/protocol/client-edge-spec.md` §1.3) -- byte-for-byte the value at offset 16 of
-  `signed_message_hex`, which `the_solana_claim_vector_declares_the_program_its_signature_is_bound_to`
-  asserts rather than leaves to the reader. It is not a free-form label: a payer who writes anything
-  else is declaring a program no channel of theirs lives under. This fixture used to declare the
-  **system program**, and that is why `schema_version` reached `2` (issue #1127) -- an SDK that
-  carried version 1's reading of this field into a real claim builder is emitting a non-conforming
-  claim. The value here is the deployed public-devnet payment-channel program
-  (`packages/solana-program/deployments/devnet-public.md`), an example settlement program in the
-  same way `claim.cases[0].chain_id` is Base Sepolia's real id -- a channel on another deployment
-  names that deployment's program instead.
-
+- **`voucher_evm`** -- `{ name, chain_id, verifying_contract_hex, channel_config, channel_id_hex,
+max_claimable_amount, digest_hex, signer_address_hex, signature_hex, json, btp_raw_hex,
+http_base64 }`: a peer's voucher on its own outbound `x402BatchSettlement` channel toward the next
+  hop, exactly as the paying node renders it into the claim slot. The facts are `claim_voucher.evm`'s
+  fields under the same names; here `channel_config.payer_hex == payer_authorizer_hex ==
+signer_address_hex` -- the paying node's **settlement key** signs (ADR 0075 decision 3) -- and the
+  receiver is the next hop's settlement address in both receiving seats. A peer voucher always
+  carries its `channelConfig`. `signature_hex` is `r ‖ s ‖ v`, `v` 27 or 28.
+  `crates/connector-settlement-evm/tests/x402_voucher_vector.rs` checks `channel_id_hex` and
+  `digest_hex` against the deployed contract's own `getChannelId`/`getVoucherDigest` on every run.
+- **`voucher_solana`** -- `{ name, channel_account_base58, authorized_signer_base58,
+signer_secret_hex, max_claimable_amount, signed_message_hex, signature_base58, json, btp_raw_hex,
+http_base64 }`: the Solana twin, on a `payment-channels` channel whose `authorized_signer` is the
+  paying node's Solana settlement key. `signed_message_hex` is the 50-byte voucher message
+  (`claim_voucher.solana`'s layout). Its `senderId` is the channel account: a label, as a voucher's
+  `senderId` always is.
 - **`prepare`** / **`prepare_no_claim`** (items 5, 6) -- `{ name, prepare, claim_json,
-btp_message_hex, http_headers, http_body_hex }`: a claim-bearing PREPARE.
-  `prepare` is `{ amount, expires_at, greeting, destination, data_hex }`, the OER
-  `Prepare` both `btp_message_hex` (a complete BTP MESSAGE frame: type, `requestId`, the
-  `payment-channel-claim` protocolData entry, then the OER PREPARE)
-  and `http_body_hex` (the same OER bytes as a POST body) carry. `prepare_no_claim` is the same
-  fixture with the claim entry/header removed -- "claimless is legal" pinned rather than assumed.
-  `claim_json` is `null` there. **Those OER bytes are also this file's pin of the packet encoding
-  itself** -- not only of peer carriage: see [The ILP packet encoding](#the-ilp-packet-encoding)
-  above, which walks `http_body_hex` byte by byte and says where the encoding departs from
-  RFC 0027 ([ADR 0063](../docs/adr/0063-the-ilp-packet-is-toons-dialect-not-rfc-0027s.md)).
+challenge_json, btp_message_hex, http_headers, http_body_hex }`. `prepare` is
+  `{ amount, expires_at, greeting, destination, data_hex }`, the OER `Prepare` both
+  `btp_message_hex` (a complete BTP MESSAGE frame: type, `requestId`, the `payment-channel-claim`
+  protocolData entry, then the OER PREPARE) and `http_body_hex` (the same OER bytes as a POST body)
+  carry. `claim_json` is `voucher_evm.json`. `prepare_no_claim` is the same fixture with the voucher
+  removed; `claim_json` and `challenge_json` are `null`. **Those OER bytes are also this file's pin
+  of the packet encoding itself** -- see [The ILP packet encoding](#the-ilp-packet-encoding) above.
+- **`zero_value_challenge`** -- `{ name, channel_id_hex, expires, digest_hex, signer_address_hex,
+signature_hex, packet }`: a PREPARE whose `amount` is `0` (ADR 0075 decision 5). It carries **no
+  voucher** and carries the voucher claim-state challenge instead, in a slot of its own -- the
+  `peer-role-challenge` protocolData entry on BTP, the `Toon-Peer-Role-Challenge` header (base64) on
+  HTTP -- so the receiver can attribute it to the peering. `packet` is a `prepare`-shaped pair with
+  `claim_json` `null` and `challenge_json` the challenge: a `POST /ilp/claim-state` entry's JSON
+  (`scheme: "batch-settlement"` required), signed by the channel's voucher signer (the paying node's
+  settlement key). `digest_hex` is `voucher_claim_state_challenge.evm`'s construction over
+  `voucher_evm`'s channel. A receiver honours a challenge only while `expires` is ahead of its clock
+  and **no more than 300 seconds** ahead (`peer-carriage-spec.md` §1.2); this fixture's `expires`
+  (2100-01-01T00:00:00Z) pins reproducible bytes, not a window a live receiver would accept -- a
+  replaying SDK applies the window itself.
 - **`fulfill_ack_accepted`**, **`fulfill_ack_rejected`**, **`ack_rejected_reasons[]`**,
-  **`reject_with_cost`**, **`ack_absent`**, **`flush_ack`** (items 7-11, 14) -- one shape,
-  `{ name, packet ("fulfill"|"reject"|"none"), packet_hex, ack, accumulated_cost, btp_response_hex,
+  **`reject_with_cost`**, **`ack_absent`** (items 7-11) -- one shape,
+  `{ name, packet ("fulfill"|"reject"), packet_hex, ack, accumulated_cost, btp_response_hex,
 http_status, http_headers, http_body_hex }`. `ack` is `null` (absent, item 11) or `{ result,
 reason }` (`reason` only when `result` is `"rejected"`). `http_status` is always `200` -- §6.2's
-  independence of the packet's own verdict from the claim's. `fulfill_ack_rejected` is **the single
+  independence of the packet's own verdict from the voucher's. `fulfill_ack_rejected` is **the single
   most important vector in this set** (§10.2 item 8): a `FULFILL` answer carrying a _rejected_
   claim-ack on the one response, proving the two verdicts never couple. `ack_rejected_reasons[]` has
-  one entry per §6.1 reason (`signature_invalid`, `nonce_not_advancing`, `amount_not_advancing`,
-  `unknown_channel`), named `peer_ack_rejected_<reason>`. `reject_with_cost` carries both
-  `accumulated_cost` and `ack` on one response. `flush_ack` answers an empty packet
-  (`packet: "none"`, `packet_hex: ""`) -- the answer to a FLUSH.
+  one entry per reason a voucher's verdict carries (`signature_invalid`, `amount_not_advancing`,
+  `unknown_channel`), named `peer_ack_rejected_<reason>`; `nonce_not_advancing` is no longer pinned,
+  since no voucher verdict produces it. `reject_with_cost` carries both `accumulated_cost` and `ack`
+  on one response.
 - **`ack_malformed`** (item 12) -- `{ name, malformed_json, btp_raw_hex, http_base64 }`: an ack
-  whose JSON does not decode to either verdict (here, an unrecognised `result`). Both carriages must
-  read this as **not acknowledged** (§6.3), the same as `ack_absent` -- never an error, never a
-  verdict.
-- **`flush`** (item 13) -- `{ name, claim_json, transfer_amount, btp_transfer_hex, http_headers,
-http_body_hex }`: `btp_transfer_hex` is a complete BTP TRANSFER frame whose `amount` equals
-  `transfer_amount` (the claim's own cumulative amount -- the generator asserts this equality, not
-  just a reader) and carries the claim entry with **no** `ilpPacket`. `http_body_hex` is empty; the
-  claim rides the `ILP-Payment-Channel-Claim` header alone. The shape is still pinned at this
-  `schema_version`, but since ADR 0075 (issue #1380) no peer carriage sends a FLUSH: a peer pays with
-  a voucher riding the PREPARE it covers, and an arriving BTP TRANSFER is answered with an empty
-  RESPONSE carrying no ack (`docs/protocol/peer-carriage-spec.md` §3).
-- **`claim_retransmit`**, **`claim_same_nonce_different_bytes`** (items 15, 16) -- `{ name,
-first_claim_json, second_claim_json, first_ack, second_ack, second_ack_reason }`: §6.3's
-  idempotent re-ack and its boundary. In `claim_retransmit`, `second_claim_json` is
-  byte-identical to `first_claim_json` and both acks are `"accepted"` -- a retransmission of the
-  claim already at the watermark is accepted again, not refused. In
-  `claim_same_nonce_different_bytes`, `second_claim_json` carries the same nonce but a different
-  (still validly signed) amount, and `second_ack` is `"rejected"` with `second_ack_reason:
-"nonce_not_advancing"`.
-- **`flush_requested`** (item 17) -- `{ name, channel_id, http_header_value, note }`. **HTTP
-  only**: `note` records that BTP has no counterpart (§6.4) -- on BTP the payee can originate a
-  request of its own, so the hint has nothing to ride. Still pinned, and no longer emitted by either
-  peer carriage since ADR 0075 (issue #1380): it prompted a flush of a pending `toon-channel` claim,
-  and a voucher is never pending.
-- ~~**`minimum_delivery_absent`**, **`minimum_delivery_malformed`** (items 18, 19)~~ -- **deleted**
-  in `schema_version` 3 (issue #1143). Minimum delivery is retired
-  ([ADR 0057](../docs/adr/0057-minimum-delivery-is-retired-a-claim-bounds-erosion.md)): no packet
-  declares a floor, and the `toon-minimum-delivery` entry and `Toon-Minimum-Delivery` header are
-  gone from both carriages. `R01` stays in the reject vocabulary with RFC 0027's own meaning -- a
-  hop's fee alone exceeding the arriving amount -- and answers an unmet floor no longer, because
-  there is no floor (ADR 0051 as corrected). The item numbers are not reused.
+  whose JSON does not decode to either verdict. Both carriages must read this as **not
+  acknowledged** (§6.3), the same as `ack_absent` -- never an error, never a verdict.
 - **`forwarded_data_unchanged`** (item 20) -- `{ name, sealed_data_hex, btp_ilp_packet_prepare_hex,
 http_body_hex }`: one sealed request wrap from this file's own `giftwrap` section (§8.1), carried
   as a PREPARE's `data` on both carriages. `sealed_data_hex` must appear byte-for-byte inside both
-  `btp_ilp_packet_prepare_hex`'s OER PREPARE and `http_body_hex` -- a forwarding hop never
-  re-encodes, re-wraps or truncates a payload it holds no key for.
-
-### `channel_control_declaration`
-
-Issue #792, `client-edge-spec.md` §1.9 step 1 (issue #790): the BTP auth entry's
-`channelId`/`expires`/`signature` fields, which bind a client session to a channel it controls
-_before_ that session has ever presented a claim. The signature scheme is the identical
-domain-separated `ClaimStateChallenge` `POST /ilp/claim-state` verifies for a read
-(`connector_signer::claim_state_challenge`), reused rather than a claim's own `BalanceProof`
-scheme (this file's `claim` section above) -- deliberately a different EIP-712 typehash, so a
-captured claim-state proof and a captured claim can never stand in for each other.
-
-**Unlike every other section in this file, three fields here (`channel_id_hex`, `signature_hex`,
-and the corresponding values embedded in `auth_json`) carry a `0x` prefix.** This is deliberate:
-these are the literal strings that ride on the wire inside the auth entry's JSON body (matching
-`peer_carriage.claim_evm.wire_channel_id`'s same convention for the same reason), not this file's
-usual internal byte encoding.
-
-- `cases[]`: `{ name, peer_id, chain_id, token_network_address_hex, channel_id_hex, expires,
-counterparty_address_hex, signer_secret_hex, signer_address_hex, digest_hex, signature_hex,
-auth_json, btp_message_hex, signature_verifies }`.
-- `chain_id` / `token_network_address_hex` are the channel's own registered EIP-712 domain --
-  same rule as the `claim` section: configured per channel, never a node-wide default.
-- `digest_hex` is `keccak256(0x1901 || domainSeparator || structHash)`, where `domainSeparator` is
-  the identical `EIP712Domain(name: "TokenNetwork", version: "1", chainId, verifyingContract)`
-  construction the `claim` section's `BalanceProof` digest uses (see that section for the exact
-  ABI encoding), and
-
-  ```text
-  structHash = keccak256(abi.encode(
-                   keccak256("ClaimStateChallenge(bytes32 channelId,uint256 expires)"),
-                   channelId, expires))
-  ```
-
-  -- a distinct type hash and a distinct field set from `BalanceProof`, so the two digests can
-  never collide for any input.
-
-- `counterparty_address_hex` is the channel's registered counterparty -- what `signature_hex` must
-  recover to for `signature_verifies` to be `true`. `signer_secret_hex`/`signer_address_hex` are
-  the keypair that actually produced `signature_hex`: for `channel_control_declaration_valid` and
-  `channel_control_declaration_expired`, this is the same keypair as `counterparty_address_hex`
-  (a genuine proof); for `channel_control_declaration_wrong_key`, it is a different, unrelated
-  keypair, and `signature_verifies` is `false`.
-- `expires` is unix seconds, compared by the verifier as `expires <= now` -> rejected -- a
-  wall-clock fact at verification time that this static file cannot itself encode. Instead,
-  `channel_control_declaration_valid`/`_wrong_key` use an `expires` far enough in the future
-  (2100-01-01T00:00:00Z) to still be valid against any reasonable clock, and
-  `channel_control_declaration_expired` uses `1` (1970-01-01T00:00:01Z) to be expired against any
-  reasonable clock. `signature_verifies` is about the signature alone (`true` for
-  `channel_control_declaration_expired` too, since its signature is genuine) -- a replaying SDK
-  must apply the `expires` check itself, separately, exactly as
-  `verify_and_record_declared_channel` (`connector-client-edge::btp`) does.
-- `auth_json` is the auth entry's full JSON body -- `{peerId, secret, channelId, expires,
-signature}` -- byte-for-byte what rides as the BTP `auth` protocolData entry's `data`.
-  `btp_message_hex` is the complete BTP MESSAGE frame carrying it (no `ilpPacket`), decoded and
-  re-checked against `auth_json` by the generator before being emitted.
+  -- a forwarding hop never re-encodes, re-wraps or truncates a payload it holds no key for.
+- **Deleted** at `schema_version` 7 (ADR 0075): `claim_evm`, `claim_solana`, `claim_digest_hex`
+  (items 2-4, the `toon-channel` claim), `flush`, `flush_ack`, `flush_requested` (items 13, 14, 17,
+  the `toon-channel` FLUSH), and `claim_retransmit`, `claim_same_nonce_different_bytes` (items 15,
+  16, the nonce rule; a voucher's retransmission is `claim_voucher.amount_only_watermark`'s
+  `"retransmission"` case). Earlier: `credential` (item 1, `schema_version` 4) and
+  `minimum_delivery_*` (items 18, 19, `schema_version` 3). The item numbers are not reused.
 
 ### `charge`
 
@@ -513,16 +399,12 @@ connector accepts in silence, so there was no reject to read.
 ### `claim_voucher`
 
 [ADR 0074](../docs/adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 7,
-issue #1347: `schema_version` **6**. A client-edge claim gains a `scheme` discriminator (issue
-#1341); absent, or `"toon-channel"`, is the `claim`/`peer_carriage` claim above, unchanged. Under
-`scheme: "batch-settlement"` a claim is a **voucher** -- x402's own claim, on a channel this
-connector never opens, verified against a different signature scheme per chain and freed of the
-nonce every claim above uses: its freshness is an amount-only watermark
-(`connector_domain::validate_voucher`). **Client edge only** -- no peer carriage ever accepts one
-(`connector_peer_btp::claim_json::parse` has no voucher arm) -- so unlike `peer_carriage`'s claim
-cases there is no BTP/HTTP framing pair here: a voucher rides the same
-`ILP-Payment-Channel-Claim` header/protocolData entry a `toon-channel` claim already does, and only
-its JSON shape differs.
+issue #1347 (`schema_version` 6); since `schema_version` 7 (ADR 0075) the **only** claim. A claim
+carries a **required** `scheme` discriminator, `"batch-settlement"`: a **voucher** -- x402's own
+claim, verified against a signature scheme per chain, with no nonce: its freshness is an
+amount-only watermark (`connector_domain::validate_voucher`). A claim with no `scheme`, or
+`"toon-channel"`, is refused by name (`toon_channel_refused`). This section pins the client edge's
+shape; `peer_carriage.voucher_evm`/`voucher_solana` pin a peer's, with their BTP/HTTP framing pair.
 
 - **`evm`** -- `{ name, chain_id, verifying_contract_hex, channel_config, channel_id_hex,
 max_claimable_amount, digest_hex, signer_address_hex, signature_hex, json }`. `channel_config` is
@@ -535,7 +417,7 @@ withdraw_delay, salt_hex }` -- x402's `ChannelConfig`, the seven fields a channe
   fixture's is nonzero -- ADR 0074 decision 4). `json` is the full claim, exactly as it rides the
   claim header/protocolData entry -- note its wire field names are camelCase
   (`channelId`, `maxClaimableAmount`, `channelConfig.payerAuthorizer`, ...) where this file's own
-  `_hex` fields are snake_case, the same convention `peer_carriage.claim_evm.json` uses.
+  `_hex` fields are snake_case.
 
   **Independently confirmed against the deployed contract.** `channel_id_hex` and `digest_hex` are
   not only this repository's own arithmetic: they equal `x402BatchSettlement.getChannelId` and
@@ -548,7 +430,8 @@ withdraw_delay, salt_hex }` -- x402's `ChannelConfig`, the seven fields a channe
   `crates/connector-settlement-evm/tests/x402_voucher_vector.rs` reads this committed case, places
   Base Sepolia's `x402BatchSettlement` runtime bytecode at that address on an `anvil` running as chain
   84532, and asserts the contract's own `getChannelId` and `getVoucherDigest` return `channel_id_hex`
-  and `digest_hex`.
+  and `digest_hex`. The same test checks `peer_carriage.voucher_evm` and `payout_voucher.evm` --
+  every EVM voucher this file pins.
 
 - **`solana`** -- `{ name, channel_account_hex, channel_account_base58, signer_public_key_hex,
 signer_public_key_base58, max_claimable_amount, expires_at, signed_message_hex, signature_hex,
@@ -557,25 +440,23 @@ signature_base58, json }`. `signed_message_hex` is payment-channels' 50-byte vou
   `signature_hex`/`signature_base58` (the same 64 bytes, Ed25519) covers, verifying against
   `signer_public_key_hex`, the channel's `authorized_signer`. `expires_at` is `0`: see `invalid[]`
   for what a nonzero one costs. `json`'s wire fields (`channelId`, `signature`) are base58 on
-  Solana, unlike EVM's hex -- the same convention `peer_carriage.claim_solana` uses.
+  Solana, unlike EVM's hex.
 
 - **`amount_only_watermark[]`** -- `{ name, watermark_amount, watermark_signature_hex,
 presented_amount, presented_signature_hex, charge, outcome, advanced }`: the outcomes of
   [`connector_domain::validate_voucher`], the amount-only rule a voucher's freshness is judged by
-  in place of a `toon-channel` claim's nonce (ADR 0074 decision 3). `watermark_amount`/
+  (ADR 0074 decision 3) -- the only freshness rule since ADR 0075 deleted the nonce rules. `watermark_amount`/
   `watermark_signature_hex` are `null` for a channel that has never accepted a voucher; otherwise
   they are the amount and signature of the voucher that set the watermark, and
   `presented_amount`/`presented_signature_hex` are the voucher now being judged against it.
   `outcome` is one of:
   - `"amount_not_advancing"` -- the presented amount equals the watermark's under a **different**
-    signature. Refused, and for a voucher this means _not strictly greater_ (`claim`'s nonce rule
-    means _less than_ -- ADR 0074 decision 3 pins the difference deliberately).
+    signature. Refused: for a voucher, not advancing means _not strictly greater_.
   - `"advances"` -- the presented amount is strictly above the watermark's, `advanced` (the
     difference) covers `charge`, and the voucher is accepted; `advanced` carries the figure.
   - `"retransmission"` -- the presented amount **and** signature are byte-identical to the
-    voucher at the watermark: a retransmission, not a new claim, answered exactly as
-    `peer_carriage.claim_retransmit` answers a `toon-channel` claim retransmitted at its watermark
-    today -- accepted again, buying nothing new. Byte identity is the test: an equal amount under a
+    voucher at the watermark: a retransmission, not a new claim -- accepted again, buying nothing
+    new. Byte identity is the test: an equal amount under a
     different signature is `"amount_not_advancing"` instead, not a retransmission. Pinned at a
     `charge` of `0`.
   - `"underpayment"` -- the same byte-identical retransmission against a nonzero `charge`. It buys
@@ -595,22 +476,21 @@ presented_amount, presented_signature_hex, charge, outcome, advanced }`: the out
 
 Issue #1364, `client-edge-spec.md` §1.10: the signature a `POST /ilp/claim-state` entry under
 `scheme: "batch-settlement"` carries, proving control of an x402 channel so the connector will
-report its voucher watermark. Additive, so `schema_version` stays **6**. It is signed by the
-channel's **voucher signer** -- `payerAuthorizer`, else `payer`, of the verified `ChannelConfig` on
-EVM; `authorized_signer` on Solana (ADR 0074 decision 4) -- over a challenge kept apart from that
-key's vouchers, as `channel_control_declaration`'s challenge is kept apart from a `BalanceProof`.
-Both chains' cases are on the `claim_voucher` section's channels. As in
-`channel_control_declaration`, `signature_verifies` is about the signature alone, and every case's
-`expires` is 2100-01-01T00:00:00Z; a replaying SDK applies the `expires <= now` check itself.
+report its voucher watermark (added at `schema_version` 6). Since ADR 0075 the same message also
+proves the peer role for a zero-value packet (`peer_carriage.zero_value_challenge`) and declares a
+client's channel on its BTP `auth` entry (`channelChallenge`, replacing the retired
+`auth_channel_proof`). It is signed by the channel's **voucher signer** -- `payerAuthorizer`, else
+`payer`, of the verified `ChannelConfig` on EVM; `authorized_signer` on Solana (ADR 0074 decision 4) -- over a challenge kept apart from that key's vouchers. Both chains' cases are on the
+`claim_voucher` section's channels. `signature_verifies` is about the signature alone, and every
+case's `expires` is 2100-01-01T00:00:00Z; a replaying SDK applies the `expires <= now` check itself.
 
 - **`evm[]`** -- `{ name, chain_id, verifying_contract_hex, channel_id_hex, expires,
 voucher_signer_address_hex, signer_secret_hex, signer_address_hex, digest_hex, signature_hex,
 signature_verifies, entry_json }`. `digest_hex` is `keccak256(0x1901 || domainSeparator ||
-  structHash)` with `channel_control_declaration`'s `structHash` --
-  `ClaimStateChallenge(bytes32 channelId,uint256 expires)` -- under **`x402BatchSettlement`'s**
-  domain, `("x402 Batch Settlement", "1", chain_id, verifying_contract_hex)`, the one
-  `claim_voucher.evm`'s digest uses. A distinct type hash from `Voucher`, and a distinct domain
-  from `TokenNetwork`'s, so it stands in for neither a voucher nor a `toon-channel` challenge.
+  structHash)`, where `structHash = keccak256(abi.encode(keccak256("ClaimStateChallenge(bytes32
+  channelId,uint256 expires)"), channelId, expires))`, under **`x402BatchSettlement`'s** domain,
+  `("x402 Batch Settlement", "1", chain_id, verifying_contract_hex)`, the one `claim_voucher.evm`'s
+  digest uses. A distinct type hash from `Voucher`, so it never stands in for a voucher.
   `signature_hex` is `0x`-prefixed `r ‖ s ‖ v` with `v` 27 or 28. `voucher_claim_state_evm_valid`
   is signed by `voucher_signer_address_hex` (anvil's published account 1, the fixture's
   `payerAuthorizer`); `voucher_claim_state_evm_wrong_key` by an unrelated key, and does not verify.
@@ -625,4 +505,49 @@ signature_verifies, entry_json }`. `signed_message_hex` is
   accepted a voucher on the channel already holds it and ignores this, and one that has not needs
   it, because the contract stores a channel by id alone.
 
-[ADR 0018]: ../docs/adr/0018-a-payload-is-sealed-to-the-terminating-connector.md
+### `toon_channel_refused`
+
+[ADR 0075](../docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision
+8, issue #1384: a claim with no `scheme`, or with `scheme: "toon-channel"`, is the retired
+`toon-channel` claim, and every edge refuses it **by name**, never as merely malformed -- the way a
+`mina` claim is refused.
+
+- `cases[]`: `{ name, claim_json, client_edge_error, client_edge_message, btp_message_hex,
+btp_error_hex, http_headers, http_body_hex, http_status, http_response_body_hex, refusal_text }`.
+  `claim_json` is a retired claim exactly as a pre-ADR 0075 client or peer sends it
+  (`toon_channel_evm_no_scheme`, `toon_channel_evm_explicit_scheme`, `toon_channel_solana_no_scheme`).
+- **Client edge:** parsing it fails with `client_edge_error` `"toon_channel"` (a stable tag);
+  `client_edge_message` is the message, which names the retirement and is informational.
+- **BTP peer carriage:** `btp_message_hex` is the claim riding a PREPARE; it is answered with
+  `btp_error_hex`, an ERROR frame (`code F00`, `name NotAcceptedError`, `data` = `refusal_text`),
+  before the role is decided.
+- **HTTP peer carriage:** the same claim in the `Payment-Channel-Claim` header beside the same
+  PREPARE (`http_body_hex`) is answered `http_status` `400`, with no ILP body and `refusal_text` as a
+  `text/plain` body (`http_response_body_hex`).
+
+### `payout_voucher`
+
+ADR 0075 decision 7 (issue #1381): a connector pays a client back with a voucher on its own
+outbound channel toward the client's payee key, signed by the chain's settlement key, and delivers
+it as a BTP TRANSFER on the client's session (`client-edge-spec.md` §1.9 step 7). ADR 0026's #1073
+correction records the client BTP dialect as uncovered by this contract; this section covers the one
+entry of it a client must parse to be paid.
+
+- **`evm`** -- `{ name, chain_id, verifying_contract_hex, channel_config, channel_id_hex,
+max_claimable_amount, digest_hex, signer_address_hex, signature_hex, json, btp_transfer_hex }`: the
+  voucher facts under `claim_voucher.evm`'s names (checked against the deployed contract by the same
+  `x402_voucher_vector.rs`), with the connector as `payer == payerAuthorizer` and the client's payee
+  in both receiving seats. `json` is the `payout-claim` entry: the voucher claim JSON **less its
+  envelope** (`version`, `messageId`, `timestamp`, `senderId`) -- `blockchain`, `scheme`,
+  `channelId`, `maxClaimableAmount` (decimal string), `signature`, and always the `channelConfig`
+  landing needs. `btp_transfer_hex` is the complete TRANSFER frame: its `amount` is
+  `max_claimable_amount`, its one protocolData entry is `payout-claim` carrying `json` as raw UTF-8,
+  and it has no `ilpPacket`.
+- **`solana`** -- `{ name, channel_account_base58, authorized_signer_base58, signer_secret_hex,
+max_claimable_amount, signed_message_hex, signature_base58, json, btp_transfer_hex }`: the same,
+  on `payment-channels`, with `expiresAt: 0` and a base58 signature over the 50-byte message.
+- A client lands a payout itself: it can restore the envelope and parse `json` as its own voucher
+  claim (the generator does exactly this before committing each case), and only the channel's
+  receiver can land it.
+
+[ADR 0018]: [ADR 0018]: ../docs/adr/0018-a-payload-is-sealed-to-the-terminating-connector.md

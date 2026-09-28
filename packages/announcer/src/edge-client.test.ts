@@ -72,44 +72,41 @@ const EVM_GREETING = {
   resource: { url: 'g.toon.relay' },
   accepts: [
     {
-      scheme: 'toon-channel',
-      network: 'g.toon.relay',
+      scheme: 'batch-settlement',
+      network: 'eip155:84532',
       amount: '1000',
-      payTo: 'g.toon.relay',
+      asset: '0xToken',
+      payTo: '0xSettlement',
       maxTimeoutSeconds: 60,
-      httpEndpoint: '/ilp',
       extra: {
-        ilpAddress: 'g.toon.relay',
-        endpoint: '/ilp',
-        price: '1000',
-        settlement: {
-          chain: 'evm:84532',
-          settlementAddress: '0xSettlement',
-          tokenNetworkRegistry: '0xRegistry',
-          tokenNetwork: '0xTokenNetwork',
-          tokenAddress: '0xToken',
-          decimals: 6,
-        },
-        settlements: [
-          {
-            chain: 'evm:84532',
-            settlementAddress: '0xSettlement',
-            tokenNetworkRegistry: '0xRegistry',
-            tokenNetwork: '0xTokenNetwork',
-            tokenAddress: '0xToken',
-            decimals: 6,
-          },
-          {
-            chain: 'solana',
-            settlementAddress: 'SolSettlement111',
-            programId: 'ProgramId1111',
-            tokenAddress: 'MintAddress111',
-            decimals: 6,
-          },
-        ],
+        receiverAuthorizer: '0xSettlement',
+        withdrawDelay: 86400,
+        name: 'USDC',
+        version: '2',
+      },
+    },
+    {
+      scheme: 'batch-settlement',
+      network: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+      amount: '1000',
+      asset: 'MintAddress111',
+      payTo: 'SolSettlement111',
+      maxTimeoutSeconds: 60,
+      extra: {
+        feePayer: 'SolSettlement111',
+        withdrawDelay: 86400,
+        tokenProgram: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+        minDeposit: '1000000',
+        sponsorEndpoint: '/ilp/batch-settlement/solana/open',
       },
     },
   ],
+  extensions: {
+    toon: {
+      info: { ilpAddress: 'g.toon.relay', amount: '1000', endpoint: '/ilp', price: '1000' },
+      schema: { type: 'object' },
+    },
+  },
 };
 
 function base64Header(json: unknown): string {
@@ -121,16 +118,44 @@ test('parseGreetingHeader: decodes a well-formed payment-required header into a 
   assert.ok(greeting);
   assert.equal(greeting?.destination, 'g.toon.relay');
   assert.equal(greeting?.price, '1000');
-  assert.equal(greeting?.httpEndpoint, '/ilp');
-  assert.equal(greeting?.settlement?.chain, 'evm:84532');
-  assert.equal(greeting?.settlements.length, 2);
+  assert.equal(greeting?.endpoint, '/ilp');
+  assert.equal(greeting?.batchSettlements.length, 2);
+  assert.equal(greeting?.batchSettlements[0]?.network, 'eip155:84532');
+  assert.equal(greeting?.batchSettlements[1]?.payTo, 'SolSettlement111');
+});
+
+test('parseGreetingHeader: reads channel terms from batch-settlement entries alone', () => {
+  const withStranger = {
+    ...EVM_GREETING,
+    accepts: [...EVM_GREETING.accepts, { scheme: 'exact', network: 'eip155:1', amount: '1' }],
+  };
+  const greeting = parseGreetingHeader(base64Header(withStranger), 'g.toon.relay', logger);
+  assert.equal(greeting?.batchSettlements.length, 2);
+});
+
+test('parseGreetingHeader: a pre-ADR 0075 toon-channel greeting (no extensions.toon) is refused', () => {
+  const old = {
+    x402Version: 2,
+    resource: { url: 'g.toon.relay' },
+    accepts: [
+      {
+        scheme: 'toon-channel',
+        network: 'g.toon.relay',
+        amount: '1000',
+        payTo: 'g.toon.relay',
+        httpEndpoint: '/ilp',
+        extra: { price: '1000', settlements: [] },
+      },
+    ],
+  };
+  assert.equal(parseGreetingHeader(base64Header(old), 'g.toon.relay', logger), null);
 });
 
 test('parseGreetingHeader: returns null on malformed base64', () => {
   assert.equal(parseGreetingHeader('%%%not-base64%%%', 'g.toon.relay', logger), null);
 });
 
-test('parseGreetingHeader: returns null when accepts/extra is missing', () => {
+test('parseGreetingHeader: returns null when extensions.toon is missing', () => {
   assert.equal(parseGreetingHeader(base64Header({ accepts: [] }), 'g.toon.relay', logger), null);
 });
 

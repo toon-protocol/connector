@@ -16,10 +16,10 @@
 //! solely to be refused by name ([`ConfigError::PeerCredentialRemoved`]).
 
 mod batch_settlement;
-mod client_channel;
 mod client_channel_asset;
 mod config;
 mod denomination;
+mod encoding;
 mod error;
 mod identity;
 mod node;
@@ -37,7 +37,6 @@ pub use batch_settlement::{
     EvmBatchSettlementConfig, SolanaBatchSettlementConfig, BATCH_SETTLEMENT_DELAY_FLOOR_SECS,
     DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS, EVM_BATCH_SETTLEMENT_MAX_WITHDRAW_DELAY_SECS,
 };
-pub use client_channel::{ClientChannelConfig, EvmClientChannelConfig, SolanaClientChannelConfig};
 pub use client_channel_asset::ClientChannelAssets;
 pub use config::{parse_socks_proxy, Config};
 pub use denomination::{DeclaredToken, DenominationConfig, QuoteLeg, QuotePath, RateRow};
@@ -56,5 +55,5 @@ pub use route::{PeerRouteConfig, StaticRoute, TransportPolicy};
 pub use secret::SecretLocation;
 pub use settlement::{
     EvmSettlementConfig, SettlementChain, SettlementConfig, SolanaSettlementConfig,
-    UnknownSettlementChain, DEFAULT_CHANNEL_INDEX_CONFIRMATIONS,
+    UnknownSettlementChain,
 };

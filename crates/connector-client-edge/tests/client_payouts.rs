@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use connector_client_edge::{
     AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
-    ChannelResolutionError, ClientChannelRegistry, ClientClaimGate, ClientPayoutLedger,
+    ChannelResolutionError, ClientClaimGate, ClientPayoutLedger,
 };
 use connector_domain::{Fulfill, Prepare};
 use connector_runtime::{
@@ -296,13 +296,10 @@ async fn serve(outbound: Arc<OutboundChannels>) -> SocketAddr {
         Arc::new(InProcessPeerTransport::new()),
         clock,
     ));
-    let gate = ClientClaimGate::restore(
-        ClientChannelRegistry::new(),
-        Arc::new(connector_runtime::InMemoryJournal::new()),
-    )
-    .expect("an empty journal")
-    .with_batch_settlement(Arc::new(ClientChannels))
-    .with_payout_ledger(Arc::new(ClientPayoutLedger::new(outbound)));
+    let gate = ClientClaimGate::restore(Arc::new(connector_runtime::InMemoryJournal::new()))
+        .expect("an empty journal")
+        .with_batch_settlement(Arc::new(ClientChannels))
+        .with_payout_ledger(Arc::new(ClientPayoutLedger::new(outbound)));
     let app = connector_client_edge::router_with_gate(connector, signer, None, gate);
     let server = axum::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(app.into_make_service());
     let addr = server.local_addr();

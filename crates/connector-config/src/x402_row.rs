@@ -13,7 +13,7 @@
 //! base58 of exactly 32 bytes. A `0x` string is never valid base58 (`0` is
 //! outside the alphabet), so no value can be read as both.
 
-use crate::client_channel::{is_base58_32_bytes, parse_hex_bytes, to_hex};
+use crate::encoding::{is_base58_32_bytes, parse_hex_bytes, to_hex};
 use crate::settlement::SettlementChain;
 
 /// A value written in one chain's spelling, canonicalized: EVM hex lower-cased

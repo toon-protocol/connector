@@ -81,7 +81,7 @@ pub mod ws;
 
 pub use accept::{PeerAcceptPolicy, PeerCarriageState, PeerSession};
 pub use challenge_json::{ChallengeDecodeError, PeerRoleChallenge};
-pub use claim_json::{ClaimDecodeError, PeerClaimDomain, PresentedPeerClaim};
+pub use claim_json::ClaimDecodeError;
 pub use dial::{decode_answer, BtpPeerTransport, DialError, PeerAnswer, PeerDialer, PeerRelation};
 pub use price_gate::{ClaimEnforcementPolicy, PaymentRequired};
 pub use role_gate::{FrameEvidence, VoucherCheck, VoucherEvidence};

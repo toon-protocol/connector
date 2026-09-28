@@ -4,7 +4,8 @@
 shape of `money-model-pre-868.md` — the joining-piece role, not its text. Both are frozen history
 (issues #1056, #1065); this document is what describes what money does **now**.
 
-**Coverage:** none of PM-01 – PM-22 is vectored except where noted — the EIP-712 claim digest and the
+**Coverage:** none of PM-01 – PM-22 is vectored except where noted — the voucher (`claim_voucher`,
+which replaced the EIP-712 `BalanceProof` digest at `schema_version` 7, issue #1384) and the
 peer-carriage claim framing are, and are the only payment facts under the cross-repo contract today.
 The rest enter [ADR 0045](../adr/0045-a-behavioural-rule-is-normative-prose-until-its-vector-lands.md)'s
 debt ledger; issue #1084 owns the order.
@@ -55,9 +56,22 @@ degraded mode.
 if its nonce advances its **watermark**. A byte-identical retransmit at an accepted nonce is
 idempotent; a _different_ claim at an accepted nonce MUST be refused and MUST NOT move the watermark.
 
+> **Amended by [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+> decision 8 (issue #1384).** Every claim is a voucher, and a voucher has no nonce: its cumulative
+> amount MUST strictly exceed the watermark, and a byte-identical resend is idempotent and buys
+> nothing (ADR 0074 decision 3; `client-edge-spec.md` §1.3 step 2). The nonce rule above governed the
+> retired `toon-channel` claim and is deleted with it.
+
 ---
 
 ## 3. What a claim signs
+
+> **Amended by [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+> (issue #1384).** PM-09 and PM-10 describe the retired `toon-channel` claim (ADR 0024 and ADR 0053,
+> both retired by ADR 0075), which no carriage accepts any more. A claim is an x402 voucher: on EVM
+> the EIP-712 `Voucher(bytes32 channelId,uint128 maxClaimableAmount)` under `x402BatchSettlement`'s
+> domain, on Solana Ed25519 over `payment-channels`' 50-byte voucher message — both vectored as
+> `claim_voucher` in `vectors/wire-vectors.json` (`schema_version` 7).
 
 **PM-09** `[any participant]` — An **EVM** claim signs the EIP-712 `BalanceProof` digest, covering
 `channel_id`, `nonce`, `transferred_amount` — **and `chain_id` and `token_network_address` through the

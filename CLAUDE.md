@@ -178,8 +178,8 @@ A node reads these:
 ADR 0075 (accepted, partly built — #1371) makes each chain's settlement key the signer of every
 voucher on that chain and leaves `[signer]` as identity only, with no spending authority. Client
 payouts (#1381) and peer claims (#1378, #1379, #1380) already follow it: both are vouchers signed by
-the chain's settlement key. Until #1384 lands, a client may still present a `toon-channel` claim at
-the client edge.
+the chain's settlement key. Since #1384 every claim at the client edge is a voucher too; a
+`toon-channel` claim is refused by name.
 
 `[announce]` is gone (ADR 0046 / #1074): the section is now `[node]`, holding only `addresses`,
 `http_endpoint` and `btp_endpoint` — the facts a node cannot introspect about itself — and no key of
@@ -348,8 +348,8 @@ so there is no per-peer proxy key and nothing to keep in sync. The host rule has
 client of that `rpc_url` on the one `socks_proxy`, on a circuit pinned per chain by SOCKS
 username, failing closed (ADR 0073, amending decision 4). Every client of a table's
 `rpc_url` is built from one `connector_chain_rpc::RpcTransport` in
-`runtime::settlement_transports` — the backend, and on EVM the channel-index syncer and the
-rate source; do not build a settlement RPC client any other way. The operational half — the daemon's
+`runtime::settlement_transports` — the backend, and on EVM the rate source; do not build a
+settlement RPC client any other way. The operational half — the daemon's
 terms-acceptance flag, its `HiddenServiceDir` on a persisted volume, and the fact that
 `HiddenServicePort`'s target is resolved when the daemon _parses_ its config, so an
 unresolvable container name crashes it before it runs — is

@@ -13,7 +13,7 @@
 //! packet's payload length, flat when its slope is zero (ADR 0065, [`price`]) --
 //! fulfilment / expiry rules (RFC-0022; the execution condition itself left
 //! the wire under issue #1269 / ADR 0069),
-//! claim nonce / watermark rules (ADR 0004, ADR 0005, issue #423), and the
+//! the voucher watermark rule (ADR 0074, ADR 0075), and the
 //! structured envelope a packet carries to and from the app behind a
 //! terminated route (ADR 0018, issue #519). Also the x402 `payment-required`
 //! greeting's wire shape and its reader (issue #874, [`x402`]) -- shared here
@@ -44,8 +44,8 @@ pub mod x402;
 pub use address::is_valid_ilp_address;
 pub use asset::{AssetChain, AssetId, AssetIdError};
 pub use claim::{
-    advance_voucher_watermark, advance_watermark, validate_claim, validate_price, validate_voucher,
-    ClaimError, VoucherAdmission, VoucherWatermark, Watermark, VOUCHER_WATERMARK_NONCE,
+    advance_voucher_watermark, validate_price, validate_voucher, ClaimError, VoucherAdmission,
+    VoucherWatermark, Watermark, VOUCHER_WATERMARK_NONCE,
 };
 pub use condition::{
     delivery_budget, forwarded_expiry, fulfillment_matches_condition, is_expired,

@@ -102,7 +102,7 @@ below is a **boot failure naming what is wrong**, not a runtime surprise:
 | **any** route sets a `fee`                                             | a fee attaches to a peering, not to a route (ADR 0061)                           |
 | a **forwarded** route has no `price`                                   | it is priced at this connector's own client edge                                 |
 | a forwarded route names a peer id no `[[peers]]` row configures        | the routing table _is_ the relationship set                                      |
-| `[[client_channels]]` is configured with no `state_dir`                | a restart would hand every spent claim back as free service                      |
+| a settlement table or channel row is configured with no `state_dir`    | a restart would hand every spent claim back as free service                      |
 | `state_dir` cannot be written                                          | same, discovered at boot rather than at the first claim                          |
 | the claim journal is corrupt                                           | claims are the source of truth; a damaged journal is not recoverable by guessing |
 | the operator surface is enabled with no bearer token, or no write keys | an unauthenticated operator surface is worse than none                           |
@@ -333,7 +333,10 @@ highest voucher signed, outbound, or accepted, inbound) and `status` (`opening`,
 `withdrawing`, `closing`, `sealed`, or `unreadable` with a `detail`), marked `scheme:
 "batch-settlement"`. Any `toon-channel` rows follow in their older shape. `GET /claims` shows vouchers
 received and vouchers signed, each row with its `direction` and its `scheme`; a signed voucher's row
-comes from the outbound channels' own book (`book: "outbound"`).
+comes from the outbound channels' own book (`book: "outbound"`). A row's `nonce` is `0` for a
+voucher, which has none; a `toon-channel` row an older journal still holds reports the nonce the
+journal recorded on the peer book and `0` on the client book, whose replay keeps only amounts since
+issue #1384.
 
 The audit log is the one worth knowing about: **every accepted write is retained as its own
 signature**, not as a log line asserting that something happened.

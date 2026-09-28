@@ -120,8 +120,10 @@ one place a value is chosen), applied by `Connector::deliver_opened_envelope`
 (`crates/connector-runtime/src/connector.rs`) above the `AppClient` port, so the port itself stays
 the thin adapter issue #521 made it. Asserted by `connector::tests::payment_attribution::*`, which
 read the headers a `FakeAppClient` actually recorded receiving, and — against a real chain, a real
-claim and a real signature check — by
-`price_charging_real_chain.rs::a_claim_backed_by_real_on_chain_funding_is_charged_the_routes_price`.
+claim and a real signature check — by the voucher end-to-end tests
+`crates/connector-cli/tests/batch_settlement_evm_end_to_end.rs` and
+`batch_settlement_solana_end_to_end.rs`, which read the headers a real app received (moved there
+from the retired `toon-channel` real-chain tests by issue #1384).
 
 ## Considered options
 

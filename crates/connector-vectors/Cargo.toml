@@ -13,6 +13,7 @@ connector-peer-auth = { path = "../connector-peer-auth" }
 connector-peer-btp = { path = "../connector-peer-btp" }
 connector-peer-http = { path = "../connector-peer-http" }
 connector-runtime = { path = "../connector-runtime" }
+connector-settlement = { path = "../connector-settlement" }
 connector-signer = { path = "../connector-signer", features = ["test-util"] }
 base64 = "0.22"
 chrono = "0.4"

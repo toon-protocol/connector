@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use connector_domain::{advance_watermark, JournalEntry, Watermark};
+use connector_domain::JournalEntry;
 use connector_signer::Signature;
 
 use crate::journal::{Journal, JournalError};
@@ -32,11 +32,9 @@ use crate::operator_view::ClaimView;
 ///
 /// **No peering sends or judges one any more** (ADR 0075, issue #1380):
 /// every peering pays with vouchers, and a `toon-channel` claim presented on
-/// a peer carriage never decides the peer role. The type survives for the
-/// carriages' parse of the claim slot -- a frame that carries one is read,
-/// and is a client's -- and for the wire vectors, whose `toon-channel`
-/// sections #1384 drops. Distinct from `connector_settlement::Claim`, the
-/// on-chain redemption claim.
+/// a peer carriage is refused by name (#1384). The type survives only for
+/// `SettlementBackend`'s redemption port, deleted in #1385. Distinct from
+/// `connector_settlement::Claim`, the on-chain redemption claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireClaim {
     pub channel_id: String,
@@ -254,13 +252,23 @@ impl From<Signature> for ClaimSignature {
     }
 }
 
+/// Where a `toon-channel` channel's watermark stood when an older build's
+/// journal last recorded it: its nonce and cumulative amount, as history.
+/// Not `connector_domain`'s voucher watermark, and nothing is judged against
+/// it -- the nonce rules are deleted (ADR 0075 decision 8, issue #1384).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayedWatermark {
+    nonce: u64,
+    cumulative_amount: u64,
+}
+
 /// The replay of a peer claim journal an older build wrote (ADR 0005):
 /// each channel's `toon-channel` watermark as the journal last recorded it,
 /// for `GET /claims`. Nothing appends to it and nothing judges a claim
 /// against it (see the module doc).
 pub struct ClaimBook {
     /// `channel_id` -> the highest nonce/amount the journal recorded on it.
-    inbound_watermarks: Arc<RwLock<HashMap<String, Watermark>>>,
+    inbound_watermarks: Arc<RwLock<HashMap<String, ReplayedWatermark>>>,
 }
 
 impl Default for ClaimBook {
@@ -289,8 +297,8 @@ impl ClaimBook {
         Ok(())
     }
 
-    fn rebuild_from(entries: &[JournalEntry]) -> HashMap<String, Watermark> {
-        let mut inbound_watermarks: HashMap<String, Watermark> = HashMap::new();
+    fn rebuild_from(entries: &[JournalEntry]) -> HashMap<String, ReplayedWatermark> {
+        let mut inbound_watermarks: HashMap<String, ReplayedWatermark> = HashMap::new();
         for entry in entries {
             if let JournalEntry::InboundClaimAccepted {
                 channel_id,
@@ -301,7 +309,10 @@ impl ClaimBook {
             {
                 inbound_watermarks.insert(
                     channel_id.clone(),
-                    advance_watermark(*nonce, *cumulative_amount),
+                    ReplayedWatermark {
+                        nonce: *nonce,
+                        cumulative_amount: *cumulative_amount,
+                    },
                 );
             }
         }
@@ -405,6 +416,6 @@ mod tests {
         assert_eq!(views.len(), 1, "an outbound entry replays as nothing");
         assert_eq!(views[0].channel_id, "0x02");
         assert_eq!(views[0].cumulative_amount, 90);
-        assert_eq!(views[0].nonce, advance_watermark(2, 90).nonce);
+        assert_eq!(views[0].nonce, 2);
     }
 }

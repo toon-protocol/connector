@@ -175,11 +175,11 @@ demonstrated good behaviour is a trust mechanism, and trust is policy.
 
 **CF-21** `[operator]` — A connector MUST distinguish, in configuration, three channel roles:
 
-| role               | means                                                                        |
-| ------------------ | ---------------------------------------------------------------------------- |
-| **peer channel**   | whose vouchers prove a peering, and optionally the channel they must ride on |
-| **client channel** | which channel a client's claims are judged against                           |
-| **pay channel**    | a channel this connector pays _from_, as a client of another node            |
+| role               | means                                                                                                                                                                                                                    |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **peer channel**   | whose vouchers prove a peering, and optionally the channel they must ride on                                                                                                                                             |
+| **client channel** | which channel a client's claims are judged against — **not configured** since issue #1384: a client's x402 channel is resolved from the chain when its voucher presents it, and `[[client_channels]]` is refused by name |
+| **pay channel**    | a channel this connector pays _from_, as a client of another node                                                                                                                                                        |
 
 **CF-22** `[connector]` — No channel may appear in two books: one channel that is both a peer's
 and a client's, or both paid from and received on, is one channel counted as credit twice, and MUST
@@ -205,8 +205,8 @@ client book's declared-channel latitude (CF-23's "a configured row", and the dep
 does not reach it. ([issue #1138](https://github.com/toon-protocol/connector/issues/1138))
 
 **CF-23** `[connector]` — A claim's signature MUST be verified against **this connector's own record
-of the channel** — a configured row, or a channel resolved from chain — and never against anything the
-claim declares about itself.
+of the channel** — a channel resolved from chain (since issue #1384 the only kind at the client edge,
+where no row configures one) — and never against anything the claim declares about itself.
 ([ADR 0052](../adr/0052-permissionless-payment-is-guaranteed-and-a-claim-is-what-authorises.md))
 
 **CF-37** `[connector]` — A configured peering MUST be bound to at least one **peer channel** row,
@@ -317,7 +317,6 @@ spell it however it likes.
 | `[[routes]]`                               | array of tables                       | —        | CF-10 – CF-15                                        |
 | `[[peers]]`                                | array of tables                       | —        | CF-16 – CF-20                                        |
 | `[[peer_channels]]`                        | array of tables                       | —        | CF-21, the peer book                                 |
-| `[[client_channels]]`                      | array of tables                       | —        | CF-21, the client book                               |
 | `[[pay_channels]]`                         | array of tables                       | —        | CF-21, channels this node pays from                  |
 | `[[client_identities]]`                    | array of tables                       | —        | CF-29                                                |
 | `[settlement.evm]` / `[settlement.solana]` | tables                                | —        | CF-24, CF-25                                         |
@@ -387,8 +386,8 @@ neither is a proxy address, and both are refused by name. The scheme must be
 the hostname locally, no local resolver resolves a hidden-service name, and a node that accepted one
 would fail its onion peerings at dial time instead of at the line an operator wrote.
 
-**The three channel books** (CF-21) — `[[peer_channels]]`, `[[client_channels]]` and
-`[[pay_channels]]` — are §2.4.
+**The channel books** (CF-21) — `[[peer_channels]]` and `[[pay_channels]]` — are §2.4.
+`[[client_channels]]` was the third, and is a tombstone since issue #1384 (§2.3).
 
 **Settlement has two shapes** (issue #628). The legacy flat one — `chain`, `rpc_url`,
 `contract_address`, `token_address`, `decimals` and a key table, all directly under `[settlement]` —
@@ -502,7 +501,6 @@ mount, which has to be `chown 10001:10001`ed first.
 Visible to nobody outside the process, and **not** part of §1. They shape this connector's own resource
 use and belong in an operator's guide rather than a protocol specification.
 
-`channel_liveness_ttl_secs` · `channel_serve_stale_secs` · `channel_reattempt_interval_ms` ·
 `unresolvable_lookup_budget_per_signer` · `unresolvable_lookup_budget_total` ·
 `unresolvable_lookup_budget_window_secs` · `unresolvable_lookup_budget_max_wait_ms` ·
 `btp_session_window`
@@ -513,7 +511,7 @@ is a boolean on `[settlement.evm]` and on `[settlement.solana]`, `false` when om
 accepted by the frozen legacy `[settlement]` shape. When a table sets it:
 
 - every client of that table's `rpc_url` dials through the node's one `socks_proxy` as `socks5h`: the
-  settlement backend, and on EVM the channel-index syncer and the rate source too. None is left
+  settlement backend, and on EVM the rate source too. None is left
   direct, and a proxy that is down is a failed call, never a direct dial;
 - each chain rides its own circuit, pinned by a fixed SOCKS username (`toon-settlement-evm`,
   `toon-settlement-solana`), which relies on the daemon's `IsolateSOCKSAuth` (on by default);
@@ -531,15 +529,6 @@ endpoint ties them to the account that holds the key. Every settlement client, p
 runs under the same bounds: 20s to connect, 30s per request, idle connections dropped after 30s, and
 a 403 or 429 retried with backoff.
 
-`[settlement.evm]` carries two more of the same kind (issue #661), for the local channel index a node
-builds from its own `TokenNetwork`'s logs so that resolving an unfamiliar channel is a map hit rather
-than an RPC call: `channel_index_from_block`, the block a cold start with no checkpoint backfills from
-— it defaults to `0`, so an operator who knows their `TokenNetwork`'s deploy block should set it
-rather than scan a public chain from genesis — and `channel_index_confirmations`, how many blocks
-behind head a log must be before the index applies it. That one defaults to `5`, and `0` is refused at
-load, since there is deliberately no reorg-unwind path. Omitting both changes no behaviour: a channel
-the index has not caught up to falls through to a direct chain read.
-
 `btp_session_window` splits, and shows the general shape: **the existence of an in-flight limit and
 what a connector does when it is exceeded are law** (client-edge specification); the number that sets
 it is not. _The limit is law, the number is policy._
@@ -549,24 +538,27 @@ it is not. _The limit is law, the number is policy._
 Parsed **solely to be rejected by name**, per CF-35. Finding one of these identifiers in the tree is
 finding a tombstone, not a live mechanism.
 
-| key                                                                                                                                                       | removed by                                                                                                                                                                                                                            |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `peer_wire_addr`                                                                                                                                          | [ADR 0027](../adr/0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md)                                                                                                                                      |
-| a peer's `addr`                                                                                                                                           | [ADR 0027](../adr/0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md) (#679) — the `SocketAddr` form of the same removal; a peer is reached by `endpoint` now                                              |
-| a Solana channel row's `program_id`                                                                                                                       | (#1082, #1128, #1146) — the program is `[settlement.solana]`'s, per CF-26; the field is spelled out on each Solana row only so writing one is named rather than lost in a shape mismatch                                              |
-| the `toon-channel` fields of `[[peer_channels]]` and `[[pay_channels]]`: `channel_id`, `channel_account`, `chain_id`, `token_network`, `counterparty_key` | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1380) — a peering is proven by a voucher signer and paid over this node's own outbound x402 channel                                            |
-| `ceiling`, `flush_interval_ms`                                                                                                                            | [ADR 0033](../adr/0033-the-exposure-machinery-is-retired-not-restated.md)                                                                                                                                                             |
-| a peer's `claim_ack_timeout_ms`                                                                                                                           | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1380) — it bounded the flush, which is deleted; a voucher's verdict rides the answer `peer_answer_timeout_ms` bounds                           |
-| `[peer_sale]`                                                                                                                                             | [ADR 0043](../adr/0043-purchasable-peering-is-removed.md)                                                                                                                                                                             |
-| `apex`, `[[children]]`                                                                                                                                    | [ADR 0009](../adr/0009-one-typed-config-file-no-environment-layer.md)'s update (#1057)                                                                                                                                                |
-| `claim_enforcement`                                                                                                                                       | [ADR 0042](../adr/0042-a-packet-carries-its-claim.md) item 4 (#1062 decided, #1077 deleted)                                                                                                                                           |
-| a peer's `credential`                                                                                                                                     | [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (#1157) — a claim proves a peering, so there is no shared secret to write                                                                        |
-| a route's `fee`                                                                                                                                           | [ADR 0061](../adr/0061-a-fee-attaches-to-a-peering-not-to-a-route.md) (#1159) — it moved to the `[[peers]]` row the route's `peer_id` names                                                                                           |
-| `[announce]` and its announce-only keys                                                                                                                   | [ADR 0046](../adr/0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md) (#1074); the section's three surviving fields are `[node]`, per [ADR 0050](../adr/0050-a-connectors-url-resolves-to-its-self-description.md) |
+| key                                                                                                                                                       | removed by                                                                                                                                                                                                                                                            |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `peer_wire_addr`                                                                                                                                          | [ADR 0027](../adr/0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md)                                                                                                                                                                      |
+| a peer's `addr`                                                                                                                                           | [ADR 0027](../adr/0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md) (#679) — the `SocketAddr` form of the same removal; a peer is reached by `endpoint` now                                                                              |
+| a Solana channel row's `program_id`                                                                                                                       | (#1082, #1128, #1146) — the program is `[settlement.solana]`'s, per CF-26; the field is spelled out on each Solana row only so writing one is named rather than lost in a shape mismatch                                                                              |
+| the `toon-channel` fields of `[[peer_channels]]` and `[[pay_channels]]`: `channel_id`, `channel_account`, `chain_id`, `token_network`, `counterparty_key` | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1380) — a peering is proven by a voucher signer and paid over this node's own outbound x402 channel                                                                            |
+| `ceiling`, `flush_interval_ms`                                                                                                                            | [ADR 0033](../adr/0033-the-exposure-machinery-is-retired-not-restated.md)                                                                                                                                                                                             |
+| a peer's `claim_ack_timeout_ms`                                                                                                                           | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1380) — it bounded the flush, which is deleted; a voucher's verdict rides the answer `peer_answer_timeout_ms` bounds                                                           |
+| `[peer_sale]`                                                                                                                                             | [ADR 0043](../adr/0043-purchasable-peering-is-removed.md)                                                                                                                                                                                                             |
+| `apex`, `[[children]]`                                                                                                                                    | [ADR 0009](../adr/0009-one-typed-config-file-no-environment-layer.md)'s update (#1057)                                                                                                                                                                                |
+| `claim_enforcement`                                                                                                                                       | [ADR 0042](../adr/0042-a-packet-carries-its-claim.md) item 4 (#1062 decided, #1077 deleted)                                                                                                                                                                           |
+| a peer's `credential`                                                                                                                                     | [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (#1157) — a claim proves a peering, so there is no shared secret to write                                                                                                        |
+| a route's `fee`                                                                                                                                           | [ADR 0061](../adr/0061-a-fee-attaches-to-a-peering-not-to-a-route.md) (#1159) — it moved to the `[[peers]]` row the route's `peer_id` names                                                                                                                           |
+| `[[client_channels]]`                                                                                                                                     | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384) — it declared the channels a `toon-channel` claim was paid on; a client's x402 channel is resolved from the chain when its voucher presents it (`ClientChannelsRemoved`) |
+| `channel_liveness_ttl_secs`, `channel_serve_stale_secs`, `channel_reattempt_interval_ms`                                                                  | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384) — they tuned the client-edge `toon-channel` channel registry's liveness memo, deleted with it (`ChannelLivenessKeyRemoved`)                                              |
+| `[settlement.evm]` `channel_index_from_block`, `channel_index_confirmations`                                                                              | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384, ahead of #1385) — they tuned the `TokenNetwork` channel index, deleted with its last caller (`SettlementChannelIndexKeyRemoved`)                                         |
+| `[announce]` and its announce-only keys                                                                                                                   | [ADR 0046](../adr/0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md) (#1074); the section's three surviving fields are `[node]`, per [ADR 0050](../adr/0050-a-connectors-url-resolves-to-its-self-description.md)                                 |
 
 ### 2.4 The channel books
 
-**The three channel books** (CF-21) are told apart by what each does with a claim.
+**The channel books** (CF-21) are told apart by what each does with a claim.
 
 `[[peer_channels]]` names **whose vouchers prove a peering**
 ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decisions 5
@@ -583,8 +575,9 @@ challenge — signed by that key, on either carriage; a `toon-channel` claim nev
 chain is read off the spelling, so there is no `chain` key: a `0x` value is EVM and a base58 one
 Solana, and no value is both.
 
-`[[client_channels]]` is a channel this node **receives** a client's claims on, and names its
-`counterparty` (CF-23).
+`[[client_channels]]`, which named a channel this node **received** a client's `toon-channel`
+claims on and its `counterparty` (CF-23), is refused by name since issue #1384: a client's channel
+is an x402 channel, resolved from the chain when its voucher presents it.
 
 `[[pay_channels]]` names the channel this node **pays** a hop from — every PREPARE forwarded to that
 peer carries a covering voucher on it ([ADR 0042](../adr/0042-a-packet-carries-its-claim.md)):

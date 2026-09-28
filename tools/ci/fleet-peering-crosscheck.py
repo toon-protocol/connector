@@ -35,20 +35,16 @@ NODES = {
     "gas": "https://proxy.gas.devnet.toonprotocol.dev/ilp",
 }
 
-# Settlement facts that MUST match across a peering, per chain. The
-# settlement ADDRESS is deliberately absent: it is meant to differ, being
-# each node's own. These are the shared facts a channel identifier is
-# derived FROM (ADR 0059), so changing any of them on one box and not the
-# other moves every channel id on one side only. That is the 2026-08-28
-# 01:27Z outage exactly -- an SPL mint cutover, and Solana seeds the channel
-# PDA with the mint (["channel", min(p1, p2), max(p1, p2), mint]).
-SHARED_SETTLEMENT_FACTS = (
-    "tokenNetworkRegistry",
-    "tokenNetwork",
-    "tokenAddress",
-    "programId",
-    "decimals",
-)
+# Settlement facts that MUST match across a peering, per chain, read off
+# each document's `batchSettlements` (ADR 0075: every channel is an x402
+# channel, and the self-description's `settlements` -- the retired
+# `toon-channel` terms -- is gone, issue #1384). The settlement ADDRESS
+# (`payTo`) is deliberately absent: it is meant to differ, being each node's
+# own. What must agree is the token: a peering's two one-way channels each
+# settle in one asset, and a mint cutover on one box and not the other --
+# the 2026-08-28 01:27Z outage exactly -- leaves one side opening channels
+# the other will not admit.
+SHARED_SETTLEMENT_FACTS = ("asset",)
 
 
 def fetch_over_https(url):
@@ -176,12 +172,12 @@ def crosscheck(nodes, fetch):
     }
 
     def settlements_of(name):
-        return {s["chain"]: s for s in docs[name].get("settlements", [])}
+        return {s["network"]: s for s in docs[name].get("batchSettlements", [])}
 
     def check_peering(near, far, prefix):
         """The two checks that are about the PEERING rather than the route:
-        can the two sides still derive the same channel, and can either of
-        them still dial the other."""
+        do the two sides still settle in the same token on a chain they
+        share, and can either of them still dial the other."""
         a, b = settlements_of(near), settlements_of(far)
         subject = f"{near} -> {far}"
         shared = sorted(set(a) & set(b))
@@ -211,10 +207,9 @@ def crosscheck(nodes, fetch):
                     False,
                     subject,
                     f"settlement facts agree on `{chain}`",
-                    "the two sides derive channel ids from DIFFERENT facts, "
-                    "so every channel id between them has moved on one side "
-                    "only, and the other answers T00 'would not report the "
-                    "claim state of channel ...' -- " + "; ".join(differing),
+                    "the two sides settle in DIFFERENT tokens, so a channel "
+                    "one side opens is one the other will not admit -- "
+                    + "; ".join(differing),
                 )
             elif not agreed:
                 row(
@@ -231,7 +226,7 @@ def crosscheck(nodes, fetch):
                     subject,
                     f"settlement facts agree on `{chain}`",
                     "agree on " + ", ".join(agreed)
-                    + " -- channel ids derive alike on both sides",
+                    + " -- each side admits the other's channels",
                 )
 
         # Exactly one side of a peering dials; the other only accepts, and
@@ -446,23 +441,20 @@ def _doc(addresses, routes, settlements, carriages):
             dict({"prefix": p, "price": str(f)}, **({"pricePerKib": str(k)} if k else {}))
             for p, f, k in routes
         ],
-        "settlements": settlements,
+        "batchSettlements": settlements,
         "peerCarriages": carriages,
     }
 
 
 _EVM = {
-    "chain": "evm:84532",
-    "tokenNetworkRegistry": "0xreg",
-    "tokenNetwork": "0xnet",
-    "tokenAddress": "0xusdc",
-    "decimals": 6,
+    "network": "eip155:84532",
+    "asset": "0xusdc",
+    "payTo": "0xnode",
 }
 _SOL = {
-    "chain": "solana",
-    "programId": "prog",
-    "tokenAddress": "mintA",
-    "decimals": 6,
+    "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+    "asset": "mintA",
+    "payTo": "node",
 }
 
 
@@ -515,8 +507,8 @@ def _self_test():
 
     # The 2026-08-28 01:27Z outage: an SPL mint cutover on one box only.
     cut = _fleet()
-    cut["store"]["settlements"][1] = dict(_SOL, tokenAddress="mintB")
-    case("an SPL mint cutover on one side fails", _run(cut), True, "tokenAddress")
+    cut["store"]["batchSettlements"][1] = dict(_SOL, asset="mintB")
+    case("an SPL mint cutover on one side fails", _run(cut), True, "asset")
 
     # A prefix forwarded to nobody -- the shape found live on the store box.
     dangling = _fleet()
@@ -540,8 +532,8 @@ def _self_test():
 
     # No chain in common: nothing can pay.
     apart = _fleet()
-    apart["store"]["settlements"] = [dict(_SOL)]
-    apart["relay"]["settlements"] = [dict(_EVM)]
+    apart["store"]["batchSettlements"] = [dict(_SOL)]
+    apart["relay"]["batchSettlements"] = [dict(_EVM)]
     case("no settlement chain in common fails", _run(apart), True, "no chain in common")
 
     # An unreachable node is a failure, never a skip.

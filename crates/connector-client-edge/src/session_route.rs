@@ -348,7 +348,7 @@ mod tests {
         test_state_with_gate(
             connector,
             session_registry,
-            ClientClaimGate::restore(Default::default(), Arc::new(InMemoryJournal::new()))
+            ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
                 .expect("a fresh in-memory journal has nothing to replay"),
         )
     }
@@ -796,7 +796,7 @@ mod tests {
     /// [`payee`] -- what a verified voucher or channel-control proof on this
     /// session teaches it (`crate::btp::record_accepted_claim`).
     fn gate_paying(address: &str, ledger: &Arc<ClientPayoutLedger>) -> ClientClaimGate {
-        let gate = ClientClaimGate::restore(Default::default(), Arc::new(InMemoryJournal::new()))
+        let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
             .expect("a fresh in-memory journal has nothing to replay")
             .with_payout_ledger(Arc::clone(ledger));
         gate.record_session_payee(address, payee());
@@ -1005,7 +1005,7 @@ mod tests {
     async fn a_destination_with_no_known_payee_is_not_paid() {
         let address = "g.provider.unpaid";
         let ledger = test_ledger_paying(PAYEE).await;
-        let gate = ClientClaimGate::restore(Default::default(), Arc::new(InMemoryJournal::new()))
+        let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
             .expect("a fresh in-memory journal has nothing to replay")
             .with_payout_ledger(Arc::clone(&ledger));
 

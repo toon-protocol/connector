@@ -166,6 +166,18 @@ price = {PRICE}
         2,
         "both writes reached the app"
     );
+    // ADR 0040, over the voucher path (issue #1384 moved this from the
+    // retired toon-channel paid-write test): the app is told which channel
+    // paid for each write, how much, and on what chain -- the channel the
+    // voucher was verified against, not anything the sender wrote.
+    for write in recorded.lock().unwrap().iter() {
+        assert_eq!(write.header("x-toon-payer"), Some(key.as_str()));
+        assert_eq!(
+            write.header("x-toon-amount"),
+            Some(PRICE.to_string().as_str())
+        );
+        assert_eq!(write.header("x-toon-chain"), Some("evm"));
+    }
 
     // Journaled: the channel, with the config that restores it, and each
     // voucher's signed bytes and watermark.

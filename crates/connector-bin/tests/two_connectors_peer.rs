@@ -31,22 +31,19 @@
 //!
 //! | # | Claim | Test |
 //! | - | ----- | ---- |
-//! | 1 | a packet crosses the peering and is fulfilled, and the payee's client-edge journal records the payer's voucher advanced by exactly what was forwarded (`CLIENT_PRICE - PEER_FEE`) -- the client leg paid by a real client claim on the payer's edge | [`two_connectors_move_a_paid_packet_over_btp`] / [`_over_http`](two_connectors_move_a_paid_packet_over_http) |
+//! | 1 | a packet crosses the peering and is fulfilled, and the payee's client-edge journal records the payer's voucher advanced by exactly what was forwarded (`CLIENT_PRICE - PEER_FEE`) -- the client leg paid by a real client voucher on the payer's edge | [`two_connectors_move_a_paid_packet_over_btp`] / [`_over_http`](two_connectors_move_a_paid_packet_over_http) |
 //! | 2 | a peer voucher is acked `accepted`, a byte-identical resend is re-acked `accepted` (§6.3), and a voucher below the watermark is refused `amount_not_advancing` | [`a_peer_voucher_is_acknowledged_over_btp`] / [`_over_http`](a_peer_voucher_is_acknowledged_over_http) |
-//! | 3 | §1.9's named regression: no evidence, a stranger's voucher on the payer's channel, an unbound signer's voucher on its own channel, a **genuine** `toon-channel` claim by the bound payer key, and a garbage header -- each gets no claim-ack and journals nothing on the peering's channel; the two that are genuine payments to the payee (the unbound voucher, the `toon-channel` claim) are journaled as a client's and nothing else is | [`a_claim_that_does_not_prove_the_peer_role_reaches_no_peer_handling_over_http`] / [`_over_btp`](a_claim_that_does_not_prove_the_peer_role_reaches_no_peer_handling_over_btp) |
+//! | 3 | §1.9's named regression: no evidence, a stranger's voucher on the payer's channel, an unbound signer's voucher on its own channel, a retired `toon-channel` claim (refused by name, #1384), and a garbage header -- each gets no claim-ack and journals nothing on the peering's channel; the one genuine payment to the payee (the unbound voucher) is journaled as a client's and nothing else is | [`a_claim_that_does_not_prove_the_peer_role_reaches_no_peer_handling_over_http`] / [`_over_btp`](a_claim_that_does_not_prove_the_peer_role_reaches_no_peer_handling_over_btp) |
 //! | 4 | a peering with no `[[peer_channels]]` row, and a `[[pay_channels]]` row naming a channel this node's journal does not hold, each refuse to start by name | [`a_peer_with_no_channel_binding_refuses_to_start`], [`a_pay_channel_this_node_never_opened_refuses_to_start`] |
 //! | 5 | a priced forwarded route carries no more than its price (ADR 0028) | [`a_client_may_not_declare_more_than_the_forwarded_route_charges`] |
 //!
-//! # The client leg is still a `toon-channel` one (until #1384)
+//! # The client leg
 //!
-//! A client of the payer pays on a TOON `TokenNetwork` channel named by a
-//! `[[client_channels]]` row, which the payer still accepts until #1384. So
-//! [`PeerFixture`] deploys a `TokenNetworkRegistry` -- which
-//! `[settlement.evm]` still names as a boot requirement until #1385 -- and
-//! opens that client channel on it. The same registry holds the one
-//! `TokenNetwork` channel between payer and payee that the regression's
-//! genuine `toon-channel` claim is signed on: a claim that would have been a
-//! valid peer claim before ADR 0075 and now must decide nothing.
+//! A client of the payer pays on an x402 channel of its own toward the payer
+//! (ADR 0075: every claim is a voucher, #1384), opened the way a stock x402
+//! client opens one. `[settlement.evm]` still names a `TokenNetworkRegistry`
+//! as a boot requirement until #1385, so [`Chain`] deploys one; nothing is
+//! opened on it.
 //!
 //! # EVM only
 //!
@@ -59,11 +56,9 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use chrono::Duration as ChronoDuration;
 use ethers::signers::{LocalWallet, Signer as _};
 use ethers::types::Address;
 use futures_util::{SinkExt as _, StreamExt as _};
-use libsecp256k1::{Message, PublicKey, SecretKey};
 
 use connector_btp::{
     decode_frame, encode_message, ProtocolData, BTP_RESPONSE, CLAIM_ACK_PROTOCOL, CLAIM_PROTOCOL,
@@ -74,25 +69,19 @@ use connector_runtime::{FileJournal, InMemoryJournal, Journal, OutboundChannels,
 use connector_settlement::batch::{
     BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, ReceiverTerms, Voucher,
 };
-use connector_settlement::{ChannelId, SettlementBackend};
+use connector_settlement::ChannelId;
 use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
 use connector_settlement_evm::EvmSettlementBackend;
-use connector_signer::{
-    derive_evm_address, evm_balance_proof_digest, to_hex, EvmBalanceProof, PublicKeyBytes,
-};
+use connector_signer::PublicKeyBytes;
 
 mod support;
 use support::{
     identity_from_key_seed, sample_prepare, sealed_prepare_data, spawn_connector, spawn_stub_app,
     write_config, write_raw_key_file, ConnectorProcess,
 };
-
-/// `anvil`'s own default chain id: the EIP-712 domain a `toon-channel`
-/// claim on its `TokenNetwork` is signed under.
-const ANVIL_CHAIN_ID: u64 = 31_337;
 
 /// This test binary's own base port for [`Anvil::spawn`], distinct from
 /// every other test binary's `ANVIL_BASE_PORT` in this workspace.
@@ -124,8 +113,8 @@ const WITHDRAW_DELAY_SECS: u64 = 86_400;
 /// resend is byte-identical (§6.3).
 const VOUCHER_TIMESTAMP: &str = "2026-09-28T00:00:00.000Z";
 
-/// The client's own EIP-712 identity -- a third party to the peering, with
-/// its own TOON channel to the payer.
+/// The client's own key -- a third party to the peering, with its own x402
+/// channel to the payer.
 const CLIENT_SECRET_SEED: u8 = 23;
 
 /// A key that is nobody's voucher signer: forges a voucher on the payer's
@@ -174,66 +163,6 @@ fn wallet_of(key: &[u8; 32]) -> LocalWallet {
 
 fn spelled(address: Address) -> String {
     format!("{address:#x}")
-}
-
-fn channel_id_bytes(id: &str) -> [u8; 32] {
-    hex::decode(id.trim_start_matches("0x"))
-        .expect("channel id is 0x-prefixed 64-hex")
-        .try_into()
-        .expect("32 bytes")
-}
-
-/// 65 bytes `r || s || v`, `v` in libsecp256k1's raw `{0, 1}`, as
-/// `connector_signer` signs a `toon-channel` claim.
-fn sign_evm(secret: &SecretKey, digest: &[u8; 32]) -> Vec<u8> {
-    let message = Message::parse(digest);
-    let (signature, recovery_id) = libsecp256k1::sign(&message, secret);
-    let mut bytes = signature.serialize().to_vec();
-    let recovery_byte: u8 = recovery_id.into();
-    bytes.push(recovery_byte);
-    bytes
-}
-
-/// A `toon-channel` EIP-712 balance-proof claim, as a single fixed string.
-/// Genuine in every field: the client leg pays with these, and the §1.9
-/// regression presents one signed by the bound payer key on a real
-/// `TokenNetwork` channel to prove it no longer decides the peer role.
-fn evm_claim_json(
-    secret: &SecretKey,
-    sender_id: &str,
-    channel_id_hex: &str,
-    nonce: u64,
-    transferred_amount: u128,
-    token_network_address: [u8; 20],
-) -> String {
-    let public = PublicKey::from_secret_key(secret);
-    let address = derive_evm_address(&public.serialize());
-
-    let proof = EvmBalanceProof {
-        channel_id: channel_id_bytes(channel_id_hex),
-        nonce,
-        transferred_amount,
-        locked_amount: 0,
-        locks_root: [0u8; 32],
-        chain_id: ANVIL_CHAIN_ID,
-        token_network_address,
-    };
-    let signature = sign_evm(secret, &evm_balance_proof_digest(&proof));
-
-    format!(
-        r#"{{"version":"1.0","blockchain":"evm","messageId":"msg-{nonce}",\
-"timestamp":"2026-02-02T12:00:00.000Z","senderId":"{sender_id}",\
-"channelId":"{channel_id_hex}","nonce":{nonce},\
-"transferredAmount":"{transferred_amount}","lockedAmount":"0",\
-"locksRoot":"0x{zeros}","signature":"0x{signature}",\
-"signerAddress":"{address}","chainId":{ANVIL_CHAIN_ID},\
-"tokenNetworkAddress":"{token_network_address}"}}"#,
-        zeros = "0".repeat(64),
-        signature = hex_encode(&signature),
-        address = to_hex(&address),
-        token_network_address = to_hex(&token_network_address),
-    )
-    .replace("\\\n", "")
 }
 
 /// Which carriage a parameterised test runs over. §9 makes a peer behaviour
@@ -381,7 +310,7 @@ asset_eip712_version = "2"
 /// Everything below the carriage, shared by every live test: the chain, the
 /// payer's own outbound x402 channel toward the payee (journaled under the
 /// payer's `state_dir`), an unbound signer's channel toward the payee, and
-/// the client leg's TOON channel.
+/// the client leg's x402 channel toward the payer.
 struct PeerFixture {
     chain: Chain,
     payer_address: Address,
@@ -400,16 +329,11 @@ struct PeerFixture {
     unbound_channel: String,
     unbound_presentation: ChannelPresentation,
     unbound_key: [u8; 32],
-    /// The one `TokenNetwork` channel between payer and payee, funded by
-    /// the payer: what a pre-ADR-0075 config peering paid on.
-    token_network_address: [u8; 20],
-    payer_secret: SecretKey,
-    toon_peer_channel: String,
-    /// The client leg (ADR 0028): a TOON channel the payer opened naming an
-    /// ordinary client, collateralised on the client's side.
-    client_secret: SecretKey,
-    client_address: [u8; 20],
-    client_channel_id: String,
+    /// The client leg (ADR 0028): the client's own x402 channel toward the
+    /// payer, which the payer admits as a client's.
+    client_key: [u8; 32],
+    client_channel: String,
+    client_presentation: ChannelPresentation,
 }
 
 impl PeerFixture {
@@ -429,41 +353,13 @@ impl PeerFixture {
             .await;
         chain.x402.fund_gas(unbound_address).await;
 
-        // The TOON side first, all by the deployer's own backend, before
-        // any other client of the same key reads its nonce.
-        let toon = EvmSettlementBackend::connect(
-            &connector_settlement_evm::RpcTransport::direct(&chain.anvil.rpc_url)
-                .expect("rpc transport"),
-            PAYER_SETTLEMENT_KEY,
-            chain.registry,
-            chain.token,
-            6,
-        )
-        .await
-        .expect("connect the payer's TokenNetwork half");
-        let token_network_address = toon.address().to_fixed_bytes();
-        let toon_peer_channel = toon
-            .open(payee_address.as_bytes().to_vec(), ChronoDuration::hours(1))
-            .await
-            .expect("the payer opens a TokenNetwork channel naming the payee");
-        toon.fund(&toon_peer_channel, u128::from(100 * PEER_FEE))
-            .await
-            .expect("fund the TokenNetwork channel with real value");
-        let client_secret = SecretKey::parse(&[CLIENT_SECRET_SEED; 32])
-            .expect("the client's secp256k1 secret is valid");
-        let client_address =
-            derive_evm_address(&PublicKey::from_secret_key(&client_secret).serialize());
-        let client_channel = toon
-            .open(client_address.to_vec(), ChronoDuration::hours(1))
-            .await
-            .expect("the payer opens a client channel");
-        // On the client leg the client signs and the payer redeems, so the
-        // collateral sits on the client's side; the fixture-only delegate
-        // deposit stands in for the client's own (issue #1118).
-        toon.fund_counterparty(&client_channel, u128::from(100 * CLIENT_PRICE))
-            .await
-            .expect("fund the client channel with real value");
-        drop(toon);
+        let client_key = [CLIENT_SECRET_SEED; 32];
+        let client_address = wallet_of(&client_key).address();
+        chain
+            .x402
+            .mint(chain.token, client_address, 1_000_000)
+            .await;
+        chain.x402.fund_gas(client_address).await;
 
         // The payer's own x402 channel toward the payee, journaled exactly
         // where the payer binary will restore it from.
@@ -491,8 +387,16 @@ impl PeerFixture {
             )
             .await;
 
-        let payer_secret = SecretKey::parse(&key_bytes(PAYER_SETTLEMENT_KEY))
-            .expect("the payer's settlement key is a valid secp256k1 secret");
+        // The client leg: the client's own x402 channel toward the payer.
+        let (client_channel, client_presentation) = chain
+            .open_x402_channel(
+                &hex_encode(&client_key),
+                Arc::new(InMemoryJournal::new()),
+                payer_address,
+                100 * u128::from(CLIENT_PRICE),
+            )
+            .await;
+
         Some(PeerFixture {
             chain,
             payer_address,
@@ -503,12 +407,9 @@ impl PeerFixture {
             unbound_channel,
             unbound_presentation,
             unbound_key,
-            token_network_address,
-            payer_secret,
-            toon_peer_channel: toon_peer_channel.0,
-            client_secret,
-            client_address,
-            client_channel_id: client_channel.0,
+            client_key,
+            client_channel,
+            client_presentation,
         })
     }
 
@@ -546,16 +447,13 @@ impl PeerFixture {
         )
     }
 
-    /// The client's `toon-channel` claim for its `n`th packet across the
-    /// payer's forwarded route: cumulative `n * CLIENT_PRICE` at nonce `n`.
-    fn client_claim(&self, nonce: u64) -> String {
-        evm_claim_json(
-            &self.client_secret,
-            "client",
-            &self.client_channel_id,
-            nonce,
-            u128::from(nonce) * u128::from(CLIENT_PRICE),
-            self.token_network_address,
+    /// The client's voucher for its `n`th packet across the payer's
+    /// forwarded route: cumulative `n * CLIENT_PRICE`.
+    fn client_claim(&self, n: u64) -> String {
+        self.voucher(
+            &self.client_presentation,
+            &self.client_key,
+            u128::from(n) * u128::from(CLIENT_PRICE),
         )
     }
 
@@ -564,13 +462,12 @@ impl PeerFixture {
     /// [`a_peer_voucher_is_acknowledged`], which presents the payer's own
     /// voucher to the same binary and is acked.
     ///
-    /// Two of them are **genuine payments to the payee**, and a payee is
-    /// right to take them -- as a client's: the unbound signer's voucher on
-    /// its own x402 channel, and the payer's `toon-channel` claim on its
-    /// `TokenNetwork` channel, which the client edge still resolves on chain
-    /// until #1384. Each names the channel it pays on and the cumulative
-    /// amount it is journaled at, and that is the only thing either may
-    /// leave behind: no ack, and nothing on the peering's channel.
+    /// One of them is a **genuine payment to the payee**, and a payee is
+    /// right to take it -- as a client's: the unbound signer's voucher on its
+    /// own x402 channel. It names the channel it pays on and the cumulative
+    /// amount it is journaled at, and that is the only thing it may leave
+    /// behind: no ack, and nothing on the peering's channel. The retired
+    /// `toon-channel` claim is refused by name (#1384) and journals nothing.
     fn refused_claims(&self) -> Vec<RefusedCase> {
         vec![
             RefusedCase {
@@ -597,16 +494,9 @@ impl PeerFixture {
                 pays_as_client: Some((self.unbound_channel.clone(), FORWARDED)),
             },
             RefusedCase {
-                name: "a genuine toon-channel claim signed by the bound payer key",
-                claim: Some(evm_claim_json(
-                    &self.payer_secret,
-                    PAYER_ID,
-                    &self.toon_peer_channel,
-                    1,
-                    u128::from(PEER_FEE),
-                    self.token_network_address,
-                )),
-                pays_as_client: Some((self.toon_peer_channel.to_lowercase(), PEER_FEE)),
+                name: "a retired toon-channel claim",
+                claim: Some(toon_channel_claim()),
+                pays_as_client: None,
             },
             RefusedCase {
                 name: "a claim header that is not a claim",
@@ -615,6 +505,27 @@ impl PeerFixture {
             },
         ]
     }
+}
+
+/// A retired `toon-channel` claim, as a pre-ADR 0075 peer rendered one: no
+/// `scheme`, a nonce and a balance proof. Refused by name before anything
+/// about it is read (#1384), so its signature does not matter.
+fn toon_channel_claim() -> String {
+    serde_json::json!({
+        "version": "1.0",
+        "blockchain": "evm",
+        "messageId": "msg-1",
+        "timestamp": "2026-02-02T12:00:00.000Z",
+        "senderId": PAYER_ID,
+        "channelId": format!("0x{}", "07".repeat(32)),
+        "nonce": 1,
+        "transferredAmount": PEER_FEE.to_string(),
+        "lockedAmount": "0",
+        "locksRoot": format!("0x{}", "00".repeat(32)),
+        "signature": format!("0x{}", "11".repeat(65)),
+        "signerAddress": format!("0x{}", "44".repeat(20)),
+    })
+    .to_string()
 }
 
 /// One §1.9 case: what rides the request, and -- when it is a genuine
@@ -735,13 +646,6 @@ voucher_signer = "{payee}"
 peer_id = "{PAYEE_ID}"
 outbound_channel = "{channel}"
 client_edge_url = "{payee_client_edge}"
-
-# The client leg's TOON channel (until #1384).
-[[client_channels]]
-channel_id = "{client_channel_id}"
-counterparty = "{client}"
-chain_id = {ANVIL_CHAIN_ID}
-token_network_address = "{token_network}"
 "#,
         state_dir = fixture.payer_state.path().display(),
         key_file = key_file.path().display(),
@@ -749,9 +653,6 @@ token_network_address = "{token_network}"
         settlement = fixture.chain.settlement_block(settlement_key.path()),
         payee = spelled(fixture.payee_address),
         channel = fixture.payer_channel,
-        client_channel_id = fixture.client_channel_id,
-        client = to_hex(&fixture.client_address),
-        token_network = to_hex(&fixture.token_network_address),
     ));
     let connector = spawn_connector(config.path());
     (connector, config, key_file, settlement_key)
@@ -908,9 +809,10 @@ async fn present(
 /// **The named regression, over HTTP** (`peer-carriage-spec.md` §1.9, as ADR
 /// 0075 decision 5 amends ADR 0060): only a voucher on a channel whose
 /// `payerAuthorizer` is a bound voucher signer proves the peer role. Each
-/// case below -- including a genuine `toon-channel` claim signed by the very
-/// key that is bound -- is a client interaction: no claim-ack, and nothing
-/// journaled, read off the binary's own `state_dir`.
+/// case below is a client interaction -- a retired `toon-channel` claim is
+/// refused by name by the client edge a shared listener hands it to -- no
+/// claim-ack, and nothing journaled on the peering's channel, read off the
+/// binary's own `state_dir`.
 #[tokio::test]
 async fn a_claim_that_does_not_prove_the_peer_role_reaches_no_peer_handling_over_http() {
     a_claim_that_does_not_prove_the_peer_role_reaches_no_peer_handling(Carriage::Http).await;
@@ -977,6 +879,31 @@ async fn a_claim_that_does_not_prove_the_peer_role_reaches_no_peer_handling(carr
              was:\n{journal}"
         );
     }
+
+    // The retired claim is refused by name, not merely read as nothing: on
+    // this shared listener it is a client's, and the client edge names the
+    // retirement in its REJECT (#1384).
+    let (data, _shared) = sealed_prepare_data(b"toon-channel", &payee_identity);
+    let prepare = sample_prepare(APP_PREFIX, data);
+    let claim = toon_channel_claim();
+    let packet = match carriage {
+        Carriage::Btp => {
+            send_peer_message(&payee.client_edge_addr, Some(&claim), &prepare)
+                .await
+                .0
+        }
+        Carriage::Http => {
+            post_peer_request(&client, &payee.client_edge_addr, Some(&claim), &prepare)
+                .await
+                .1
+        }
+    };
+    let reject = Reject::decode(&packet).expect("a toon-channel claim is refused");
+    assert!(
+        reject.message.contains("toon-channel") && reject.message.contains("ADR 0075"),
+        "refused by name: {}",
+        reject.message
+    );
 }
 
 /// **§1.9 case 4, in the only form a live binary can express it**: a
@@ -1178,7 +1105,7 @@ async fn two_connectors_move_a_paid_packet(carriage: Carriage) {
     )
     .await;
     assert_eq!(
-        terms["accepts"][0]["extra"]["price"],
+        terms["extensions"]["toon"]["info"]["price"],
         CLIENT_PRICE.to_string()
     );
     assert!(
@@ -1186,7 +1113,7 @@ async fn two_connectors_move_a_paid_packet(carriage: Carriage) {
         "an unpaid client request moves nothing across the peering"
     );
 
-    // The client leg, paid: a real TOON client claim on the payer's edge,
+    // The client leg, paid: a real client voucher on the payer's edge,
     // advancing by CLIENT_PRICE per packet.
     for (nonce, body) in [
         (1, b"across the peering".as_slice()),
@@ -1228,10 +1155,11 @@ async fn two_connectors_move_a_paid_packet(carriage: Carriage) {
     }
 
     // And the client leg was charged, in the payer's own journal.
-    let charged = client_edge_journal(fixture.payer_state.path());
-    assert!(
-        charged.contains(&fixture.client_channel_id),
-        "the client leg must be charged on the client's channel. Journal was:\n{charged}"
+    assert_eq!(
+        journaled(fixture.payer_state.path(), &fixture.client_channel),
+        vec![CLIENT_PRICE, 2 * CLIENT_PRICE],
+        "the client leg must be charged on the client's channel. Journal was:\n{}",
+        client_edge_journal(fixture.payer_state.path())
     );
 }
 

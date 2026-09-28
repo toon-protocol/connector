@@ -33,7 +33,7 @@ use url::Url;
 
 use connector_client_edge::{
     router_with_gate, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
-    BatchSettlementChannels, ChannelResolutionError, ClientChannelRegistry, ClientClaimGate,
+    BatchSettlementChannels, ChannelResolutionError, ClientClaimGate,
 };
 use connector_config::StaticRoute;
 use connector_domain::x402::{X402BatchSettlementEvmTerms, X402BatchSettlementTerms};
@@ -204,12 +204,9 @@ fn spawn_payee(domain: BatchSettlementDomain) -> (std::net::SocketAddr, PublicKe
         receiver: address_of(COUNTERPARTY_PRIVATE_KEY).to_fixed_bytes(),
         admitted: std::sync::Mutex::new(HashMap::new()),
     });
-    let gate = ClientClaimGate::restore(
-        ClientChannelRegistry::new(),
-        Arc::new(InMemoryJournal::new()),
-    )
-    .expect("a fresh journal")
-    .with_batch_settlement(seam as Arc<dyn BatchSettlementChannels>);
+    let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
+        .expect("a fresh journal")
+        .with_batch_settlement(seam as Arc<dyn BatchSettlementChannels>);
     let router_signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("payee-router"));
     let app = router_with_gate(connector, router_signer, None, gate);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind payee socket");
@@ -236,7 +233,6 @@ fn payee_document(
             http_endpoint: Some(format!("http://{addr}/ilp")),
             btp_endpoint: None,
             peer_carriages: vec!["http".to_string()],
-            settlements: Vec::new(),
             batch_settlements: vec![X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
                 network: network.clone(),
                 asset: spelled(token),

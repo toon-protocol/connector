@@ -664,7 +664,7 @@ async fn assert_answered_with_x402_greeting(
 ) {
     let terms = x402_terms(client_edge_addr, destination).await;
     assert_eq!(
-        terms["accepts"][0]["amount"],
+        terms["extensions"]["toon"]["info"]["amount"],
         expected_price.to_string(),
         "greeted price for {destination} must match the route's committed `price`"
     );
@@ -1160,7 +1160,7 @@ async fn the_relay_route_is_btp_only_and_the_store_routes_accept_both() {
     ));
     let store_terms = x402_terms(&connector.client_edge_addr, "g.toon.ario").await;
     assert!(
-        store_terms["accepts"][0]["extra"]
+        store_terms["extensions"]["toon"]["info"]
             .get("requiredTransport")
             .is_none(),
         "the store leg left at the default must not carry requiredTransport: {store_terms}"
@@ -1175,7 +1175,7 @@ async fn the_relay_route_is_btp_only_and_the_store_routes_accept_both() {
     ));
     let relay_own_terms = x402_terms(&relay_connector.client_edge_addr, "g.toon.relay").await;
     assert_eq!(
-        relay_own_terms["accepts"][0]["extra"]["requiredTransport"], "btp",
+        relay_own_terms["extensions"]["toon"]["info"]["requiredTransport"], "btp",
         "the relay box's own file must require BTP on its own terminating \
          route too: {relay_own_terms}"
     );

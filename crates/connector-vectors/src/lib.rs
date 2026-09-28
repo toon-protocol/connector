@@ -17,9 +17,9 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use connector_btp::{
-    decode_frame, encode_message, encode_response, encode_transfer, ProtocolData,
-    ACCUMULATED_COST_HEADER, AUTH_PROTOCOL, CLAIM_ACK_HEADER, CLAIM_ACK_PROTOCOL, CLAIM_HEADER,
-    CONTENT_TYPE_TEXT, FLUSH_REQUESTED_HEADER,
+    decode_frame, encode_error, encode_message, encode_response, encode_transfer, ProtocolData,
+    ACCUMULATED_COST_HEADER, CLAIM_ACK_HEADER, CLAIM_ACK_PROTOCOL, CLAIM_HEADER, CONTENT_TYPE_TEXT,
+    PAYOUT_CLAIM_PROTOCOL, PEER_CHALLENGE_HEADER, PEER_CHALLENGE_PROTOCOL,
 };
 use connector_domain::client_claim::{
     self, ClientClaim, ClientClaimError, SCHEME_BATCH_SETTLEMENT,
@@ -28,26 +28,27 @@ use connector_domain::{
     validate_voucher, ClaimError, EnvelopeError, EnvelopeRequest, EnvelopeResponse, Fulfill,
     Prepare, Price, Reject, RejectCode, VoucherAdmission, VoucherWatermark,
 };
-use connector_peer_btp::{ack, claim_json, fields, PeerClaimDomain};
+use connector_peer_btp::role_gate::{self, RefusedEvidence};
+use connector_peer_btp::{ack, challenge_json, claim_json, fields, ClaimDecodeError};
 use connector_peer_http::headers::{
     accumulated_cost as http_accumulated_cost, claim_ack as http_claim_ack, claim_ack_header_value,
-    claim_header_value, claim_json as http_claim_json, flush_requested as http_flush_requested,
-    Headers,
+    claim_header_value, claim_json as http_claim_json, peer_challenge_header_value, Headers,
+    PeerRequest, PeerResponse,
 };
-use connector_runtime::{ClaimAckOutcome, ClaimRejectReason, ClaimSignature, WireClaim};
+use connector_runtime::{challenge_entry, voucher_json, ClaimAckOutcome, ClaimRejectReason};
+use connector_settlement::batch::{ChannelPresentation, EvmChannelConfig, Voucher};
+use connector_settlement::ChannelId as SettlementChannelId;
 use connector_signer::giftwrap::{
     derive_fulfillment, open_request, open_response, seal_request_with_randomness,
     seal_response_with_randomness,
 };
 use connector_signer::{
-    derive_evm_address, evm_balance_proof_digest, evm_batch_channel_id,
-    evm_claim_state_challenge_digest, evm_voucher_claim_state_challenge_digest, evm_voucher_digest,
-    evm_voucher_signer, solana_voucher_claim_state_challenge_message, solana_voucher_message,
-    verify_evm_balance_proof, verify_evm_claim_state_challenge, verify_evm_voucher,
-    verify_evm_voucher_claim_state_challenge, verify_solana_voucher,
-    verify_solana_voucher_claim_state_challenge, Address, BatchChannelConfig,
-    BatchSettlementDomain, Ed25519Signer, EvmBalanceProof, EvmClaimStateChallenge,
-    LocalEd25519Signer, LocalSigner, Signer, X402_BATCH_SETTLEMENT_ADDRESS,
+    derive_evm_address, evm_batch_channel_id, evm_voucher_claim_state_challenge_digest,
+    evm_voucher_digest, evm_voucher_signer, solana_voucher_claim_state_challenge_message,
+    solana_voucher_message, verify_evm_voucher, verify_evm_voucher_claim_state_challenge,
+    verify_solana_voucher, verify_solana_voucher_claim_state_challenge, Address,
+    BatchChannelConfig, BatchSettlementDomain, Ed25519Signer, LocalEd25519Signer, LocalSigner,
+    Signer, X402_BATCH_SETTLEMENT_ADDRESS,
 };
 use serde::Serialize;
 
@@ -136,7 +137,29 @@ use serde::Serialize;
 /// protocolData entry it already parses, and would misread one as a
 /// malformed `toon-channel` claim rather than a voucher it may not yet
 /// support.
-pub const SCHEMA_VERSION: u32 = 6;
+///
+/// **7** (issue #1384 / ADR 0075 decision 14): **every claim is a voucher.**
+/// The `toon-channel` claim scheme is retired (ADR 0024 and ADR 0053, retired
+/// by ADR 0075), and with it every section that pinned it: the top-level
+/// `claim` section (the EIP-712 `BalanceProof`), `peer_carriage`'s
+/// `claim_evm`, `claim_solana` and `claim_digest_hex`, its FLUSH cases
+/// (`flush`, `flush_ack`, `flush_requested`) and its nonce cases
+/// (`claim_retransmit`, `claim_same_nonce_different_bytes`), and the whole
+/// `channel_control_declaration` section -- the `TokenNetwork`-domain
+/// `auth_channel_proof`, replaced by the voucher claim-state challenge. In
+/// their place: `peer_carriage.voucher_evm`/`voucher_solana` (a peer's
+/// voucher, as the paying node renders it), `peer_carriage.prepare` re-based
+/// on that voucher, `peer_carriage.zero_value_challenge` (a zero-value peer
+/// PREPARE carrying no voucher and the peer-role challenge in its own slot),
+/// a top-level `toon_channel_refused` section (a `toon-channel` claim, and a
+/// claim with no `scheme`, refused by name at the client edge and on both
+/// peer carriages), and a top-level `payout_voucher` section (the
+/// `payout-claim` TRANSFER a connector pays a client with). The
+/// `nonce_not_advancing` ack reason is no longer pinned: no voucher verdict
+/// carries it. A replaying SDK that still sends a claim with no `scheme` is
+/// sending a claim every connector refuses -- which is what this number
+/// exists to announce.
+pub const SCHEMA_VERSION: u32 = 7;
 
 fn seq_bytes<const N: usize>(start: u8) -> [u8; N] {
     let mut out = [0u8; N];
@@ -167,12 +190,12 @@ pub struct WireVectors {
     pub envelope: EnvelopeVectors,
     pub giftwrap: GiftwrapVectors,
     pub fulfilment: FulfilmentVectors,
-    pub claim: ClaimVectors,
     pub peer_carriage: PeerCarriageVectors,
-    pub channel_control_declaration: ChannelControlDeclarationVectors,
     pub charge: ChargeVectors,
     pub claim_voucher: ClaimVoucherVectors,
     pub voucher_claim_state_challenge: VoucherClaimStateChallengeVectors,
+    pub toon_channel_refused: ToonChannelRefusedVectors,
+    pub payout_voucher: PayoutVoucherVectors,
 }
 
 #[derive(Debug, Serialize)]
@@ -252,50 +275,6 @@ pub struct FulfilmentCase {
     pub name: &'static str,
     pub shared_secret_hex: String,
     pub fulfilment_hex: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ClaimVectors {
-    pub cases: Vec<ClaimCase>,
-}
-
-/// A signed EIP-712 `BalanceProof` (ADR 0024, issue #575): the same struct
-/// and digest both a peer claim (before ADR 0075 retired it, #1380) and a
-/// client-edge claim (`client-edge-spec.md` §1.3 step 4) are checked
-/// against -- `connector_signer::claim_signature` has exactly one such
-/// scheme, shared by both wires, so one vector section covers both.
-#[derive(Debug, Serialize)]
-pub struct ClaimCase {
-    pub name: &'static str,
-    /// The EIP-712 domain's `chainId` -- configured per channel
-    /// (as a `[[client_channels]]` row does), never a global default, since a
-    /// vector hardcoding one real chain would be unusable against another.
-    pub chain_id: u64,
-    /// The EIP-712 domain's `verifyingContract` -- the `TokenNetwork`
-    /// deployment this channel's claims are redeemed against.
-    pub token_network_address_hex: String,
-    /// The channel id in its on-chain `bytes32` form -- what the signed
-    /// struct actually hashes, not whatever string label a peering
-    /// relation happens to know the channel by.
-    pub channel_id_hex: String,
-    pub nonce: u64,
-    pub transferred_amount: u64,
-    /// Always zero on the wire (ADR 0004) but still part of the signed
-    /// struct -- omitting it computes a different digest than the one a
-    /// real signer signs.
-    pub locked_amount: u64,
-    /// Always zero on the wire (ADR 0004); same reason as `locked_amount`.
-    pub locks_root_hex: String,
-    /// `keccak256(0x1901 || domainSeparator || structHash)` -- the exact
-    /// bytes a real signer signs and `TokenNetwork.sol` recovers against on
-    /// redemption.
-    pub digest_hex: String,
-    pub signer_secret_hex: String,
-    pub signer_address_hex: String,
-    /// `r || s || recovery_id` (recovery_id `0`/`1`, not the `27`/`28` a
-    /// wallet's own signature carries) -- 65 bytes, recovering to
-    /// `signer_address_hex` over `digest_hex`.
-    pub signature_hex: String,
 }
 
 /// This module's own name for each [`EnvelopeError`] variant -- stable
@@ -613,130 +592,192 @@ fn generate_fulfilment_vectors(giftwrap_shared_secret: [u8; 32]) -> FulfilmentVe
     }
 }
 
-/// The Rust-typed values behind [`ClaimCase`]'s hex-string fields, passed
-/// on to [`generate_peer_carriage_vectors`] so item 2's claim and item 3's
-/// digest are built from -- and pinned equal to -- this section's own
-/// fixture rather than a second, independently chosen one (§10.2 item 3:
-/// "pinned **unchanged** against the existing claim section").
-struct ClaimFixture {
-    chain_id: u64,
-    token_network_address: Address,
-    channel_id: [u8; 32],
-    nonce: u64,
-    transferred_amount: u64,
-    signer_address: Address,
-    signature: connector_signer::Signature,
-    digest_hex: String,
-}
-
-fn generate_claim_vectors() -> (ClaimVectors, ClaimFixture) {
-    let signer_secret = seq_bytes::<32>(0xa1);
-    let signer = LocalSigner::from_secret_bytes("vector-fixture-claim-key", signer_secret)
-        .expect("fixture claim secret is a valid secp256k1 scalar");
-    let signer_address = derive_evm_address(&signer.public_key().expect("fixture has a key"));
-
-    let chain_id: u64 = 84_532; // Base Sepolia -- an example domain, not the only one a channel can be configured with.
-    let token_network_address: Address = seq_bytes::<20>(0xc1);
-    let channel_id: [u8; 32] = seq_bytes::<32>(0xd1);
-    let nonce: u64 = 7;
-    let transferred_amount: u64 = 1_500_000;
-    let locked_amount: u64 = 0;
-    let locks_root = [0u8; 32];
-
-    let proof = EvmBalanceProof {
-        channel_id,
-        nonce,
-        transferred_amount: u128::from(transferred_amount),
-        locked_amount: u128::from(locked_amount),
-        locks_root,
-        chain_id,
-        token_network_address,
-    };
-    let digest = evm_balance_proof_digest(&proof);
-    let signature = signer
-        .sign(&digest)
-        .expect("fixture signer signs its own digest");
-    let signature_bytes = signature.to_bytes();
-
-    assert!(
-        verify_evm_balance_proof(&proof, &signature_bytes, &signer_address),
-        "the fixture signature must recover to the fixture signer's own address"
-    );
-
-    let digest_hex = hex_of(&digest);
-    (
-        ClaimVectors {
-            cases: vec![ClaimCase {
-                name: "evm_balance_proof_digest_and_signature",
-                chain_id,
-                token_network_address_hex: hex_of(&token_network_address),
-                channel_id_hex: hex_of(&channel_id),
-                nonce,
-                transferred_amount,
-                locked_amount,
-                locks_root_hex: hex_of(&locks_root),
-                digest_hex: digest_hex.clone(),
-                signer_secret_hex: hex_of(&signer_secret),
-                signer_address_hex: hex_of(&signer_address),
-                signature_hex: hex_of(&signature_bytes),
-            }],
-        },
-        ClaimFixture {
-            chain_id,
-            token_network_address,
-            channel_id,
-            nonce,
-            transferred_amount,
-            signer_address,
-            signature,
-            digest_hex,
-        },
-    )
-}
-
 // ---------------------------------------------------------------------
-// Peer carriage (issue #729, `docs/protocol/peer-carriage-spec.md` §10)
+// Peer carriage (issue #729, `docs/protocol/peer-carriage-spec.md` §10;
+// ADR 0075 decisions 5 and 6, issue #1384)
 // ---------------------------------------------------------------------
 //
-// Twenty items, most of them *(pair)*: one BTP encoding and one HTTP
-// encoding of the same fixture value, generated in one pass and asserted
-// decoded-equal (§10.1's pairing rule, spec I1). Every function here calls
-// the real carriage code -- `connector_peer_btp`'s codec and
-// `connector_peer_http::headers`' wrappers over it -- never a
-// hand-rolled parallel encoder, so a vector this module emits is a vector
-// its own implementation would also accept.
+// Most items are *(pair)*s: one BTP encoding and one HTTP encoding of the
+// same fixture value, generated in one pass and asserted decoded-equal
+// (§10.1's pairing rule, spec I1). Every function here calls the real code
+// -- the paying side's own renderers (`connector_runtime::voucher_json`,
+// `connector_runtime::challenge_entry`), `connector_peer_btp`'s codec and
+// role gate, and `connector_peer_http`'s headers and evidence reader --
+// never a hand-rolled parallel encoder, so a vector this module emits is a
+// vector its own implementation would also emit and accept.
+//
+// Every claim on a peer carriage is an x402 **voucher** since ADR 0075
+// (schema 7): the `toon-channel` peer claim, its FLUSH, and its nonce
+// retransmission cases are gone with the scheme.
 
-/// A peer claim JSON and its two transfer encodings (§10.2 items 2, 4):
-/// raw UTF-8 on BTP, `base64` in the HTTP header -- the same JSON both
-/// ways (§4).
+/// The facts an EVM voucher's signature hangs off -- its x402
+/// `ChannelConfig`, the channel id that config hashes to, and the EIP-712
+/// digest `getVoucherDigest(channelId, amount)` answers -- shared, under the
+/// same field names, by `claim_voucher.evm`, `peer_carriage.voucher_evm` and
+/// `payout_voucher.evm`, so one cross-check against the deployed contract
+/// (`connector-settlement-evm/tests/x402_voucher_vector.rs`) reads all three
+/// the same way.
 #[derive(Debug, Serialize)]
-pub struct PeerClaimCase {
+pub struct EvmVoucherFacts {
+    /// The EIP-712 domain's `chainId` (Base Sepolia's real id).
+    pub chain_id: u64,
+    /// `x402BatchSettlement`'s one deployed address.
+    pub verifying_contract_hex: String,
+    pub channel_config: VoucherEvmChannelConfigFields,
+    /// `getChannelId(channel_config)`.
+    pub channel_id_hex: String,
+    pub max_claimable_amount: u64,
+    /// `getVoucherDigest(channel_id_hex, max_claimable_amount)`.
+    pub digest_hex: String,
+    /// `evm_voucher_signer(channel_config)`.
+    pub signer_address_hex: String,
+    /// `r ‖ s ‖ v`, 65 bytes, `v` 27 or 28.
+    pub signature_hex: String,
+}
+
+fn channel_config_fields(config: &BatchChannelConfig) -> VoucherEvmChannelConfigFields {
+    VoucherEvmChannelConfigFields {
+        payer_hex: hex_of(&config.payer),
+        payer_authorizer_hex: hex_of(&config.payer_authorizer),
+        receiver_hex: hex_of(&config.receiver),
+        receiver_authorizer_hex: hex_of(&config.receiver_authorizer),
+        token_hex: hex_of(&config.token),
+        withdraw_delay: config.withdraw_delay,
+        salt_hex: hex_of(&config.salt),
+    }
+}
+
+/// A node's EVM **settlement key** -- the key that signs every voucher on
+/// its outbound channels (ADR 0075 decision 3: `payerAuthorizer == payer`,
+/// both its settlement address). A fixture scalar, never a real key.
+fn node_settlement_signer(label: &'static str, start: u8) -> (LocalSigner, Address) {
+    let signer = LocalSigner::from_secret_bytes(label, seq_bytes::<32>(start))
+        .expect("fixture secret is a valid secp256k1 scalar");
+    let address = derive_evm_address(&signer.public_key().expect("fixture has a key"));
+    (signer, address)
+}
+
+/// The `ChannelConfig` a paying node builds toward `receiver` (ADR 0075
+/// decision 3): itself as `payer` and `payerAuthorizer`, the receiver in
+/// both receiving seats.
+fn outbound_channel_config(payer: Address, receiver: Address, salt: u8) -> BatchChannelConfig {
+    BatchChannelConfig {
+        payer,
+        payer_authorizer: payer,
+        receiver,
+        receiver_authorizer: receiver,
+        token: [0x55; 20],
+        withdraw_delay: 86_400,
+        salt: [salt; 32],
+    }
+}
+
+fn to_settlement_config(config: &BatchChannelConfig) -> EvmChannelConfig {
+    EvmChannelConfig {
+        payer: config.payer,
+        payer_authorizer: config.payer_authorizer,
+        receiver: config.receiver,
+        receiver_authorizer: config.receiver_authorizer,
+        token: config.token,
+        withdraw_delay: config.withdraw_delay,
+        salt: config.salt,
+    }
+}
+
+/// Sign an EVM voucher for `amount` on `config`'s channel with `signer`, in
+/// the wallet convention (`v` 27/28) the paying half's key produces, and
+/// self-verify it against the channel's voucher signer.
+fn sign_evm_voucher(
+    signer: &LocalSigner,
+    config: &BatchChannelConfig,
+    amount: u64,
+) -> (EvmVoucherFacts, EvmPresentation) {
+    let domain = BatchSettlementDomain::x402(VOUCHER_EVM_CHAIN_ID);
+    let channel_id = evm_batch_channel_id(&domain, config);
+    let digest = evm_voucher_digest(&domain, &channel_id, u128::from(amount));
+    let mut signature = signer
+        .sign(&digest)
+        .expect("fixture signer signs its own digest")
+        .to_bytes();
+    signature[64] += 27;
+    let voucher_signer = evm_voucher_signer(config);
+    assert!(
+        verify_evm_voucher(
+            &domain,
+            &channel_id,
+            u128::from(amount),
+            &signature,
+            &voucher_signer
+        ),
+        "a fixture voucher must verify against its channel's voucher signer"
+    );
+    let facts = EvmVoucherFacts {
+        chain_id: VOUCHER_EVM_CHAIN_ID,
+        verifying_contract_hex: hex_of(&X402_BATCH_SETTLEMENT_ADDRESS),
+        channel_config: channel_config_fields(config),
+        channel_id_hex: hex_of(&channel_id),
+        max_claimable_amount: amount,
+        digest_hex: hex_of(&digest),
+        signer_address_hex: hex_of(&voucher_signer),
+        signature_hex: hex_of(&signature),
+    };
+    let presentation = EvmPresentation {
+        presentation: ChannelPresentation::Evm {
+            channel: SettlementChannelId(format!("0x{}", hex_of(&channel_id))),
+            config: to_settlement_config(config),
+        },
+        channel_id,
+        signature,
+    };
+    (facts, presentation)
+}
+
+/// A signed EVM voucher's channel, as the paying half presents it.
+struct EvmPresentation {
+    presentation: ChannelPresentation,
+    channel_id: [u8; 32],
+    signature: [u8; 65],
+}
+
+/// The timestamp every rendered fixture claim carries.
+const FIXTURE_TIMESTAMP: &str = "2030-01-01T00:00:00.000Z";
+
+/// A peer voucher: what a paying node puts in the claim slot of a PREPARE it
+/// forwards (ADR 0075 decision 6), rendered by the paying side's own
+/// `connector_runtime::voucher_json`, and its two transfer encodings -- raw
+/// UTF-8 in the BTP `payment-channel-claim` entry, base64 in the
+/// `Payment-Channel-Claim` header (§4).
+#[derive(Debug, Serialize)]
+pub struct PeerVoucherEvmCase {
     pub name: &'static str,
-    /// The exact bytes this claim's signature covers, hex-encoded.
-    ///
-    /// For Solana this is [`connector_signer::solana_balance_proof_message`]'s
-    /// 96 bytes -- domain tag, settlement program id, channel account, nonce,
-    /// transferred amount (ADR 0053, issue #1082). It is the cross-repo
-    /// contract for that format, and the only thing keeping its **three**
-    /// in-tree copies in step: this crate's, `connector-settlement-solana`'s
-    /// `wire::balance_proof_message`, and the on-chain program's own
-    /// `expected_message`.
-    ///
-    /// Empty for EVM, whose signed bytes are an EIP-712 digest already
-    /// pinned by `claim_digest_hex`.
-    pub signed_message_hex: String,
-    pub blockchain: &'static str,
+    #[serde(flatten)]
+    pub facts: EvmVoucherFacts,
     pub json: String,
     pub btp_raw_hex: String,
     pub http_base64: String,
-    pub wire_channel_id: String,
-    pub wire_nonce: u64,
-    pub wire_cumulative_amount: u64,
-    pub wire_signature_hex: String,
 }
 
-/// The OER `Prepare` a claim-bearing PREPARE carries, and the two carriage
-/// framings around it (§10.2 items 5, 6).
+/// The Solana twin of [`PeerVoucherEvmCase`]: a voucher on a
+/// `payment-channels` channel whose `authorized_signer` is the paying
+/// node's Solana settlement key.
+#[derive(Debug, Serialize)]
+pub struct PeerVoucherSolanaCase {
+    pub name: &'static str,
+    pub channel_account_base58: String,
+    /// The paying node's Solana settlement key: the channel's
+    /// `authorized_signer`.
+    pub authorized_signer_base58: String,
+    pub signer_secret_hex: String,
+    pub max_claimable_amount: u64,
+    /// `solana_voucher_message(channel, amount, 0)`'s 50 bytes.
+    pub signed_message_hex: String,
+    pub signature_base58: String,
+    pub json: String,
+    pub btp_raw_hex: String,
+    pub http_base64: String,
+}
+
+/// The OER `Prepare` a peer PREPARE carries (§10.2 items 5, 6).
 #[derive(Debug, Serialize)]
 pub struct PreparePacketFields {
     pub amount: u64,
@@ -746,27 +787,56 @@ pub struct PreparePacketFields {
     pub data_hex: String,
 }
 
+/// A PREPARE on both carriages, with whatever evidence rides beside it: a
+/// voucher in the claim slot, a peer-role challenge in its own slot, or
+/// nothing.
 #[derive(Debug, Serialize)]
 pub struct PreparePairCase {
     pub name: &'static str,
     pub prepare: PreparePacketFields,
+    /// The claim slot's JSON -- always a voucher -- or `None`.
     pub claim_json: Option<String>,
+    /// The peer-role challenge slot's JSON (§1.4), or `None`.
+    pub challenge_json: Option<String>,
     pub btp_message_hex: String,
     pub http_headers: Vec<(String, String)>,
     pub http_body_hex: String,
 }
 
-/// A judged claim's verdict, as it rides a RESPONSE (§10.2 items 7-9).
+/// A zero-value peer PREPARE (ADR 0075 decision 5): it carries **no
+/// voucher**, and carries the voucher claim-state challenge instead, signed
+/// by the channel's voucher signer, so the receiver can attribute it to the
+/// peering. The challenge's message and signature are pinned alongside the
+/// frames.
+#[derive(Debug, Serialize)]
+pub struct PeerZeroValueCase {
+    pub name: &'static str,
+    /// The channel the challenge names: `peer_carriage.voucher_evm`'s.
+    pub channel_id_hex: String,
+    /// Unix seconds. A receiver honours a challenge only while `expires` is
+    /// ahead of its clock and no more than 300 seconds ahead
+    /// (`peer-carriage-spec.md` §1.2) -- a fact about the clock at
+    /// verification, which this static vector cannot encode; it pins a far
+    /// future `expires` so the signature and bytes are reproducible.
+    pub expires: u64,
+    /// `keccak256(0x1901 ‖ x402DomainSeparator ‖ structHash)` for
+    /// `ClaimStateChallenge(bytes32 channelId,uint256 expires)`.
+    pub digest_hex: String,
+    pub signer_address_hex: String,
+    /// `r ‖ s ‖ v`, 65 bytes, `v` 27 or 28.
+    pub signature_hex: String,
+    pub packet: PreparePairCase,
+}
+
+/// A judged voucher's verdict, as it rides a RESPONSE (§10.2 items 7-9).
 #[derive(Debug, Serialize)]
 pub struct AckFields {
     pub result: &'static str,
     pub reason: Option<&'static str>,
 }
 
-/// A RESPONSE answering a claim-bearing frame: the packet it answers, and
-/// the claim-ack riding beside it -- independently (§6.2), including the
-/// combinations item 8, item 10, item 11 and item 14 each name (§10.2
-/// items 7, 8, 9, 10, 11, 14).
+/// A RESPONSE answering a voucher-bearing frame: the packet it answers, and
+/// the claim-ack riding beside it -- independently (§6.2).
 #[derive(Debug, Serialize)]
 pub struct PeerAnswerCase {
     pub name: String,
@@ -791,41 +861,6 @@ pub struct PeerMalformedAckCase {
     pub http_base64: String,
 }
 
-/// FLUSH: a TRANSFER carrying the claim's new cumulative as its amount, and
-/// the HTTP standalone-claim POST (§10.2 item 13).
-#[derive(Debug, Serialize)]
-pub struct PeerFlushCase {
-    pub name: &'static str,
-    pub claim_json: String,
-    pub transfer_amount: u64,
-    pub btp_transfer_hex: String,
-    pub http_headers: Vec<(String, String)>,
-    pub http_body_hex: String,
-}
-
-/// §6.3's idempotent re-ack and its boundary (§10.2 items 15, 16): a
-/// byte-identical retransmission is accepted again, and a same-nonce claim
-/// that differs in any other field is refused `nonce_not_advancing`.
-#[derive(Debug, Serialize)]
-pub struct PeerRetransmitCase {
-    pub name: &'static str,
-    pub first_claim_json: String,
-    pub second_claim_json: String,
-    pub first_ack: &'static str,
-    pub second_ack: &'static str,
-    pub second_ack_reason: Option<&'static str>,
-}
-
-/// `Toon-Flush-Requested` -- HTTP only, no BTP counterpart (§6.4, §10.2
-/// item 17).
-#[derive(Debug, Serialize)]
-pub struct PeerFlushRequestedCase {
-    pub name: &'static str,
-    pub channel_id: String,
-    pub http_header_value: String,
-    pub note: &'static str,
-}
-
 /// A sealed giftwrap payload carried unchanged as a PREPARE's `data`, on
 /// both carriages (§8.1, §10.2 item 20).
 #[derive(Debug, Serialize)]
@@ -836,32 +871,25 @@ pub struct PeerForwardedDataCase {
     pub http_body_hex: String,
 }
 
-/// There is no `credential` entry, and there was one: a `{peerId, secret}`
-/// in a BTP `auth` entry and a `Toon-Peer-Auth` header, pinned as §10.2's
-/// item 1. ADR 0060 deleted the credential from both carriages, so there is
-/// no encoding left to pin -- a replayer that still has the old vector will
-/// find nothing to compare it against, which is the point.
+/// Schema 7 (ADR 0075): no `toon-channel` claim (`claim_evm`,
+/// `claim_solana`, `claim_digest_hex`), no FLUSH (`flush`, `flush_ack`,
+/// `flush_requested`) and no nonce cases (`claim_retransmit`,
+/// `claim_same_nonce_different_bytes`); a peer voucher on each chain and a
+/// zero-value packet carrying the peer-role challenge in their place. A
+/// voucher's own retransmission rule is `claim_voucher.amount_only_watermark`.
 #[derive(Debug, Serialize)]
 pub struct PeerCarriageVectors {
-    pub claim_evm: PeerClaimCase,
-    /// §10.2 item 3: pinned equal to [`ClaimCase::digest_hex`] of this same
-    /// run's `claim` section -- demonstrating ADR 0024's digest is
-    /// untouched by carriage, not a second, independently computed one.
-    pub claim_digest_hex: String,
-    pub claim_solana: PeerClaimCase,
+    pub voucher_evm: PeerVoucherEvmCase,
+    pub voucher_solana: PeerVoucherSolanaCase,
     pub prepare: PreparePairCase,
     pub prepare_no_claim: PreparePairCase,
+    pub zero_value_challenge: PeerZeroValueCase,
     pub fulfill_ack_accepted: PeerAnswerCase,
     pub fulfill_ack_rejected: PeerAnswerCase,
     pub ack_rejected_reasons: Vec<PeerAnswerCase>,
     pub reject_with_cost: PeerAnswerCase,
     pub ack_absent: PeerAnswerCase,
     pub ack_malformed: PeerMalformedAckCase,
-    pub flush: PeerFlushCase,
-    pub flush_ack: PeerAnswerCase,
-    pub claim_retransmit: PeerRetransmitCase,
-    pub claim_same_nonce_different_bytes: PeerRetransmitCase,
-    pub flush_requested: PeerFlushRequestedCase,
     pub forwarded_data_unchanged: PeerForwardedDataCase,
 }
 
@@ -884,131 +912,21 @@ fn prepare_fields(prepare: &Prepare) -> PreparePacketFields {
     }
 }
 
-fn generate_peer_claim_evm_case(fixture: &ClaimFixture) -> PeerClaimCase {
-    let claim = WireClaim {
-        channel_id: format!("0x{}", hex::encode(fixture.channel_id)),
-        nonce: fixture.nonce,
-        cumulative_amount: fixture.transferred_amount,
-        signature: ClaimSignature::Evm(fixture.signature),
-    };
-    let domain = PeerClaimDomain {
-        chain_id: fixture.chain_id,
-        token_network: fixture.token_network_address,
-    };
-    let json = claim_json::encode(
-        &claim,
-        &fixture.signer_address,
-        // No Solana signer and no Solana program id: which arm renders is
-        // decided by `claim.signature`'s discriminant, and this fixture's
-        // is `ClaimSignature::Evm`. Both are read only in the
-        // `ClaimSignature::Solana` arm, so a value here would be inert.
-        None,
-        None,
-        Some(domain),
-        "vector-fixture:evm:1",
-        "2030-01-01T00:00:00.000Z",
-    );
+/// The paying peer's settlement address, and the receiving peer's.
+const PEER_PAYER_KEY_START: u8 = 0x31;
+const PEER_RECEIVER: Address = [0x77; 20];
 
-    // I4/I1: the emitted claim parses back through the client edge's own
-    // validator, and both carriage encodings hand that parser the same
-    // bytes.
-    let reparsed = claim_json::parse(json.as_bytes()).expect("the emitted claim parses back");
-    assert_eq!(reparsed, claim);
-
-    let raw_entry = claim_json::protocol_data(&json);
-    let http_value = claim_header_value(&json);
-    let mut headers = Headers::new();
-    headers.push(CLAIM_HEADER, &http_value);
-    let via_http = http_claim_json(&headers)
-        .expect("a claim rode")
-        .expect("valid base64");
-    assert_eq!(via_http, json.as_bytes());
-
-    PeerClaimCase {
-        name: "peer_claim_evm",
-        signed_message_hex: String::new(),
-        blockchain: "evm",
-        json,
-        btp_raw_hex: hex_of(&raw_entry.data),
-        http_base64: http_value,
-        wire_channel_id: claim.channel_id,
-        wire_nonce: claim.nonce,
-        wire_cumulative_amount: claim.cumulative_amount,
-        wire_signature_hex: hex_of(&claim.signature.to_bytes()),
-    }
-}
-
-/// Decode a base58 32-byte fixture, panicking on a bad literal -- these are
-/// hardcoded in this file, so a failure here is a typo, not input.
-fn bs58_32(value: &str) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let decoded = bs58::decode(value).into_vec().expect("a base58 fixture");
-    assert_eq!(decoded.len(), 32, "fixture is not 32 bytes: {value}");
-    out.copy_from_slice(&decoded);
-    out
-}
-
-/// The settlement program the `claim_solana` fixture's channel lives under.
-///
-/// This is the deployed public-devnet payment-channel program
-/// (`packages/solana-program/deployments/devnet-public.md`) -- an example
-/// settlement program, not the only one a channel can live under, exactly as
-/// `generate_claim_vectors`'s `chain_id` is Base Sepolia's real id rather than
-/// a made-up one. A claim fixture's *domain* half carries a real deployment's
-/// value for that reason; its account and key halves stay fixture bytes.
-///
-/// It deliberately replaces the system program
-/// (`11111111111111111111111111111111`) this fixture carried until issue
-/// #1127. A Solana claim's `programId` MUST name the settlement program its
-/// `channelAccount` lives under (`client-edge-spec.md` §1.3) -- the same 32
-/// bytes ADR 0053 binds into the signed balance proof at offset 16 -- and a
-/// normative fixture declaring the system program taught every payer reading
-/// it that any value would do.
-const SOLANA_SETTLEMENT_PROGRAM_ID: &str = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip";
-
-/// §10.2 item 4: marked **aspirational**, exactly as `peer-semantics-pre-868.md`
-/// §3.5 marks the Solana claim row -- pinning the shape before an emitting
-/// implementation exists on this connector (outbound peer claims are
-/// EVM-only, `claim_json::encode`'s own doc). What *does* exist and is
-/// exercised here for real is the inbound half: `claim_json::parse`
-/// already accepts a Solana claim (issue #732).
-fn generate_peer_claim_solana_case() -> PeerClaimCase {
-    let channel_account = "GDDMwNyyx8uB6zrqwBFHjLLG3TBYk2F1Mh6usnNPUsqk";
-    let program_id = SOLANA_SETTLEMENT_PROGRAM_ID;
-    let signer_public_key = "11111111111111111111111111111113";
-    let signature_bytes = seq_bytes::<64>(0xe1);
-    let json = serde_json::json!({
-        "version": "1.0",
-        "blockchain": "solana",
-        "messageId": "vector-fixture:solana:1",
-        "timestamp": "2030-01-01T00:00:00.000Z",
-        "senderId": signer_public_key,
-        // One literal, read twice: the declared label here and the signed
-        // domain at offset 16 of `signed_message_hex` below are the same
-        // `program_id`, so this fixture cannot drift into declaring one
-        // program while signing under another (issue #1127).
-        "programId": program_id,
-        "channelAccount": channel_account,
-        "nonce": 1,
-        "transferredAmount": "250000",
-        "signature": BASE64.encode(signature_bytes),
-        "signerPublicKey": signer_public_key,
-    })
-    .to_string();
-
-    let parsed = claim_json::parse(json.as_bytes()).expect("the aspirational solana shape parses");
+/// A voucher's two transfer encodings, each read back by the real reader
+/// and parsed back through the real claim parser (§4, I1, I4).
+fn voucher_encodings(json: &str) -> (String, String) {
+    let parsed = claim_json::parse(json.as_bytes()).expect("the rendered voucher parses back");
     assert_eq!(
+        client_claim::parse_client_claim(json).expect("the client edge parses it too"),
         parsed,
-        WireClaim {
-            channel_id: channel_account.to_string(),
-            nonce: 1,
-            cumulative_amount: 250_000,
-            signature: ClaimSignature::Solana(signature_bytes),
-        }
+        "one parser serves both edges (I4)"
     );
-
-    let raw_entry = claim_json::protocol_data(&json);
-    let http_value = claim_header_value(&json);
+    let raw_entry = claim_json::protocol_data(json);
+    let http_value = claim_header_value(json);
     let mut headers = Headers::new();
     headers.push(CLAIM_HEADER, &http_value);
     assert_eq!(
@@ -1017,88 +935,217 @@ fn generate_peer_claim_solana_case() -> PeerClaimCase {
             .expect("valid base64"),
         json.as_bytes()
     );
+    (hex_of(&raw_entry.data), http_value)
+}
 
-    PeerClaimCase {
-        name: "peer_claim_solana",
-        signed_message_hex: hex_of(&connector_signer::solana_balance_proof_message(
-            &bs58_32(program_id),
-            &bs58_32(channel_account),
-            1,
-            250_000,
-        )),
-        blockchain: "solana",
+fn generate_peer_voucher_evm_case() -> (PeerVoucherEvmCase, EvmPresentation) {
+    let (signer, payer) = node_settlement_signer("vector-fixture-peer-payer", PEER_PAYER_KEY_START);
+    let config = outbound_channel_config(payer, PEER_RECEIVER, 0x88);
+    let (facts, presentation) = sign_evm_voucher(&signer, &config, 250_000);
+    let json = voucher_json(
+        &presentation.presentation,
+        &Voucher {
+            cumulative_amount: 250_000,
+            signature: presentation.signature.to_vec(),
+        },
+        &format!("0x{}", hex_of(&config.payer_authorizer)),
+        FIXTURE_TIMESTAMP,
+    );
+    let ClientClaim::EvmVoucher(voucher) =
+        claim_json::parse(json.as_bytes()).expect("the peer voucher parses")
+    else {
+        panic!("an EVM peer voucher");
+    };
+    assert_eq!(
+        voucher.channel_id,
+        format!("0x{}", hex_of(&presentation.channel_id))
+    );
+    assert!(
+        voucher.channel_config.is_some(),
+        "a peer voucher always carries its channelConfig"
+    );
+    let (btp_raw_hex, http_base64) = voucher_encodings(&json);
+    (
+        PeerVoucherEvmCase {
+            name: "peer_voucher_evm",
+            facts,
+            json,
+            btp_raw_hex,
+            http_base64,
+        },
+        presentation,
+    )
+}
+
+fn generate_peer_voucher_solana_case() -> PeerVoucherSolanaCase {
+    let seed = seq_bytes::<32>(0xd1);
+    let signer = LocalEd25519Signer::from_secret_bytes(seed).expect("fixture seed is 32 bytes");
+    let channel_account: [u8; 32] = [0xd4; 32];
+    let amount: u64 = 250_000;
+    let message = solana_voucher_message(&channel_account, amount, 0);
+    let signature = signer.sign(&message);
+    assert!(verify_solana_voucher(
+        &channel_account,
+        amount,
+        0,
+        &signature,
+        &signer.public_key()
+    ));
+    let channel_account_base58 = bs58::encode(channel_account).into_string();
+    // As the paying half renders it: `senderId` is a label, the channel
+    // account on Solana (`connector_runtime`'s `voucher_sender`).
+    let json = voucher_json(
+        &ChannelPresentation::Solana {
+            channel: SettlementChannelId(channel_account_base58.clone()),
+        },
+        &Voucher {
+            cumulative_amount: u128::from(amount),
+            signature: signature.to_vec(),
+        },
+        &channel_account_base58,
+        FIXTURE_TIMESTAMP,
+    );
+    assert!(matches!(
+        claim_json::parse(json.as_bytes()),
+        Ok(ClientClaim::SolanaVoucher(_))
+    ));
+    let (btp_raw_hex, http_base64) = voucher_encodings(&json);
+    PeerVoucherSolanaCase {
+        name: "peer_voucher_solana",
+        channel_account_base58,
+        authorized_signer_base58: bs58::encode(signer.public_key()).into_string(),
+        signer_secret_hex: hex_of(&seed),
+        max_claimable_amount: amount,
+        signed_message_hex: hex_of(&message),
+        signature_base58: bs58::encode(signature).into_string(),
         json,
-        btp_raw_hex: hex_of(&raw_entry.data),
-        http_base64: http_value,
-        wire_channel_id: channel_account.to_string(),
-        wire_nonce: 1,
-        wire_cumulative_amount: 250_000,
-        wire_signature_hex: hex_of(&signature_bytes),
+        btp_raw_hex,
+        http_base64,
     }
 }
 
-fn generate_prepare_pair_cases(evm_claim: &PeerClaimCase) -> (PreparePairCase, PreparePairCase) {
+fn fixture_prepare(amount: u64) -> Prepare {
     let prepare = Prepare {
-        amount: 250_000,
+        amount,
         expires_at: "2030-01-01T00:01:00Z".parse().expect("fixed literal"),
         greeting: false,
         destination: "g.toon.store-box.settle".to_string(),
         data: b"vector-fixture-prepare-data".to_vec(),
     };
-    let prepare_bytes = prepare.encode();
     assert_eq!(
-        Prepare::decode(&prepare_bytes).expect("self-generated prepare decodes"),
+        Prepare::decode(&prepare.encode()).expect("self-generated prepare decodes"),
         prepare
     );
+    prepare
+}
 
-    let claim_entry = claim_json::protocol_data(&evm_claim.json);
-
-    // Item 5: a claim riding one PREPARE.
-    let btp_with_claim = encode_message(9_001, &[claim_entry], &prepare_bytes);
-    let decoded = decode_frame(&btp_with_claim).expect("self-generated frame decodes");
+/// One PREPARE on both carriages with `claim` and/or `challenge` riding
+/// beside it, each read back through the role gate's own evidence readers
+/// (`role_gate::btp_evidence`, `connector_peer_http::evidence_on`).
+fn prepare_pair_case(
+    name: &'static str,
+    request_id: u32,
+    prepare: &Prepare,
+    claim: Option<&str>,
+    challenge: Option<&str>,
+) -> PreparePairCase {
+    let prepare_bytes = prepare.encode();
+    let mut entries = Vec::new();
+    let mut headers = Headers::new();
+    if let Some(json) = claim {
+        entries.push(claim_json::protocol_data(json));
+        headers.push(CLAIM_HEADER, claim_header_value(json));
+    }
+    if let Some(json) = challenge {
+        entries.push(ProtocolData {
+            name: PEER_CHALLENGE_PROTOCOL.to_string(),
+            content_type: CONTENT_TYPE_TEXT,
+            data: json.as_bytes().to_vec(),
+        });
+        headers.push(PEER_CHALLENGE_HEADER, peer_challenge_header_value(json));
+    }
+    let btp = encode_message(request_id, &entries, &prepare_bytes);
+    let decoded = decode_frame(&btp).expect("self-generated frame decodes");
     assert_eq!(decoded.ilp_packet, prepare_bytes);
+
+    let via_btp = role_gate::btp_evidence(&decoded).expect("unambiguous evidence");
+    let via_http = connector_peer_http::evidence_on(&PeerRequest {
+        headers: headers.clone(),
+        body: prepare_bytes.clone(),
+    })
+    .expect("unambiguous evidence");
+    for evidence in [&via_btp, &via_http] {
+        assert_eq!(evidence.claim.is_some(), claim.is_some());
+        assert_eq!(evidence.challenge.is_some(), challenge.is_some());
+        assert_eq!(evidence.moves_no_value, prepare.amount == 0);
+    }
+    assert_eq!(via_btp.claim, via_http.claim, "I1: one voucher, both ways");
+    assert_eq!(via_btp.challenge, via_http.challenge);
+
+    PreparePairCase {
+        name,
+        prepare: prepare_fields(prepare),
+        claim_json: claim.map(str::to_string),
+        challenge_json: challenge.map(str::to_string),
+        btp_message_hex: hex_of(&btp),
+        http_headers: headers_pairs(&headers),
+        http_body_hex: hex_of(&prepare_bytes),
+    }
+}
+
+/// The peer-role challenge a paying node signs for a zero-value packet on
+/// its outbound channel (ADR 0075 decision 5), rendered by the paying side's
+/// own `connector_runtime::challenge_entry`.
+fn generate_zero_value_case(voucher: &EvmPresentation) -> PeerZeroValueCase {
+    let (signer, signer_address) =
+        node_settlement_signer("vector-fixture-peer-payer", PEER_PAYER_KEY_START);
+    let domain = BatchSettlementDomain::x402(VOUCHER_EVM_CHAIN_ID);
+    let expires = VOUCHER_CLAIM_STATE_EXPIRES;
+    let digest = evm_voucher_claim_state_challenge_digest(&domain, &voucher.channel_id, expires);
+    let mut signature = signer
+        .sign(&digest)
+        .expect("fixture signer signs its own digest")
+        .to_bytes();
+    signature[64] += 27;
+    assert!(verify_evm_voucher_claim_state_challenge(
+        &domain,
+        &voucher.channel_id,
+        expires,
+        &signature,
+        &signer_address,
+    ));
+    // A challenge is never a voucher: its signature does not verify as one.
+    assert!(!verify_evm_voucher(
+        &domain,
+        &voucher.channel_id,
+        u128::from(expires),
+        &signature,
+        &signer_address,
+    ));
+    let json = challenge_entry(&voucher.presentation, expires, &signature).to_string();
+    let parsed = challenge_json::parse(json.as_bytes()).expect("the challenge parses");
+    assert_eq!(parsed.expires(), expires);
     assert_eq!(
-        claim_json::from_protocol_data(&decoded.protocol_data),
-        Some(evm_claim.json.as_bytes())
+        parsed.channel(),
+        format!("0x{}", hex_of(&voucher.channel_id))
     );
 
-    let mut headers_with_claim = Headers::new();
-    headers_with_claim.push(CLAIM_HEADER, claim_header_value(&evm_claim.json));
-    assert_eq!(
-        http_claim_json(&headers_with_claim)
-            .expect("a claim rode")
-            .expect("valid base64"),
-        evm_claim.json.as_bytes()
+    let packet = prepare_pair_case(
+        "peer_prepare_zero_value_challenge",
+        9_003,
+        &fixture_prepare(0),
+        None,
+        Some(&json),
     );
-
-    let with_claim = PreparePairCase {
-        name: "peer_prepare",
-        prepare: prepare_fields(&prepare),
-        claim_json: Some(evm_claim.json.clone()),
-        btp_message_hex: hex_of(&btp_with_claim),
-        http_headers: headers_pairs(&headers_with_claim),
-        http_body_hex: hex_of(&prepare_bytes),
-    };
-
-    // Item 6: the same PREPARE with no claim entry/header -- "claimless is
-    // legal" pinned rather than assumed.
-    let btp_no_claim = encode_message(9_002, &[], &prepare_bytes);
-    let decoded_no_claim = decode_frame(&btp_no_claim).expect("self-generated frame decodes");
-    assert!(claim_json::from_protocol_data(&decoded_no_claim.protocol_data).is_none());
-
-    let headers_no_claim = Headers::new();
-    assert!(http_claim_json(&headers_no_claim).is_none());
-
-    let without_claim = PreparePairCase {
-        name: "peer_prepare_no_claim",
-        prepare: prepare_fields(&prepare),
-        claim_json: None,
-        btp_message_hex: hex_of(&btp_no_claim),
-        http_headers: headers_pairs(&headers_no_claim),
-        http_body_hex: hex_of(&prepare_bytes),
-    };
-
-    (with_claim, without_claim)
+    PeerZeroValueCase {
+        name: "peer_zero_value_challenge",
+        channel_id_hex: hex_of(&voucher.channel_id),
+        expires,
+        digest_hex: hex_of(&digest),
+        signer_address_hex: hex_of(&signer_address),
+        signature_hex: hex_of(&signature),
+        packet,
+    }
 }
 
 fn fixture_fulfill() -> Fulfill {
@@ -1134,7 +1181,7 @@ struct AnswerCaseSpec {
     accumulated_cost: Option<u64>,
 }
 
-/// One judged-claim RESPONSE, on both carriages: `protocol_data` rides the
+/// One judged-voucher RESPONSE, on both carriages: `protocol_data` rides the
 /// BTP RESPONSE beside `ilp_packet`, and the same fields ride as HTTP
 /// headers beside the same body -- always status `200` (§6.2).
 fn answer_case(spec: AnswerCaseSpec) -> PeerAnswerCase {
@@ -1147,9 +1194,6 @@ fn answer_case(spec: AnswerCaseSpec) -> PeerAnswerCase {
         headers.push(name.clone(), value.clone());
     }
 
-    // I1, on the ack and the accumulated-cost fields alike: whatever this
-    // case pins is read back identically off both encodings by the real
-    // decoders.
     let expected_ack = spec.ack.as_ref().map(|fields| match fields.reason {
         None => ClaimAckOutcome::Accepted,
         Some(reason) => ClaimAckOutcome::Rejected(
@@ -1179,10 +1223,8 @@ fn answer_case(spec: AnswerCaseSpec) -> PeerAnswerCase {
     }
 }
 
-/// [`generate_answer_cases`]'s output, named so its four same-typed
-/// [`PeerAnswerCase`] values can't be silently transposed by position the
-/// way a same-typed tuple return could be -- the return-side counterpart
-/// to [`AnswerCaseSpec`] grouping the argument side.
+/// [`generate_answer_cases`]'s output, named so its same-typed
+/// [`PeerAnswerCase`] values can't be silently transposed by position.
 struct AnswerCases {
     fulfill_ack_accepted: PeerAnswerCase,
     fulfill_ack_rejected: PeerAnswerCase,
@@ -1194,9 +1236,9 @@ struct AnswerCases {
 fn generate_answer_cases() -> AnswerCases {
     let fulfill_bytes = fixture_fulfill().encode();
 
-    // Item 7: a FULFILL, acknowledged accepted.
-    let ack_entry = ack::protocol_data(ClaimAckOutcome::Accepted).expect("a judged claim");
-    let ack_header = claim_ack_header_value(ClaimAckOutcome::Accepted).expect("a judged claim");
+    // Item 7: a FULFILL, its voucher acknowledged accepted.
+    let ack_entry = ack::protocol_data(ClaimAckOutcome::Accepted).expect("a judged voucher");
+    let ack_header = claim_ack_header_value(ClaimAckOutcome::Accepted).expect("a judged voucher");
     let fulfill_ack_accepted = answer_case(AnswerCaseSpec {
         name: "peer_fulfill_ack_accepted".to_string(),
         request_id: 9_101,
@@ -1215,8 +1257,8 @@ fn generate_answer_cases() -> AnswerCases {
     // a FULFILL answer carrying a *rejected* claim-ack on the same
     // response, pinning §6.2's independence of the two verdicts.
     let rejected_signature_invalid = ClaimAckOutcome::Rejected(ClaimRejectReason::SignatureInvalid);
-    let ack_entry = ack::protocol_data(rejected_signature_invalid).expect("a judged claim");
-    let ack_header = claim_ack_header_value(rejected_signature_invalid).expect("a judged claim");
+    let ack_entry = ack::protocol_data(rejected_signature_invalid).expect("a judged voucher");
+    let ack_header = claim_ack_header_value(rejected_signature_invalid).expect("a judged voucher");
     let fulfill_ack_rejected = answer_case(AnswerCaseSpec {
         name: "peer_fulfill_ack_rejected".to_string(),
         request_id: 9_102,
@@ -1231,11 +1273,16 @@ fn generate_answer_cases() -> AnswerCases {
         accumulated_cost: None,
     });
 
-    // Item 9: one pair per §6.1 reason.
+    // Item 9: one pair per reason a voucher's verdict can carry (§6.1): a
+    // signature that does not recover to the channel's voucher signer, an
+    // amount that does not strictly exceed the watermark (or does not cover
+    // the packet, or is above the channel's collateral), and a channel the
+    // receiving half does not admit. `nonce_not_advancing` stays in the
+    // ack's vocabulary for a pre-ADR 0075 decoder, but no voucher verdict
+    // produces it, so it is no longer pinned.
     let mut ack_rejected_reasons = Vec::new();
     for (index, reason) in [
         ClaimRejectReason::SignatureInvalid,
-        ClaimRejectReason::NonceNotAdvancing,
         ClaimRejectReason::AmountNotAdvancing,
         ClaimRejectReason::UnknownChannel,
     ]
@@ -1244,8 +1291,8 @@ fn generate_answer_cases() -> AnswerCases {
     {
         let outcome = ClaimAckOutcome::Rejected(reason);
         let reason_name = ack::reason_name(reason);
-        let ack_entry = ack::protocol_data(outcome).expect("a judged claim");
-        let ack_header = claim_ack_header_value(outcome).expect("a judged claim");
+        let ack_entry = ack::protocol_data(outcome).expect("a judged voucher");
+        let ack_header = claim_ack_header_value(outcome).expect("a judged voucher");
         ack_rejected_reasons.push(answer_case(AnswerCaseSpec {
             name: format!("peer_ack_rejected_{reason_name}"),
             request_id: 9_110 + index as u32,
@@ -1267,8 +1314,8 @@ fn generate_answer_cases() -> AnswerCases {
     let accumulated_cost = 4_200u64;
     let cost_entry = fields::accumulated_cost_protocol_data(accumulated_cost);
     let cost_header = accumulated_cost.to_string();
-    let ack_entry = ack::protocol_data(ClaimAckOutcome::Accepted).expect("a judged claim");
-    let ack_header = claim_ack_header_value(ClaimAckOutcome::Accepted).expect("a judged claim");
+    let ack_entry = ack::protocol_data(ClaimAckOutcome::Accepted).expect("a judged voucher");
+    let ack_header = claim_ack_header_value(ClaimAckOutcome::Accepted).expect("a judged voucher");
     let reject_with_cost = answer_case(AnswerCaseSpec {
         name: "peer_reject_with_cost".to_string(),
         request_id: 9_120,
@@ -1286,7 +1333,7 @@ fn generate_answer_cases() -> AnswerCases {
         accumulated_cost: Some(accumulated_cost),
     });
 
-    // Item 11: a response answering a claim-bearing request with **no**
+    // Item 11: a response answering a voucher-bearing request with **no**
     // ack at all -- pinned as NOT ACKNOWLEDGED (§6.3), not a verdict.
     let ack_absent = answer_case(AnswerCaseSpec {
         name: "peer_ack_absent".to_string(),
@@ -1306,27 +1353,6 @@ fn generate_answer_cases() -> AnswerCases {
         reject_with_cost,
         ack_absent,
     }
-}
-
-/// Item 14: the answer to a FLUSH -- an **empty** packet, acknowledged
-/// accepted. Shares [`answer_case`]'s machinery with items 7-11 over a
-/// zero-length `packet_bytes`.
-fn generate_flush_ack_case() -> PeerAnswerCase {
-    let ack_entry = ack::protocol_data(ClaimAckOutcome::Accepted).expect("a judged claim");
-    let ack_header = claim_ack_header_value(ClaimAckOutcome::Accepted).expect("a judged claim");
-    answer_case(AnswerCaseSpec {
-        name: "peer_flush_ack".to_string(),
-        request_id: 9_140,
-        packet: "none",
-        packet_bytes: Vec::new(),
-        protocol_data: vec![ack_entry],
-        http_headers: vec![(CLAIM_ACK_HEADER.to_string(), ack_header)],
-        ack: Some(AckFields {
-            result: "accepted",
-            reason: None,
-        }),
-        accumulated_cost: None,
-    })
 }
 
 fn generate_ack_malformed_case() -> PeerMalformedAckCase {
@@ -1353,182 +1379,6 @@ fn generate_ack_malformed_case() -> PeerMalformedAckCase {
         malformed_json: malformed.clone(),
         btp_raw_hex: hex_of(malformed.as_bytes()),
         http_base64: http_value,
-    }
-}
-
-fn generate_flush_case(evm_claim: &PeerClaimCase) -> PeerFlushCase {
-    let claim_entry = claim_json::protocol_data(&evm_claim.json);
-    let amount = evm_claim.wire_cumulative_amount;
-
-    let btp = encode_transfer(9_150, amount, &[claim_entry]);
-    let decoded = decode_frame(&btp).expect("self-generated frame decodes");
-    assert_eq!(decoded.amount, Some(amount));
-    assert!(
-        decoded.ilp_packet.is_empty(),
-        "a TRANSFER carries no ilpPacket"
-    );
-    assert_eq!(
-        claim_json::from_protocol_data(&decoded.protocol_data),
-        Some(evm_claim.json.as_bytes())
-    );
-
-    let mut headers = Headers::new();
-    headers.push(CLAIM_HEADER, claim_header_value(&evm_claim.json));
-    assert_eq!(
-        http_claim_json(&headers)
-            .expect("a claim rode")
-            .expect("valid base64"),
-        evm_claim.json.as_bytes()
-    );
-
-    PeerFlushCase {
-        name: "peer_flush",
-        claim_json: evm_claim.json.clone(),
-        transfer_amount: amount,
-        btp_transfer_hex: hex_of(&btp),
-        http_headers: headers_pairs(&headers),
-        http_body_hex: String::new(),
-    }
-}
-
-/// Items 15 and 16: §6.3's idempotent re-ack and its boundary, for a
-/// `toon-channel` peer claim.
-///
-/// No carriage judges one any more (ADR 0075, #1380): the accept paths'
-/// `judge_claim` and the `ClaimBook` it fell through to are deleted, and
-/// #1384 drops these cases with the rest of the `toon-channel` sections at
-/// `schema_version` 7. Until then the vectors are unchanged, and what the
-/// two deleted gates decided is restated here from the domain's own rule
-/// (`connector_domain::validate_claim`) and the claim's own signature, so the
-/// fixtures still say what they always said.
-fn generate_retransmit_cases() -> (PeerRetransmitCase, PeerRetransmitCase) {
-    let signer =
-        LocalSigner::from_secret_bytes("vector-fixture-retransmit-key", seq_bytes::<32>(0xb1))
-            .expect("fixture retransmit secret is a valid secp256k1 scalar");
-    let signer_address = derive_evm_address(&signer.public_key().expect("fixture has a key"));
-    let channel_id = seq_bytes::<32>(0xb5);
-    let chain_id = 84_532u64;
-    let token_network_address: Address = seq_bytes::<20>(0xb9);
-    let peer_domain = PeerClaimDomain {
-        chain_id,
-        token_network: token_network_address,
-    };
-
-    let sign = |nonce: u64, amount: u64| -> WireClaim {
-        let proof = EvmBalanceProof {
-            channel_id,
-            nonce,
-            transferred_amount: u128::from(amount),
-            locked_amount: 0,
-            locks_root: [0u8; 32],
-            chain_id,
-            token_network_address,
-        };
-        let signature = signer
-            .sign(&evm_balance_proof_digest(&proof))
-            .expect("fixture signer signs its own digest");
-        WireClaim {
-            channel_id: format!("0x{}", hex::encode(channel_id)),
-            nonce,
-            cumulative_amount: amount,
-            signature: ClaimSignature::Evm(signature),
-        }
-    };
-    let render = |claim: &WireClaim| {
-        claim_json::encode(
-            claim,
-            &signer_address,
-            // EVM fixture, as above -- no Solana signer or program id to
-            // render with.
-            None,
-            None,
-            Some(peer_domain),
-            "vector-fixture:retransmit",
-            "2030-01-01T00:00:00.000Z",
-        )
-    };
-
-    let first = sign(11, 800_000);
-    let first_json = render(&first);
-
-    // The re-ack: the claim at the watermark, byte for byte.
-    let at_watermark = first.clone();
-    assert_eq!(
-        at_watermark, first,
-        "a byte-identical retransmission must be recognised at the watermark"
-    );
-
-    let retransmit = PeerRetransmitCase {
-        name: "peer_claim_retransmit",
-        first_claim_json: first_json.clone(),
-        second_claim_json: first_json.clone(),
-        first_ack: "accepted",
-        second_ack: "accepted",
-        second_ack_reason: None,
-    };
-
-    // Item 16: a genuinely different, validly signed claim at the *same*
-    // nonce is not the one at the watermark, and falls through to the
-    // strictly-advancing rule: its signature verifies, and its nonce does
-    // not advance past the first's.
-    let different = sign(11, 950_000);
-    assert_ne!(at_watermark, different);
-    let verifies = |claim: &WireClaim| {
-        let ClaimSignature::Evm(signature) = claim.signature else {
-            unreachable!("an EVM fixture");
-        };
-        connector_signer::verify_evm_balance_proof(
-            &EvmBalanceProof {
-                channel_id,
-                nonce: claim.nonce,
-                transferred_amount: u128::from(claim.cumulative_amount),
-                locked_amount: 0,
-                locks_root: [0u8; 32],
-                chain_id,
-                token_network_address,
-            },
-            &signature.to_bytes(),
-            &signer_address,
-        )
-    };
-    assert!(verifies(&first) && verifies(&different));
-    assert!(connector_domain::validate_claim(None, first.nonce, first.cumulative_amount).is_ok());
-    assert!(matches!(
-        connector_domain::validate_claim(
-            Some(connector_domain::advance_watermark(
-                first.nonce,
-                first.cumulative_amount
-            )),
-            different.nonce,
-            different.cumulative_amount,
-        ),
-        Err(connector_domain::ClaimError::NonceNotAdvancing { .. })
-    ));
-
-    let different_bytes = PeerRetransmitCase {
-        name: "peer_claim_same_nonce_different_bytes",
-        first_claim_json: first_json,
-        second_claim_json: render(&different),
-        first_ack: "accepted",
-        second_ack: "rejected",
-        second_ack_reason: Some("nonce_not_advancing"),
-    };
-
-    (retransmit, different_bytes)
-}
-
-fn generate_flush_requested_case() -> PeerFlushRequestedCase {
-    let channel_id = format!("0x{}", hex::encode(seq_bytes::<32>(0xc5)));
-    let mut headers = Headers::new();
-    headers.push(FLUSH_REQUESTED_HEADER, &channel_id);
-    assert_eq!(http_flush_requested(&headers), vec![channel_id.clone()]);
-
-    PeerFlushRequestedCase {
-        name: "peer_flush_requested",
-        channel_id: channel_id.clone(),
-        http_header_value: channel_id,
-        note: "HTTP only -- BTP has no counterpart (peer-carriage-spec.md §6.4): the payee can \
-               originate a request of its own",
     }
 }
 
@@ -1561,13 +1411,25 @@ fn generate_forwarded_data_case(giftwrap: &GiftwrapVectors) -> PeerForwardedData
     }
 }
 
-fn generate_peer_carriage_vectors(
-    claim_fixture: &ClaimFixture,
-    giftwrap: &GiftwrapVectors,
-) -> PeerCarriageVectors {
-    let claim_evm = generate_peer_claim_evm_case(claim_fixture);
-    let claim_solana = generate_peer_claim_solana_case();
-    let (prepare, prepare_no_claim) = generate_prepare_pair_cases(&claim_evm);
+fn generate_peer_carriage_vectors(giftwrap: &GiftwrapVectors) -> PeerCarriageVectors {
+    let (voucher_evm, evm_presentation) = generate_peer_voucher_evm_case();
+    let voucher_solana = generate_peer_voucher_solana_case();
+    let prepare_with_voucher = fixture_prepare(250_000);
+    let prepare = prepare_pair_case(
+        "peer_prepare",
+        9_001,
+        &prepare_with_voucher,
+        Some(&voucher_evm.json),
+        None,
+    );
+    let prepare_no_claim = prepare_pair_case(
+        "peer_prepare_no_claim",
+        9_002,
+        &prepare_with_voucher,
+        None,
+        None,
+    );
+    let zero_value_challenge = generate_zero_value_case(&evm_presentation);
     let AnswerCases {
         fulfill_ack_accepted,
         fulfill_ack_rejected,
@@ -1575,256 +1437,339 @@ fn generate_peer_carriage_vectors(
         reject_with_cost,
         ack_absent,
     } = generate_answer_cases();
-    let flush_ack = generate_flush_ack_case();
     let ack_malformed = generate_ack_malformed_case();
-    let flush = generate_flush_case(&claim_evm);
-    let (claim_retransmit, claim_same_nonce_different_bytes) = generate_retransmit_cases();
-    let flush_requested = generate_flush_requested_case();
     let forwarded_data_unchanged = generate_forwarded_data_case(giftwrap);
 
     PeerCarriageVectors {
-        claim_digest_hex: claim_fixture.digest_hex.clone(),
-        claim_evm,
-        claim_solana,
+        voucher_evm,
+        voucher_solana,
         prepare,
         prepare_no_claim,
+        zero_value_challenge,
         fulfill_ack_accepted,
         fulfill_ack_rejected,
         ack_rejected_reasons,
         reject_with_cost,
         ack_absent,
         ack_malformed,
-        flush,
-        flush_ack,
-        claim_retransmit,
-        claim_same_nonce_different_bytes,
-        flush_requested,
         forwarded_data_unchanged,
     }
 }
 
 // ---------------------------------------------------------------------
-// Client channel-control declaration (issue #792,
-// `docs/protocol/client-edge-spec.md` §1.9 step 1, issue #790)
+// The retired `toon-channel` claim, refused by name (ADR 0075 decision 8,
+// issue #1384)
 // ---------------------------------------------------------------------
 //
-// The BTP auth entry's `channelId`/`expires`/`signature` fields, binding a
-// client session to a channel *before* it has ever presented a claim
-// (issue #790) -- the identical domain-separated `ClaimStateChallenge`
-// signature `POST /ilp/claim-state` already verifies for a read
-// (`connector_signer::claim_state_challenge`), reused rather than a
-// claim's own balance-proof scheme. Generated through the real digest and
-// verification functions, never a hand-rolled parallel signer, and
-// self-verified against them before being emitted -- exactly the
-// discipline `verify_and_record_declared_channel`
-// (`connector-client-edge::btp`) itself applies.
+// A claim with no `scheme`, or `scheme: "toon-channel"`, is the retired
+// claim. Every edge refuses it **by name** rather than as malformed, so a
+// straggler learns to upgrade: the client edge's claim parser
+// (`ClientClaimError::ToonChannel`), and each peer carriage before the role
+// is decided -- a BTP ERROR frame, and an HTTP `400` whose body names it.
 
-/// One `auth` entry carrying a channel-control declaration, and the BTP
-/// MESSAGE frame it rides in -- the same `{peerId, secret, channelId,
-/// expires, signature}` shape `auth_channel_proof`
-/// (`connector-client-edge::btp`) extracts.
+/// One retired claim and every edge's refusal of it.
 #[derive(Debug, Serialize)]
-pub struct ChannelControlDeclarationCase {
+pub struct ToonChannelRefusedCase {
     pub name: &'static str,
-    pub peer_id: &'static str,
-    /// The EIP-712 domain's `chainId` -- the channel's own registered
-    /// domain, never a self-declared one (same rule as [`ClaimCase`]).
-    pub chain_id: u64,
-    pub token_network_address_hex: String,
-    pub channel_id_hex: String,
-    /// Unix seconds. Compared by the verifier as `expires <= now` ->
-    /// rejected -- a fact about wall-clock time at verification time, not
-    /// something this static vector can itself encode, which is why the
-    /// `channel_control_declaration_expired` case picks an `expires` far
-    /// enough in the past (`1`, 1970-01-01T00:00:01Z) to be expired against
-    /// any reasonable clock, and the valid cases pick one far enough in the
-    /// future (2030/2100) to still be valid against any reasonable clock.
-    pub expires: u64,
-    /// The channel's registered counterparty -- what `signature` must
-    /// recover to for [`signature_verifies`] to be `true`.
-    ///
-    /// [`signature_verifies`]: ChannelControlDeclarationCase::signature_verifies
-    pub counterparty_address_hex: String,
-    pub signer_secret_hex: String,
-    pub signer_address_hex: String,
-    /// `keccak256(0x1901 || domainSeparator || structHash)` for
-    /// `ClaimStateChallenge(bytes32 channelId,uint256 expires)` -- the
-    /// exact bytes `signature` covers.
-    pub digest_hex: String,
-    /// `r || s || recovery_id` (recovery_id `0`/`1`), `0x`-prefixed, 65
-    /// bytes -- matching `EvmSigner.signClaimStateChallenge`'s wire form.
-    pub signature_hex: String,
-    /// The auth entry's JSON body, byte-for-byte what rides as the BTP
-    /// `auth` protocolData entry's `data`.
-    pub auth_json: String,
+    pub claim_json: String,
+    /// The client edge's refusal, as a stable tag: always `"toon_channel"`.
+    pub client_edge_error: &'static str,
+    /// Its message, which names the retirement (informational: match on
+    /// `client_edge_error`).
+    pub client_edge_message: String,
+    /// The claim riding a PREPARE on the BTP peer carriage.
     pub btp_message_hex: String,
-    /// Whether `signature` recovers to `counterparty_address_hex` under
-    /// `connector_signer::verify_evm_claim_state_challenge` -- independent
-    /// of `expires`, which the verifier checks separately (see that
-    /// field's own doc). `false` only for the wrong-key case: the expired
-    /// case's signature is genuine and this is still `true` for it.
-    pub signature_verifies: bool,
+    /// The ERROR frame answering it: `code F00`, `name NotAcceptedError`,
+    /// `data` = [`Self::refusal_text`].
+    pub btp_error_hex: String,
+    /// The same claim in the HTTP peer carriage's `Payment-Channel-Claim`
+    /// header, beside the same PREPARE.
+    pub http_headers: Vec<(String, String)>,
+    pub http_body_hex: String,
+    /// The HTTP answer: `400`, with no ILP body, and the refusal as a
+    /// `text/plain` body.
+    pub http_status: u16,
+    pub http_response_body_hex: String,
+    /// What both peer carriages say.
+    pub refusal_text: String,
 }
 
 #[derive(Debug, Serialize)]
-pub struct ChannelControlDeclarationVectors {
-    pub cases: Vec<ChannelControlDeclarationCase>,
+pub struct ToonChannelRefusedVectors {
+    pub cases: Vec<ToonChannelRefusedCase>,
 }
 
-/// The fields shared by every [`ChannelControlDeclarationCase`] this module
-/// emits -- one channel, one registered counterparty, varied only by which
-/// key signs and what `expires` says.
-struct ChannelControlFixture {
-    channel_id: [u8; 32],
-    chain_id: u64,
-    token_network_address: Address,
-    peer_id: &'static str,
-    counterparty_address: Address,
-}
-
-/// Builds and self-verifies one [`ChannelControlDeclarationCase`]: signs the
-/// real EIP-712 digest, checks the resulting signature against
-/// `fixture.counterparty_address` through the real verifier (asserting the
-/// result matches `expect_verifies`, so this module cannot silently commit
-/// a case whose own verdict it got wrong), round-trips the JSON through
-/// `serde_json` the same way `auth_channel_proof` reads it, and round-trips
-/// the BTP frame through `encode_message`/`decode_frame`.
-fn channel_control_case(
-    fixture: &ChannelControlFixture,
+fn toon_channel_refused_case(
     name: &'static str,
-    expires: u64,
-    signer_secret: [u8; 32],
-    signer_label: &'static str,
-    expect_verifies: bool,
-) -> ChannelControlDeclarationCase {
-    let signer = LocalSigner::from_secret_bytes(signer_label, signer_secret)
-        .expect("fixture secret is a valid secp256k1 scalar");
-    let signer_address = derive_evm_address(&signer.public_key().expect("fixture has a key"));
-
-    let challenge = EvmClaimStateChallenge {
-        channel_id: fixture.channel_id,
-        expires,
-        chain_id: fixture.chain_id,
-        token_network_address: fixture.token_network_address,
-    };
-    let digest = evm_claim_state_challenge_digest(&challenge);
-    let signature = signer
-        .sign(&digest)
-        .expect("fixture signer signs its own digest");
-    let signature_bytes = signature.to_bytes();
-
-    let signature_verifies = verify_evm_claim_state_challenge(
-        &challenge,
-        &signature_bytes,
-        &fixture.counterparty_address,
-    );
+    request_id: u32,
+    claim: &serde_json::Value,
+) -> ToonChannelRefusedCase {
+    let claim_json = claim.to_string();
+    let client_error =
+        client_claim::parse_client_claim(&claim_json).expect_err("a toon-channel claim is refused");
+    assert_eq!(client_error, ClientClaimError::ToonChannel);
     assert_eq!(
-        signature_verifies, expect_verifies,
-        "vector {name} computed the wrong verification verdict"
+        claim_json::parse(claim_json.as_bytes()),
+        Err(ClaimDecodeError::ToonChannel)
     );
+    let refusal = RefusedEvidence::ToonChannelClaim.message();
 
-    let channel_id_hex = format!("0x{}", hex::encode(fixture.channel_id));
-    let signature_hex = format!("0x{}", hex::encode(signature_bytes));
-    let auth_json = serde_json::json!({
-        "peerId": fixture.peer_id,
-        "secret": "",
-        "channelId": channel_id_hex,
-        "expires": expires,
-        "signature": signature_hex,
-    })
-    .to_string();
-
-    // Same field access `auth_channel_proof` performs: this vector cannot
-    // commit a JSON shape that function would fail to parse.
-    let reparsed: serde_json::Value =
-        serde_json::from_str(&auth_json).expect("this module's own json! output parses");
+    let prepare_bytes = fixture_prepare(250_000).encode();
+    let btp = encode_message(
+        request_id,
+        &[claim_json::protocol_data(&claim_json)],
+        &prepare_bytes,
+    );
+    let decoded = decode_frame(&btp).expect("self-generated frame decodes");
     assert_eq!(
-        reparsed["channelId"].as_str(),
-        Some(channel_id_hex.as_str())
+        role_gate::btp_evidence(&decoded).map(|_| ()),
+        Err(RefusedEvidence::ToonChannelClaim)
     );
-    assert_eq!(reparsed["expires"].as_u64(), Some(expires));
-    assert_eq!(reparsed["signature"].as_str(), Some(signature_hex.as_str()));
+    let btp_error = encode_error(request_id, "F00", "NotAcceptedError", &refusal);
 
+    let mut headers = Headers::new();
+    headers.push(CLAIM_HEADER, claim_header_value(&claim_json));
+    assert_eq!(
+        connector_peer_http::evidence_on(&PeerRequest {
+            headers: headers.clone(),
+            body: prepare_bytes.clone(),
+        })
+        .map(|_| ()),
+        Err(RefusedEvidence::ToonChannelClaim)
+    );
+    let http = PeerResponse::refused_naming(400, &refusal);
+    assert!(!http.answers_the_packet());
+
+    ToonChannelRefusedCase {
+        name,
+        claim_json,
+        client_edge_error: "toon_channel",
+        client_edge_message: client_error.to_string(),
+        btp_message_hex: hex_of(&btp),
+        btp_error_hex: hex_of(&btp_error),
+        http_headers: headers_pairs(&headers),
+        http_body_hex: hex_of(&prepare_bytes),
+        http_status: http.status,
+        http_response_body_hex: hex_of(&http.body),
+        refusal_text: String::from_utf8(refusal.to_vec()).expect("the refusal is text"),
+    }
+}
+
+/// The devnet deploy of TOON's retired Solana payment-channel program: what
+/// the refused Solana `toon-channel` claim below names as its `programId`,
+/// so the refusal is pinned against the claim a straggling devnet payer
+/// actually sends. `solana_program_ids.rs` holds it to the deployment record.
+const SOLANA_SETTLEMENT_PROGRAM_ID: &str = "2aEVJ8koKD8LTZrLRSGtAtU7LBt4e7QjjCgf1kzQ7Rip";
+
+fn generate_toon_channel_refused_vectors() -> ToonChannelRefusedVectors {
+    // The EVM `toon-channel` claim exactly as a pre-ADR 0075 client or peer
+    // sends it: no `scheme`, a nonce, a balance proof.
+    let evm = serde_json::json!({
+        "version": "1.0",
+        "blockchain": "evm",
+        "messageId": "vector-fixture:toon-channel:evm",
+        "timestamp": FIXTURE_TIMESTAMP,
+        "senderId": "0x4444444444444444444444444444444444444444",
+        "channelId": format!("0x{}", hex_of(&seq_bytes::<32>(0xa0))),
+        "nonce": 4,
+        "transferredAmount": "12500",
+        "lockedAmount": "0",
+        "locksRoot": format!("0x{}", "0".repeat(64)),
+        "signature": format!("0x{}", hex_of(&seq_bytes::<65>(0x11))),
+        "signerAddress": "0x4444444444444444444444444444444444444444",
+        "chainId": VOUCHER_EVM_CHAIN_ID,
+        "tokenNetworkAddress": format!("0x{}", hex_of(&[0x42; 20])),
+    });
+    let mut explicit = evm.clone();
+    explicit["scheme"] = "toon-channel".into();
+    let solana = serde_json::json!({
+        "version": "1.0",
+        "blockchain": "solana",
+        "messageId": "vector-fixture:toon-channel:solana",
+        "timestamp": FIXTURE_TIMESTAMP,
+        "senderId": "11111111111111111111111111111113",
+        "programId": SOLANA_SETTLEMENT_PROGRAM_ID,
+        "channelAccount": "GDDMwNyyx8uB6zrqwBFHjLLG3TBYk2F1Mh6usnNPUsqk",
+        "nonce": 1,
+        "transferredAmount": "250000",
+        "signature": BASE64.encode(seq_bytes::<64>(0xe1)),
+        "signerPublicKey": "11111111111111111111111111111113",
+    });
+    ToonChannelRefusedVectors {
+        cases: vec![
+            toon_channel_refused_case("toon_channel_evm_no_scheme", 9_401, &evm),
+            toon_channel_refused_case("toon_channel_evm_explicit_scheme", 9_402, &explicit),
+            toon_channel_refused_case("toon_channel_solana_no_scheme", 9_403, &solana),
+        ],
+    }
+}
+
+// ---------------------------------------------------------------------
+// Client payouts (ADR 0075 decision 7, issue #1381)
+// ---------------------------------------------------------------------
+//
+// A connector pays a client back with a voucher on its own outbound channel
+// toward the client's payee key, signed by the chain's settlement key, and
+// delivers it as a BTP TRANSFER over the client's session: the voucher JSON
+// in a `payout-claim` protocolData entry, the TRANSFER's `amount` the
+// voucher's cumulative amount (`client-edge-spec.md` §1.9 step 7). The
+// client lands it itself. ADR 0026's #1073 correction records the client BTP
+// dialect as uncovered by this contract; this section covers the one entry
+// of it a client has to parse to be paid.
+//
+// The entry is the client-edge claim JSON (§1.3) less its envelope
+// (`version`, `messageId`, `timestamp`, `senderId`): `blockchain`, `scheme`,
+// `channelId`, `maxClaimableAmount`, `signature`, and on EVM always the
+// `channelConfig` `claim` needs, on Solana `expiresAt: 0`. Its bytes are
+// reproduced here from `connector-client-edge`'s
+// `payout_voucher_protocol_data`, which this crate cannot depend on; the
+// self-verification below restores the envelope and parses it with the
+// client edge's own parser, and checks the signature.
+
+#[derive(Debug, Serialize)]
+pub struct PayoutVoucherEvmCase {
+    pub name: &'static str,
+    #[serde(flatten)]
+    pub facts: EvmVoucherFacts,
+    /// The `payout-claim` entry's JSON.
+    pub json: String,
+    /// The TRANSFER carrying it; its `amount` is `max_claimable_amount`.
+    pub btp_transfer_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PayoutVoucherSolanaCase {
+    pub name: &'static str,
+    pub channel_account_base58: String,
+    /// The connector's Solana settlement key: the channel's
+    /// `authorized_signer`.
+    pub authorized_signer_base58: String,
+    pub signer_secret_hex: String,
+    pub max_claimable_amount: u64,
+    pub signed_message_hex: String,
+    pub signature_base58: String,
+    pub json: String,
+    pub btp_transfer_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PayoutVoucherVectors {
+    pub evm: PayoutVoucherEvmCase,
+    pub solana: PayoutVoucherSolanaCase,
+}
+
+/// Restore a payout entry's envelope and parse it as a client would its own
+/// claim (§1.3), through the client edge's parser.
+fn parse_payout_entry(json: &str) -> ClientClaim {
+    let mut claim: serde_json::Value = serde_json::from_str(json).expect("the entry is JSON");
+    claim["version"] = "1.0".into();
+    claim["messageId"] = "vector-fixture:payout".into();
+    claim["timestamp"] = FIXTURE_TIMESTAMP.into();
+    claim["senderId"] = "vector-fixture".into();
+    client_claim::parse_client_claim(&claim.to_string()).expect("the payout voucher parses")
+}
+
+fn payout_transfer(request_id: u32, amount: u64, json: &str) -> Vec<u8> {
     let entry = ProtocolData {
-        name: AUTH_PROTOCOL.to_string(),
+        name: PAYOUT_CLAIM_PROTOCOL.to_string(),
         content_type: CONTENT_TYPE_TEXT,
-        data: auth_json.clone().into_bytes(),
+        data: json.as_bytes().to_vec(),
     };
-    let btp_message = encode_message(9_500, &[entry], &[]);
-    let decoded = decode_frame(&btp_message).expect("self-generated frame decodes");
-    let decoded_entry = decoded
+    let btp = encode_transfer(request_id, amount, &[entry]);
+    let decoded = decode_frame(&btp).expect("self-generated frame decodes");
+    assert_eq!(decoded.amount, Some(amount));
+    assert!(
+        decoded.ilp_packet.is_empty(),
+        "a TRANSFER carries no ilpPacket"
+    );
+    let rode = decoded
         .protocol_data
         .iter()
-        .find(|pd| pd.name == AUTH_PROTOCOL)
-        .expect("the auth entry rides the frame it was just encoded into");
-    assert_eq!(decoded_entry.data, auth_json.as_bytes());
-
-    ChannelControlDeclarationCase {
-        name,
-        peer_id: fixture.peer_id,
-        chain_id: fixture.chain_id,
-        token_network_address_hex: hex_of(&fixture.token_network_address),
-        channel_id_hex,
-        expires,
-        counterparty_address_hex: hex_of(&fixture.counterparty_address),
-        signer_secret_hex: hex_of(&signer_secret),
-        signer_address_hex: hex_of(&signer_address),
-        digest_hex: hex_of(&digest),
-        signature_hex,
-        auth_json,
-        btp_message_hex: hex_of(&btp_message),
-        signature_verifies,
-    }
+        .find(|pd| pd.name == PAYOUT_CLAIM_PROTOCOL)
+        .expect("the payout entry rode");
+    assert_eq!(rode.data, json.as_bytes());
+    btp
 }
 
-fn generate_channel_control_declaration_vectors() -> ChannelControlDeclarationVectors {
-    let counterparty_secret = seq_bytes::<32>(0x91);
-    let counterparty_label = "vector-fixture-channel-control-counterparty";
-    let counterparty = LocalSigner::from_secret_bytes(counterparty_label, counterparty_secret)
-        .expect("fixture counterparty secret is a valid secp256k1 scalar");
-    let counterparty_address =
-        derive_evm_address(&counterparty.public_key().expect("fixture has a key"));
-
-    let fixture = ChannelControlFixture {
-        channel_id: seq_bytes::<32>(0xe5),
-        chain_id: 84_532, // Base Sepolia -- an example domain, as in `generate_claim_vectors`.
-        token_network_address: seq_bytes::<20>(0xe9),
-        peer_id: "g.toon.vector-agent",
-        counterparty_address,
+fn generate_payout_voucher_vectors() -> PayoutVoucherVectors {
+    // EVM: the connector's settlement key pays a client's payee address.
+    let (signer, payer) = node_settlement_signer("vector-fixture-connector", 0x61);
+    let client_payee: Address = [0x9a; 20];
+    let config = outbound_channel_config(payer, client_payee, 0xab);
+    let amount: u64 = 42_000;
+    let (facts, presentation) = sign_evm_voucher(&signer, &config, amount);
+    let address = |bytes: &[u8; 20]| format!("0x{}", hex_of(bytes));
+    let mut evm_json = serde_json::json!({
+        "scheme": "batch-settlement",
+        "channelId": format!("0x{}", hex_of(&presentation.channel_id)),
+        "maxClaimableAmount": amount.to_string(),
+    });
+    evm_json["blockchain"] = "evm".into();
+    evm_json["signature"] = format!("0x{}", hex_of(&presentation.signature)).into();
+    evm_json["channelConfig"] = serde_json::json!({
+        "payer": address(&config.payer),
+        "payerAuthorizer": address(&config.payer_authorizer),
+        "receiver": address(&config.receiver),
+        "receiverAuthorizer": address(&config.receiver_authorizer),
+        "token": address(&config.token),
+        "withdrawDelay": config.withdraw_delay,
+        "salt": format!("0x{}", hex_of(&config.salt)),
+    });
+    let evm_json = serde_json::to_string(&evm_json).expect("a json! object serializes");
+    let ClientClaim::EvmVoucher(voucher) = parse_payout_entry(&evm_json) else {
+        panic!("an EVM payout voucher");
+    };
+    assert_eq!(voucher.max_claimable_amount, amount);
+    assert!(voucher.channel_config.is_some());
+    let evm = PayoutVoucherEvmCase {
+        name: "payout_voucher_evm",
+        facts,
+        btp_transfer_hex: hex_of(&payout_transfer(9_501, amount, &evm_json)),
+        json: evm_json,
     };
 
-    let valid = channel_control_case(
-        &fixture,
-        "channel_control_declaration_valid",
-        4_102_444_800, // 2100-01-01T00:00:00Z
-        counterparty_secret,
-        counterparty_label,
-        true,
-    );
+    // Solana: the connector's Solana settlement key is `authorized_signer`.
+    let seed = seq_bytes::<32>(0x71);
+    let solana_signer =
+        LocalEd25519Signer::from_secret_bytes(seed).expect("fixture seed is 32 bytes");
+    let channel_account: [u8; 32] = [0x7c; 32];
+    let solana_amount: u64 = 42_000;
+    let message = solana_voucher_message(&channel_account, solana_amount, 0);
+    let signature = solana_signer.sign(&message);
+    assert!(verify_solana_voucher(
+        &channel_account,
+        solana_amount,
+        0,
+        &signature,
+        &solana_signer.public_key()
+    ));
+    let channel_account_base58 = bs58::encode(channel_account).into_string();
+    let mut solana_json = serde_json::json!({
+        "scheme": "batch-settlement",
+        "channelId": channel_account_base58,
+        "maxClaimableAmount": solana_amount.to_string(),
+    });
+    solana_json["blockchain"] = "solana".into();
+    solana_json["expiresAt"] = 0.into();
+    solana_json["signature"] = bs58::encode(signature).into_string().into();
+    let solana_json = serde_json::to_string(&solana_json).expect("a json! object serializes");
+    assert!(matches!(
+        parse_payout_entry(&solana_json),
+        ClientClaim::SolanaVoucher(_)
+    ));
+    let solana = PayoutVoucherSolanaCase {
+        name: "payout_voucher_solana",
+        channel_account_base58,
+        authorized_signer_base58: bs58::encode(solana_signer.public_key()).into_string(),
+        signer_secret_hex: hex_of(&seed),
+        max_claimable_amount: solana_amount,
+        signed_message_hex: hex_of(&message),
+        signature_base58: bs58::encode(signature).into_string(),
+        btp_transfer_hex: hex_of(&payout_transfer(9_502, solana_amount, &solana_json)),
+        json: solana_json,
+    };
 
-    let wrong_key = channel_control_case(
-        &fixture,
-        "channel_control_declaration_wrong_key",
-        4_102_444_800, // 2100-01-01T00:00:00Z
-        seq_bytes::<32>(0x99),
-        "vector-fixture-channel-control-forger",
-        false,
-    );
-
-    let expired = channel_control_case(
-        &fixture,
-        "channel_control_declaration_expired",
-        1, // 1970-01-01T00:00:01Z -- the signature itself is genuine; only
-        // the caller's own wall-clock check (not this function) treats it
-        // as expired.
-        counterparty_secret,
-        counterparty_label,
-        true,
-    );
-
-    ChannelControlDeclarationVectors {
-        cases: vec![valid, wrong_key, expired],
-    }
+    PayoutVoucherVectors { evm, solana }
 }
 
 /// What a route charges for one packet, as a function of that packet's
@@ -1983,12 +1928,9 @@ fn generate_charge_vectors() -> ChargeVectors {
 // is a **voucher** -- no nonce, ordered by its cumulative amount alone
 // (`connector_domain::validate_voucher`), verified against a different
 // signature scheme per chain (`connector_signer::voucher_signature`).
-// Client edge only: no peer carriage ever accepts one
-// (`connector_peer_btp::claim_json::parse` has no voucher arm), so unlike
-// `peer_carriage`'s claim cases there is no BTP/HTTP framing pair here -- a
-// voucher rides the same `ILP-Payment-Channel-Claim` header/protocolData
-// entry a `toon-channel` claim already does, and only its JSON shape
-// differs.
+// Since ADR 0075 it is the only claim, on every edge: this section pins the
+// client-edge shape, and `peer_carriage.voucher_evm`/`voucher_solana` pin a
+// peer's, with its BTP/HTTP framing pair.
 //
 // **Live cross-check, 2026-09-25.** The EVM fixture below is not only this
 // crate's own arithmetic: `channel_id_hex` and `digest_hex` were
@@ -2261,7 +2203,7 @@ fn generate_voucher_solana_case() -> VoucherSolanaCase {
 
 /// One outcome of [`validate_voucher`] (ADR 0074 decision 3): the
 /// amount-only rule a voucher's freshness is judged by, in place of the
-/// nonce every `toon-channel` claim uses.
+/// nonce the retired `toon-channel` claim used.
 #[derive(Debug, Serialize)]
 pub struct VoucherWatermarkCase {
     pub name: &'static str,
@@ -2337,9 +2279,8 @@ fn voucher_watermark_case(
 /// vectors to pin: an equal amount under a *different* signature is
 /// refused, a strictly higher amount is accepted, and a voucher
 /// byte-identical to the one at the watermark -- same amount, same
-/// signature -- is a retransmission, answered as
-/// `peer_claim_retransmit` answers one today: accepted again, buying
-/// nothing new. Because it buys nothing, the same retransmission against a
+/// signature -- is a retransmission: accepted again, buying nothing
+/// new. Because it buys nothing, the same retransmission against a
 /// nonzero charge covers none of it, and is refused as an underpayment
 /// (decision 3, amended 2026-09-25).
 fn generate_voucher_watermark_cases() -> Vec<VoucherWatermarkCase> {
@@ -2481,8 +2422,8 @@ pub struct VoucherClaimStateEvmCase {
     pub verifying_contract_hex: String,
     /// `claim_voucher.evm`'s channel.
     pub channel_id_hex: String,
-    /// Unix seconds; as `channel_control_declaration`'s, checked against
-    /// the verifier's clock, not encoded in the signature's verdict.
+    /// Unix seconds, checked against the verifier's clock, not encoded in
+    /// the signature's verdict.
     pub expires: u64,
     /// `evm_voucher_signer(channel_config)` -- the key `signature_hex` must
     /// recover to: `claim_voucher.evm.signer_address_hex`.
@@ -2529,7 +2470,7 @@ pub struct VoucherClaimStateChallengeVectors {
     pub solana: Vec<VoucherClaimStateSolanaCase>,
 }
 
-/// 2100-01-01T00:00:00Z, as `channel_control_declaration`'s valid cases.
+/// 2100-01-01T00:00:00Z: far enough ahead to be valid against any clock.
 const VOUCHER_CLAIM_STATE_EXPIRES: u64 = 4_102_444_800;
 
 /// anvil's account 1 (`0x59c6995e…690d`), the `payerAuthorizer` of
@@ -2696,24 +2637,24 @@ pub fn generate() -> WireVectors {
     let envelope = generate_envelope_vectors();
     let (giftwrap, shared_secret) = generate_giftwrap_vectors();
     let fulfilment = generate_fulfilment_vectors(shared_secret);
-    let (claim, claim_fixture) = generate_claim_vectors();
-    let peer_carriage = generate_peer_carriage_vectors(&claim_fixture, &giftwrap);
-    let channel_control_declaration = generate_channel_control_declaration_vectors();
+    let peer_carriage = generate_peer_carriage_vectors(&giftwrap);
     let charge = generate_charge_vectors();
     let claim_voucher = generate_claim_voucher_vectors();
     let voucher_claim_state_challenge = generate_voucher_claim_state_challenge_vectors();
+    let toon_channel_refused = generate_toon_channel_refused_vectors();
+    let payout_voucher = generate_payout_voucher_vectors();
 
     WireVectors {
         schema_version: SCHEMA_VERSION,
         envelope,
         giftwrap,
         fulfilment,
-        claim,
         peer_carriage,
-        channel_control_declaration,
         charge,
         claim_voucher,
         voucher_claim_state_challenge,
+        toon_channel_refused,
+        payout_voucher,
     }
 }
 

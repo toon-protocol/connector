@@ -2925,7 +2925,6 @@ impl Connector {
                     tracing::warn!(
                         peer_id,
                         price = again.price().unwrap_or_default(),
-                        pay_to = again.pay_to().unwrap_or_default(),
                         resource = %again.resource.url,
                         "peer demanded payment again after a covering claim -- not retrying"
                     );

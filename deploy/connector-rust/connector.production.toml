@@ -210,8 +210,9 @@ key_file = "/nonexistent/production-solana-settlement-key-does-not-exist"
 # a production node starts with no such assumption, and this skeleton does not
 # hand it one for free.
 #
-# `[[peers]]`, `[[peer_channels]]`, `[[pay_channels]]` and `[[client_channels]]`
-# are absent for the same reason: a peering, and a channel, are relationships
+# `[[peers]]`, `[[peer_channels]]` and `[[pay_channels]]` are absent for the
+# same reason (`[[client_channels]]` no longer exists at all -- ADR 0075,
+# issue #1384): a peering, and a channel, are relationships
 # with a counterparty. There is no production counterparty. See this
 # directory's `connector.toml` for the fully commented shape of each, and
 # docs/protocol/peer-carriage-spec.md for what establishing one requires.

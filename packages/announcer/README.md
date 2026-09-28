@@ -15,9 +15,14 @@ only **asks** the edge's already-public answers —
 - `GET /ilp/identity` — the client edge's ADR 0018 identity (informational
   only; this is a different keypair from the one this sidecar signs with).
 - The x402 payment-required greeting (`POST /ilp` with no claim header,
-  client-edge-spec.md §1.4) — the settlement/contract facts a buyer needs to
-  open a channel, exactly the facts the retired TypeScript connector used to
-  push in its own kind:10032 announce.
+  client-edge-spec.md §1.4) — the facts a buyer needs to open a channel. Since
+  ADR 0075 (connector#1384) these are read from the greeting's
+  `batch-settlement` `accepts[]` entries alone (each chain's CAIP-2
+  `network`, `asset` and `payTo`), and the route price from its
+  `extensions.toon` terms; there is no `toon-channel` entry and no
+  `TokenNetwork` or TOON program to announce, so the announce no longer
+  carries `tokenNetworks`. A greeting from a pre-ADR 0075 connector is
+  refused (logged) rather than half-read.
 
 — and republishes them as a signed kind:10032 event on a timer (default
 300s). No push-announce loop enters the connector binary; ADR 0022 stands.
@@ -51,7 +56,7 @@ the box being fronted, not a retired one.
 | `ANNOUNCER_RELAY_PUBLIC_URL`         |    no    | first `ws(s)://` `ANNOUNCER_RELAY_URLS` entry      | The `relayUrl` field advertised for free reads. Never falls back to an `http(s)://` publish entry (that is a private ingress) — set explicitly when publishing over HTTP.                                                                                                                                  |
 | `ANNOUNCER_ASSET_CODE`               |    no    | `USDC`                                             | —                                                                                                                                                                                                                                                                                                          |
 | `ANNOUNCER_ASSET_SCALE`              |    no    | `6`                                                | —                                                                                                                                                                                                                                                                                                          |
-| `ANNOUNCER_SOLANA_CHAIN_ID`          |    no    | `solana:devnet`                                    | The edge's x402 greeting reports a bare `"solana"` chain (no cluster id); this re-qualifies it.                                                                                                                                                                                                            |
+| `ANNOUNCER_SOLANA_CHAIN_ID`          |    no    | `solana:devnet`                                    | The greeting's Solana entry names its chain by CAIP-2 genesis hash; it is announced under this id.                                                                                                                                                                                                         |
 | `ANNOUNCER_REFRESH_INTERVAL_SECS`    |    no    | `300`                                              | Republish cadence.                                                                                                                                                                                                                                                                                         |
 | `ANNOUNCER_TTL_SECS`                 |    no    | `2 × ANNOUNCER_REFRESH_INTERVAL_SECS`              | NIP-40 expiration TTL stamped on each announce.                                                                                                                                                                                                                                                            |
 | `ANNOUNCER_EDGE_POLL_TIMEOUT_MS`     |    no    | `5000`                                             | Per-request timeout polling the edge.                                                                                                                                                                                                                                                                      |

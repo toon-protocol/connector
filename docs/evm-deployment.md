@@ -221,7 +221,7 @@ and with this record.
 
 - [x] `crates/connector-bin/tests/devnet_configs_load.rs` → `FLEET_LIVE_REGISTRY` = `<NEW REGISTRY>`
 - [x] `crates/connector-bin/tests/devnet_configs_load.rs` → `FLEET_LIVE_TOKEN_NETWORK` = `<NEW TOKEN NETWORK>`
-- [x] `crates/connector-settlement-evm/tests/channel_index_sync.rs` → `DEVNET_TOKEN_NETWORK` = `<NEW TOKEN NETWORK>`
+- [x] `crates/connector-settlement-evm/tests/channel_index_sync.rs` → `DEVNET_TOKEN_NETWORK` = `<NEW TOKEN NETWORK>` _(file deleted since, with the channel index, issue #1384)_
 
 **Live-chain workflows that name the registry.** Both drive real Base Sepolia and would otherwise
 keep passing against the old deployment while quietly proving nothing about the one the fleet uses:
@@ -273,8 +273,9 @@ value merely stale instead of missing.
       match what this node now indexes. A repoint therefore discards the old index by itself, logs a
       WARN naming the mismatch, and backfills clean. The old file is ignored, never repaired — so
       deleting it is still harmless, just unnecessary.
-- [ ] Set `[settlement.evm] channel_index_from_block` in both configs to the new `TokenNetwork`'s
-      deploy block. Unset means backfill from genesis — correct, but slow on a public chain — and
+- [ ] ~~Set `[settlement.evm] channel_index_from_block` in both configs to the new `TokenNetwork`'s
+      deploy block.~~ _Since issue #1384 the channel index is deleted and the key is refused by
+      name; the rest of this item is history._ Unset means backfill from genesis — correct, but slow on a public chain — and
       since #1282 it is also the second, independent guard: a checkpoint below it is discarded even
       when the chain id and `TokenNetwork` both match.
 
@@ -469,7 +470,8 @@ note above warns about:
   ```
 
 - **`crates/connector-settlement-evm/tests/channel_index_sync.rs`** -- `DEVNET_TOKEN_NETWORK`, the
-  contract that test's `eth_getLogs` names (issue #970).
+  contract that test's `eth_getLogs` names (issue #970). _Deleted with the channel index, issue
+  #1384._
 
 **Records of the deploy, which gain the new addresses without losing the old:**
 

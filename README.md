@@ -383,9 +383,11 @@ name shows up only as every client's deposit failing.
 `min_sponsored_deposit` has none either, and `0` is refused, because it is the
 bound on an endpoint that spends your SOL.
 
-**What a payer sees.** The `402` greeting keeps its `toon-channel` entry first
-and gains one `batch-settlement` entry for each chain you opted in to. That entry
-is valid x402: a CAIP-2 `network`, the `asset`, `payTo` set to your settlement
+**What a payer sees.** The `402` greeting's `accepts[]` holds one
+`batch-settlement` entry for each chain you opted in to, and nothing else — a
+`toon-channel` claim is refused by name since #1384, so a node that opts in on
+no chain can be paid by nobody. The price and your node's addresses ride beside
+it in `extensions.toon`. Each entry is valid x402: a CAIP-2 `network`, the `asset`, `payTo` set to your settlement
 address, and an `extra` holding everything a stock x402 client needs to open a
 channel you will accept. `GET /ilp` publishes the same facts under
 `batchSettlements`.
@@ -515,16 +517,6 @@ curl -s https://their-node.example/ilp | jq
     "keyId": "connector-signer",
     "publicKey": "0x04…"
   },
-  "settlements": [
-    {
-      "chain": "evm:84532",
-      "settlementAddress": "0x…",
-      "tokenNetworkRegistry": "0x0c41D9D424d6B075A3cEa1068a694f7847a8CCa5",
-      "tokenNetwork": "0x…",
-      "tokenAddress": "0x0C996d7c934c79a6255254875607Fe69df25C0E1",
-      "decimals": 6
-    }
-  ],
   "batchSettlements": [
     {
       "network": "eip155:84532",
@@ -549,7 +541,7 @@ Four fields decide whether a peering is possible at all:
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | `peerCarriages`                | Empty means not dialable — they have not set `peer_expose`, and your write will answer `502`.                            |
 | `httpEndpoint` / `btpEndpoint` | Where you dial, and which carriage: `wss://` is BTP, `https://` is ILP-over-HTTP. BTP wins where both are published.     |
-| `batchSettlements[]`           | On EVM you need x402 terms on a network **in common** (Solana still reads `settlements[]`). No overlap is a `502`.       |
+| `batchSettlements[]`           | You need x402 terms on a network **in common**. No overlap is a `502`.                                                   |
 | `voucherSigners[]`             | The key their vouchers are signed with. Without one for the shared network the EVM write is a `502`.                     |
 | `routes[].price`               | What their terminating route charges — the number your `--amount` has to cover. A decimal **string**, not a JSON number. |
 
@@ -970,7 +962,7 @@ curl -s http://127.0.0.1:3010/ilp | jq
 ```
 
 `"peerCarriages": ["http"]`, an `httpEndpoint`, an `edgeIdentity` and one
-`settlements` entry on `evm:31337` means A is peerable. B's own document, at
+`batchSettlements` entry on `eip155:31337` means A is peerable. B's own document, at
 `http://127.0.0.1:3011/ilp`, has `"peerCarriages": []` — B dials, it is not
 dialed, and that asymmetry is fine.
 
@@ -1091,18 +1083,20 @@ curl -s -H "Authorization: Bearer $(cat "$LAB"/node-a/data/operator-bearer-token
     "peer_id": null,
     "channel_id": "evm:0x…",
     "direction": "inbound",
-    "nonce": 1,
+    "nonce": 0,
     "cumulative_amount": 1000,
     "pending": false,
-    "book": "client"
+    "book": "client",
+    "scheme": "batch-settlement"
   }
 ]
 ```
 
 `cumulative_amount` is 1000, not 1100: B collected 1100 and kept its 100 fee.
-Send a second packet and the nonce becomes 2 and the cumulative 2000 — a claim
-that merely repeats the same cumulative at a fresh nonce advances nothing and
-buys nothing, so **the watermark is the thing to watch**, not the claim count.
+Send a second packet and the cumulative becomes 2000. A voucher has no nonce
+(`nonce` is always `0`): a voucher that merely repeats the same cumulative
+advances nothing and buys nothing, so **the watermark is the thing to watch**,
+not the claim count.
 
 #### 9. Tear it down
 

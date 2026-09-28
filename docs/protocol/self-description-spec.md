@@ -7,7 +7,7 @@ carrying a URL (#1083, [ADR 0054](../adr/0054-an-unsealed-termination-reject-ans
 and the route descriptions [ADR 0044](../adr/0044-a-probe-answers-what-a-route-costs-and-what-it-does.md)
 adds.
 
-**Coverage:** none of ND-01 – ND-17 is vectored. This **is** a wire surface, so unlike the
+**Coverage:** none of ND-01 – ND-18 is vectored. This **is** a wire surface, so unlike the
 configuration and operator documents these rules **do** enter
 [ADR 0045](../adr/0045-a-behavioural-rule-is-normative-prose-until-its-vector-lands.md)'s debt ledger,
 and the burn-down order is issue #1084's.
@@ -83,7 +83,6 @@ The document carries:
 | ILP address(es)                                                                                                                                                                                                                                                                                                                                                                                                   | what to address                                                                       |
 | public HTTP and BTP endpoints, and which carriages are exposed                                                                                                                                                                                                                                                                                                                                                    | where to reach it, and how                                                            |
 | **edge identity** — the key a packet is sealed to                                                                                                                                                                                                                                                                                                                                                                 | without it a packet cannot be sealed, so it cannot be delivered                       |
-| per chain: chain id, settlement address, token network and its registry, token address, decimals                                                                                                                                                                                                                                                                                                                  | what a buyer needs to **open a channel**                                              |
 | per chain paid on over x402, as `voucherSigners` (ND-17): the key this node's vouchers are signed by                                                                                                                                                                                                                                                                                                              | what a peer **binds this node's channel toward it** by                                |
 | per chain opted in to x402 `batch-settlement` ([ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md) decision 8), as `batchSettlements`: `network`, `asset`, `payTo`, and `receiverAuthorizer`, the minimum `withdrawDelay` and the asset's EIP-712 `name`/`version` on EVM, or `feePayer`, the minimum `withdrawDelay`, `tokenProgram`, `minDeposit` and `sponsorEndpoint` on Solana | what a buyer needs to **open an x402 channel** this node admits, or have it sponsored |
 | route prices — the whole schedule, base and per-KiB slope ([ADR 0065](../adr/0065-a-price-is-a-schedule-over-payload-length.md)) — and their descriptions once [ADR 0044](../adr/0044-a-probe-answers-what-a-route-costs-and-what-it-does.md) is built                                                                                                                                                            | what a route costs **at any size**, and what it does                                  |
@@ -96,7 +95,7 @@ is unpublished is unreachable: a sender cannot seal to it, so it can never be de
 
 **ND-05a** `[connector]` — A route that **requires** a client transport MUST name it on that
 route's own entry, as `requiredTransport`, spelled `"http"` or `"btp"` — the same two spellings the
-greeting's `extra.requiredTransport` uses. A route that accepts either MUST carry **no such key at
+greeting's `extensions.toon.info.requiredTransport` uses. A route that accepts either MUST carry **no such key at
 all**: not `"both"`, not `null`, so a node that pins nothing publishes byte-for-byte the document it
 published before this field existed.
 ([ADR 0072](../adr/0072-a-carriage-pin-is-published-on-the-route-that-enforces-it.md), TOON_Network
@@ -135,9 +134,14 @@ channel toward it by when `POST /peers` establishes the peering
 and 10, #1378, #1379). Derived from the backend the key was connected through, never declared
 (ND-07), and omitted — not an empty array — on a node that pays on no x402 channel. A peer reads the
 entry whose `network` is the one its own x402 terms name, and refuses by name to establish a peering,
-on either chain, with a node that publishes none, or one not in that chain's shape. A peering reads
-nothing from `settlements` on either chain; it stays beside `voucherSigners` only for clients until
-#1384 drops it.
+on either chain, with a node that publishes none, or one not in that chain's shape.
+
+**ND-18** `[connector]` — The document publishes **no `settlements`**
+([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 10,
+issue #1384). That list — per chain the chain id, settlement address, `TokenNetwork` and its
+registry or TOON program, token and decimals — was what a buyer needed to open a `toon-channel`,
+and the scheme is retired. `batchSettlements` and `voucherSigners` are a node's whole settlement
+description; a reader MUST NOT expect `settlements`, and a connector MUST NOT emit it.
 
 **ND-07a** `[connector]` — A route's `request` table is the one exception to ND-07's "derived, never
 declared" rule, and deliberately so: there is no backend this connector can ask what an arbitrary
@@ -180,7 +184,7 @@ reject's message states the current cap, which is the whole discovery mechanism.
 
 ### 1.4 The greeting is a projection
 
-**ND-11** `[connector]` — The x402 greeting's `extra` block MUST be derived from the same source as
+**ND-11** `[connector]` — The x402 greeting's node facts (its `accepts[]` entries and `extensions.toon`) MUST be derived from the same source as
 this document. Where the two disagree the **document** is authoritative — the point being that they
 cannot.
 
@@ -188,14 +192,15 @@ cannot.
 band, to a client that just tried to use it. It is not a node description and MUST NOT be treated as
 one.
 
-The greeting therefore carries what a client needs _at that moment_ — `payTo`, `maxTimeoutSeconds`,
-the route's price, `sessionLeaseTtlMs` — alongside the projected node facts. Fields that exist only to
+The greeting therefore carries what a client needs _at that moment_ — each `accepts[]` entry's
+`payTo` and `maxTimeoutSeconds`, and in `extensions.toon` the quoted `amount`, the route's price and
+`sessionLeaseTtlMs` (`client-edge-spec.md` §1.4, issue #1384) — alongside the projected node facts. Fields that exist only to
 serve an in-flight transaction stay there and are not promoted.
 
 **ND-12a** `[connector]` — Where a route's price carries a slope
 ([ADR 0065](../adr/0065-a-price-is-a-schedule-over-payload-length.md)), both surfaces MUST publish
 the **schedule** and not only a figure: this document per priced prefix, and the greeting as
-`extra.price` + `extra.pricePerKib` beside its own `amount`. The greeting's `amount` stays what the
+`extensions.toon.info`'s `price` + `pricePerKib` beside its `amount`. The greeting's `amount` stays what the
 greeted request costs — that is the field's job — so the schedule is what makes one read answer
 every size. The slope is **omitted** where it is zero, so a flat route's document and greeting are
 byte-identical to what they were before schedules existed.

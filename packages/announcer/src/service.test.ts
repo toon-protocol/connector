@@ -30,23 +30,30 @@ function base64Header(json: unknown): string {
 }
 
 const GREETING = {
+  x402Version: 2,
+  resource: { url: 'g.toon.relay' },
   accepts: [
     {
-      httpEndpoint: '/ilp',
+      scheme: 'batch-settlement',
+      network: 'eip155:84532',
+      amount: '1000',
+      asset: '0xToken',
+      payTo: '0xSettlement',
+      maxTimeoutSeconds: 60,
       extra: {
-        price: '1000',
-        settlement: {
-          chain: 'evm:84532',
-          settlementAddress: '0xSettlement',
-          tokenNetworkRegistry: '0xRegistry',
-          tokenNetwork: '0xTokenNetwork',
-          tokenAddress: '0xToken',
-          decimals: 6,
-        },
-        settlements: [],
+        receiverAuthorizer: '0xSettlement',
+        withdrawDelay: 86400,
+        name: 'USDC',
+        version: '2',
       },
     },
   ],
+  extensions: {
+    toon: {
+      info: { ilpAddress: 'g.toon.relay', amount: '1000', endpoint: '/ilp', price: '1000' },
+      schema: { type: 'object' },
+    },
+  },
 };
 
 test('AnnouncerService.buildEvent: mocked /ilp/identity + greeting produce the exact expected signed event', async () => {
@@ -105,7 +112,6 @@ test('AnnouncerService.buildEvent: mocked /ilp/identity + greeting produce the e
     assetScale: 6,
     supportedChains: ['evm:84532'],
     settlementAddresses: { 'evm:84532': '0xSettlement' },
-    tokenNetworks: { 'evm:84532': '0xTokenNetwork' },
     preferredTokens: { 'evm:84532': '0xToken' },
     routePrices: { 'g.toon.relay': '1000' },
     edgeIdentity: { keyId: 'edge-key-1', publicKey: '0x04deadbeef' },

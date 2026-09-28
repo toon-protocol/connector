@@ -455,9 +455,9 @@ fn the_fleet_guard_and_the_wire_vector_generator_mirror_the_deployed_devnet_prog
         )),
         "crates/connector-vectors/src/lib.rs's SOLANA_SETTLEMENT_PROGRAM_ID is no longer \
          {DEVNET_PUBLIC_PROGRAM_ID}. It is what `generate-vectors` writes into \
-         vectors/wire-vectors.json's Solana claim, which is the normative contract toon-client, \
-         rig and swap build against (ADR 0021). Regenerating the vector from a drifted constant \
-         would publish the drift as the contract."
+         vectors/wire-vectors.json's refused Solana `toon-channel` claim (issue #1384), the claim \
+         a straggling devnet payer actually sends; regenerating the vector from a drifted \
+         constant would pin the refusal against a claim nobody sends."
     );
 }
 

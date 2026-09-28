@@ -24,10 +24,10 @@
 //! ([`Connector::voucher_signer_peer_on`]) -- the key a runtime peering's
 //! self-description published, or the one a `[[peer_channels]]` row names.
 //!
-//! **A `toon-channel` claim never decides the role** (#1380). It is still
-//! read off the claim slot -- a client may still pay with one until #1384 --
-//! but a frame carrying one is a client frame on either carriage, whatever
-//! its signature does.
+//! **A `toon-channel` claim never decides the role** (#1380), and since
+//! #1384 it is not read at all: a claim slot holding one -- no `scheme`, or
+//! `scheme: "toon-channel"` -- is refused by name on either carriage
+//! ([`RefusedEvidence::ToonChannelClaim`]), before the role is decided.
 //!
 //! # Judging a peer's voucher (ADR 0075 decision 6, issue #1378)
 //!
@@ -35,14 +35,14 @@
 //! receiving half ([`VoucherEvidence::judge_peer_voucher`]): admitted by the
 //! rules a client's is, held to the channel's **one** amount watermark
 //! whichever role its vouchers arrive under (`peer-carriage-spec.md` §1.8),
-//! and journaled. Its verdict rides back in the `claim-ack` exactly as a
-//! `toon-channel` claim's does, and [`crate::price_gate`] measures coverage
-//! by the advance it made ([`judge_voucher`]).
+//! and journaled. Its verdict rides back in the `claim-ack`, and
+//! [`crate::price_gate`] measures coverage by the advance it made
+//! ([`judge_voucher`]).
 
 use async_trait::async_trait;
 use connector_btp::{BtpFrame, BTP_MESSAGE, CLAIM_PROTOCOL, PEER_CHALLENGE_PROTOCOL};
 use connector_domain::client_claim::ClientClaim;
-use connector_domain::{Watermark, VOUCHER_WATERMARK_NONCE};
+use connector_domain::Watermark;
 use connector_peer_auth::SessionRole;
 use connector_peer_auth::{
     decide_voucher_role, PresentedVoucher, RoleDecision, VoucherVerification,
@@ -50,7 +50,7 @@ use connector_peer_auth::{
 use connector_runtime::{ClaimAckOutcome, Connector, VoucherSigner};
 
 use crate::challenge_json::PeerRoleChallenge;
-use crate::claim_json::PresentedPeerClaim;
+use crate::claim_json::ClaimDecodeError;
 
 /// The longest ahead of this node's clock a peer-role challenge's `expires`
 /// may lie, in seconds (ADR 0075: "`expires` is to be kept short", a bound
@@ -155,7 +155,6 @@ pub async fn judge_voucher(
         ack: verdict.ack,
         claimed: Some(voucher.transferred_amount()),
         prior: Some(Watermark {
-            nonce: VOUCHER_WATERMARK_NONCE,
             cumulative_amount: verdict.prior,
         }),
     })
@@ -163,14 +162,13 @@ pub async fn judge_voucher(
 
 /// Everything one frame presents that could prove the peer role.
 ///
-/// A carriage refuses a frame carrying both a claim and a challenge before
-/// building one of these (§1.5: duplicated authentication material is
-/// refused, never resolved), so at most one of the two decides.
+/// A carriage refuses a frame carrying both a claim and a challenge, or a
+/// `toon-channel` claim, before building one of these ([`RefusedEvidence`]),
+/// so at most one of the two decides.
 #[derive(Debug, Clone, Default)]
 pub struct FrameEvidence {
-    /// The claim slot, decoded: a voucher, or a `toon-channel` claim that
-    /// proves nothing about the role.
-    pub claim: Option<PresentedPeerClaim>,
+    /// The claim slot, decoded: always a voucher.
+    pub claim: Option<ClientClaim>,
     /// The `peer-role-challenge` slot, decoded.
     pub challenge: Option<PeerRoleChallenge>,
     /// Whether the frame's packet is a PREPARE whose `amount` is zero. A
@@ -184,27 +182,30 @@ impl FrameEvidence {
     /// role by the receiving half ([`judge_voucher`]).
     #[must_use]
     pub fn voucher(&self) -> Option<&ClientClaim> {
-        match &self.claim {
-            Some(PresentedPeerClaim::Voucher(voucher)) => Some(voucher),
-            Some(PresentedPeerClaim::Channel(_)) | None => None,
-        }
+        self.claim.as_ref()
     }
 }
 
-/// §1.5's smuggling defence, over both evidence slots: which duplicated
-/// authentication material a frame or request carried. Refused, never
-/// resolved -- "which one did we check?" has no answer.
+/// Evidence a frame or request is refused for outright, before its role is
+/// decided: §1.5's smuggling defence over both evidence slots -- duplicated
+/// authentication material, refused, never resolved, because "which one did
+/// we check?" has no answer -- and a retired `toon-channel` claim, refused
+/// by name (ADR 0075 decision 8, issue #1384).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AmbiguousEvidence {
+pub enum RefusedEvidence {
     /// More than one claim.
     Claims,
     /// More than one peer-role challenge.
     Challenges,
     /// A claim beside a challenge (ADR 0075 decision 5).
     ClaimAndChallenge,
+    /// A claim with no `scheme`, or `scheme: "toon-channel"`: the retired
+    /// `toon-channel` claim. Refused rather than read as absent, so a
+    /// straggling peer is told why rather than silently downgraded.
+    ToonChannelClaim,
 }
 
-impl AmbiguousEvidence {
+impl RefusedEvidence {
     /// The one rule, from how many of each slot were presented. Counted
     /// before anything is parsed, so an undecodable second entry cannot be
     /// discarded to leave one unambiguous one standing.
@@ -212,25 +213,32 @@ impl AmbiguousEvidence {
     /// # Errors
     ///
     /// The ambiguity, when there is one.
-    pub fn check(claims: usize, challenges: usize) -> Result<(), AmbiguousEvidence> {
+    pub fn check(claims: usize, challenges: usize) -> Result<(), RefusedEvidence> {
         match (claims, challenges) {
-            (claims, _) if claims > 1 => Err(AmbiguousEvidence::Claims),
-            (_, challenges) if challenges > 1 => Err(AmbiguousEvidence::Challenges),
-            (1, 1) => Err(AmbiguousEvidence::ClaimAndChallenge),
+            (claims, _) if claims > 1 => Err(RefusedEvidence::Claims),
+            (_, challenges) if challenges > 1 => Err(RefusedEvidence::Challenges),
+            (1, 1) => Err(RefusedEvidence::ClaimAndChallenge),
             _ => Ok(()),
         }
     }
 
-    /// What a BTP ERROR frame says about it.
+    /// What a BTP ERROR frame, or an HTTP refusal's body, says about it. A
+    /// `toon-channel` claim's is the client edge's own refusal text
+    /// (`ClientClaimError::ToonChannel`), so the two cannot drift.
     #[must_use]
-    pub fn message(self) -> &'static [u8] {
+    pub fn message(self) -> Vec<u8> {
         match self {
-            AmbiguousEvidence::Claims => b"more than one claim entry on one frame",
-            AmbiguousEvidence::Challenges => {
-                b"more than one peer-role challenge entry on one frame"
+            RefusedEvidence::Claims => b"more than one claim entry on one frame".to_vec(),
+            RefusedEvidence::Challenges => {
+                b"more than one peer-role challenge entry on one frame".to_vec()
             }
-            AmbiguousEvidence::ClaimAndChallenge => {
-                b"a claim and a peer-role challenge on one frame"
+            RefusedEvidence::ClaimAndChallenge => {
+                b"a claim and a peer-role challenge on one frame".to_vec()
+            }
+            RefusedEvidence::ToonChannelClaim => {
+                connector_domain::client_claim::ClientClaimError::ToonChannel
+                    .to_string()
+                    .into_bytes()
             }
         }
     }
@@ -241,8 +249,9 @@ impl AmbiguousEvidence {
 ///
 /// # Errors
 ///
-/// [`AmbiguousEvidence`] when the frame carries duplicated evidence (§1.5).
-pub fn btp_evidence(frame: &BtpFrame) -> Result<FrameEvidence, AmbiguousEvidence> {
+/// [`RefusedEvidence`] when the frame carries duplicated evidence (§1.5) or
+/// a `toon-channel` claim.
+pub fn btp_evidence(frame: &BtpFrame) -> Result<FrameEvidence, RefusedEvidence> {
     let count = |name: &str| {
         frame
             .protocol_data
@@ -250,7 +259,7 @@ pub fn btp_evidence(frame: &BtpFrame) -> Result<FrameEvidence, AmbiguousEvidence
             .filter(|entry| entry.name == name)
             .count()
     };
-    AmbiguousEvidence::check(count(CLAIM_PROTOCOL), count(PEER_CHALLENGE_PROTOCOL))?;
+    RefusedEvidence::check(count(CLAIM_PROTOCOL), count(PEER_CHALLENGE_PROTOCOL))?;
     let slot = |name: &str| {
         frame
             .protocol_data
@@ -259,31 +268,45 @@ pub fn btp_evidence(frame: &BtpFrame) -> Result<FrameEvidence, AmbiguousEvidence
             .map(|entry| entry.data.as_slice())
     };
     Ok(FrameEvidence {
-        claim: slot(CLAIM_PROTOCOL).and_then(decode_claim),
+        claim: slot(CLAIM_PROTOCOL)
+            .map(decode_claim)
+            .transpose()?
+            .flatten(),
         challenge: slot(PEER_CHALLENGE_PROTOCOL).and_then(decode_challenge),
         moves_no_value: frame.frame_type == BTP_MESSAGE && moves_no_value(&frame.ilp_packet),
     })
 }
 
-/// A claim slot's raw JSON, decoded; `None`, with a warning, when it does
-/// not decode. An undecodable claim is *not acknowledged* (§6.3) rather than
-/// rejected, so the payer's claim stays pending and its retransmission is
-/// read the same way.
-#[must_use]
-pub fn decode_claim(raw: &[u8]) -> Option<PresentedPeerClaim> {
-    crate::claim_json::parse_presented(raw)
-        .inspect_err(|error| {
+/// A claim slot's raw JSON, decoded to a voucher; `Ok(None)`, with a
+/// warning, when it does not decode. An undecodable claim is *not
+/// acknowledged* (§6.3) rather than rejected, so the payer's claim stays
+/// pending and its retransmission is read the same way.
+///
+/// # Errors
+///
+/// [`RefusedEvidence::ToonChannelClaim`] for a `toon-channel` claim (ADR
+/// 0075 decision 8): not merely undecodable, but a claim this connector no
+/// longer takes, and the carriage refuses it by name.
+pub fn decode_claim(raw: &[u8]) -> Result<Option<ClientClaim>, RefusedEvidence> {
+    match crate::claim_json::parse(raw) {
+        Ok(voucher) => Ok(Some(voucher)),
+        Err(ClaimDecodeError::ToonChannel) => {
+            tracing::warn!("refusing a toon-channel claim: ADR 0075 retired the scheme");
+            Err(RefusedEvidence::ToonChannelClaim)
+        }
+        Err(error) => {
             // No peer id to name: the claim *is* what would have named one,
             // and it did not decode.
             tracing::warn!(%error, "peer claim could not be decoded; not acknowledged");
-        })
-        .ok()
+            Ok(None)
+        }
+    }
 }
 
 /// The role of one frame, from everything it presents (§1.2 as amended by
 /// ADR 0075 decision 5): a voucher, or -- for a packet that moves no value --
-/// a peer-role challenge. A `toon-channel` claim presents nothing and the
-/// frame is a client's (#1380).
+/// a peer-role challenge. A `toon-channel` claim never reaches here: the
+/// carriage refused it by name ([`RefusedEvidence::ToonChannelClaim`]).
 ///
 /// `vouchers` is `None` on a carriage built without the receiving half, on
 /// which a voucher or a challenge proves nothing and the frame is a client's.
@@ -300,13 +323,7 @@ pub async fn decide_frame(
 ) -> RoleDecision {
     let vouchers = vouchers.filter(|_| connector.has_voucher_bindings());
     match &evidence.claim {
-        // A `toon-channel` claim proves nothing (ADR 0075, #1380): it is a
-        // client's to pay with until #1384, and the frame is a client frame
-        // whatever its signature does. Not an event either -- §1.6's is owed
-        // to an assertion of a configured peering, and no peering is
-        // configured by a TOON channel any more.
-        Some(PresentedPeerClaim::Channel(_)) => decide_voucher_role(None),
-        Some(PresentedPeerClaim::Voucher(voucher)) => {
+        Some(voucher) => {
             let Some(vouchers) = vouchers else {
                 return decide_voucher_role(None);
             };
@@ -339,9 +356,6 @@ fn voucher_channel(voucher: &ClientClaim) -> String {
     match voucher {
         ClientClaim::EvmVoucher(voucher) => voucher.channel_id.to_ascii_lowercase(),
         ClientClaim::SolanaVoucher(voucher) => voucher.channel_id.clone(),
-        // Not a voucher: `PresentedPeerClaim::Voucher` holds only the two
-        // above, so no channel here could be bound.
-        ClientClaim::Evm(_) | ClientClaim::Solana(_) => String::new(),
     }
 }
 
@@ -407,20 +421,17 @@ mod tests {
 
     #[test]
     fn ambiguous_evidence_is_counted_across_both_slots() {
-        assert_eq!(AmbiguousEvidence::check(0, 0), Ok(()));
-        assert_eq!(AmbiguousEvidence::check(1, 0), Ok(()));
-        assert_eq!(AmbiguousEvidence::check(0, 1), Ok(()));
+        assert_eq!(RefusedEvidence::check(0, 0), Ok(()));
+        assert_eq!(RefusedEvidence::check(1, 0), Ok(()));
+        assert_eq!(RefusedEvidence::check(0, 1), Ok(()));
+        assert_eq!(RefusedEvidence::check(2, 0), Err(RefusedEvidence::Claims));
         assert_eq!(
-            AmbiguousEvidence::check(2, 0),
-            Err(AmbiguousEvidence::Claims)
+            RefusedEvidence::check(0, 2),
+            Err(RefusedEvidence::Challenges)
         );
         assert_eq!(
-            AmbiguousEvidence::check(0, 2),
-            Err(AmbiguousEvidence::Challenges)
-        );
-        assert_eq!(
-            AmbiguousEvidence::check(1, 1),
-            Err(AmbiguousEvidence::ClaimAndChallenge)
+            RefusedEvidence::check(1, 1),
+            Err(RefusedEvidence::ClaimAndChallenge)
         );
     }
 

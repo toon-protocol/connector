@@ -121,7 +121,9 @@ A request identifies its sender in one of two ways:
   permissionless-configured identity — mirrors BTP's `secret: ''` auth frame). Failure to
   authenticate a presented `ILP-Peer-Id` is `401`.
 - **Anonymous:** no `ILP-Peer-Id`. The connector derives an ephemeral peer id from the plaintext
-  `ILP-Payment-Channel-Claim` header's signer (`http:<signerAddress-or-signerPublicKey>`), or
+  `ILP-Payment-Channel-Claim` header's self-declared sender (`http:<senderId>` — a voucher
+  declares no signer, issue #1384; before it, a `toon-channel` claim's `signerAddress` or
+  `signerPublicKey`), or
   `http:anon` if that header is absent — including when only the wrapped
   `ILP-Payment-Channel-Claim-Wrapped` header is present, since deriving an identity from it would
   require unwrapping before the identity used to authenticate the request is known. This is the
@@ -130,11 +132,14 @@ A request identifies its sender in one of two ways:
 
 ### 1.3 Payment claim
 
-A request pays with a claim header. The claim is a JSON object, `version: '1.0'`, discriminated
-by `blockchain: 'evm' | 'solana'` — the shape below is this document's own definition, not a
-pointer to source; the peer semantics's predecessor (BTP protocol) carried the same shape, but that
-code no longer exists in this repository. `blockchain: 'mina'` is a distinct, invalid value here:
-see the note at the end of this section.
+A request pays with a claim header. **Every claim is an x402 `batch-settlement` voucher**
+([ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md),
+[ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 8,
+issue #1384): a JSON object, `version: '1.0'`, `scheme: 'batch-settlement'`, discriminated by
+`blockchain: 'evm' | 'solana'`, paying on an x402 channel -- EVM `x402BatchSettlement`, Solana
+`payment-channels` -- that the payer opened toward this connector. The normative bytes are
+`claim_voucher` in `vectors/wire-vectors.json` ([ADR 0021](../adr/0021-vectors-are-normative-prose-is-not.md)
+-- prose is not).
 
 | Header                              | Content                                                      |
 | ----------------------------------- | ------------------------------------------------------------ |
@@ -149,152 +154,90 @@ exemption: the claim inside runs every step below exactly as a plaintext one doe
 connector cannot open is refused under its own reason, distinguishable both from a malformed header
 and from a claim naming an unknown channel.
 
-Required fields on every claim, regardless of chain: `version` (`'1.0'`), `blockchain`,
-`messageId` (idempotency), `timestamp` (ISO 8601), `senderId`. Chain-specific fields:
+Required fields on every claim, regardless of chain: `version` (`'1.0'`), `scheme`
+(`'batch-settlement'`), `blockchain`, `messageId` (idempotency), `timestamp` (ISO 8601),
+`senderId`. `senderId` is self-declared and carries no authority: it labels the sender for §1.2's
+anonymous identity and for the lookup budget below, and nothing is verified against it.
+Chain-specific fields, named as x402's own voucher payloads name them:
 
-- **evm**: `channelId` (bytes32 hex), `nonce` (uint), `transferredAmount` (decimal string,
-  cumulative), `lockedAmount`/`locksRoot` (present on the wire today for backward compatibility
-  but always zero — see [ADR 0004](../adr/0004-value-moves-on-fulfilment.md) — and dropped
-  entirely once a client edge version built against the rewritten balance proof ships),
-  `signature` (EIP-712), `signerAddress`; optional `chainId`, `tokenNetworkAddress`,
-  `tokenAddress`. `signerAddress` and the optional domain fields ride the wire but carry no
-  authority — step 4 below reads both the signer and the signing domain from the connector's own
-  per-channel record instead.
-- **solana**: `programId`, `channelAccount` (both base58), `nonce`, `transferredAmount` (lamports,
-  decimal string), `signature` (base64 Ed25519), `signerPublicKey` (base58); optional `cluster`.
-  `programId` MUST be the **settlement program the `channelAccount` lives under** — the program
-  that owns that account and that would redeem this claim on chain, which is byte-for-byte the
-  program id the payer put into the balance proof `signature` covers
-  ([ADR 0053](../adr/0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md) puts it at
-  offset 16 of that message). It is not a free-form label and it is not the payer's own key: a
-  claim naming any other program names a program no channel of the payer's lives under. The
-  normative statement of this is `peer_carriage.claim_solana` in `vectors/wire-vectors.json`, whose
-  declared `programId` and whose `signed_message_hex` carry the same 32 bytes
-  ([ADR 0021](../adr/0021-vectors-are-normative-prose-is-not.md) — prose is not).
-  `signerPublicKey`, like an EVM claim's `signerAddress`, rides the wire but carries no authority.
+- **evm**: `channelId` (bytes32 hex), `maxClaimableAmount` (decimal string, cumulative, a `uint128`
+  that must also fit a `u64` -- a larger one is refused, never truncated), `signature` (`0x` + 130
+  hex, `r ‖ s ‖ v`, EIP-712 `Voucher(bytes32 channelId,uint128 maxClaimableAmount)` under the
+  `x402BatchSettlement` domain), and `channelConfig` -- the seven `ChannelConfig` fields `getChannelId`
+  hashes -- on a channel's first voucher, optional after it.
+- **solana**: `channelId` (the channel account, base58), `maxClaimableAmount` (decimal string,
+  cumulative), `expiresAt` (MUST be `0`: a voucher that can expire is value that can lapse before
+  it is landed, and is refused structurally), `signature` (base58 Ed25519 over the 50-byte voucher
+  message).
 
-A present claim is validated by the same gate the peer role uses (the inbound claim validator)
-before the PREPARE is routed, in this order — deliberately freshness-and-value before
-cryptography, so a replay or an underpayment never pays the cost of a signature verification and
-never reaches the terminating app:
+**`scheme` is required, and a `toon-channel` claim is refused by name**
+([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 8,
+issue #1384). A claim with no `scheme` is the retired `toon-channel` claim -- the nonce-ordered
+EIP-712 or `TOON-BALPROOF-V2` balance proof on a `TokenNetwork` or TOON-program channel
+([ADR 0024](../adr/0024-peer-wire-claims-sign-the-eip-712-balance-proof.md),
+[ADR 0053](../adr/0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md), both retired)
+-- and so is one declaring `scheme: 'toon-channel'`. Either is refused as its own reason, naming the
+retirement, before any scheme-specific field is read, the way `blockchain: 'mina'` is (see the note
+at the end of this section) -- never reported as merely malformed, so a straggling client learns to
+upgrade rather than wondering why payment failed. `vectors/wire-vectors.json`'s
+`toon_channel_refused` pins the refusal. A `scheme` naming anything else is malformed.
 
-1. **Structural validation** — required/optional fields per chain, formats (hex length, base58
-   alphabet) as enumerated above; a structurally invalid claim is rejected. `blockchain: 'mina'`
-   fails here unconditionally — see the note below.
-2. **Freshness** — the claim's nonce MUST strictly advance this connector's last-verified
-   watermark for the (peer, blockchain, channel) tuple; a non-advancing nonce is rejected without
-   spending a cryptographic verification on it.
+> **Superseded by issue #1384.** Until #1384 a claim with no `scheme` was a `toon-channel` claim
+> (`channelId`/`channelAccount`, `nonce`, `transferredAmount`, `lockedAmount`/`locksRoot`,
+> `signerAddress`/`signerPublicKey`, `programId`, optional `chainId`/`tokenNetworkAddress`/
+> `tokenAddress`/`cluster`), verified against a counterparty this connector recorded per channel --
+> declared in `[[client_channels]]` or resolved from the `TokenNetwork`/TOON program -- under a nonce
+> watermark, with a Solana `cluster` cross-check (issue #975) and a declared-`programId` report
+> (issue #1127). All of it is deleted with the scheme; this section's history is in git.
+
+A present claim is validated by the same gate a peer's voucher is judged by, before the PREPARE is
+routed, in this order — deliberately freshness-and-value before cryptography, so a replay or an
+underpayment never pays the cost of a channel lookup or a signature verification and never reaches
+the terminating app:
+
+1. **Structural validation** — required fields per chain, formats (hex length, base58 alphabet) as
+   enumerated above; a structurally invalid claim is rejected. `blockchain: 'mina'` and a
+   `toon-channel` claim fail here, each by name.
+2. **Freshness** — a voucher has no nonce: its `maxClaimableAmount` MUST **strictly** exceed this
+   connector's watermark for the (blockchain, channel) tuple, the highest cumulative amount it has
+   accepted on that channel. A voucher byte-identical to the one that set the watermark -- same
+   amount, same signature bytes -- is a **retransmission**: it buys nothing, so it is accepted again
+   where the charge is zero, advancing and recording nothing, and refused as an underpayment
+   (step 3) where it is not. An equal amount under a different signature is not the same voucher
+   and is refused as not advancing. Nothing here spends a lookup.
 
    The **channel** in that tuple is the channel, not the text the claim spelled it with ([issue
    #643](https://github.com/toon-protocol/connector/issues/643)). A connector MUST identify a
    channel's watermark by a canonical form of the id, applied before the watermark is written or
    read. For `evm` that form is exactly `0x` followed by the `channelId`'s 32 bytes as 64
-   **lower-case** hex characters — one spelling, not a family of accepted ones, since a canonical
-   form that admitted alternatives would be the same ambiguity again. For `solana` it is the
-   `channelAccount` as it arrives: base58 of an exact 32-byte decode already has only one
-   spelling, and base58 is case-_sensitive_, so normalising it would merge distinct accounts.
-   Hex is case-insensitive and everything else about a claim already treats
-   the spellings as one channel — the counterparty record is looked up by the decoded bytes, and
-   the EIP-712 digest is computed over them — so a connector that keyed a watermark by the literal
-   text would grant a fresh, empty watermark per spelling, and `None` accepts every nonce: one
-   signed claim would buy a write once per casing it was retyped in.
+   **lower-case** hex characters — one spelling, not a family of accepted ones. For `solana` it is
+   the channel account as it arrives: base58 of an exact 32-byte decode already has only one
+   spelling, and base58 is case-_sensitive_, so normalising it would merge distinct accounts. Hex
+   is case-insensitive and everything else about a voucher already treats the spellings as one
+   channel — the channel is resolved, and the EIP-712 digest computed, over the decoded bytes — so
+   a connector that keyed a watermark by the literal text would grant a fresh, empty watermark per
+   spelling, and one signed voucher would buy a write once per casing it was retyped in.
 
-3. **Value binding** (for a locally-terminated, priced route) — the claim's cumulative amount
-   MUST advance by at least the route's configured flat price, so a minimal fresh claim cannot pay
-   for an expensive route. This compares the claim's plaintext `transferredAmount` directly.
-4. **Cryptographic verification** — the signature (EIP-712 for EVM, Ed25519 for Solana) MUST
-   recover to **the counterparty recorded for the channel the claim names**
-   ([issue #558](https://github.com/toon-protocol/connector/issues/558)). A claim's own
-   `signerAddress`/`signerPublicKey` is not consulted, and neither is the EIP-712 domain
-   (`chainId`/`tokenNetworkAddress`) it declares for itself: both come from the connector's
-   per-channel record, so a claim has no say in what it is checked against. A forger who signs
-   correctly with a key of their own and declares themselves the payer is refused here, because
-   that key is not the channel's counterparty.
+3. **Value binding** (for a priced route) — the voucher's cumulative amount MUST advance past the
+   watermark by at least the route's charge for this packet, so a minimal fresh voucher cannot pay
+   for an expensive route.
+4. **Cryptographic verification** — the voucher's channel is resolved from the chain by the
+   settlement backend of its `blockchain`, and the signature MUST recover to **the channel's
+   voucher signer as the chain records it** ([issue #558](https://github.com/toon-protocol/connector/issues/558)'s
+   rule): on EVM `payerAuthorizer` from the verified `ChannelConfig` (a nonzero one is required
+   at admission, ADR 0074 decision 2), on Solana `authorized_signer`. Nothing the voucher says
+   about its own signer is consulted. On EVM the `channelConfig` -- presented, or this connector's
+   journaled record of the channel -- MUST hash to `channelId` (`getChannelId`) before the backend
+   is asked, and the backend's own config is re-hashed too, since the signer is read from it; a
+   mismatch is refused under its own reason. A voucher on a chain this connector settles on no
+   `batch-settlement` channel for -- no `[settlement.<chain>.batch_settlement]` table -- is refused
+   by name before anything about it is judged.
 
-   A `solana` claim's self-declared **`cluster` is cross-checked** against the cluster the
-   connector settles on, before its channel is resolved
-   ([issue #975](https://github.com/toon-protocol/connector/issues/975)). Where a connector
-   can tell which cluster it is on, it MUST refuse — under its own reason — a claim whose
-   optional `cluster` names a different one. The field is not an authority the check reads
-   _from_; it is an assertion the claim makes, and a claim naming a chain the connector is
-   not on is **wrong, not merely unverifiable**. Silently accepting it would leave a
-   settlement on one chain permanently labelled with another's name, invisible to both
-   parties — the payer sees a FULFILL, the operator sees nothing — and the claim is the
-   artifact each side keeps.
-
-   `cluster` gets this treatment because it is the one field naming a chain that **no
-   signature can ever bind**. Since [ADR 0053](../adr/0053-a-solana-claim-binds-its-domain-the-way-an-evm-claim-does.md)
-   a Solana balance proof signs the settlement program, and the verifier rebuilds that
-   message from the channel's own program id rather than the claim's — so cross-cluster
-   replay is closed by the bytes. A Solana program cannot learn which cluster it is running
-   on, so it could never rebuild a message containing one; the cluster stayed out of the
-   signed bytes for that reason, and this off-chain comparison is the only check it can get.
-   A claim's declared `programId` is a different case again, and the two halves of it should
-   not be confused. **What a payer must write there is pinned** — the settlement program the
-   `channelAccount` lives under, as the field list above and
-   `peer_carriage.claim_solana` now both say. **What a connector does with a disagreement is
-   still only to report it.** A connector MUST report one (this connector logs it at `warn`,
-   naming the channel and the declared value) and MUST NOT refuse on it, because the signature
-   is checked against the channel's own program either way: a claim that reaches this point is
-   one whose payer signed for this node's program whatever they wrote in that field, so it is
-   cryptographically correct and fully redeemable, and refusing it would refuse money the node
-   can actually collect.
-
-   That asymmetry is deliberate and dated. Until
-   [issue #1127](https://github.com/toon-protocol/connector/issues/1127) the field had no
-   pinned meaning at all: this document called it decorative and the one cross-repo statement
-   of it — `peer_carriage.claim_solana` — declared the **system program**, which is not a
-   settlement program and which no channel lives under. A payer built against that contract is
-   conforming to what it said. Refusing on the field is therefore gated on adoption, not on
-   this text: it becomes permissible once the payers on a connector's client edge are known to
-   emit the pinned value, and that is a fleet-by-fleet fact rather than a protocol one, since
-   the client edge is where buyers a connector has never heard of arrive. The vector's
-   `schema_version` bump to `2` is the signal that the reading changed.
-
-   **The duty to report is this edge's alone.** `peer-carriage-spec.md` §4 carries this whole
-   field list onto the peer edge unchanged — a peer claim is the same JSON object, and what a
-   payer MUST write in `programId` is the same there — but §4.1 deliberately does **not** carry
-   the reporting duty with it: a peer claim's declared `programId` is validated structurally and
-   then discarded, and this connector's shared claim codec drops it before the claim is judged.
-   Neither edge may refuse on the field. The difference is in what a report could find and who
-   could act on it, not in peers being trusted more. Since
-   [issue #1128](https://github.com/toon-protocol/connector/issues/1128) a Solana peering has
-   exactly one program it can be judged under — `[settlement.solana] program_id` — and that one
-   value both renders the field on an outbound peer claim and keys the channel an inbound one is
-   verified against, so a peer that declares a program it did not sign under is a disagreement
-   this connector cannot produce, and a peer that signs under a program this node does not settle
-   with already fails verification outright and carries no traffic at all. Here neither holds: the
-   payer is someone the operator has never heard of, running software the operator did not
-   configure and cannot reach, so this log line is the only channel by which the mislabelling can
-   become known to anyone — and it is the adoption signal a future refusal is gated on, for the
-   only population whose adoption is an open question. **Read issue #1127's "wait until the
-   warning stops firing" accordingly: it is a statement about client-edge payers, and the peer
-   edge's silence is not a gap in it.** §4.1 of that document states this difference and argues
-   it from the same two cases; the two texts are meant to be read as a pair, and neither should be
-   changed alone.
-
-   The cluster check is skipped where there is nothing to compare: a claim that omits
-   `cluster` declares none, and a connector with no `[settlement.solana]` table — or one
-   whose `rpc_url` names no cluster it recognises, a third-party RPC provider's say — knows
-   of none. A connector MUST NOT guess a cluster from such a URL: a wrong guess refuses every
-   genuine claim it ever receives.
-
-   A claim naming a channel the connector has **no record of** is refused with its own reason,
+   A voucher naming a channel the backend does **not admit** (it does not exist, is not toward this
+   connector, or fails ADR 0074 decision 2's admission rules) is refused with its own reason,
    distinguishable from a bad signature and from an underpayment — there is nothing to verify it
-   against, and unverifiable is never accepted. A node that can vouch for no channel therefore
-   accepts no claim at all; that is the intended failure mode, since the only alternative is
-   trusting what a claim says about itself.
-
-   Where the record comes from is a deployment question rather than a wire one, and there are two
-   sources ([issue #556](https://github.com/toon-protocol/connector/issues/556)). A node declares
-   channels in its `[[client_channels]]` config section, whose entries carry the counterparty and
-   the signing domain per channel; and a node with a `[settlement]` section **resolves any other
-   channel from the chain that section already names**, reading the counterparty and the EIP-712
-   domain off the deployed `TokenNetwork` itself. The second is what makes §1.2's anonymous path
-   real: an unaffiliated buyer registers on chain, which the connector can read, rather than with
-   the operator. A declared channel is authoritative and is never resolved, so a node with no
-   settlement backend — or one whose chain endpoint is unreachable — still accepts claims on
-   exactly the channels it wrote down.
+   against, and unverifiable is never accepted. A channel the backend knows to be **done** (sealed,
+   or withdrawn) is refused as such, a stronger and more actionable fact than "no record".
 
    A resolution that **fails** — an unreachable endpoint rather than an absent channel — refuses
    the claim under a third, separate reason. It never degrades to accepting the claim, and it is
@@ -302,106 +245,34 @@ never reaches the terminating app:
    naming channels at random, and a legitimate payer has to be told to retry rather than told they
    do not exist. A resolution the connector **declined to perform**, because its budget for lookups
    that do not resolve is spent, is a fourth reason again — see "A lookup that resolves nothing must
-   be bounded too" below.
+   be bounded" below.
 
-5. **Collateral binding** — the claim's cumulative `transferredAmount` MUST NOT exceed the
-   **on-chain deposit of the channel's counterparty**
-   ([issue #646](https://github.com/toon-protocol/connector/issues/646)). This is not a credit
-   policy a connector invents: both settlement contracts already refuse an over-deposit claim at
-   redemption (`TokenNetwork.claimFromChannel` reverts `InsufficientChannelBalance`;
-   `packages/solana-program`'s claim handler returns `TransferredAmountExceedsDeposit`), so a claim
-   above the deposit is not value at risk — it is provably unredeemable, and serving it is work the
-   operator can never be paid for. Evaluating it here makes the accept rule agree with the redeem
-   rule. It is checked **after** cryptographic verification, so only a claim that is already fresh,
-   value-covering and correctly signed can provoke the chain read it may need.
-
-   The refusal is its own reason, distinguishable from an underpayment: this claim _does_ cover the
-   route's price, and it consumes nothing — no watermark advances and nothing is recorded — so the
-   remedy is the one both contracts already document: **deposit more and resubmit the same claim,
-   at the same nonce**.
-
-   Deposits are monotonically non-decreasing while a channel is open or closed on both chains
-   (`setTotalDeposit` reverts on a decrease; the Solana `Deposit` handler only `checked_add`s), so a
-   deposit a connector read earlier is a permanent _lower bound_. A connector MAY therefore cache it
-   and compare against the cached value, provided a claim that breaches it triggers a fresh read
-   before being refused — the bound can only ever produce a false refusal, never a false accept, and
-   one re-read repairs it.
-
-   **The exemption is deliberate.** A `[[client_channels]]` record declares a counterparty and a
-   signing domain and never an amount, and a node with no settlement backend has no chain to ask, so
-   a declared channel is not subject to this step. An operator hand-declaring a channel _is_ the
-   credit decision, correctly located in config and theirs to make; an anonymous buyer resolved from
-   chain (§1.2) never made any such deal, and gets the check.
+5. **Collateral binding** — the voucher's cumulative amount MUST NOT exceed what its channel can
+   pay, as the backend reads it now: the amount already landed plus what still backs a voucher above
+   it -- EVM `balance − pendingWithdrawal`, Solana `deposit` while the channel is Open (ADR 0074
+   decision 5) ([issue #646](https://github.com/toon-protocol/connector/issues/646)). A voucher
+   above that is provably unredeemable, and serving it is work the operator can never be paid for.
+   It is checked **after** cryptographic verification, against the backend's current reading rather
+   than a cached floor: on EVM the figure can fall, so there is no lower bound to cache. The refusal
+   is its own reason, distinguishable from an underpayment: this voucher _does_ cover the route's
+   price, and it consumes nothing — no watermark advances and nothing is recorded — so the remedy
+   is to top the channel up and resubmit the same voucher.
 
    **A payout nets against nothing** ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
-   decision 7, issue #1381). The ceiling is the deposit alone. From issue #700 until #1381 it was
-   `deposit + credited`, where `credited` was what this connector had signed the same channel's
-   counterparty in payout claims; a payout now rides a connector→client channel of its own (§1.9
-   step 7), so value paid out does not raise what the client may spend, and value the client pays in
-   does not fund its payouts.
+   decision 7, issue #1381). A payout rides a connector→client channel of its own (§1.9 step 7), so
+   value paid out does not raise what the client may spend, and value the client pays in does not
+   fund its payouts.
 
 A claim that fails any check is a validation failure and the PREPARE is rejected before it
-reaches the terminating app or advances any watermark.
+reaches the terminating app or advances any watermark. A channel's first accepted voucher also
+records the channel itself -- on EVM its `ChannelConfig`, the only way to land any voucher on it
+after a restart -- durably, with the voucher.
 
-**A resolved channel's mutable facts expire.** The counterparty and signing domain a resolution
-reports are immutable on chain, but the same resolution also asserts two things that are not — that
-the channel has not `Settled`, and that its token/mint is the one this node settles in
-([issue #649](https://github.com/toon-protocol/connector/issues/649)). A connector that memoises a
-resolution therefore MUST re-verify it periodically, or a channel resolved while open and settled
-afterwards keeps buying writes for the life of the process, with the settled-channel refusal
-(step 4) silently bypassed. Re-verification and the deposit re-read above are one mechanism: a
-refresh reports liveness and deposit together.
-
-A **declared** channel is outside this too, and for the same reason it is outside the cap: config,
-not the chain, is its authority, and a node with no settlement backend has no chain to ask. The
-consequence is worth stating plainly rather than leaving to be discovered — an operator who both
-runs a settlement backend **and** hand-declares a channel in `[[client_channels]]` gets a channel
-that is exempt from the deposit cap _and_ never re-verified, so it keeps being paid on after it
-settles on chain. That is the same credit decision the exemption above describes, extended in time:
-declaring a channel says "I vouch for this one", and a connector cannot both take that at its word
-and second-guess it. An operator who wants the chain consulted should not declare the channel — a
-node with a settlement backend resolves it anyway (§1.2), which is the path both this step and the
-cap apply to.
-
-**Re-verification must not become a per-packet read.** The expiry above is a bound on staleness, and
-a connector that implements it naively converts it into a bound on nothing: if a re-verification
-that _fails_ leaves the entry expired and refuses the claim, then every subsequent packet on that
-channel retries the same failing read, so an unreachable or rate-limited endpoint turns one read per
-interval into one read per packet — a load pattern that sustains its own failure, on the endpoint
-already failing. A connector MUST therefore bound the work as well as the staleness: it SHOULD serve
-the last successfully-read resolution while a re-verification is failing, up to a hard staleness
-ceiling past which it refuses, and it MUST NOT allow one channel to provoke unbounded lookups —
-neither by arrival rate (many packets, one aged-out entry) nor by concurrency (many packets at once)
-nor by resubmission (one undercollateralized claim, re-presented, which by design consumes nothing).
-Serving a stale resolution is a deliberate, logged degradation, and it is bounded: it is strictly
-better than refusing a paying client because a third party's endpoint is down, and the ceiling keeps
-it far inside the close-challenge-settle window the expiry defends against.
-
-The bound on work MUST hold **past the staleness ceiling too**, and this is the part that is easy to
-get wrong in the direction of good intentions. Past the ceiling there is nothing left to serve, so it
-reads as the moment to try hardest — but reaching it means the chain has already been failing for the
-entire stale window, and a connector that waives its own rate limit there reinstates exactly the
-per-packet storm described above, merely later, against an endpoint that has by then been failing for
-the whole window. The claim is refused either way once nothing can be served; the only question is
-whether each refusal also costs a chain read, and it must not. A connector that has to refuse SHOULD
-say which refusal it is — "the chain answered and said no" is an operator's problem to fix, "I am
-backing off from asking" is the same operator's endpoint already being known-bad — since the two lead
-to different actions.
-
-The three durations this implies (when a reading stops being believed, how long past that it may
-still be served, and how often one channel may provoke a lookup) are a **deployment** choice, not a
-protocol constant: a node on a metered or rate-limited endpoint needs them longer, and a node that
-wants a settled channel noticed sooner needs the first shorter. A connector SHOULD make them
-configurable and SHOULD refuse, at load, values that read as strictness but behave as a per-packet
-read — a zero re-verification interval, or a zero floor on lookups per channel.
-
-**A lookup that resolves nothing must be bounded too, and none of the above bounds it.**
-Every bound in the paragraphs above is keyed to a channel the connector has resolved at least once —
-it is an interval on _that entry_, a stale window measured from _that reading_. A channel that never
-resolves has no entry, so a sender naming nonexistent channel ids provokes one chain read per
-request, indefinitely ([issue #613](https://github.com/toon-protocol/connector/issues/613)). The gap
-is wider than "a fresh id each time escapes a per-channel interval": **even the same nonexistent id,
-repeated, escapes it**, because the entry an interval would be recorded on is never created. Every
+**A lookup that resolves nothing must be bounded.** A channel this connector has accepted a voucher
+on is known, and its lookup is not a discovery. A channel it has no record of is, and a sender naming
+nonexistent channel ids provokes one chain read per request, indefinitely
+([issue #613](https://github.com/toon-protocol/connector/issues/613)) -- **even the same
+nonexistent id, repeated**, since a lookup that finds nothing leaves no record behind. Every
 one of those claims is refused, nothing is paid and nothing is delivered — which is what makes it
 worth doing: the sender spends a packet, and the connector spends a unit of its own metered
 settlement-RPC budget, on an anonymous request's say-so. A connector MUST therefore bound how many
@@ -457,12 +328,11 @@ what it buys.** A probe (§1.6) is budgeted per recognized channel; a lookup tha
 no recognized channel by definition. The transport source address is the obvious fallback and is
 worth little: a connector deployed behind a reverse proxy sees the proxy's address, so every
 anonymous buyer shares one bucket with the attacker, and the remedy — trusting a forwarded-for header
-— is trusting attacker-supplied text. The claim's own declared signer is available before any lookup
-and costs nothing to read, but it is **not a credential**: for EVM the EIP-712 digest needs the
-channel's own domain, which is precisely what has not been resolved yet, so nothing about the
-declared signer can be verified at this point without either trusting the claim's self-declared
-domain (which proves only that the sender can run one `ecrecover`) or spending elliptic-curve work on
-every anonymous request — trading an RPC-spend amplifier for a CPU-spend one.
+— is trusting attacker-supplied text. The voucher's own declared sender (`senderId`, the "declared
+signer" below) is available before any lookup and costs nothing to read, but it is **not a
+credential**: a voucher's signer is the channel's, which is precisely what has not been resolved
+yet, so nothing about the declared sender can be verified at this point without spending the very
+lookup being budgeted.
 
 A connector that shapes per declared signer therefore MUST NOT present it as a bound: a keypair is
 free, so an adaptive sender declares a fresh one per request. What the per-signer axis buys is that a
@@ -481,40 +351,16 @@ anyone for their declared identity. It does not _remove_ the aim, and a connecto
 plainly rather than claiming otherwise: a sender who sustains the flood can still spend a named
 buyer's share, at which point it is the flood, not the aim, that an operator is looking at.
 
-**Neither axis is a durable answer, and the durable answers live outside this step.** Two are worth
+**Neither axis is a durable answer, and the durable answer lives outside this step.** It is worth
 naming, because a reader who has followed the paragraphs above should not conclude that a declared
 signer is the best that can be done:
 
 - **Per-address rate limiting at the reverse proxy** a connector is deployed behind. That is the only
   sybil-resistant axis available at this layer — an address costs something, a keypair does not — and
   it is the right place for it, since the proxy is the only component that sees the real peer.
-- **A local channel index built from the settlement contract's own logs** (issue #661, shipped as
-  `connector-settlement-evm`'s `EvmChannelIndex`/`EvmChannelIndexSyncer`, wired in by
-  `connector-cli::runtime`'s `IndexedEvmChannelSource`). A connector backfills, then polls,
-  `ChannelOpened`/`ChannelNewDeposit`/`ChannelSettled` from `TokenNetwork` (the close events change
-  nothing about claimability — `claimFromChannel` accepts a `Closed` channel — so they are not indexed)
-  once each log is a configured confirmation depth behind chain head, and answers "is this a channel
-  I can be paid on, and for how much?" from a local map rather than an RPC round trip. Once the index
-  has caught up to a channel, an unknown- or settled-channel lookup costs a hashmap probe instead of
-  an `eth_call` and this step's rates and wait have nothing left to bound _for that channel_ — that is
-  the fix that dissolves the problem rather than rationing it. It is not a replacement for the axes
-  above: a channel the index has not caught up to yet (never opened, opened inside the confirmation
-  window, or the index's own sync lagging or down) falls through to exactly the RPC-reading,
-  budget-shaped resolution this section describes, unchanged — so a connector whose index has never
-  once caught up behaves exactly as one with no index at all, and the rates and wait above remain the
-  bound for every lookup this index cannot yet answer. Since issue #1151 one further answer falls
-  through: an indexed, open channel whose counterparty **deposit reads zero**. The index reports zero
-  both for a channel that holds nothing and for one whose `ChannelNewDeposit` is younger than the
-  confirmation depth, and it can never separate the two — it is permanently that many blocks behind
-  head — so "for how much?" is asked of the chain in that case rather than answered from the map. It
-  is deliberately **not** answered with the declared-channel exemption (`DepositFloor::Unknown`,
-  `depositTotal: null`): that exemption covers every claim, and a channel opened and never funded
-  would become an unlimited line of credit no `claimFromChannel` could ever redeem. A resolved
-  channel still always reports a number; the number is now the chain's.
 
-The rates and the wait are a **deployment** choice for the same reason the three durations above are
-— what a connector can afford to spend discovering channels that do not exist depends on the
-settlement endpoint it pays for, and it should be derived from that endpoint's real capacity rather
+The rates and the wait are a **deployment** choice — what a connector can afford to spend
+discovering channels that do not exist depends on the settlement endpoint it pays for, and it should be derived from that endpoint's real capacity rather
 than picked for tidiness. The arithmetic is worth doing rather than eyeballing: at a common metered
 schedule of 26 compute units per `eth_call`, ten lookups a second sustained is 864,000 lookups and
 about 22.5M CU a day — over a 300M/month allowance in a fortnight, on discovery traffic alone and
@@ -532,36 +378,23 @@ worth and a delay no packet's own deadline would survive.
 
 **A watermark outlives the process.** Freshness (step 2) is only a replay defence if the watermark
 it compares against survives a restart: a connector that forgets a channel's watermark compares
-against nothing, and `None` accepts every nonce, so every claim the client already spent becomes
-free service again ([issue
+against nothing, and an empty watermark admits any voucher naming more than zero, so every voucher
+the client already spent becomes free service again ([issue
 #605](https://github.com/toon-protocol/connector/issues/605)). A connector therefore MUST record
-each accepted claim durably before treating it as accepted, and MUST rebuild its watermarks from
+each accepted voucher durably before treating it as accepted, and MUST rebuild its watermarks from
 that record before serving. Two consequences follow, and both are refusals rather than degradations:
-a claim whose acceptance cannot be made durable is refused (as a **temporary** error — the claim
+a voucher whose acceptance cannot be made durable is refused (as a **temporary** error — the voucher
 itself is fine), and a record that cannot be read back, or that carries an entry the connector
 cannot decode, stops the connector starting rather than letting it start at no watermarks. Where
 the record lives is a deployment question rather than a wire one: today it is the `state_dir`
-config field, and a config that configures `[[client_channels]]` without one does not load.
+config field, and a config with a settlement table and no `state_dir` does not load.
 
-**A watermark does not outlive its channel.** The rule above is bounded by the channel it defends.
-Both chains this connector settles on _derive_ a channel's identifier rather than randomising it,
-so a payer's next channel can land on the identifier their settled one used. On EVM it does not:
-`TokenNetwork` hashes the pair's `channelEpoch` into the id, and that epoch advances when a channel
-of theirs settles. On Solana it does: the channel PDA is seeded on the sorted participants and the
-token mint with no epoch, so a reopened pair is back at the identical address. A connector that
-carried the settled incarnation's watermark forward would refuse every claim that payer could
-sign — one continuing the old watermark asks the new channel to honour units the chain has already
-paid out, and one starting fresh reads as a replay — leaving them no way to pay at all
-([issue #1283](https://github.com/toon-protocol/connector/issues/1283)). A connector therefore MUST
-retire a channel's watermark once a chain has told it that channel is finished, and MUST record the
-retirement as durably as it records an acceptance. Two answers count as being told, and only those
-two: a settle this connector itself submitted and the chain accepted, and a later read finding the
-channel gone altogether ([issue #977](https://github.com/toon-protocol/connector/issues/977)). A
-connector MUST NOT retire a watermark on anything weaker — a deposit that merely looks too small for
-it is an inference rather than a chain's answer, and a stale read of one would hand that payer a
-free replay of a claim already honoured. Retirement is not a licence to forget early either: a
-channel that is merely _closed_ is still running its challenge period, still owes its counterparty
-this defence, and its last claim is still what a redemption submits.
+**A watermark belongs to one channel, and an x402 channel is never reopened at its own id.** An
+EVM channel's id hashes its whole `ChannelConfig`, `salt` included, and a Solana channel's account
+is derived with its `open_slot`, so a payer's next channel is a new id with a new, empty watermark,
+and nothing carries a finished channel's watermark forward. (The `toon-channel` sweep that retired
+the watermark of a settled `TokenNetwork` or TOON-program channel, whose ids a reopen could reuse --
+issues #977, #1283 -- is deleted with that scheme, #1384.)
 
 **Mina is not a supported chain.** [ADR 0002](../adr/0002-drop-mina-from-the-rust-connector.md)
 drops Mina from the Rust connector: a Mina claim's on-chain lifecycle (open, deposit, close,
@@ -571,28 +404,13 @@ structural validation failure (step 1 above) rather than parsed or cryptographic
 zkApp-specific fields the peer semantics's predecessor once carried for it (`zkAppAddress`, `tokenId`,
 `balanceCommitment`, `proof`, `salt`, and the dual-party `balanceB`/`signatureB` extension) are not
 part of this connector's claim shape and are not documented here. A Mina client's claim is rejected
-clearly and immediately; it is not owed a code path, only an unambiguous refusal.
+clearly and immediately; it is not owed a code path, only an unambiguous refusal. Mina is checked
+before `scheme`, so a Mina claim is refused as Mina whatever scheme it declares.
 
-> **Amended by [ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
-> (accepted 2026-09-25, built under epic #1349: #1340–#1347).** A claim may also carry the scheme
-> `batch-settlement`, whose claims are x402 **vouchers** on x402's own channel contracts: EVM
-> `x402BatchSettlement`, and Solana payment-channels. Three steps above read differently for a
-> voucher:
->
-> - **Step 2 (freshness):** a voucher has no nonce. It must strictly exceed the amount watermark
->   for the same (peer, blockchain, channel) tuple. A byte-identical voucher at the watermark is a
->   retransmission, which buys nothing: it is accepted again where the charge is zero, and refused
->   as an underpayment (step 3) where it is not.
-> - **Step 4 (cryptography):** the signer comes from the chain. On EVM it is `payerAuthorizer` from
->   the verified `ChannelConfig` — x402 would fall back to `payer` when it is zero, but this
->   connector admits no such channel (ADR 0074 decision 2, amended 2026-09-25); on Solana it is
->   `authorized_signer`.
-> - **Step 5 (collateral):** the licence to cache a deposit as a permanent lower bound does **not**
->   extend to an EVM batch-settlement channel, whose `balance − totalClaimed − pendingWithdrawal`
->   can fall.
->
-> A `toon-channel` claim is unchanged. The voucher's own vectors landed with #1347, as
-> `claim_voucher` in `vectors/wire-vectors.json` (`schema_version` 6) -- normative per ADR 0021.
+> **History.** [ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
+> (epic #1349) added the `batch-settlement` voucher beside the `toon-channel` claim, with its own
+> freshness, signer and collateral rules; its vectors landed as `claim_voucher` at `schema_version` 6. [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (issue
+> #1384, `schema_version` 7) made the voucher the only claim, and the steps above are its rules.
 
 ### 1.4 Answering an unpaid request: x402 v2 terms
 
@@ -649,7 +467,10 @@ unprompted greeting, and _that_ stays removed. [ADR
 was written against that same earlier, unprompted shape.
 
 The body is an x402 v2 `PaymentRequired` document — `Content-Type: application/json` — repeated
-byte-for-byte, base64-encoded, in a `Payment-Required` response header:
+byte-for-byte, base64-encoded, in a `Payment-Required` response header. Since issue #1384
+([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 10)
+its `accepts[]` holds **only x402-valid `batch-settlement` entries**, one per chain this node
+settles on, and TOON's own terms for the request ride in x402 v2's `extensions` slot, under `toon`:
 
 ```json
 {
@@ -658,40 +479,55 @@ byte-for-byte, base64-encoded, in a `Payment-Required` response header:
   "request": { "protocol": "nip90", "kinds": [5096, 5098] },
   "accepts": [
     {
-      "scheme": "toon-channel",
-      "network": "g.example.app",
+      "scheme": "batch-settlement",
+      "network": "eip155:84532",
       "amount": "100",
-      "payTo": "g.example.app",
+      "asset": "<token address>",
+      "payTo": "<settlement address>",
       "maxTimeoutSeconds": 60,
-      "httpEndpoint": "/ilp",
       "extra": {
+        "receiverAuthorizer": "<settlement address>",
+        "withdrawDelay": 86400,
+        "name": "USDC",
+        "version": "2"
+      }
+    }
+  ],
+  "extensions": {
+    "toon": {
+      "info": {
         "ilpAddress": "g.example.app",
+        "amount": "100",
         "endpoint": "/ilp",
         "price": "100",
         "sessionLeaseTtlMs": 120000
-      }
+      },
+      "schema": { "type": "object", "required": ["amount"], "...": "..." }
     }
-  ]
+  }
 }
 ```
 
-`accepts` is a list — ADR 0022 notes terms are plural — and until ADR 0074 exactly one entry
-existed, for the one payment method this client edge's own claim gate (§1.3) actually understands: a
-TOON payment channel claim, presented back over this same `POST /ilp`. There is no per-chain `exact`
-scheme entry naming a settlement `asset`/`payTo` address, for EVM, Solana or any other chain,
-because this claim gate understands one payment method and an `exact` scheme entry would describe a
-second. **Not** because settlement facts are unavailable — they have been in the greeting's `extra`
-since issue #617, and are per-chain since #632 (corrected, issue #1073). `extra` is limited to
-what the code actually sets — `ilpAddress`, `endpoint`, `price` and `sessionLeaseTtlMs` on every
-greeting, plus `pricePerKib` where the addressed route prices by size, plus whichever of
-`ilpAddresses`/`btpEndpoint`/`settlement`/`settlements`/`requiredTransport` this node has
-configured (below) — and carries nothing else.
+`accepts` is a list — ADR 0022 notes terms are plural — of the payment methods this connector's
+claim gate (§1.3) understands: an x402 `batch-settlement` voucher on each chain whose
+`[settlement.<chain>.batch_settlement]` table is written. It is **empty** on a node that settles
+on no such chain, which can be paid by nobody. The `toon-channel` entry that led the list until
+#1384, and its `extra.settlement`/`extra.settlements` channel-opening terms (issues #617, #632), are
+deleted with that claim scheme.
 
-> **Amended by [ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
-> decision 8 (issue #1345).** `accepts` gains one **`batch-settlement`** entry per chain this node
-> has opted into accepting a batch-settlement channel on (`[settlement.<chain>.batch_settlement]`) --
-> unlike a hypothetical `exact` entry, this one names a real scheme this connector's settlement
-> backends actually redeem, x402's own audited contracts, with no TOON contract involved. Its
+**`extensions.toon`** carries what that entry also carried that is not a payment option, unchanged
+in name and meaning: `info` holds `ilpAddress`, `amount`, `endpoint` (`/ilp`), `price` and
+`sessionLeaseTtlMs` on every greeting, plus `pricePerKib` where the addressed route prices by size,
+plus whichever of `ilpAddresses`/`btpEndpoint`/`requiredTransport` applies (below), and nothing
+else; `schema` is a JSON Schema describing `info`, as x402 v2 asks of an extension, and is
+informational. It is on **every** greeting, including one with no `accepts[]` entry, so the amount
+is always quoted. A reader MUST treat a greeting with no `extensions.toon`, or with an `amount` that
+is not a decimal uint64, as unreadable terms, never as "nothing to pay". In the rest of this section
+`toon.<field>` names `extensions.toon.info.<field>`.
+
+> **The `batch-settlement` entry** ([ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
+> decision 8, issue #1345) names a real scheme this connector's settlement backends actually
+> redeem, x402's own audited contracts, with no TOON contract involved. Its
 > top-level `network`/`asset`/`payTo` and its `extra` carry everything x402's `batch-settlement`
 > scheme spec requires, so a stock client can build a deposit from the greeting alone: `network` is
 > CAIP-2 (`eip155:<chainId>` or `solana:<genesis-hash-prefix>`), `asset` is the token address or
@@ -744,8 +580,7 @@ configured (below) — and carries nothing else.
 >   hints and requires it to refresh them when stale, and the client already has to reach the chain
 >   to check `tokenProgram` against the mint's owner.
 >
-> The `toon-channel` entry is unchanged and stays first. The self-description publishes the same
-> facts under `batchSettlements` (ND-11); this is a projection of that value, never a second
+> The self-description publishes the same facts under `batchSettlements` (ND-11); this is a projection of that value, never a second
 > assembly of it (`connector_domain::x402::batch_settlement_accept`).
 >
 > **What `extra` cannot say: this connector requires a `payerAuthorizer`.** x402's EVM scheme lets a
@@ -767,17 +602,16 @@ reads a key out of it, never fetches it from anywhere, and never varies its beha
 contains. A reader that predates this field ignores it, the same as any other addition to this
 forgiving-deserialization document.
 
-**`extra.ilpAddresses`/`extra.btpEndpoint`** ([issue
+**`toon.ilpAddresses`/`toon.btpEndpoint`** ([issue
 #807](https://github.com/toon-protocol/connector/issues/807)): this node's own ILP address(es) and
 BTP endpoint — the same facts a kind:10032 announce carries under the identical names — present
-exactly when `[announce]` is configured (`connector_config::AnnounceConfig`, the section
-`connector announce` already reads these from), absent — not empty/null — otherwise. Unlike
-`extra.ilpAddress` above, which echoes back whatever `destination` the probing PREPARE named,
+exactly when `[node]` configures them, absent — not empty/null — otherwise. Unlike
+`toon.ilpAddress` above, which echoes back whatever `destination` the probing PREPARE named,
 these are this node's own authoritative facts regardless of what was probed; a client that trusts
-`ilpAddress` as a confirmation of a _guessed_ destination should prefer `ilpAddresses` when it is
+`toon.ilpAddress` as a confirmation of a _guessed_ destination should prefer `ilpAddresses` when it is
 present, since the guess is exactly what a stale-or-missing-genesis-seed client cannot rely on.
 
-`amount` and `extra.price` are read from the same longest-prefix route lookup that §1.3's value
+`amount` (on `extensions.toon` and on every `accepts[]` entry alike) and `toon.price` are read from the same longest-prefix route lookup that §1.3's value
 binding and §1.7's `GET /ilp/routes/price` charge and answer against, so this response never states
 a price a real request wouldn't also be charged.
 
@@ -787,21 +621,19 @@ carries a slope the two answer different questions and must not be conflated:
 
 - **`amount`** is what the request being answered would cost — the route's schedule evaluated at
   that request's own payload length. This is x402's meaning of the field: what to pay for _this_.
-- **`extra.price`** is the schedule's **base**, and **`extra.pricePerKib`** its slope, in the same
+- **`toon.price`** is the schedule's **base**, and **`toon.pricePerKib`** its slope, in the same
   decimal-string spelling. Together they let a client compute the cost of a packet it has not sent
   yet, which is what keeps [ADR 0011](../adr/0011-rejects-accumulate-fees-and-probes-discover-cost.md)'s
   cacheability true: one greeting answers every size, rather than one greeting per size.
 
-`extra.pricePerKib` is **absent**, not `"0"`, on a flat route, so a flat route's greeting is
-byte-identical to what it was before schedules existed and a parser written against that greeting
-is unaffected.
+`toon.pricePerKib` is **absent**, not `"0"`, on a flat route.
 
 **Transport policy** (issue #701, `toon-meta#262` decision 11): which transport(s) a terminated
 route accepts is per-connector config, not a protocol constant — `both` by default, so no deployed
 route changes behavior until an operator opts in, or restricted to `http` or `btp` alone. A request
 over a transport its route does not accept is refused with this SAME `402` shape — before payment
 is considered at all, and whether or not the request carries a valid claim, since paying over the
-wrong transport does not make the route reachable that way — with one addition: `extra` also
+wrong transport does not make the route reachable that way — with one addition: `extensions.toon.info` also
 carries `requiredTransport` (`"http"` or `"btp"`), naming the transport the route actually
 requires. An ordinary unpaid-request greeting (above) never sets this field.
 
@@ -813,8 +645,8 @@ exactly as it is for a client that did not read it. The BTP carriage
 answers the mirror case (a route restricted to HTTP, reached over the websocket session) the same
 way; see §1.9 step 3.
 
-**`extra.sessionLeaseTtlMs`** ([issue #722](https://github.com/toon-protocol/connector/issues/722),
-`toon-meta#262` decision 12): unlike every other `extra` field above, always present, on every
+**`toon.sessionLeaseTtlMs`** ([issue #722](https://github.com/toon-protocol/connector/issues/722),
+`toon-meta#262` decision 12): always present, on every
 greeting this connector answers — a settlement-less node still has a client session registry. The
 value is
 [`connector_client_edge::session_registry::SESSION_LEASE_BACKSTOP_TTL`](../../crates/connector-client-edge/src/session_registry.rs)
@@ -893,12 +725,11 @@ forwarded. A `403` carries no OER body, per §1.1's rule that a non-2xx status n
 
 The claim on a probe **identifies rather than pays**: it is validated in full (§1.3's five steps)
 against a price of `0`, so possession of the channel is proven and a replay is still refused, but
-no value need advance — a sender probes by reissuing at the same cumulative amount with a fresh
-nonce. A connector recognizes a channel once a claim on it has cleared §1.3's gate at this edge.
-It necessarily already holds that channel's counterparty, whether declared or resolved from chain
-— step 4 above verifies against it, so without one no claim on the channel could clear the gate at
-all — but holding a counterparty says only
-_whose signature is accepted here_, never that anyone has turned up and paid; no chain indexes
+no value need advance — a sender probes by resending its latest voucher byte for byte, a
+retransmission (§1.3 step 2) that advances and records nothing. A connector recognizes a channel
+once a claim on it has cleared §1.3's gate at this edge. It necessarily already holds that
+channel's voucher signer, read from the chain — step 4 above verifies against it — but holding a
+signer says only _whose signature is accepted here_, never that anyone has turned up and paid; no chain indexes
 that, so a cleared claim is the only evidence a connector ever gets of it. This is what makes the
 probe gate satisfiable by a deployed node: a sender able to pay is, by the same record, a sender
 able to probe, and a gate no deployed node could pass would not be a gate.
@@ -1050,7 +881,7 @@ price (ADR 0020), whether or not this hop was the one that took the payment.
 The connector's own records are unchanged and remain the after-the-fact answer: an operator joins
 the `"packet"` log (ADR 0014, `client_channel_id`) to `state_dir/client-edge-claims.log`'s
 `InboundClaimAccepted` entries under that same chain-namespaced channel key, with the payer's
-identity from the channel's `[[client_channels]]`/chain-resolved record (ADR 0036).
+identity from the channel's chain-resolved record (ADR 0036).
 (`GET /channels`/`GET /claims` do not carry this: both project the node's own peer channels,
 which a payer-opened client channel is not.)
 
@@ -1058,7 +889,7 @@ which a payer-opened client channel is not.)
 
 A second carriage for exactly the pipeline §1.1–§1.6 specify over HTTP: one persistent,
 **ordered** websocket session carrying BTP-framed ILP packets and claims, so that a client
-streaming many paid writes advances its claim nonces on one socket in one order instead of racing
+streaming many paid writes advances its vouchers on one socket in one order instead of racing
 parallel HTTP requests. Nothing here changes what is validated or charged — the same claim gate
 instance, watermarks, journal and refusal taxonomy serve both carriages, and a write that arrived
 over BTP is indistinguishable downstream from one that arrived over HTTP.
@@ -1071,7 +902,7 @@ challenge — on a channel whose voucher signer is bound to that peering, by a `
 or by `POST /peers` ([ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md),
 issue #1157, as [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
 decision 5 amends it, issue #1380; `peer-carriage-spec.md` §1.2). A `toon-channel` claim never
-makes one, whatever channel it names. Anything else is a client frame, with no fallthrough,
+makes one: since #1384 it is refused by name on this session like any other (§1.3). Anything else is a client frame, with no fallthrough,
 and everything below in this section describes client sessions exactly as before. **There is no
 peering credential**, and nothing replaced it: opening this transport is permissionless, a session
 that proves no peering is accepted and stays a client, and role attaches to a frame's own evidence
@@ -1144,30 +975,41 @@ silently dropped exactly as it was before TRANSFER existed.
    is best-effort and never blocks the ack: a session with no usable `peerId` is simply never
    registered.
 
-   **Update (issue #790):** the same `auth` entry MAY carry three additional fields —
-   `channelId`, `expires` (unix seconds) and `signature` — a channel-control proof binding this
-   session's `peerId` to an EVM channel _before_ it has ever presented a claim. This exists
-   because issue #787's channel association is learned only from a genuine inbound claim, which a
-   client that only ever earns (opens a channel, serves paid work, sends no claim of its own)
-   never sends — it would otherwise be structurally uncreditable. The signature is the identical
-   domain-separated `ClaimStateChallenge` `POST /ilp/claim-state` (§1.10) already verifies for a
-   read, reused rather than a claim's own balance-proof scheme, so a captured claim-state proof
-   and a captured claim can never stand in for each other (issue #558's rule, applied to this new
-   surface too). Verified against `ClientChannelRegistry`'s already-registered counterparty for
-   `channelId`, exactly as `/ilp/claim-state` verifies it, before this session is taught the
-   association — a bare declaration is never trusted. Best-effort, like the `peerId` bind itself:
-   an expired, malformed, unresolvable or wrongly-signed proof leaves the session exactly as
-   uncreditable as it was, and `record_accepted_claim`'s inbound-claim path (issue #787) is
-   untouched and stays the fallback for a session that pays before it ever declares. EVM only,
-   matching the payout ledger's own reach at the time. **Since issue #1381** a verified proof teaches
-   the session its _payee_ — the channel's recorded counterparty key, which a payout channel toward
-   this client names as receiver (step 7) — rather than a channel to pay on; the proof itself, and
-   its wire, are unchanged until #1384 replaces it with the voucher claim-state challenge.
-   `vectors/wire-vectors.json`'s
-   `channel_control_declaration` section is the reproducible bytes — the exact `channelId`/
-   `expires`/`signature` JSON, the EIP-712 digest they cover, and a wrong-key and an expired case
-   alongside the valid one — for all of the above; this paragraph is orientation, not the thing to
-   conform to (ADR 0021, issue #792).
+   **Declaring a channel at auth (issue #790, as issue #1384 replaces it).** The same `auth` entry
+   MAY carry a `channelChallenge` field: the **voucher claim-state challenge** object — exactly what
+   a `POST /ilp/claim-state` entry (§1.10) and a peer's `peer-role-challenge`
+   (`peer-carriage-spec.md` §1.4) carry, `scheme: "batch-settlement"` required:
+
+   ```json
+   {"peerId": "g.example.agent", "secret": "",
+    "channelChallenge": {"blockchain": "evm", "scheme": "batch-settlement",
+                         "channelId": "0x…", "expires": 1800000000, "signature": "0x…",
+                         "channelConfig": {…}}}
+   ```
+
+   It proves, _before_ this session has ever paid, that the session holds the voucher signer of an
+   x402 channel toward this connector. That exists because a client that only ever earns (opens a
+   channel, serves paid work, pays nothing) would otherwise never teach this connector where to pay
+   it (step 7). It is verified exactly as a peer's challenge is: the channel it names is resolved by
+   the settlement backend of its chain, the **voucher signer is read from the chain** (EVM
+   `payerAuthorizer`, Solana `authorized_signer`), and the signature — over
+   `ClaimStateChallenge(bytes32 channelId,uint256 expires)` under `x402BatchSettlement`'s EIP-712
+   domain on EVM, Ed25519 over `"toon-voucher-claim-state-challenge-v1" ‖ channelAccount ‖ expires`
+   on Solana (`vectors/wire-vectors.json`'s `voucher_claim_state_challenge`) — must recover to it.
+   Its `expires` must be ahead of this connector's clock and no more than **300 seconds** ahead
+   (the peer challenge's own bound): within it a challenge is a bearer proof. A verified challenge
+   teaches the session its _payee_ — that voucher signer (step 7). Best-effort, like the `peerId`
+   bind itself: an expired, too-distant, malformed, unresolvable or wrongly signed challenge leaves
+   the session exactly where it was, and an accepted voucher (§1.3) teaches the same payee anyway.
+
+   **The retired `auth_channel_proof` is refused by name.** Until #1384 the declaration was three
+   flat fields on the `auth` entry — `channelId`, `expires`, `signature` — signing the same struct
+   under a `TokenNetwork` channel's domain and verified against a `[[client_channels]]` or
+   chain-resolved `toon-channel` counterparty. An `auth` entry carrying any of those three
+   top-level fields is answered with an ERROR frame (`code F00`, `name NotAcceptedError`, data
+   naming the retirement) instead of the empty RESPONSE, and **the session is not bound**; nothing
+   in it is read. Its vector section, `channel_control_declaration`, is gone from
+   `vectors/wire-vectors.json` at `schema_version` 7.
 
 2. **Prepare + claim**: a MESSAGE with a non-empty `ilpPacket` is decoded as a PREPARE. A
    protocolData entry named `payment-channel-claim` carries the claim as **raw UTF-8 JSON**
@@ -1185,7 +1027,7 @@ silently dropped exactly as it was before TRANSFER existed.
    RESPONSE carries an `F02` (Unreachable) REJECT — from this carriage's own point of view, there
    is no route to the destination over BTP, even though one may exist over HTTP — with the SAME
    x402-shaped terms JSON step 4 below uses, again as a `payment-required` protocolData entry, but
-   self-diagnosing via an additional `extra.requiredTransport` field (`"http"` or `"btp"`) naming
+   self-diagnosing via an additional `extensions.toon.info.requiredTransport` field (`"http"` or `"btp"`) naming
    the transport the route actually requires. This reuses §1.4's greeting mechanism rather than
    inventing a second one; the HTTP carriage answers the mirror case (a route restricted to BTP,
    reached over `POST /ilp`) the same way, with `402` and the same field. A route with no
@@ -1238,8 +1080,12 @@ silently dropped exactly as it was before TRANSFER existed.
    - **Which client a channel pays.** A session is paid at its **payee key**, learned only from a
      signature the claim gate has verified by that key: the voucher signer of the channel the session
      pays this connector on (EVM `payerAuthorizer`, Solana `authorized_signer`, as the chain records
-     it), taught when a voucher on it is accepted on the session; or, until #1384, the counterparty an
-     `auth` channel-control proof (step 1) verified against. A payout is signed on this connector's
+     it), taught when a voucher on it is accepted on the session; or the voucher signer a
+     `channelChallenge` at auth (step 1) proved. There is no client-declared payout address, and
+     nothing a client merely asserts teaches a payee. The payee is recorded against the session's
+     bound `peerId`, which the client asserts: issue #1396 (an unauthenticated `peerId` can
+     overwrite another session's payee) is open, and #1384 neither fixes nor widens it — the key it
+     teaches is still one a signature proved, of a channel open toward this connector. A payout is signed on this connector's
      open outbound channel whose receiver is that key; a session with no payee, or a payee with no
      open channel toward it, is paid nothing and the packet still answers as it would. A voucher is
      landable only by its channel's receiver, so a payout delivered to the wrong socket pays nobody
@@ -1251,8 +1097,9 @@ silently dropped exactly as it was before TRANSFER existed.
      (`0x` + 130 hex on EVM, base58 of 64 bytes on Solana). An EVM payout always carries the
      `channelConfig` `claim` needs; a Solana one carries `expiresAt: 0`. The TRANSFER's `amount` is
      the voucher's cumulative amount. Everything the client needs to land the voucher itself is in the
-     entry. This entry is not covered by `vectors/wire-vectors.json`, as the rest of this dialect is
-     not (ADR 0026's #1073 correction).
+     entry. `vectors/wire-vectors.json`'s `payout_voucher` section (`schema_version` 7, issue #1384)
+     pins this entry and its TRANSFER; the rest of this dialect stays uncovered (ADR 0026's #1073
+     correction).
    - **Delivery and dedupe are unchanged**: one voucher per fulfilled job, deduped on the job this
      connector asked for (issue #770), resent on the next delivery or reconnect until the client
      answers the TRANSFER with a RESPONSE (issue #779). A voucher is cumulative, so the latest one
@@ -1304,7 +1151,7 @@ during the disagreement this connector would route paid work into a hole.
   **Cross-plane invariant:** `buzz#84`'s relay-side provider-freshness window must never exceed
   this value, or a buyer pays for a job advertised as routable here after this connector has
   already given up on it. `buzz#84` is TypeScript and has no path to import a Rust `pub const`
-  (issue #722) — it reads `extra.sessionLeaseTtlMs` off the §1.4 greeting instead (see §1.4), the
+  (issue #722) — it reads `extensions.toon.info.sessionLeaseTtlMs` off the §1.4 greeting instead (see §1.4), the
   same value this constant enforces, rather than duplicating a guess.
 
 No production caller decides when to push a job to a client session yet — that is the next
@@ -1315,14 +1162,18 @@ every live session, not only by tests.
 
 ### 1.10 Owner-authenticated claim state: `POST /ilp/claim-state` (issue #693)
 
-A bulk, read-only answer to "what is the off-chain claim state of every channel I control?" —
-deposit total, cumulative claimed, available balance, nonce and last-claim time, for as many
-channels as one request names, each independently authenticated by a signature over that
-channel alone. Exists because the off-chain claim watermark is known only to a channel's own
-counterparty and to this connector's claim gate: an on-chain read gives deposit and channel
-existence for free, but not the watermark, and an agent whose channel has run dry cannot afford
-a paid write to report its own state (a management surface polling many agents' runway needs
-this to work precisely when an agent is broke, dead or offline).
+A bulk, read-only answer to "where does every channel I pay on stand?" — the amount watermark, the
+ceiling the next voucher is admitted against, and the last-claim time, for as many channels as one
+request names, each independently authenticated by a signature over that channel alone. It exists
+because the off-chain watermark is known only to the payer and to this connector's claim gate: a
+voucher has no nonce, so this is the only way a client that lost its channel store learns the
+amount its next voucher must strictly exceed — the chain's `totalClaimed` (EVM) or `settled`
+(Solana) is only a floor, trailing the watermark until the connector lands its latest voucher — and
+an agent whose channel has run dry cannot afford a paid write to report its own state.
+
+Since issue #1384 ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+decision 8) every entry asks about an x402 `batch-settlement` channel this connector receives
+vouchers on, and names `scheme: "batch-settlement"`.
 
 **Request.**
 
@@ -1330,130 +1181,6 @@ this to work precisely when an agent is broke, dead or offline).
 POST /ilp/claim-state
 Content-Type: application/json
 
-{
-  "channels": [
-    {
-      "blockchain": "evm",
-      "channelId": "0x<64-char hex>",
-      "expires": 1735689600,
-      "signature": "0x<65-byte r||s||v hex>"
-    },
-    {
-      "blockchain": "solana",
-      "channelAccount": "<base58>",
-      "expires": 1735689600,
-      "signature": "<base64 64-byte Ed25519>"
-    }
-  ]
-}
-```
-
-Every entry is independent: a request MAY mix EVM and Solana channels, and a request naming
-channels controlled by different keys is answered exactly as one naming channels controlled by
-one key would be — nothing about this endpoint requires the caller to be a single identity, only
-that it can produce a valid signature per channel it asks about.
-
-**Auth: a signature per channel, not a signature over the request.** Each entry's `signature` is
-that channel's counterparty key (the same key that signs a real claim, §1.3 step 4's "the
-counterparty this connector has recorded for the channel") signing a **claim-state challenge** —
-a message distinct from a real claim's balance-proof signature, so a captured challenge can never
-be replayed as a payment or vice versa:
-
-- **evm** — EIP-712, same domain as a real claim (`EIP712Domain(name: "TokenNetwork", version:
-"1", chainId, verifyingContract)`, read from the channel's own recorded domain, never from the
-  request), a distinct typed struct:
-  ```text
-  ClaimStateChallenge(bytes32 channelId,uint256 expires)
-  ```
-- **solana** — Ed25519 over a tagged message distinct in both content and length from a real
-  claim's 96-byte balance-proof message (48 bytes before ADR 0053 bound the program id into it,
-  issue #1082; the challenge tag was chosen to be neither the same length as nor a prefix or suffix
-  of either layout):
-  ```text
-  message = "toon-claim-state-challenge-v1" || channelAccount(32 bytes) || expires(u64 LE)
-  ```
-
-`expires` (unix seconds) is required and is the whole of this endpoint's replay bound: a
-signature verifies for any `now <= expires`, reusably — this is a read that changes no state and
-advances no watermark, so there is nothing for a nonce to protect. A caller reissues a fresh
-`expires` (and therefore a fresh signature) whenever it wants a signature that outlives one it no
-longer wants trusted.
-
-**Response.** `200`, one result per requested channel, same order as the request:
-
-```json
-{
-  "channels": [
-    {
-      "blockchain": "evm",
-      "channelId": "0x...",
-      "ok": true,
-      "depositTotal": "1000000",
-      "cumulativeClaimed": "250000",
-      "available": "750000",
-      "nonce": 3,
-      "lastClaimTime": 1735680000
-    },
-    {
-      "blockchain": "solana",
-      "channelAccount": "...",
-      "ok": false,
-      "error": "unverified"
-    }
-  ]
-}
-```
-
-Money fields are decimal strings (matching §1.3's `transferredAmount` convention), never a bare
-JSON number — a value a JS `Number` cannot represent exactly past 2^53 is a real amount this
-endpoint reports, not a hypothetical one.
-
-- `depositTotal` — the channel's on-chain deposit, or `null` for a channel this connector only
-  has _declared_ (`[[client_channels]]`) — declaring a channel names a counterparty and never an
-  amount (§1.3's collateral-binding exemption applies here identically), so no figure exists to
-  report. A resolved (chain-backed) channel always reports a number.
-- `cumulativeClaimed` — the channel's watermark, `"0"` if this connector has never accepted a
-  claim on it.
-- `available` — `depositTotal - cumulativeClaimed`: the same headroom §1.3 step 5's collateral
-  binding admits an inbound claim against. `null` exactly when `depositTotal` is. _Until issue
-  #1381 this was `depositTotal - cumulativeClaimed + credited` (issue #700's payout netting), which
-  [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 7
-  retired: a payout rides a channel of its own and nets against nothing._
-- `nonce` — the watermark's nonce, `0` if none yet.
-- `lastClaimTime` — unix seconds this connector last accepted a claim on this channel (over
-  **any** carrier — `POST /ilp`, `POST /ilp/probe`, or the BTP session), or `null` if it never
-  has. **Best-effort and non-durable**, unlike every other field above: a connector restart resets
-  it to `null` until the next accepted claim, deliberately — recording it durably would mean
-  stamping a wall-clock read into the claim admission path's write-lock or group-commit journal
-  (issues #686/#690), which this endpoint's own acceptance criteria forbids adding to. A consumer
-  MUST treat a `null` here as "unknown", never as "never claimed" — the deposit/cumulative/
-  available/nonce figures beside it remain exact across a restart regardless, since those still
-  come from the durable watermark.
-
-**One book answers** (amended by
-[ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md), issue #1380).
-Every channel this endpoint reports is judged by this edge's own claim gate, and is reported from it.
-A peer's vouchers are judged there too, against the channel's one watermark whichever role they
-arrive under (`peer-carriage-spec.md` §1.8), so a `[[pay_channels]]` payer restoring its outbound
-watermark from here is told exactly where its channel stands.
-
-> _Superseded by #1380 — which book answered (issue #1102)._ A connector kept two inbound books —
-> this edge's own, and the peer semantics's `ClaimBook`, which judged a `toon-channel` claim on a
-> `[[peer_channels]]` channel — and a channel held as a `[[peer_channels]]` row MUST be reported
-> from the peer book, since a `[[pay_channels]]` payer held that one channel with its next hop in
-> both roles at once and, answered out of the wrong book, re-signed one cumulative amount at a fresh
-> nonce forever. No peering pays on a `toon-channel` now, `ClaimBook` advances no peer's watermark,
-> and the two-book answer is gone.
-
-**An x402 `batch-settlement` channel (issue #1364).** An entry MAY carry `scheme`, spelled as a
-claim's own discriminator (§1.3, ADR 0074 decision 4): absent or `"toon-channel"` asks about a
-`TokenNetwork` or TOON-program channel, exactly as above; `"batch-settlement"` asks about a channel
-this connector receives **vouchers** on. A voucher has no nonce, so this is the only way a client
-that lost its channel store learns the amount its next voucher must strictly exceed — the chain's
-`totalClaimed` (EVM) or `settled` (Solana) is only a floor, trailing the watermark until the
-connector lands its latest voucher.
-
-```json
 {
   "channels": [
     {
@@ -1483,79 +1210,123 @@ connector lands its latest voucher.
 }
 ```
 
-- **Who signs.** The channel's voucher signer, taken from the chain and never from the request: on
-  EVM the verified `ChannelConfig`'s `payerAuthorizer` (else `payer`), on Solana the channel
-  account's `authorized_signer`.
-- **What is signed**, kept apart from the key's vouchers:
-  - **evm** — EIP-712 `ClaimStateChallenge(bytes32 channelId,uint256 expires)`, the struct above,
-    under **`x402BatchSettlement`'s** domain (`("x402 Batch Settlement", "1", chainId,
-0x4020074e…0003)`, this connector's, never the request's). A different typehash from `Voucher`
-    and a different domain from `TokenNetwork`'s, so it is neither a voucher nor a `toon-channel`
-    challenge.
-  - **solana** — Ed25519 over
-    `"toon-voucher-claim-state-challenge-v1" || channelAccount(32 bytes) || expires(u64 LE)`.
-- **`channelConfig` (EVM, optional).** The contract stores a channel by id alone, so the connector
-  finds one by its config: its own journaled record for every channel it has accepted a voucher
-  on, else this field, in a voucher's own spelling. Either must hash to `channelId`. A client
-  that lost its store therefore needs only the channel id and its signing key for any channel it
-  has paid on; for one it has not, it presents the config it opened the channel with.
+Every entry is independent: a request MAY mix EVM and Solana channels, and a request naming
+channels controlled by different keys is answered exactly as one naming channels controlled by
+one key would be — nothing about this endpoint requires the caller to be a single identity, only
+that it can produce a valid signature per channel it asks about.
 
-A verified voucher channel is answered in its own shape, with no `nonce`:
+**`scheme` is required.** An entry with no `scheme`, or with `scheme: "toon-channel"`, asks about a
+retired `toon-channel` channel and is answered `"toon-channel-refused"` by name, with nothing looked
+up for it (issue #1384); any other `scheme` is `"unverified"`. Until #1384 an absent `scheme` asked
+about a `TokenNetwork` or TOON-program channel, proved over the same struct under that channel's
+`TokenNetwork` domain or the `"toon-claim-state-challenge-v1"` Solana message, and answered with a
+`nonce` and a `depositTotal`; all of that is deleted with the scheme.
+
+**Auth: a signature per channel, not a signature over the request.** Each entry's `signature` is
+by the channel's **voucher signer**, taken from the chain and never from the request — on EVM the
+verified `ChannelConfig`'s `payerAuthorizer`, on Solana the channel account's `authorized_signer`
+— over a **claim-state challenge**, kept apart from that key's vouchers so a captured challenge can
+never be replayed as a payment or vice versa:
+
+- **evm** — EIP-712 `ClaimStateChallenge(bytes32 channelId,uint256 expires)` under
+  **`x402BatchSettlement`'s** domain (`("x402 Batch Settlement", "1", chainId, 0x4020074e…0003)`,
+  this connector's, never the request's): a different typehash from `Voucher`.
+- **solana** — Ed25519 over
+  `"toon-voucher-claim-state-challenge-v1" || channelAccount(32 bytes) || expires(u64 LE)`.
+
+`vectors/wire-vectors.json`'s `voucher_claim_state_challenge` pins both. The same message proves
+the peer role for a packet that moves no value (`peer-carriage-spec.md` §1.4) and declares a
+client's channel at BTP auth (§1.9 step 1).
+
+**`channelConfig` (EVM, optional).** The contract stores a channel by id alone, so the connector
+finds one by its config: its own journaled record for every channel it has accepted a voucher on,
+else this field, in a voucher's own spelling. Either must hash to `channelId`. A client that lost
+its store therefore needs only the channel id and its signing key for any channel it has paid on;
+for one it has not, it presents the config it opened the channel with.
+
+`expires` (unix seconds) is required and is the whole of this endpoint's replay bound: a signature
+verifies for any `now < expires`, reusably — this is a read that changes no state and advances no
+watermark. A caller reissues a fresh `expires` (and therefore a fresh signature) whenever it wants
+a signature that outlives one it no longer wants trusted.
+
+**Response.** `200`, one result per requested channel, same order as the request:
 
 ```json
 {
-  "blockchain": "evm",
-  "channelId": "0x...",
-  "ok": true,
-  "scheme": "batch-settlement",
-  "cumulativeClaimed": "250000",
-  "maxCumulative": "1000000",
-  "available": "750000",
-  "lastClaimTime": 1735680000
+  "channels": [
+    {
+      "blockchain": "evm",
+      "channelId": "0x...",
+      "ok": true,
+      "scheme": "batch-settlement",
+      "cumulativeClaimed": "250000",
+      "maxCumulative": "1000000",
+      "available": "750000",
+      "lastClaimTime": 1735680000
+    },
+    {
+      "blockchain": "solana",
+      "channelId": "...",
+      "ok": false,
+      "error": "unverified"
+    }
+  ]
 }
 ```
 
+Money fields are decimal strings, never a bare JSON number — a value a JS `Number` cannot represent
+exactly past 2^53 is a real amount this endpoint reports, not a hypothetical one.
+
 - `cumulativeClaimed` — the amount watermark: the highest cumulative amount the connector has
   accepted a voucher for on this channel, `"0"` for none. The next voucher must strictly exceed it
-  (ADR 0074 decision 3). It is this edge's book's, which judges a peer's vouchers too: since
-  [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 5
-  a voucher proves the peer role on a channel whose voucher signer is bound to a peering, it is
+  (§1.3 step 2). It is this edge's book's, which judges a peer's vouchers too: since
+  [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 5 a
+  voucher proves the peer role on a channel whose voucher signer is bound to a peering, it is
   judged against the channel's one watermark whichever role it arrives under, and decision 6 makes
   this endpoint the watermark a paying peer restores from, so a peer-bound channel is answered
-  exactly as a client's is and never below where the channel stands. _Before #1377 this read "a
-  voucher is never a peer claim, so only this edge's book is consulted" (ADR 0074 decision 1,
-  superseded there by ADR 0075); from #1377 to #1380 it was the higher of this edge's book and the
-  peer book, which #1380 retired._
+  exactly as a client's is and never below where the channel stands.
 - `maxCumulative` — the highest cumulative amount a voucher may name and be accepted, as §1.3 step
   5 reads it now: the amount landed on chain plus what still backs a voucher above it, which is
   `balance − pendingWithdrawal` on EVM and `deposit` on an Open Solana channel (ADR 0074 decision 5).
   It **can fall** on EVM, when the payer initiates a withdrawal.
 - `available` — `maxCumulative − cumulativeClaimed`, at least `"0"`: what the next voucher may add.
-- `lastClaimTime` — as above.
+  A payout this connector owes the client rides a channel of its own and nets against nothing
+  (ADR 0075 decision 7, retiring issue #700's netting).
+- `lastClaimTime` — unix seconds this connector last accepted a voucher on this channel (over
+  **any** carrier — `POST /ilp`, `POST /ilp/probe`, or the BTP session), or `null` if it never
+  has. **Best-effort and non-durable**, unlike every other field above: a connector restart resets
+  it to `null` until the next accepted voucher, deliberately — recording it durably would mean
+  stamping a wall-clock read into the claim admission path's write-lock or group-commit journal
+  (issues #686/#690). A consumer MUST treat a `null` here as "unknown", never as "never claimed" —
+  the figures beside it remain exact across a restart regardless, since those come from the
+  durable watermark.
 
-Every refusal is the same `"unverified"` as above: a node that has not opted in to the chain's
-vouchers, a channel with no record and no `channelConfig`, a config that hashes to another
-channel, a channel that is not admitted or no longer accepts vouchers, or a signature by any other
-key.
+**One book answers** (amended by
+[ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md), issue #1380).
+Every channel this endpoint reports is judged by this edge's own claim gate, and is reported from
+it, so a `[[pay_channels]]` payer restoring its outbound watermark from here is told exactly where
+its channel stands. (Until #1380 a `toon-channel` channel held as a `[[peer_channels]]` row was
+reported from the peer semantics's `ClaimBook`, issue #1102; no peering pays on one now.)
 
 **What a failed entry reveals.** `ok: false` carries only `error`, one of:
 
 - `"expired"` — `expires` is not in the future. A fact about the request, safe to report exactly.
-- `"unverified"` — everything else: the channel does not exist, the signature does not verify, or
-  this connector's resolution of the channel from chain failed. These are deliberately collapsed
-  into one reason, unlike §1.3's claim-refusal taxonomy (which _does_ distinguish "no such
-  channel" from "bad signature" for a paying sender's benefit) — this endpoint's own acceptance
-  criteria requires that a caller learn nothing about a channel it does not control, and "channel
-  exists but your signature is wrong" already discloses existence. A caller cannot distinguish a
-  channel that has never existed from one it simply guessed the wrong key for.
+- `"toon-channel-refused"` — the entry names no `scheme`, or `"toon-channel"` (issue #1384). A fact
+  about the request too: nothing about any channel was looked up.
+- `"unverified"` — everything else: a chain this connector does not settle vouchers on, a channel
+  with no record and no `channelConfig`, a config that hashes to another channel, a channel that is
+  not admitted or no longer accepts vouchers, a resolution from chain that failed, or a signature
+  by any other key. These are deliberately collapsed into one reason, unlike §1.3's claim-refusal
+  taxonomy (which _does_ distinguish "no such channel" from "bad signature" for a paying sender's
+  benefit) — a caller learns nothing about a channel it does not control, and "channel exists but
+  your signature is wrong" already discloses existence.
 
-**Not on the admission path.** This endpoint only reads: the watermark, the channel registry
-(counterparty, deposit floor, EIP-712 domain) and the best-effort last-claim-time index above. A
-channel lookup this connector has not already resolved goes through the same budgeted resolution
-§1.3's "a lookup that resolves nothing must be bounded too" already governs for a claim, so a
-flood of fabricated channel ids against this endpoint costs no more than the same flood would
-against `POST /ilp`. Nothing here calls into claim ingestion, and no per-packet work was added to
-`handle_prepare` to build it.
+**Not on the admission path.** This endpoint only reads: the watermark, the journaled channel
+records and the best-effort last-claim-time index above. A channel lookup this connector has no
+record of goes through the same metered resolution §1.3's "a lookup that resolves nothing must be
+bounded" governs for a voucher, so a flood of fabricated channel ids against this endpoint costs no
+more than the same flood would against `POST /ilp`. Nothing here calls into claim ingestion, and no
+per-packet work was added to `handle_prepare` to build it.
 
 ### 1.11 Sponsoring a Solana batch-settlement open: `POST /ilp/batch-settlement/solana/open` (issue #1346)
 
@@ -1756,7 +1527,7 @@ previously pointed at is gone** (issue #1073): ADR 0013's parallel fleet was swi
 ## 4. Consistency
 
 This specification uses exactly the vocabulary of `CONTEXT.md` (connector, app, handler, packet,
-route, route termination, client edge, payment channel, claim, nonce, watermark, fee, price,
+route, route termination, client edge, payment channel, claim, voucher, watermark, fee, price,
 probe) and implements [ADR 0001](../adr/0001-rust-workspace-library-first.md) and
 [ADR 0003](../adr/0003-clean-room-peer-wire-versioned-client-edge.md). It does not use
 "terminator", "BLS"/"Business Logic Server", or "agent runtime" (all deprecated); it uses "app"

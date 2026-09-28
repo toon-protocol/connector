@@ -20,9 +20,11 @@ practitioner means; read `CONTEXT.md` to understand what a line of this
 repository means.
 
 - **"Ledger" and "transfer" have no referent here.** There is no ledger and no
-  transfer object. The money primitives are **payment channel**, **claim**,
-  **nonce** and **watermark**
-  ([ADR 0005](../../adr/0005-claims-are-truth-balances-are-a-projection.md)).
+  transfer object. The money primitives are **payment channel**, **claim** (always a
+  **voucher**) and **watermark**
+  ([ADR 0005](../../adr/0005-claims-are-truth-balances-are-a-projection.md), as
+  [ADR 0075](../../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
+  amends it; **nonce** is retired with the `toon-channel` claim, issue #1384).
   `TRANSFER` survives only as a BTP frame type at carriage, never as a ledger
   concept.
 - **"Receiver" is not a role.** The triad becomes **connector**, **app** and

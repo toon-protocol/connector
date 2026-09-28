@@ -149,6 +149,18 @@ price = {PRICE}
         1,
         "the write reached the app"
     );
+    // ADR 0040, over the voucher path (issue #1384 moved this from the
+    // retired toon-channel paid-write test): the app is told which channel
+    // paid for each write, how much, and on what chain -- the channel the
+    // voucher was verified against, not anything the sender wrote.
+    for write in recorded.lock().unwrap().iter() {
+        assert_eq!(write.header("x-toon-payer"), Some(key.as_str()));
+        assert_eq!(
+            write.header("x-toon-amount"),
+            Some(PRICE.to_string().as_str())
+        );
+        assert_eq!(write.header("x-toon-chain"), Some("solana"));
+    }
 
     let entries = FileJournal::open(state_dir.path().join(CLIENT_EDGE_JOURNAL))
         .expect("the client-edge journal")

@@ -405,7 +405,7 @@ async fn a_production_signed_claim_redeems_on_the_deployed_token_network_and_a_w
     let claim = wire_round_trip(&channel.0, &proof, signature);
     assert!(
         verify_evm_balance_proof(&proof, &claim.signature, &payer_address),
-        "the signature check a toon-channel claim is held to must accept this claim"
+        "the retired toon-channel balance-proof check (kept for SettlementBackend until #1385) must accept this claim"
     );
 
     let provider = Provider::<Http>::try_from(rpc.as_str()).expect("provider");

@@ -351,7 +351,7 @@ price = {PRICE}
     )
     .expect("a new voucher on a channel admission now refuses is refused");
     assert!(
-        refused.message.contains("no record of"),
+        refused.message.contains("does not admit"),
         "refused as a channel this node does not admit: {refused:?}"
     );
 

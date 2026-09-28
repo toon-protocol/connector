@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use connector_client_edge::{
     journaled_batch_channels, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
-    BatchSettlementChannels, ChannelResolutionError, ClaimIngestRejection, ClientChannelRegistry,
-    ClientClaimGate, JournaledBatchChannel, UnresolvableLookupBudgetPolicy,
+    BatchSettlementChannels, ChannelResolutionError, ClaimIngestRejection, ClientClaimGate,
+    JournaledBatchChannel, UnresolvableLookupBudgetPolicy,
 };
 use connector_domain::{JournalEntry, Watermark, VOUCHER_WATERMARK_NONCE};
 use connector_runtime::{FileJournal, InMemoryJournal, Journal};
@@ -214,7 +214,7 @@ impl BatchSettlementChannels for FakeBatchSettlement {
 }
 
 fn gate_over(journal: Arc<dyn Journal>, backend: &Arc<FakeBatchSettlement>) -> ClientClaimGate {
-    ClientClaimGate::restore(ClientChannelRegistry::new(), journal)
+    ClientClaimGate::restore(journal)
         .expect("the journal replays")
         .with_batch_settlement(Arc::clone(backend) as Arc<dyn BatchSettlementChannels>)
 }
@@ -231,11 +231,8 @@ fn gate_with(backend: &Arc<FakeBatchSettlement>) -> (ClientClaimGate, Arc<InMemo
 
 #[tokio::test]
 async fn a_node_that_has_not_opted_in_refuses_a_voucher_by_name() {
-    let gate = ClientClaimGate::restore(
-        ClientChannelRegistry::new(),
-        Arc::new(InMemoryJournal::new()),
-    )
-    .expect("an empty journal");
+    let gate =
+        ClientClaimGate::restore(Arc::new(InMemoryJournal::new())).expect("an empty journal");
     for voucher in [
         signed_evm_voucher(100),
         solana_voucher(100, &solana_signer(), 0),
@@ -247,7 +244,7 @@ async fn a_node_that_has_not_opted_in_refuses_a_voucher_by_name() {
     }
     assert!(ClaimIngestRejection::BatchSettlementNotAccepted
         .message()
-        .contains("batch-settlement"));
+        .contains("does not settle on"));
 }
 
 // -- EVM --
@@ -264,7 +261,6 @@ async fn a_genuine_evm_voucher_is_accepted_and_journaled_like_a_claim() {
     assert_eq!(
         gate.watermark(&channel_key()),
         Some(Watermark {
-            nonce: VOUCHER_WATERMARK_NONCE,
             cumulative_amount: 100
         })
     );
@@ -534,7 +530,6 @@ async fn a_genuine_solana_voucher_is_accepted_and_a_strangers_refused() {
     assert_eq!(
         gate.watermark(&key),
         Some(Watermark {
-            nonce: VOUCHER_WATERMARK_NONCE,
             cumulative_amount: 100
         })
     );
@@ -626,45 +621,6 @@ async fn after_a_restart_a_voucher_without_its_config_is_still_admitted() {
     );
 }
 
-/// The gate's periodic sweep resets the watermark of a `toon-channel`
-/// channel its registry no longer finds (issue #977). A batch-settlement
-/// channel is not the registry's to find: it lives in another contract, so
-/// the registry never has it, and a sweep that judged it would reset its
-/// watermark and make every voucher already spent on it good again.
-#[tokio::test]
-async fn a_sweep_never_resets_a_voucher_channels_watermark() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("client-claims.journal");
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
-    let solana_key = format!("solana:{}", bs58::encode(SOLANA_CHANNEL).into_string());
-    {
-        let gate = gate_over(Arc::new(FileJournal::open(&path).expect("opens")), &backend);
-        gate.ingest(&signed_evm_voucher(100), 100)
-            .await
-            .expect("accepted");
-        gate.ingest(&solana_voucher(100, &solana_signer(), 0), 100)
-            .await
-            .expect("accepted");
-        gate.reap_unresolvable_channels().await;
-        assert!(gate.watermark(&channel_key()).is_some());
-        assert!(gate.watermark(&solana_key).is_some());
-    }
-
-    // And after a restart, when only the journal says which channels these
-    // are.
-    let gate = gate_over(
-        Arc::new(FileJournal::open(&path).expect("reopens")),
-        &backend,
-    );
-    gate.reap_unresolvable_channels().await;
-    assert_eq!(
-        gate.watermark(&channel_key()).map(|w| w.cumulative_amount),
-        Some(100),
-        "a voucher already spent stays spent"
-    );
-    assert!(gate.watermark(&solana_key).is_some());
-}
-
 /// Issue #613's bound, applied to vouchers: a lookup for a channel this gate
 /// has never accepted a voucher on costs a slot of the unresolvable-lookup
 /// budget unless it finds a channel, so naming fresh channel ids cannot make
@@ -673,16 +629,15 @@ async fn a_sweep_never_resets_a_voucher_channels_watermark() {
 #[tokio::test]
 async fn a_voucher_lookup_that_finds_nothing_is_metered() {
     // One lookup per hour, and no waiting for the next.
-    let registry =
-        ClientChannelRegistry::new().with_lookup_budget(UnresolvableLookupBudgetPolicy {
+    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
+        .expect("an empty journal")
+        .with_lookup_budget(UnresolvableLookupBudgetPolicy {
             per_signer: 1,
             total: 1,
             window: std::time::Duration::from_secs(3_600),
             max_wait: std::time::Duration::ZERO,
-        });
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
-    let gate = ClientClaimGate::restore(registry, Arc::new(InMemoryJournal::new()))
-        .expect("an empty journal")
+        })
         .with_batch_settlement(Arc::clone(&backend) as Arc<dyn BatchSettlementChannels>);
 
     // Real channels resolve, so they give their slot back: any number of
@@ -751,8 +706,8 @@ mod claim_state {
         Connector, FakeAppClient, InProcessPeerTransport, TestClock, VoucherSigner,
     };
     use connector_signer::{
-        evm_claim_state_challenge_digest, evm_voucher_claim_state_challenge_digest,
-        solana_voucher_claim_state_challenge_message, EvmClaimStateChallenge, LocalSigner,
+        evm_voucher_claim_state_challenge_digest, solana_voucher_claim_state_challenge_message,
+        LocalSigner,
     };
     use tower::ServiceExt;
 
@@ -963,35 +918,38 @@ mod claim_state {
         assert_eq!(entry["error"], "unverified");
     }
 
-    /// The `toon-channel` challenge -- no `scheme`, `TokenNetwork`'s struct
-    /// under whatever domain -- proves nothing about a voucher channel, even
-    /// signed by its voucher signer over x402's own address.
+    /// ADR 0075 decision 8 (issue #1384): `scheme` is required on a
+    /// claim-state entry too. An entry with none, or with `"toon-channel"`,
+    /// asks about a retired `toon-channel` channel and is answered
+    /// `toon-channel-refused` by name, on both chains, without the backend
+    /// ever being asked -- even for a channel the voucher signer really
+    /// controls.
     #[tokio::test]
-    async fn a_toon_channel_challenge_does_not_open_a_voucher_channel() {
+    async fn a_toon_channel_entry_is_refused_by_name_without_a_lookup() {
         let backend = Arc::new(FakeBatchSettlement::new(1_000));
-        let (gate, _journal) = gate_with(&backend);
-        gate.ingest(&signed_evm_voucher(100), 100)
-            .await
-            .expect("accepted");
-        let digest = evm_claim_state_challenge_digest(&EvmClaimStateChallenge {
-            channel_id: channel_id(),
-            expires: EXPIRES,
-            chain_id: CHAIN_ID,
-            token_network_address: domain().verifying_contract,
-        });
-        let signature = sign_digest(&authorizer(), &digest);
-
-        for scheme in [None, Some("batch-settlement")] {
-            let mut entry = evm_entry(signature.clone(), None);
-            match scheme {
-                Some(scheme) => entry["scheme"] = scheme.into(),
-                None => {
-                    entry.as_object_mut().unwrap().remove("scheme");
+        let signature = evm_challenge(&authorizer(), channel_id());
+        for scheme in [None, Some("toon-channel")] {
+            let mut evm = evm_entry(signature.clone(), Some(&config()));
+            let mut solana = solana_entry(&solana_signer());
+            for entry in [&mut evm, &mut solana] {
+                match scheme {
+                    Some(scheme) => entry["scheme"] = scheme.into(),
+                    None => {
+                        entry.as_object_mut().unwrap().remove("scheme");
+                    }
                 }
             }
-            let answer = claim_state(gate_with(&backend).0, entry.clone()).await;
-            assert_eq!(answer["error"], "unverified", "scheme {scheme:?}");
+            for entry in [evm, solana] {
+                let answer = claim_state(gate_with(&backend).0, entry).await;
+                assert_eq!(answer["ok"], false, "scheme {scheme:?}");
+                assert_eq!(answer["error"], "toon-channel-refused", "scheme {scheme:?}");
+            }
         }
+        assert_eq!(
+            backend.lookups(),
+            0,
+            "a refusal by name asks the chain nothing"
+        );
     }
 
     #[tokio::test]
@@ -1036,11 +994,8 @@ mod claim_state {
     /// channel, and says no more than that.
     #[tokio::test]
     async fn a_node_that_has_not_opted_in_answers_unverified() {
-        let gate = ClientClaimGate::restore(
-            ClientChannelRegistry::new(),
-            Arc::new(InMemoryJournal::new()),
-        )
-        .expect("an empty journal");
+        let gate =
+            ClientClaimGate::restore(Arc::new(InMemoryJournal::new())).expect("an empty journal");
 
         let entry = claim_state(
             gate,

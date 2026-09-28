@@ -303,7 +303,7 @@ nothing: `chown 10001:10001` it first, exactly like `signer.key` in step 1.
 
 Two things fail closed here rather than degrading quietly:
 
-- a config with `[[client_channels]]` but no `state_dir` **does not load**;
+- a config with a settlement table or a channel row but no `state_dir` **does not load**;
 - a `state_dir` the node cannot write, or a journal it cannot replay (a
   corrupt line), is an **exit 1 at startup**, naming the path.
 
