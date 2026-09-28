@@ -873,7 +873,7 @@ pub fn vet_channel_rent(
 }
 
 /// SIMD-0194's threshold, the one `payment-channels`' rent figure assumes.
-fn threshold_is_one(rent: &Rent) -> bool {
+pub(super) fn threshold_is_one(rent: &Rent) -> bool {
     rent.exemption_threshold == 1.0
 }
 
@@ -991,23 +991,10 @@ impl SolanaBatchSettlement {
     /// on mainnet-beta, devnet and a v3+ validator this costs no read at all
     /// after the first.
     async fn vet_cluster_rent(&self, channel: &Pubkey) -> Result<(), SponsorRefusal> {
-        let rent = match self.cluster_rent.get() {
-            Some(rent) => rent.clone(),
-            None => {
-                let sysvar = solana_sdk::sysvar::rent::id();
-                let account = retry_read(|| self.rpc.get_account(&sysvar))
-                    .await
-                    .map_err(|error| SponsorRefusal::ChainUnavailable(error.to_string()))?;
-                let rent: Rent = bincode::deserialize(&account.data).map_err(|error| {
-                    SponsorRefusal::ChainUnavailable(format!(
-                        "the Rent sysvar does not decode: {error}"
-                    ))
-                })?;
-                // A racing request may have set it first, to the same value.
-                let _ = self.cluster_rent.set(rent.clone());
-                rent
-            }
-        };
+        let rent = self
+            .cluster_rent()
+            .await
+            .map_err(SponsorRefusal::ChainUnavailable)?;
         if threshold_is_one(&rent) {
             return Ok(());
         }

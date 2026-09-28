@@ -115,7 +115,11 @@ connector-settlement-solana      real Solana backend, speaking packages/solana-p
   │                               settle_and_seal, that program's own wire, and the
   │                               sponsor that co-signs a client's `open` (sponsor.rs);
   │                               sweep.rs is its watcher, which rediscovers every
-  │                               sponsored channel and seals, distributes and reclaims it
+  │                               sponsored channel and seals, distributes and reclaims it;
+  │                               pay.rs is the paying half (ADR 0075): an `open` posted
+  │                               to the counterparty's sponsor endpoint, `top_up`,
+  │                               vouchers signed by the settlement key, `request_close`
+  │                               then `distribute`
   └─ fixtures/payment_channels.so  that program's mainnet-beta binary, which tier-3
      fixtures/p_token.so          tests load into genesis at its canonical id; and
                                   mainnet-beta's Token program (p-token), loaded at

@@ -256,22 +256,26 @@ impl SolanaBatchSettlement {
                 self.submit(&[wire::seal_instruction(&self.program_id, address)])
                     .await
             }
-            Step::Distribute => self.distribute(channel, treasury).await,
+            Step::Distribute => self.distribute(channel, &self.receiver(), treasury).await,
         }
     }
 
-    /// `distribute` a Sealed channel. Creates this node's receiving account
-    /// and the treasury's, idempotently, in the same transaction: an unusable
-    /// receiving account forfeits this node's share to the treasury, and a
-    /// missing treasury account refuses the whole instruction.
+    /// `distribute` a Sealed channel whose one distribution recipient is
+    /// `receiver`: this node's receiving account when the watcher pays out a
+    /// channel it received on, the counterparty's when this node's paying
+    /// half finishes a withdrawal. Creates the receiving account and the
+    /// treasury's, idempotently, in the same transaction: an unusable
+    /// receiving account forfeits the receiver's share to the treasury, and
+    /// a missing treasury account refuses the whole instruction.
     ///
     /// The treasury owner is not derivable from the program id, which is the
     /// same on every cluster, so each known one is tried in turn; a wrong one
     /// fails the preflight simulation and costs nothing. The one that works
     /// is remembered in `treasury`.
-    async fn distribute(
+    pub(super) async fn distribute(
         &self,
         channel: &SponsoredChannel,
+        receiver: &Pubkey,
         treasury: &Mutex<Option<Pubkey>>,
     ) -> Result<(), BatchSettlementError> {
         let account = &channel.account;
@@ -280,7 +284,7 @@ impl SolanaBatchSettlement {
             .map_err(backend_error)?;
         let token_program = mint.owner;
         let sponsor = self.sponsor.pubkey();
-        let recipients = wire::sole_recipient(&self.receiver());
+        let recipients = wire::sole_recipient(receiver);
         let known = *treasury.lock().expect("treasury lock poisoned");
         let candidates: Vec<Pubkey> = known
             .into_iter()
@@ -295,7 +299,7 @@ impl SolanaBatchSettlement {
             let instructions = [
                 spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                     &sponsor,
-                    &self.receiver(),
+                    receiver,
                     &account.mint,
                     &token_program,
                 ),

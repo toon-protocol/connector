@@ -1,8 +1,16 @@
-//! The Solana implementation of the receive-only batch-settlement port
-//! (ADR 0074 decisions 2, 5 and 9; issue #1343): x402 `batch-settlement`
-//! channels on solana-foundation's `payment-channels` program, which a
-//! client opens, this node's sponsor key co-signs, and this node only
-//! admits, reads and lands vouchers on.
+//! The Solana implementation of both halves of the batch-settlement port
+//! (ADR 0074 decisions 2, 5 and 9; ADR 0075 decisions 2 and 3; issues #1343
+//! and #1375): x402 `batch-settlement` channels on solana-foundation's
+//! `payment-channels` program.
+//!
+//! - **Receiving** ([`BatchSettlementBackend`]): a payer opens a channel
+//!   toward this node, this node's sponsor key co-signs it, and this node
+//!   admits, reads and lands vouchers on it.
+//! - **Paying** ([`BatchSettlementPayer`](connector_settlement::batch::BatchSettlementPayer),
+//!   the `pay` module): this node opens a channel toward a counterparty by
+//!   posting a payer-signed `open` to the counterparty's sponsor endpoint,
+//!   tops it up, signs vouchers on it and winds it down with
+//!   `request_close` and `distribute`.
 //!
 //! It shares nothing with [`SolanaSettlementBackend`](crate::SolanaSettlementBackend)
 //! but the crate: a different program, a different account, a different
@@ -21,6 +29,7 @@
 //! is written and hands it to the client edge's claim gate
 //! (`connector-cli`'s `batch_settlement` module).
 
+mod pay;
 pub mod sponsor;
 mod sweep;
 pub mod wire;
@@ -30,7 +39,7 @@ pub use sweep::{
     OPEN_SETTLE_INTERVAL,
 };
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -54,21 +63,28 @@ use crate::submit::{send_and_confirm, ConfirmPolicy};
 /// The chain this backend answers for, in the port's spelling.
 const CHAIN: &str = "solana";
 
-/// A [`BatchSettlementBackend`] over a real `payment-channels` deployment.
+/// Both halves of the batch-settlement port over a real `payment-channels`
+/// deployment: a [`BatchSettlementBackend`] for the channels this node
+/// receives on, and a [`BatchSettlementPayer`](connector_settlement::batch::BatchSettlementPayer)
+/// for the ones it pays on (the `pay` module).
 ///
-/// **One key, three seats.** The sponsor key is this node's
+/// **One key, three seats as receiver.** The sponsor key is this node's
 /// `[settlement.solana]` settlement key. An admitted channel must name it as
 /// `payee` and as `rent_payer` (ADR 0074 decision 5: the only configuration
 /// in which this node can always land its latest voucher), and its
 /// distribution must send everything to the **receiver** -- the owner of
 /// this node's receiving account, which is the same key, since the
 /// settlement table names no other. The receiver is what the greeting
-/// publishes as `payTo` (decision 8).
+/// publishes as `payTo` (decision 8). As payer, the same key is `payer` and
+/// `authorized_signer` of every channel this node opens (ADR 0075 decision
+/// 3).
 ///
-/// Holds no channel ledger. Every answer is read from the chain; the only
-/// local memory is which channels have been admitted or restored, because
-/// the port requires one of the two before [`channel_state`](BatchSettlementBackend::channel_state)
-/// and [`land`](BatchSettlementBackend::land).
+/// Holds no channel ledger on the receiving side. Every answer is read from
+/// the chain; the only local memory is which channels have been admitted or
+/// restored, because the port requires one of the two before
+/// [`channel_state`](BatchSettlementBackend::channel_state) and
+/// [`land`](BatchSettlementBackend::land). The paying side remembers what it
+/// opened and signed, for the process lifetime.
 pub struct SolanaBatchSettlement {
     rpc: RpcClient,
     confirm: ConfirmPolicy,
@@ -82,8 +98,17 @@ pub struct SolanaBatchSettlement {
     min_sponsored_deposit: u64,
     admitted: Mutex<HashSet<Pubkey>>,
     /// The cluster's Rent sysvar, read on the first sponsored `open`
-    /// ([`sponsor`]'s rent check, issue #1356).
+    /// ([`sponsor`]'s rent check, issue #1356) or the first `open` this node
+    /// pays for.
     cluster_rent: OnceLock<solana_sdk::rent::Rent>,
+    /// The channels this node opened as payer, and what it has signed on
+    /// each: the paying half's memory, for the process lifetime (ADR 0075
+    /// decision 2).
+    outbound: Mutex<HashMap<Pubkey, pay::Outbound>>,
+    /// Posts a payer-signed `open` to a counterparty's sponsor endpoint. Not
+    /// the settlement `rpc_url`'s transport: the endpoint is a peer's, not
+    /// the chain's (ADR 0073 governs only the latter).
+    sponsor_http: reqwest::Client,
 }
 
 impl SolanaBatchSettlement {
@@ -135,6 +160,8 @@ impl SolanaBatchSettlement {
             min_sponsored_deposit,
             admitted: Mutex::new(HashSet::new()),
             cluster_rent: OnceLock::new(),
+            outbound: Mutex::new(HashMap::new()),
+            sponsor_http: pay::sponsor_http_client()?,
         })
     }
 
@@ -258,6 +285,24 @@ impl SolanaBatchSettlement {
         .await
         .map(|_signature| ())
         .map_err(backend_error)
+    }
+
+    /// The cluster's Rent sysvar, read once per process: a cluster's rent
+    /// does not change under a running node. `Err` names why it could not be
+    /// read.
+    async fn cluster_rent(&self) -> Result<solana_sdk::rent::Rent, String> {
+        if let Some(rent) = self.cluster_rent.get() {
+            return Ok(rent.clone());
+        }
+        let sysvar = solana_sdk::sysvar::rent::id();
+        let account = retry_read(|| self.rpc.get_account(&sysvar))
+            .await
+            .map_err(|error| error.to_string())?;
+        let rent: solana_sdk::rent::Rent = bincode::deserialize(&account.data)
+            .map_err(|error| format!("the Rent sysvar does not decode: {error}"))?;
+        // A racing request may have set it first, to the same value.
+        let _ = self.cluster_rent.set(rent.clone());
+        Ok(rent)
     }
 }
 

@@ -90,6 +90,9 @@ bincode = "1"
 # rather than against this crate's own idea of it.
 bs58 = "0.5"
 connector-operator = { path = "../connector-operator", features = ["test-util"] }
+# The batch-settlement port's contract suites, which the Solana paying half
+# runs here, behind this crate's real sponsor endpoint (issue #1375).
+connector-settlement = { path = "../connector-settlement", features = ["test-util"] }
 connector-settlement-evm = { path = "../connector-settlement-evm", features = ["test-util"] }
 connector-settlement-solana = { path = "../connector-settlement-solana", features = ["test-util"] }
 chrono = "0.4"
