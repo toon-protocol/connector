@@ -53,7 +53,7 @@ pub struct ReqwestPeerClient {
 impl ReqwestPeerClient {
     /// A client over `client`, so a caller that already tunes timeouts,
     /// pools or roots keeps them. The carriage's own deadlines
-    /// (`peerAnswerTimeoutMs`, `claimAckTimeoutMs` -- §6.3) are applied
+    /// (`peerAnswerTimeoutMs` -- §6.3) are applied
     /// above this, per peering relation, and are not this client's.
     ///
     /// No proxy: a node that configured none dials every endpoint direct,

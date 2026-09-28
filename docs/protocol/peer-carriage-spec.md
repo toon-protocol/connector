@@ -1341,8 +1341,8 @@ arrives there it MUST be ignored.
 
 > **Amended by ADR 0075 (issue #1380).** The absence rule and the per-PREPARE deadline below govern
 > a voucher exactly as they governed a claim. What does not carry over: the FLUSH rows of the
-> deadline table (no peering sends a FLUSH, §3), so `claim_ack_timeout_ms` still parses on a
-> `[[peers]]` row but no longer bounds anything; and the nonce rules of the retransmission bullets,
+> deadline table (no peering sends a FLUSH, §3), so `claim_ack_timeout_ms` is removed and refused
+> by name on a `[[peers]]` row (`PeerClaimAckTimeoutRemoved`); and the nonce rules of the retransmission bullets,
 > since a voucher has no nonce. A voucher's freshness is its amount alone (ADR 0074 decision 3): a
 > byte-identical resend at the watermark is `accepted` and advances nothing, a different voucher at
 > or below it is `amount_not_advancing`, and a payer whose voucher went unacknowledged or refused
@@ -1789,11 +1789,12 @@ Required surface:
 - `[peers].expose` — a set drawn from `{"btp", "http"}`; `[]` is legal and means dial-only (§2.1).
 - Per peer: `id`; optional `endpoint` (a URL whose scheme is `wss://` or `https://`, with host and
   port, SNI-capable — omitted means accept-only); the per-peering-relation
-  `fee` (`peer-semantics-pre-868.md` §4); and this document's `claim_ack_timeout_ms` and
-  `peer_answer_timeout_ms` (§6.3, default 30 000 each). `ceiling`/`flush_interval_ms` were also
-  required here before [ADR 0033](../adr/0033-the-exposure-machinery-is-retired-not-restated.md)
-  (issue #882); both are retired and now parsed only as removed-field traps
-  (`PeerCeilingRemoved`/`PeerFlushIntervalRemoved`, below).
+  `fee` (`peer-semantics-pre-868.md` §4); and this document's `peer_answer_timeout_ms` (§6.3,
+  default 30 000). `ceiling`/`flush_interval_ms` were also required here before
+  [ADR 0033](../adr/0033-the-exposure-machinery-is-retired-not-restated.md) (issue #882); both are
+  retired and now parsed only as removed-field traps (`PeerCeilingRemoved`/`PeerFlushIntervalRemoved`,
+  below). `claim_ack_timeout_ms` followed with the flush it bounded (ADR 0075, issue #1380) and is
+  refused by name the same way (`PeerClaimAckTimeoutRemoved`).
 - **`credential` is not a field of a peer**, and nothing takes its place.
   [ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md) (issue
   #1157) deleted the `{peerId, secret}` shared secret outright — not renamed, not demoted to a
@@ -1983,6 +1984,7 @@ Named load-time errors this specification requires (spelling #677's, identity ou
 | `InvalidForwardedClaimEnforcement`                                      | `forwarded_claim_enforcement` set to anything other than `"observe"` or `"enforce"` — here a typo meant as `"enforce"` falls through to the permissive default and carries forwards for free                                                                                                                                | ADR 0042              |
 | `PeerMaxPacketAmountZero`                                               | `max_packet_amount = 0` — a cap of zero refuses every packet the peering could carry, and there is no "disable the cap" spelling                                                                                                                                                                                            | ADR 0042              |
 | `PeerClaimEnforcementRemoved`                                           | `claim_enforcement` set at all — issue #883's canary knob is gone and the terminated rule enforces unconditionally, so `"observe"` names no mode and `"enforce"` names the only behaviour there is. The message also disambiguates the still-live `forwarded_claim_enforcement`, since the two spellings differ by one word | ADR 0042, #1077       |
+| `PeerClaimAckTimeoutRemoved`                                            | `claim_ack_timeout_ms` set at all — it bounded the flush, which ADR 0075 deleted; a voucher's verdict rides the answer `peer_answer_timeout_ms` already bounds                                                                                                                                                              | ADR 0075, #1380       |
 | removed-field errors                                                    | `peer_wire_addr`, `addr` in its old `SocketAddr` shape, or `ceiling`/`flush_interval_ms` (ADR 0033, issue #882) — a **hard, named** error pointing at the bring-up doc, never a silent ignore, because the devnet boxes run bind-mounted configs that lead the repo                                                         | ADR 0027, ADR 0033    |
 
 `AcceptOnlyPeerWithoutCeiling` and the `claim_ack_timeout_ms > flush_interval_ms` load-time warning

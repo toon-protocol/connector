@@ -127,9 +127,8 @@ const ZERO_BYTES32: &str = "0x00000000000000000000000000000000000000000000000000
 /// or under `solana_program_id` where it is Solana.
 ///
 /// Which arm renders is decided by `claim.signature`'s own discriminant,
-/// not by which parameter is `Some` -- mirroring `ClaimBook::record_fulfillment`
-/// (issue #742), which never produces a `ClaimSignature::Solana` without a
-/// `solana_signer` configured to have signed it. `solana_signer_public_key`
+/// not by which parameter is `Some` (issue #742): a `ClaimSignature::Solana`
+/// is only ever produced by a Solana signer. `solana_signer_public_key`
 /// or `solana_program_id` being `None` while `claim.signature` is
 /// `ClaimSignature::Solana` is therefore a caller bug (a transport driving a
 /// claim it has no identity, or no `[[peer_channels]]` program id, to
@@ -702,9 +701,8 @@ mod tests {
         assert_ne!(parsed.channel_id, CHANNEL_ACCOUNT.to_ascii_lowercase());
     }
 
-    /// Issue #742: the outbound half. `ClaimBook::record_fulfillment` can
-    /// now produce a `ClaimSignature::Solana` `WireClaim`; this is the
-    /// same round trip `an_emitted_claim_parses_back_through_the_client_edges_own_validator`
+    /// Issue #742: the outbound half, for a `ClaimSignature::Solana`
+    /// `WireClaim`; this is the same round trip `an_emitted_claim_parses_back_through_the_client_edges_own_validator`
     /// proves for EVM, over the Solana arm `encode` used to `unreachable!`
     /// on.
     fn wire_solana_claim() -> WireClaim {

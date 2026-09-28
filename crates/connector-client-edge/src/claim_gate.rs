@@ -40,11 +40,11 @@
 //! `connector_runtime::ClaimBook` does for the first two -- this is a
 //! second *state* around the same rules, not a second set of rules. The
 //! state is deliberately separate from `ClaimBook`: a client-edge claim's
-//! channel is never a peer channel, and (unlike `ClaimBook::accept_inbound`)
-//! a watermark advance here is gated behind a signature verification, on the
-//! `ClientClaimGate`'s own claim-native scheme (EIP-712 for EVM, Ed25519 for
-//! Solana -- `connector_signer::claim_signature`), not `ClaimBook`'s
-//! chain-agnostic internal digest.
+//! channel is never a peer channel, and a watermark advance here is gated
+//! behind a signature verification, on the `ClientClaimGate`'s own
+//! claim-native scheme (EIP-712 for EVM, Ed25519 for Solana --
+//! `connector_signer::claim_signature`). `ClaimBook` itself only replays its
+//! journal since ADR 0075 (issue #1380): a peer is paid in vouchers.
 //!
 //! **What "verified" means here** (issue #558): a claim's signature must
 //! recover to the counterparty this connector has recorded for the channel

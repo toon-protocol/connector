@@ -1611,7 +1611,6 @@ client_edge_url = "https://store.example/ilp"
             Some("wss://store.example/btp")
         );
         assert_eq!(peer.dial(), Some(PeerCarriage::Btp));
-        assert_eq!(peer.claim_ack_timeout_ms(), 30_000);
         assert_eq!(peer.peer_answer_timeout_ms(), 30_000);
         assert!(peer.can_originate());
 
@@ -3228,6 +3227,27 @@ counterparty = "{SOLANA_COUNTERPARTY_KEY}"
         );
         assert!(
             message.contains("ADR 0033") && message.contains(BRINGUP_DOC),
+            "got: {message}"
+        );
+    }
+
+    /// §11's removed-field row, `claim_ack_timeout_ms` (ADR 0075, issue
+    /// #1380): the flush it bounded is gone.
+    #[test]
+    fn rejects_a_peering_that_still_sets_claim_ack_timeout_ms() {
+        let result = load_peering(|text| {
+            text.replace(
+                "endpoint = \"wss://store.example:443/btp\"\n",
+                "endpoint = \"wss://store.example:443/btp\"\nclaim_ack_timeout_ms = 30000\n",
+            )
+        });
+
+        let message = expect_error(
+            result,
+            |error| matches!(error, ConfigError::PeerClaimAckTimeoutRemoved { id } if id == "store"),
+        );
+        assert!(
+            message.contains("ADR 0075") && message.contains("peer_answer_timeout_ms"),
             "got: {message}"
         );
     }

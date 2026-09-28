@@ -6,8 +6,8 @@ use url::Url;
 
 use crate::error::ConfigError;
 
-/// The default for `claim_ack_timeout_ms` and `peer_answer_timeout_ms`
-/// (`peer-carriage-spec.md` §6.3): thirty seconds each.
+/// The default for `peer_answer_timeout_ms` (`peer-carriage-spec.md`
+/// §6.3): thirty seconds.
 ///
 /// Public because a peering established at runtime (ADR 0058) has no
 /// `[[peers]]` row to read a timeout off and must land on the same number a
@@ -459,8 +459,12 @@ pub(crate) struct RawPeer {
     /// nothing left to flush on a timer.
     #[serde(default)]
     flush_interval_ms: Option<toml::Value>,
+    /// Removed with the flush it bounded (ADR 0075, issue #1380): a
+    /// peering's voucher is acknowledged on the answer to the packet it
+    /// covers, so no claim is sent that waits on an acknowledgement of its
+    /// own. Parsed as an opaque value only so it can be refused **by name**.
     #[serde(default)]
-    claim_ack_timeout_ms: Option<u64>,
+    claim_ack_timeout_ms: Option<toml::Value>,
     #[serde(default)]
     peer_answer_timeout_ms: Option<u64>,
     /// Removed with the B6 migration ramp it selected (ADR 0042 item 4,
@@ -506,7 +510,6 @@ pub struct PeerConfig {
     endpoint: Option<Url>,
     dial: Option<PeerCarriage>,
     can_originate: bool,
-    claim_ack_timeout_ms: u64,
     peer_answer_timeout_ms: u64,
     forwarded_claim_enforcement: ForwardedClaimEnforcement,
     max_packet_amount: u64,
@@ -544,12 +547,6 @@ impl PeerConfig {
     /// only ever flow the other way (§6.4(1)).
     pub fn can_originate(&self) -> bool {
         self.can_originate
-    }
-
-    /// How long a sent claim may go unacknowledged before it is
-    /// retransmitted (§6.3). Defaults to 30 000 ms.
-    pub fn claim_ack_timeout_ms(&self) -> u64 {
-        self.claim_ack_timeout_ms
     }
 
     /// How long a request to this peer may go unanswered (§6.3). Defaults
@@ -639,6 +636,9 @@ pub(crate) fn resolve_peers(
         if peer.flush_interval_ms.is_some() {
             return Err(ConfigError::PeerFlushIntervalRemoved { id: peer.id });
         }
+        if peer.claim_ack_timeout_ms.is_some() {
+            return Err(ConfigError::PeerClaimAckTimeoutRemoved { id: peer.id });
+        }
         // ADR 0042 item 4 (issue #1077): the B6 ramp is gone, so `"observe"`
         // no longer names a mode -- and `"enforce"` names the only behaviour
         // there is. Refused by name rather than ignored, because a config
@@ -727,7 +727,6 @@ pub(crate) fn resolve_peers(
             endpoint,
             dial,
             can_originate,
-            claim_ack_timeout_ms: peer.claim_ack_timeout_ms.unwrap_or(DEFAULT_PEER_TIMEOUT_MS),
             peer_answer_timeout_ms: peer
                 .peer_answer_timeout_ms
                 .unwrap_or(DEFAULT_PEER_TIMEOUT_MS),
@@ -774,7 +773,6 @@ mod tests {
             Some("wss://peer.example/btp")
         );
         assert!(peers[0].can_originate());
-        assert_eq!(peers[0].claim_ack_timeout_ms(), 30_000);
         assert_eq!(peers[0].peer_answer_timeout_ms(), 30_000);
     }
 
@@ -1040,6 +1038,20 @@ mod tests {
         assert!(matches!(
             resolve_peers(vec![entry], PeerExposure::Neither, false),
             Err(ConfigError::PeerFlushIntervalRemoved { ref id }) if id == "peer-b"
+        ));
+    }
+
+    /// ADR 0009: `claim_ack_timeout_ms` bounded the flush (§6.3), which
+    /// ADR 0075 deleted (issue #1380), so a row that still writes it is
+    /// refused by name rather than loading a number that bounds nothing.
+    #[test]
+    fn rejects_a_peering_that_still_sets_claim_ack_timeout_ms() {
+        let mut entry = raw("peer-b");
+        entry.claim_ack_timeout_ms = Some(toml::Value::Integer(30_000));
+
+        assert!(matches!(
+            resolve_peers(vec![entry], PeerExposure::Neither, false),
+            Err(ConfigError::PeerClaimAckTimeoutRemoved { ref id }) if id == "peer-b"
         ));
     }
 

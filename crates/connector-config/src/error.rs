@@ -608,6 +608,18 @@ pub enum ConfigError {
     )]
     PeerFlushIntervalRemoved { id: String },
 
+    /// `claim_ack_timeout_ms` (ADR 0075, issue #1380): it bounded how long a
+    /// flushed claim waited for its acknowledgement, and the flush is gone.
+    /// A peering's voucher rides the packet it covers, and its verdict rides
+    /// that packet's answer, bounded by `peer_answer_timeout_ms`.
+    #[error(
+        "peer '{id}' sets 'claim_ack_timeout_ms', which was removed with the flush it bounded \
+         (ADR 0075, issue #1380): a peering's voucher rides the packet it covers and is \
+         acknowledged on that packet's answer, which 'peer_answer_timeout_ms' already bounds. \
+         Delete the key rather than replace it"
+    )]
+    PeerClaimAckTimeoutRemoved { id: String },
+
     /// §11's removed-field row, `claim_enforcement` (ADR 0042 item 4, issue
     /// #1077): the issue #883 migration ramp is gone, so `"observe"` names
     /// no mode and `"enforce"` names the only behaviour there is. Refused by
