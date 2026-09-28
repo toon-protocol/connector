@@ -18,8 +18,8 @@ use connector_settlement::batch::contract::{
     assert_upholds_the_paying_contract, PayingContractFixture,
 };
 use connector_settlement::batch::{
-    BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer, ChannelPresentation,
-    EvmChannelConfig, EvmReceiverTerms, ReceiverTerms, VoucherSigner,
+    BatchChannelStatus, BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer,
+    ChannelPresentation, EvmChannelConfig, EvmReceiverTerms, ReceiverTerms, VoucherSigner,
 };
 use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
@@ -577,4 +577,228 @@ async fn an_opening_deposit_that_lands_behind_a_lost_confirmation_is_kept() {
         .sign_voucher(&channel, 1_000)
         .await
         .expect("the landed deposit backs a voucher");
+}
+
+/// Issue #1413: a node that crashes with `initiateWithdraw` still in the
+/// mempool, restarts, and re-reads the channel as not withdrawing yet. Its
+/// own send is then re-seeded behind the in-flight one on the same key
+/// (#1412), mines after it and reverts. That refusal must not surface as a
+/// `Backend` error for a withdrawal that did happen: the port's contract
+/// suite already says a second sequential `start_withdrawal` returns `Ok`
+/// with the state it finds, so a raced one must too.
+///
+/// Modelled the same way `an_open_sent_twice_at_once_deposits_once_for_both_token_routes`
+/// models #1371: two nodes on one settlement key, holding the same outbound
+/// record, call `start_withdrawal` at once. Raced several times so a pass is
+/// not one lucky interleaving.
+#[tokio::test]
+async fn concurrent_start_withdrawal_ends_with_one_withdrawal_pending() {
+    if !require_anvil() {
+        return;
+    }
+    const RACES: usize = 5;
+    let peering = Peering::spawn(Token::FiatToken).await;
+    for race in 0..RACES {
+        let record = peering
+            .payer
+            .prepare_open(peering.terms(), 1_000)
+            .await
+            .expect("prepare");
+        peering
+            .payer
+            .open_prepared(&record)
+            .await
+            .expect("open the channel two nodes will race a withdrawal on");
+        let channel = record.channel().clone();
+
+        // Two nodes on the payer's settlement key, each restored onto the
+        // same on-chain channel as a restarted process restores it.
+        let first = peering.node(DEPLOYER_PRIVATE_KEY).await;
+        first
+            .restore_outbound(&record, 0)
+            .await
+            .expect("restore onto the first node");
+        let second = peering.node(DEPLOYER_PRIVATE_KEY).await;
+        second
+            .restore_outbound(&record, 0)
+            .await
+            .expect("restore onto the second node");
+
+        let (first_result, second_result) = tokio::join!(
+            first.start_withdrawal(&channel),
+            second.start_withdrawal(&channel)
+        );
+        let first_state =
+            first_result.unwrap_or_else(|error| panic!("race {race}: first: {error:?}"));
+        let second_state =
+            second_result.unwrap_or_else(|error| panic!("race {race}: second: {error:?}"));
+        assert_eq!(
+            first_state.on_chain.status,
+            BatchChannelStatus::Withdrawing,
+            "race {race}"
+        );
+        assert_eq!(
+            second_state.on_chain.status,
+            BatchChannelStatus::Withdrawing,
+            "race {race}"
+        );
+
+        let (amount, initiated_at) = peering.x402.pending_withdrawal(&channel).await;
+        assert_eq!(
+            amount, 1_000,
+            "race {race}: one withdrawal, for the whole deposit"
+        );
+        assert_ne!(
+            initiated_at, 0,
+            "race {race}: exactly one withdrawal is pending"
+        );
+    }
+}
+
+/// The same crash window as above, past the withdraw delay: the loser's
+/// `finalizeWithdraw` is re-seeded behind the winner's, mines after it and
+/// reverts against a channel with nothing left pending. The port's contract
+/// suite already says a second sequential `finish_withdrawal` there answers
+/// `NoWithdrawalPending`, and a raced one must answer the same way rather
+/// than a spurious `Backend` error -- while the payer is paid back exactly
+/// once.
+#[tokio::test]
+async fn concurrent_finish_withdrawal_pays_the_winner_once() {
+    if !require_anvil() {
+        return;
+    }
+    const RACES: usize = 5;
+    let peering = Peering::spawn(Token::FiatToken).await;
+    for race in 0..RACES {
+        let record = peering
+            .payer
+            .prepare_open(peering.terms(), 1_000)
+            .await
+            .expect("prepare");
+        peering
+            .payer
+            .open_prepared(&record)
+            .await
+            .expect("open the channel two nodes will race a withdrawal on");
+        let channel = record.channel().clone();
+        peering
+            .payer
+            .start_withdrawal(&channel)
+            .await
+            .expect("start the withdrawal both nodes will race finishing");
+        peering.x402.advance_time(ONE_DAY).await;
+
+        let first = peering.node(DEPLOYER_PRIVATE_KEY).await;
+        first
+            .restore_outbound(&record, 0)
+            .await
+            .expect("restore onto the first node");
+        let second = peering.node(DEPLOYER_PRIVATE_KEY).await;
+        second
+            .restore_outbound(&record, 0)
+            .await
+            .expect("restore onto the second node");
+
+        let before = peering.payer_balance().await;
+        let (first_result, second_result) = tokio::join!(
+            first.finish_withdrawal(&channel),
+            second.finish_withdrawal(&channel)
+        );
+        let (winner, loser_error) = match (first_result, second_result) {
+            (Ok(state), Err(error)) => (state, error),
+            (Err(error), Ok(state)) => (state, error),
+            other => panic!("race {race}: expected exactly one winner, got {other:?}"),
+        };
+        assert_eq!(
+            loser_error,
+            BatchSettlementError::NoWithdrawalPending(channel.clone()),
+            "race {race}: the loser sees exactly what a second sequential call would"
+        );
+        assert_eq!(
+            winner.on_chain.status,
+            BatchChannelStatus::Open,
+            "race {race}"
+        );
+        assert_eq!(winner.on_chain.collateral, 0, "race {race}");
+        assert_eq!(
+            peering.payer_balance().await - before,
+            1_000,
+            "race {race}: the payer's balance rises exactly once, by balance - totalClaimed"
+        );
+    }
+}
+
+/// The re-read after a failed send is not a licence to swallow every
+/// failure: a refusal for the write's own reasons, with the chain never
+/// touched, must still surface as an error on both `start_withdrawal` and
+/// `finish_withdrawal`. Modelled on `send.rs`'s own fault injection
+/// (ADR 0007): a `FakeRpc` in front of a real anvil refuses every
+/// `eth_sendRawTransaction` outright, so nothing this node sends ever
+/// lands and the chain never reaches either write's target state.
+#[tokio::test]
+async fn a_send_refused_for_its_own_reasons_still_errors() {
+    if !require_anvil() {
+        return;
+    }
+    let peering = Peering::spawn(Token::FiatToken).await;
+    let record = peering
+        .payer
+        .prepare_open(peering.terms(), 1_000)
+        .await
+        .expect("prepare");
+    peering.payer.open_prepared(&record).await.expect("open");
+    let channel = record.channel().clone();
+
+    let refused = FakeRpc::spawn_in_front_of(&peering._anvil.rpc_url, |call| {
+        if call.method == "eth_sendRawTransaction" {
+            return RpcReply::Error {
+                code: -32000,
+                message: "execution reverted: refused for the test".to_string(),
+            };
+        }
+        RpcReply::Forward
+    })
+    .await;
+    let faulty = build_node(&refused.url(), DEPLOYER_PRIVATE_KEY, peering.token).await;
+    faulty
+        .restore_outbound(&record, 0)
+        .await
+        .expect("restore onto the faulty node");
+
+    let error = faulty
+        .start_withdrawal(&channel)
+        .await
+        .expect_err("a refusal that never touches the chain is not a race won");
+    assert!(
+        matches!(error, BatchSettlementError::Backend(_)),
+        "{error:?}"
+    );
+    assert_eq!(
+        peering.x402.pending_withdrawal(&channel).await,
+        (0, 0),
+        "nothing was ever initiated"
+    );
+
+    // A healthy node starts the withdrawal for real, so `finish_withdrawal`
+    // on the faulty node has a real pending withdrawal to fail finishing.
+    peering
+        .payer
+        .start_withdrawal(&channel)
+        .await
+        .expect("start for real, off the faulty endpoint");
+    peering.x402.advance_time(ONE_DAY).await;
+
+    let error = faulty
+        .finish_withdrawal(&channel)
+        .await
+        .expect_err("a refusal that never touches the chain is not a race won");
+    assert!(
+        matches!(error, BatchSettlementError::Backend(_)),
+        "{error:?}"
+    );
+    assert_ne!(
+        peering.x402.pending_withdrawal(&channel).await.1,
+        0,
+        "the withdrawal this node started is still pending -- the faulty send never landed"
+    );
 }

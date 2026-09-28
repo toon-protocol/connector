@@ -64,8 +64,9 @@
 
 use async_trait::async_trait;
 use connector_settlement::batch::{
-    BatchSettlementError, BatchSettlementPayer, EvmChannelConfig, OpenedChannel,
-    OutboundChannelRecord, OutboundChannelState, ReceiverTerms, Voucher, VoucherSigner,
+    BatchChannelStatus, BatchSettlementError, BatchSettlementPayer, EvmChannelConfig,
+    OpenedChannel, OutboundChannelRecord, OutboundChannelState, ReceiverTerms, Voucher,
+    VoucherSigner,
 };
 use connector_settlement::ChannelId;
 use connector_signer::{evm_voucher_claim_state_challenge_digest, evm_voucher_digest};
@@ -355,6 +356,30 @@ impl EvmBatchSettlementBackend {
             signed,
         };
         Ok((snapshot, state))
+    }
+
+    /// A `start_withdrawal` or `finish_withdrawal` send failed with `error`:
+    /// re-read `channel`, and if the chain now shows `target`, hand the
+    /// state to `on_target` rather than surfacing `error`. `target` is what
+    /// this same write's own success would have left behind, so a chain
+    /// already there means another node on this key made the same write
+    /// first -- this send lost the race, not a failure of its own (issue
+    /// #1413). Anything else -- an RPC error, or a state neither write's
+    /// success nor failure explains -- returns `error` unchanged.
+    async fn reinterpret_failed_send<T>(
+        &self,
+        channel: &ChannelId,
+        config: &EvmChannelConfig,
+        error: BatchSettlementError,
+        target: BatchChannelStatus,
+        on_target: impl FnOnce(OutboundChannelState) -> Result<T, BatchSettlementError>,
+    ) -> Result<T, BatchSettlementError> {
+        let state = self.read_outbound(channel, config).await?;
+        if state.on_chain.status == target {
+            on_target(state)
+        } else {
+            Err(error)
+        }
     }
 
     /// Send `transaction` from the settlement key and wait for it to land.
@@ -749,8 +774,23 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
                 )
                 .await;
             if let Err(error) = sent {
-                self.read_outbound(channel, &config).await?;
-                return Err(error);
+                // Another node on this key may have started the same
+                // withdrawal first: this send is then refused (a nonce
+                // conflict re-seeded behind it) or reverts (mined after it,
+                // against a channel already withdrawing), and the chain now
+                // shows one pending. That is exactly what a second
+                // sequential `start_withdrawal` answers, so a raced loser
+                // ends the same way rather than surfacing this send's own
+                // failure.
+                return self
+                    .reinterpret_failed_send(
+                        channel,
+                        &config,
+                        error,
+                        BatchChannelStatus::Withdrawing,
+                        Ok,
+                    )
+                    .await;
             }
         }
         self.read_outbound(channel, &config).await
@@ -778,8 +818,23 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
                 remaining_secs: due_at - now,
             });
         }
-        self.transact(self.contract.finalize_withdraw(chain_config(&config)).tx)
-            .await?;
+        if let Err(error) = self
+            .transact(self.contract.finalize_withdraw(chain_config(&config)).tx)
+            .await
+        {
+            // Another node on this key may have finalized the same
+            // withdrawal first: this send is then refused or reverts
+            // (mined after it, against a channel with nothing pending any
+            // more), and the chain now shows none pending. That is exactly
+            // what a second sequential `finish_withdrawal` answers, so a
+            // raced loser ends the same way rather than surfacing this
+            // send's own failure.
+            return self
+                .reinterpret_failed_send(channel, &config, error, BatchChannelStatus::Open, |_| {
+                    Err(BatchSettlementError::NoWithdrawalPending(channel.clone()))
+                })
+                .await;
+        }
         self.read_outbound(channel, &config).await
     }
 
