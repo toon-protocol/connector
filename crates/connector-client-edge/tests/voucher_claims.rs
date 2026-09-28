@@ -711,6 +711,11 @@ mod claim_state {
     };
     use tower::ServiceExt;
 
+    /// The committed cross-repo wire vectors (issue #1408): this module's
+    /// own `claim_state_toon_channel_refused` cases, replayed against the
+    /// real route below.
+    const WIRE_VECTORS: &str = include_str!("../../../vectors/wire-vectors.json");
+
     /// 2031-01-01, after the test clock's 2030 and any real one's today.
     const EXPIRES: u64 = 1_924_992_000;
 
@@ -949,6 +954,49 @@ mod claim_state {
             backend.lookups(),
             0,
             "a refusal by name asks the chain nothing"
+        );
+    }
+
+    /// Issue #1408: the committed `claim_state_toon_channel_refused`
+    /// vectors (`vectors/wire-vectors.json`) replayed through the real
+    /// `POST /ilp/claim-state` route, over a backend that admits nothing --
+    /// the point of this refusal is that it costs no lookup, so a case with
+    /// no admitted channel still answering it correctly is exactly the
+    /// proof. Each request entry is the vector's own, unmodified; the
+    /// answer must equal the vector's `response_entry_json`, including the
+    /// `channelId` field a Solana entry's answer carries its channel
+    /// account text under.
+    #[tokio::test]
+    async fn the_committed_claim_state_toon_channel_refused_vectors_match_the_real_endpoint() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(WIRE_VECTORS).expect("the committed vectors parse");
+        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let cases = vectors["claim_state_toon_channel_refused"]["cases"]
+            .as_array()
+            .expect("claim_state_toon_channel_refused.cases is an array");
+        assert!(
+            !cases.is_empty(),
+            "claim_state_toon_channel_refused has cases"
+        );
+        for case in cases {
+            let name = case["name"].as_str().expect("a name");
+            let request_entry: serde_json::Value =
+                serde_json::from_str(case["request_entry_json"].as_str().expect("request entry"))
+                    .expect("the vector's request entry is JSON");
+            let expected: serde_json::Value = serde_json::from_str(
+                case["response_entry_json"]
+                    .as_str()
+                    .expect("response entry"),
+            )
+            .expect("the vector's response entry is JSON");
+
+            let answer = claim_state(gate_with(&backend).0, request_entry).await;
+            assert_eq!(answer, expected, "{name}");
+        }
+        assert_eq!(
+            backend.lookups(),
+            0,
+            "a refusal by name asks the chain nothing, for any committed case"
         );
     }
 
