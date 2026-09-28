@@ -106,7 +106,7 @@ the one thing `cargo test` structurally cannot check: that the **image**, as uid
 `/app/state`, boots and moves a packet. `make local-verify` brings it up, sends a
 real packet, asserts the outcome and tears it down;
 `.github/workflows/local-topologies.yml` runs it on every push to `main` and on
-PRs touching the crates, the Dockerfile, the compose files, the contracts or
+PRs touching the crates, the Dockerfile, the compose files, the chain seeding (`infra/anvil`, `infra/solana`) or
 `local/` itself — the path filter is there because a docs-only change elsewhere
 cannot break it and the image build is the expensive part.
 
@@ -197,17 +197,18 @@ separate failure ("the connector refused to start" and "its settlement account h
 no ETH" look identical otherwise). Everything it writes lands in `local/.keys/`,
 which is gitignored.
 
-It has a second stage, `local/keys.sh <topology> solana-channels`, and `make
-local-up` calls it after the containers are serving. That ordering is forced: a
-Solana channel is created by an `InitializeChannel`, no chain CLI here can build
-one, and the only submitter is a running node's `POST /channels`. Opening it is
-therefore an operator write after boot, not something the config does at boot.
-Funding it is too, and for a stronger reason — the program's `Deposit` credits
-strictly by signer, so only the payer's own node can put the payer's collateral
-behind the payer's claims (`POST /channels/:id/fund`, a self-deposit on both
-chains since #1118). That endpoint takes an **increment**, unlike the EVM leg's
-absolute `setTotalDeposit`, so the stage reads the deposit back off the chain
-first and tops up the shortfall rather than depositing again.
+It has a second stage, `local/keys.sh <topology> channels`, and `make local-up`
+calls it after the containers are serving. That ordering is forced: every local
+channel is an x402 channel (ADR 0075), a peering is two of them, and each is
+opened by its own payer's node — nothing here opens one with a chain CLI. The
+stage sends each end of every peering a signed `POST /peers` naming the other's
+URL (the payee first, so the payer's first voucher already arrives on a bound
+channel), tops the payer's channel up with `POST /channels/:id/fund` (an
+**increment**, so it reads the collateral first and funds the shortfall), points
+the forwarding prefix at the peering with `POST /routes/peers`, and reads every
+channel back off the chain it lives on. The peering figures — each `fee`, cap
+and route `price` — live in that script's topology table, not in any committed
+config.
 
 In a container, `state_dir` must be a mounted volume: the image runs as uid 10001
 and creates `/app/state` owned by that uid precisely so a fresh named volume
@@ -228,13 +229,19 @@ Local and devnet fund completely differently. Do not carry an assumption from on
 to the other.
 
 **Local EVM (anvil).** Genesis funds 10 accounts with 10,000 ETH each; account 0
-(`0xf39F…2266`) is the deployer everything uses. `DeployLocal.s.sol` deploys a
-mintable `MockERC20` USDC at 6 decimals, plus `TokenNetworkRegistry`, `TokenNetwork`
-and `RollingSwapChannel`. USDC is **minted on demand** (`deploy_mock_token`,
-`MockERC20.mint`), never dripped. No faucet is involved.
+(`0xf39F…2266`) is the deployer everything uses. `infra/anvil/seed.sh` places x402's
+`x402BatchSettlement` and its collectors at their canonical addresses and deploys
+Circle's FiatToken v2.2 as USDC (6 decimals), with account 1 as its minter — plus
+the one `TokenNetworkRegistry` the connector still boots through until #1385, on
+which no channel is opened. USDC is **minted on demand** (`FiatToken.mint` from
+account 1 in `local/keys.sh`; `X402Chain::mint` in tests), never dripped. No
+faucet is involved.
 
-**Local Solana.** The validator entrypoint airdrops to the genesis-funded validator
-identity and uses it as the deploy fee payer, so no keypair is committed for it.
+**Local Solana.** The validator entrypoint loads solana-foundation's
+`payment-channels` at `CHNLx…` and mainnet's p-token from the pinned fixtures
+under `crates/connector-settlement-solana/fixtures/` (and TOON's own program only
+for the boot requirement, until #1385) into genesis, so no keypair is committed
+for any of them.
 `infra/solana/create-usdc-mint.sh` creates a deterministic mock USDC mint and seeds
 a treasury from `infra/solana/usdc-authority.json`. That script refuses any RPC URL
 containing "mainnet" — it mints unlimited supply of a mock token from a committed

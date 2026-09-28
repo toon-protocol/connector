@@ -51,12 +51,20 @@ price       = 1000
 
 [settlement.evm]
 rpc_url = "http://anvil:8545"
-# The TokenNetworkRegistry, NOT a token network: the connector resolves
-# getTokenNetwork(token_address) through it and refuses to start if that comes
-# back zero. Both are the deterministic output of DeployLocal.s.sol.
-contract_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-token_address    = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+# The local chain `infra/anvil/seed.sh` builds (ADR 0075 decision 13): Circle's
+# FiatToken v2.2 as USDC, and x402's `x402BatchSettlement` at its canonical
+# address. `contract_address` is the TokenNetworkRegistry the connector still
+# BOOTS through (it resolves getTokenNetwork(token_address) and refuses to
+# start if that is zero) until #1385; no channel is opened on it.
+contract_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+token_address    = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals         = 6
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
+
+# x402 batch-settlement, the only channel a payer can open toward this node
+# (ADR 0075): the FiatToken's own EIP-712 domain.
+[settlement.evm.batch_settlement]
+asset_eip712_name    = "USDC"
+asset_eip712_version = "2"

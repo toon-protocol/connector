@@ -725,25 +725,30 @@ cd "$REPO"
 docker compose --profile evm up -d --wait anvil
 ```
 
-That starts `anvil` on `127.0.0.1:8545` and deploys the settlement topology into
-it. `--wait anvil` is doing two jobs: it blocks until anvil reports **healthy**,
-which for this service means the deploy has actually landed rather than that the
+That starts `anvil` on `127.0.0.1:8545` and seeds it (`infra/anvil/seed.sh`):
+x402's `x402BatchSettlement` and its deposit collectors at their canonical
+addresses, Circle's FiatToken v2.2 as USDC, and the `TokenNetworkRegistry` the
+connector still boots through. `--wait anvil` is doing two jobs: it blocks
+until anvil reports **healthy**, which for this service means the seed has
+actually landed rather than that the
 process started — and naming the service keeps the `evm` profile's other member,
 a devnet `faucet` container irrelevant to this walkthrough, out of the way.
 
 Three addresses, deterministic on every fresh anvil, which is what lets them be
 written down here:
 
-| What                                        | Address                                      |
-| ------------------------------------------- | -------------------------------------------- |
-| `TokenNetworkRegistry` (`contract_address`) | `0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512` |
-| Mock USDC, 6 dp (`token_address`)           | `0x5FbDB2315678afecb367f032d93F642f64180aa3` |
-| Chain id                                    | `31337`                                      |
+| What                                         | Address                                      |
+| -------------------------------------------- | -------------------------------------------- |
+| `TokenNetworkRegistry` (`contract_address`)  | `0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0` |
+| USDC, FiatToken v2.2, 6 dp (`token_address`) | `0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512` |
+| Chain id                                     | `31337`                                      |
 
 Anvil's account 0 — `0xf39F…2266`, private key
 `0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80` — is the
-deployer, holds 10,000 ETH, and can mint that USDC to anyone. It is a public test
-key; it is not a secret and nothing outside a local anvil will accept it.
+deployer and holds 10,000 ETH. Account 1 — `0x7099…79C8`, private key
+`0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d` — is the
+USDC's minter and can mint it to anyone. Both are public test keys; they are not
+secrets and nothing outside a local anvil will accept them.
 
 #### 2. Keys
 
@@ -790,7 +795,8 @@ A needs a little ETH so its backend has a funded account, and no USDC at all.
 ```bash
 cd "$REPO"
 DEPLOYER=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-USDC=0x5FbDB2315678afecb367f032d93F642f64180aa3
+MINTER=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+USDC=0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512
 RPC=http://localhost:8545
 
 # every `cast` below runs inside the anvil container -- nothing is installed here
@@ -803,7 +809,7 @@ echo "A $A_ADDR   B $B_ADDR"
 
 cast send --rpc-url $RPC --private-key $DEPLOYER --value 10ether  "$A_ADDR"
 cast send --rpc-url $RPC --private-key $DEPLOYER --value 100ether "$B_ADDR"
-cast send --rpc-url $RPC --private-key $DEPLOYER "$USDC" "mint(address,uint256)" "$B_ADDR" 1000000000
+cast send --rpc-url $RPC --private-key $MINTER "$USDC" "mint(address,uint256)" "$B_ADDR" 1000000000
 
 # check it landed: 100 ETH, and 1000 USDC at 6 decimals
 cast balance --rpc-url $RPC "$B_ADDR"
@@ -842,8 +848,8 @@ write_keys_file   = "/app/data/operator-write-keys"
 
 [settlement.evm]
 rpc_url          = "http://anvil:8545"
-contract_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-token_address    = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+contract_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+token_address    = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals         = 6
 
 [settlement.evm.key]
@@ -868,8 +874,8 @@ write_keys_file   = "/app/data/operator-write-keys"
 
 [settlement.evm]
 rpc_url          = "http://anvil:8545"
-contract_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-token_address    = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+contract_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+token_address    = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals         = 6
 
 [settlement.evm.key]

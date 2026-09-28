@@ -310,16 +310,14 @@ journaled — never below what the chain shows landed — so its watermark never
 channel's open is unconfirmed it is listed `opening`, and funding or withdrawing it answers `409`.
 
 **The `toon-channel` writes are gone.** `redeem`, `redeem-latest`, `settle`, `close` and
-`cooperative-close` are deleted (#1376), and so is the EVM `toon-channel` open through `POST
-/channels`, which answers `400` by name. **This build no longer lands a `toon-channel` claim on chain
+`cooperative-close` are deleted (#1376). **This build no longer lands a `toon-channel` claim on chain
 at all**: nothing on it redeemed one but these writes (#1376 found no automatic path, though the issue
 assumed one). A node draining live TOON channels does so on the last release that still has these
-writes (ADR 0075, "Draining a node with live TOON channels"). **Two `toon-channel` branches remain.**
-A body carrying `counterparty_hex` with `"chain": "solana"` still opens a Solana `toon-channel`,
-because `local/keys.sh`'s `solana-channels` stage opens its channels through it until #1383 moves the
-local stack to x402. And `/fund` still funds a Solana `toon-channel`, by `amount` or by `total`, for
-the same stage. Its EVM `toon-channel` branch is deleted (#1378) and refused by name: an EVM
-`POST /peers` peering now opens and funds its own x402 channel.
+writes (ADR 0075, "Draining a node with live TOON channels"). **Nor does it open or fund one, on
+either chain** (#1376, #1378, #1383): a `POST /channels` body without `terms` — the old
+`counterparty_hex` open — answers `400` by name, and so does `/fund` on any channel that is not one
+of this node's outbound x402 channels, or a body carrying the old `total`. A peering on either chain
+opens and funds its own x402 channel through `POST /peers`.
 
 ### 2.3 What an operator can see
 

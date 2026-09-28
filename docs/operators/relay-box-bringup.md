@@ -38,17 +38,17 @@ the numbers, not running the window.
 
 ## Who does what
 
-| Step                         |      Repo-side (PR, reviewable)      |    Human-only (SSH, key material, funds)     |
-| ---------------------------- | :----------------------------------: | :------------------------------------------: |
-| 1. Provision                 |                                      |                  ✅ (#821)                   |
-| 2. DNS                       |                                      |                  ✅ (#821)                   |
-| 3. Certs                     |       ✅ `init-letsencrypt.sh`       |             runs it, on the box              |
-| 4. Key generation/derivation |                                      |     ✅ (#821 — this box's own mnemonic)      |
-| 5. Funding                   |                                      | ✅ (#821 — devnet faucet + a human transfer) |
-| 6. Standalone verification   |    ✅ `bootstrap.sh`, curl checks    |         runs them, reads the output          |
-| 7. Channel open              | ✅ `POST /channels` shape (ADR 0008) |   ✅ holds the bearer token, funds the tx    |
-| 8. Peering flip              |         ✅ config PR (#820)          |      ✅ deploys it, restarts both boxes      |
-| 9. Rollback                  |       ✅ one-line config edit        |       ✅ applies it, restarts the apex       |
+| Step                         |    Repo-side (PR, reviewable)     |    Human-only (SSH, key material, funds)     |
+| ---------------------------- | :-------------------------------: | :------------------------------------------: |
+| 1. Provision                 |                                   |                  ✅ (#821)                   |
+| 2. DNS                       |                                   |                  ✅ (#821)                   |
+| 3. Certs                     |     ✅ `init-letsencrypt.sh`      |             runs it, on the box              |
+| 4. Key generation/derivation |                                   |     ✅ (#821 — this box's own mnemonic)      |
+| 5. Funding                   |                                   | ✅ (#821 — devnet faucet + a human transfer) |
+| 6. Standalone verification   |  ✅ `bootstrap.sh`, curl checks   |         runs them, reads the output          |
+| 7. Channel open              | ✅ `POST /peers` shape (ADR 0075) |   ✅ holds the bearer token, funds the tx    |
+| 8. Peering flip              |        ✅ config PR (#820)        |      ✅ deploys it, restarts both boxes      |
+| 9. Rollback                  |      ✅ one-line config edit      |       ✅ applies it, restarts the apex       |
 
 Steps 1, 2, 4 and 5 need SSH, key material or funds this environment does not have — same posture
 every other infra-touching ticket in this repo's history records when it applies (#806, #815 §
@@ -133,36 +133,17 @@ every other infra-touching ticket in this repo's history records when it applies
    `POST /peers { id, url, fee, max_packet_amount, deposit }` naming the other's URL, which opens
    and funds that box's own outbound x402 channel — on Solana through the other box's sponsor endpoint — and binds the other's
    by its published voucher signer. No channel id is recorded and no `[[peer_channels]]` row is
-   written for it ([`operator-spec.md` §1.5](../protocol/operator-spec.md)). The `"chain":"evm"`
-   `toon-channel` open and top-up below are refused by name. What follows is only for a **Solana**
-   leg declared in the config file's `[[peer_channels]]` rows, which still pays over a
-   `toon-channel` until #1380.
+   written for it ([`operator-spec.md` §1.5](../protocol/operator-spec.md)). The `toon-channel`
+   open and top-up this step used to describe are retired on both chains (ADR 0075, #1376, #1378,
+   #1383): a `POST /channels` body without `terms` is refused by name, and so is `/fund` on
+   anything but one of the box's own outbound x402 channels.
 
-   ```sh
-   curl -X POST https://proxy.devnet.toonprotocol.dev/channels \
-     -H "Authorization: Bearer ${OPERATOR_TOKEN}" \
-     -H 'Content-Type: application/json' \
-     -d '{"counterparty_hex":"<relay box settlement pubkey, hex>","settlement_timeout_seconds":<…>,"chain":"solana"}'
-   ```
-
-   (A node settling on more than one chain refuses an omitted `chain` as ambiguous.)
-
-   **Collateral.** `POST /channels/:id/fund` is a **self-deposit** (issue #1118): run it on the box
-   that will _sign_ claims on this channel, and it puts that box's own collateral behind them,
-   raising `own_deposited` on `GET /channels`. Each participant funds their own side; neither box
-   can fund the other's — `packages/solana-program`'s `Deposit` credits strictly by signer. So: the
-   apex funds the apex's side, the relay funds the relay's, and the direction debt actually flows
-   decides which of the two matters (§6.4 — debt flows the way packets do). On EVM the deposit is
-   `POST /peers`'s own `deposit`, and a top-up is `POST /channels/:id/fund` on the outbound x402
-   channel it opened.
-
-   Before the Solana leg can be funded, the box's `[settlement.solana]` address needs the SPL token
-   itself, not just SOL for fees: the deposit moves real tokens out of that identity's associated
-   token account, which the node creates at boot but nothing fills.
-
-   Record the resulting
-   `channel_account` and the relay's `counterparty_key` — exactly the fields `btp-peer-transport-bringup.md`'s "A correct peering"
-   example's `[[peer_channels]]` row needs, one row on each side.
+   **Collateral.** Each box funds its own side and neither can fund the other's: the deposit is
+   `POST /peers`'s own `deposit`, and a top-up is `POST /channels/:id/fund { "amount": n }` — an
+   increment — on the outbound x402 channel it opened, run on the box that pays over it. The
+   direction debt actually flows decides which of the two matters (§6.4 — debt flows the way
+   packets do). Before a Solana leg can be funded, the box's `[settlement.solana]` address needs
+   the SPL token itself, not just SOL for fees.
 
 8. **Peering flip.** A repo PR (#820), deployed in the same window it merges:
    - **Relay box.** Add `[[peers]]` (accept-only — no `endpoint`, since the apex dials in) and the

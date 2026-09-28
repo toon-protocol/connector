@@ -5,15 +5,13 @@
 > table, `[settlement.solana]` ([Configuration](#configuration)), and the program is driven through
 > `connector-settlement-solana`'s `SettlementBackend`.
 >
-> Two things the connector does that are easy to assume it does not: it **opens** a Solana channel
-> on demand -- `POST /channels` with `"chain":"solana"` reaches `SolanaSettlementBackend::open`,
-> which submits the `InitializeChannel`
-> ([ADR 0008](adr/0008-operator-surface-splits-read-from-write.md)'s third write, issue #459), and
-> [`local/mixed-chain`](../local/README.md) opens its peering's channel that way on every run. It
-> **also** deposits a node's own collateral, as of issue #1118: `POST /channels/:id/fund` submits a
-> `Deposit` signed by the node's own `[settlement.solana]` identity. What no node can do -- here or
-> on any other chain -- is deposit on its _counterparty's_ behalf: `Deposit` credits strictly by
-> signer, so the other side's collateral is always their own transaction from their own wallet.
+> **The operator surface no longer opens or funds a channel of this program** (ADR 0075, #1383).
+> `POST /channels` with `"chain":"solana"` and `POST /channels/:id/fund` on such a channel once
+> submitted its `InitializeChannel` and `Deposit`; both are now refused by name. A node's channels
+> are x402 batch-settlement channels, opened and funded through `POST /peers` or `POST /channels`
+> with the counterparty's `terms`. What no node can do -- here or on any other chain -- is deposit
+> on its _counterparty's_ behalf: `Deposit` credits strictly by signer, so the other side's
+> collateral is always their own transaction from their own wallet.
 
 This guide covers deploying the Solana payment channel program to devnet, pointing a connector at it, and operating payment channels in a test environment.
 
@@ -261,7 +259,7 @@ key, and the [README](../README.md) is the walk-through of what the node then do
 
 ### Opening a Channel
 
-A connector opens a channel with an operator write -- `POST /channels` with `"chain":"solana"` -- and any other participant opens one directly against the program. The channel state is stored in a Program Derived Address (PDA):
+A participant opens one directly against the program; a connector no longer does (ADR 0075, #1383 retired its `POST /channels` open of this program's channels). The channel state is stored in a Program Derived Address (PDA):
 
 ```
 PDA seeds = [b"channel", participant_a, participant_b, token_mint]
@@ -276,20 +274,9 @@ signer (`processor.rs:309-311`, `:356-360`): the depositor account must sign, an
 carries no participant field naming anyone else. Whoever signs the balance proofs is who has to
 deposit.
 
-**From a running Rust connector** (issue #1118) -- this is the current procedure:
-
-```sh
-curl -X POST https://<node>/channels/<CHANNEL_PDA>/fund \
-  -H 'Content-Type: application/json' \
-  -d '{"amount": <base units>}'
-```
-
-signed as an operator write (RFC 9421, [ADR 0008](adr/0008-operator-surface-splits-read-from-write.md)
--- a bearer token is never sufficient to move value). The node signs the `Deposit` with its
-`[settlement.solana] key` identity and moves the tokens from that identity's associated token
-account, which it creates at boot but does not fill: **the settlement address needs the SPL token
-itself, not just SOL for fees.** The response's `own_deposited` is the node's own side read back
-from the chain; `deposited` is the counterparty's and this write never touches it.
+**From a running Rust connector** -- no longer: `POST /channels/<CHANNEL_PDA>/fund`, which signed
+this program's `Deposit` with the node's `[settlement.solana] key` from #1118, is refused by name
+since #1383 (ADR 0075). `/fund` tops up only the node's own outbound x402 channels.
 
 **From a counterparty that is not a connector** -- `rig`, `toon-client`, a wallet -- the deposit is
 submitted directly against the deployed program under that participant's own key. There is no

@@ -4,107 +4,66 @@
 # LOCAL / DEV ONLY. `infra/linode-*` owns devnet; nothing here is deployed,
 # published or SSH'd anywhere, and every chain this file names is disposable.
 #
-# The far end of the boundary, and the mirror of A: one chain, one peering, no
-# idea that the hop before B was on a different one. A packet arriving here has
-# crossed anvil and then the Solana validator, and this node can tell only
-# because its own peering's claims are ed25519.
+# C terminates the app's prefix and is paid over its Solana peering with B.
+# The packet the rehearsal sends is sealed to THIS node's `[signer]` identity
+# (ADR 0018), because C is the connector that terminates it.
 #
-# The rehearsal's payload is sealed to THIS node's `[signer]` identity (ADR
-# 0018) -- neither A nor B can open it, and `connector send --seal-to` naming
-# either of them is reported as "FULFILL WITH THE WRONG FULFILMENT" rather than
-# quietly passing.
+# C holds no peering row. `local/keys.sh mixed-chain channels` sends C a
+# signed `POST /peers` naming B's URL, which binds B's Solana voucher signer to
+# the peering -- the channel B opens toward C shows up here when B posts its
+# `open` to C's sponsor endpoint (ADR 0075 decision 3), with C in the `payee`
+# and `rent_payer` seats -- and opens C's own channel toward B, which nothing
+# here ever pays on.
 # =============================================================================
 
 client_edge_addr = "0.0.0.0:3000"
 
-# Where the Solana peering's inbound claim watermarks are written, and the file
-# the rehearsal reads to prove the Solana leg was actually paid rather than
-# merely traversed (`peer-claims.log`).
+# Where C's inbound vouchers are journaled (`client-edge-claims.log`), which
+# the rehearsal reads to prove the Solana leg was paid.
 state_dir = "/app/state"
 
-# CF-17: the peer carriage rides this node's own listener. C dials nobody, so
-# there is no `peer_allow_plaintext_endpoints` here -- the opt-in widens which
-# schemes this node may DIAL, and C never does.
-#
-# `"http"`, and B one hop back exposes `"btp"` (issue #1155). Two nodes in one
-# stack exposing different carriages is not an inconsistency to tidy up: §2.1
-# makes exposure a property of each connector, and a topology where every node
-# answered the same way could never show that. What each node exposes is the
-# carriage the peer that dials IT actually uses -- B is dialled over BTP, this
-# node is dialled over HTTP -- so neither opens a value-bearing listener with
-# no counterparty behind it.
+# B dials this node over ILP-over-HTTP (issue #1155 moved only `a-b` to BTP).
 peer_expose = "http"
+
+# C's own `POST /peers` reads B's self-description at a plaintext URL (CF-18).
+peer_allow_plaintext_endpoints = true
 
 [signer]
 key_file = "/app/data/signer.key"
 
+# What C publishes at `GET /ilp` (ADR 0050): the URL B's `POST /peers` dials,
+# and -- off the `[settlement.solana]` table -- the terms B opens its channel
+# on, the sponsor endpoint it posts the `open` to, and the voucher signer B
+# binds C's by. HTTP only: this leg is the ILP-over-HTTP one.
+[node]
+addresses = ["g.local.mixed.b.c"]
+http_endpoint = "http://connector-c:3000/ilp"
+
 # ── The terminated route ─────────────────────────────────────────────────────
-# `stub-app` is the connector image's second binary: it answers `POST /`, holds
-# no secret and performs no cryptography, so it contributes nothing to the
-# packet's fulfilment -- this connector derives that itself from the sealed
-# request (ADR 0019). The trailing slash is load-bearing (`handler_url.join`
-# and RFC 3986).
+# `price = 0`: what the hop is paid here is the forwarded amount, 1050 per
+# crossing on a real Solana voucher, not a route price -- this topology is
+# about the chain boundary, not about pricing a termination (`two-hop` does
+# that).
 #
-# `price = 0`, AND THAT IS NOW A CHOICE RATHER THAN A CONSTRAINT. A route a
-# node both TERMINATES and PRICES refuses a peer PREPARE that arrives without a
-# claim covering that price (`F06`, issue #880), and this leg used to be
-# POSTPAY -- B owed this node nothing until a crossing had fulfilled, so the
-# first crossing carried no claim, was refused, never fulfilled, left nothing
-# owed, and the second carried none either. A price here deadlocked the peering
-# instead of charging for it.
-#
-# THAT IS OVER (issue #1145). B holds a `[[pay_channels]]` row for `b-c` and
-# covers each PREPARE *before* it is sent, so crossing 1 arrives here already
-# paid for and a price would be perfectly payable. It stays at zero because
-# pricing a peer termination is what `local/two-hop` is for -- there is no
-# second thing this topology would learn from doing it again on the other
-# chain, and what this topology IS for is one node holding a settlement backend
-# on each of two.
-#
-# So what B pays this node is the forwarded amount, and `[[peer_channels]]`
-# below is what that claim is written against. Since issue #1144 that figure
-# is what is left after two hops have taken their fees: the rehearsal sends
-# 1200, A keeps 100, B keeps 50, and 1050 arrives here -- unpriced, so nothing
-# is required of it, but paid for all the same by the claim B signs on the
-# Solana channel. `connector-a.toml` writes the whole path's arithmetic out in
-# one block.
+# `transport = "btp"` is the PEER-ROLE PROOF, as on `two-hop`'s B: B peers with
+# C over ILP-over-HTTP, a CLIENT arriving over HTTP is refused a route pinned
+# to BTP (ADR 0072), and a PEER is not held to a client's pin -- so a packet
+# that reaches this app arrived on a voucher from a channel C bound to the
+# peering.
 [[routes]]
 prefix = "g.local.mixed.b.c.app"
 handler_url = "http://stub-app:3100/"
 price = 0
+transport = "btp"
 
-# ── The Solana peering ───────────────────────────────────────────────────────
-# No `endpoint`: B dials us, which on ILP-over-HTTP makes this node the payee
-# (§6.4).
-[[peers]]
-id = "b-c"
-
-
-# The other half of B's Solana row. `counterparty_key` is B's Solana
-# SETTLEMENT public key -- the identity a claim on this channel must be signed
-# by, and the one thing this node checks a signature against (CF-23).
-#
-# The settlement program is bound into the signed message since ADR 0053, so a
-# claim rendered against another deployment of the same program does not verify
-# here even though every other field matches. The row does not name it: it is
-# read from `[settlement.solana] program_id` below, the only program this node
-# could redeem such a claim through (issue #1128). A `program_id` key here is
-# refused at boot by name rather than allowed to disagree with it.
-[[peer_channels]]
-peer_id = "b-c"
-channel_account = "G5mXQzfZb4tXWX7cQvXP9ZJnDBcUo6irWTmGGtX3xpzL"
-counterparty_key = "BCXtFg3PtZwxVDBDGmknPzxHUtweYxb4YygrchiQKk7y"
-
-# No `[operator]` section, deliberately (CF-31): an absent table means the
-# surface is not started at all, rather than started unauthenticated. The
-# rehearsal hands its packet to A.
+[operator]
+bearer_token_file = "/app/data/operator-bearer-token"
+write_keys_file = "/app/data/operator-write-keys"
 
 # ── Settlement: Solana only ──────────────────────────────────────────────────
-# No `[settlement.evm]`, and that is the assertion this node makes: it holds no
-# EVM identity, cannot sign an EIP-712 balance proof, and could not verify one
-# -- so a packet reaching it has genuinely been handed across a chain boundary
-# rather than carried on one chain the whole way with a differently-shaped
-# config in the middle.
+# `local/solo/connector.toml` has why each value is what it is.
+# `min_sponsored_deposit` bounds the opening deposit of any channel B opens
+# toward C through C's sponsor endpoint.
 [settlement.solana]
 rpc_url = "http://solana-validator:8899"
 program_id = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR"
@@ -113,3 +72,6 @@ decimals = 6
 
 [settlement.solana.key]
 key_file = "/app/data/settlement-solana.key"
+
+[settlement.solana.batch_settlement]
+min_sponsored_deposit = 1

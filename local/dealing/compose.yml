@@ -21,7 +21,8 @@
 # is NOT this: both of its legs hold 6-decimal USDC, it declares no
 # `[[tokens]]`, and decision 2's absence rule leaves it on the ordinary
 # unconverted path. This is the only stack in the repository where a shipped
-# image converts anything.
+# image converts anything. Both peerings are x402 ones, established by
+# `local/keys.sh dealing channels` once the nodes are serving (ADR 0075).
 # =============================================================================
 
 services:
@@ -153,28 +154,23 @@ services:
   # Its own profile so `up` never starts it: a one-shot that exits 0 or 1, run
   # by `make local-rehearse` via `docker compose run --rm`.
   #
-  # TWO packets, for `local/two-hop`'s and `local/mixed-chain`'s reason (issue
-  # #1102): a covering payer asks its payee where its claims stand on every
-  # packet, and a payee answering out of the wrong book reports nonce 0 forever
-  # -- accepted every time, advancing nothing. One crossing cannot see that.
-  # Two can.
+  # First the chains: A's channel toward B off `x402BatchSettlement`, B's
+  # toward C off `payment-channels` -- in this topology's own 9-decimal mint,
+  # so its collateral is a thousand times the base units of the EVM leg's for
+  # the same hundred tokens.
+  #
+  # TWO packets, for `local/two-hop`'s reason (issue #1102): one crossing
+  # cannot see a payer re-signing the same cumulative amount forever. Two can.
   #
   # Then BOTH journals are read, and on this topology that pair is not two
   # spellings of one check. B's is 1100 per crossing, in µUSDC, unconverted:
   # A crosses no boundary. C's is 4350000 per crossing, in base units of a
-  # nine-decimal token: B does. `--expect-fulfill` cannot see either, because a
-  # peer claim's verdict rides back in `Toon-Claim-Ack` and never gates the
-  # packet -- AND ON THIS TOPOLOGY IT WOULD MISS MORE THAN A FREE CROSSING. A
-  # boundary converting at the wrong rate, or not converting at all, fulfils
-  # exactly as happily: the packet reaches the app either way, and only the
-  # figure in C's journal is different. That figure is the whole point of this
-  # stack, so it is what is asserted.
-  #
-  # Around those, one on-chain read: the Solana channel account exists, belongs
-  # to the payment-channel program and holds B's collateral. A journal grep
-  # proves a claim was ACCEPTED, which is a signature check against a
-  # configured key and reads no chain (CF-23) -- so it stays green against a
-  # channel nobody ever opened.
+  # nine-decimal token: B does. `--expect-fulfill` cannot see either -- AND ON
+  # THIS TOPOLOGY IT WOULD MISS MORE THAN A FREE CROSSING. A boundary converting
+  # at the wrong rate, or not converting at all, fulfils exactly as happily:
+  # the packet reaches the app either way, and only the figure in C's journal
+  # is different. That figure is the whole point of this stack, so it is what
+  # is asserted, exactly.
   sender:
     image: connector-rust:local
     profiles: [sender]
@@ -182,72 +178,30 @@ services:
     command:
       - |
         set -e
-
-        # The Solana peering's channel, BEFORE anything is sent, so a failure
-        # names the missing channel rather than a puzzling claim further down.
+        . /app/rehearsal.sh
+        # 1200 is this path's COST (`CONTEXT.md`) IN THE SENDER'S OWN UNIT,
+        # and on this topology that qualification is the whole of ADR 0071
+        # decision 7: the sender pays A's posted price in µUSDC and never meets
+        # a 9-decimal figure. 1200 leaves, A keeps its flat 100, and 1100 µUSDC
+        # arrives at the boundary; what leaves it is
         #
-        # Existence and owner establish the address is a real account of the
-        # payment-channel program: it is a PDA
-        # `find_program_address(["channel", min, max, mint])` produces -- and
-        # the MINT in those seeds is this topology's 9-decimal mock, not the
-        # mock USDC every other Solana leg here settles in, so this address is
-        # one only this topology's configuration derives.
+        #   floor(1100 * 4000/1 * 99/100) - 6000 = 4350000
         #
-        # And that it still holds B's COLLATERAL. `deposit_a` (offset 104,
-        # `packages/solana-program/src/state.rs`) and NOT `deposit_b`, which is
-        # the offset `local/mixed-chain` reads: a channel is two-sided,
-        # `ClaimFromChannel` bounds a claim by the CLAIMER's own deposit, B is
-        # the payer here -- and which slot B holds is decided by the 32-byte
-        # sort the PDA is derived from. B's key sorts BEFORE C's on this
-        # topology's indices, so B is participant_a. That constant cannot pass
-        # by accident if those indices ever change: it would read C's side,
-        # which nothing here funds, and report zero.
-        #
-        # `commitment: confirmed`, named rather than defaulted, and
-        # load-bearing: getAccountInfo defaults to FINALIZED, which a channel
-        # opened seconds ago by `make local-up` is not yet. Confirmed is also
-        # the level the Solana backend itself reads and writes at, so this sees
-        # exactly what the node that opened it sees.
-        #
-        # `content-type: application/json` likewise: busybox wget sends
-        # `application/x-www-form-urlencoded` for a --post-data body, and the
-        # validator answers that with 415.
-        channel_open() {
-          if ! wget -q -O - --header 'content-type: application/json' \
-              --post-data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$$1\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]}" \
-              http://solana-validator:8899 >/tmp/channel.json; then
-            echo "NO CHANNEL: getAccountInfo for $$1 failed against the local validator." >&2
-            exit 1
-          fi
-          if ! grep -q "\"owner\":\"$$2\"" /tmp/channel.json; then
-            echo "NO CHANNEL: $$1 is not an account of the payment-channel program $$2 on the local validator." >&2
-            echo "            The Solana peering's claims would name a channel nobody could redeem." >&2
-            exit 1
-          fi
-          echo "--- the outgoing leg's channel $$1 is live on chain, owned by $$2"
-
-          # The account's own bytes: base64 out of the JSON, then the u64 at
-          # $$3. busybox `od -tu8` reads it little-endian, which is the layout
-          # a Solana account is written in.
-          sed 's/.*"data":\["\([^"]*\)".*/\1/' /tmp/channel.json | base64 -d >/tmp/channel.bin
-          held=$$(od -An -tu8 -j"$$3" -N8 /tmp/channel.bin | tr -d ' ')
-          if [ -z "$$held" ] || [ "$$held" -lt "$$4" ]; then
-            echo "NO COLLATERAL: $$1 holds $$held base units at deposit offset $$3, not the $$4 the payer deposited." >&2
-            echo "               A claim against an unfunded channel is a signature, not a payment: the" >&2
-            echo "               program's ClaimFromChannel bounds a claim by the claimer's OWN deposit," >&2
-            echo "               so every claim this peering signs would be refused on redemption." >&2
-            echo "               'local/keys.sh dealing solana-channels' is what deposits it." >&2
-            exit 1
-          fi
-          echo "--- it holds $$held base units of B's own collateral, at least the $$4 provisioning deposited"
-        }
-        channel_open AiCAdi9xJ5XhJQ3sRkeCYzbWozd7dbS3gwZ9rneJWk8W HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR 104 100000000000
-
-        # 1200 is this path's COST (`CONTEXT.md`) IN THE SENDER'S OWN UNIT, and
-        # on this topology that qualification is the whole of ADR 0071 decision
-        # 7: the sender pays A's posted price in µUSDC and never meets a
-        # 9-decimal figure, however many boundaries the path crosses. 1200
-        # leaves, A keeps its flat 100, and 1100 µUSDC arrives at the boundary.
+        # base units of the 9-decimal mock (connector-b.toml has the long
+        # version). A figure wrong at C and right at B is the RATE, the SPREAD
+        # or the outgoing FEE having moved -- or the boundary not converting
+        # at all, which would put 1100 there and fulfil every packet
+        # regardless.
+        AMOUNT=1200
+        OWED_AT_B=1100
+        OWED_AT_C=4350000
+        CROSSINGS=2
+        EVM_DEPOSIT=100000000
+        SOLANA_DEPOSIT=100000000000
+        A_B=$$(peering_key a-b)
+        B_C=$$(peering_key b-c)
+        channel_holds "$$A_B" "$$EVM_DEPOSIT" a-b
+        channel_holds "$$B_C" "$$SOLANA_DEPOSIT" b-c
         send() {
           /usr/local/bin/connector send \
             --operator     http://connector-a:3000 \
@@ -255,7 +209,7 @@ services:
             --to           g.local.dealing.b.c.app \
             --seal-to      http://connector-c:3000/ilp \
             --target       / \
-            --amount       1200 \
+            --amount       "$$AMOUNT" \
             --body         /app/data/payload.json \
             --expect-fulfill
         }
@@ -263,53 +217,34 @@ services:
         send
         echo '--- crossing 2: a second covered crossing on BOTH peerings (issue #1102)'
         send
-
-        # $$1 state dir, $$2 channel, $$3 label, $$4 what ONE crossing must
-        # advance that channel by, $$5 the unit that figure is in.
-        #
-        # The ADVANCE, not merely the existence of a claim. Both legs cover
-        # before they send (ADR 0042), so N crossings owe exactly N advances,
-        # and the figure each leg owes is in ITS OWN unit -- which on this
-        # topology is the difference between the two calls below rather than a
-        # detail of them.
-        #
-        # The last line for the channel is the highest cumulative: a claim book
-        # only ever advances, and only the highest-nonce claim is ever
-        # redeemable.
-        paid() {
-          if ! grep -q "$$2" "$$1/peer-claims.log" 2>/dev/null; then
-            echo "NOT PAID: $$3 records no accepted claim on $$2." >&2
-            cat "$$1/peer-claims.log" >&2 || echo '(the journal does not exist)' >&2
-            exit 1
-          fi
-          accepted=$$(grep -c "$$2" "$$1/peer-claims.log")
-          cumulative=$$(grep "$$2" "$$1/peer-claims.log" | tail -1 | cut -f4)
-          expected=$$((accepted * $$4))
-          if [ "$$cumulative" != "$$expected" ]; then
-            echo "WRONG FIGURE: $$3 accepted $$accepted claims on $$2 totalling $$cumulative $$5," >&2
-            echo "              not the $$expected that $$accepted crossings at $$4 each owe it." >&2
-            echo "              What one crossing owes each leg:" >&2
-            echo "                B, in 6-decimal USDC:  amount_after_fee(1200, 100)        = 1100" >&2
-            echo "                C, in the 9-decimal mock:" >&2
-            echo "                  floor(1100 * 4000/1 * 99/100) - 6000                    = 4350000" >&2
-            echo "              A figure wrong at C and right at B is the RATE, the SPREAD or the" >&2
-            echo "              outgoing FEE having moved -- or the boundary not converting at all," >&2
-            echo "              which would put 1100 there and fulfil every packet regardless." >&2
-            grep "$$2" "$$1/peer-claims.log" >&2
-            exit 1
-          fi
-          echo "--- $$3 accepted $$accepted claims on $$2, cumulative $$cumulative $$5 ($$4 per crossing)"
-        }
+        # The a-b leg's PEER-ROLE PROOF: B's own route, pinned to the carriage A
+        # does not pay B over (connector-b.toml). A client is refused it and a
+        # peer is not, so reaching this app says A's channel is bound to the
+        # peering -- the channel every voucher B's journal holds arrived on.
+        echo '--- crossing 3: A -> B only, to the route B pins against clients'
+        /usr/local/bin/connector send \
+          --operator     http://connector-a:3000 \
+          --operator-key /app/data/operator-send.key \
+          --to           g.local.dealing.b.app \
+          --seal-to      http://connector-b:3000/ilp \
+          --target       / \
+          --amount       "$$AMOUNT" \
+          --body         /app/data/payload.json \
+          --expect-fulfill
         # The two units, side by side, which is the whole topology in two
-        # greps. B is paid in what arrived; C is paid in what the boundary
+        # reads. B is paid in what arrived; C is paid in what the boundary
         # converted it into.
-        paid /app/b-state 0xaabd147bc75ca72e8deaca1d7994716b6a29cb0ee4e3237ee629b440475e59fc "B (EVM, 6dp USDC)" 1100 uUSDC
-        paid /app/c-state AiCAdi9xJ5XhJQ3sRkeCYzbWozd7dbS3gwZ9rneJWk8W "C (Solana, 9dp mock)" 4350000 base-units
+        paid /app/b-state "$$A_B" "B (EVM, 6dp USDC)" "$$((CROSSINGS + 1))" "$$OWED_AT_B"
+        paid /app/c-state "$$B_C" "C (Solana, 9dp mock)" "$$CROSSINGS" "$$OWED_AT_C"
+        echo "--- B was paid $$OWED_AT_B uUSDC and C $$OWED_AT_C base units per crossing: converted at the declared rate"
     volumes:
       # A's keys: the sender signs the operator write with A's allowlisted key
       # and posts the fixture body from the same directory.
       - ./local/.keys/dealing/connector-a:/app/data:ro
-      # The two payees' state volumes, READ-ONLY, purely to read their claim
+      # The peerings keys.sh established on this run -- each one's channel key.
+      - ./local/.keys/dealing/peerings:/app/peerings:ro
+      - ./local/rehearsal.sh:/app/rehearsal.sh:ro
+      # The two payees' state volumes, READ-ONLY, purely to read their voucher
       # journals. The sender runs as the same uid 10001 that wrote them.
       - dealing-b-state:/app/b-state:ro
       - dealing-c-state:/app/c-state:ro

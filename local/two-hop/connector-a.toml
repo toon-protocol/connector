@@ -4,18 +4,43 @@
 # LOCAL / DEV ONLY. `infra/linode-*` owns devnet; nothing here is deployed,
 # published or SSH'd anywhere, and every chain this file names is disposable.
 #
-# A terminates nothing. Its only route to the app is a `peer_id` forward
-# across the peering to B, so a packet that comes back FULFILLed can only have
-# crossed it. That is the whole subject of this topology, and it is the
-# containerised counterpart of `crates/connector-bin/tests/
-# two_connectors_peer.rs` -- which proves the same path in-process, against an
-# anvil it spawns itself, and therefore cannot say anything about the image.
+# A terminates nothing. Its only route to the app is a forward across the
+# peering to B, so a packet that comes back FULFILLed can only have crossed
+# it. That is the whole subject of this topology, and it is the containerised
+# counterpart of `crates/connector-cli/tests/peering_from_a_url.rs`, which
+# proves the same peering in-process against an anvil it spawns itself and
+# therefore cannot say anything about the image.
 #
-# Every address below is deterministic, which is what lets this file be
-# committed rather than generated. Secrets are not: every key and the peering
-# secret are PATHS (ADR 0009/0012), written by `local/keys.sh` into a
-# gitignored directory. See that script's header for which keys are random and
-# which are derived, and why a `counterparty_key` forces the question.
+# ── The peering is not in this file, on purpose ──────────────────────────────
+#
+# ADR 0075: every channel is an x402 `batch-settlement` channel, and a peering
+# is TWO of them -- A->B carries A's vouchers to B, B->A carries B's to A. A
+# peering is established from a URL (ADR 0058, as 0075 decision 4 amends it):
+# each node is sent one signed `POST /peers` naming the other's
+# self-description URL, opens and funds only ITS OWN outbound channel, and
+# binds the other's channel toward it by the voucher signer the other's
+# self-description publishes. Nobody pastes a channel id anywhere, so there is
+# no `[[peer_channels]]` or `[[pay_channels]]` row here to paste it into.
+#
+# `local/keys.sh two-hop channels` makes those writes once both nodes are
+# serving, and it is where this peering's facts live -- its `fee` (100), the
+# forwarding route `g.local.two-hop.b` at `price` 1100 (`POST /routes/peers`),
+# and the opening and topped-up deposits. They are operator writes against a
+# running node, which is exactly what ADR 0058 made them; ADR 0009's config
+# creates nothing on a chain.
+#
+# THE ARITHMETIC, WRITTEN OUT, BECAUSE NOTHING IN THE CODE CHECKS IT. ADR 0028:
+# A collects its route's `price`, forwards `price - fee`, and so earns exactly
+# `fee`, which composes across a path only while `price - fee` is at least
+# the next hop's price:
+#
+#     A collects 1100, retains 100, forwards 1000
+#     B terminates at 1000, and 1100 - 100 == 1000 exactly, with no slack
+#
+# `local_topologies_load.rs` holds A's two figures in keys.sh's table, B's
+# `price` below in connector-b.toml and the rehearsal's AMOUNT/PRICE/FEE to
+# that one arithmetic; no container can notice a price or a fee quietly
+# dropped to zero.
 # =============================================================================
 
 # 0.0.0.0 so the container's published port reaches it. Same port inside every
@@ -23,188 +48,35 @@
 # apart.
 client_edge_addr = "0.0.0.0:3000"
 
-# Not optional here the way it is for a single node. This is where the peer
-# claim ledger lives, and a forwarding hop with no durable ledger re-issues
-# nonce 1 after every restart -- handing the payee a claim it must refuse
-# (issue #605).
+# Where this node's outbound channel lives across a restart (ADR 0075 decision
+# 8: journaled before its opening transaction is sent, and every voucher before
+# it is handed out) and where the runtime peering row is kept.
 state_dir = "/app/state"
 
 # Issue #678, gap 3. B is a plain container port with no TLS terminator in
-# front of it, and a peer endpoint is `wss://`/`https://` only unless a node
-# says otherwise -- one top-level line, default false, node-wide rather than
-# per-peering (CF-18), and the node logs a WARN naming every plaintext peering
-# at startup. Every deployed config leaves it unset.
+# front of it, and a peer URL is `https://` only unless a node says otherwise
+# -- one top-level line, default false, node-wide (CF-18). It covers reading
+# B's self-description, dialing B's carriage and asking B's claim-state, all
+# of which `POST /peers` does over `http://connector-b:3000/ilp`.
 peer_allow_plaintext_endpoints = true
 
 [signer]
 key_file = "/app/data/signer.key"
 
-# ── The only path to the app ─────────────────────────────────────────────────
-# Nothing on this node terminates `g.local.two-hop.b.app`, so a fulfilled
-# packet addressed there has exactly one explanation.
-#
-# ADR 0028's `price` is what this node's own client edge charges a client for a
-# packet to this prefix -- greeted, claim-gated and journaled exactly as a
-# terminated route's price is. Before ADR 0028 a `price` here was a hard config
-# error, which is precisely why a forwarded route was a free gateway that also
-# paid its own peer (issue #620).
-#
-# What this hop RETAINS of that price is the `fee` on the `[[peers]]` row
-# below, and not a key here: this hop does the same work whichever prefix the
-# packet was addressed to, so the fee belongs to the peering (ADR 0061).
-# `[[routes]] fee` is a refuse-to-start tombstone now.
-#
-# A fee of zero used to be THE ONLY VALUE THAT WORKED for a packet this topology
-# sends, and that was a property of the operator surface rather than of
-# peering: `POST /packets` passed `minimum_delivery = prepare.amount`, and
-# `amount_after_fee` refused when `amount - fee` fell below it, so an
-# operator-originated packet could not pay any hop a fee. Minimum delivery is
-# retired (ADR 0057, issue #1143), no packet declares a floor, and this hop now
-# keeps its fee like any other (issue #1144) -- so the flat per-packet fee that
-# is ADR 0010's whole revenue model is finally exercised by a shipped image
-# rather than by `cargo test` alone.
-#
-# THE ARITHMETIC, WRITTEN OUT, BECAUSE NOTHING IN THE CODE CHECKS IT. ADR 0028:
-# this hop collects `price`, forwards `price - fee`, and so earns exactly
-# `fee`. That composes across a path only while every hop keeps
-#
-#     price - fee >= the next hop's price
-#
-# and NO CODE ANYWHERE ENFORCES THAT -- a connector cannot know what the next
-# hop charges (ADR 0028, "Consequences"), so it is kept true by the operator
-# choosing the numbers, which here means by these two figures and B's one:
-#
-#     A collects 1100, retains 100, forwards 1000
-#     B terminates at 1000, and 1100 - 100 == 1000 exactly, with no slack
-#
-# The 1000 is B's committed `price`; the 100 is what carriage over this one
-# peering relation costs (ADR 0010 -- flat per packet, never a share of the
-# amount). The rehearsal sends 1100 because that is the path's COST
-# (`CONTEXT.md`): the fees of every hop that carries the packet plus the price
-# of the route that terminates it. This node's own fee is in that sum without
-# the operator paying anything for it -- it is value that never leaves a node
-# the operator owns, which is why an operator still does not pay their own
-# connector. `local_topologies_load.rs` holds these two figures, B's `price`
-# and the rehearsal's `AMOUNT`/`PRICE`/`FEE` to one arithmetic; no container
-# can notice a price or a fee quietly dropped to zero.
-#
-# The peering is genuinely paid either way -- see the `[[peer_channels]]` and
-# `[[pay_channels]]` rows below: this node covers the whole FORWARDED amount
-# (1000, post-fee) with a claim before the packet leaves. The payer of record
-# on the client leg is simply the operator, who is the sender.
-[[routes]]
-prefix = "g.local.two-hop.b"
-peer_id = "a-b"
-price = 1100
-
-# ── The peering ──────────────────────────────────────────────────────────────
-# `[[peers]].id` names the *relation*, and since ADR 0060 it is a purely LOCAL
-# label: nothing puts it on the wire. Role is decided by the claim, which names
-# a channel, which names at most one `[[peer_channels]]` row, which names one
-# peering (§1.2's P2 and P3). So the two files no longer have to agree on this
-# literal string -- they happen to here, because one name for one relation is
-# easier to read across two configs, not because anything checks.
-#
-# `endpoint` selects the carriage by scheme (§2.1): `http://` is
-# ILP-over-HTTP, `ws://` would be BTP. Only the dialing side has one, and on
-# HTTP that makes this node structurally the payer (§6.4) -- there is no path
-# for B to originate back.
-#
-# `fee` is what this node retains for carrying ONE packet over this peering
-# (ADR 0010, ADR 0061) -- flat, per packet, never a share of the amount, and
-# the same figure whichever prefix `a-b` carries. It rides here rather than on
-# the `[[routes]]` row above because it is a fact about the counterparty, not
-# about the destination. It is the 100 in the arithmetic written out above the
-# route: A collects 1100, retains 100, forwards 1000.
-[[peers]]
-id = "a-b"
-endpoint = "http://connector-b:3000/ilp"
-fee = 100
-
-# P2 (§1.2): the channel this relation's claims are judged against, and the
-# EIP-712 domain they are signed under (ADR 0024). A peering with no row here
-# is `ConfigError::PeerUnbound` -- a load-time refusal, not a runtime surprise.
-#
-# `counterparty_key` is B's SETTLEMENT address, never its `[signer]` identity:
-# a peer claim is redeemed against the channel participant this node is on
-# chain. `channel_id` is a real channel on the local anvil, opened and funded
-# by `local/keys.sh`, which also refuses to proceed if the chain does not
-# produce exactly this id.
-#
-# `chain_id` is anvil's own default, and `token_network` is the contract
-# `TokenNetworkRegistry.getTokenNetwork(mock USDC)` resolves to -- a
-# deterministic CREATE from a registry deployed at a fixed nonce by
-# `DeployLocal.s.sol`. NOT the registry itself: the registry is what
-# `[settlement.evm] contract_address` names, and the two are different
-# addresses with different jobs (issue #576).
-[[peer_channels]]
-peer_id = "a-b"
-channel_id = "0x57c5462d40a3c60fa89b8fe4f3f24cf560947a413df9a691499e58abea1d63f8"
-counterparty_key = "0x976EA74026E726554dB657fA54763abd0C3a0aa9"
-chain_id = 31337
-token_network = "0xCafac3dD18aC6c6e92c921884f9E4176737C052c"
-
-# ── Paying for the crossing, BEFORE it crosses (ADR 0042 item 2) ─────────────
-# `[[pay_channels]]` makes this node cover a forwarded PREPARE with a
-# client-role claim before it is sent. It is REQUIRED since issue #1145 -- a
-# peering a `[[routes]]` entry forwards to with no row here is refused at load
-# by name -- and this file has held one since #1107, so nothing about it
-# changed except that removing it now stops the node booting rather than
-# quietly changing how the peering is paid.
-#
-# It is also the only reason B can price the route it terminates. Under the
-# deleted postpay convention (ADR 0004) the claim covering crossing n was
-# signed after crossing n had fulfilled, so the FIRST crossing carried nothing,
-# a priced peer termination refused it `F06` (issue #880), it never fulfilled,
-# nothing was ever owed, and the second carried nothing either. `cover_forward`
-# breaks that circle by minting the claim first, so crossing 1 arrives already
-# paid for. B's own `price` comment is the other half of this.
-#
-# ONE CHANNEL, TWO ROLES, WITH ONE HOP. This row names the same `channel_id`
-# the `[[peer_channels]]` row above does, and `Config::load` permits exactly
-# that -- `pay_channel.rs` calls it "the deployed shape": the peer role for
-# what arrives, the client role for what this node sends. Nothing is ever owed
-# on the peer ledger for a forward any more (issue #1145 deleted that half
-# outright), so exactly one book signs per packet and it is this one. (The
-# collision `Config::load` DOES refuse is with `[[client_channels]]`, a channel
-# this node receives on.)
-#
-# Only the facts nothing can derive are written here (ADR 0030's table):
-#
-#   * the SIGNING KEY is `[settlement.evm]`'s -- no second key is introduced,
-#     because the channel's on-chain participant IS this node's settlement
-#     address, exactly as for the peer role;
-#   * the NONCE AND CUMULATIVE AMOUNT are B's, asked over `POST
-#     /ilp/claim-state` at `client_edge_url` on every covered packet, never
-#     remembered and never guessed. B answers a channel it holds as a
-#     `[[peer_channels]]` row out of its PEER book, which is issue #1102's fix
-#     and the whole reason this row can exist here at all: answered out of B's
-#     client-edge book it reports nonce 0 / cumulative 0 forever, and this node
-#     then re-signs one cumulative amount at a fresh nonce on every packet --
-#     accepted every time and buying nothing;
-#   * the CHANNEL ID and the EIP-712 DOMAIN are the peer row's own, because
-#     both roles sign against the very same on-chain channel.
-#
-# `client_edge_url` is B's `POST /ilp` -- the same URL the peering dials, and
-# still written out rather than derived from it: a `wss://` peering has no HTTP
-# client edge to derive one from, and guessing is the class of mistake ADR 0030
-# refuses. `http://` needs `peer_allow_plaintext_endpoints` above, for the same
-# reason the peering's own endpoint does: the claim-state ask carries a signed
-# EIP-712 challenge -- a capability to read this channel's state -- in the
-# clear.
-[[pay_channels]]
-peer_id = "a-b"
-channel_id = "0x57c5462d40a3c60fa89b8fe4f3f24cf560947a413df9a691499e58abea1d63f8"
-chain_id = 31337
-token_network = "0xCafac3dD18aC6c6e92c921884f9E4176737C052c"
-client_edge_url = "http://connector-b:3000/ilp"
+# What this node publishes about itself at `GET /ilp` (ADR 0050) -- the
+# document B's `POST /peers` reads to find A's voucher signer. Without it B
+# could not bind A's channel, and A's vouchers would arrive at B as a
+# client's rather than a peer's.
+[node]
+addresses = ["g.local.two-hop.a"]
+http_endpoint = "http://connector-a:3000/ilp"
 
 # ── Operator surface (ADR 0008) ──────────────────────────────────────────────
-# Only this node has one, because only this node is sent to: `connector send`
-# originates the rehearsal's packet through `POST /packets` here. Both settings
-# are FILES, not literals, and both are written by local/keys.sh -- the bearer
-# token gates reads, `write_keys` is the ed25519 PUBLIC-key allowlist that
-# gates the write.
+# Both are FILES, not literals, and both are written by local/keys.sh. The
+# bearer token gates reads; `write_keys` is the ed25519 PUBLIC-key allowlist
+# that gates every write -- `POST /peers`, `POST /routes/peers`,
+# `POST /channels/:id/fund` from keys.sh, and `POST /packets` from
+# `connector send`, which originates the packet this topology exists to prove.
 [operator]
 bearer_token_file = "/app/data/operator-bearer-token"
 write_keys_file = "/app/data/operator-write-keys"
@@ -216,23 +88,20 @@ write_keys_file = "/app/data/operator-write-keys"
 # whole local chain environment rather than a per-topology subset; nothing here
 # dials it.
 #
-# `contract_address` is the TokenNetworkRegistry, NOT a TokenNetwork:
-# `EvmSettlementBackend::connect` resolves `getTokenNetwork(token_address)`
-# through the registry and refuses to start if that comes back zero (issue
-# #576).
-#
-# The `[settlement.evm]` key is also this node's peer-claim signing key
-# (ADR 0030 -- "no second key is introduced"), because the channel's on-chain
-# participant IS this node's settlement address. That is why the address it
-# derives to appears in B's `counterparty_key` above, and why `local/keys.sh`
-# derives it deterministically rather than generating it.
+# The token, the EIP-712 domain and the boot-only `contract_address` are
+# `local/solo/connector.toml`'s, for the reasons written there. The
+# `[settlement.evm]` key is also what signs this node's vouchers (ADR 0075
+# decision 3: `payerAuthorizer == payer`), so its address is the voucher
+# signer A's self-description publishes and B binds.
 [settlement.evm]
 rpc_url = "http://anvil:8545"
-contract_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-token_address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
-# `connect` reads the token's own `decimals()` and refuses to start if the two
-# disagree (issue #564), so this matches the mock USDC actually deployed.
+contract_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+token_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals = 6
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
+
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"

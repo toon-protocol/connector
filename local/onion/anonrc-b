@@ -1,8 +1,10 @@
 ##=================== /etc/anon/anonrc -- local/onion, B's side ==============##
 #
-# The onion SERVICE. This daemon generates `connector-b`'s address, publishes
-# a descriptor for it, and forwards what arrives to the connector's one
-# listener. It opens no SOCKS port: B dials nothing.
+# The onion SERVICE, and B's own way out. This daemon generates `connector-b`'s
+# address, publishes a descriptor for it and forwards what arrives to the
+# connector's one listener -- and it is the SOCKS5 proxy B reads A's
+# self-description through when B's `POST /peers` names A's hidden-service URL
+# (ADR 0075 decision 4: a peering is established from both ends).
 #
 # Mounted READ-ONLY at /etc/anon/anonrc; see `anonrc-a` for why the `Nickname`
 # line below cannot be dropped.
@@ -15,10 +17,16 @@ DataDirectory /var/lib/anon
 Nickname toonlocalonionB
 
 ClientOnly 1
-SocksPort 0
 ORPort 0
 DirPort 0
 ControlSocket 0
+
+# `connector-b`'s `socks_proxy`. See `anonrc-a` for the policy.
+SocksPort 0.0.0.0:9050
+SocksPolicy accept 10.0.0.0/8
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy accept 192.168.0.0/16
+SocksPolicy reject *
 
 # ── The address, and where it lives ─────────────────────────────────────────
 # `anon` writes the generated address to `HiddenServiceDir/hostname` and the

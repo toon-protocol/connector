@@ -25,16 +25,16 @@
 //! `close`, `settle` and `cooperative-close` are deleted, and so are the
 //! EVM `toon-channel` open and top-up (#1376, #1378): a peering, on either
 //! chain (#1378, #1379), opens and funds its outbound x402 channel through
-//! `POST /peers` itself. `POST /channels` and `/fund` still serve a Solana
-//! `toon-channel` for `local/keys.sh` until #1383.
-//! Every one calls
+//! `POST /peers` itself. The Solana `toon-channel` open and top-up
+//! followed with #1383: `POST /channels` without `terms`, and `/fund` on
+//! anything but an outbound x402 channel, are refused by name. Every one
+//! calls
 //! [`write_auth::authenticate_write`] first and nothing else in this
 //! crate accepts a body, so a write cannot reach [`Connector`] without a
 //! valid, allowlisted, unexpired, non-replayed signature. Bearer tokens
 //! gate reads and reads only; no shared secret is ever sufficient to move
 //! value. Channel writes 503 rather than reach [`Connector`] at all on a
-//! node with no settlement backend configured
-//! ([`connector_runtime::ChannelOperationError::NoSettlementBackend`]).
+//! node with no x402 batch-settlement backend configured.
 //!
 //! Per ADR 0001, each read handler below deserializes nothing beyond the
 //! bearer token (a GET request has no body) and calls exactly one
@@ -90,10 +90,10 @@ use connector_client_edge::ClientClaimGate;
 use connector_domain::x402::X402BatchSettlementTerms;
 use connector_domain::{PacketResponse, Prepare, Price};
 use connector_runtime::{
-    BatchChannelError, BatchChannelView, BatchChannels, ChannelOperationError, ChannelView,
-    ClaimBookKind, ClaimDirection, ClaimScheme, ClaimView, Connector, DeclaredRates,
-    EstablishPeeringError, LeaseRouteError, LeasedRouteView, PeerRouteTableError, PeerRouteView,
-    PeerView, RateView, RouteView, SelfDescriptionError, SettlementChain, WithdrawStep,
+    BatchChannelError, BatchChannelView, BatchChannels, ClaimBookKind, ClaimDirection, ClaimScheme,
+    ClaimView, Connector, DeclaredRates, EstablishPeeringError, LeaseRouteError, LeasedRouteView,
+    PeerRouteTableError, PeerRouteView, PeerView, RateView, RouteView, SelfDescriptionError,
+    SettlementChain, WithdrawStep,
 };
 use connector_settlement::batch::BatchSettlementError;
 use connector_signer::{derive_evm_address, to_hex, Signer, SignerError};
@@ -872,72 +872,31 @@ struct OpenOutboundChannelRequest {
     url: Option<String>,
 }
 
-/// A `POST /channels` body that opens a **Solana `toon-channel`**: the one
-/// TOON-channel write still served, because `local/keys.sh`'s
-/// `solana-channels` stage opens its channels through it until #1383 moves
-/// the local stack to x402 (ADR 0075 decision 13). `chain` must be
-/// `"solana"`; the EVM branch is deleted (#1376).
+/// A `POST /channels/:id/fund` request body: `{"amount": n}` deposits `n`
+/// more of this node's own collateral into one of its outbound x402
+/// channels. An increment, so a retry after an ambiguous outcome deposits
+/// again -- the only form an x402 channel takes (ADR 0075 decision 11).
 #[derive(Debug, Deserialize)]
-struct OpenToonChannelRequest {
-    counterparty_hex: String,
-    settlement_timeout_seconds: i64,
-    #[serde(default)]
-    chain: Option<String>,
-}
-
-/// A `POST /channels/:id/fund` request body, in one of two forms:
-///
-/// - `{"amount": n}` deposits `n` more of this node's own collateral. An
-///   increment, so a retry after an ambiguous outcome deposits again. The
-///   only form an x402 channel takes (ADR 0075 decision 11).
-/// - `{"total": n}` raises this node's own deposit **to** `n` and no
-///   further, so it can be repeated until it is answered (ADR 0073). Solana
-///   `toon-channel` only.
-///
-/// Exactly one of the two.
-#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FundChannelRequest {
-    #[serde(default)]
-    amount: Option<u128>,
-    #[serde(default)]
-    total: Option<u128>,
+    amount: u128,
 }
 
-/// The refusal a top-up of an EVM `toon-channel` gets (ADR 0075, #1378).
-const EVM_TOON_CHANNEL_NOT_FUNDED: &str =
-    "EVM toon-channel channels are no longer funded here (ADR 0075, #1378): an EVM peering pays \
-     over its own outbound x402 channel, which POST /peers opens and funds -- top that one up \
-     instead";
+/// The refusal a `POST /channels` body without `terms` gets: the
+/// `toon-channel` open it would have been, on either chain, is retired
+/// (ADR 0075, #1376, #1383).
+const TOON_CHANNEL_OPEN_RETIRED: &str =
+    "toon-channel channels are no longer opened here, on either chain (ADR 0075): open an \
+     outbound x402 batch-settlement channel by posting the counterparty's `terms` (and a \
+     `deposit`), or peer with it through POST /peers, which opens and funds one itself";
 
-/// The refusal a request for the retired EVM `toon-channel` writes gets.
-const EVM_TOON_CHANNEL_RETIRED: &str =
-    "EVM toon-channel channels are no longer opened here (ADR 0075, #1376): open an outbound \
-     x402 batch-settlement channel by posting the counterparty's `terms` instead";
-
-fn channel_operation_response(result: Result<ChannelView, ChannelOperationError>) -> Response {
-    match result {
-        Ok(view) => Json(view).into_response(),
-        Err(error) => channel_operation_error_response(error),
-    }
-}
-
-/// The status a failed channel operation answers with, shared by every
-/// endpoint that drives one -- the channel lifecycle writes, and
-/// `POST /peers`, which opens a channel of its own (ADR 0058).
-fn channel_operation_error_response(error: ChannelOperationError) -> Response {
-    match error {
-        // Both "no backend at all" and "no backend on that chain" are the
-        // node's own configuration lacking what the request needs -- 503,
-        // not a caller error.
-        ChannelOperationError::NoSettlementBackend
-        | ChannelOperationError::NoSettlementBackendForChain(_) => {
-            (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()
-        }
-        ChannelOperationError::AmbiguousSettlementChain | ChannelOperationError::Settlement(_) => {
-            (StatusCode::BAD_REQUEST, error.to_string()).into_response()
-        }
-    }
-}
+/// The refusal a top-up of a channel that is not one of this node's
+/// outbound x402 channels gets -- a `toon-channel` among them, whose
+/// funding is retired (ADR 0075, #1378, #1383).
+const NOT_AN_OUTBOUND_X402_CHANNEL: &str =
+    "not an outbound x402 channel of this node: only those are topped up here, and \
+     toon-channel funding, on either chain, is retired (ADR 0075) -- a peering pays over the \
+     outbound x402 channel POST /peers opens and funds, so top that one up instead";
 
 /// The status a failed x402 channel operation answers with.
 ///
@@ -987,30 +946,18 @@ fn no_batch_backend() -> Response {
         .into_response()
 }
 
-/// Decode `0x`-optional hex into raw bytes; `Err` on odd length or a
-/// non-hex character.
-fn decode_hex(input: &str) -> Result<Vec<u8>, ()> {
-    let trimmed = input.strip_prefix("0x").unwrap_or(input);
-    if !trimmed.len().is_multiple_of(2) {
-        return Err(());
-    }
-    (0..trimmed.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&trimmed[i..i + 2], 16).map_err(|_| ()))
-        .collect()
-}
-
 /// `POST /channels`: open an outbound x402 channel toward a counterparty
-/// (ADR 0075 decision 11), or -- the one retained TOON branch -- a Solana
-/// `toon-channel`. A body carrying `terms` is the former; one carrying
-/// `counterparty_hex` the latter. Authenticated exactly like every other
-/// write on this surface -- [`authenticate_write`] first, nothing else in
-/// this handler accepts the request until that succeeds.
+/// (ADR 0075 decision 11). The body carries the counterparty's `terms`; a
+/// body without them is refused by name, since the `toon-channel` open it
+/// would once have been is retired on both chains (#1376, #1383).
+/// Authenticated exactly like every other write on this surface --
+/// [`authenticate_write`] first, nothing else in this handler accepts the
+/// request until that succeeds.
 ///
-/// **This endpoint spends.** Its x402 branch is safe to retry: the channel
-/// is journaled before its opening transaction is sent, and a retry toward
-/// the same receiver while that open is unconfirmed resumes it rather than
-/// opening a second (ADR 0075 decision 8). The answer says which it did --
+/// **This endpoint spends.** It is safe to retry: the channel is journaled
+/// before its opening transaction is sent, and a retry toward the same
+/// receiver while that open is unconfirmed resumes it rather than opening a
+/// second (ADR 0075 decision 8). The answer says which it did --
 /// `resumed: true` -- so an unintended second channel is visible in the
 /// operator's own output.
 async fn open_channel(
@@ -1028,43 +975,10 @@ async fn open_channel(
         Ok(fields) => fields,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
-    if fields.contains_key("terms") {
-        return open_outbound_channel(&state, &body).await;
+    if !fields.contains_key("terms") {
+        return (StatusCode::BAD_REQUEST, TOON_CHANNEL_OPEN_RETIRED).into_response();
     }
-
-    let request: OpenToonChannelRequest = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
-    };
-    match request.chain.as_deref() {
-        Some("solana") => {}
-        Some("evm") => return (StatusCode::BAD_REQUEST, EVM_TOON_CHANNEL_RETIRED).into_response(),
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "a toon-channel open is served only on Solana and must say `\"chain\": \
-                 \"solana\"`; an x402 channel is opened by posting the counterparty's `terms`",
-            )
-                .into_response()
-        }
-    }
-    let counterparty = match decode_hex(&request.counterparty_hex) {
-        Ok(bytes) => bytes,
-        Err(()) => {
-            return (StatusCode::BAD_REQUEST, "counterparty_hex must be hex").into_response()
-        }
-    };
-
-    channel_operation_response(
-        state
-            .connector
-            .open_channel(
-                Some(SettlementChain::Solana),
-                counterparty,
-                chrono::Duration::seconds(request.settlement_timeout_seconds),
-            )
-            .await,
-    )
+    open_outbound_channel(&state, &body).await
 }
 
 /// The answer to an x402 `POST /channels`: the channel, and whether this
@@ -1104,12 +1018,12 @@ async fn open_outbound_channel(state: &OperatorState, body: &Bytes) -> Response 
     }
 }
 
-/// `POST /channels/:id/fund`: top up a channel this node pays on, by an
-/// increment (ADR 0075 decision 11). An outbound x402 channel takes
-/// `{"amount": n}`. A Solana `toon-channel` takes either form, because
-/// `local/keys.sh` funds through it until #1383. An EVM `toon-channel` is
-/// refused by name (#1378): an EVM peering pays over its own x402 channel,
-/// which `POST /peers` opens and funds.
+/// `POST /channels/:id/fund`: top up one of this node's outbound x402
+/// channels by `{"amount": n}`, an increment (ADR 0075 decision 11). Any
+/// other channel -- a `toon-channel` included, on either chain -- is
+/// refused by name: `toon-channel` funding is retired (#1378, #1383), and a
+/// peering pays over the outbound x402 channel `POST /peers` opens and
+/// funds.
 async fn fund_channel(
     State(state): State<OperatorState>,
     Path(channel_id): Path<String>,
@@ -1121,45 +1035,39 @@ async fn fund_channel(
     if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
         return error.into_response();
     }
-
+    // `total` is named before the body is parsed: it was toon-channel funding
+    // to an absolute figure, retired by ADR 0075, and a body carrying it is
+    // refused as that rather than as an unknown field.
+    let names_total = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&body)
+        .is_ok_and(|fields| fields.contains_key("total"));
+    if names_total {
+        return (
+            StatusCode::BAD_REQUEST,
+            "`total` was toon-channel funding to an absolute figure, retired by ADR 0075: an \
+             x402 channel is topped up by an increment -- give exactly `amount`",
+        )
+            .into_response();
+    }
     let request: FundChannelRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
-        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
-    };
-
-    if let Some(batch) = state
-        .batch
-        .as_ref()
-        .filter(|batch| batch.outbound().knows(&channel_id))
-    {
-        let (Some(amount), None) = (request.amount, request.total) else {
+        Err(error) => {
             return (
                 StatusCode::BAD_REQUEST,
-                "an x402 channel is topped up by an increment: give exactly `amount`",
+                format!("{error}: an x402 channel is topped up by giving exactly `amount`"),
             )
-                .into_response();
-        };
-        return match batch.outbound().top_up(&channel_id, amount).await {
-            Ok(state) => Json(batch.outbound().view_of(&state)).into_response(),
-            Err(error) => batch_channel_error_response(error),
-        };
+                .into_response()
+        }
+    };
+    let Some(batch) = state.batch.as_ref() else {
+        return no_batch_backend();
+    };
+    if !batch.outbound().knows(&channel_id) {
+        return (StatusCode::BAD_REQUEST, NOT_AN_OUTBOUND_X402_CHANNEL).into_response();
     }
-
-    if state.connector.toon_channel_chain(&channel_id) == Some(SettlementChain::Evm) {
-        return (StatusCode::BAD_REQUEST, EVM_TOON_CHANNEL_NOT_FUNDED).into_response();
+    match batch.outbound().top_up(&channel_id, request.amount).await {
+        Ok(state) => Json(batch.outbound().view_of(&state)).into_response(),
+        Err(error) => batch_channel_error_response(error),
     }
-    let result =
-        match (request.amount, request.total) {
-            (Some(amount), None) => state.connector.fund_channel(&channel_id, amount).await,
-            (None, Some(total)) => state.connector.fund_channel_to(&channel_id, total).await,
-            _ => return (
-                StatusCode::BAD_REQUEST,
-                "give exactly one of 'amount' (an increment: a retry deposits again) or 'total' \
-                 (this node's own deposit to reach: a retry deposits nothing more)",
-            )
-                .into_response(),
-        };
-    channel_operation_response(result)
 }
 
 /// The answer to `POST /channels/:id/withdraw`: which step it took, and
@@ -2439,7 +2347,6 @@ mod tests {
             BatchSettlementPayer, InMemoryBatchChain, InMemoryBatchSettlement, PayerExit,
             ReceiverTerms,
         };
-        use connector_settlement::InMemorySettlementBackend;
         use ed25519_dalek::Keypair;
         use rand::rngs::OsRng;
         use std::net::SocketAddr;
@@ -2609,204 +2516,6 @@ mod tests {
                 .uri(path)
                 .body(Body::from(body))
                 .unwrap()
-        }
-
-        /// A node settling on Solana only, over the in-memory `toon-channel`
-        /// backend: the one `toon-channel` branch of `POST /channels` and
-        /// `/fund` still served, because `local/keys.sh` opens and funds its
-        /// Solana channels through it until #1383.
-        fn solana_toon_router(write_keys: Vec<[u8; 32]>) -> Router {
-            let connector = Arc::new(
-                Connector::new(
-                    vec![],
-                    vec![],
-                    Arc::new(FakeAppClient::new()),
-                    Arc::new(InProcessPeerTransport::new()),
-                    Arc::new(TestClock::new(chrono::Utc::now())),
-                )
-                .with_settlement(
-                    SettlementChain::Solana,
-                    Arc::new(InMemorySettlementBackend::new()),
-                ),
-            );
-            router(
-                connector,
-                empty_claim_gate(),
-                Arc::new(LocalSigner::generate("operator-test-key")),
-                "correct-token".to_string(),
-                write_keys,
-                None,
-            )
-        }
-
-        /// ADR 0075, #1376: the EVM `toon-channel` branch of `POST /channels`
-        /// is deleted, and refused by name rather than served -- and a
-        /// `toon-channel` open that names no chain is refused too, since the
-        /// one it could mean is no longer a choice.
-        #[tokio::test]
-        async fn the_evm_toon_channel_open_is_refused_by_name() {
-            let keypair = keypair();
-            let app = router_with(vec![keypair.public.to_bytes()]).await;
-            for body in [
-                serde_json::json!({
-                    "counterparty_hex": COUNTERPARTY_SETTLEMENT,
-                    "settlement_timeout_seconds": 3600,
-                    "chain": "evm",
-                }),
-                serde_json::json!({
-                    "counterparty_hex": COUNTERPARTY_SETTLEMENT,
-                    "settlement_timeout_seconds": 3600,
-                }),
-            ] {
-                let response = app
-                    .clone()
-                    .oneshot(signed(
-                        &keypair,
-                        "POST",
-                        "/channels",
-                        serde_json::to_vec(&body).unwrap(),
-                    ))
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-                let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-                assert!(String::from_utf8_lossy(&body).contains("toon-channel"));
-            }
-        }
-
-        /// ADR 0075, #1378: an EVM `toon-channel` is no longer topped up
-        /// here -- an EVM peering pays over its own x402 channel, which
-        /// `POST /peers` opens and funds -- and the refusal says so by name
-        /// rather than reaching the backend. Both forms are refused.
-        #[tokio::test]
-        async fn an_evm_toon_channel_top_up_is_refused_by_name() {
-            let keypair = keypair();
-            let connector = Arc::new(
-                Connector::new(
-                    vec![],
-                    vec![],
-                    Arc::new(FakeAppClient::new()),
-                    Arc::new(InProcessPeerTransport::new()),
-                    Arc::new(TestClock::new(chrono::Utc::now())),
-                )
-                .with_settlement(
-                    SettlementChain::Evm,
-                    Arc::new(InMemorySettlementBackend::new()),
-                ),
-            );
-            let app = router(
-                connector,
-                empty_claim_gate(),
-                Arc::new(LocalSigner::generate("operator-test-key")),
-                "correct-token".to_string(),
-                vec![keypair.public.to_bytes()],
-                None,
-            );
-            let path = format!("/channels/0x{}/fund", "ab".repeat(32));
-            for (created, body) in [
-                (1_000, serde_json::json!({ "amount": 500 })),
-                (1_001, serde_json::json!({ "total": 500 })),
-            ] {
-                let body = serde_json::to_vec(&body).unwrap();
-                let (sig_input, sig, digest) =
-                    sign_request(&keypair, "POST", &path, &body, created, Some(9_999_999_999));
-                let response = app
-                    .clone()
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri(&path)
-                            .header("signature-input", sig_input)
-                            .header("signature", sig)
-                            .header("content-digest", digest)
-                            .body(Body::from(body))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-                let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-                assert!(
-                    String::from_utf8_lossy(&body).contains("no longer funded here"),
-                    "{}",
-                    String::from_utf8_lossy(&body)
-                );
-            }
-        }
-
-        /// `POST /channels/:id/fund` with a `total` is the retry-safe form
-        /// (ADR 0073): the same body, re-signed and sent again, deposits
-        /// nothing more. A body naming both forms, or neither, is refused.
-        /// On the retained Solana `toon-channel` branch.
-        #[tokio::test]
-        async fn funding_to_a_total_can_be_repeated_without_depositing_twice() {
-            let keypair = keypair();
-            let app = solana_toon_router(vec![keypair.public.to_bytes()]);
-            let signed_at = |created: u64, path: &str, body: serde_json::Value| {
-                let body = serde_json::to_vec(&body).unwrap();
-                let (sig_input, sig, digest) =
-                    sign_request(&keypair, "POST", path, &body, created, Some(9_999_999_999));
-                Request::builder()
-                    .method("POST")
-                    .uri(path)
-                    .header("signature-input", sig_input)
-                    .header("signature", sig)
-                    .header("content-digest", digest)
-                    .body(Body::from(body))
-                    .unwrap()
-            };
-
-            let opened = app
-                .clone()
-                .oneshot(signed_at(
-                    1_000,
-                    "/channels",
-                    serde_json::json!({
-                        "counterparty_hex": COUNTERPARTY_SETTLEMENT,
-                        "settlement_timeout_seconds": 3600,
-                        "chain": "solana",
-                    }),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(opened.status(), StatusCode::OK);
-            let opened: ChannelView =
-                serde_json::from_slice(&hyper::body::to_bytes(opened.into_body()).await.unwrap())
-                    .unwrap();
-            let path = format!("/channels/{}/fund", opened.id);
-
-            for created in [1_001, 1_002] {
-                let funded = app
-                    .clone()
-                    .oneshot(signed_at(
-                        created,
-                        &path,
-                        serde_json::json!({ "total": 500 }),
-                    ))
-                    .await
-                    .unwrap();
-                assert_eq!(funded.status(), StatusCode::OK);
-                let funded: ChannelView = serde_json::from_slice(
-                    &hyper::body::to_bytes(funded.into_body()).await.unwrap(),
-                )
-                .unwrap();
-                assert_eq!(
-                    funded.own_deposited, 500,
-                    "the second send deposits nothing"
-                );
-            }
-
-            for (created, body) in [
-                (1_003, serde_json::json!({ "amount": 1, "total": 2 })),
-                (1_004, serde_json::json!({})),
-            ] {
-                let refused = app
-                    .clone()
-                    .oneshot(signed_at(created, &path, body))
-                    .await
-                    .unwrap();
-                assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-            }
         }
 
         #[tokio::test]
@@ -3371,6 +3080,97 @@ mod tests {
             assert_eq!(node.this.balance(), 10_000);
         }
 
+        /// ADR 0075, #1376, #1383: the `toon-channel` open is retired on
+        /// both chains. A `POST /channels` body without `terms` -- the old
+        /// `counterparty_hex` shape, on either chain or none -- is refused
+        /// by name, not answered with a deserialisation error, and opens
+        /// nothing.
+        #[tokio::test]
+        async fn a_channel_open_without_terms_is_refused_by_name() {
+            let node = Node::new().await;
+            for body in [
+                serde_json::json!({
+                    "counterparty_hex": "ab".repeat(20),
+                    "settlement_timeout_seconds": 3600,
+                    "chain": "solana",
+                }),
+                serde_json::json!({
+                    "counterparty_hex": "ab".repeat(20),
+                    "settlement_timeout_seconds": 3600,
+                    "chain": "evm",
+                }),
+                serde_json::json!({ "deposit": 1_000 }),
+            ] {
+                let (status, refusal) = node.write("/channels", body.clone()).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                let refusal = refusal.as_str().expect("a text refusal");
+                assert!(
+                    refusal.contains("toon-channel") && refusal.contains("`terms`"),
+                    "{refusal}"
+                );
+            }
+            assert_eq!(node.this.balance(), 10_000, "nothing moved");
+            let listed = node.read("/channels").await;
+            assert!(
+                !listed
+                    .as_array()
+                    .expect("a list")
+                    .iter()
+                    .any(|row| row["direction"] == "outbound"),
+                "{listed}"
+            );
+        }
+
+        /// ADR 0075, #1378, #1383: `POST /channels/:id/fund` tops up this
+        /// node's own outbound x402 channels and nothing else. A channel
+        /// id that is not one -- a `toon-channel` id on either chain, or a
+        /// channel the counterparty opened toward this node -- is refused
+        /// by name, and a `total` (the retired `toon-channel` form) is a
+        /// `400` that says to give `amount`.
+        #[tokio::test]
+        async fn funding_anything_but_an_outbound_x402_channel_is_refused_by_name() {
+            let node = Node::new().await;
+            let inbound = node
+                .counterparty
+                .open(node.this.published_terms(), 1_000)
+                .await
+                .expect("the counterparty opens toward this node");
+            let inbound = inbound.presentation.channel().0.clone();
+            for id in [
+                format!("0x{}", "ab".repeat(32)),
+                "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
+                inbound,
+            ] {
+                let (status, refusal) = node
+                    .write(
+                        &format!("/channels/{id}/fund"),
+                        serde_json::json!({ "amount": 500 }),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{id}");
+                let refusal = refusal.as_str().expect("a text refusal");
+                assert!(
+                    refusal.contains("not an outbound x402 channel of this node")
+                        && refusal.contains("toon-channel funding"),
+                    "{refusal}"
+                );
+            }
+            assert_eq!(node.this.balance(), 10_000, "nothing moved");
+
+            let (status, refusal) = node
+                .write(
+                    &format!("/channels/0x{}/fund", "ab".repeat(32)),
+                    serde_json::json!({ "total": 500 }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let refusal = refusal.as_str().expect("a text refusal");
+            assert!(
+                refusal.contains("give exactly `amount`") && refusal.contains("`total`"),
+                "{refusal}"
+            );
+        }
+
         /// Land the held latest voucher on an inbound channel; landing it
         /// again is a `409` by name, and a channel with none held a `404`.
         #[tokio::test]
@@ -3469,9 +3269,6 @@ mod tests {
             for (created, (path, body)) in
                 (1_000..).zip(channel_writes(&format!("0x{}", "ab".repeat(32))))
             {
-                if path.ends_with("/fund") {
-                    continue;
-                }
                 let body = if body.is_null() {
                     Vec::new()
                 } else {

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Solana Test Validator Entrypoint
 #
-# Loads the payment-channel program into GENESIS at a fixed program id and
+# Loads solana-foundation's `payment-channels` and mainnet's p-token (below),
+# and TOON's own payment-channel program, into GENESIS at fixed program ids and
 # starts the validator. Nothing is deployed after startup and no keypair is
 # needed for any of it.
 #
@@ -57,13 +58,43 @@ trap cleanup TERM INT
 # error to trace back to this line. `make solana-up` depends on solana-build
 # so the supported path never reaches here.
 if [ -f "$PROGRAM_SO" ]; then
-  echo "Loading $PROGRAM_SO into genesis at $PROGRAM_ID"
+  echo "Loading $PROGRAM_SO into genesis at $PROGRAM_ID (boot only, until #1385)"
   set -- --bpf-program "$PROGRAM_ID" "$PROGRAM_SO"
 else
   echo "WARNING: $PROGRAM_SO is missing -- starting with NO payment-channel program."
   echo "WARNING: run 'make solana-build' and recreate this container before settling."
   set --
 fi
+
+# ── The programs a channel actually lives on (ADR 0075 decision 13) ──────────
+# solana-foundation's `payment-channels` at its canonical id, and mainnet-beta's
+# Token program (p-token) at the SPL Token id, from the SAME pinned fixtures the
+# in-process harness loads (`connector_settlement_solana::test_support::
+# SolanaValidator::spawn`, mounted read-only from
+# crates/connector-settlement-solana/fixtures/, whose hashes a test pins). p-token
+# replaces the bundled SPL Token because the latter refuses the `Batch` a
+# two-payout `distribute` sends (#1358); it is a drop-in for every instruction
+# `spl-token` and `infra/solana/create-usdc-mint.sh` send.
+#
+# Every channel under local/ is a `payment-channels` channel. The TOON program
+# above is loaded only because `[settlement.solana] program_id` is still a boot
+# requirement of the connector on this tree -- no channel is ever opened on it.
+#
+# REQUIRED, unlike the TOON program: a validator without them cannot hold a
+# single local channel, and the fixtures are committed, so their absence means
+# a broken mount rather than an unbuilt tree.
+PAYMENT_CHANNELS_ID=CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX
+SPL_TOKEN=TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+for fixture in /fixtures/payment_channels.so /fixtures/p_token.so; do
+  if [ ! -f "$fixture" ]; then
+    echo "ERROR: $fixture is missing -- crates/connector-settlement-solana/fixtures is not mounted." >&2
+    exit 1
+  fi
+done
+echo "Loading payment-channels at $PAYMENT_CHANNELS_ID and p-token at $SPL_TOKEN"
+set -- "$@" \
+  --bpf-program "$PAYMENT_CHANNELS_ID" /fixtures/payment_channels.so \
+  --bpf-program "$SPL_TOKEN" /fixtures/p_token.so
 
 # --limit-ledger-size caps how many shreds the rocksdb ledger retains. NOTE the
 # `solana-test-validator` default is only 10000 shreds (NOT the full validator's

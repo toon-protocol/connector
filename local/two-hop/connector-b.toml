@@ -4,126 +4,102 @@
 # LOCAL / DEV ONLY. `infra/linode-*` owns devnet; nothing here is deployed,
 # published or SSH'd anywhere, and every chain this file names is disposable.
 #
-# B terminates the app's prefix and accepts one peering. It dials nothing --
-# there is no `endpoint` on its `[[peers]]` row -- which on ILP-over-HTTP makes
-# it structurally the payee (peer-carriage-spec.md §6.4): only the dialing side
-# can originate, so packets and debt both flow one way across this peering.
+# B terminates the app's prefix and is paid over the peering. The packet the
+# rehearsal sends is sealed to THIS node's `[signer]` identity, not to A's
+# (ADR 0018): a payload is sealed to the connector that TERMINATES it, and A is
+# a forwarding hop that cannot open it. `connector send`'s `--seal-to` says so.
 #
-# The packet the rehearsal sends is sealed to THIS node's `[signer]` identity,
-# not to A's (ADR 0018): a payload is sealed to the connector that TERMINATES
-# it, and A is a forwarding hop that cannot open it. `connector send`'s
-# `--seal-to` is what says so, and getting it wrong is reported distinctly --
-# "FULFILL WITH THE WRONG FULFILMENT" -- rather than as a decode failure.
+# Like A, B holds no peering row. `local/keys.sh two-hop channels` sends B a
+# signed `POST /peers` naming A's URL, which is how B learns A's voucher signer
+# from A's self-description and binds the channel A opens toward it to the
+# peering (ADR 0075 decision 4). B opens a channel of its own toward A in the
+# same write -- a peering is two one-way channels -- which nothing in this
+# topology ever pays on, since no packet flows from B to A.
 # =============================================================================
 
 client_edge_addr = "0.0.0.0:3000"
 
-# The peer claim ledger's home. This is the node that RECEIVES claims, so this
-# is the file the rehearsal reads to prove the peering was actually paid rather
-# than merely traversed (`peer-claims.log`, written by `ClaimBook`).
+# Where B's inbound vouchers are journaled -- `client-edge-claims.log`, the
+# one book an x402 channel keeps whichever role its vouchers arrive under
+# (`peer-carriage-spec.md` §1.8). It is the file the rehearsal reads to prove
+# the peering was actually paid rather than merely traversed.
 state_dir = "/app/state"
 
 # CF-17: peer carriages ride this node's own listener, told apart from clients
-# by authentication rather than by port -- there is no second socket (ADR 0027).
-# `"http"` rather than `"both"` because this topology dials one carriage; the
-# BTP twin is exercised in-process by `two_connectors_peer.rs`, which runs every
-# assertion over both.
+# by authentication rather than by port -- there is no second socket (ADR
+# 0027). `"http"` because this topology peers over ILP-over-HTTP; the BTP twin
+# is `mixed-chain`'s first hop.
 peer_expose = "http"
+
+# B's own `POST /peers` reads A's self-description at
+# `http://connector-a:3000/ilp`, which is plaintext (CF-18).
+peer_allow_plaintext_endpoints = true
 
 [signer]
 key_file = "/app/data/signer.key"
+
+# What B publishes at `GET /ilp` (ADR 0050): the URL A's `POST /peers` dials,
+# and -- off the `[settlement.evm]` table below -- the x402 terms A opens its
+# channel on and the voucher signer A binds B's by. An http endpoint only, so
+# A peers over ILP-over-HTTP: `POST /peers` prefers BTP wherever a node
+# publishes both, and this topology is the HTTP one.
+[node]
+addresses = ["g.local.two-hop.b"]
+http_endpoint = "http://connector-b:3000/ilp"
 
 # ── The terminated route ─────────────────────────────────────────────────────
 # `stub-app` is the connector image's second binary: it answers `POST /`, holds
 # no secret and performs no cryptography, so it supplies nothing toward the
 # packet's fulfilment -- the connector derives that itself from the sealed
-# request (ADR 0019).
+# request (ADR 0019). The trailing slash on handler_url is load-bearing:
+# `HttpAppClient::deliver` does `handler_url.join(&target)`, and RFC 3986 makes
+# an absolute-path reference REPLACE the base's path.
 #
-# The trailing slash on handler_url is load-bearing. `HttpAppClient::deliver`
-# does `handler_url.join(&target)`, and RFC 3986 makes an absolute-path
-# reference REPLACE the base's path.
+# `price = 1000`: THIS NODE BOTH TERMINATES AND PRICES THIS ROUTE. A peer
+# PREPARE to it must arrive carrying a voucher that advances the channel's
+# watermark by at least the price, or it is refused `F06` with the x402
+# greeting (`peer-carriage-spec.md` §3.1, issue #880). A covers every forward
+# with a voucher BEFORE it is sent (ADR 0042, ADR 0075 decision 6), asking this
+# node's `POST /ilp/claim-state` where its watermark stands -- which is what
+# lets crossing 2 advance past crossing 1 rather than repeat it (issue #1102).
 #
-# `price = 1000`: THIS NODE BOTH TERMINATES AND PRICES THIS ROUTE, which is the
-# whole subject of the topology and is not a shape a peered config here could
-# hold until #1103. A peer PREPARE to a route its payee both terminates and
-# prices must arrive carrying a claim that covers that price, or it is refused
-# `F06` with the x402 greeting (`peer-carriage-spec.md` §3.1, issue #880).
+# The rehearsal sends 1100, A retains its `fee` of 100 and forwards 1000 --
+# exactly this price, so the gate has no slack in either direction.
 #
-# Under ADR 0004's postpay convention -- deleted in issue #1145, and the reason
-# this file could not hold a price before #1103 -- nothing could satisfy that,
-# and the failure was a deadlock rather than a degradation: value moved on
-# fulfilment, so a peering's payer owed nothing until a crossing had fulfilled
-# -- the FIRST crossing therefore carried no claim, was refused, never
-# fulfilled, left nothing owed, and the second carried none either. It never
-# recovered.
-#
-# WHAT BREAKS THE CIRCLE IS ON A, NOT HERE. A holds a `[[pay_channels]]` row
-# (ADR 0042 item 2), which covers each PREPARE *before* it is sent instead of
-# owing for it after it fulfils, so crossing 1 arrives already paid for. See
-# that row for the other half of this arrangement.
-#
-# That row asks THIS node, on every packet, where its claims on the channel
-# stand -- `POST /ilp/claim-state`, the receiver being the only authority on
-# its own watermark. Until #1103 this node answered a channel it holds as a
-# `[[peer_channels]]` row out of its CLIENT-edge book, which no peer claim ever
-# reaches: nonce 0 / cumulative 0 forever, so A re-signed one cumulative amount
-# at a fresh nonce on every packet, each claim was accepted and advanced
-# nothing, and every crossing after the first was refused `F06`,
-# `advanced: 0, shortfall: 1000` (issue #1102). Measured on this topology
-# before the fix, not reasoned about.
-#
-# THE FIGURE IS THE WHOLE OF WHAT A FORWARDS, AND A CHARGES A REAL FEE ON TOP
-# OF IT (issue #1144). The rehearsal sends 1100, A retains its `fee = 100` and
-# forwards 1000 -- exactly this price, so the gate still has no slack in either
-# direction. A claim advancing one unit less than the packet's own value is an
-# `F06` rather than a discount, and an arrival carrying less than this price is
-# an `F03` before the app is ever reached (`handle_peer_prepare`, ADR 0029).
-# The invariant that makes the two numbers fit -- A's `price - fee` is at least
-# this price -- is documented in `connector-a.toml` and enforced by nothing, so
-# it holds because these two files were written together.
-# `local_topologies_load.rs` holds this number, A's `price` and `fee`, and the
-# rehearsal's `--amount`/`PRICE`/`FEE` to one arithmetic; the rehearsal itself
-# then reads this node's claim journal and fails unless every crossing was
-# covered AND A retained exactly its fee.
+# `transport = "btp"`: THE PEER-ROLE PROOF. A CLIENT arriving over
+# ILP-over-HTTP is refused a route pinned to BTP (ADR 0072), and a PEER is not
+# held to a client's pin. A peers with B over HTTP, so a crossing that reaches
+# this route at all arrived in the peer role -- on a voucher from a channel
+# whose signer B bound to the peering. A voucher from an UNBOUND channel is
+# admitted as a client's and would pay this price just as well, so without
+# the pin nothing in the rehearsal could tell a peering from a paying client.
 [[routes]]
 prefix = "g.local.two-hop.b.app"
 handler_url = "http://stub-app:3100/"
 price = 1000
+transport = "btp"
 
-# ── The peering ──────────────────────────────────────────────────────────────
-# The same relation id A writes, and the same secret, from the same file
-# `local/keys.sh` copied into both key directories. No `endpoint`: A dials us.
-[[peers]]
-id = "a-b"
-
-
-# The other half of A's row. Same channel, same EIP-712 domain, and the
-# `counterparty_key` pointed the other way: this is A's SETTLEMENT address,
-# whose signature this node accepts on a claim for this channel -- never the
-# signer address the claim declares about itself (CF-23).
-[[peer_channels]]
-peer_id = "a-b"
-channel_id = "0x57c5462d40a3c60fa89b8fe4f3f24cf560947a413df9a691499e58abea1d63f8"
-counterparty_key = "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc"
-chain_id = 31337
-token_network = "0xCafac3dD18aC6c6e92c921884f9E4176737C052c"
-
-# No `[operator]` section, deliberately (CF-31): an absent table means the
-# surface is not started at all. Nothing sends to this node directly -- the
-# rehearsal hands its packet to A, which is the whole point -- so an operator
-# surface here would be an unused authenticated endpoint with two more key
-# files behind it.
+# The operator surface, because B is now written to: keys.sh's `POST /peers`
+# is what binds A's channel. The bearer token gates reads, `write_keys` is the
+# ed25519 PUBLIC-key allowlist (ADR 0008); both are files keys.sh writes.
+[operator]
+bearer_token_file = "/app/data/operator-bearer-token"
+write_keys_file = "/app/data/operator-write-keys"
 
 # ── Settlement: EVM only ─────────────────────────────────────────────────────
-# The same registry, token and decimals A names. It has to be the same
-# deployment: a claim this node accepts is written against the channel A opened
-# on these contracts, and a node pointed at a different registry cannot resolve
-# it.
+# The same chain, token and EIP-712 domain A names. It has to be: a peering is
+# refused unless both nodes' x402 terms name the same network (`POST /peers`'
+# `NetworkMismatch`), and a voucher is verified against the channel's own
+# config on this chain.
 [settlement.evm]
 rpc_url = "http://anvil:8545"
-contract_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-token_address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+contract_address = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+token_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals = 6
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"
+
+[settlement.evm.batch_settlement]
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"

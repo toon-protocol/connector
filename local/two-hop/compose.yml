@@ -11,12 +11,17 @@
 # means one network, which means the connectors reach the chain and each other
 # by service name -- `anvil:8545`, `connector-b:3000`.
 #
-# This is the containerised counterpart of `crates/connector-bin/tests/
-# two_connectors_peer.rs`, which proves the same peering in-process against an
-# anvil it spawns per test. What that cannot say anything about is the image:
+# This is the containerised counterpart of `crates/connector-cli/tests/
+# peering_from_a_url.rs`, which proves the same x402 peering in-process against
+# an anvil it spawns per test. What that cannot say anything about is the image:
 # two of them, as uid 10001, each with its own mounted config, its own key
 # files and its own state volume, discovering each other over a container
 # network. That is this.
+#
+# The peering itself is not in any file here: `local/keys.sh two-hop channels`
+# establishes it once both nodes are serving, with a signed `POST /peers` on
+# each end (ADR 0075 decision 4). See local/README.md, "How a peering is
+# established here".
 # =============================================================================
 
 services:
@@ -123,48 +128,28 @@ services:
   # Its own profile so `up` never starts it: a one-shot that exits 0 or 1, run
   # by `make local-rehearse` via `docker compose run --rm`.
   #
-  # TWO packets, and NOT for the reason a postpay peering needed two. Under the
-  # deleted postpay convention (ADR 0004, gone in issue #1145) a peering owed
-  # after the fact and could not pay for its own first crossing, so a rehearsal
-  # sent one packet to prove DELIVERY and a second to carry the claim covering
-  # it. Nothing owes after the fact now: A holds a `[[pay_channels]]` row (ADR
-  # 0042 item 2, required since #1145) and covers each PREPARE BEFORE it is
-  # sent, so crossing 1 arrives already paid for. That is exactly what lets B
-  # price the route it terminates, and pricing it is what this topology is for.
+  # First the chain: A's channel toward B is read off `x402BatchSettlement`
+  # itself and must still hold the collateral keys.sh topped it up to, before
+  # anything is sent -- so a failure names the missing collateral rather than
+  # a puzzling voucher further down.
   #
-  # The second crossing is what makes this a measurement rather than a
-  # demonstration, because it is the one issue #1102 broke. A covering payer
-  # asks the payee where its claims stand on every packet, and a payee that
-  # answers out of the wrong book says nonce 0 / cumulative 0 forever -- so
-  # crossing 2 re-signs crossing 1's cumulative amount at a fresh nonce,
-  # advances nothing, and is refused `F06`. One crossing cannot see that; two
-  # can, and did.
+  # Then TWO packets. A covers each PREPARE with a voucher BEFORE it is sent
+  # (ADR 0042, ADR 0075 decision 6), so crossing 1 arrives already paid for --
+  # which is what lets B price the route it terminates. The second crossing is
+  # what makes this a measurement rather than a demonstration, because it is
+  # the one issue #1102 broke: a covering payer asks the payee where its
+  # watermark stands, and a payee answering out of the wrong book reports zero
+  # forever -- so crossing 2 re-signs crossing 1's amount, advances nothing,
+  # and is refused `F06`. One crossing cannot see that; two can.
   #
-  # Then the money is asserted from B's own claim journal, because the exit
-  # status is not enough on its own. #1101 proved that by breaking this
-  # peering's EIP-712 `chain_id` and watching every packet still FULFILL: a
-  # peer claim's verdict rides back in `Toon-Claim-Ack` and never gates the
-  # packet (`handle_peer_prepare` -- the ack and the answer are separate). A
-  # priced termination does turn an UNCOVERED arrival into an F06 the sender
-  # sees, but nothing in this container can check that the price is still
-  # there to be paid; `local_topologies_load.rs` holds PRICE, AMOUNT and both
-  # committed configs to one figure, which is the half this container cannot
-  # do. What this container CAN read is what B wrote down -- every accepted
-  # claim on the peering's channel and what each one actually advanced -- and
-  # that advance is the exact quantity the coverage gate charges against
-  # (`price_gate::payment_required`). So that is what is asserted: fewer
-  # accepted claims than crossings, or any one of them advancing less than the
-  # price, fails the run. A claim that merely EXISTS proves nothing here --
-  # that is what a `nonce 2 -> 1000` repeat is.
+  # Every crossing reaching B's route at all is ALSO the peer-role proof:
+  # that route is pinned to BTP (connector-b.toml) and A peers over HTTP, so
+  # only a voucher on a channel B bound to the peering gets through.
   #
-  # And since #1144 the same journal answers the other half of the money
-  # question: WHAT A KEPT. A collects the packet's `AMOUNT` and its claim to B
-  # advances by what it forwarded, so `AMOUNT - advance` is this hop's earnings
-  # -- ADR 0010's rule ("the difference between the cumulative it receives from
-  # upstream and the cumulative it sends downstream") measured on a running
-  # image rather than restated from A's config. It must equal A's `fee`
-  # exactly, in both directions: keeping less than it charges is a hop working
-  # for free, keeping more is a hop eroding what it passes on.
+  # Then B's own journal (local/rehearsal.sh's `paid`): exactly one voucher
+  # per crossing on A's channel, each advancing B's watermark by exactly the
+  # PRICE A forwarded -- so A kept exactly its FEE of the AMOUNT it collected,
+  # ADR 0010's earnings rule measured on a running image.
   sender:
     image: connector-rust:local
     profiles: [sender]
@@ -172,24 +157,29 @@ services:
     command:
       - |
         set -e
-        # The five figures this rehearsal is written around, and the arithmetic
+        . /app/rehearsal.sh
+        # The figures this rehearsal is written around, and the arithmetic
         # that relates them (ADR 0028, ADR 0010, issue #1144):
         #
         #   AMOUNT = FEE + PRICE -- the path's COST (`CONTEXT.md`): A's fee for
         #     carrying the packet plus the price of the route B terminates. It
-        #     is also exactly A's own client-edge `price`, which is ADR 0028's
-        #     intended `amount == price`.
+        #     is also exactly A's own client-edge `price` for the prefix.
         #   PRICE  -- B's committed price, and therefore the whole of what A
         #     forwards, so the coverage gate has no slack.
-        #   FEE    -- A's committed fee, and what A must be left holding: the
-        #     difference between what it collected and what it forwarded is
-        #     ADR 0010's earnings rule, measured below rather than assumed.
+        #   FEE    -- A's fee on the peering (keys.sh's table), and what A must
+        #     be left holding.
+        #   DEPOSIT -- what keys.sh topped A's channel up to.
         AMOUNT=1100
         PRICE=1000
         FEE=100
         CROSSINGS=2
-        CHANNEL=0x57c5462d40a3c60fa89b8fe4f3f24cf560947a413df9a691499e58abea1d63f8
-        JOURNAL=/app/payee-state/peer-claims.log
+        DEPOSIT=100000000
+        if [ "$$((AMOUNT - PRICE))" != "$$FEE" ]; then
+          echo "AMOUNT - PRICE is not FEE: this rehearsal's own figures disagree." >&2
+          exit 1
+        fi
+        CHANNEL=$$(peering_key a-b)
+        channel_holds "$$CHANNEL" "$$DEPOSIT" a-b
         send() {
           /usr/local/bin/connector send \
             --operator     http://connector-a:3000 \
@@ -203,69 +193,18 @@ services:
         }
         echo '--- crossing 1: priced at B, covered by A before it is sent'
         send
-        echo '--- crossing 2: the covering claim must ADVANCE, not repeat'
+        echo '--- crossing 2: the covering voucher must ADVANCE, not repeat'
         send
-
-        if [ ! -f "$$JOURNAL" ]; then
-          echo "B kept no claim journal at $$JOURNAL, so nothing was ever accepted and" >&2
-          echo "both crossings were carried for free." >&2
-          exit 1
-        fi
-        echo "--- what B was actually paid, out of B's own claim journal"
-        # One line per accepted claim on this channel, in the order ClaimBook
-        # wrote them: `inbound_claim_accepted <channel> <nonce> <cumulative>
-        # <signature>`, tab separated (`connector_runtime::journal`).
-        if ! awk -F '\t' -v channel="$$CHANNEL" -v price="$$PRICE" -v crossings="$$CROSSINGS" \
-                 -v amount="$$AMOUNT" -v fee="$$FEE" '
-              $$1 == "inbound_claim_accepted" && $$2 == channel {
-                accepted = accepted + 1
-                advance = $$4 - cumulative
-                retained = amount - advance
-                printf "    claim %d: nonce %s, cumulative %s, advance %d, A retained %d\n", accepted, $$3, $$4, advance, retained
-                if (advance < price) {
-                  printf "    ^^ that advance does not cover the %d this route costs\n", price
-                  short = 1
-                }
-                # ADR 0010 stated as a measurement rather than as a
-                # restatement of the config: a hops earnings are the
-                # difference between what it collected upstream and what it
-                # sent downstream, and that difference must be its fee
-                # EXACTLY. Two figures from two places -- what the sender
-                # actually put on the wire, and what B wrote in its own
-                # journal -- so a fee silently dropped, doubled, or turned
-                # into a share of the amount all land here. Not implied by
-                # the advance check above: an advance of price + 1 satisfies
-                # that one and means A retained a unit less than it charges.
-                if (retained != fee) {
-                  printf "    ^^ A collected %d and forwarded %d, so it kept %d -- not the %d fee it charges\n", amount, advance, retained, fee
-                  earnings = 1
-                }
-                cumulative = $$4
-              }
-              END {
-                if (accepted < crossings) {
-                  printf "B accepted %d claims on this channel, but %d crossings were sent and every one of them had to be paid for\n", accepted, crossings
-                  exit 1
-                }
-                if (short || earnings) { exit 1 }
-                if (cumulative < crossings * price) {
-                  printf "the watermark on this channel stands at %d, and %d crossings at %d each is %d\n", cumulative, crossings, price, crossings * price
-                  exit 1
-                }
-                printf "    watermark %d = %d crossings x %d, and A kept %d x %d = %d of the %d it collected\n", cumulative, crossings, price, crossings, fee, crossings * fee, crossings * amount
-              }
-            ' "$$JOURNAL"; then
-          echo 'the priced peer termination was NOT paid for -- see the claim lines above.' >&2
-          echo '--- B/peer-claims.log follows ---' >&2
-          cat "$$JOURNAL" >&2
-          exit 1
-        fi
-        echo "--- the peering paid B for every crossing it carried"
+        paid /app/payee-state "$$CHANNEL" B "$$CROSSINGS" "$$PRICE"
+        echo "--- the peering paid B $$PRICE for each of $$CROSSINGS crossings; A kept $$FEE of each $$AMOUNT"
     volumes:
       # A's keys: the sender signs the operator write with A's allowlisted key
       # and posts the fixture body from the same directory.
       - ./local/.keys/two-hop/connector-a:/app/data:ro
-      # B's state volume, READ-ONLY, purely to read the claim journal. The
+      # The peerings keys.sh established on this run -- each one's channel key.
+      - ./local/.keys/two-hop/peerings:/app/peerings:ro
+      - ./local/rehearsal.sh:/app/rehearsal.sh:ro
+      # B's state volume, READ-ONLY, purely to read its voucher journal. The
       # sender runs as the same uid 10001 that wrote it.
       - two-hop-b-state:/app/payee-state:ro
 

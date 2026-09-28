@@ -144,9 +144,9 @@ pub enum PeerRouteTableError {
 }
 
 /// What can go wrong driving a payment channel's lifecycle through
-/// [`Connector::open_channel`]/[`Connector::fund_channel`]/
-/// [`Connector::close_channel`] (issue #459). [`Settlement`] carries
-/// through whatever the configured [`SettlementBackend`] itself reported;
+/// [`Connector::open_channel`] and [`Connector::channel_view`] (issue
+/// #459). [`Settlement`] carries through whatever the configured
+/// [`SettlementBackend`] itself reported;
 /// [`NoSettlementBackend`] is this crate's own -- a channel operation
 /// reaching a node with none configured (ADR 0009: a node that never names
 /// one in its config simply never gets a working channel surface, rather
@@ -4191,15 +4191,6 @@ impl Connector {
         self.settlement_on(chain)
     }
 
-    /// The chain a `toon-channel` write on `channel_id` would reach, by
-    /// [`Self::settlement_chain_for_channel`]'s rule, or `None` when no
-    /// backend would take it. What the operator surface refuses an EVM
-    /// `toon-channel` top-up by (ADR 0075, #1378).
-    #[must_use]
-    pub fn toon_channel_chain(&self, channel_id: &str) -> Option<SettlementChain> {
-        self.settlement_chain_for_channel(channel_id).ok()
-    }
-
     /// The chain whose backend [`Self::settlement_for_channel`] routes
     /// `channel_id` to, by the same rule: the one backend on a node with one,
     /// the id's own namespace otherwise.
@@ -4252,35 +4243,6 @@ impl Connector {
             .expect("known channels lock poisoned")
             .push((chain, id.clone()));
         let state = settlement.channel_state(&id).await?;
-        Ok(ChannelView::from(state))
-    }
-
-    /// Deposit `amount` into `channel_id` (issue #459), on whichever chain
-    /// the id itself names ([`Self::settlement_for_channel`]).
-    pub async fn fund_channel(
-        &self,
-        channel_id: &str,
-        amount: u128,
-    ) -> Result<ChannelView, ChannelOperationError> {
-        let state = self
-            .settlement_for_channel(channel_id)?
-            .fund(&ChannelId(channel_id.to_string()), amount)
-            .await?;
-        Ok(ChannelView::from(state))
-    }
-
-    /// Raise this node's own deposit in `channel_id` to `own_total`, on
-    /// whichever chain the id names: the retry-safe form of
-    /// [`Self::fund_channel`] (ADR 0073, `SettlementBackend::fund_to`).
-    pub async fn fund_channel_to(
-        &self,
-        channel_id: &str,
-        own_total: u128,
-    ) -> Result<ChannelView, ChannelOperationError> {
-        let state = self
-            .settlement_for_channel(channel_id)?
-            .fund_to(&ChannelId(channel_id.to_string()), own_total)
-            .await?;
         Ok(ChannelView::from(state))
     }
 
@@ -8623,22 +8585,22 @@ mod tests {
             let connector = both_chains_connector();
 
             assert_eq!(
-                backend_reached(connector.fund_channel(EVM_CHANNEL, 5).await),
-                "evm: fund"
+                backend_reached(connector.channel_view(EVM_CHANNEL).await),
+                "evm: channel_state"
             );
             assert_eq!(
-                backend_reached(connector.fund_channel(SOLANA_CHANNEL, 5).await),
-                "solana: fund"
+                backend_reached(connector.channel_view(SOLANA_CHANNEL).await),
+                "solana: channel_state"
             );
             // A bare (un-`0x`-prefixed) hex id is the same EVM namespace,
             // exactly as `EvmSettlementBackend::parse_channel_id` accepts.
             assert_eq!(
                 backend_reached(
                     connector
-                        .fund_channel(EVM_CHANNEL.trim_start_matches("0x"), 5)
+                        .channel_view(EVM_CHANNEL.trim_start_matches("0x"))
                         .await
                 ),
-                "evm: fund"
+                "evm: channel_state"
             );
         }
 
@@ -8680,12 +8642,12 @@ mod tests {
                 .with_settlement(SettlementChain::Evm, Arc::new(TaggedBackend("evm")));
 
             assert_eq!(
-                backend_reached(connector.fund_channel("7", 5).await),
-                "evm: fund"
+                backend_reached(connector.channel_view("7").await),
+                "evm: channel_state"
             );
             assert_eq!(
-                backend_reached(connector.fund_channel(SOLANA_CHANNEL, 5).await),
-                "evm: fund"
+                backend_reached(connector.channel_view(SOLANA_CHANNEL).await),
+                "evm: channel_state"
             );
             assert_eq!(
                 backend_reached(
@@ -8727,7 +8689,7 @@ mod tests {
         async fn an_id_in_no_namespace_is_not_found_on_a_both_chains_node() {
             let connector = both_chains_connector();
 
-            let result = connector.fund_channel("not-any-chains-shape", 5).await;
+            let result = connector.channel_view("not-any-chains-shape").await;
             assert!(matches!(
                 result,
                 Err(ChannelOperationError::Settlement(

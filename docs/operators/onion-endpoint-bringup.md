@@ -63,8 +63,8 @@ make local-verify LOCAL_TOPOLOGY=onion
 ```
 
 It is the same shape as the deployment below, with `local/keys.sh onion` playing the operator for
-the one manual step — it starts the sidecars, reads the generated address out of the daemon's
-`hostname` file, and renders it into the configs compose mounts. On a real box, that copying is
+the one manual step — it starts the sidecars, reads each generated address out of its daemon's
+`hostname` file, and renders them into the configs compose mounts. On a real box, that copying is
 yours.
 
 ## Carriage, and what is unchanged
