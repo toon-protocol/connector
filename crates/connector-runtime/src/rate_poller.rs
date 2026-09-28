@@ -552,9 +552,6 @@ mod tests {
     /// A real Raydium account address: a base58 32-byte pool name, which is
     /// all `canonical_pool` asks of a Solana pool.
     const POOL_SOL_DEALT_NUMERAIRE: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
-    /// The payment-channel program id `local/dealing` names -- a
-    /// `[settlement.solana]` table needs one, and nothing here dials it.
-    const SOL_PROGRAM_ID: &str = "HY4AYFNe5Vg5BkEwAURNsGY3uFAvGMNpAQPRtgoasJiR";
 
     fn asset(text: &str) -> AssetId {
         text.parse::<AssetId>().expect("a declared asset")
@@ -941,7 +938,6 @@ max_move = {{ numerator = 5, denominator = 100 }}
             state_dir = state_dir.display(),
             key_file = key_file.display(),
             usdc = USDC.trim_start_matches("evm:"),
-            program_id = SOL_PROGRAM_ID,
             sol_numeraire = SOL_NUMERAIRE.trim_start_matches("solana:"),
             sol_numeraire_asset = SOL_NUMERAIRE,
             sol_dealt = SOL_DEALT,

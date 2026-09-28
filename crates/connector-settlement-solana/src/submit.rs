@@ -42,7 +42,6 @@ use solana_sdk::signature::Signature;
 use solana_sdk::transaction::TransactionError;
 use solana_transaction_status_client_types::UiTransactionEncoding;
 
-use connector_settlement::SettlementError;
 
 /// How [`send_and_confirm`] paces itself.
 #[derive(Debug, Clone, Copy)]
@@ -107,12 +106,6 @@ pub(crate) enum SubmitError {
         waited_secs: u64,
         last_error: String,
     },
-}
-
-impl From<SubmitError> for SettlementError {
-    fn from(error: SubmitError) -> SettlementError {
-        SettlementError::Backend(error.to_string())
-    }
 }
 
 /// Send `transaction` (already signed over a blockhash whose

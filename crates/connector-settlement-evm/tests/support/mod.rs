@@ -3,7 +3,7 @@
 
 // Each integration-test binary compiles this module separately and uses a
 // different subset of it -- `anvil_gate_smoke` needs only `require_anvil`,
-// while `contract_suite` and `gas_and_nonce` need the `Anvil` harness. Under
+// while `boot_survives_a_lost_round_trip` needs the `Anvil` harness. Under
 // clippy's `-D warnings` on `--all-targets`, whatever a given binary does not
 // touch is a hard `dead_code` error, so the standard shared-support-module
 // allow is required here rather than optional.
@@ -55,77 +55,11 @@ pub fn require_anvil() -> bool {
     false
 }
 
-/// True if `forge --version` runs successfully.
-pub fn forge_available() -> bool {
-    command_version_check("forge")
-}
-
-/// The `forge` twin of [`require_anvil`], for tests that build
-/// `packages/contracts` rather than talk to a running chain (issue #572's
-/// ABI-provenance check). Same CI-vs-local policy: a fresh CI job installs
-/// Foundry (see `.github/workflows/ci.yml`'s `rust-gate` job) and must
-/// fail loudly rather than silently skip if that install regresses; a
-/// local run without Foundry just skips.
-pub fn require_forge() -> bool {
-    if forge_available() {
-        return true;
-    }
-
-    if std::env::var_os("CI").is_some() {
-        panic!(
-            "forge is not on PATH, but CI is set -- the Rust Workspace Gate must install \
-             Foundry (foundry-rs/foundry-toolchain) before this crate's tests run. Refusing to \
-             silently skip and report success here; see issue #471's precedent for anvil."
-        );
-    }
-
-    eprintln!(
-        "skipping: forge is not on PATH (install Foundry: https://getfoundry.sh) -- this test \
-         builds packages/contracts and only skips because this is not a CI run"
-    );
-    false
-}
-
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use ethers::providers::{Http, Middleware, Provider};
-use libsecp256k1::{Message, SecretKey};
-
-/// `Anvil::spawn`'s own default chain id (`--chain-id 31337` above), and so
-/// the EIP-712 domain a claim against its deployed `TokenNetwork` must be
-/// signed under.
-pub const ANVIL_CHAIN_ID: u64 = 31_337;
-
-/// The inverse of `EvmSettlementBackend`'s own `format_channel_id` --
-/// `TokenNetwork`'s channel id as the `[u8; 32]` an `EvmBalanceProof` signs
-/// over.
-pub fn channel_id_bytes(id: &str) -> [u8; 32] {
-    let hex_digits = id.trim_start_matches("0x");
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex_digits[i * 2..i * 2 + 2], 16)
-            .expect("channel id is 0x-prefixed 64-hex");
-    }
-    out
-}
-
-/// Sign `digest` exactly the way the production peer-role/client-edge
-/// signing path does (`connector_signer::crypto::sign_digest`): a 65-byte
-/// `r || s || v` signature with `v` in libsecp256k1's raw `{0, 1}` range,
-/// *not* the `{27, 28}` an EVM wallet would append. `EvmSettlementBackend`
-/// itself normalizes that before submitting to `claimFromChannel` (issue
-/// #590) -- a test signing the wallet range here would paper over that
-/// normalization never being exercised.
-pub fn sign_evm(secret: &SecretKey, digest: &[u8; 32]) -> Vec<u8> {
-    let message = Message::parse(digest);
-    let (signature, recovery_id) = libsecp256k1::sign(&message, secret);
-    let mut bytes = signature.serialize().to_vec();
-    let recovery_byte: u8 = recovery_id.into();
-    bytes.push(recovery_byte);
-    bytes
-}
 
 /// Anvil's first well-known dev account -- the same one
 /// `packages/contracts/script/DeployLocal.s.sol` already uses as its

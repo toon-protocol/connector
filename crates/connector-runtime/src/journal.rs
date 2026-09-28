@@ -54,7 +54,7 @@ pub trait Journal: Send + Sync {
 }
 
 /// An in-process, non-durable [`Journal`] (ADR 0007's fake, not a mock --
-/// real behavior, just not backed by a disk). This is `ClaimBook`'s default:
+/// real behavior, just not backed by a disk). This is a book's default:
 /// a node that never configures a real journal keeps working exactly as it
 /// did before issue #424, just as a node with no settlement backend keeps
 /// working with `settlement: None`. Nothing here survives a restart.

@@ -1,9 +1,8 @@
 //! Proves the CI/local anvil gate end to end (issue #471): when anvil is available, this test
 //! spawns a real instance and answers a real JSON-RPC call, taking non-zero time -- not a
 //! 0.00s early return that reports `passed` without exercising anything. The real settlement
-//! suite (opening/funding/closing a channel against `TokenNetwork`, reached through a
-//! `TokenNetworkRegistry`) is `tests/contract_suite.rs`'s own scope; this only proves the gate
-//! that suite depends on.
+//! suites (`tests/batch_settlement.rs`, `tests/batch_settlement_paying.rs`) are their own
+//! scope; this only proves the gate they depend on.
 
 mod support;
 

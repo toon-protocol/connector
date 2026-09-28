@@ -41,23 +41,20 @@ pub use batch_channels::{
     receiver_terms, BatchChannelError, BatchChannelView, BatchChannelViewStatus, BatchChannels,
     ChannelDirection, OutboundChannels, WithdrawStep,
 };
-pub use claim::{
-    ClaimAckOutcome, ClaimBook, ClaimRejectReason, ClaimSignature, Covering, WireClaim,
-};
+pub use claim::{ClaimAckOutcome, ClaimRejectReason, Covering};
 pub use clock::{Clock, SystemClock, TestClock};
 pub use connector::{
-    ChannelOperationError, ClientRouteFacts, ClientRouteKind, ClientRoutePrice, ConfigPeeringError,
+    ClientRouteFacts, ClientRouteKind, ClientRoutePrice, ConfigPeeringError,
     Connector, LeaseRouteError, PeerRouteTableError, ProbeDenied,
 };
 // Re-exported for callers that hold a `Connector` but not a config-crate
-// dependency of their own (`connector-operator`): the chain key
-// `Connector::with_settlement` files a settlement backend under, and
-// `Connector::open_channel` names a backend by.
+// dependency of their own (`connector-operator`): the chain key an x402
+// channel and its settlement backend are filed under.
 pub use connector_config::{SettlementChain, UnknownSettlementChain};
 pub use journal::{FileJournal, InMemoryJournal, Journal, JournalError};
 pub use metrics::Metrics;
 pub use operator_view::{
-    ChannelView, ChannelViewStatus, ClaimBookKind, ClaimDirection, ClaimScheme, ClaimView,
+    ClaimBookKind, ClaimDirection, ClaimScheme, ClaimView,
     DeclaredRates, LeasedRouteView, PeerRouteView, PeerView, RateView, RateViewState,
     RefusedRefreshView, RouteSource, RouteView,
 };

@@ -46,7 +46,7 @@
 //! implementation's job.
 
 use async_trait::async_trait;
-use connector_domain::client_claim::{EVM_NAMESPACE, SOLANA_NAMESPACE};
+use connector_domain::client_claim::{canonical_channel_key, EVM_NAMESPACE, SOLANA_NAMESPACE};
 use connector_domain::JournalEntry;
 use connector_runtime::JournalError;
 use connector_signer::{BatchChannelConfig, BatchSettlementDomain};
@@ -244,9 +244,115 @@ pub fn journaled_batch_channels(
     Ok(channels)
 }
 
+/// The channel of the first `toon-channel` entry in a claim journal, or
+/// `None` when it holds only vouchers (ADR 0075 decision 8, issue #1385).
+///
+/// A journal an older build wrote may hold claims on TOON's own channels:
+/// the peer book's (`peer-claims.log`), and a pre-ADR 0075 client's in the
+/// client edge's book. This build can neither judge, land nor drain one, so
+/// the runtime refuses such a journal at boot, by name, rather than skip
+/// entries somebody could still redeem.
+///
+/// A `toon-channel` entry is one only TOON's channels ever produced -- an
+/// `OutboundClaimSigned` or an `InboundFulfillmentRecorded` -- or a claim
+/// entry (`InboundClaimAccepted`, `InboundClaimRolledBack`,
+/// `InboundClaimWatermarkReset`) on a channel the journal never admitted as
+/// an x402 channel: the gate journals a voucher channel's
+/// `BatchChannelAdmitted` with, and immediately before, its first accepted
+/// voucher, so a claim on a channel with none is not a voucher's.
+pub fn first_toon_channel_entry(entries: &[JournalEntry]) -> Option<String> {
+    let admitted: std::collections::HashSet<String> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            JournalEntry::BatchChannelAdmitted { channel_id, .. } => {
+                Some(canonical_channel_key(channel_id))
+            }
+            _ => None,
+        })
+        .collect();
+    entries.iter().find_map(|entry| match entry {
+        JournalEntry::OutboundClaimSigned { channel_id, .. }
+        | JournalEntry::InboundFulfillmentRecorded { channel_id, .. } => Some(channel_id.clone()),
+        JournalEntry::InboundClaimAccepted { channel_id, .. }
+        | JournalEntry::InboundClaimRolledBack { channel_id, .. }
+        | JournalEntry::InboundClaimWatermarkReset { channel_id }
+            if !admitted.contains(&canonical_channel_key(channel_id)) =>
+        {
+            Some(channel_id.clone())
+        }
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR 0075 decision 8: a journal of vouchers alone holds no
+    /// `toon-channel` entry, whatever else it records about them.
+    #[test]
+    fn a_voucher_journal_holds_no_toon_channel_entry() {
+        let channel = evm();
+        let key = channel.channel_key();
+        let entries = vec![
+            channel.clone().to_entry(),
+            JournalEntry::InboundClaimAccepted {
+                channel_id: key.clone(),
+                nonce: connector_domain::VOUCHER_WATERMARK_NONCE,
+                cumulative_amount: 10,
+                signature: vec![1; 65],
+            },
+            JournalEntry::InboundClaimWatermarkReset { channel_id: key },
+            JournalEntry::OutboundVoucherSigned {
+                channel_id: "evm:0x01".to_string(),
+                cumulative_amount: 5,
+            },
+        ];
+        assert_eq!(first_toon_channel_entry(&entries), None);
+        assert_eq!(first_toon_channel_entry(&[]), None);
+    }
+
+    /// A claim on a channel the journal never admitted as an x402 channel is
+    /// a `toon-channel` claim, and so is every entry kind only TOON's
+    /// channels produced. Each is named by its channel.
+    #[test]
+    fn a_toon_channel_entry_is_found_and_named() {
+        let voucher = evm();
+        let toon = format!("0x{}", "ab".repeat(32));
+        for entry in [
+            JournalEntry::InboundClaimAccepted {
+                channel_id: toon.clone(),
+                nonce: 3,
+                cumulative_amount: 90,
+                signature: vec![0; 65],
+            },
+            JournalEntry::InboundClaimWatermarkReset {
+                channel_id: toon.clone(),
+            },
+            JournalEntry::InboundClaimRolledBack {
+                channel_id: toon.clone(),
+                nonce: 2,
+                cumulative_amount: 40,
+            },
+            JournalEntry::OutboundClaimSigned {
+                peer_id: "peer-b".to_string(),
+                channel_id: toon.clone(),
+                nonce: 2,
+                cumulative_amount: 150,
+            },
+            JournalEntry::InboundFulfillmentRecorded {
+                channel_id: toon.clone(),
+                amount: 7,
+            },
+        ] {
+            let entries = vec![voucher.clone().to_entry(), entry.clone()];
+            assert_eq!(
+                first_toon_channel_entry(&entries),
+                Some(toon.clone()),
+                "{entry:?}"
+            );
+        }
+    }
 
     fn evm() -> JournaledBatchChannel {
         JournaledBatchChannel::Evm {
