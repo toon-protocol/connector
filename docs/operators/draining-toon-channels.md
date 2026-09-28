@@ -26,11 +26,19 @@ apply to you: upgrade normally.
 
 ## What the boot refusal looks like
 
+The node prints this to stderr and exits 1, naming whichever journal file and
+channel it found (`RuntimeError::ToonChannelJournal`,
+`crates/connector-cli/src/runtime.rs`):
+
 ```
-ERROR: peer-claims.log holds a toon-channel entry for channel 0x… . This build
-       no longer settles TOON channels (ADR 0075). Drain the node on the last
-       TOON-capable release before upgrading -- see
-       docs/operators/draining-toon-channels.md.
+the claim journal at /app/state/peer-claims.log holds toon-channel entries
+(channel '0x…'), and this build settles on x402 channels only (ADR 0075,
+issue #1385): it can neither land nor drain a claim on TOON's own channels.
+Drain the node on the last release that supports TOON channels -- land every
+inbound channel's latest claim, close and settle every TOON channel, confirm
+on chain none is still open (ADR 0075, "Draining a node with live TOON
+channels"; docs/operators/draining-toon-channels.md) -- then move this
+journal out of state_dir and start this build
 ```
 
 The same refusal fires on `client-edge-claims.log`. Either way, the node does

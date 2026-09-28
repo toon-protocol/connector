@@ -404,45 +404,6 @@ Turning the vouchers you collect into money on chain is
 [the operator surface](#the-operator-surface)'s job. Before you rely on this,
 know what it costs and what you are trusting:
 
-- **EVM.** The client picks its own `payer` and `salt`. `receiver` and
-  `receiverAuthorizer` must both be your settlement address, `token` must be your
-  token, and `withdrawDelay` must be at least your minimum. `payerAuthorizer`
-  must be **nonzero**. That last rule is stricter than x402, which allows a zero
-  one, and the greeting has no field to say so. A channel with a zero one is
-  refused on its first voucher. The client deposits through any x402 facilitator.
-  x402.org's facilitator relays deposits on Base Sepolia and pays their gas, but
-  only a token with ERC-3009 skips the payer's one-time `approve`, and devnet
-  USDC has ERC-3009. The first voucher on a channel your node has not seen carries
-  the full `channelConfig`, and the node recomputes the channel id from it.
-- **Solana.** The client builds an `open` in which your settlement key is the fee
-  payer, `rent_payer` and `payee`. It signs it and posts it to
-  `POST /ilp/batch-settlement/solana/open`, which the greeting names as
-  `extra.sponsorEndpoint`. The node checks every field, co-signs, submits, waits
-  for the channel to confirm, and admits it. This endpoint is **public** and
-  unauthenticated, because the buyer is a stranger with no channel yet. Its
-  limits are what it will sign, a cap of 8 sponsorships in flight and 1 per payer,
-  and an hourly budget of failed opens. Only SPL Token mints are accepted:
-  Token-2022 is refused.
-
-**How vouchers are checked.** A voucher has no nonce. It is accepted only if its
-amount is **strictly greater** than the last one accepted on that channel, by at
-least the route's charge. A replayed voucher buys nothing. A packet to a free
-route carries no voucher at all. A Solana voucher with a nonzero `expiresAt` is
-refused. A client that lost track of its last voucher asks
-`POST /ilp/claim-state` with `"scheme": "batch-settlement"` to learn the amount
-it has to beat.
-
-**How you get paid.** Automatically, with no operator write. On EVM, the node
-claims every held voucher in one `claim` and then `settle`s to your address every
-ten minutes. It also watches for `WithdrawInitiated`, and the moment a payer
-starts a withdrawal it claims that channel's latest voucher. That matters because
-only the amount already claimed on chain survives the withdrawal. On Solana, the
-node `settle`s open channels every ten minutes. It rediscovers its sponsored
-channels from the chain every ten seconds. On a closing channel it lands the
-latest voucher with `settle_and_seal` inside the grace period, then
-`distribute`s, then `reclaim`s the rent. The one-day minimum delay is how long a
-delayed or censored transaction still has to land.
-
 - **One way per channel.** Value moves one way on a channel. To pay a client
   back, open a channel of your own toward the terms it publishes
   (`POST /channels`); its payouts arrive as vouchers on that channel.
@@ -713,7 +674,11 @@ lands in `git status`:
 ```bash
 export REPO=/path/to/connector       # this clone
 export LAB=~/peering-lab             # anywhere else
-export IMAGE=ghcr.io/toon-protocol/connector:rust-2026.08.28.1
+# `rust-main` floats on every green build of main -- fine for a scratch trial
+# like this one, never for a deployment (see step 1). Pin a release handle
+# instead once one has shipped this lab's config shape; check
+# deploy/connector-rust/README.md's tag table for the newest.
+export IMAGE=ghcr.io/toon-protocol/connector:rust-main
 mkdir -p "$LAB"
 
 docker pull $IMAGE     # ~1 min the first time; everything below assumes it is here
@@ -909,12 +874,12 @@ to the packet's fulfilment. Both nodes join the network anvil is already on:
 ```yaml
 services:
   stub-app:
-    image: ghcr.io/toon-protocol/connector:rust-2026.08.28.1
+    image: ghcr.io/toon-protocol/connector:rust-main
     entrypoint: ['/usr/local/bin/stub-app']
     command: ['0.0.0.0:3100']
 
   node-a:
-    image: ghcr.io/toon-protocol/connector:rust-2026.08.28.1
+    image: ghcr.io/toon-protocol/connector:rust-main
     command: ['/app/config/connector.toml']
     volumes:
       - ./node-a/connector.toml:/app/config/connector.toml:ro
@@ -931,7 +896,7 @@ services:
       retries: 15
 
   node-b:
-    image: ghcr.io/toon-protocol/connector:rust-2026.08.28.1
+    image: ghcr.io/toon-protocol/connector:rust-main
     command: ['/app/config/connector.toml']
     volumes:
       - ./node-b/connector.toml:/app/config/connector.toml:ro
