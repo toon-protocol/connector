@@ -154,8 +154,9 @@ connector refused to start and sent you here, find your error message below.
 | `[[pay_channels]]` `channel_id`, `channel_account`, `chain_id`, `token_network`                                    | `outbound_channel` — an x402 channel this node opened (ADR 0075, issue #1380)                                              |
 
 All are **hard, named errors**, never a silent ignore. A `toon-channel` field is refused naming it
-and ADR 0075's drain procedure: a node still holding live `toon-channel` peer channels drains them on
-the last TOON-capable release first — there is no in-place migration of a channel. The devnet boxes run bind-mounted configs
+and [ADR 0075's drain procedure](draining-toon-channels.md): a node still holding live `toon-channel`
+peer channels drains them on the last TOON-capable release first — there is no in-place migration of
+a channel. The devnet boxes run bind-mounted configs
 that lead the repo copies, so a stale file has to stop the node rather than come up looking healthy
 and never peer.
 
@@ -287,8 +288,8 @@ after a lost journal.
 also a `[[peer_channels]]` `inbound_channel` is `ChannelInBothDirections`: an x402 channel moves
 value one way, so this node is either its payer or its receiver.
 
-**Both rows need the chain's `batch_settlement` sub-table** (`PeerChannelWithoutX402`,
-`PayChannelWithoutX402`), per chain and no wider: that sub-table is what makes this node take part
+**Both rows need the chain's `[settlement.<chain>]` table** (`PeerChannelWithoutX402`,
+`PayChannelWithoutX402`), per chain and no wider: that table is what makes this node take part
 in x402 channels on the chain at all, and without it no channel the peer opens could be admitted and
 no voucher could be signed.
 
@@ -299,8 +300,9 @@ no voucher could be signed.
 > `[settlement.solana]`'s (issue #1128, after `program_id` on the row was removed); and
 > `[[pay_channels]]` named that same channel "in both roles at once". Every one of those fields is
 > now refused by name (`PeerChannelToonFieldRemoved`, `PayChannelToonFieldRemoved`), pointing at
-> ADR 0075's drain procedure. **If you are recovering an old config, drain the channel on the last
-> TOON-capable release and delete the row — do not copy its values anywhere.**
+> [ADR 0075's drain procedure](draining-toon-channels.md). **If you are recovering an old config,
+> drain the channel on the last TOON-capable release and delete the row — do not copy its values
+> anywhere.**
 
 ### `credential` — deleted, and refused by name
 
