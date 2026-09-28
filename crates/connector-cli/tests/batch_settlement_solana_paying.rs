@@ -273,6 +273,11 @@ async fn a_deposit_below_the_counterpartys_minimum_is_refused_by_its_sponsor_by_
     }
     let world = World::new(ONE_DAY).await;
     let before = world.payer_tokens().await;
+    let lamports_before = world
+        .rpc
+        .get_balance(&world.payer_key)
+        .await
+        .expect("the payer's SOL");
 
     let refused = world
         .payer
@@ -287,6 +292,15 @@ async fn a_deposit_below_the_counterpartys_minimum_is_refused_by_its_sponsor_by_
         "the payer surfaces the sponsor's own name for the refusal: {reason}"
     );
     assert_eq!(world.payer_tokens().await, before, "nothing was deposited");
+    assert_eq!(
+        world
+            .rpc
+            .get_balance(&world.payer_key)
+            .await
+            .expect("the payer's SOL"),
+        lamports_before,
+        "nothing was sent at all: not even a channel's rent, on a cluster that would need it"
+    );
     assert!(
         world
             .receiver

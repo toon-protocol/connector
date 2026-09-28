@@ -40,10 +40,17 @@
 //! that, and restoring the signed watermark from the receiver's
 //! `POST /ilp/claim-state` after a restart, are the operator surface's and
 //! the peering's (ADR 0075 decisions 6 and 8; issues #1376, #1378).
+//!
+//! **Not yet through `socks_proxy`.** The sponsor endpoint is a peer's, so a
+//! counterparty on an onion endpoint (ADR 0070) needs its post dialed
+//! through the node's proxy by the host rule in
+//! `connector_config::is_onion_endpoint`. This backend is built with no
+//! config to read that from; wiring it is the runtime peering's (issue
+//! #1379), which builds the paying half with the node's proxy in hand.
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -67,7 +74,12 @@ use super::{backend_error, sponsor, state_of, wire, SolanaBatchSettlement, CHAIN
 /// sponsor answers only once its co-signed `open` has confirmed, which can
 /// take up to a blockhash's lifetime -- about a minute -- so this leaves that
 /// and the round trip room, and no more.
-pub const SPONSOR_POST_TIMEOUT: Duration = Duration::from_secs(120);
+const SPONSOR_POST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The sponsor's name for an `open` whose channel would come up short of
+/// rent on a cluster whose rent exemption threshold is not 1
+/// ([`sponsor::SponsorRefusal::ClusterRentThresholdUnsupported`]).
+const RENT_SHORT: &str = "cluster_rent_threshold_unsupported";
 
 /// The client [`SolanaBatchSettlement`] posts opens with.
 pub(super) fn sponsor_http_client() -> Result<reqwest::Client, BatchSettlementError> {
@@ -97,29 +109,29 @@ pub(super) struct Outbound {
 }
 
 /// Why a post to a sponsor endpoint produced no channel.
-enum SponsorAnswer {
+enum SponsorFailure {
     /// The endpoint answered with a named refusal: its `error` and `detail`.
     Refused { name: String, detail: String },
     /// The endpoint could not be reached, or did not answer in its own terms.
     Unreachable(String),
 }
 
-impl SponsorAnswer {
+impl SponsorFailure {
     fn into_error(self) -> BatchSettlementError {
         match self {
-            SponsorAnswer::Refused { name, detail } => {
+            SponsorFailure::Refused { name, detail } => {
                 BatchSettlementError::OpenRefused(format!("{name}: {detail}"))
             }
-            SponsorAnswer::Unreachable(reason) => BatchSettlementError::Backend(reason),
+            SponsorFailure::Unreachable(reason) => BatchSettlementError::Backend(reason),
         }
     }
 }
 
-impl std::fmt::Display for SponsorAnswer {
+impl std::fmt::Display for SponsorFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SponsorAnswer::Refused { name, detail } => write!(f, "{name}: {detail}"),
-            SponsorAnswer::Unreachable(reason) => write!(f, "{reason}"),
+            SponsorFailure::Refused { name, detail } => write!(f, "{name}: {detail}"),
+            SponsorFailure::Unreachable(reason) => write!(f, "{reason}"),
         }
     }
 }
@@ -162,14 +174,18 @@ impl SolanaBatchSettlement {
         }
     }
 
-    /// Where a cluster's rent exemption threshold is not 1 -- the pinned
-    /// v2.1.21 test validator, and no public cluster -- `payment-channels`
-    /// under-funds a new channel's rent and the counterparty's sponsor
-    /// refuses the `open` unless the channel already holds it
-    /// ([`sponsor::vet_channel_rent`], issue #1356). There this node, which
-    /// holds SOL, puts the rent there itself first; the program then tops up
-    /// nothing, and `reclaim` hands it to the `rent_payer`. On a cluster
-    /// whose threshold is 1 this sends nothing.
+    /// Put `channel`'s rent there before its `open` executes. Only ever in
+    /// answer to the counterparty's sponsor refusing the `open` as
+    /// [`RENT_SHORT`]: on a cluster whose rent exemption threshold is not 1
+    /// -- the pinned v2.1.21 test validator, and no public cluster --
+    /// `payment-channels` under-funds a new channel's rent, and the sponsor
+    /// refuses an `open` whose channel does not already hold it rather than
+    /// float that itself (issue #1356). This node, which holds SOL, puts it
+    /// there; the program then tops up nothing. The cost is stated: those
+    /// lamports go to the `rent_payer`, the counterparty, when its sweep
+    /// reclaims the channel, and they stay at the channel's address if the
+    /// `open` then fails anyway. On any cluster whose threshold is 1 the
+    /// sponsor never asks, and this never runs.
     async fn prefund_channel_rent(&self, channel: &Pubkey) -> Result<(), BatchSettlementError> {
         let rent = self
             .cluster_rent()
@@ -210,7 +226,7 @@ impl SolanaBatchSettlement {
             )
             .map_err(backend_error)?,
         );
-        let payer = self.sponsor.pubkey();
+        let payer = self.settlement_key();
         let signers = usize::from(message.header().num_required_signatures);
         let index = message.static_account_keys()[..signers]
             .iter()
@@ -236,7 +252,7 @@ impl SolanaBatchSettlement {
         &self,
         endpoint: &str,
         transaction: String,
-    ) -> Result<Pubkey, SponsorAnswer> {
+    ) -> Result<Pubkey, SponsorFailure> {
         let response = self
             .sponsor_http
             .post(endpoint)
@@ -244,24 +260,24 @@ impl SolanaBatchSettlement {
             .send()
             .await
             .map_err(|error| {
-                SponsorAnswer::Unreachable(format!(
+                SponsorFailure::Unreachable(format!(
                     "the sponsor endpoint {endpoint} could not be reached: {error}"
                 ))
             })?;
         let status = response.status();
         let body: serde_json::Value = response.json().await.map_err(|error| {
-            SponsorAnswer::Unreachable(format!(
+            SponsorFailure::Unreachable(format!(
                 "the sponsor endpoint {endpoint} answered {status} with no JSON: {error}"
             ))
         })?;
         let text = |field: &str| body.get(field).and_then(serde_json::Value::as_str);
         if !status.is_success() {
             return Err(match text("error") {
-                Some(name) => SponsorAnswer::Refused {
+                Some(name) => SponsorFailure::Refused {
                     name: name.to_string(),
                     detail: text("detail").unwrap_or_default().to_string(),
                 },
-                None => SponsorAnswer::Unreachable(format!(
+                None => SponsorFailure::Unreachable(format!(
                     "the sponsor endpoint {endpoint} answered {status} without naming why: {body}"
                 )),
             });
@@ -269,10 +285,34 @@ impl SolanaBatchSettlement {
         text("channelId")
             .and_then(|channel| Pubkey::from_str(channel).ok())
             .ok_or_else(|| {
-                SponsorAnswer::Unreachable(format!(
+                SponsorFailure::Unreachable(format!(
                     "the sponsor endpoint {endpoint} answered {status} with no channelId: {body}"
                 ))
             })
+    }
+
+    /// What a post that produced no channel means for `channel`, the one the
+    /// `open` would have made. If the chain holds it anyway, the open landed
+    /// with this node's deposit in it: it stays recorded as this node's, to
+    /// withdraw from, and the error says so. If the chain shows nothing, the
+    /// record goes and the sponsor's own answer is the error. If the chain
+    /// cannot be read, the record stays, costing nothing if nothing landed.
+    async fn after_failed_open(
+        &self,
+        channel: &Pubkey,
+        failure: SponsorFailure,
+    ) -> BatchSettlementError {
+        match self.read(channel).await {
+            Ok(Some(_)) => BatchSettlementError::Backend(format!(
+                "the sponsor endpoint answered {failure}, but channel {channel} exists on chain; \
+                 it is recorded as this node's, to withdraw from"
+            )),
+            Ok(None) => {
+                self.outbound().remove(channel);
+                failure.into_error()
+            }
+            Err(_) => failure.into_error(),
+        }
     }
 }
 
@@ -321,7 +361,7 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
         })
         .await
         .map_err(backend_error)?;
-        let payer = self.sponsor.pubkey();
+        let payer = self.settlement_key();
         let open = wire::OpenChannel {
             payer,
             rent_payer: sponsor,
@@ -338,7 +378,6 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
         let channel = open.channel(&self.program_id);
         let id = ChannelId(channel.to_string());
 
-        self.prefund_channel_rent(&channel).await?;
         let transaction = self.payer_signed_open(&open, &sponsor).await?;
         self.outbound().insert(
             channel,
@@ -349,40 +388,41 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
                 finished: None,
             },
         );
-        match self
-            .post_to_sponsor(&terms.sponsor_endpoint, transaction)
-            .await
-        {
+        let mut posted = self
+            .post_to_sponsor(&terms.sponsor_endpoint, transaction.clone())
+            .await;
+        if matches!(&posted, Err(SponsorFailure::Refused { name, .. }) if name == RENT_SHORT) {
+            // The sponsor accepted everything else, and named the one thing
+            // this node can put right; the same signed open, sent again.
+            self.prefund_channel_rent(&channel).await?;
+            posted = self
+                .post_to_sponsor(&terms.sponsor_endpoint, transaction)
+                .await;
+        }
+        match posted {
             Ok(answered) if answered == channel => {}
             Ok(answered) => {
-                return Err(BatchSettlementError::Backend(format!(
+                let failure = SponsorFailure::Unreachable(format!(
                     "the sponsor answered with channel {answered}, not the {channel} this open \
                      creates"
-                )))
+                ));
+                return Err(self.after_failed_open(&channel, failure).await);
             }
-            Err(answer) => {
-                return match self.read(&channel).await {
-                    Ok(Some(_)) => Err(BatchSettlementError::Backend(format!(
-                        "the sponsor endpoint answered {answer}, but channel {channel} exists on \
-                         chain; it is recorded as this node's, to withdraw from"
-                    ))),
-                    Ok(None) => {
-                        self.outbound().remove(&channel);
-                        Err(answer.into_error())
-                    }
-                    // Whether it landed cannot be told; the record stays,
-                    // costing nothing if it did not.
-                    Err(_) => Err(answer.into_error()),
-                };
-            }
+            Err(failure) => return Err(self.after_failed_open(&channel, failure).await),
         }
 
         let account = self.read_existing(&id, &channel).await?;
-        if account.payer != payer || account.authorized_signer != payer {
+        let as_built = account.derive_address(&self.program_id) == channel
+            && account.payer == payer
+            && account.authorized_signer == payer
+            && account.payee == sponsor
+            && account.rent_payer == sponsor
+            && account.mint == self.mint
+            && account.deposit == deposit_units
+            && account.distribution_hash == wire::distribution_hash(&open.recipients);
+        if !as_built {
             return Err(BatchSettlementError::Backend(format!(
-                "channel {channel} names payer {} and authorized_signer {}, not this node's \
-                 settlement key {payer}",
-                account.payer, account.authorized_signer
+                "channel {channel} is on chain, but not as this node built its open: {account:?}"
             )));
         }
         Ok(OpenedChannel {
@@ -543,7 +583,7 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
                 account: account.clone(),
             },
             &record.receiver,
-            &Mutex::new(None),
+            &self.treasury,
         )
         .await?;
 

@@ -109,6 +109,9 @@ pub struct SolanaBatchSettlement {
     /// the settlement `rpc_url`'s transport: the endpoint is a peer's, not
     /// the chain's (ADR 0073 governs only the latter).
     sponsor_http: reqwest::Client,
+    /// The treasury owner this deployment's `distribute` accepted, once one
+    /// has, for the paying half's own distributions.
+    treasury: Mutex<Option<Pubkey>>,
 }
 
 impl SolanaBatchSettlement {
@@ -162,6 +165,7 @@ impl SolanaBatchSettlement {
             cluster_rent: OnceLock::new(),
             outbound: Mutex::new(HashMap::new()),
             sponsor_http: pay::sponsor_http_client()?,
+            treasury: Mutex::new(None),
         })
     }
 
