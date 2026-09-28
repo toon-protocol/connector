@@ -1133,7 +1133,11 @@ impl Connector {
             Arrival::ClientChannel(channel_key) => self.client_channel_assets.asset(channel_key)?,
         };
         let outgoing = self.peer_asset(outgoing_peer_id)?;
-        (incoming != outgoing).then_some((incoming, outgoing))
+        // The compare itself is `PeeringAssets::crosses`: both legs are
+        // resolved above (through `peer_asset` or `client_channel_assets`,
+        // whichever the arrival needs), so what is left is the one
+        // comparison every resolution path shares, never repeated here.
+        PeeringAssets::crosses(incoming, outgoing)
     }
 
     /// The declared token `peer_id`'s channels hold (ADR 0071 decision 1),
@@ -1148,36 +1152,70 @@ impl Connector {
     ///
     /// **A runtime x402 peering, otherwise** (ADR 0075 decision 4, issue
     /// #1382): such a peering has no `[[peers]]` row for
-    /// [`Self::peering_assets`] to have resolved, so its token is read off
-    /// its own channel binding instead -- on EVM the `ChannelConfig`'s
-    /// token, on Solana the channel's mint. Neither is read a second time
-    /// here: the settlement port admits and opens only this node's
-    /// declared token on any channel it holds (`WrongToken`), so a
-    /// channel's *chain* already names its token, and that is exactly the
-    /// fact [`Self::client_channel_assets`] resolves a client channel's
-    /// token from -- reused here rather than read a second way, so a peer
-    /// arrival and a client arrival on the same chain can never disagree
-    /// about what it is denominated in.
+    /// [`Self::peering_assets`] to have resolved, so its token is resolved
+    /// off its own channel binding's *chain* instead -- not by reading the
+    /// channel's `ChannelConfig.token` or mint a second time, but by the
+    /// same fact [`Self::client_channel_assets`] already resolves a client
+    /// channel's token from (via the same `evm:`/`solana:`-namespaced key
+    /// [`crate::batch_channels::journal_key`] builds): the settlement port
+    /// admits and opens only this node's declared token on any channel on
+    /// a chain (`AdmissionRefusal::TokenNotSettled` on the receiving side,
+    /// `BatchSettlementError::TokenNotShared` on the paying side), so a
+    /// channel's chain already determines its token, and a peer arrival
+    /// and a client arrival on the same chain can never disagree about
+    /// what it is denominated in.
+    ///
+    /// A peering may in principle bind more than one channel -- ADR 0075
+    /// decision 4 leaves room for "one per chain the two nodes share" --
+    /// though nothing that establishes one writes more than one today.
+    /// Every bound channel is resolved and checked to agree: an ambiguous
+    /// peering (channels on chains this node deals in two different
+    /// tokens) is logged and treated as unresolved, the same "refuse rather
+    /// than guess" rule `resolve_peering_assets`'s
+    /// `PeeringTokenAmbiguous` enforces for a config-declared peering at
+    /// boot -- this runs per packet rather than at boot, so it cannot
+    /// refuse to start; it can only refuse to guess.
     ///
     /// `None` for a peering with no config row and no runtime channel, for
-    /// one whose one channel is a refused pre-ADR-0075 `toon-channel`
-    /// binding, and for every peer id on a node that declares no
-    /// `[[tokens]]` -- the same "empty is a whole answer" rule
-    /// `peering_assets` and `client_channel_assets` both keep, since
+    /// one whose every channel is a refused pre-ADR-0075 `toon-channel`
+    /// binding, for an ambiguous peering, and for every peer id on a node
+    /// that declares no `[[tokens]]` -- the same "empty is a whole answer"
+    /// rule `peering_assets` and `client_channel_assets` both keep, since
     /// `client_channel_assets` is what this falls through to.
     fn peer_asset(&self, peer_id: &str) -> Option<&AssetId> {
         if let Some(asset) = self.peering_assets.asset(peer_id) {
             return Some(asset);
         }
         let runtime_peers = self.runtime_peers_snapshot();
-        let binding = runtime_peers.get(peer_id)?.channels.first()?;
-        let chain = match binding {
-            RuntimePeerChannel::EvmVoucher { .. } => SettlementChain::Evm,
-            RuntimePeerChannel::SolanaVoucher { .. } => SettlementChain::Solana,
-            RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::Solana { .. } => return None,
-        };
-        self.client_channel_assets
-            .asset(&format!("{}:{}", chain.name(), binding.channel()))
+        let channels = &runtime_peers.get(peer_id)?.channels;
+        let mut resolved: Option<&AssetId> = None;
+        for binding in channels {
+            let chain = match binding {
+                RuntimePeerChannel::EvmVoucher { .. } => SettlementChain::Evm,
+                RuntimePeerChannel::SolanaVoucher { .. } => SettlementChain::Solana,
+                RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::Solana { .. } => continue,
+            };
+            let key = crate::batch_channels::journal_key(
+                chain,
+                &ChannelId(binding.channel().to_string()),
+            );
+            let Some(asset) = self.client_channel_assets.asset(&key) else {
+                continue;
+            };
+            match resolved {
+                None => resolved = Some(asset),
+                Some(first) if first == asset => {}
+                Some(_) => {
+                    tracing::warn!(
+                        peer_id,
+                        "peering's channels resolve to more than one declared token; treating \
+                         it as unresolved rather than picking one"
+                    );
+                    return None;
+                }
+            }
+        }
+        resolved
     }
 
     /// Reserve every peer id this node's config file names (issue #884):
@@ -11033,6 +11071,51 @@ mod tests {
                 Some(6_990),
                 "journaled as signed"
             );
+        }
+
+        /// `Connector::peer_asset`'s ambiguity guard: ADR 0075 decision 4
+        /// leaves room for a peering to bind more than one channel (one per
+        /// chain the two nodes share), so a peering whose bound channels
+        /// resolve to two different declared tokens is treated as
+        /// unresolved rather than letting whichever channel happens to be
+        /// first decide silently -- the same "refuse rather than guess"
+        /// rule `resolve_peering_assets`'s `PeeringTokenAmbiguous` enforces
+        /// for a config-declared peering at boot, but answered per packet
+        /// rather than at boot since a runtime peering is written after the
+        /// node is already serving.
+        #[tokio::test]
+        async fn an_ambiguous_runtime_peerings_channels_resolve_to_no_token() {
+            let (connector, _next_hop, _receiver, _outbound, _channel) = peered().await;
+            connector
+                .upsert_runtime_peer(
+                    "ambiguous",
+                    RuntimePeering {
+                        channels: vec![
+                            RuntimePeerChannel::EvmVoucher {
+                                outbound_channel_id: format!("0x{}", "aa".repeat(32)),
+                                voucher_signer: format!("0x{}", "bb".repeat(20)),
+                                network: "eip155:31337".to_string(),
+                            },
+                            RuntimePeerChannel::SolanaVoucher {
+                                outbound_channel_id: bs58::encode([0x03; 32]).into_string(),
+                                voucher_signer: bs58::encode([0x04; 32]).into_string(),
+                                network: "solana:test".to_string(),
+                            },
+                        ],
+                        ..RuntimePeering::default()
+                    },
+                )
+                .expect("the ambiguous row");
+            let connector = connector.with_client_channel_assets(
+                [
+                    (SettlementChain::Evm, asset(USDC)),
+                    (SettlementChain::Solana, asset(USDC_SOLANA)),
+                ]
+                .into_iter()
+                .collect(),
+            );
+
+            assert_eq!(connector.peer_asset("ambiguous"), None);
         }
     }
 }

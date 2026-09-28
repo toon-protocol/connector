@@ -200,8 +200,12 @@ struct Tracked {
 }
 
 /// The canonical key a channel is journaled under: `evm:0x…` or
-/// `solana:…`, as the client edge keys its own.
-fn journal_key(chain: SettlementChain, channel: &ChannelId) -> String {
+/// `solana:…`, as the client edge keys its own. `pub(crate)` because
+/// `Connector::peer_asset` (issue #1382) builds the identical key for a
+/// runtime x402 peering's own channel, to read its token off
+/// [`connector_config::ClientChannelAssets`] the same way a client
+/// channel's is -- one key format, not two that could drift apart.
+pub(crate) fn journal_key(chain: SettlementChain, channel: &ChannelId) -> String {
     format!("{}:{}", chain.name(), channel.0)
 }
 
