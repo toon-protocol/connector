@@ -30,7 +30,7 @@ use connector_runtime::{
 use connector_settlement::batch::{
     BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer, HeldVouchers,
 };
-use connector_settlement_evm::{EvmBatchSettlementBackend, EvmBatchWatcher};
+use connector_settlement_evm::{DepositRoute, EvmBatchSettlementBackend, EvmBatchWatcher};
 use connector_settlement_solana::batch::{SolanaBatchSettlement, SolanaBatchWatcher};
 use connector_signer::{LocalSigner, Signer, SignerError};
 
@@ -162,6 +162,25 @@ pub enum RuntimeError {
         table: &'static str,
         source: BatchSettlementError,
     },
+    /// `[settlement.evm] asset_transfer_method` is `"eip3009"`, and the
+    /// token has no ERC-3009: it fails the very probe this node's own
+    /// deposits are routed by (`EvmBatchSettlementBackend::deposit_route`,
+    /// ADR 0075 decision 3). A refusal to start (issue #1422), because the
+    /// method is published to payers and never used by this node itself:
+    /// every payer's deposit would fail on chain, and nothing here would
+    /// ever see it.
+    AssetTransferMethodUnsupported { token: String },
+    /// `[settlement.evm] asset_eip712_name` and `asset_eip712_version` do
+    /// not reproduce the token's own `DOMAIN_SEPARATOR()`, on a table that
+    /// publishes `eip3009`: every payer's ERC-3009 authorization is signed
+    /// under them, so every one would be refused by the token (issue
+    /// #1422). Only a definite mismatch is refused; a token with no
+    /// `DOMAIN_SEPARATOR()` is not judged.
+    AssetEip712DomainMismatch {
+        token: String,
+        name: String,
+        version: String,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -258,6 +277,26 @@ impl fmt::Display for RuntimeError {
                 f,
                 "[settlement.{table}] could not be bound: {source}. A node must reach the x402 \
                  contract or program its vouchers are signed for (ADR 0074, ADR 0075)"
+            ),
+            RuntimeError::AssetTransferMethodUnsupported { token } => write!(
+                f,
+                "[settlement.evm] asset_transfer_method = \"eip3009\", but token {token} does not \
+                 have ERC-3009 (it reverts on authorizationState). Payers read this method to \
+                 sign their deposit, so every deposit would fail on chain -- set \
+                 asset_transfer_method = \"permit2\", which works for any ERC-20 (issue #1422)"
+            ),
+            RuntimeError::AssetEip712DomainMismatch {
+                token,
+                name,
+                version,
+            } => write!(
+                f,
+                "[settlement.evm] asset_eip712_name = \"{name}\" and asset_eip712_version = \
+                 \"{version}\" are not the EIP-712 domain of token {token}: they do not reproduce \
+                 its DOMAIN_SEPARATOR() on this chain. Payers sign their ERC-3009 deposit under \
+                 them, so the token would refuse every one -- set them to the token's own name \
+                 and version (cast call {token} 'name()(string)' and 'version()(string)') \
+                 (issue #1422)"
             ),
         }
     }
@@ -372,8 +411,9 @@ fn unbound(table: &'static str, source: BatchSettlementError) -> RuntimeError {
 /// This node's x402 settlement backend on EVM, both halves (ADR 0074, ADR
 /// 0075), built from its `[settlement.evm]` table over the table's one
 /// transport (ADR 0073): refuses, by name, a chain without
-/// `x402BatchSettlement` (ADR 0075 decision 1), and a `decimals` the token
-/// disagrees with (issue #564).
+/// `x402BatchSettlement` (ADR 0075 decision 1), a `decimals` the token
+/// disagrees with (issue #564), and a deposit method or asset domain the
+/// token cannot honour ([`check_published_deposit_terms`], issue #1422).
 async fn build_evm_batch_settlement(
     settlement: &EvmSettlementConfig,
     transport: &RpcTransport,
@@ -388,7 +428,63 @@ async fn build_evm_batch_settlement(
     )
     .await
     .map_err(|source| unbound(SettlementChain::Evm.name(), source))?;
+    check_published_deposit_terms(settlement, &backend).await?;
     Ok(Arc::new(backend))
+}
+
+/// Refuse a `[settlement.evm]` table whose published deposit terms the
+/// token cannot honour (issue #1422). This node never deposits under them
+/// -- its own deposits are routed by what the token answers -- so a wrong
+/// value would fail only other payers, on chain, where nothing here sees
+/// it.
+///
+/// * `asset_transfer_method = "eip3009"` on a token that fails
+///   [`EvmBatchSettlementBackend::deposit_route`]'s ERC-3009 probe: the
+///   same probe, so the published method and this node's own route are
+///   one answer;
+/// * under `eip3009`, an `asset_eip712_name` and `asset_eip712_version`
+///   that do not reproduce the token's `DOMAIN_SEPARATOR()`. A token with
+///   none is not judged. Under `permit2` the domain is not checked: a
+///   Permit2 deposit is signed under Permit2's domain, and the asset's is
+///   used only by a facilitator's optional EIP-2612 sponsoring, on a token
+///   whose domain need not take this shape at all.
+///
+/// `permit2` itself needs no check: it moves any ERC-20. Permit2 sits
+/// beneath x402's own `Permit2DepositCollector`, deployed with the
+/// `x402BatchSettlement` that `connect` has already found on this chain,
+/// and this node's own Permit2 deposits ask nothing more of it.
+async fn check_published_deposit_terms(
+    settlement: &EvmSettlementConfig,
+    backend: &EvmBatchSettlementBackend,
+) -> Result<(), RuntimeError> {
+    let terms = settlement.batch_settlement();
+    if terms.asset_transfer_method() != connector_domain::x402::X402AssetTransferMethod::Eip3009 {
+        return Ok(());
+    }
+    let table = SettlementChain::Evm.name();
+    let token = format!(
+        "{:#x}",
+        ethers::types::Address::from(settlement.token_address())
+    );
+    let route = backend
+        .deposit_route()
+        .await
+        .map_err(|source| unbound(table, source))?;
+    if route != DepositRoute::Erc3009 {
+        return Err(RuntimeError::AssetTransferMethodUnsupported { token });
+    }
+    let matches = backend
+        .asset_eip712_domain_matches(terms.asset_eip712_name(), terms.asset_eip712_version())
+        .await
+        .map_err(|source| unbound(table, source))?;
+    if matches == Some(false) {
+        return Err(RuntimeError::AssetEip712DomainMismatch {
+            token,
+            name: terms.asset_eip712_name().to_string(),
+            version: terms.asset_eip712_version().to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// The Solana twin of [`build_evm_batch_settlement`]: bound over the table's
@@ -2538,6 +2634,26 @@ key_file = "{}"
             decimals: u8,
             key: &str,
         ) -> String {
+            evm_table_with(
+                rpc_url,
+                token,
+                decimals,
+                key,
+                "asset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"\n\
+                 asset_transfer_method = \"permit2\"",
+            )
+        }
+
+        /// [`evm_table`] with `deposit_terms` -- the asset's EIP-712 keys
+        /// and, where written, `asset_transfer_method` -- in place of its
+        /// own.
+        fn evm_table_with(
+            rpc_url: &str,
+            token: ethers::types::Address,
+            decimals: u8,
+            key: &str,
+            deposit_terms: &str,
+        ) -> String {
             format!(
                 r#"
 [settlement.evm]
@@ -2545,9 +2661,7 @@ rpc_url = "{rpc_url}"
 token_address = "{token:?}"
 decimals = {decimals}
 min_withdraw_delay_secs = 3600
-asset_eip712_name = "USDC"
-asset_eip712_version = "2"
-asset_transfer_method = "permit2"
+{deposit_terms}
 facilitator_url = "https://facilitator.example/x402"
 
 [settlement.evm.key]
@@ -2691,6 +2805,189 @@ key_file = "{signer_key}"
                 message.contains("decimals") && message.contains("18"),
                 "{message}"
             );
+        }
+
+        /// The published EVM `assetTransferMethod` a built node offers.
+        fn published_method(runtime: &Runtime) -> connector_domain::x402::X402AssetTransferMethod {
+            runtime
+                .batch_settlements
+                .iter()
+                .find_map(|entry| match entry {
+                    connector_client_edge::X402BatchSettlementTerms::Evm(terms) => {
+                        Some(terms.asset_transfer_method)
+                    }
+                    _ => None,
+                })
+                .expect("the batch-settlement list carries an EVM entry")
+        }
+
+        /// Issue #1422: a token with ERC-3009 -- Circle's FiatToken v2.2 --
+        /// boots under `eip3009`, written or left at its default, with the
+        /// asset's own EIP-712 domain.
+        #[tokio::test]
+        async fn an_erc3009_token_builds_under_eip3009() {
+            if !require_anvil() {
+                return;
+            }
+            let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+            let mut x402 = X402Chain::place(&anvil.rpc_url).await;
+            let token = x402.deploy_fiat_token().await;
+            let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let key = key_path.display().to_string();
+            for deposit_terms in [
+                "asset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"\n\
+                 asset_transfer_method = \"eip3009\"",
+                "asset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"",
+            ] {
+                let config = node_config(
+                    &key,
+                    &evm_table_with(&anvil.rpc_url, token, 6, &key, deposit_terms),
+                );
+                let runtime = build(&config)
+                    .await
+                    .expect("an ERC-3009 token builds under eip3009");
+                assert_eq!(
+                    published_method(&runtime),
+                    connector_domain::x402::X402AssetTransferMethod::Eip3009
+                );
+            }
+        }
+
+        /// Issue #1422: a token without ERC-3009 is refused `eip3009` by
+        /// name -- written, or left at its default -- and the refusal names
+        /// `permit2` as the fix.
+        #[tokio::test]
+        async fn a_token_without_erc3009_refuses_to_build_under_eip3009() {
+            if !require_anvil() {
+                return;
+            }
+            let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+            X402Chain::place(&anvil.rpc_url).await;
+            let token = connector_settlement_evm::test_support::deploy_plain_token(
+                &anvil.rpc_url,
+                DEPLOYER_PRIVATE_KEY,
+                0,
+            )
+            .await;
+            let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let key = key_path.display().to_string();
+            for deposit_terms in [
+                "asset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"\n\
+                 asset_transfer_method = \"eip3009\"",
+                "asset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"",
+            ] {
+                let config = node_config(
+                    &key,
+                    &evm_table_with(&anvil.rpc_url, token, 6, &key, deposit_terms),
+                );
+                let Err(error) = build(&config).await else {
+                    panic!("built eip3009 over a token without ERC-3009");
+                };
+                assert!(
+                    matches!(&error, RuntimeError::AssetTransferMethodUnsupported { token: named } if *named == format!("{token:#x}")),
+                    "{error}"
+                );
+                let message = error.to_string();
+                for named in [
+                    "[settlement.evm]",
+                    "asset_transfer_method = \"eip3009\"",
+                    "ERC-3009",
+                    "asset_transfer_method = \"permit2\"",
+                ] {
+                    assert!(message.contains(named), "expected {named} in: {message}");
+                }
+            }
+        }
+
+        /// Issue #1422: the same token builds under `permit2`, which moves
+        /// any ERC-20, and publishes it.
+        #[tokio::test]
+        async fn a_token_without_erc3009_builds_under_permit2() {
+            if !require_anvil() {
+                return;
+            }
+            let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+            X402Chain::place(&anvil.rpc_url).await;
+            let token = connector_settlement_evm::test_support::deploy_plain_token(
+                &anvil.rpc_url,
+                DEPLOYER_PRIVATE_KEY,
+                0,
+            )
+            .await;
+            let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let key = key_path.display().to_string();
+            let config = node_config(&key, &evm_table(&anvil.rpc_url, token, 6, &key));
+
+            let runtime = build(&config)
+                .await
+                .expect("permit2 builds over a token without ERC-3009");
+            assert_eq!(
+                published_method(&runtime),
+                connector_domain::x402::X402AssetTransferMethod::Permit2
+            );
+        }
+
+        /// Issue #1422: under `eip3009`, an asset EIP-712 name or version
+        /// that does not reproduce the token's own `DOMAIN_SEPARATOR()` is
+        /// refused by name -- here Base mainnet USDC's `"USD Coin"` on a
+        /// token named `"USDC"`, and the right name at the wrong version.
+        /// Under `permit2` the same values are not judged.
+        #[tokio::test]
+        async fn an_asset_domain_the_token_disagrees_with_refuses_to_build_under_eip3009() {
+            if !require_anvil() {
+                return;
+            }
+            let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+            let mut x402 = X402Chain::place(&anvil.rpc_url).await;
+            let token = x402.deploy_fiat_token().await;
+            let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let key = key_path.display().to_string();
+            for (name, version) in [("USD Coin", "2"), ("USDC", "1")] {
+                let config = node_config(
+                    &key,
+                    &evm_table_with(
+                        &anvil.rpc_url,
+                        token,
+                        6,
+                        &key,
+                        &format!(
+                            "asset_eip712_name = \"{name}\"\nasset_eip712_version = \"{version}\""
+                        ),
+                    ),
+                );
+                let Err(error) = build(&config).await else {
+                    panic!("built under an EIP-712 domain the token disagrees with");
+                };
+                assert!(
+                    matches!(&error, RuntimeError::AssetEip712DomainMismatch { name: n, version: v, .. } if n == name && v == version),
+                    "{error}"
+                );
+                let message = error.to_string();
+                for named in [
+                    "asset_eip712_name",
+                    "asset_eip712_version",
+                    "DOMAIN_SEPARATOR",
+                ] {
+                    assert!(message.contains(named), "expected {named} in: {message}");
+                }
+
+                let config = node_config(
+                    &key,
+                    &evm_table_with(
+                        &anvil.rpc_url,
+                        token,
+                        6,
+                        &key,
+                        &format!(
+                            "asset_eip712_name = \"{name}\"\nasset_eip712_version = \"{version}\"\n\
+                             asset_transfer_method = \"permit2\""
+                        ),
+                    ),
+                );
+                build(&config)
+                    .await
+                    .expect("under permit2 the asset domain is not judged");
+            }
         }
 
         #[tokio::test]

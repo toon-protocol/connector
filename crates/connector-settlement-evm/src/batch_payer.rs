@@ -118,6 +118,11 @@ const TOKEN_PERMISSIONS_TYPE: &[u8] = b"TokenPermissions(address token,uint256 a
 /// it: its `DEPOSIT_WITNESS_TYPE_STRING` appended to Permit2's stub.
 const PERMIT_WITNESS_TRANSFER_FROM_TYPE: &[u8] = b"PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,DepositWitness witness)DepositWitness(bytes32 channelId)TokenPermissions(address token,uint256 amount)";
 
+/// EIP-712's domain struct in the shape a token's `DOMAIN_SEPARATOR()` is
+/// checked against.
+const EIP712_DOMAIN_TYPE: &[u8] =
+    b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+
 /// `Permit2DepositCollector`'s `DEPOSIT_WITNESS_TYPEHASH` preimage.
 const DEPOSIT_WITNESS_TYPE: &[u8] = b"DepositWitness(bytes32 channelId)";
 
@@ -210,6 +215,12 @@ impl EvmBatchSettlementBackend {
     /// fallback answers with bytes that are not a `bool` -- is an error
     /// rather than a guess, and nothing is cached, so the next deposit asks
     /// again.
+    ///
+    /// It is also the one answer to whether the token has ERC-3009 at all:
+    /// a booting node asks it to refuse a published
+    /// `asset_transfer_method = "eip3009"` on a token without it (issue
+    /// #1422), so what this node tells payers and how it deposits itself
+    /// can never be decided two ways.
     pub async fn deposit_route(&self) -> Result<DepositRoute, BatchSettlementError> {
         self.deposit_route
             .get_or_try_init(|| async {
@@ -235,6 +246,51 @@ impl EvmBatchSettlementBackend {
             })
             .await
             .copied()
+    }
+
+    /// Whether `name` and `version` are the EIP-712 domain the token signs
+    /// under on this chain: whether `EIP712Domain(name, version, chainId,
+    /// token)` hashes to the token's own `DOMAIN_SEPARATOR()`. It is the
+    /// domain a payer signs its ERC-3009 authorization under, so a mismatch
+    /// is an authorization the token refuses (issue #1422).
+    ///
+    /// `None` when the token has no `DOMAIN_SEPARATOR()` -- a revert, read
+    /// exactly as [`deposit_route`](Self::deposit_route) reads one -- since
+    /// then there is nothing on chain to compare with. Any other failure is
+    /// an error rather than a guess.
+    pub async fn asset_eip712_domain_matches(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<bool>, BatchSettlementError> {
+        let token = DepositToken::new(self.token, std::sync::Arc::clone(&self.client));
+        let on_chain = connector_chain_rpc::retry_read(|| async {
+            match token.domain_separator().call().await {
+                Ok(separator) => Ok(Some(separator)),
+                Err(error) if error.is_revert() => Ok(None),
+                Err(error) => Err(error),
+            }
+        })
+        .await
+        .map_err(|error| {
+            BatchSettlementError::Backend(format!(
+                "could not read token {:?}'s DOMAIN_SEPARATOR(): {error}",
+                self.token
+            ))
+        })?;
+        Ok(on_chain.map(|separator| separator == self.asset_domain_separator(name, version)))
+    }
+
+    /// The EIP-712 domain separator of a token named `name` at `version` at
+    /// this backend's token address on this chain.
+    fn asset_domain_separator(&self, name: &str, version: &str) -> [u8; 32] {
+        keccak256(encode(&[
+            Token::FixedBytes(keccak256(EIP712_DOMAIN_TYPE).to_vec()),
+            Token::FixedBytes(keccak256(name.as_bytes()).to_vec()),
+            Token::FixedBytes(keccak256(version.as_bytes()).to_vec()),
+            Token::Uint(U256::from(self.domain().chain_id)),
+            Token::Address(self.token),
+        ]))
     }
 
     /// The config this node opens a channel toward `terms` under. See the

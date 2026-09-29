@@ -113,8 +113,9 @@ pub struct EvmBatchSettlementBackend {
     /// this node opened as payer, with its config and its watermark.
     pub(crate) outbound: Mutex<HashMap<ChannelId, crate::batch_payer::Outbound>>,
     /// How this node's deposits reach the contract, learned from the token
-    /// on the first deposit and kept: a token does not gain or lose
-    /// ERC-3009.
+    /// on the first ask -- at boot, where the runtime checks the published
+    /// `asset_transfer_method` against it -- and kept: a token does not
+    /// gain or lose ERC-3009.
     pub(crate) deposit_route: tokio::sync::OnceCell<crate::batch_payer::DepositRoute>,
     /// Orders the paying half's writes against each other, so the backing
     /// each records is never overwritten by an older reading.

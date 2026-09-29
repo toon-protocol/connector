@@ -351,7 +351,8 @@ whose terms are the ones it published:
   (`facilitator_url`, published as `extra.facilitator`) and pay for its gas as a
   cost of the sale; your node never calls it. A payer holding ETH can deposit
   directly instead. An ERC-3009 token such as USDC deposits with one signature.
-  Any other ERC-20 needs `asset_transfer_method = "permit2"` and a one-time
+  Any other ERC-20 needs `asset_transfer_method = "permit2"` (the node refuses
+  to start on `"eip3009"` for a token without ERC-3009) and a one-time
   Permit2 approval, which is gasless only if your facilitator sponsors it. The
   first voucher on a channel your node has not seen carries the full
   `channelConfig`, and the node recomputes the channel id from it.
