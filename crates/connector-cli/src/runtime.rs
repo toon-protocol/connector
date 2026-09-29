@@ -573,7 +573,7 @@ pub struct Runtime {
     /// Writing it is [`spawn_rate_pollers`]'s job, and nothing else's.
     pub rate_table: Option<SharedRateTable>,
     /// This node's receive-only x402 `batch-settlement` backend on EVM (ADR
-    /// 0074), `Some` exactly when `[settlement.evm.batch_settlement]` is
+    /// 0074), `Some` exactly when `[settlement.evm]` is
     /// written. [`router`] hands it to the client edge's claim gate, which
     /// admits vouchers through it; every channel the client-edge journal
     /// holds vouchers on is already restored to it by the time [`build`]
@@ -582,7 +582,7 @@ pub struct Runtime {
     /// #1344, `spawn_batch_settlement_watchers`).
     pub batch_settlement_evm: Option<Arc<EvmBatchSettlementBackend>>,
     /// The Solana twin of [`Self::batch_settlement_evm`], `Some` exactly
-    /// when `[settlement.solana.batch_settlement]` is written -- and what
+    /// when `[settlement.solana]` is written -- and what
     /// the public sponsor endpoint (issue #1346) co-signs an `open` with.
     pub batch_settlement_solana: Option<Arc<SolanaBatchSettlement>>,
     /// The x402 channels this node pays on (ADR 0075 decisions 8 and 11),

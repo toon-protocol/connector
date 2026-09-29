@@ -30,7 +30,7 @@
 //!   fee; this caps how many, whoever sends them.
 //!
 //! **Off unless configured.** Always mounted, so that a node without
-//! `[settlement.solana.batch_settlement]` refuses by name
+//! `[settlement.solana]` refuses by name
 //! (`batch_settlement_not_offered`) rather than with a bare 404 a client
 //! cannot tell from a wrong URL.
 
@@ -175,7 +175,7 @@ async fn sponsor_open(State(sponsor): State<Arc<Option<Sponsor>>>, body: Bytes) 
             StatusCode::NOT_FOUND,
             "batch_settlement_not_offered",
             "this node does not accept x402 batch-settlement channels on Solana \
-             ([settlement.solana.batch_settlement] is not configured), so it sponsors no open"
+             ([settlement.solana] is not configured), so it sponsors no open"
                 .to_string(),
         );
     };

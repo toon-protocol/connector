@@ -283,7 +283,7 @@ pub struct X402BatchSettlementEvmTerms {
     #[serde(rename = "receiverAuthorizer")]
     pub receiver_authorizer: String,
     /// The shortest `withdrawDelay` a channel may carry and still be
-    /// admitted, in seconds -- `[settlement.evm.batch_settlement]
+    /// admitted, in seconds -- `[settlement.evm]
     /// min_withdraw_delay_secs`.
     #[serde(rename = "withdrawDelay")]
     pub min_withdraw_delay_secs: u64,
@@ -375,9 +375,10 @@ pub struct X402BatchSettlementSolanaTerms {
     /// (`connector_settlement_solana::SolanaSettlementBackend::caip2_network`,
     /// issue #1131's own precedent), never guessed from the RPC URL.
     pub network: String,
-    /// The SPL/Token-2022 mint this node accepts a deposit in, base58 --
+    /// The SPL Token mint this node accepts a deposit in, base58 --
     /// `[settlement.solana] token_address`, never declared a second time
-    /// (CF-26).
+    /// (CF-26). Classic SPL Token only: the sponsor refuses a Token-2022
+    /// `open` (ADR 0074 decision 8).
     pub asset: String,
     /// The owner of this node's receiving token account -- the x402 SVM
     /// scheme's single 10000bps distribution recipient (decision 2), which
@@ -390,7 +391,7 @@ pub struct X402BatchSettlementSolanaTerms {
     #[serde(rename = "feePayer")]
     pub fee_payer: String,
     /// The shortest `grace_period` a channel may carry and still be
-    /// admitted, in seconds -- `[settlement.solana.batch_settlement]
+    /// admitted, in seconds -- `[settlement.solana]
     /// min_grace_period_secs` -- carried on the wire as `withdrawDelay` (see
     /// this type's own doc).
     #[serde(rename = "withdrawDelay")]
@@ -406,7 +407,7 @@ pub struct X402BatchSettlementSolanaTerms {
     #[serde(rename = "tokenProgram")]
     pub token_program: String,
     /// The smallest opening deposit, in the mint's base units, this node's
-    /// sponsor will co-sign an `open` for -- `[settlement.solana.batch_settlement]
+    /// sponsor will co-sign an `open` for -- `[settlement.solana]
     /// min_sponsored_deposit`. Published because ADR 0074 decision 5 has
     /// the sponsor refuse "below a *published* minimum deposit": a client
     /// must be able to read the bound before it builds an `open` the public

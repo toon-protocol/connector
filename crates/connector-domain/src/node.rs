@@ -85,8 +85,8 @@ pub struct NodeFacts {
     pub peer_carriages: Vec<String>,
     /// One entry per chain this node has opted into accepting an x402
     /// `batch-settlement` channel on (ADR 0074 decision 8) --
-    /// `[settlement.evm.batch_settlement]` and/or
-    /// `[settlement.solana.batch_settlement]`. Empty on a node that has
+    /// `[settlement.evm]` and/or
+    /// `[settlement.solana]`. Empty on a node that has
     /// opted into neither, which is every node before this record and every
     /// node after it that writes neither table. The greeting's own
     /// `batch-settlement` `accepts[]` entries and the self-description's

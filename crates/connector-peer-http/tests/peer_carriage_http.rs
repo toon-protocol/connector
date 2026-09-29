@@ -1003,7 +1003,7 @@ async fn an_uncovered_prepare_carries_no_claim_header() {
 /// Dialing from a **loaded config** rather than a hand-built relation:
 /// [`HttpPeerTransport::add_peers_from_config`] registers the `https://`
 /// peering an ADR 0075 config names -- a `[[peer_channels]]` row binding
-/// the peer's `voucher_signer`, `[settlement.evm.batch_settlement]` beside
+/// the peer's `voucher_signer`, `[settlement.evm]` beside
 /// it -- at the endpoint the file gives, and a voucher rides it.
 #[tokio::test]
 async fn a_peering_dialed_from_a_loaded_config_carries_its_voucher_to_the_configured_endpoint() {

@@ -11,7 +11,7 @@
 //! without one refuses every voucher by name
 //! ([`crate::ClaimIngestRejection::BatchSettlementNotAccepted`]) -- ADR 0074
 //! decision 1's "off unless configured". `connector-cli`'s runtime passes
-//! one exactly when a `[settlement.<chain>.batch_settlement]` table is
+//! one exactly when a `[settlement.<chain>]` table is
 //! written, adapting that chain's receive-only settlement port to this
 //! trait.
 //!

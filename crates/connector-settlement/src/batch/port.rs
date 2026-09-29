@@ -698,10 +698,10 @@ pub enum BatchSettlementError {
 /// Implementations live in `connector-settlement-evm` (issue #1342) and
 /// `connector-settlement-solana` (issue #1343), as modules beside the
 /// existing backends, reusing their RPC clients and keys. Each is built from
-/// its `[settlement.<chain>.batch_settlement]` table and the enclosing
-/// settlement table: this node's receiving identity is that table's
-/// settlement key, its token that table's `token_address`, and its minimum
-/// delay the batch table's. [`InMemoryBatchSettlement`](super::InMemoryBatchSettlement)
+/// its `[settlement.<chain>]` table: this node's receiving identity is that
+/// table's settlement key, its token that table's `token_address`, and its
+/// minimum delay that table's own `min_withdraw_delay_secs`/
+/// `min_grace_period_secs`. [`InMemoryBatchSettlement`](super::InMemoryBatchSettlement)
 /// is the fake, and [`super::contract`] is the suite every implementation
 /// must pass unmodified (ADR 0007).
 ///

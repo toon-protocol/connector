@@ -642,7 +642,7 @@ pub enum ConfigPeeringError {
     /// A `[[pay_channels]]` row on a node with no x402 channels to pay on.
     #[error(
         "the [[pay_channels]] row for peer '{peer_id}' cannot be wired: this node has no x402 \
-         batch-settlement backend to pay on (a [settlement.<chain>.batch_settlement] table)"
+         batch-settlement backend to pay on (a [settlement.<chain>] table)"
     )]
     NoOutboundChannels { peer_id: String },
     /// A `[[pay_channels]]` row naming a channel this node's
