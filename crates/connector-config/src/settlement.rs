@@ -83,6 +83,12 @@ pub(crate) struct RawEvmSettlementTable {
     asset_eip712_name: Option<String>,
     #[serde(default)]
     asset_eip712_version: Option<String>,
+    /// toon-client#695: `"eip3009"` (default) or `"permit2"`.
+    #[serde(default)]
+    asset_transfer_method: Option<String>,
+    /// toon-client#695: the x402 facilitator payers relay deposits through.
+    #[serde(default)]
+    facilitator_url: Option<String>,
     #[serde(default)]
     contract_address: Option<toml::Value>,
     #[serde(default)]
@@ -552,6 +558,8 @@ fn resolve_evm_fields(table: RawEvmSettlementTable) -> Result<EvmSettlementConfi
         min_withdraw_delay_secs: table.min_withdraw_delay_secs,
         asset_eip712_name: required("evm", "asset_eip712_name", table.asset_eip712_name)?,
         asset_eip712_version: required("evm", "asset_eip712_version", table.asset_eip712_version)?,
+        asset_transfer_method: table.asset_transfer_method,
+        facilitator_url: table.facilitator_url,
     })?;
 
     Ok(EvmSettlementConfig {
@@ -783,6 +791,48 @@ key_file = "{key}"
         assert_eq!(evm.batch_settlement().min_withdraw_delay_secs(), 3600);
         assert_eq!(evm.batch_settlement().asset_eip712_name(), "USDC");
         assert_eq!(evm.batch_settlement().asset_eip712_version(), "2");
+        assert_eq!(
+            evm.batch_settlement().asset_transfer_method(),
+            connector_domain::x402::X402AssetTransferMethod::Eip3009
+        );
+        assert_eq!(evm.batch_settlement().facilitator_url(), None);
+    }
+
+    /// toon-client#695: the deposit keys sit in `[settlement.evm]` itself,
+    /// like every other x402 term, and reach the resolved terms.
+    #[test]
+    fn an_evm_table_carries_its_deposit_method_and_facilitator() {
+        let key_file = temp_key_file();
+        let evm = single_evm(
+            resolve(&evm_table(
+                "asset_transfer_method = \"permit2\"\nfacilitator_url = \"https://facilitator.example/x402\"",
+                key_file.path(),
+            ))
+            .expect("resolve"),
+        );
+        assert_eq!(
+            evm.batch_settlement().asset_transfer_method(),
+            connector_domain::x402::X402AssetTransferMethod::Permit2
+        );
+        assert_eq!(
+            evm.batch_settlement().facilitator_url(),
+            Some("https://facilitator.example/x402")
+        );
+    }
+
+    /// EVM-only: a Solana table that writes either key is refused as an
+    /// unknown field, not silently ignored.
+    #[test]
+    fn a_solana_table_refuses_the_evm_deposit_keys() {
+        let key_file = temp_key_file();
+        for extra in [
+            "asset_transfer_method = \"permit2\"",
+            "facilitator_url = \"https://facilitator.example\"",
+        ] {
+            let body = solana_table(extra, key_file.path());
+            let result: Result<RawSettlementSection, _> = toml::from_str(&body);
+            assert!(result.is_err(), "{extra} must be refused on Solana");
+        }
     }
 
     /// `[settlement.solana]` needs an RPC URL, a mint, its decimals and a

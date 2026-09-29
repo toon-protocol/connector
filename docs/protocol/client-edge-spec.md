@@ -489,7 +489,9 @@ settles on, and TOON's own terms for the request ride in x402 v2's `extensions` 
         "receiverAuthorizer": "<settlement address>",
         "withdrawDelay": 86400,
         "name": "USDC",
-        "version": "2"
+        "version": "2",
+        "assetTransferMethod": "eip3009",
+        "facilitator": "https://facilitator.example/x402"
       }
     }
   ],
@@ -538,6 +540,23 @@ is not a decimal uint64, as unreadable terms, never as "nothing to pay". In the 
 >   domain of the **asset**, which a client signs its deposit's ERC-3009 or Permit2 authorization
 >   under. x402 requires both and an ERC-20 need not expose either, so they are not read off the
 >   chain: they are the required config keys `asset_eip712_name`/`asset_eip712_version`.
+>   `assetTransferMethod` is x402's own EVM field naming how that deposit moves the token:
+>   `"eip3009"` (ERC-3009 `receiveWithAuthorization`; the token must implement ERC-3009, as USDC
+>   does) or `"permit2"` (a Permit2 witness transfer, for any ERC-20). It is **always** written,
+>   even at x402's own default `eip3009` (`[settlement.evm] asset_transfer_method`, toon-client#695):
+>   x402 reads an absent value as `eip3009`, so the explicit default means the same to a stock
+>   client, and a reader of this node's greeting never has to know x402's default to know how to
+>   deposit. A reader MUST still read an absent `assetTransferMethod` as `eip3009`, as x402 does —
+>   a node that predates the field writes none.
+>   `facilitator` is this connector's own addition to x402's EVM `extra`, as `sponsorEndpoint` is to
+>   its SVM one: the absolute `http(s)` URL of the x402 facilitator this operator relays deposits
+>   through and pays the gas of (`[settlement.evm] facilitator_url`). A stock x402 seller calls its
+>   facilitator itself; here the deposit precedes the channel and leaves the packet path, so the
+>   payer calls it, and the seller names it. It is **absent** when the operator names none, and
+>   this connector never calls it. With `permit2`, a payer's one-time Permit2 approval of a token
+>   without ERC-3009 is gasless only when that facilitator offers x402's `eip2612GasSponsoring`
+>   (a token with EIP-2612 `permit`) or `erc20ApprovalGasSponsoring` (a plain ERC-20); otherwise
+>   the payer pays that approval once, from its own ETH.
 > - **Solana:** `feePayer` (the sponsor key); `withdrawDelay`, x402's SVM field name, carrying the
 >   minimum `grace_period` (`[settlement.solana.batch_settlement] min_grace_period_secs`);
 >   `tokenProgram`, x402's required SVM field naming the program that owns `asset` — always SPL

@@ -763,6 +763,10 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                         min_withdraw_delay_secs: batch.min_withdraw_delay_secs(),
                         name: batch.asset_eip712_name().to_string(),
                         version: batch.asset_eip712_version().to_string(),
+                        // toon-client#695: configured, like `name` and
+                        // `version`; this node never calls the facilitator.
+                        asset_transfer_method: batch.asset_transfer_method(),
+                        facilitator: batch.facilitator_url().map(str::to_string),
                     },
                 ));
                 batch_settlement_evm = Some(backend);
@@ -2543,6 +2547,8 @@ decimals = {decimals}
 min_withdraw_delay_secs = 3600
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
+asset_transfer_method = "permit2"
+facilitator_url = "https://facilitator.example/x402"
 
 [settlement.evm.key]
 key_file = "{key}"
@@ -2799,6 +2805,16 @@ key_file = "{signer_key}"
             assert_eq!(evm_batch.min_withdraw_delay_secs, 3600);
             assert_eq!(evm_batch.name, "USDC");
             assert_eq!(evm_batch.version, "2");
+            assert_eq!(
+                evm_batch.asset_transfer_method,
+                connector_domain::x402::X402AssetTransferMethod::Permit2,
+                "the configured deposit method, not x402's default (toon-client#695)"
+            );
+            assert_eq!(
+                evm_batch.facilitator.as_deref(),
+                Some("https://facilitator.example/x402"),
+                "the configured facilitator, verbatim (toon-client#695)"
+            );
 
             let solana_batch = runtime
                 .batch_settlements

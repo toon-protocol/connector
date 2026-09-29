@@ -788,6 +788,39 @@ pub enum ConfigError {
     )]
     BatchSettlementEmptyAssetEip712Field { key: &'static str },
 
+    /// `[settlement.evm] asset_transfer_method` names neither of x402's two
+    /// EVM deposit methods (toon-client#695). The greeting publishes it as
+    /// `extra.assetTransferMethod`, and a payer that deposits by a method
+    /// the operator did not mean has its deposit refused on chain.
+    #[error(
+        "[settlement.evm] asset_transfer_method = \"{value}\" is not an x402 asset transfer \
+         method. Write \"eip3009\" (ERC-3009 receiveWithAuthorization -- the token must \
+         implement ERC-3009, as USDC does) or \"permit2\" (a Permit2 witness transfer, for any \
+         ERC-20), or omit the key for \"eip3009\""
+    )]
+    BatchSettlementUnknownAssetTransferMethod { value: String },
+
+    /// `[settlement.evm] facilitator_url` is not a URL at all
+    /// (toon-client#695).
+    #[error(
+        "[settlement.evm] facilitator_url = \"{value}\" is not a valid URL ({source}). It is \
+         published to payers as the x402 facilitator their deposit is relayed through; write \
+         an absolute http(s) URL, or omit the key to name none"
+    )]
+    BatchSettlementInvalidFacilitatorUrl {
+        value: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    /// `[settlement.evm] facilitator_url` is a URL, but not `http`/`https`
+    /// (toon-client#695): a payer POSTs its deposit to it.
+    #[error(
+        "[settlement.evm] facilitator_url = \"{value}\" must use http or https. A payer POSTs \
+         its deposit to the x402 facilitator it names"
+    )]
+    BatchSettlementUnsupportedFacilitatorScheme { value: String },
+
     /// A settlement table asked for its RPC to ride the node's `socks_proxy`
     /// and the node has none (ADR 0073 decision 1). The key selects the one
     /// proxy ADR 0070 gives a node; it never names a second, and a dial that

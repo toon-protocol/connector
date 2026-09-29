@@ -430,6 +430,8 @@ table does not start with one:
 | EVM    | `min_withdraw_delay_secs` | `86400` (a day) | below `900`, or above `2592000` (the contract's 30-day maximum) |
 | EVM    | `asset_eip712_name`       | **required**    | missing or empty                                                |
 | EVM    | `asset_eip712_version`    | **required**    | missing or empty                                                |
+| EVM    | `asset_transfer_method`   | `"eip3009"`     | anything but `"eip3009"` or `"permit2"`                         |
+| EVM    | `facilitator_url`         | none            | not a URL, or not `http`/`https`                                |
 | Solana | `min_grace_period_secs`   | `86400` (a day) | below `900`                                                     |
 | Solana | `min_sponsored_deposit`   | **required**    | missing, or `0`; it bounds a public endpoint that spends rent   |
 
@@ -456,6 +458,21 @@ required wherever `[settlement.evm]` exists -- there is no safe default for an
 arbitrary settlement token, and publishing the wrong domain would build a deposit signature that
 never verifies. Solana carries no equivalent key: the x402 SVM scheme's asset transfer has no EIP-712
 domain of its own to publish.
+
+**`asset_transfer_method` and `facilitator_url`** say how a payer deposits (toon-client#695), and
+both are published on the EVM `batch-settlement` entry — `extra.assetTransferMethod` and
+`extra.facilitator` on the greeting, the same names on the self-description's `batchSettlements`
+(ADR 0074 decision 8). `asset_transfer_method` is x402's own EVM field: `"eip3009"` (ERC-3009
+`receiveWithAuthorization`, the default — the token must implement ERC-3009, as USDC does) or
+`"permit2"` (a Permit2 witness transfer, for any ERC-20 without it). It is published even at its
+default. `facilitator_url` is optional and TOON's own: the absolute `http(s)` URL of the x402
+facilitator this operator relays deposits through and pays the gas of — the seller names it
+because in TOON the payer, not the seller, calls it, the deposit preceding the channel. It is
+published verbatim and omitted when unset, and the connector never calls it. A `permit2` deposit of
+a token without ERC-3009 is gasless for the payer only when the named facilitator offers x402's
+`eip2612GasSponsoring` (a permit token) or `erc20ApprovalGasSponsoring` (a plain ERC-20); otherwise
+the payer pays a one-time Permit2 approval from its own ETH. Solana carries neither: its sponsor
+endpoint is this node (`extra.sponsorEndpoint`).
 
 **`decimals` is a declaration, not a conversion.** Nothing scales by it: every amount on the value path
 — a route's price, a claim's amount, a channel's deposit — is already in the settlement token's base

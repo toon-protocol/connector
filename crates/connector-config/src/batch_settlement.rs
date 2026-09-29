@@ -23,6 +23,8 @@
 #[cfg(test)]
 use serde::Deserialize;
 
+use connector_domain::x402::X402AssetTransferMethod;
+
 use crate::error::ConfigError;
 
 /// The floor under both published minimums, in seconds: x402's own 900
@@ -43,7 +45,9 @@ pub const EVM_BATCH_SETTLEMENT_MAX_WITHDRAW_DELAY_SECS: u64 = 30 * 86_400;
 
 /// The EVM terms as `[settlement.evm]` wrote them. `asset_eip712_name` and
 /// `asset_eip712_version` are required (issue #1345, ADR 0075 decision 9);
-/// an omitted `min_withdraw_delay_secs` takes the default the record chose.
+/// an omitted `min_withdraw_delay_secs` takes the default the record chose,
+/// an omitted `asset_transfer_method` is x402's own `eip3009`, and an
+/// omitted `facilitator_url` names none (toon-client#695).
 #[derive(Debug)]
 #[cfg_attr(test, derive(Deserialize))]
 pub(crate) struct RawEvmBatchSettlementTable {
@@ -51,6 +55,10 @@ pub(crate) struct RawEvmBatchSettlementTable {
     pub(crate) min_withdraw_delay_secs: Option<u64>,
     pub(crate) asset_eip712_name: String,
     pub(crate) asset_eip712_version: String,
+    #[cfg_attr(test, serde(default))]
+    pub(crate) asset_transfer_method: Option<String>,
+    #[cfg_attr(test, serde(default))]
+    pub(crate) facilitator_url: Option<String>,
 }
 
 /// The Solana terms as `[settlement.solana]` wrote them.
@@ -77,6 +85,8 @@ pub struct EvmBatchSettlementConfig {
     min_withdraw_delay_secs: u64,
     asset_eip712_name: String,
     asset_eip712_version: String,
+    asset_transfer_method: X402AssetTransferMethod,
+    facilitator_url: Option<String>,
 }
 
 impl EvmBatchSettlementConfig {
@@ -101,6 +111,22 @@ impl EvmBatchSettlementConfig {
     /// devnet's Circle FiatToken v2.2, published as `accepts[].extra.version`.
     pub fn asset_eip712_version(&self) -> &str {
         &self.asset_eip712_version
+    }
+
+    /// How a payer's deposit moves the asset -- ERC-3009 or a Permit2
+    /// witness transfer -- published as x402's own
+    /// `accepts[].extra.assetTransferMethod`, always, even at its default
+    /// `eip3009` (toon-client#695).
+    pub fn asset_transfer_method(&self) -> X402AssetTransferMethod {
+        self.asset_transfer_method
+    }
+
+    /// The x402 facilitator this operator relays deposits through and pays
+    /// the gas of, published as `accepts[].extra.facilitator` verbatim when
+    /// set (toon-client#695). An `http`/`https` URL. This node never calls
+    /// it: a payer does, because its deposit precedes the channel.
+    pub fn facilitator_url(&self) -> Option<&str> {
+        self.facilitator_url.as_deref()
     }
 }
 
@@ -169,11 +195,35 @@ pub(crate) fn resolve_evm_batch_settlement(
             key: "asset_eip712_version",
         });
     }
+    let asset_transfer_method = match raw.asset_transfer_method {
+        None => X402AssetTransferMethod::default(),
+        Some(value) => X402AssetTransferMethod::from_name(&value)
+            .ok_or(ConfigError::BatchSettlementUnknownAssetTransferMethod { value })?,
+    };
+    let facilitator_url = raw.facilitator_url.map(facilitator_url).transpose()?;
     Ok(EvmBatchSettlementConfig {
         min_withdraw_delay_secs,
         asset_eip712_name: raw.asset_eip712_name,
         asset_eip712_version: raw.asset_eip712_version,
+        asset_transfer_method,
+        facilitator_url,
     })
+}
+
+/// `facilitator_url` must be an absolute `http`/`https` URL: a payer POSTs
+/// its deposit there. Kept verbatim -- the greeting publishes exactly what
+/// the operator wrote, as it does `asset_eip712_name`.
+fn facilitator_url(value: String) -> Result<String, ConfigError> {
+    let url = match url::Url::parse(&value) {
+        Ok(url) => url,
+        Err(source) => {
+            return Err(ConfigError::BatchSettlementInvalidFacilitatorUrl { value, source })
+        }
+    };
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(ConfigError::BatchSettlementUnsupportedFacilitatorScheme { value });
+    }
+    Ok(value)
 }
 
 pub(crate) fn resolve_solana_batch_settlement(
@@ -304,6 +354,108 @@ mod tests {
         let config = evm("").expect("the helper's own USDC/2 fixture");
         assert_eq!(config.asset_eip712_name(), "USDC");
         assert_eq!(config.asset_eip712_version(), "2");
+    }
+
+    // -- EVM deposit terms (toon-client#695) --
+
+    /// An operator who writes neither key deposits by ERC-3009 -- x402's
+    /// own default -- and names no facilitator.
+    #[test]
+    fn an_evm_table_without_deposit_keys_takes_eip3009_and_no_facilitator() {
+        let config = evm("").expect("both keys are optional");
+        assert_eq!(
+            config.asset_transfer_method(),
+            X402AssetTransferMethod::Eip3009
+        );
+        assert_eq!(config.facilitator_url(), None);
+    }
+
+    #[test]
+    fn both_x402_asset_transfer_methods_are_accepted() {
+        let config = evm("asset_transfer_method = \"eip3009\"").expect("x402's default");
+        assert_eq!(
+            config.asset_transfer_method(),
+            X402AssetTransferMethod::Eip3009
+        );
+        let config = evm("asset_transfer_method = \"permit2\"").expect("x402's other method");
+        assert_eq!(
+            config.asset_transfer_method(),
+            X402AssetTransferMethod::Permit2
+        );
+    }
+
+    /// Only x402's two spellings: anything else would publish a method no
+    /// client can deposit by, so it is refused by name, never defaulted.
+    #[test]
+    fn an_unknown_asset_transfer_method_is_refused_by_name() {
+        for value in ["eip2612", "Permit2", "EIP3009", ""] {
+            let error = evm(&format!("asset_transfer_method = \"{value}\""))
+                .expect_err("not an x402 asset transfer method");
+            assert!(
+                matches!(
+                    &error,
+                    ConfigError::BatchSettlementUnknownAssetTransferMethod { value: written }
+                        if written == value
+                ),
+                "got {error:?}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("asset_transfer_method")
+                    && message.contains("eip3009")
+                    && message.contains("permit2"),
+                "the message must name the key and both legal values, got: {message}"
+            );
+        }
+    }
+
+    /// The facilitator URL is published verbatim, as the operator wrote it.
+    #[test]
+    fn an_http_or_https_facilitator_url_is_accepted_verbatim() {
+        let config =
+            evm("facilitator_url = \"https://facilitator.example/x402\"").expect("an https URL");
+        assert_eq!(
+            config.facilitator_url(),
+            Some("https://facilitator.example/x402")
+        );
+        let config = evm("facilitator_url = \"http://127.0.0.1:4022\"").expect("a local http URL");
+        assert_eq!(config.facilitator_url(), Some("http://127.0.0.1:4022"));
+    }
+
+    /// A value that is not a URL at all, or is written empty, is refused
+    /// by name rather than published for a payer to fail against.
+    #[test]
+    fn an_unparseable_facilitator_url_is_refused_by_name() {
+        for value in ["", "not a url", "facilitator.example/x402"] {
+            let error = evm(&format!("facilitator_url = \"{value}\"")).expect_err("not a URL");
+            assert!(
+                matches!(
+                    &error,
+                    ConfigError::BatchSettlementInvalidFacilitatorUrl { value: written, .. }
+                        if written == value
+                ),
+                "got {error:?}"
+            );
+            assert!(error.to_string().contains("facilitator_url"));
+        }
+    }
+
+    /// A payer calls it over HTTP(S); any other scheme is refused by name.
+    #[test]
+    fn a_non_http_facilitator_url_is_refused_by_name() {
+        for value in ["ws://facilitator.example", "ftp://facilitator.example/x402"] {
+            let error = evm(&format!("facilitator_url = \"{value}\"")).expect_err("not http(s)");
+            assert!(
+                matches!(
+                    &error,
+                    ConfigError::BatchSettlementUnsupportedFacilitatorScheme { value: written }
+                        if written == value
+                ),
+                "got {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("facilitator_url") && message.contains("https"));
+        }
     }
 
     // -- Solana --

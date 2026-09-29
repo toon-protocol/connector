@@ -365,7 +365,9 @@ pub fn agreed_required_transport<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::x402::{X402BatchSettlementEvmTerms, X402BatchSettlementSolanaTerms};
+    use crate::x402::{
+        X402AssetTransferMethod, X402BatchSettlementEvmTerms, X402BatchSettlementSolanaTerms,
+    };
 
     fn facts() -> NodeFacts {
         NodeFacts {
@@ -635,6 +637,8 @@ mod tests {
             min_withdraw_delay_secs: 86_400,
             name: "USDC".to_string(),
             version: "2".to_string(),
+            asset_transfer_method: X402AssetTransferMethod::Permit2,
+            facilitator: Some("https://facilitator.example/x402".to_string()),
         });
         let solana_batch = X402BatchSettlementTerms::Solana(X402BatchSettlementSolanaTerms {
             network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
@@ -662,7 +666,9 @@ mod tests {
                 "receiverAuthorizer": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
                 "withdrawDelay": 86400,
                 "name": "USDC",
-                "version": "2"
+                "version": "2",
+                "assetTransferMethod": "permit2",
+                "facilitator": "https://facilitator.example/x402"
             }, {
                 "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
                 "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
