@@ -350,6 +350,13 @@ this node lands its latest **voucher**. It pays the fees and floats the rent, wh
 where the money goes.
 _Avoid_: facilitator (x402's relayer, which on Solana would take these seats itself)
 
+**Facilitator**:
+x402's relayer: the service that sends a payer's signed EVM deposit into `x402BatchSettlement` and
+pays its gas. In TOON the **operator** names it (`[settlement.evm] facilitator_url`, published as
+`facilitator`) and pays for it as a cost of the sale; the payer calls it, and the connector never
+does ([ADR 0076](docs/adr/0076-the-operator-names-the-facilitator-and-pays-its-gas.md)). EVM only:
+on Solana the **sponsor** does this job. A node's own outbound deposits use none.
+
 **Covering claim**:
 The claim that pays for one particular packet, carried **with** it rather than trailing behind it.
 A packet arriving without one is greeted, not carried. This is what removes accumulation from the
