@@ -103,7 +103,7 @@ const FORWARDED: u64 = CLIENT_PRICE - PEER_FEE;
 const PEER_DEPOSIT: u128 = 100 * CLIENT_PRICE as u128;
 
 /// The seconds a channel this suite opens may be withdrawn after: the
-/// `[settlement.evm.batch_settlement]` default a payee requires at least.
+/// `[settlement.evm]` default a payee requires at least.
 const WITHDRAW_DELAY_SECS: u64 = 86_400;
 
 /// The fixed `timestamp` every in-test voucher is rendered with, so a

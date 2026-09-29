@@ -7,7 +7,7 @@
 //! the receive-only port.
 //!
 //! Nothing here builds a backend and hands it to the gate: the
-//! `[settlement.evm.batch_settlement]` table is the only opt-in this test
+//! `[settlement.evm]` table is the only opt-in this test
 //! writes, and `connector_cli::build` / `router` are what turn it into a
 //! gate that accepts vouchers and a port that lands them.
 

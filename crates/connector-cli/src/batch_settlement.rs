@@ -33,7 +33,7 @@ use connector_settlement::ChannelId;
 use connector_signer::{BatchChannelConfig, BatchSettlementDomain};
 
 /// This node's batch-settlement backends, one per chain it has opted in on
-/// (`[settlement.<chain>.batch_settlement]`), as the claim gate asks them.
+/// (`[settlement.<chain>]`), as the claim gate asks them.
 /// A chain whose table is absent is `None` here, and the gate refuses its
 /// vouchers by name.
 pub(crate) struct BatchSettlementChannelsAdapter {

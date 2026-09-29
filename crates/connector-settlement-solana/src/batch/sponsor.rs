@@ -168,7 +168,7 @@ pub struct SponsorTerms {
     /// The mint this node settles in.
     pub mint: Pubkey,
     pub min_grace_period_secs: u64,
-    /// `[settlement.solana.batch_settlement] min_sponsored_deposit`.
+    /// `[settlement.solana] min_sponsored_deposit`.
     pub min_sponsored_deposit: u64,
 }
 
