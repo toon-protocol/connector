@@ -1,5 +1,10 @@
 # EVM devnet deployment: `TokenNetwork` cutovers on Base Sepolia
 
+> **History.** This build settles only on x402's `x402BatchSettlement` (ADR 0075), a constant of
+> the binary that nobody here deploys, so nothing below applies to running a node today. How a
+> node is paid now, and every key it takes, is
+> [`docs/operators/x402-batch-settlement.md`](operators/x402-batch-settlement.md).
+
 The committed runbook for redeploying `TokenNetwork` to Base Sepolia devnet and repointing every
 place this repo names a settlement contract address. `TokenNetwork` is not upgradeable, so every
 change to it is a cutover of this shape, and this file accumulates them: issue #695's meta-tx-aware

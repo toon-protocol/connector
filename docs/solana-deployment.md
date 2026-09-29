@@ -1,5 +1,10 @@
 # Solana Payment Channel Program -- Devnet Deployment & Operations Guide
 
+> **History.** This build settles only on solana-foundation's `payment-channels` (ADR 0075), and
+> `packages/solana-program` left this repository in #1386, so nothing below applies to running a
+> node today. How a node is paid now, sponsored opens included, is
+> [`docs/operators/x402-batch-settlement.md`](operators/x402-batch-settlement.md).
+
 > **Where the connector fits.** Everything here is about `packages/solana-program` itself --
 > building it, deploying it, its PDA seeds, its account layout. The connector side is one TOML
 > table, `[settlement.solana]` ([Configuration](#configuration)), and the program is driven through

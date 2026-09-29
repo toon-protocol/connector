@@ -229,9 +229,8 @@ the terminating app:
    about its own signer is consulted. On EVM the `channelConfig` -- presented, or this connector's
    journaled record of the channel -- MUST hash to `channelId` (`getChannelId`) before the backend
    is asked, and the backend's own config is re-hashed too, since the signer is read from it; a
-   mismatch is refused under its own reason. A voucher on a chain this connector settles on no
-   `batch-settlement` channel for -- no `[settlement.<chain>.batch_settlement]` table -- is refused
-   by name before anything about it is judged.
+   mismatch is refused under its own reason. A voucher on a chain this connector does not settle
+   on -- no `[settlement.<chain>]` table -- is refused by name before anything about it is judged.
 
    A voucher naming a channel the backend does **not admit** (it does not exist, is not toward this
    connector, or fails ADR 0074 decision 2's admission rules) is refused with its own reason,
@@ -512,8 +511,9 @@ settles on, and TOON's own terms for the request ride in x402 v2's `extensions` 
 
 `accepts` is a list — ADR 0022 notes terms are plural — of the payment methods this connector's
 claim gate (§1.3) understands: an x402 `batch-settlement` voucher on each chain whose
-`[settlement.<chain>.batch_settlement]` table is written. It is **empty** on a node that settles
-on no such chain, which can be paid by nobody. The `toon-channel` entry that led the list until
+`[settlement.<chain>]` table is written, since every such table carries that chain's x402 terms
+directly (ADR 0075 decision 9). It is **empty** on a node that settles on no chain, which can be
+paid by nobody. The `toon-channel` entry that led the list until
 #1384, and its `extra.settlement`/`extra.settlements` channel-opening terms (issues #617, #632), are
 deleted with that claim scheme.
 
@@ -558,7 +558,7 @@ is not a decimal uint64, as unreadable terms, never as "nothing to pay". In the 
 >   (a token with EIP-2612 `permit`) or `erc20ApprovalGasSponsoring` (a plain ERC-20); otherwise
 >   the payer pays that approval once, from its own ETH.
 > - **Solana:** `feePayer` (the sponsor key); `withdrawDelay`, x402's SVM field name, carrying the
->   minimum `grace_period` (`[settlement.solana.batch_settlement] min_grace_period_secs`);
+>   minimum `grace_period` (`[settlement.solana] min_grace_period_secs`);
 >   `tokenProgram`, x402's required SVM field naming the program that owns `asset` — always SPL
 >   Token (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`), the one program the backend boots
 >   against and the sponsor co-signs under (a Token-2022 `open` is `token_program_unsupported`,
@@ -1379,7 +1379,7 @@ once 8 co-signed opens have been sent and failed within an hour, every request i
 passed, by moving its tokens away first, and the node pays that transaction's fee; the fee caps below
 bound one such fee, and the budget bounds how many.
 
-**Off unless configured.** A node without `[settlement.solana.batch_settlement]` answers `404`
+**Off unless configured.** A node without a `[settlement.solana]` table answers `404`
 `batch_settlement_not_offered`.
 
 **Request.** Base64 of the transaction's wire bytes, legacy or version 0, signed by the payer alone with
@@ -1417,7 +1417,7 @@ allows:
 
 - the top level is an optional Compute Budget prefix — at most one `SetComputeUnitLimit` (≤ 400,000),
   then at most one `SetComputeUnitPrice` (≤ 100,000 microlamports, a fiftieth of x402's cap, because the priority fee is the node's even when an `open` a client has sabotaged fails on chain) — exactly
-  one `open` of the configured `program_id`, then at most one account-less, UTF-8 Memo of ≤ 256 bytes.
+  one `open` of `payment-channels` (the program id the binary fixes, never config), then at most one account-less, UTF-8 Memo of ≤ 256 bytes.
   Nothing else: no other program, no Lighthouse assertion, no address lookup table;
 - the required signers are exactly the fee payer and the `open`'s `payer`, both writable, and the
   payer's signature already verifies;
@@ -1443,7 +1443,7 @@ channel this node admits.
 
 | Name                                                                                            | Status | When                                                                                                                                |
 | ----------------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `batch_settlement_not_offered`                                                                  | 404    | the Solana `batch_settlement` table is not configured                                                                               |
+| `batch_settlement_not_offered`                                                                  | 404    | no `[settlement.solana]` table is configured                                                                                        |
 | `request_malformed`, `transaction_not_base64`, `transaction_too_large`, `transaction_malformed` | 400    | not `{"transaction": base64}` of one Solana transaction of at most 1,232 bytes, decoded exactly                                     |
 | `address_lookup_tables_refused`                                                                 | 422    | the message uses an address lookup table                                                                                            |
 | `fee_payer_not_sponsor`                                                                         | 422    | the fee payer is not this node's sponsor key                                                                                        |
