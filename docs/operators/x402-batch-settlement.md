@@ -285,8 +285,9 @@ is refused too. Fund both keys before the first boot.
 x402's `x402BatchSettlement` has **no fee field**. Nothing on chain pays a facilitator, so gas is
 paid by whoever wants the transaction to happen. The owner decided on 2026-09-29 that in TOON that
 is **the seller**: your node names the facilitator it relays deposits through
-(`facilitator_url`), and deposit gas is a cost of the sale. Your node publishes that URL and never
-calls it. A stock x402 seller calls its facilitator itself. Here the deposit precedes the channel
+(`facilitator_url`), and deposit gas is a cost of the sale
+([ADR 0076](../adr/0076-the-operator-names-the-facilitator-and-pays-its-gas.md)). Your node
+publishes that URL and never calls it. A stock x402 seller calls its facilitator itself. Here the deposit precedes the channel
 and leaves the packet path, so the payer calls it, and you have to name it.
 
 | Step                                           | Who pays                                                                                        |

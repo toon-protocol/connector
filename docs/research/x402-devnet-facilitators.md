@@ -527,3 +527,45 @@ without it.
 
 This strengthens the recommendation above. The devnet's token has no ERC-3009, so a gasless devnet
 deposit needs a facilitator that performs the funding step, and ours can.
+
+## Update, 2026-09-29: the devnet Onboarder funds the approval
+
+The update above ends with a facilitator that performs the funding step being needed, and says ours
+can. **Ours now does.** toon-protocol/infra#40 (merged 2026-09-29, pinned by infra#41) registers both
+of x402's gas-sponsoring extensions on the devnet Onboarder, the facilitator this note recommended
+the devnet run:
+
+- **`eip2612GasSponsoring`**, for a token with an EIP-2612 `permit`. It is built into `@x402/evm`'s
+  batch scheme, and registering it only advertises it.
+- **`erc20ApprovalGasSponsoring`**, for a plain ERC-20. `@x402/evm` ships no signer for it, so the
+  Onboarder carries its own. It funds exactly the payer's shortfall for the approval's worst-case fee,
+  broadcasts the approval the payer signed, waits for it, and sends the deposit. It sponsors only the
+  tokens in `ONBOARDER_SPONSORED_TOKENS`. The devnet allowlists one, the mock USDC `0x49beE1Bc…a9Ce`
+  from the run above. It also refuses an approval over a gas or fee bound, a payer it has already
+  funded, and an approval that is for another chain, is not at the payer's next nonce, or fails when
+  simulated.
+
+Evidence, by tag:
+
+- **CONFIRMED-LIVE:** `GET https://onboard.devnet.toonprotocol.dev/supported` lists
+  `batch-settlement` on `eip155:84532` and the extensions
+  `["eip2612GasSponsoring","erc20ApprovalGasSponsoring"]` (read 2026-09-29, 10:52 UTC).
+- **CONFIRMED-CODE, run on anvil:** infra#40 ran toon-client's `batch-settlement-deposit-gas` suite
+  against the real x402 contracts and the Onboarder, 5 of 5. That covers a WETH9 deposit (neither
+  ERC-3009 nor a permit) from a wallet with no ETH, and a FiatToken Permit2 deposit from a wallet
+  with no ETH that sent no transaction.
+- **Live on Base Sepolia, the permit path only:** toon-client#695 records a devnet USDC Permit2
+  deposit from a wallet with no ETH passing against the live Onboarder, with the permit inside the
+  deposit.
+- **UNVERIFIED:** a live Base Sepolia run of the approval-funding path against the Onboarder. Neither
+  #695 nor infra#40 records one.
+
+**x402.org is unchanged as far as is known.** Its `/supported` still lists
+`erc20ApprovalGasSponsoring` (read 2026-09-29). Nothing has been sent to it since the 2026-09-25 run,
+so whether it now funds the approval is not known.
+
+**The facilitator is now the operator's to name.** Recommendation 6 above leaned on 0074's _"a stock
+x402 facilitator relays the deposit"_. The owner decided on 2026-09-29 that the connector's operator
+names the facilitator its payers deposit through, and pays that facilitator's gas as a cost of the
+sale. That is [ADR 0076](../adr/0076-the-operator-names-the-facilitator-and-pays-its-gas.md). Whether
+any devnet node's config names the Onboarder as its `facilitator_url` was not checked here.
