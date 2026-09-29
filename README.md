@@ -241,6 +241,11 @@ solana-foundation's `payment-channels` program. Both are **constants of the
 binary**, the same address on every network, so there is nothing chain-specific
 to name here beyond your own RPC, token and key.
 
+**[`docs/operators/x402-batch-settlement.md`](docs/operators/x402-batch-settlement.md)
+is the full guide**: what a paying client does from greeting to exit, every
+x402 key with its default and refusal, who pays gas and why, choosing a
+facilitator, and which tokens work. This step is the short version.
+
 > [!NOTE]
 > **Upgrading a node that still holds TOON channels?** Read
 > [`docs/operators/draining-toon-channels.md`](docs/operators/draining-toon-channels.md)
@@ -341,11 +346,15 @@ whose terms are the ones it published:
   token, and `withdrawDelay` must be at least your minimum. `payerAuthorizer`
   must be **nonzero**. That last rule is stricter than x402, which allows a zero
   one, and the greeting has no field to say so. A channel with a zero one is
-  refused on its first voucher. The client deposits through any x402 facilitator.
-  x402.org's facilitator relays deposits on Base Sepolia and pays their gas, but
-  only a token with ERC-3009 skips the payer's one-time `approve`, and devnet
-  USDC has ERC-3009. The first voucher on a channel your node has not seen carries
-  the full `channelConfig`, and the node recomputes the channel id from it.
+  refused on its first voucher. The client's deposit is relayed by an x402
+  facilitator, which pays its gas. **You name that facilitator**
+  (`facilitator_url`, published as `extra.facilitator`) and pay for its gas as a
+  cost of the sale; your node never calls it. A payer holding ETH can deposit
+  directly instead. An ERC-3009 token such as USDC deposits with one signature.
+  Any other ERC-20 needs `asset_transfer_method = "permit2"` and a one-time
+  Permit2 approval, which is gasless only if your facilitator sponsors it. The
+  first voucher on a channel your node has not seen carries the full
+  `channelConfig`, and the node recomputes the channel id from it.
 - **Solana.** The client builds an `open` in which your settlement key is the fee
   payer, `rent_payer` and `payee`. It signs it and posts it to
   `POST /ilp/batch-settlement/solana/open`, which the greeting names as
@@ -1293,28 +1302,30 @@ the binary and a box's mounted TOML are a matched pair in both directions,
 bump that pin.
 
 **Devnet** settles on Base Sepolia and Solana devnet; test funds come from the
-[devnet faucet](https://faucet.devnet.toonprotocol.dev). **Mainnet** contracts and
-program exist on Base and Solana mainnet-beta (records under
-`packages/*/deployments/`), run by a third-party operator. **The fleet's production
-tier is still named and empty** (ADR 0056): no fleet machine, no fleet key.
+[devnet faucet](https://faucet.devnet.toonprotocol.dev). **Mainnet**: TOON's own
+retired contracts and program exist on Base and Solana mainnet-beta (records
+under [`docs/deployments/`](docs/deployments/)), run by a third-party operator;
+this build settles on x402's instead. **The fleet's production tier is still
+named and empty** (ADR 0056): no fleet machine, no fleet key.
 
 ---
 
 ## Where to go next
 
-| Path                                                                               | What it is                                                                                               |
-| ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| [`docs/the-yellow-brick-road.md`](docs/the-yellow-brick-road.md)                   | **The idea.** Why you pay a path and not a destination, and why the road earns the traffic.              |
-| [`docs/rfcs/`](docs/rfcs/README.md)                                                | **The protocol.** Interledger, the ten vendored RFCs, and where TOON departs from each.                  |
-| [`docs/protocol/configuration-spec.md`](docs/protocol/configuration-spec.md)       | Every config key, and what each one binds.                                                               |
-| [`docs/protocol/operator-spec.md`](docs/protocol/operator-spec.md)                 | The operator surface's rules, numbered.                                                                  |
-| [`docs/protocol/self-description-spec.md`](docs/protocol/self-description-spec.md) | What `GET /ilp` must and must not carry, rule by rule.                                                   |
-| [`docs/operators/`](docs/operators/)                                               | Runbooks: box bring-up, key rotation, fleet release and health, signing a write, draining TOON channels. |
-| [`deploy/connector-rust/README.md`](deploy/connector-rust/README.md)               | The container path in full, including the image tag table.                                               |
-| [`local/`](local/README.md)                                                        | The shipped image against real chains — `make local-verify`.                                             |
-| [`CONTEXT.md`](CONTEXT.md)                                                         | The vocabulary. Read before writing docs or naming anything.                                             |
-| [`docs/adr/`](docs/adr/README.md)                                                  | Why any of this is the way it is. The tiebreaker for everything.                                         |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md)                                               | Building from source, the test gate, the chain binaries it needs.                                        |
+| Path                                                                                 | What it is                                                                                               |
+| ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| [`docs/the-yellow-brick-road.md`](docs/the-yellow-brick-road.md)                     | **The idea.** Why you pay a path and not a destination, and why the road earns the traffic.              |
+| [`docs/rfcs/`](docs/rfcs/README.md)                                                  | **The protocol.** Interledger, the ten vendored RFCs, and where TOON departs from each.                  |
+| [`docs/protocol/configuration-spec.md`](docs/protocol/configuration-spec.md)         | Every config key, and what each one binds.                                                               |
+| [`docs/protocol/operator-spec.md`](docs/protocol/operator-spec.md)                   | The operator surface's rules, numbered.                                                                  |
+| [`docs/protocol/self-description-spec.md`](docs/protocol/self-description-spec.md)   | What `GET /ilp` must and must not carry, rule by rule.                                                   |
+| [`docs/operators/x402-batch-settlement.md`](docs/operators/x402-batch-settlement.md) | **Getting paid.** x402 channels end to end: the client's side, your keys, gas, facilitators, tokens.     |
+| [`docs/operators/`](docs/operators/)                                                 | Runbooks: box bring-up, key rotation, fleet release and health, signing a write, draining TOON channels. |
+| [`deploy/connector-rust/README.md`](deploy/connector-rust/README.md)                 | The container path in full, including the image tag table.                                               |
+| [`local/`](local/README.md)                                                          | The shipped image against real chains — `make local-verify`.                                             |
+| [`CONTEXT.md`](CONTEXT.md)                                                           | The vocabulary. Read before writing docs or naming anything.                                             |
+| [`docs/adr/`](docs/adr/README.md)                                                    | Why any of this is the way it is. The tiebreaker for everything.                                         |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md)                                                 | Building from source, the test gate, the chain binaries it needs.                                        |
 
 ## License
 

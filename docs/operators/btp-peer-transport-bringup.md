@@ -556,7 +556,8 @@ one of the four).
    last TOON-capable release first (ADR 0075); this build refuses the row by name.
 5. Add a `[[peer_channels]]` row per peering naming the peer's `voucher_signer`, and — for a peering
    a route forwards to — open an outbound channel with `POST /channels` and add a `[[pay_channels]]`
-   row naming it. Make sure the chain's `batch_settlement` sub-table exists and `state_dir` is set
-   and mounted.
+   row naming it. Make sure the chain's `[settlement.<chain>]` table exists (its x402 terms sit in
+   it directly; a `batch_settlement` sub-table is refused by name) and `state_dir` is set and
+   mounted.
 
 Start the node. If it refuses, the message names the field and points back here.

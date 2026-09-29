@@ -295,7 +295,7 @@ it did not open; and `client_edge_url`, that hop's own `POST /ilp` endpoint, whe
 channel stand. That ask restores the channel's watermark after a lost journal and only ever raises
 it (§1.11). The signing key is the chain's settlement key, `[settlement.evm]`'s or
 `[settlement.solana]`'s, and no second key exists (ADR 0030). The row requires the chain's
-`[settlement.<chain>.batch_settlement]` table (`PayChannelWithoutX402`) and `state_dir`
+`[settlement.<chain>]` table (`PayChannelWithoutX402`) and `state_dir`
 (`PayChannelsWithoutStateDir`). **The table is required of any peering a `[[routes]]` entry
 forwards to** (issue #1145): a route naming a peer with no row is `ConfigError::PayChannelUnbound`,
 refused at load naming the peer and the route. A peering this node only accepts on needs no row --
@@ -1867,7 +1867,7 @@ Required surface:
   channel's `payerAuthorizer`; Solana: its base58 `authorized_signer`), whose spelling names the
   chain; and optional `inbound_channel`, the x402 channel id (EVM) or `payment-channels` channel
   account (Solana) that pins the binding to one channel (§1.2). The row requires the chain's
-  `[settlement.<chain>.batch_settlement]` table and `state_dir`, and binds the signer at boot
+  `[settlement.<chain>]` table and `state_dir`, and binds the signer at boot
   (`configuration-spec.md` §2.1 is the key-by-key reference).
 - `[[pay_channels]]` (ADR 0042 item 2, as ADR 0075 decisions 4, 6 and 9 amend it, issue #1380) —
   `peer_id`, `outbound_channel` (an x402 channel this node opened, which its outbound-channel
@@ -1912,11 +1912,12 @@ Required surface:
 
 ### 11.1 A channel row requires the settlement table of its own chain (issue #1138)
 
-> **Amended by ADR 0075 (issue #1380).** For the peer and pay books the rule is now stricter: a
-> `[[peer_channels]]` or `[[pay_channels]]` row requires its chain's
-> `[settlement.<chain>.batch_settlement]` table, not merely `[settlement.<chain>]`, because that
-> sub-table is what makes this node take part in x402 channels on the chain at all
-> (`PeerChannelWithoutX402`, `PayChannelWithoutX402`). The per-book consequences below that speak of
+> **Amended by ADR 0075 (issues #1380, #1385).** For the peer and pay books the rule is
+> `PeerChannelWithoutX402` and `PayChannelWithoutX402`: a `[[peer_channels]]` or `[[pay_channels]]`
+> row requires its chain's `[settlement.<chain>]` table. From #1380 until #1385 it required the
+> opt-in `[settlement.<chain>.batch_settlement]` sub-table as well, which was what made a node take
+> part in x402 channels on the chain; since #1385 every settlement table carries its chain's x402
+> terms directly and the sub-table is refused by name, so the settlement table alone suffices. The per-book consequences below that speak of
 > a peer or pay row's `toon-channel` claims — a claim signed or judged under a program id, an
 > EVM-only file reaching `PayChannelWithoutEvmSettlement` — describe the retired row shapes.
 > **Since #1384** `[[client_channels]]` itself is refused by name (`ClientChannelsRemoved`): a
@@ -1983,7 +1984,7 @@ Named load-time errors this specification requires (spelling #677's, identity ou
 | `PeerChannelVoucherSignerMissing`                                       | a `[[peer_channels]]` row with no `voucher_signer`                                                                                                                                                                                                                                                                          | §1.2, #1380           |
 | `PeerChannelInvalidVoucherSigner`                                       | a `voucher_signer` that is neither `0x` + 20-byte hex (EVM) nor base58 of a 32-byte key (Solana)                                                                                                                                                                                                                            | §1.2, #1380           |
 | `PeerChannelInvalidInboundChannel`                                      | an `inbound_channel` that is not an x402 channel on the chain its `voucher_signer` names                                                                                                                                                                                                                                    | §1.2, #1380           |
-| `PeerChannelWithoutX402`                                                | a `[[peer_channels]]` row on a chain whose `[settlement.<chain>]` has no `batch_settlement` sub-table — no channel the peer opens toward this node could ever be admitted                                                                                                                                                   | §11.1, #1380          |
+| `PeerChannelWithoutX402`                                                | a `[[peer_channels]]` row on a chain with no `[settlement.<chain>]` table — no channel the peer opens toward this node could ever be admitted                                                                                                                                                                               | §11.1, #1380          |
 | `PeerChannelsWithoutStateDir`                                           | `[[peer_channels]]` with no `state_dir` — a peer's vouchers are journaled beside a client's, and a watermark held only in memory is no replay defence                                                                                                                                                                       | §1.8, #1380           |
 | `PeerChannelToonFieldRemoved`                                           | a `[[peer_channels]]` row writing `channel_id`, `channel_account`, `chain_id`, `token_network`, `counterparty_key` or `program_id` — the `toon-channel` row shape, refused by name and pointing at ADR 0075's drain procedure                                                                                               | ADR 0075, #1380       |
 | `ChannelInBothDirections`                                               | a `[[pay_channels]]` `outbound_channel` that is also a `[[peer_channels]]` `inbound_channel` — an x402 channel moves value one way                                                                                                                                                                                          | §1.8, ADR 0075, #1380 |
@@ -1991,7 +1992,7 @@ Named load-time errors this specification requires (spelling #677's, identity ou
 | `PayChannelUnbound`                                                     | a `[[routes]]` entry whose next hop is a peering with no `[[pay_channels]]` row — a connector covers every PREPARE it sends and the postpay fallback is deleted, so every packet on that route would be refused at packet time. Keyed on the **route**: a peering this node only accepts on needs no row                    | ADR 0042, #1145       |
 | `PayChannelOrphaned`                                                    | a `[[pay_channels]]` row naming an unknown `peer_id`                                                                                                                                                                                                                                                                        | §1.2                  |
 | `PayChannelOutboundChannelMissing` / `PayChannelInvalidOutboundChannel` | a `[[pay_channels]]` row with no `outbound_channel`, or one that is neither an EVM x402 channel id nor a base58 Solana channel account                                                                                                                                                                                      | §1.2, #1380           |
-| `PayChannelWithoutX402`                                                 | a `[[pay_channels]]` row on a chain whose `[settlement.<chain>]` has no `batch_settlement` sub-table — no paying half to sign a voucher with                                                                                                                                                                                | §11.1, #1380          |
+| `PayChannelWithoutX402`                                                 | a `[[pay_channels]]` row on a chain with no `[settlement.<chain>]` table — no paying half to sign a voucher with                                                                                                                                                                                                            | §11.1, #1380          |
 | `PayChannelInvalidClientEdgeUrl` / `PayChannelClientEdgeUrlScheme`      | an unparseable `client_edge_url`, or one that is not `https://` (or `http://` under `peer_allow_plaintext_endpoints`)                                                                                                                                                                                                       | §1.2                  |
 | `PayChannelDuplicatePeer` / `PayChannelDuplicate`                       | one peering in two `[[pay_channels]]` rows, or one channel paying two                                                                                                                                                                                                                                                       | §1.2, #1380           |
 | `PayChannelsWithoutStateDir`                                            | `[[pay_channels]]` with no `state_dir` — the channel is held in the outbound-channel journal there                                                                                                                                                                                                                          | §1.2, #1380           |
