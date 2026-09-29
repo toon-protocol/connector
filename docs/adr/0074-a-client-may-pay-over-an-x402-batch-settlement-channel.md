@@ -10,6 +10,8 @@
 
 **Amended 2026-09-27 (#1364):** `POST /ilp/claim-state` (`client-edge-spec.md` §1.10) answers for a batch-settlement channel, so a client that lost its channel store can recover the amount watermark decision 3 has its next voucher exceed. An entry carrying `scheme: "batch-settlement"` is proved by the channel's voucher signer (decision 4's), over a claim-state challenge distinct from a voucher: on EVM the existing `ClaimStateChallenge` struct under `x402BatchSettlement`'s domain, on Solana a message tagged `toon-voucher-claim-state-challenge-v1`. It is answered with the watermark and the collateral ceiling the gate admits the next voucher against, and no nonce. The vectors gain a `voucher_claim_state_challenge` section; it is additive, so `schema_version` stays 6.
 
+**Amended 2026-09-29 (toon-client#695):** decision 8's EVM `extra` gains two fields, published in the greeting's entry and in the self-description's `batchSettlements` alike. `assetTransferMethod` is x402's own EVM field for how a deposit moves the token: `eip3009` (ERC-3009 `receiveWithAuthorization`) or `permit2` (a Permit2 witness transfer, for any ERC-20 without ERC-3009). It is what a stock x402 client reads, and x402 reads it as `eip3009` when absent, so the connector publishes it always, even at that default: the explicit value means the same to a stock client and leaves a reader nothing to infer. It comes from `[settlement.evm] asset_transfer_method`, default `eip3009`. `facilitator` is TOON's own addition: the URL of the x402 facilitator this operator relays deposits through and pays the gas of, from the optional `[settlement.evm] facilitator_url`, and absent when unset. A stock x402 seller calls its facilitator itself. In TOON the deposit precedes the channel and leaves the packet path, so the payer calls it, and the seller has to name it. The owner decided on 2026-09-29 that the connector names its own facilitator: gas is a cost of the sale. The connector never calls it. A Permit2 deposit of a token without ERC-3009 is gasless for the payer only when that facilitator offers x402's `eip2612GasSponsoring` (for a token with EIP-2612 `permit`) or `erc20ApprovalGasSponsoring` (for a plain ERC-20). Otherwise the payer pays a one-time Permit2 approval from its own ETH. No vector covers the greeting or the self-description, so `schema_version` stays 7.
+
 **Scope:** protocol law. It binds every implementation, because it adds a claim scheme to the wire and an offer to the greeting. The watchers and sweeps in decision 5 and the port shape in decision 9 are connector architecture. See the [ADR index](README.md).
 
 **A client may pay a connector over an x402 `batch-settlement` channel, on Base and on Solana: the
@@ -334,7 +336,14 @@ names, recorded 2026-09-25, are x402's own wherever x402 has one:
   EIP-712 domain of the deposit's **asset**, which a client signs its ERC-3009 or Permit2
   authorization under. x402's EVM scheme requires both, and an ERC-20 need not expose either, so
   the connector does not read them off the chain: they come from the required config keys
-  `asset_eip712_name` and `asset_eip712_version`.
+  `asset_eip712_name` and `asset_eip712_version`. `assetTransferMethod` (amended by
+  toon-client#695) is x402's own field naming which of the two the deposit uses: `eip3009` or
+  `permit2`, from `asset_transfer_method`, and always written, even at x402's default `eip3009`.
+  `facilitator` (the same amendment) is this connector's own addition: the URL of the x402
+  facilitator the operator relays deposits through and pays the gas of, from the optional
+  `facilitator_url`, and absent when it is unset. x402's seller calls its own facilitator; here
+  the payer does, because the deposit precedes the channel, so the seller names it. The connector
+  never calls it.
 - **Solana:** `feePayer`, which is the sponsor key; `withdrawDelay`, which carries the minimum
   `grace_period` under x402's SVM field name (x402 calls the program's `grace_period`
   `withdrawDelay` on both chains, and a stock client reads that name); `tokenProgram`, the program

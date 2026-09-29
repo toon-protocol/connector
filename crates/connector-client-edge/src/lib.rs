@@ -2733,6 +2733,8 @@ mod tests {
             min_withdraw_delay_secs: 86_400,
             name: "USDC".to_string(),
             version: "2".to_string(),
+            asset_transfer_method: Default::default(),
+            facilitator: None,
         });
         let solana = X402BatchSettlementTerms::Solana(X402BatchSettlementSolanaTerms {
             network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),

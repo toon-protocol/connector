@@ -255,6 +255,8 @@ decimals              = 6              # units per token: 6 means 1,000,000 = 1.
 asset_eip712_name     = "USDC"         # the token's own EIP-712 domain --
 asset_eip712_version  = "2"            # `cast call <token> 'name()(string)'` / `'version()(string)'`
 # min_withdraw_delay_secs = 86400      # default one day; 900 at least, 30 days at most
+# asset_transfer_method = "eip3009"    # how a deposit moves the token; "permit2" for one without ERC-3009
+# facilitator_url = "https://..."      # the x402 facilitator payers relay deposits through; you pay its gas
 
 [settlement.evm.key]
 key_file = "/app/data/settlement.key"

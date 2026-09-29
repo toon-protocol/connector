@@ -590,6 +590,8 @@ mod tests {
             min_withdraw_delay_secs: 86_400,
             name: "USDC".to_string(),
             version: "2".to_string(),
+            asset_transfer_method: Default::default(),
+            facilitator: None,
         })
     }
 
@@ -914,6 +916,8 @@ mod tests {
             min_withdraw_delay_secs: terms.min_withdraw_delay_secs,
             name: "USDC".to_string(),
             version: "2".to_string(),
+            asset_transfer_method: Default::default(),
+            facilitator: None,
         });
         let signers = voucher_signer
             .map(|signer| {

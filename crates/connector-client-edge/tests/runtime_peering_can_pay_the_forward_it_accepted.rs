@@ -240,6 +240,8 @@ fn payee_document(
                 min_withdraw_delay_secs: 86_400,
                 name: "USDC".to_string(),
                 version: "2".to_string(),
+                asset_transfer_method: Default::default(),
+                facilitator: None,
             })],
             voucher_signers: vec![VoucherSignerFact {
                 network,

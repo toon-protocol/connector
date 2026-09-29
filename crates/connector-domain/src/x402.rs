@@ -298,6 +298,66 @@ pub struct X402BatchSettlementEvmTerms {
     /// Circle FiatToken v2.2. Configured (`asset_eip712_version`), for the
     /// same reason `name` is.
     pub version: String,
+    /// How a payer's deposit moves `asset` into the channel -- x402's own
+    /// `extra.assetTransferMethod` (EVM spec), configured as
+    /// `[settlement.evm] asset_transfer_method`. **Always published**, even
+    /// at its default (toon-client#695, ADR 0074 decision 8): x402 reads an
+    /// absent value as `eip3009`, so the explicit default means the same to
+    /// a stock client and leaves nothing for a TOON client to infer. Read
+    /// as `eip3009` when absent, for the same reason -- a node that predates
+    /// the field deposits by ERC-3009.
+    #[serde(rename = "assetTransferMethod", default)]
+    pub asset_transfer_method: X402AssetTransferMethod,
+    /// The URL of the x402 facilitator this node relays deposits through
+    /// and pays the gas of -- `[settlement.evm] facilitator_url`. TOON's own
+    /// addition, as the Solana leg's `sponsorEndpoint` is: a stock x402
+    /// seller calls its facilitator itself, but in TOON the deposit precedes
+    /// the channel, so the payer calls it and the seller must name it
+    /// (toon-client#695). This connector never calls it. Absent from the
+    /// wire when the operator names none.
+    #[serde(
+        rename = "facilitator",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub facilitator: Option<String>,
+}
+
+/// x402's EVM `extra.assetTransferMethod`: how a `batch-settlement` deposit
+/// moves the token (toon-client#695). Only the two x402 names; anything else
+/// is refused rather than read as the default.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum X402AssetTransferMethod {
+    /// ERC-3009 `receiveWithAuthorization` -- the token itself must
+    /// implement ERC-3009 (Circle's USDC does). x402's default.
+    #[default]
+    #[serde(rename = "eip3009")]
+    Eip3009,
+    /// A Permit2 witness transfer, for any ERC-20 without ERC-3009. The
+    /// payer's one-time Permit2 approval is gasless only when the named
+    /// facilitator offers x402's `eip2612GasSponsoring` (a permit token) or
+    /// `erc20ApprovalGasSponsoring` (a plain ERC-20).
+    #[serde(rename = "permit2")]
+    Permit2,
+}
+
+impl X402AssetTransferMethod {
+    /// The wire (and config) spelling: `"eip3009"` or `"permit2"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Eip3009 => "eip3009",
+            Self::Permit2 => "permit2",
+        }
+    }
+
+    /// The inverse of [`Self::as_str`]; `None` for any other spelling.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "eip3009" => Some(Self::Eip3009),
+            "permit2" => Some(Self::Permit2),
+            _ => None,
+        }
+    }
 }
 
 /// The Solana twin of [`X402BatchSettlementEvmTerms`] (ADR 0074 decisions 2,
@@ -402,6 +462,11 @@ pub enum X402BatchSettlementExtra {
 /// `withdrawDelay` are required so a client can build a `ChannelConfig`;
 /// `name`/`version` are required so it can build the deposit's own
 /// ERC-3009/permit2 signature under the asset's real EIP-712 domain.
+/// `assetTransferMethod` is x402's own optional field, always written here;
+/// `facilitator` is this connector's addition (toon-client#695), written
+/// only when the operator names one -- see
+/// [`X402BatchSettlementEvmTerms::asset_transfer_method`] and
+/// [`X402BatchSettlementEvmTerms::facilitator`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct X402BatchSettlementEvmExtra {
     #[serde(rename = "receiverAuthorizer")]
@@ -410,6 +475,14 @@ pub struct X402BatchSettlementEvmExtra {
     pub withdraw_delay: u64,
     pub name: String,
     pub version: String,
+    #[serde(rename = "assetTransferMethod", default)]
+    pub asset_transfer_method: X402AssetTransferMethod,
+    #[serde(
+        rename = "facilitator",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub facilitator: Option<String>,
 }
 
 /// x402 SVM batch-settlement spec `#L170-L183`: `feePayer`, `withdrawDelay`
@@ -464,6 +537,8 @@ fn batch_settlement_accept(
                 withdraw_delay: evm.min_withdraw_delay_secs,
                 name: evm.name.clone(),
                 version: evm.version.clone(),
+                asset_transfer_method: evm.asset_transfer_method,
+                facilitator: evm.facilitator.clone(),
             }),
         },
         X402BatchSettlementTerms::Solana(solana) => X402BatchSettlementOption {
@@ -843,6 +918,24 @@ mod tests {
             min_withdraw_delay_secs: 86_400,
             name: "USDC".to_string(),
             version: "2".to_string(),
+            asset_transfer_method: X402AssetTransferMethod::Eip3009,
+            facilitator: None,
+        })
+    }
+
+    /// The same EVM fact from a node that deposits by Permit2 and names the
+    /// facilitator it relays deposits through (toon-client#695).
+    fn evm_permit2_batch_settlement_fact() -> X402BatchSettlementTerms {
+        X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
+            network: "eip155:84532".to_string(),
+            asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".to_string(),
+            pay_to: "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf".to_string(),
+            receiver_authorizer: "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf".to_string(),
+            min_withdraw_delay_secs: 86_400,
+            name: "USDC".to_string(),
+            version: "2".to_string(),
+            asset_transfer_method: X402AssetTransferMethod::Permit2,
+            facilitator: Some("https://facilitator.example/x402".to_string()),
         })
     }
 
@@ -900,7 +993,8 @@ mod tests {
                     "receiverAuthorizer": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
                     "withdrawDelay": 86400,
                     "name": "USDC",
-                    "version": "2"
+                    "version": "2",
+                    "assetTransferMethod": "eip3009"
                 }
             }),
             "a stock @x402/evm client builds its ChannelConfig from payTo and extra alone"
@@ -948,6 +1042,109 @@ mod tests {
         let terms = parse_greeting(&body).expect("well-formed");
         assert!(terms.accepts.is_empty());
         assert_eq!(terms.price(), Some(1000));
+    }
+
+    /// toon-client#695: a node that deposits by Permit2 and names its
+    /// facilitator publishes both in the EVM entry's `extra` -- x402's own
+    /// `assetTransferMethod`, and TOON's `facilitator` -- and the Solana
+    /// entry is untouched by either.
+    #[test]
+    fn a_permit2_node_greets_with_its_transfer_method_and_its_facilitator() {
+        let facts = NodeFacts {
+            batch_settlements: vec![
+                evm_permit2_batch_settlement_fact(),
+                solana_batch_settlement_fact(),
+            ],
+            ..Default::default()
+        };
+        let body = terms_body(&GreetingTerms {
+            destination: "g.toon.ario",
+            price: Price::flat(1000),
+            payload_len: 0,
+            node: Some(&facts),
+            ..Default::default()
+        });
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            value["accepts"][0],
+            serde_json::json!({
+                "scheme": "batch-settlement",
+                "network": "eip155:84532",
+                "amount": "1000",
+                "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                "payTo": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
+                "maxTimeoutSeconds": 60,
+                "extra": {
+                    "receiverAuthorizer": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
+                    "withdrawDelay": 86400,
+                    "name": "USDC",
+                    "version": "2",
+                    "assetTransferMethod": "permit2",
+                    "facilitator": "https://facilitator.example/x402"
+                }
+            })
+        );
+        let solana_extra = value["accepts"][1]["extra"].as_object().unwrap();
+        assert!(!solana_extra.contains_key("assetTransferMethod"));
+        assert!(!solana_extra.contains_key("facilitator"));
+
+        let terms = parse_greeting(&body).expect("well-formed");
+        let reserialized = serde_json::to_vec(&terms).unwrap();
+        assert_eq!(parse_greeting(&reserialized), Ok(terms));
+    }
+
+    /// An EVM fact from a node that predates toon-client#695 carries
+    /// neither field. It still reads as EVM terms -- the untagged enum must
+    /// not fall through to Solana -- with x402's own default,
+    /// `eip3009`, and no facilitator.
+    #[test]
+    fn an_evm_fact_without_the_deposit_fields_reads_as_eip3009_and_no_facilitator() {
+        let fact: X402BatchSettlementTerms = serde_json::from_value(serde_json::json!({
+            "network": "eip155:84532",
+            "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "payTo": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
+            "receiverAuthorizer": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
+            "withdrawDelay": 86400,
+            "name": "USDC",
+            "version": "2"
+        }))
+        .expect("an older node's EVM fact");
+        assert_eq!(fact, evm_batch_settlement_fact());
+
+        let extra: X402BatchSettlementExtra = serde_json::from_value(serde_json::json!({
+            "receiverAuthorizer": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
+            "withdrawDelay": 86400,
+            "name": "USDC",
+            "version": "2"
+        }))
+        .expect("an older node's EVM extra");
+        match extra {
+            X402BatchSettlementExtra::Evm(evm) => {
+                assert_eq!(evm.asset_transfer_method, X402AssetTransferMethod::Eip3009);
+                assert_eq!(evm.facilitator, None);
+            }
+            other => panic!("expected EVM extra, got {other:?}"),
+        }
+    }
+
+    /// An `assetTransferMethod` this connector has no name for is not
+    /// silently read as the default: a payer that deposits the wrong way
+    /// has a deposit the contract refuses.
+    #[test]
+    fn an_unknown_asset_transfer_method_does_not_read_as_evm_terms() {
+        let result: Result<X402BatchSettlementEvmTerms, _> =
+            serde_json::from_value(serde_json::json!({
+                "network": "eip155:84532",
+                "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                "payTo": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
+                "receiverAuthorizer": "0xf29fd62c4848b9573c9b90adbf61b664f386d9cf",
+                "withdrawDelay": 86400,
+                "name": "USDC",
+                "version": "2",
+                "assetTransferMethod": "eip2612"
+            }));
+        assert!(result.is_err());
     }
 
     /// A greeting round-trips through JSON: the untagged `extra` has to
