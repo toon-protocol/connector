@@ -116,7 +116,10 @@ impl EvmBatchSettlementConfig {
     /// How a payer's deposit moves the asset -- ERC-3009 or a Permit2
     /// witness transfer -- published as x402's own
     /// `accepts[].extra.assetTransferMethod`, always, even at its default
-    /// `eip3009` (toon-client#695).
+    /// `eip3009` (toon-client#695). Only the spelling is judged here; boot
+    /// refuses `eip3009` on a token without ERC-3009, and under it an
+    /// asset EIP-712 domain the token disagrees with (issue #1422), since
+    /// that needs the chain.
     pub fn asset_transfer_method(&self) -> X402AssetTransferMethod {
         self.asset_transfer_method
     }

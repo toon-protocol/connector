@@ -223,27 +223,33 @@ asset_eip712_version  = "2"
 key_file = "/app/data/settlement.key"
 ```
 
-| Key                       | Default         | Refused at load when                                                           | Published as                                                           |
-| ------------------------- | --------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
-| `rpc_url`                 | required        | empty, not a URL, or not `http`/`https`                                        | (the chain id, read from it, is `network`)                             |
-| `token_address`           | required        | not a 20-byte hex address                                                      | `asset`                                                                |
-| `decimals`                | required        | `0`. Boot also refuses a value the token itself disagrees with.                | nothing: it is how you read `price`                                    |
-| `asset_eip712_name`       | **required**    | missing or empty                                                               | `extra.name`                                                           |
-| `asset_eip712_version`    | **required**    | missing or empty                                                               | `extra.version`                                                        |
-| `min_withdraw_delay_secs` | `86400` (a day) | below `900`, or above `2592000` (the contract's 30-day maximum)                | `extra.withdrawDelay`                                                  |
-| `asset_transfer_method`   | `"eip3009"`     | anything but `"eip3009"` or `"permit2"`                                        | `extra.assetTransferMethod`, always                                    |
-| `facilitator_url`         | none            | not a URL, or not `http`/`https`                                               | `extra.facilitator`, verbatim; absent when unset                       |
-| `rpc_via_socks_proxy`     | `false`         | `true` with no root `socks_proxy` (ADR 0073)                                   | nothing                                                                |
-| `[settlement.evm.key]`    | required        | not exactly one of `key_file`/`kms_key_id`, or a `key_file` that is not a file | `payTo`, `receiverAuthorizer`, `voucherSigners[].signer` (the address) |
+| Key                       | Default         | Refused at load when                                                                                | Published as                                                           |
+| ------------------------- | --------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `rpc_url`                 | required        | empty, not a URL, or not `http`/`https`                                                             | (the chain id, read from it, is `network`)                             |
+| `token_address`           | required        | not a 20-byte hex address                                                                           | `asset`                                                                |
+| `decimals`                | required        | `0`. Boot also refuses a value the token itself disagrees with.                                     | nothing: it is how you read `price`                                    |
+| `asset_eip712_name`       | **required**    | missing or empty                                                                                    | `extra.name`                                                           |
+| `asset_eip712_version`    | **required**    | missing or empty                                                                                    | `extra.version`                                                        |
+| `min_withdraw_delay_secs` | `86400` (a day) | below `900`, or above `2592000` (the contract's 30-day maximum)                                     | `extra.withdrawDelay`                                                  |
+| `asset_transfer_method`   | `"eip3009"`     | anything but `"eip3009"` or `"permit2"`. Boot also refuses `"eip3009"` on a token without ERC-3009. | `extra.assetTransferMethod`, always                                    |
+| `facilitator_url`         | none            | not a URL, or not `http`/`https`                                                                    | `extra.facilitator`, verbatim; absent when unset                       |
+| `rpc_via_socks_proxy`     | `false`         | `true` with no root `socks_proxy` (ADR 0073)                                                        | nothing                                                                |
+| `[settlement.evm.key]`    | required        | not exactly one of `key_file`/`kms_key_id`, or a `key_file` that is not a file                      | `payTo`, `receiverAuthorizer`, `voucherSigners[].signer` (the address) |
 
 `kms_key_id` parses, but the binary refuses to start with it. Use `key_file`.
 
 **Read the EIP-712 name and version off the token itself**
 (`cast call <token> 'name()(string)'` and `'version()(string)'`). Base mainnet's native USDC is
-`"USD Coin"` / `"2"`, not the devnet's `"USDC"` / `"2"`. Your node never signs under this domain, so
-it boots with a wrong value, and the only symptom is every client's deposit failing.
-`asset_transfer_method` is not checked against the token either: `"eip3009"` on a token without
-ERC-3009 boots, and every stock client's deposit then fails on chain.
+`"USD Coin"` / `"2"`, not the devnet's `"USDC"` / `"2"`. Your node never signs under this domain
+itself, so boot checks what it can. Under `"eip3009"` it refuses a name and version that do not
+reproduce the token's own `DOMAIN_SEPARATOR()`, since the token would refuse every client's deposit
+signed under them. A token with no `DOMAIN_SEPARATOR()` cannot be checked, and under `"permit2"` the
+domain is not checked. With either of those, a wrong value still boots, and the only symptom is
+failing deposits.
+
+Boot also asks the token whether it has ERC-3009, the same question your node asks before its own
+deposits, and refuses `asset_transfer_method = "eip3009"` on a token that does not have it. The
+error tells you to set `"permit2"`, which works for any ERC-20.
 
 ### `[settlement.solana]`
 

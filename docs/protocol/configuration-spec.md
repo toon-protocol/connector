@@ -430,7 +430,7 @@ table does not start with one:
 | EVM    | `min_withdraw_delay_secs` | `86400` (a day) | below `900`, or above `2592000` (the contract's 30-day maximum) |
 | EVM    | `asset_eip712_name`       | **required**    | missing or empty                                                |
 | EVM    | `asset_eip712_version`    | **required**    | missing or empty                                                |
-| EVM    | `asset_transfer_method`   | `"eip3009"`     | anything but `"eip3009"` or `"permit2"`                         |
+| EVM    | `asset_transfer_method`   | `"eip3009"`     | anything but `"eip3009"` or `"permit2"`; see below for boot     |
 | EVM    | `facilitator_url`         | none            | not a URL, or not `http`/`https`                                |
 | Solana | `min_grace_period_secs`   | `86400` (a day) | below `900`                                                     |
 | Solana | `min_sponsored_deposit`   | **required**    | missing, or `0`; it bounds a public endpoint that spends rent   |
@@ -452,8 +452,12 @@ a node repository bumping its pin past #1385 moves them in the same change.
 are published on the greeting's `batch-settlement` `accepts[].extra` (ADR 0074 decision 8) so a stock
 client can sign its deposit's ERC-3009/permit2 authorization under the asset's real domain. Configured
 rather than read off the chain: an arbitrary ERC-20 need not expose an EIP-712 `version()` the way
-Circle's FiatToken does, and this connector never itself signs or verifies under either value, so
-there is nothing here to prove against a live contract the way `decimals` is (issue #1345). Both are
+Circle's FiatToken does, and this connector never itself signs or verifies under either value
+(issue #1345). They are still checked where the token can answer: under `asset_transfer_method =
+"eip3009"`, boot refuses a name and version that do not reproduce the token's own
+`DOMAIN_SEPARATOR()` on its chain (issue #1422), since every payer's ERC-3009 authorization is signed
+under them. A token with no `DOMAIN_SEPARATOR()` is not judged, and neither is any token under
+`"permit2"`, whose deposit is signed under Permit2's domain rather than the asset's. Both are
 required wherever `[settlement.evm]` exists -- there is no safe default for an
 arbitrary settlement token, and publishing the wrong domain would build a deposit signature that
 never verifies. Solana carries no equivalent key: the x402 SVM scheme's asset transfer has no EIP-712
@@ -473,6 +477,13 @@ a token without ERC-3009 is gasless for the payer only when the named facilitato
 `eip2612GasSponsoring` (a permit token) or `erc20ApprovalGasSponsoring` (a plain ERC-20); otherwise
 the payer pays a one-time Permit2 approval from its own ETH. Solana carries neither: its sponsor
 endpoint is this node (`extra.sponsorEndpoint`).
+
+**`asset_transfer_method` is checked against the token at boot** (issue #1422). This node never
+deposits under the published method: its own deposits are routed by asking the token whether it
+answers ERC-3009's `authorizationState` (ADR 0075 decision 3). Boot asks the token that same
+question and refuses `"eip3009"` on a token that does not, naming `"permit2"` as the fix, because
+otherwise every payer's deposit fails on chain and the node never sees it. `"permit2"` is not
+checked: it moves any ERC-20.
 
 **`decimals` is a declaration, not a conversion.** Nothing scales by it: every amount on the value path
 — a route's price, a claim's amount, a channel's deposit — is already in the settlement token's base
