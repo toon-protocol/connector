@@ -311,11 +311,14 @@ impl Sender {
     }
 }
 
-/// "already known" (geth, anvil) or "known transaction" (older nodes): the
-/// node has these exact bytes already.
+/// "already known" (geth, anvil), "transaction already imported" (anvil,
+/// when the same bytes race in from two senders at once, code -32003) or
+/// "known transaction" (older nodes): the node has these exact bytes already.
 fn already_known(error: &ProviderError) -> bool {
     let message = error.to_string().to_ascii_lowercase();
-    message.contains("already known") || message.contains("known transaction")
+    message.contains("already known")
+        || message.contains("already imported")
+        || message.contains("known transaction")
 }
 
 /// The node refused the nonce itself: it is spent, or another pending
@@ -610,6 +613,33 @@ mod tests {
             before + 2,
             "two writes, two transactions: the lost answer did not become a third"
         );
+    }
+
+    /// Two senders over one key offering the same signed bytes at once: the
+    /// one that loses is answered anvil's "transaction already imported"
+    /// (-32003), and that is the node already holding the write, not a
+    /// refusal. Seen in CI as `an_open_sent_twice_at_once_...` failing its
+    /// second opener.
+    #[tokio::test]
+    async fn the_same_bytes_already_imported_is_the_write_sent_not_refused() {
+        if !require_anvil() {
+            return;
+        }
+        let anvil = Anvil::spawn(19_960).await;
+        let racing =
+            FakeRpc::spawn_in_front_of(&anvil.rpc_url, |call| match call.method.as_str() {
+                "eth_sendRawTransaction" => RpcReply::Error {
+                    code: -32003,
+                    message: "transaction already imported".to_owned(),
+                },
+                _ => RpcReply::Forward,
+            })
+            .await;
+        let (_, sender) = sender(&racing.url());
+        sender
+            .send(self_transfer(&sender))
+            .await
+            .expect("already imported is the node holding these bytes");
     }
 
     #[test]
