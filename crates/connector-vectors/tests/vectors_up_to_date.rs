@@ -92,8 +92,12 @@ fn the_committed_voucher_vectors_replay_against_the_real_implementation() {
         "the committed channelId must be what the committed channelConfig hashes to"
     );
 
-    let amount = evm["max_claimable_amount"].as_u64().expect("amount");
-    let digest = evm_voucher_digest(&domain, &channel_id, u128::from(amount));
+    let amount: u128 = evm["max_claimable_amount"]
+        .as_str()
+        .expect("amount is a decimal string (schema 8)")
+        .parse()
+        .expect("amount");
+    let digest = evm_voucher_digest(&domain, &channel_id, amount);
     assert_eq!(
         hex::encode(digest),
         evm["digest_hex"].as_str().expect("digest_hex"),
@@ -107,13 +111,7 @@ fn the_committed_voucher_vectors_replay_against_the_real_implementation() {
             .expect("signer_address_hex"),
     );
     assert!(
-        verify_evm_voucher(
-            &domain,
-            &channel_id,
-            u128::from(amount),
-            &signature,
-            &signer
-        ),
+        verify_evm_voucher(&domain, &channel_id, amount, &signature, &signer),
         "the committed signature must verify against the committed signer"
     );
 
@@ -122,6 +120,29 @@ fn the_committed_voucher_vectors_replay_against_the_real_implementation() {
         parse_client_claim(evm_json).expect("the committed voucher parses"),
         ClientClaim::EvmVoucher(_)
     ));
+
+    // -- Schema 8 (#1429): a uint128 amount above u64::MAX is admitted
+    // exactly, not refused and not truncated.
+    let above = &voucher["evm_above_u64_max"];
+    let above_amount: u128 = above["max_claimable_amount"]
+        .as_str()
+        .expect("amount is a decimal string")
+        .parse()
+        .expect("amount");
+    assert!(
+        above_amount > u128::from(u64::MAX),
+        "this case's whole point is an amount above u64::MAX"
+    );
+    let above_json = above["json"].as_str().expect("json");
+    let ClientClaim::EvmVoucher(above_voucher) =
+        parse_client_claim(above_json).expect("the committed voucher parses")
+    else {
+        panic!("an EVM voucher");
+    };
+    assert_eq!(
+        above_voucher.max_claimable_amount, above_amount,
+        "a uint128 amount above u64::MAX must parse to exactly itself, never truncated"
+    );
 
     // -- Solana: recompute the 50-byte message and check the committed
     // signature against it.
@@ -136,7 +157,11 @@ fn the_committed_voucher_vectors_replay_against_the_real_implementation() {
             .as_str()
             .expect("signer_public_key_hex"),
     );
-    let solana_amount = solana["max_claimable_amount"].as_u64().expect("amount");
+    let solana_amount: u64 = solana["max_claimable_amount"]
+        .as_str()
+        .expect("amount is a decimal string (schema 8)")
+        .parse()
+        .expect("amount");
     let expires_at = solana["expires_at"].as_i64().expect("expires_at");
     let solana_signature: [u8; 64] =
         hex_bytes(solana["signature_hex"].as_str().expect("signature_hex"));
@@ -176,7 +201,9 @@ fn the_committed_voucher_vectors_replay_against_the_real_implementation() {
         .expect("amount_only_watermark is an array")
     {
         let name = case["name"].as_str().expect("name");
-        let watermark_amount = case["watermark_amount"].as_u64();
+        let watermark_amount: Option<u128> = case["watermark_amount"]
+            .as_str()
+            .map(|s| s.parse().expect("watermark_amount is a decimal string"));
         let watermark_signature = case["watermark_signature_hex"]
             .as_str()
             .map(|s| hex::decode(s).expect("watermark_signature_hex is hex"));
@@ -186,7 +213,11 @@ fn the_committed_voucher_vectors_replay_against_the_real_implementation() {
                 .as_deref()
                 .expect("a present watermark_amount carries a watermark_signature_hex"),
         });
-        let presented_amount = case["presented_amount"].as_u64().expect("presented_amount");
+        let presented_amount: u128 = case["presented_amount"]
+            .as_str()
+            .expect("presented_amount is a decimal string")
+            .parse()
+            .expect("presented_amount");
         let presented_signature = hex::decode(
             case["presented_signature_hex"]
                 .as_str()
@@ -199,9 +230,11 @@ fn the_committed_voucher_vectors_replay_against_the_real_implementation() {
         let result = validate_voucher(watermark, presented_amount, &presented_signature, charge);
         match outcome {
             "advances" => {
-                let advanced = case["advanced"]
-                    .as_u64()
-                    .expect("an advancing case carries `advanced`");
+                let advanced: u128 = case["advanced"]
+                    .as_str()
+                    .expect("an advancing case carries `advanced`")
+                    .parse()
+                    .expect("advanced");
                 assert_eq!(
                     result,
                     Ok(VoucherAdmission::Advances { advanced }),
@@ -314,9 +347,13 @@ fn the_committed_peer_vouchers_and_challenge_replay() {
     let evm = &peer["voucher_evm"];
     let domain = BatchSettlementDomain::x402(evm["chain_id"].as_u64().expect("chain_id"));
     let channel_id: [u8; 32] = hex_array(&evm["channel_id_hex"]);
-    let amount = evm["max_claimable_amount"].as_u64().expect("amount");
+    let amount: u128 = evm["max_claimable_amount"]
+        .as_str()
+        .expect("amount is a decimal string (schema 8)")
+        .parse()
+        .expect("amount");
     assert_eq!(
-        hex::encode(evm_voucher_digest(&domain, &channel_id, u128::from(amount))),
+        hex::encode(evm_voucher_digest(&domain, &channel_id, amount)),
         evm["digest_hex"].as_str().expect("digest_hex")
     );
     let signer: [u8; 20] = hex_array(&evm["signer_address_hex"]);
@@ -328,7 +365,7 @@ fn the_committed_peer_vouchers_and_challenge_replay() {
     assert!(verify_evm_voucher(
         &domain,
         &channel_id,
-        u128::from(amount),
+        amount,
         &hex_array::<65>(&evm["signature_hex"]),
         &signer
     ));
@@ -347,7 +384,11 @@ fn the_committed_peer_vouchers_and_challenge_replay() {
     .expect("base58")
     .try_into()
     .expect("32 bytes");
-    let solana_amount = solana["max_claimable_amount"].as_u64().expect("amount");
+    let solana_amount: u64 = solana["max_claimable_amount"]
+        .as_str()
+        .expect("amount is a decimal string (schema 8)")
+        .parse()
+        .expect("amount");
     let signature: [u8; 64] = bs58::decode(solana["signature_base58"].as_str().expect("sig"))
         .into_vec()
         .expect("base58")
@@ -452,16 +493,20 @@ fn the_committed_payout_vouchers_replay() {
     assert!(voucher.channel_config.is_some(), "landing needs the config");
     let domain = BatchSettlementDomain::x402(evm["chain_id"].as_u64().expect("chain_id"));
     let channel_id: [u8; 32] = hex_array(&evm["channel_id_hex"]);
-    let amount = evm["max_claimable_amount"].as_u64().expect("amount");
+    let amount: u128 = evm["max_claimable_amount"]
+        .as_str()
+        .expect("amount is a decimal string (schema 8)")
+        .parse()
+        .expect("amount");
     assert_eq!(voucher.max_claimable_amount, amount);
     assert_eq!(
-        hex::encode(evm_voucher_digest(&domain, &channel_id, u128::from(amount))),
+        hex::encode(evm_voucher_digest(&domain, &channel_id, amount)),
         evm["digest_hex"].as_str().expect("digest_hex")
     );
     assert!(verify_evm_voucher(
         &domain,
         &channel_id,
-        u128::from(amount),
+        amount,
         &hex_array::<65>(&evm["signature_hex"]),
         &hex_array::<20>(&evm["signer_address_hex"])
     ));

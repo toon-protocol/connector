@@ -125,7 +125,10 @@ pub struct ClaimView {
     pub channel_id: String,
     pub direction: ClaimDirection,
     pub nonce: u64,
-    pub cumulative_amount: u64,
+    /// `u128` (ADR 0074 decision 3, amended 2026-09-30 #1429), matching
+    /// [`crate::batch_channels::BatchChannelView::watermark`]'s own width
+    /// rather than narrowing it back down for this row.
+    pub cumulative_amount: u128,
     /// `true` for an outbound claim not yet acknowledged by the peer --
     /// always `false` for an inbound claim, which is accepted or rejected
     /// the instant it is received, never left pending.

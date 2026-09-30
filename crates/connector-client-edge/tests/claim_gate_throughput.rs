@@ -99,7 +99,7 @@ impl BatchSettlementChannels for Channels {
             .get(channel_id)
             .map(|config| AdmittedEvmVoucherChannel {
                 config: *config,
-                max_cumulative: u64::MAX,
+                max_cumulative: u128::MAX,
             }))
     }
 

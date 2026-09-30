@@ -62,8 +62,10 @@ pub struct AdmittedEvmVoucherChannel {
     pub config: BatchChannelConfig,
     /// The highest cumulative amount a voucher on this channel may name and
     /// still be claimable -- the backend's current reading of the channel's
-    /// escrow, net of any pending withdrawal (ADR 0074 decision 5).
-    pub max_cumulative: u64,
+    /// escrow, net of any pending withdrawal (ADR 0074 decision 5). `u128`
+    /// (ADR 0074 decision 3, amended 2026-09-30 #1429), matching an EVM
+    /// voucher's own width.
+    pub max_cumulative: u128,
 }
 
 /// A Solana batch-settlement channel this connector admits.
@@ -71,8 +73,10 @@ pub struct AdmittedEvmVoucherChannel {
 pub struct AdmittedSolanaVoucherChannel {
     /// The channel account's `authorized_signer`, fixed at open.
     pub authorized_signer: [u8; 32],
-    /// As [`AdmittedEvmVoucherChannel::max_cumulative`]: on Solana, the
-    /// channel's `deposit`, which only `top_up` moves while it is Open.
+    /// As [`AdmittedEvmVoucherChannel::max_cumulative`], but `u64`: Solana's
+    /// signed message and SPL amounts stay `u64` (ADR 0074 decision 3,
+    /// amended 2026-09-30 #1429). The channel's `deposit`, which only
+    /// `top_up` moves while it is Open.
     pub max_cumulative: u64,
 }
 

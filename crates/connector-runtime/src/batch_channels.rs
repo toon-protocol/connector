@@ -765,7 +765,7 @@ impl OutboundChannels {
                 channel_id: journal_key(tracked.chain, tracked.record.channel()),
                 direction: ClaimDirection::Outbound,
                 nonce: 0,
-                cumulative_amount: u64::try_from(tracked.signed).unwrap_or(u64::MAX),
+                cumulative_amount: tracked.signed,
                 pending: false,
                 book: ClaimBookKind::Outbound,
                 scheme: ClaimScheme::BatchSettlement,

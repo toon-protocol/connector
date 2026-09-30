@@ -33,10 +33,13 @@ pub enum JournalEntry {
     /// retained rather than discarded once accepted: on-chain redemption
     /// (issue #425) needs the actual claim, not just its watermark, and per
     /// ADR 0005 what is signed is exactly what this journal exists to keep.
+    /// `cumulative_amount` is `u128` (ADR 0074 decision 3, amended
+    /// 2026-09-30 #1429), matching an EVM voucher's own width; a pre-widening
+    /// journal's `u64`-range decimal text still decodes unchanged.
     InboundClaimAccepted {
         channel_id: String,
         nonce: u64,
-        cumulative_amount: u64,
+        cumulative_amount: u128,
         signature: Vec<u8>,
     },
     /// Historical entry kind, no longer produced (ADR 0031, ADR 0033, issue
@@ -88,7 +91,7 @@ pub enum JournalEntry {
     InboundClaimRolledBack {
         channel_id: String,
         nonce: u64,
-        cumulative_amount: u64,
+        cumulative_amount: u128,
     },
     /// The client edge accepted its first voucher on the x402
     /// `batch-settlement` channel `channel_id` (ADR 0074): the canonical

@@ -65,8 +65,8 @@ fn channel_key() -> String {
     format!("evm:0x{}", hex::encode(channel_id()))
 }
 
-fn sign_voucher(secret: &SecretKey, amount: u64) -> String {
-    let digest = evm_voucher_digest(&domain(), &channel_id(), u128::from(amount));
+fn sign_voucher(secret: &SecretKey, amount: u128) -> String {
+    let digest = evm_voucher_digest(&domain(), &channel_id(), amount);
     let (signature, recovery) = libsecp256k1::sign(&Message::parse(&digest), secret);
     let mut bytes = signature.serialize().to_vec();
     bytes.push(recovery.serialize() + 27);
@@ -85,7 +85,7 @@ fn config_json(config: &BatchChannelConfig) -> serde_json::Value {
     })
 }
 
-fn evm_voucher(amount: u64, signature: &str, config: Option<&BatchChannelConfig>) -> String {
+fn evm_voucher(amount: u128, signature: &str, config: Option<&BatchChannelConfig>) -> String {
     let mut voucher = serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
@@ -103,7 +103,7 @@ fn evm_voucher(amount: u64, signature: &str, config: Option<&BatchChannelConfig>
     voucher.to_string()
 }
 
-fn signed_evm_voucher(amount: u64) -> String {
+fn signed_evm_voucher(amount: u128) -> String {
     evm_voucher(
         amount,
         &sign_voucher(&authorizer(), amount),
@@ -145,17 +145,17 @@ fn solana_voucher(amount: u64, signer: &ed25519_dalek::Keypair, expires_at: i64)
 #[derive(Debug)]
 struct FakeBatchSettlement {
     evm_config: BatchChannelConfig,
-    max_cumulative: u64,
+    max_cumulative: u128,
     lookups: AtomicUsize,
     admitted: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl FakeBatchSettlement {
-    fn new(max_cumulative: u64) -> FakeBatchSettlement {
+    fn new(max_cumulative: u128) -> FakeBatchSettlement {
         FakeBatchSettlement::holding(config(), max_cumulative)
     }
 
-    fn holding(evm_config: BatchChannelConfig, max_cumulative: u64) -> FakeBatchSettlement {
+    fn holding(evm_config: BatchChannelConfig, max_cumulative: u128) -> FakeBatchSettlement {
         FakeBatchSettlement {
             evm_config,
             max_cumulative,
@@ -207,7 +207,7 @@ impl BatchSettlementChannels for FakeBatchSettlement {
         Ok(
             (*channel_account == SOLANA_CHANNEL).then_some(AdmittedSolanaVoucherChannel {
                 authorized_signer: solana_signer().public.to_bytes(),
-                max_cumulative: self.max_cumulative,
+                max_cumulative: u64::try_from(self.max_cumulative).unwrap_or(u64::MAX),
             }),
         )
     }
@@ -490,14 +490,41 @@ async fn a_voucher_on_a_channel_the_backend_does_not_admit_is_unknown() {
     );
 }
 
+/// ADR 0074 decision 3, amended 2026-09-30 (#1429): EVM's amount is `u128`,
+/// matching `x402BatchSettlement`'s own `maxClaimableAmount`, so a value
+/// above `u64::MAX` -- once refused as malformed -- is admitted exactly, and
+/// appears unchanged in the watermark.
 #[tokio::test]
-async fn a_voucher_amount_above_u64_is_refused_not_truncated() {
-    let backend = Arc::new(FakeBatchSettlement::new(u64::MAX));
+async fn an_evm_voucher_amount_above_u64_is_admitted_exactly() {
+    let backend = Arc::new(FakeBatchSettlement::new(u128::MAX));
     let (gate, _journal) = gate_with(&backend);
-    let wide = signed_evm_voucher(100).replace(
-        r#""maxClaimableAmount":"100""#,
-        &format!(r#""maxClaimableAmount":"{}""#, u128::from(u64::MAX) + 100),
+    let above = u128::from(u64::MAX) + 100;
+    let wide = signed_evm_voucher(above);
+
+    gate.ingest(&wide, 0)
+        .await
+        .expect("a uint128 EVM amount above u64::MAX is admitted");
+    assert_eq!(
+        gate.watermark(&channel_key()),
+        Some(Watermark {
+            cumulative_amount: above
+        })
     );
+}
+
+/// Solana's own amount stays `u64`: the signed Solana message and SPL
+/// amounts are `u64` on chain, so a voucher above `u64::MAX` is still
+/// refused, not truncated.
+#[tokio::test]
+async fn a_solana_voucher_amount_above_u64_is_refused_not_truncated() {
+    let backend = Arc::new(FakeBatchSettlement::new(u128::MAX));
+    let (gate, _journal) = gate_with(&backend);
+    let above = u128::from(u64::MAX) + 100;
+    let wide = solana_voucher(100, &solana_signer(), 0).replace(
+        r#""maxClaimableAmount":"100""#,
+        &format!(r#""maxClaimableAmount":"{above}""#),
+    );
+
     assert!(matches!(
         gate.ingest(&wide, 0).await.unwrap_err(),
         ClaimIngestRejection::Malformed(reason) if reason.contains("refused, not truncated")
@@ -656,7 +683,8 @@ async fn a_voucher_lookup_that_finds_nothing_is_metered() {
     };
     let stranger_id = evm_batch_channel_id(&domain(), &stranger);
     let unknown = |amount: u64| {
-        let digest = evm_voucher_digest(&domain(), &stranger_id, u128::from(amount));
+        let amount = u128::from(amount);
+        let digest = evm_voucher_digest(&domain(), &stranger_id, amount);
         let (signature, recovery) = libsecp256k1::sign(&Message::parse(&digest), &authorizer());
         let mut bytes = signature.serialize().to_vec();
         bytes.push(recovery.serialize() + 27);

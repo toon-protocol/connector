@@ -108,7 +108,7 @@ pub(crate) fn config_json(config: &BatchChannelConfig) -> serde_json::Value {
 /// and the config itself, declaring `sender_id`.
 pub(crate) fn evm_voucher_with(
     config: &BatchChannelConfig,
-    amount: u64,
+    amount: u128,
     signature: &str,
     sender_id: &str,
 ) -> String {
@@ -129,8 +129,8 @@ pub(crate) fn evm_voucher_with(
 
 /// The payer's genuine voucher for cumulative `amount` on `config`'s
 /// channel.
-pub(crate) fn signed_voucher_on(config: &BatchChannelConfig, amount: u64) -> String {
-    let digest = evm_voucher_digest(&domain(), &channel_id_of(config), u128::from(amount));
+pub(crate) fn signed_voucher_on(config: &BatchChannelConfig, amount: u128) -> String {
+    let digest = evm_voucher_digest(&domain(), &channel_id_of(config), amount);
     evm_voucher_with(
         config,
         amount,
@@ -140,14 +140,14 @@ pub(crate) fn signed_voucher_on(config: &BatchChannelConfig, amount: u64) -> Str
 }
 
 /// The payer's genuine voucher for cumulative `amount` on the EVM channel.
-pub(crate) fn signed_voucher(amount: u64) -> String {
+pub(crate) fn signed_voucher(amount: u128) -> String {
     signed_voucher_on(&config(), amount)
 }
 
 /// A voucher on the EVM channel, correctly signed by a key that is not the
 /// channel's voucher signer -- the forger of issue #558.
-pub(crate) fn forged_voucher(amount: u64) -> String {
-    let digest = evm_voucher_digest(&domain(), &channel_id(), u128::from(amount));
+pub(crate) fn forged_voucher(amount: u128) -> String {
+    let digest = evm_voucher_digest(&domain(), &channel_id(), amount);
     evm_voucher_with(
         &config(),
         amount,
@@ -240,7 +240,7 @@ pub(crate) fn solana_challenge(signer: &ed25519_dalek::Keypair, expires: u64) ->
 #[derive(Debug)]
 pub(crate) struct FakeBatchSettlement {
     configs: Vec<BatchChannelConfig>,
-    max_cumulative: u64,
+    max_cumulative: u128,
     lookups: AtomicUsize,
     admitted: Mutex<HashSet<[u8; 32]>>,
     /// When set, every lookup fails as an unreachable endpoint would.
@@ -248,13 +248,13 @@ pub(crate) struct FakeBatchSettlement {
 }
 
 impl FakeBatchSettlement {
-    pub(crate) fn new(max_cumulative: u64) -> FakeBatchSettlement {
+    pub(crate) fn new(max_cumulative: u128) -> FakeBatchSettlement {
         FakeBatchSettlement::holding(vec![config(), config_salted(0x77)], max_cumulative)
     }
 
     pub(crate) fn holding(
         configs: Vec<BatchChannelConfig>,
-        max_cumulative: u64,
+        max_cumulative: u128,
     ) -> FakeBatchSettlement {
         FakeBatchSettlement {
             configs,
@@ -269,7 +269,7 @@ impl FakeBatchSettlement {
     pub(crate) fn unreachable() -> FakeBatchSettlement {
         FakeBatchSettlement {
             failing: true,
-            ..FakeBatchSettlement::new(u64::MAX)
+            ..FakeBatchSettlement::new(u128::from(u64::MAX))
         }
     }
 
@@ -330,7 +330,7 @@ impl BatchSettlementChannels for FakeBatchSettlement {
         Ok(
             (*channel_account == SOLANA_CHANNEL).then_some(AdmittedSolanaVoucherChannel {
                 authorized_signer: solana_signer().public.to_bytes(),
-                max_cumulative: self.max_cumulative,
+                max_cumulative: u64::try_from(self.max_cumulative).unwrap_or(u64::MAX),
             }),
         )
     }

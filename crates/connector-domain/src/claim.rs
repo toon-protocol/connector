@@ -25,7 +25,10 @@ use thiserror::Error;
 /// been accepted on that channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Watermark {
-    pub cumulative_amount: u64,
+    /// `u128` (ADR 0074 decision 3, amended 2026-09-30 #1429): EVM's
+    /// cumulative amount is `u128`; a Solana voucher's own `u64` amount is
+    /// widened into this without loss.
+    pub cumulative_amount: u128,
 }
 
 /// Why a claim was rejected at the watermark layer (`signature_invalid`
@@ -35,12 +38,12 @@ pub struct Watermark {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ClaimError {
     #[error("voucher amount {claimed} does not strictly exceed the watermark's {watermark}")]
-    AmountNotAdvancing { claimed: u64, watermark: u64 },
+    AmountNotAdvancing { claimed: u128, watermark: u128 },
 
     #[error(
         "claim advances value by {advanced}, less than the terminated route's price of {price}"
     )]
-    Underpayment { advanced: u64, price: u64 },
+    Underpayment { advanced: u128, price: u64 },
 }
 
 /// Whether a claim of `cumulative_amount` advances value past `watermark` by
@@ -49,14 +52,20 @@ pub enum ClaimError {
 /// verification (issue #522). `price` of `0` always passes -- a route
 /// documented as deliberately free (`connector_config::StaticRoute::price`)
 /// charges nothing and rejects nothing here.
+///
+/// `cumulative_amount` is `u128` (ADR 0074 decision 3, amended 2026-09-30
+/// #1429); `price` stays the per-packet `u64` ADR 0071 already fixed --
+/// only the channel's cumulative total widened, not a route's price. The
+/// comparison runs in `u128`, so it cannot overflow or wrap at the `u64`
+/// boundary.
 pub fn validate_price(
     watermark: Option<Watermark>,
-    cumulative_amount: u64,
+    cumulative_amount: u128,
     price: u64,
 ) -> Result<(), ClaimError> {
     let prior = watermark.map_or(0, |watermark| watermark.cumulative_amount);
     let advanced = cumulative_amount.saturating_sub(prior);
-    if advanced < price {
+    if advanced < u128::from(price) {
         return Err(ClaimError::Underpayment { advanced, price });
     }
     Ok(())
@@ -77,7 +86,7 @@ pub const VOUCHER_WATERMARK_NONCE: u64 = 0;
 /// match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoucherWatermark<'a> {
-    pub cumulative_amount: u64,
+    pub cumulative_amount: u128,
     pub signature: &'a [u8],
 }
 
@@ -87,7 +96,7 @@ pub enum VoucherAdmission {
     /// The voucher strictly advances the watermark, by `advanced`, and that
     /// advance covers the charge. Accepting it advances and journals the
     /// watermark ([`advance_voucher_watermark`]).
-    Advances { advanced: u64 },
+    Advances { advanced: u128 },
     /// The voucher is byte-identical to the one that set the watermark: a
     /// retransmission, not a new claim. It is not an error and it buys
     /// nothing new, so nothing advances and nothing is recorded. Returned
@@ -117,7 +126,7 @@ pub enum VoucherAdmission {
 /// (ADR 0075 decision 8).
 pub fn validate_voucher(
     watermark: Option<VoucherWatermark<'_>>,
-    cumulative_amount: u64,
+    cumulative_amount: u128,
     signature: &[u8],
     charge: u64,
 ) -> Result<VoucherAdmission, ClaimError> {
@@ -142,7 +151,7 @@ pub fn validate_voucher(
         });
     }
     let advanced = cumulative_amount - prior;
-    if advanced < charge {
+    if advanced < u128::from(charge) {
         return Err(ClaimError::Underpayment {
             advanced,
             price: charge,
@@ -154,7 +163,7 @@ pub fn validate_voucher(
 /// The watermark after accepting a voucher of `cumulative_amount`: the
 /// amount. Callers MUST have already checked [`validate_voucher`]; this does
 /// not re-check.
-pub fn advance_voucher_watermark(cumulative_amount: u64) -> Watermark {
+pub fn advance_voucher_watermark(cumulative_amount: u128) -> Watermark {
     Watermark { cumulative_amount }
 }
 
@@ -165,7 +174,7 @@ mod tests {
 
     // -- Vouchers (ADR 0074 decision 3, issue #1341) --
 
-    fn voucher_watermark(amount: u64, signature: &[u8]) -> Option<VoucherWatermark<'_>> {
+    fn voucher_watermark(amount: u128, signature: &[u8]) -> Option<VoucherWatermark<'_>> {
         Some(VoucherWatermark {
             cumulative_amount: amount,
             signature,
@@ -272,9 +281,9 @@ mod tests {
         /// very voucher that set it, resent at no charge. Nothing else.
         #[test]
         fn an_admitted_voucher_strictly_advances_or_is_the_same_bytes_for_free(
-            watermark_amount in any::<u64>(),
+            watermark_amount in any::<u128>(),
             watermark_signature in proptest::collection::vec(any::<u8>(), 0..4),
-            amount in any::<u64>(),
+            amount in any::<u128>(),
             signature in proptest::collection::vec(any::<u8>(), 0..4),
             charge in any::<u64>(),
             has_watermark in any::<bool>(),
@@ -288,7 +297,7 @@ mod tests {
                 Ok(VoucherAdmission::Advances { advanced }) => {
                     prop_assert!(amount > prior);
                     prop_assert_eq!(advanced, amount - prior);
-                    prop_assert!(advanced >= charge);
+                    prop_assert!(advanced >= u128::from(charge));
                 }
                 Ok(VoucherAdmission::Retransmission) => {
                     prop_assert!(has_watermark);
@@ -302,7 +311,7 @@ mod tests {
                 }
                 Err(ClaimError::Underpayment { advanced, price }) => {
                     prop_assert_eq!(price, charge);
-                    prop_assert!(advanced < charge);
+                    prop_assert!(advanced < u128::from(charge));
                 }
             }
         }
@@ -315,12 +324,12 @@ mod tests {
         #[test]
         fn replaying_vouchers_never_moves_the_watermark_back_or_pays_twice(
             candidates in proptest::collection::vec(
-                (0u64..32, proptest::collection::vec(0u8..2, 1..2), 0u64..4),
+                (0u128..32, proptest::collection::vec(0u8..2, 1..2), 0u64..4),
                 0..64,
             )
         ) {
-            let mut current: Option<(u64, Vec<u8>)> = None;
-            let mut paid = 0u64;
+            let mut current: Option<(u128, Vec<u8>)> = None;
+            let mut paid = 0u128;
             for (amount, signature, charge) in candidates {
                 let before = current.as_ref().map(|(amount, _)| *amount);
                 let watermark = current.as_ref().map(|(amount, signature)| VoucherWatermark {
@@ -330,7 +339,7 @@ mod tests {
                 if let Ok(VoucherAdmission::Advances { .. }) =
                     validate_voucher(watermark, amount, &signature, charge)
                 {
-                    paid += charge;
+                    paid += u128::from(charge);
                     current = Some((advance_voucher_watermark(amount).cumulative_amount, signature));
                 }
                 let after = current.as_ref().map(|(amount, _)| *amount);
@@ -338,6 +347,30 @@ mod tests {
                     prop_assert!(after >= before);
                 }
                 prop_assert!(paid <= after.unwrap_or(0));
+            }
+        }
+
+        /// ADR 0074 decision 3, amended 2026-09-30 (#1429): the `u64`
+        /// boundary that used to be the ceiling is now just a point in the
+        /// middle of the range. A watermark just below it, then a voucher
+        /// just above it, must still have its delta computed exactly in
+        /// `u128` and compared against the price without overflowing or
+        /// wrapping.
+        #[test]
+        fn the_delta_across_the_old_u64_ceiling_is_exact(
+            below in 0u128..=1000,
+            above in 0u128..=1000,
+            price in any::<u64>(),
+        ) {
+            let watermark_amount = u128::from(u64::MAX) - below;
+            let cumulative_amount = u128::from(u64::MAX) + above;
+            let watermark = Watermark { cumulative_amount: watermark_amount };
+            let advanced = cumulative_amount - watermark_amount;
+            let result = validate_price(Some(watermark), cumulative_amount, price);
+            prop_assert_eq!(result.is_ok(), advanced >= u128::from(price));
+            if let Err(ClaimError::Underpayment { advanced: reported, price: reported_price }) = result {
+                prop_assert_eq!(reported, advanced);
+                prop_assert_eq!(reported_price, price);
             }
         }
     }
@@ -405,14 +438,14 @@ mod tests {
         /// looks in isolation.
         #[test]
         fn value_binding_accepts_iff_the_advance_meets_the_price(
-            watermark in proptest::option::of(any::<u64>().prop_map(|cumulative_amount| Watermark { cumulative_amount })),
-            cumulative_amount in any::<u64>(),
+            watermark in proptest::option::of(any::<u128>().prop_map(|cumulative_amount| Watermark { cumulative_amount })),
+            cumulative_amount in any::<u128>(),
             price in any::<u64>(),
         ) {
             let prior = watermark.map_or(0, |w| w.cumulative_amount);
             let advanced = cumulative_amount.saturating_sub(prior);
             let result = validate_price(watermark, cumulative_amount, price);
-            prop_assert_eq!(result.is_ok(), advanced >= price);
+            prop_assert_eq!(result.is_ok(), advanced >= u128::from(price));
         }
     }
 }

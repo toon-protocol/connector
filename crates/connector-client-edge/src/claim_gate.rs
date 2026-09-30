@@ -128,7 +128,7 @@ pub enum ClaimIngestRejection {
     ToonChannel,
     AmountNotAdvancing,
     Underpayment {
-        advanced: u64,
+        advanced: u128,
         price: u64,
     },
     /// The voucher names a channel the settlement backend does not admit
@@ -197,8 +197,8 @@ pub enum ClaimIngestRejection {
     /// same client rides a channel of its own and nets against nothing
     /// (ADR 0075 decision 7, retiring issue #700's netting).
     Undercollateralized {
-        claimed: u64,
-        deposited: u64,
+        claimed: u128,
+        deposited: u128,
     },
     /// The claim was structurally valid, fresh, value-covering and
     /// correctly signed -- and this connector could not durably record
@@ -670,7 +670,7 @@ impl ClientClaimGate {
     /// `(cumulative_amount, signature)` -- exactly what landing it submits
     /// (issue #1218). `None` before any voucher has been accepted on this
     /// channel.
-    pub fn latest_inbound_claim(&self, channel_key: &str) -> Option<(u64, Vec<u8>)> {
+    pub fn latest_inbound_claim(&self, channel_key: &str) -> Option<(u128, Vec<u8>)> {
         self.watermarks
             .read()
             .expect("client claim watermarks lock poisoned")
@@ -1161,7 +1161,7 @@ impl ClientClaimGate {
     pub(crate) async fn roll_back(
         &self,
         channel_key: &str,
-        cumulative_amount: u64,
+        cumulative_amount: u128,
     ) -> Result<(), ClaimIngestRejection> {
         let key = canonical_channel_key(channel_key);
         let ticket = {
@@ -1557,7 +1557,7 @@ fn replay_watermarks(entries: &[JournalEntry]) -> HashMap<String, LiveClaim> {
 /// watermark advances, which is the authoritative one.
 fn check_voucher_freshness_and_value(
     current: Option<&LiveClaim>,
-    amount: u64,
+    amount: u128,
     signature: &[u8],
     price: u64,
 ) -> Result<VoucherAdmission, ClaimIngestRejection> {
@@ -1623,7 +1623,7 @@ pub(crate) fn decode_evm_channel_config(
 /// What survives [`verify_voucher`]: the channel's collateral bound for
 /// step 5, and the channel as the journal records it.
 struct VerifiedVoucher {
-    max_cumulative: u64,
+    max_cumulative: u128,
     channel: JournaledBatchChannel,
     /// The key the voucher verified against, as the chain records it.
     signer: VoucherSigner,
@@ -1696,7 +1696,7 @@ async fn verify_voucher(
             if verify_evm_voucher(
                 &domain,
                 &channel_id,
-                u128::from(voucher.max_claimable_amount),
+                voucher.max_claimable_amount,
                 &signature,
                 &signer,
             ) {
@@ -1733,7 +1733,7 @@ async fn verify_voucher(
                 &channel.authorized_signer,
             ) {
                 Ok(VerifiedVoucher {
-                    max_cumulative: channel.max_cumulative,
+                    max_cumulative: u128::from(channel.max_cumulative),
                     channel: JournaledBatchChannel::Solana { channel_account },
                     signer: VoucherSigner::Solana(channel.authorized_signer),
                 })
@@ -1845,7 +1845,7 @@ mod tests {
         )
     }
 
-    fn at(amount: u64) -> Option<Watermark> {
+    fn at(amount: u128) -> Option<Watermark> {
         Some(Watermark {
             cumulative_amount: amount,
         })
@@ -2085,7 +2085,7 @@ mod tests {
             for config in [test_support::config(), config_salted(0x77)] {
                 let gate = gate.clone();
                 tasks.push(tokio::spawn(async move {
-                    for step in 1..=25u64 {
+                    for step in 1..=25u128 {
                         gate.ingest(&signed_voucher_on(&config, step * 10), 0)
                             .await
                             .expect("strictly advancing vouchers are accepted");
@@ -2112,7 +2112,7 @@ mod tests {
     async fn the_journal_records_acceptances_in_acceptance_order() {
         let journal = Arc::new(InMemoryJournal::new());
         let gate = gate_over(journal.clone(), &backend());
-        for amount in [100, 200, 300u64] {
+        for amount in [100, 200, 300u128] {
             gate.ingest(&signed_voucher(amount), 0)
                 .await
                 .expect("accepted");
@@ -2122,7 +2122,7 @@ mod tests {
             entries[0],
             JournalEntry::BatchChannelAdmitted { .. }
         ));
-        let amounts: Vec<u64> = entries[1..]
+        let amounts: Vec<u128> = entries[1..]
             .iter()
             .map(|entry| match entry {
                 JournalEntry::InboundClaimAccepted {
@@ -2176,7 +2176,7 @@ mod tests {
 
     // -- Replay (pure) --
 
-    fn accepted(channel: &str, amount: u64, signature: u8) -> JournalEntry {
+    fn accepted(channel: &str, amount: u128, signature: u8) -> JournalEntry {
         JournalEntry::InboundClaimAccepted {
             channel_id: channel.to_string(),
             nonce: VOUCHER_WATERMARK_NONCE,

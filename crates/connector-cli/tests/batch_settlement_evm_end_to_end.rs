@@ -195,7 +195,7 @@ price = {PRICE}
             _ => None,
         })
         .expect("the latest voucher is journaled");
-    assert_eq!(amount, 2 * PRICE);
+    assert_eq!(amount, u128::from(2 * PRICE));
 
     // The node on Solana has not opted in, and says so.
     let refused = Reject::decode(
@@ -233,7 +233,7 @@ price = {PRICE}
         .land(
             &channel,
             Voucher {
-                cumulative_amount: u128::from(amount),
+                cumulative_amount: amount,
                 signature,
             },
         )

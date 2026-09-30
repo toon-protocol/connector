@@ -161,14 +161,17 @@ anonymous identity and for the lookup budget below, and nothing is verified agai
 Chain-specific fields, named as x402's own voucher payloads name them:
 
 - **evm**: `channelId` (bytes32 hex), `maxClaimableAmount` (decimal string, cumulative, a `uint128`
-  that must also fit a `u64` -- a larger one is refused, never truncated), `signature` (`0x` + 130
-  hex, `r ‖ s ‖ v`, EIP-712 `Voucher(bytes32 channelId,uint128 maxClaimableAmount)` under the
-  `x402BatchSettlement` domain), and `channelConfig` -- the seven `ChannelConfig` fields `getChannelId`
-  hashes -- on a channel's first voucher, optional after it.
+  -- the connector's own amount type for it is `uint128` too, amended 2026-09-30, ADR 0074 decision
+  3, issue #1429; anything wider than a `uint128` is not an amount any voucher could sign, so
+  malformed), `signature` (`0x` + 130 hex, `r ‖ s ‖ v`, EIP-712
+  `Voucher(bytes32 channelId,uint128 maxClaimableAmount)` under the `x402BatchSettlement` domain),
+  and `channelConfig` -- the seven `ChannelConfig` fields `getChannelId` hashes -- on a channel's
+  first voucher, optional after it.
 - **solana**: `channelId` (the channel account, base58), `maxClaimableAmount` (decimal string,
-  cumulative), `expiresAt` (MUST be `0`: a voucher that can expire is value that can lapse before
-  it is landed, and is refused structurally), `signature` (base58 Ed25519 over the 50-byte voucher
-  message).
+  cumulative, a `uint128` on the wire that must also fit a `u64` -- the signed Solana message and
+  SPL amounts are `u64` on chain, so a larger one is refused, never truncated), `expiresAt` (MUST be
+  `0`: a voucher that can expire is value that can lapse before it is landed, and is refused
+  structurally), `signature` (base58 Ed25519 over the 50-byte voucher message).
 
 **`scheme` is required, and a `toon-channel` claim is refused by name**
 ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 8,

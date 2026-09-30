@@ -92,8 +92,10 @@ pub enum VoucherCheck {
 pub struct PeerVoucherVerdict {
     pub ack: ClaimAckOutcome,
     /// The channel's accepted cumulative amount before this voucher was
-    /// judged, zero for a channel nothing was accepted on yet.
-    pub prior: u64,
+    /// judged, zero for a channel nothing was accepted on yet. `u128` (ADR
+    /// 0074 decision 3, amended 2026-09-30 #1429), matching EVM's own
+    /// width; a Solana channel's is always well within it.
+    pub prior: u128,
 }
 
 /// The receiving half, as the peer carriages ask it (ADR 0075 decisions 3,
@@ -134,7 +136,7 @@ pub trait VoucherEvidence: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Judged {
     pub ack: ClaimAckOutcome,
-    pub claimed: Option<u64>,
+    pub claimed: Option<u128>,
     pub prior: Option<Watermark>,
 }
 

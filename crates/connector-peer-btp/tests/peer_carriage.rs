@@ -229,14 +229,14 @@ fn challenge_on(channel: &BatchChannelConfig, signer: &SecretKey, expires: u64) 
 /// behind it.
 struct OnChain {
     config: BatchChannelConfig,
-    max_cumulative: u64,
+    max_cumulative: u128,
 }
 
 /// The voucher a channel's watermark stands at: its amount, and its
 /// signature, so a byte-identical resend can be told from a rival.
 #[derive(Clone)]
 struct Accepted {
-    amount: u64,
+    amount: u128,
     signature: String,
 }
 
@@ -293,7 +293,7 @@ impl ChannelBook {
 
     /// Where `channel`'s watermark stands, `None` before anything was
     /// accepted on it.
-    fn watermark(&self, channel: &BatchChannelConfig) -> Option<u64> {
+    fn watermark(&self, channel: &BatchChannelConfig) -> Option<u128> {
         self.watermarks
             .lock()
             .expect("watermarks lock")
@@ -335,7 +335,7 @@ impl ChannelBook {
         let verified = verify_evm_voucher(
             &domain(),
             &channel_id,
-            u128::from(voucher.max_claimable_amount),
+            voucher.max_claimable_amount,
             &signature,
             &signer,
         );

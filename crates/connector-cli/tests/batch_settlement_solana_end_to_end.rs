@@ -179,7 +179,7 @@ price = {PRICE}
             _ => None,
         })
         .expect("the voucher is journaled");
-    assert_eq!(amount, PRICE);
+    assert_eq!(amount, u128::from(PRICE));
 
     // The node on EVM has not opted in, and says so.
     let refused = Reject::decode(
@@ -215,7 +215,7 @@ price = {PRICE}
         .land(
             &channel_id,
             Voucher {
-                cumulative_amount: u128::from(amount),
+                cumulative_amount: amount,
                 signature,
             },
         )

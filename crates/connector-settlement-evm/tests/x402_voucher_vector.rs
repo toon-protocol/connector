@@ -39,8 +39,9 @@ fn bytes<const N: usize>(case: &Value, field: &str) -> [u8; N] {
 }
 
 /// Every EVM voucher case in the committed set.
-const EVM_VOUCHER_CASES: [(&str, &str); 3] = [
+const EVM_VOUCHER_CASES: [(&str, &str); 4] = [
     ("claim_voucher", "evm"),
+    ("claim_voucher", "evm_above_u64_max"),
     ("peer_carriage", "voucher_evm"),
     ("payout_voucher", "evm"),
 ];
@@ -93,11 +94,11 @@ async fn check_case(x402: &X402Chain, case: &Value, label: &str) {
         "{label}: x402BatchSettlement.getChannelId(config) is the vector's channelId"
     );
 
-    let amount = u128::from(
-        case["max_claimable_amount"]
-            .as_u64()
-            .expect("the vector's amount"),
-    );
+    let amount: u128 = case["max_claimable_amount"]
+        .as_str()
+        .expect("the vector's amount is a decimal string (schema 8)")
+        .parse()
+        .expect("the vector's amount");
     let digest: [u8; 32] = bytes(case, "digest_hex");
     assert_eq!(
         x402.contract_voucher_digest(channel_id, amount).await,

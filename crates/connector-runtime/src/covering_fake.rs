@@ -123,7 +123,7 @@ pub fn voucher_amount(covering: &Covering) -> u128 {
         panic!("expected a voucher, got {covering:?}");
     };
     match parse_client_claim(json).expect("a voucher this node rendered parses") {
-        ClientClaim::EvmVoucher(voucher) => u128::from(voucher.max_claimable_amount),
+        ClientClaim::EvmVoucher(voucher) => voucher.max_claimable_amount,
         other => panic!("expected an EVM voucher, got {other:?}"),
     }
 }
