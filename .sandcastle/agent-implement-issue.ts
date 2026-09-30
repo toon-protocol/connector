@@ -192,10 +192,22 @@ async function main() {
       promptArgs: { ISSUE_URL: issue.url, ISSUE_NUMBER: issueNumber, BRANCH: branch },
     });
 
-    if (implement.commits.length === 0) {
+    // What matters is whether the branch has work on it, not whether this session
+    // added any. A rerun of an issue whose earlier run committed the implementation
+    // and then failed later (#1429: the push) finds nothing left to do, and should go
+    // on to review, gate and PR rather than fail.
+    const ahead = await sandbox.exec(`git rev-list --count ${BASE}..HEAD`);
+    const commitsOnBranch = ahead.exitCode === 0 ? Number(ahead.stdout.trim()) : NaN;
+    if (!(commitsOnBranch > 0)) {
       throw new Error(
-        'The implement session made no commits. If it hit a blocker, it explained why ' +
-          'in a comment on the issue.'
+        `'${branch}' has no commits ahead of ${BASE}. If the implement session hit a ` +
+          'blocker, it explained why in a comment on the issue.'
+      );
+    }
+    if (implement.commits.length === 0) {
+      console.log(
+        `\nThe implement session added nothing; '${branch}' already has ${commitsOnBranch} ` +
+          `commit(s) ahead of ${BASE} from an earlier run. Continuing to review.`
       );
     }
 
