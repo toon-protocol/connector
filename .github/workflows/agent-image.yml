@@ -1,10 +1,9 @@
 name: Agent image
 
 # Minimal build-only check for the sandcastle agent container image.
-# Proves the `.sandcastle/Dockerfile` (node:22-bookworm + gh + Claude Code CLI,
-# NO corepack/pnpm — connector is npm-workspaces) builds. This is NOT the
-# label→runner: the agent:implement / agent:review triggered runners are
-# agent-implement.yml / agent-review.yml.
+# Proves the `.sandcastle/Dockerfile` (node:22-bookworm + gh + Claude Code CLI +
+# the mattpocock-skills plugin, NO corepack/pnpm — connector is npm-workspaces)
+# builds. This is not the runner itself; that is agent-implement.yml.
 
 on:
   pull_request:
@@ -44,6 +43,8 @@ jobs:
             g++ --version | head -1
             test "$(whoami)" = "agent"
             test -x /home/agent/.local/bin/claude
+            # The runner starts every session with a mattpocock-skills slash command.
+            claude plugin list | grep -q mattpocock-skills
             # The #409 rewrite is Rust, and per ADR 0007 its integration tier
             # spawns a disposable local chain, so the agent needs both.
             # NOTE the `-lc` above is a LOGIN shell on purpose: it sources

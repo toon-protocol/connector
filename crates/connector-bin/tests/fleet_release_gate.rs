@@ -416,9 +416,9 @@ fn an_unhealthy_fleet_opens_a_labelled_issue() {
          maker crash-loop was found by a human happening to look."
     );
     assert!(
-        FLEET_HEALTH_WORKFLOW.contains("--label \"needs:human\""),
-        "fleet-health.yml's alert no longer carries `needs:human`. That is the \
-         org's existing swept human queue (toon-meta#347); dropping it puts \
+        FLEET_HEALTH_WORKFLOW.contains("--label \"needs-triage\""),
+        "fleet-health.yml's alert no longer carries `needs-triage`. That is the \
+         canonical triage queue `/triage` already sweeps; dropping it puts \
          the alert in a channel nobody is already reading."
     );
     assert!(

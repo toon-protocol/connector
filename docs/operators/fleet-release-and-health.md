@@ -90,7 +90,7 @@ run — which is the behaviour you want, and the reason ordering matters.
 
 `.github/workflows/fleet-pin-drift.yml` runs daily and on dispatch. It is read-only, holds no
 credential, and reaches no host: it reads the four pins over plain HTTPS and asks GHCR anonymously
-whether each is pullable. It **fails**, and opens a rolling `needs:human` issue, when a pin cannot
+whether each is pullable. It **fails**, and opens a rolling `needs-triage` issue, when a pin cannot
 be parsed, when the four name different builds, when one is a moving tag, or when one cannot be
 pulled. The first green run closes the issue.
 
@@ -206,10 +206,10 @@ answer rather than just "not 5xx":
 
 A failing run opens — or comments on — a single rolling issue in this repo:
 
-> **`[fleet-health] devnet fleet is unhealthy`**, labelled `needs:human` + `bug`
+> **`[fleet-health] devnet fleet is unhealthy`**, labelled `needs-triage` + `bug`
 
-`needs:human` is the org's existing human-queue label (toon-meta#347), so the alert lands in a queue
-that is already swept rather than inventing a channel of its own. Opening an issue also notifies
+`needs-triage` is the canonical triage label for "a maintainer needs to look at this", so the alert
+lands in the queue `/triage` already sweeps rather than inventing a channel of its own. Opening an issue also notifies
 everyone watching the repo, which a failed scheduled run does not do reliably — GitHub mails only
 the cron's last editor.
 

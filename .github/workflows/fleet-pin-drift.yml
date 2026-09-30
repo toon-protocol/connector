@@ -82,7 +82,7 @@
 # ── WHAT REACHES A HUMAN ────────────────────────────────────────────────────
 # Same instrument as `fleet-health.yml`, and for the same reason — detection
 # nobody sees is worth nothing: a single rolling GitHub issue labelled
-# `needs:human` + `bug`, updated while the drift persists and closed by the
+# `needs-triage` + `bug`, updated while the drift persists and closed by the
 # first green run. Daily, because a pin only moves when somebody merges a
 # deploy PR; this is not a race to beat anything, it bounds how long a split
 # devnet goes unnoticed.
@@ -246,7 +246,7 @@ jobs:
           # and a search that silently matched nothing would open a fresh alert
           # every run instead of updating one.
           EXISTING=$(gh issue list --repo "${{ github.repository }}" --state open \
-                       --label "needs:human" --limit 100 \
+                       --label "needs-triage" --limit 100 \
                        --json number,title \
                        --jq ".[] | select(.title == \"$ALERT_TITLE\") | .number" | head -1)
 
@@ -301,7 +301,7 @@ jobs:
           else
             gh issue create --repo "${{ github.repository }}" \
               --title "$ALERT_TITLE" \
-              --label "needs:human" --label "bug" \
+              --label "needs-triage" --label "bug" \
               --body-file "$BODY"
             echo "Opened a new alert."
           fi

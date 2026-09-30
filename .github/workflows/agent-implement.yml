@@ -1,194 +1,123 @@
-# agent:implement runner — the sandcastle label→runner for building one issue.
+# The AFK factory: a ready-for-agent issue becomes a reviewed PR.
 #
-# WHAT THIS DOES (and does NOT do):
-#   Fires when a human applies the `agent:implement` label to an issue. It runs
-#   the single-issue PR-mode sandcastle runner (`npm run sandcastle:implement`),
-#   which implements → reviews → OPENS A PR and STOPS. A human reviews and
-#   merges. It does NOT auto-merge and does NOT close the issue.
+# The flow is the local one, run on GitHub. `to-tickets` (or `/triage`) puts
+# `ready-for-agent` on an issue. This workflow finds the issues an agent can start
+# now (.sandcastle/ready-issues.ts), and for each one the runner
+# (.sandcastle/agent-implement-issue.ts) runs /implement and then /code-review in a
+# sandbox, runs CI's gate, pushes `sandcastle/issue-N` and opens a PR. A human merges.
 #
-#   Merely committing this file triggers nothing: issue-`labeled` workflows only
-#   fire from the default branch, and only when someone actually applies the
-#   label. The first live run is a deliberate human action.
+# The labels are only the canonical triage set (docs/agents/triage-labels.md):
+#   ready-for-agent  the queue. Removed from the issue once its PR is open.
+#   ready-for-human  put on the PR: ready for a human to merge.
+#   needs-triage     put on the issue when a run fails, with a link to the run.
 #
-# ┌───────────────────────────────────────────────────────────────────────────┐
-# │ AUTO-MERGE TOGGLE (first-run safety)                                       │
-# │                                                                            │
-# │ DEFAULT = PR mode: the agent opens a PR; a human merges. This is enforced  │
-# │ by the runner having no merge phase unless told otherwise.                 │
-# │                                                                            │
-# │ TO RE-ENABLE AUTO-MERGE once the pilot is trusted: add                     │
-# │       SANDCASTLE_AUTO_MERGE: "true"                                        │
-# │ to the `env:` of the "Run sandcastle implement runner" step below. The     │
-# │ runner will then merge the branch into main and close the issue instead of │
-# │ opening a PR. (Confirm the merge path's push-to-main behavior on a         │
-# │ throwaway issue first — it is inherited from the stock engine and is       │
-# │ itself verify-on-first-run.) Leave it unset/false for the pilot.           │
-# └───────────────────────────────────────────────────────────────────────────┘
+# Triggers:
+#   issues: labeled   `ready-for-agent` was just applied. Consider that issue.
+#   issues: closed    a blocker may have cleared. Sweep every ready-for-agent issue.
+#   schedule          the same sweep, in case an event was missed.
+#   workflow_dispatch one issue, or a sweep when `issue` is empty.
 #
-# The old 4-loop backlog system (backlog-manager / issue-executor / pr-reviewer /
-# issue-decomposer, which fired on `agent:ready` / `agent:split` / `review-round:*`)
-# has been retired now that this factory has a merged agent:implement proof
-# (connector#394). This is the only automation acting on labeled issues/PRs.
+# Label events from PRs on forks carry no secrets. Only people with triage access
+# or higher can label an issue, so there is no separate permission guard here.
 
 name: agent:implement
 
 on:
   issues:
-    types: [labeled]
+    types: [labeled, closed]
+  schedule:
+    - cron: '17 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: 'Issue number to implement. Leave empty to sweep every ready-for-agent issue.'
+        type: string
+        required: false
 
-# Least-privilege for this job's GITHUB_TOKEN. The engine itself opens the PR
-# using the GitHub App token generated below (a PR opened by the default
-# GITHUB_TOKEN would NOT trigger ci.yml, so the green gate would never run on
-# the agent's PR). These scopes cover the guard job's read-only gh api calls.
-#
-# `contents: read` is DELIBERATE and stays read (reviewed for #462). The push path
-# needs write and gets it exclusively from the GitHub App token, never from this
-# GITHUB_TOKEN. Keeping it read means a bug or a prompt injection inside an agent
-# phase cannot push using the ambient job token: the only write credential in the
-# run is the one the runner mints, hands to a single `git push`, and then deletes.
-# Granting `contents: write` here would silently widen that blast radius.
+# Read-only on purpose. Every write (push, PR, labels) uses the GitHub App token
+# the runner mints, so an agent can't write with the ambient job token.
 permissions:
   contents: read
   issues: read
   pull-requests: read
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Guard: refuse the wrong targets before spending an agent run.
-  # ---------------------------------------------------------------------------
-  guard:
-    # Only react to THIS label. Every other labeled event is ignored.
-    if: github.event.label.name == 'agent:implement'
+  select:
+    if: >-
+      github.event_name != 'issues' ||
+      github.event.action == 'closed' ||
+      github.event.label.name == 'ready-for-agent'
     runs-on: ubuntu-latest
     outputs:
-      proceed: ${{ steps.check.outputs.proceed }}
+      issues: ${{ steps.ready.outputs.issues }}
     steps:
-      - name: Evaluate guards
-        id: check
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+          cache: 'npm'
+      - run: npm ci
+      - name: Find issues an agent can start now
+        id: ready
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          ISSUE: ${{ github.event.issue.number }}
-          ACTOR: ${{ github.actor }}
-        run: |
-          set -euo pipefail
-          proceed=true
+          # A label event names its issue. A close, the schedule or an empty dispatch sweeps.
+          ONLY: ${{ github.event.action == 'labeled' && github.event.issue.number || inputs.issue }}
+        run: npm run --silent sandcastle:ready -- $ONLY
 
-          # --- Guard 1: the labeler must have write access -------------------
-          # Refuses drive-by labeling by outside collaborators / bots without
-          # push rights.
-          perm=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" \
-            --jq '.permission' 2>/dev/null || echo "none")
-          echo "Actor ${ACTOR} permission: ${perm}"
-          case "$perm" in
-            admin|maintain|write) ;;
-            *)
-              echo "::warning::Actor ${ACTOR} lacks write permission (${perm}) — skipping."
-              proceed=false ;;
-          esac
-
-          # --- Guard 2: skip triage/parent labels ----------------------------
-          # epic / tracking = PRD-shaped parents; needs:human = held for a human.
-          labels=$(gh issue view "${ISSUE}" --repo "${REPO}" \
-            --json labels --jq '.labels[].name')
-          echo "Issue labels: $(echo "$labels" | paste -sd, -)"
-          for bad in epic tracking needs:human; do
-            if echo "$labels" | grep -qx "$bad"; then
-              echo "::warning::Issue #${ISSUE} carries '${bad}' — not an agent:implement target. Skipping."
-              proceed=false
-            fi
-          done
-
-          # --- Guard 3: refuse parents that have sub-issues ------------------
-          # A PRD-shaped parent (has child issues) must be decomposed, not built
-          # directly. Sub-issues are queried via GraphQL; if the field is
-          # unavailable on this GitHub plan the query errors — we then log and
-          # DO NOT block (documented residual gap: falls back to the epic/
-          # tracking label check above).
-          sub=$(gh api graphql -f query='
-            query($owner:String!,$repo:String!,$num:Int!){
-              repository(owner:$owner,name:$repo){
-                issue(number:$num){ subIssues(first:1){ totalCount } }
-              }
-            }' \
-            -F owner="${REPO%/*}" -F repo="${REPO#*/}" -F num="${ISSUE}" \
-            --jq '.data.repository.issue.subIssues.totalCount' 2>/dev/null || echo "unknown")
-          echo "Sub-issue count: ${sub}"
-          if [ "$sub" != "unknown" ] && [ "${sub:-0}" -gt 0 ]; then
-            echo "::warning::Issue #${ISSUE} has ${sub} sub-issue(s) — it is a parent. Skipping."
-            proceed=false
-          elif [ "$sub" = "unknown" ]; then
-            echo "::warning::Could not query sub-issues (field unavailable). Relying on epic/tracking labels only."
-          fi
-
-          echo "proceed=${proceed}" >> "$GITHUB_OUTPUT"
-
-  # ---------------------------------------------------------------------------
-  # Implement: run the single-issue PR-mode sandcastle runner.
-  # ---------------------------------------------------------------------------
   implement:
-    needs: guard
-    if: needs.guard.outputs.proceed == 'true'
+    needs: select
+    if: needs.select.outputs.issues != '' && needs.select.outputs.issues != '[]'
     runs-on: ubuntu-latest
-    # Real backstop; the implementer allows up to 100 iters. Raised from 90 for
-    # chain-touching tickets: #459 (EVM settlement against a real chain) was
-    # cancelled at 91 minutes with the Anvil container still running. Raising this
-    # is only safe now that the push credential is minted fresh at push time
-    # (#462) — before that, extra minutes were spent and the push still failed.
-    # Forensics split (toon-meta#278): the runner step below gets
-    # timeout-minutes: 170 so a wall-clock kill is a step failure and the
-    # always() redact+upload steps still run inside the job budget.
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        issue: ${{ fromJSON(needs.select.outputs.issues) }}
+    # A chain-touching ticket has run past 90 minutes. The runner step's own
+    # timeout is lower, so a wall-clock kill still leaves time for the always()
+    # steps below.
     timeout-minutes: 180
     concurrency:
-      group: agent-implement-issue-${{ github.event.issue.number }}
+      group: agent-implement-issue-${{ matrix.issue }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history so the sandbox can diff/branch cleanly
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
           node-version: '22.12.0'
           cache: 'npm'
 
-      # connector is npm-workspaces (NOT pnpm) — no corepack step. `npm ci`
-      # installs the exact tree from the committed package-lock.json; the host
-      # only needs tsx + @ai-hero/sandcastle to launch the orchestrator (the
-      # build/test gate runs INSIDE the sandbox container).
-      - name: Install dependencies
-        run: npm ci
+      # The host only needs tsx and @ai-hero/sandcastle to launch the runner. The
+      # gate runs inside the sandbox.
+      - run: npm ci
 
-      # Docker is preinstalled on ubuntu-latest. The agent sandbox image
-      # (.sandcastle/Dockerfile) is PREBUILT and published to GHCR because the
-      # Rust + Foundry + Solana toolchain layers take many minutes to build on a
-      # runner every run. The published image is built with AGENT_UID/GID=1001
-      # to match the runner user, and retagged to `sandcastle:connector` — the
-      # name sandcastle's docker() sandbox derives from the checkout dir. If the
-      # pull fails (image missing/renamed), fall back to building in place.
-      # REBUILD + REPUBLISH when .sandcastle/Dockerfile changes:
+      # The sandbox image is prebuilt because its Rust, Foundry and Solana layers
+      # take many minutes to build. It's built with AGENT_UID/GID=1001 to match the
+      # runner user, then retagged to the name sandcastle expects. Rebuild and push
+      # it whenever .sandcastle/Dockerfile changes:
       #   docker build --build-arg AGENT_UID=1001 --build-arg AGENT_GID=1001 \
       #     -t ghcr.io/toon-protocol/connector:sandcastle-agent .sandcastle/
       #   docker push ghcr.io/toon-protocol/connector:sandcastle-agent
-      - name: "Pull prebuilt sandcastle agent image (fallback: build)"
+      # An image built before the skills plugin was added can't run /implement, so
+      # it counts as missing.
+      - name: 'Pull prebuilt sandcastle agent image (fallback: build)'
         run: |
-          if docker pull ghcr.io/toon-protocol/connector:sandcastle-agent; then
-            docker tag ghcr.io/toon-protocol/connector:sandcastle-agent sandcastle:connector
+          image=ghcr.io/toon-protocol/connector:sandcastle-agent
+          if docker pull "$image" \
+            && docker run --rm --entrypoint bash "$image" -lc 'claude plugin list | grep -q mattpocock-skills'; then
+            docker tag "$image" sandcastle:connector
           else
-            echo "::warning::Prebuilt image pull failed — building on the runner."
+            echo "::warning::No usable prebuilt image (missing, or without the skills plugin) — building on the runner."
             npx --yes @ai-hero/sandcastle@0.12.0 docker build-image
           fi
 
-      # The engine opens the PR via this App token. A PR opened by it (unlike one
-      # opened by the default GITHUB_TOKEN) triggers ci.yml, so the green gate
-      # runs on the agent's PR. Requires the org/repo secrets APP_ID +
-      # APP_PRIVATE_KEY (same App used org-wide for GitHub Project/PR automation).
-      #
-      # This token is the STARTING credential only. It expires one hour after
-      # issue, and the pushes happen at the END of a run that can last far longer
-      # — which silently destroyed three completed implementations (#462). The
-      # runner therefore mints its OWN fresh token immediately before each push,
-      # from APP_ID + APP_PRIVATE_KEY below. See .sandcastle/mint-app-token.ts.
+      # A PR opened with the App token (unlike GITHUB_TOKEN) triggers ci.yml. This
+      # token expires after an hour, so the runner mints a fresh one before each
+      # push from APP_ID and APP_PRIVATE_KEY (#462).
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@v2
@@ -196,95 +125,69 @@ jobs:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
-      - name: Run sandcastle implement runner
-        # Step-level timeout (toon-meta#278): below the job's, so a wall-clock
-        # kill is a step failure and the always() forensics steps still run.
+      - name: Run the implement runner
         timeout-minutes: 170
         env:
-          SANDCASTLE_ISSUE_NUMBER: ${{ github.event.issue.number }}
-          # PR mode (default). To re-enable auto-merge later, uncomment:
-          # SANDCASTLE_AUTO_MERGE: "true"
+          SANDCASTLE_ISSUE_NUMBER: ${{ matrix.issue }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          # For minting a fresh push credential mid-run (#462). These stay on the
-          # HOST: `PASSTHROUGH_KEYS` in .sandcastle/sandbox-secrets.ts lists only
-          # CLAUDE_CODE_OAUTH_TOKEN and GH_TOKEN, so the private key is never
-          # forwarded into the agent's container.
+          # Host only: .sandcastle/sandbox-secrets.ts forwards just the two keys above.
           APP_ID: ${{ secrets.APP_ID }}
           APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
-          # The formal-verdict approver (toon-meta#282). HOST-ONLY: it is
-          # deliberately NOT forwarded into the sandbox (see
-          # .sandcastle/sandbox-secrets.ts) — the agent must never hold the
-          # credential that approves its own output.
-          FACTORY_OPS_TOKEN: ${{ secrets.FACTORY_OPS_TOKEN }}
         run: npm run sandcastle:implement
 
-      # REDACT BEFORE UPLOAD — this repository is PUBLIC.
-      #
-      # Actions masks registered secrets in STEP LOGS, but it does NOT mask
-      # ARTIFACT CONTENTS, and artifacts on a public repo are downloadable by
-      # anyone. The agent runs with GH_TOKEN and CLAUDE_CODE_OAUTH_TOKEN in its
-      # container environment, so any command it happens to run that echoes the
-      # environment (`env`, `git config --list`, a verbose curl) would put a live
-      # credential into the log we are about to publish.
-      #
-      # This is the org-uniform pattern (toon-meta#278): connector's proven
-      # #462-sweep redaction plus buzz's nsec addition, extended to also sweep
-      # any worktree a killed run left behind.
-      #
-      # Three passes, because no one of them is sufficient:
-      #   1. Exact values of the secrets this job holds — reliable, catches any
-      #      shape including ones we have not anticipated.
-      #   2. Known token/key shapes — catches credentials this job never held,
-      #      e.g. one the agent minted or read from somewhere else mid-run.
-      #   3. BIP-39 mnemonics and labelled private keys — defence in depth for
-      #      key material an agent generates or handles mid-run.
-      # Secrets are passed via env and never echoed.
-      #
-      # RESIDUAL GAP, stated rather than hidden: a raw 32-byte private key is
-      # 64 hex chars, indistinguishable in shape from a hash or event id.
-      # Redacting that shape unconditionally would strip the hashes that make a
-      # log worth reading, so pass 3 only redacts it when it appears against a
-      # key-ish label (`privateKey`, `secret_key`, ...). An unlabelled bare hex
-      # key would survive. Do not treat these artifacts as safe to publish a
-      # secret through; this is defence in depth.
+      # Take the issue out of the queue so it doesn't retry on every sweep, and say
+      # why. A fresh token, because the one above may have expired.
+      - name: Fresh App token for the failure hand-back
+        id: fail-token
+        if: failure()
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Move the issue to needs-triage
+        if: failure()
+        env:
+          GH_TOKEN: ${{ steps.fail-token.outputs.token }}
+          ISSUE: ${{ matrix.issue }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue edit "$ISSUE" --remove-label ready-for-agent --add-label needs-triage
+          gh issue comment "$ISSUE" --body "The AFK run for this issue failed: $RUN_URL. Any committed work is on \`sandcastle/issue-$ISSUE\`. Put \`ready-for-agent\` back on the issue to retry."
+
+      # REDACT BEFORE UPLOAD. This repository is public, and Actions masks secrets
+      # in step logs but not in uploaded artifacts. Three passes, since none is
+      # enough alone: the exact values this job holds, known token and key shapes,
+      # and BIP-39-shaped word runs or 64-hex keys next to a key-like label. A bare,
+      # unlabelled 64-hex key looks like a hash and survives, so don't treat these
+      # artifacts as safe to publish a secret through.
       - name: Redact credentials from agent logs
         if: always()
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
-          FACTORY_OPS_TOKEN: ${{ secrets.FACTORY_OPS_TOKEN }}
         run: |
           set -euo pipefail
           [ -d .sandcastle ] || { echo "No .sandcastle directory — nothing to redact."; exit 0; }
           python3 - <<'PY'
           import os, pathlib, re
 
-          # Pass 1: exact secret values held by this job (longest first, so a
-          # secret that contains another is not partially replaced).
           exact = sorted(
               (v for v in (os.environ.get(k, "") for k in
-                           ("GH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "APP_PRIVATE_KEY",
-                            "FACTORY_OPS_TOKEN"))
+                           ("GH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "APP_PRIVATE_KEY"))
                if v and len(v.strip()) >= 8),
               key=len, reverse=True,
           )
 
-          # Passes 2 and 3, as (pattern, replacement) so a rule can keep the
-          # context it matched on.
           patterns = [
-              # Pass 2 — token/key shapes, whether or not this job ever held them.
               (re.compile(r"gh[pousr]_[A-Za-z0-9]{16,}"), "***REDACTED***"),
               (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "***REDACTED***"),
               (re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), "***REDACTED***"),
               (re.compile(r"nsec1[a-z0-9]{20,}"), "***REDACTED***"),
               (re.compile(r"-----BEGIN[^-]*PRIVATE KEY-----.*?-----END[^-]*PRIVATE KEY-----",
                           re.DOTALL), "***REDACTED***"),
-              # Pass 3b — a raw private key is 64 hex chars, the same shape as a
-              # hash, so it is redacted only next to a key-ish label, and the
-              # label is kept so the log still reads. See the residual gap noted
-              # on this step.
               (re.compile(
                   r"((?:private[_\-]?key|secret[_\-]?key|signer[_\-]?key|priv[_\-]?key|keyId)"
                   r"[\"'\s:=]{0,6})(?:0x)?[0-9a-fA-F]{64}",
@@ -292,15 +195,8 @@ jobs:
                ), r"\1***REDACTED***"),
           ]
 
-          # Pass 3a — BIP-39 mnemonics: a run of exactly 12/15/18/21/24 lowercase
-          # words. Matching on structure rather than on the 2048-word list keeps
-          # this step dependency-free; the cost is that 12+ consecutive words of
-          # ordinary lowercase prose are caught too. That trade is deliberate —
-          # over-redacting a sentence in an agent log is cheap, publishing a seed
-          # is not.
-          #
-          # Longest first: with 12 tried first, a 24-word phrase would have its
-          # leading 12 words consumed and the remaining 12 left in the clear.
+          # BIP-39 phrases, longest first so a 24-word phrase isn't half-consumed
+          # by the 12-word rule.
           for n in (24, 21, 18, 15, 12):
               patterns.append((
                   re.compile(r"(?<![A-Za-z0-9'\-])(?:[a-z]{3,8}[ \n]+){%d}[a-z]{3,8}(?![A-Za-z0-9'\-])"
@@ -308,11 +204,6 @@ jobs:
                   "***REDACTED***",
               ))
 
-          # Redact every log root the upload step publishes: the engine's own
-          # logs, plus any worktree left behind by a killed run — that is where
-          # a not-yet-pushed handoff note (.sandcastle/logs/handoff-<id>.md,
-          # per the ~200k context-budget policy) lives when the run died before
-          # its push.
           roots = [pathlib.Path(".sandcastle/logs"),
                    *pathlib.Path(".sandcastle/worktrees").glob("*/.sandcastle/logs")]
 
@@ -334,32 +225,21 @@ jobs:
                   if out != raw:
                       hits += 1
                       path.write_text(out, encoding="utf-8")
-          # Count only — never print what was found.
           print(f"Redaction complete. Files modified: {hits}")
           PY
 
-      # The agent's own reasoning is written to .sandcastle/logs/, NOT to the
-      # step output — when a run fails, times out, or produces no commits there
-      # is otherwise NOTHING to diagnose from: the log dies with the runner.
-      # Upload it so a failed or empty run is explicable. The worktree glob
-      # additionally captures the committed-but-never-pushed handoff note a
-      # killed run leaves behind (toon-meta#278 acceptance: a deliberately
-      # killed run must leave a recoverable handoff note).
-      #
-      # `if: always()` because the interesting cases are exactly the ones where
-      # the previous step failed.
+      # The agents' reasoning goes to .sandcastle/logs/, not the step output, so
+      # without this a failed run has nothing to diagnose from. The worktree glob
+      # picks up a handoff note from a run that was killed before it pushed.
       - name: Upload agent logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sandcastle-implement-logs-issue-${{ github.event.issue.number }}
+          name: sandcastle-implement-logs-issue-${{ matrix.issue }}
           path: |
             .sandcastle/logs/
             .sandcastle/worktrees/*/.sandcastle/logs/
           if-no-files-found: warn
-          # Dot-dirs count as hidden for wildcard matches and upload-artifact
-          # v4.4+ default-excludes hidden files: without this the .sandcastle
-          # segment inside the worktrees glob is dropped and the handoff note
-          # never lands in the artifact (proven on the #278 mechanism run).
+          # upload-artifact v4.4+ skips dot-dirs in globs unless this is set.
           include-hidden-files: true
           retention-days: 14

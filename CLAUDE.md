@@ -362,8 +362,9 @@ See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
-The five canonical triage labels, names unchanged — distinct from the `agent:*`
-Sandcastle triggers. See `docs/agents/triage-labels.md`.
+The five canonical triage labels, names unchanged. `ready-for-agent` is also the AFK factory's
+queue: `.github/workflows/agent-implement.yml` turns each unblocked `ready-for-agent` issue into a
+PR labelled `ready-for-human`. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 

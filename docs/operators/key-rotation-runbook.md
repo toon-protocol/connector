@@ -153,8 +153,9 @@ has it, recoverable from any existing clone or fork.
 
 ## 6. Escalation
 
-Rotating a key with a reviewed workflow (`fleet-ops.yml`, `funded-ops.yml`) needs no human. Add
-`needs:human` and stop only when the situation matches this repo's standing escalation rule
-(`.sandcastle/implement-prompt.md`, "When escalation IS right"): the action is irreversible with no
+Rotating a key with a reviewed workflow (`fleet-ops.yml`, `funded-ops.yml`) needs no human. Stop
+and hand the issue back (`needs-triage`, with a comment saying what blocks you) only when the
+situation matches this repo's standing escalation rule (`.sandcastle/implement-prompt.md`, "When
+you cannot finish"): the action is irreversible with no
 rollback (a history rewrite — §5.3), it involves mainnet or real funds, or it needs a
 credential/access no reviewed workflow exposes.
