@@ -1,8 +1,8 @@
-/mattpocock-skills:code-review {{TARGET_BRANCH}} — the spec is {{ISSUE_URL}}
+/mattpocock-skills:code-review {{BASE_BRANCH}} — the spec is {{ISSUE_URL}}
 
 You are running AFK in a sandbox, on branch `{{BRANCH}}`, reviewing work another session
 committed for issue #{{ISSUE_NUMBER}}. Nobody will answer a question, so do not ask one:
-the fixed point is `{{TARGET_BRANCH}}`, and the spec is the issue above (read it with
+the fixed point is `{{BASE_BRANCH}}`, and the spec is the issue above (read it with
 `gh issue view {{ISSUE_NUMBER}} --comments`).
 
 Once both review axes have reported:
