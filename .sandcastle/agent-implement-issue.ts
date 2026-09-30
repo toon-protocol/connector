@@ -126,7 +126,10 @@ async function pushBranch(
   try {
     const push = await sandbox.exec(
       `git -c credential.helper= -c credential.helper='${FRESH_CREDENTIAL_HELPER}' ` +
-        `push -u origin ${branch}`,
+        // --no-verify: this repo's husky pre-push hook runs a local test pass meant for
+        // people pushing by hand. The runner has just run CI's own gate, and the hook
+        // failing in the sandbox is what cost #1429 its final push.
+        `push --no-verify -u origin ${branch}`,
       { onLine: (line) => console.log(`  [${label}] ${line}`) }
     );
     if (push.exitCode !== 0) {
@@ -183,16 +186,38 @@ async function main() {
     //    on a large ticket, each continuing from the previous one's commits.
     const implement = await sandbox.run({
       name: 'implement',
+      completionSignal: ['<promise>COMPLETE</promise>', '<promise>BLOCKED</promise>'],
       maxIterations: 10,
-      agent: sandcastle.claudeCode('claude-sonnet-5'),
+      agent: sandcastle.claudeCode('claude-sonnet-5-5'),
       promptFile: './.sandcastle/implement-prompt.md',
       promptArgs: { ISSUE_URL: issue.url, ISSUE_NUMBER: issueNumber, BRANCH: branch },
     });
 
-    if (implement.commits.length === 0) {
+    // A session that stops blocked has explained why on the issue. Ending here keeps
+    // the runner from starting nine more sessions that hit the same blocker and post
+    // the same comment (slop_machine#37 did exactly that).
+    if (implement.completionSignal === '<promise>BLOCKED</promise>') {
       throw new Error(
-        'The implement session made no commits. If it hit a blocker, it explained why ' +
-          'in a comment on the issue.'
+        'The implement session stopped blocked. It explained why in a comment on the issue.'
+      );
+    }
+
+    // What matters is whether the branch has work on it, not whether this session
+    // added any. A rerun of an issue whose earlier run committed the implementation
+    // and then failed later (#1429: the push) finds nothing left to do, and should go
+    // on to review, gate and PR rather than fail.
+    const ahead = await sandbox.exec(`git rev-list --count ${BASE}..HEAD`);
+    const commitsOnBranch = ahead.exitCode === 0 ? Number(ahead.stdout.trim()) : NaN;
+    if (!(commitsOnBranch > 0)) {
+      throw new Error(
+        `'${branch}' has no commits ahead of ${BASE}. If the implement session hit a ` +
+          'blocker, it explained why in a comment on the issue.'
+      );
+    }
+    if (implement.commits.length === 0) {
+      console.log(
+        `\nThe implement session added nothing; '${branch}' already has ${commitsOnBranch} ` +
+          `commit(s) ahead of ${BASE} from an earlier run. Continuing to review.`
       );
     }
 
@@ -204,9 +229,16 @@ async function main() {
     const review = await sandbox.run({
       name: 'review',
       maxIterations: 1,
-      agent: sandcastle.claudeCode('claude-opus-5'),
+      agent: sandcastle.claudeCode('claude-opus-5-5'),
       promptFile: './.sandcastle/review-prompt.md',
-      promptArgs: { ISSUE_URL: issue.url, ISSUE_NUMBER: issueNumber, BRANCH: branch },
+      // Not {{TARGET_BRANCH}}: inside createSandbox() sandcastle sets that built-in to the
+      // sandbox's own branch, so the review would diff the branch against itself.
+      promptArgs: {
+        ISSUE_URL: issue.url,
+        ISSUE_NUMBER: issueNumber,
+        BRANCH: branch,
+        BASE_BRANCH: BASE,
+      },
     });
     const summary = reviewSummary(review.stdout);
 
@@ -220,7 +252,7 @@ async function main() {
       await sandbox.run({
         name: `gate-fix-${attempt}`,
         maxIterations: 20,
-        agent: sandcastle.claudeCode('claude-sonnet-5'),
+        agent: sandcastle.claudeCode('claude-sonnet-5-5'),
         prompt: fixPrompt(gate.failure!, attempt, MAX_GATE_FIX_ATTEMPTS),
       });
       await pushBranch(sandbox, `push:gate-fix-${attempt}`, { bestEffort: true });

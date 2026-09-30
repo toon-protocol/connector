@@ -1,27 +1,37 @@
-# connector is an npm-WORKSPACES monorepo (NOT pnpm) — so, unlike the pnpm
-# repos' sandcastle images, there is deliberately NO `corepack prepare pnpm`
-# line here. The stock node:22 image already ships npm, which is all connector
-# needs (`npm ci` in the onSandboxReady hook).
+# The ONE sandbox image for every toon-protocol repo that runs the AFK factory
+# (connector, relay, store, toon-client, rig, swap, toon, gas-station, provider,
+# gateway, console). It is published as ghcr.io/toon-protocol/sandcastle-agent by
+# .github/workflows/publish-sandcastle-agent.yml, and each repo's agent-implement.yml
+# pulls it. It is the union of what those repos' gates need: Node 22 with npm and
+# pnpm (corepack, so each repo's `packageManager` field picks its pnpm version),
+# Rust, Foundry, the Solana CLI and envsubst. Change a pin here and every repo gets
+# it on the next publish, so check the other repos' CI pins before bumping one.
 #
 # NATIVE DEPS: the FULL `node:22-bookworm` image is built on
 # `buildpack-deps:bookworm`, which bundles build-essential (gcc/g++/make) and
-# python3, so `npm ci` succeeds here with NO extra apt packages and none are
-# added. The o1js toolchain this paragraph was originally written for went with
-# Mina (ADR 0065), but a native module can reappear in any dependency. (If you
+# python3, so native npm modules build here with no extra apt packages. (If you
 # ever switch this FROM to a `-slim` variant, you MUST add
 # `build-essential python3` before the USER switch.)
 FROM node:22-bookworm
 
-# Links the published GHCR package (ghcr.io/toon-protocol/connector:sandcastle-agent,
-# see the pull step in .github/workflows/agent-implement.yml) to this repo.
+# Links the published GHCR package (ghcr.io/toon-protocol/sandcastle-agent) to this repo,
+# which owns this Dockerfile.
 LABEL org.opencontainers.image.source="https://github.com/toon-protocol/connector"
 
 # Install system dependencies
+# gettext-base provides envsubst, which provider's tests call.
 RUN apt-get update && apt-get install -y \
   git \
   curl \
   jq \
+  gettext-base \
   && rm -rf /var/lib/apt/lists/*
+
+# pnpm for the pnpm repos, through corepack, so each repo's `packageManager` field
+# chooses the pnpm version it runs. Enabled as root because it writes the shims
+# into /usr/local/bin. No download prompt: nobody is there to answer it.
+RUN corepack enable
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
 # Install GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \

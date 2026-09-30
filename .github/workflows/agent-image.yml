@@ -1,9 +1,9 @@
 name: Agent image
 
-# Minimal build-only check for the sandcastle agent container image.
-# Proves the `.sandcastle/Dockerfile` (node:22-bookworm + gh + Claude Code CLI +
-# the mattpocock-skills plugin, NO corepack/pnpm — connector is npm-workspaces)
-# builds. This is not the runner itself; that is agent-implement.yml.
+# Build check for the shared sandcastle agent image (ghcr.io/toon-protocol/sandcastle-agent),
+# run on PRs that change it. publish-sandcastle-agent.yml publishes it from main.
+# Proves the `.sandcastle/Dockerfile` builds and carries every factory repo's
+# toolchain. This is not the runner itself; that is agent-implement.yml.
 
 on:
   pull_request:
@@ -23,11 +23,13 @@ jobs:
         with:
           node-version: '22.12.0'
 
-      # Docker is preinstalled on ubuntu-latest GitHub-hosted runners.
-      # `sandcastle docker build-image` builds .sandcastle/Dockerfile,
-      # defaulting the AGENT_UID/AGENT_GID build args to the runner's uid/gid.
+      # A plain `docker build` rather than `sandcastle docker build-image`, which
+      # hides Docker's output: when a layer is wrong, the log has to show which.
+      # UID/GID 1001 is the runner's user, as in publish-sandcastle-agent.yml.
       - name: Build agent image
-        run: npx --yes @ai-hero/sandcastle@0.12.0 docker build-image
+        run: |
+          docker build --progress=plain --build-arg AGENT_UID=1001 --build-arg AGENT_GID=1001 \
+            -t sandcastle:connector .sandcastle/
 
       - name: Verify toolchain inside image
         run: |
@@ -36,7 +38,6 @@ jobs:
             node --version
             npm --version
             gh --version | head -1
-            # connector is npm-workspaces — npm (not pnpm/corepack) is the PM.
             # A native module (node-gyp) needs a C toolchain + python3; the
             # full node:22-bookworm base already ships them.
             python3 --version
@@ -45,6 +46,11 @@ jobs:
             test -x /home/agent/.local/bin/claude
             # The runner starts every session with a mattpocock-skills slash command.
             claude plugin list | grep -q mattpocock-skills
+            # This image is shared by every factory repo: pnpm for the pnpm repos,
+            # envsubst for the provider tests. (No apostrophes in this block: it is
+            # one single-quoted string, and an apostrophe ends it early.)
+            pnpm --version
+            command -v envsubst
             # The #409 rewrite is Rust, and per ADR 0007 its integration tier
             # spawns a disposable local chain, so the agent needs both.
             # NOTE the `-lc` above is a LOGIN shell on purpose: it sources
