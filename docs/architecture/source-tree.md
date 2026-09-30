@@ -258,6 +258,9 @@ Scripts, none of them part of the binary.
 
 - `ci/check-tracked-secrets.sh` — the tracked-key guard, by filename **and** by content
   (a Solana keypair is a bare 64-byte JSON array and can be called anything).
+- `ci/check-noop-merge.sh` — the no-op merge guard: fails a PR whose merge result changes
+  zero files (connector#1008). Run by `ci.yml`, feeding `CI Status Summary`; `--self-test`
+  checks each verdict.
 - `fund-peers/` — devnet peer funding tooling (TypeScript).
 - `bench/peer-claim-journal-fsyncs.sh` — a one-off measurement script.
 - `vendor-rfc.sh` — re-vendors an Interledger RFC into `docs/rfcs/`

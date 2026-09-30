@@ -30,9 +30,11 @@ on:
   pull_request:
     branches:
       - '**'
-    # `synchronize` is what lets the no-op merge guard catch a PR that BECOMES a
-    # no-op when its branch is updated onto a base that has since acquired the
-    # same content; `ready_for_review` is here so a draft turned ready is checked.
+    # The first three are GitHub's defaults, spelled out because the no-op merge
+    # guard depends on `synchronize`: it is what catches a PR that BECOMES a no-op
+    # when its branch is updated onto a base that has since acquired the same
+    # content. `ready_for_review` is the one addition, so a draft turned ready is
+    # checked.
     types: [opened, synchronize, reopened, ready_for_review]
 
 # Widening the trigger above put every stacked PR on the full Rust gate, so
