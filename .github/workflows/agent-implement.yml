@@ -95,23 +95,19 @@ jobs:
       # gate runs inside the sandbox.
       - run: npm ci
 
-      # The sandbox image is prebuilt because its Rust, Foundry and Solana layers
-      # take many minutes to build. It's built with AGENT_UID/GID=1001 to match the
-      # runner user, then retagged to the name sandcastle expects. Rebuild and push
-      # it whenever .sandcastle/Dockerfile changes:
-      #   docker build --build-arg AGENT_UID=1001 --build-arg AGENT_GID=1001 \
-      #     -t ghcr.io/toon-protocol/connector:sandcastle-agent .sandcastle/
-      #   docker push ghcr.io/toon-protocol/connector:sandcastle-agent
-      # An image built before the skills plugin was added can't run /implement, so
-      # it counts as missing.
-      - name: 'Pull prebuilt sandcastle agent image (fallback: build)'
+      # Every factory repo runs the same sandbox image, ghcr.io/toon-protocol/sandcastle-agent,
+      # built from .sandcastle/Dockerfile here and published by publish-sandcastle-agent.yml.
+      # It's retagged to the name sandcastle derives from the checkout dir. An image
+      # without the skills plugin can't run /implement, so it counts as missing and
+      # the runner builds from the Dockerfile instead.
+      - name: "Pull the shared sandcastle agent image (fallback: build)"
         run: |
-          image=ghcr.io/toon-protocol/connector:sandcastle-agent
+          image=ghcr.io/toon-protocol/sandcastle-agent:latest
           if docker pull "$image" \
             && docker run --rm --entrypoint bash "$image" -lc 'claude plugin list | grep -q mattpocock-skills'; then
             docker tag "$image" sandcastle:connector
           else
-            echo "::warning::No usable prebuilt image (missing, or without the skills plugin) — building on the runner."
+            echo "::warning::No usable shared image — building .sandcastle/Dockerfile on the runner."
             npx --yes @ai-hero/sandcastle@0.12.0 docker build-image
           fi
 

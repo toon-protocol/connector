@@ -1,6 +1,7 @@
 name: Agent image
 
-# Minimal build-only check for the sandcastle agent container image.
+# Build check for the shared sandcastle agent image (ghcr.io/toon-protocol/sandcastle-agent),
+# run on PRs that change it. publish-sandcastle-agent.yml publishes it from main.
 # Proves the `.sandcastle/Dockerfile` (node:22-bookworm + gh + Claude Code CLI +
 # the mattpocock-skills plugin, NO corepack/pnpm — connector is npm-workspaces)
 # builds. This is not the runner itself; that is agent-implement.yml.
@@ -45,6 +46,10 @@ jobs:
             test -x /home/agent/.local/bin/claude
             # The runner starts every session with a mattpocock-skills slash command.
             claude plugin list | grep -q mattpocock-skills
+            # This image is shared by every factory repo: pnpm for the pnpm repos,
+            # envsubst for provider's tests.
+            pnpm --version
+            command -v envsubst
             # The #409 rewrite is Rust, and per ADR 0007 its integration tier
             # spawns a disposable local chain, so the agent needs both.
             # NOTE the `-lc` above is a LOGIN shell on purpose: it sources
