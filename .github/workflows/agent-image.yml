@@ -47,8 +47,8 @@ jobs:
             # The runner starts every session with a mattpocock-skills slash command.
             claude plugin list | grep -q mattpocock-skills
             # This image is shared by every factory repo: pnpm for the pnpm repos,
-            # envsubst for provider's tests.
-            echo "PATH=$PATH"; ls -la "$(dirname "$(command -v node)")" | grep -E "pnpm|corepack" || true
+            # envsubst for the provider tests. (No apostrophes in this block: it is
+            # one single-quoted string, and an apostrophe ends it early.)
             pnpm --version
             command -v envsubst
             # The #409 rewrite is Rust, and per ADR 0007 its integration tier
