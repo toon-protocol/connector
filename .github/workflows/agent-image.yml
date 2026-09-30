@@ -51,6 +51,7 @@ jobs:
             # one single-quoted string, and an apostrophe ends it early.)
             pnpm --version
             command -v envsubst
+            docker compose version
             # The #409 rewrite is Rust, and per ADR 0007 its integration tier
             # spawns a disposable local chain, so the agent needs both.
             # NOTE the `-lc` above is a LOGIN shell on purpose: it sources
