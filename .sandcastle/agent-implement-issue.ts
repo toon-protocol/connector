@@ -184,7 +184,7 @@ async function main() {
     const implement = await sandbox.run({
       name: 'implement',
       maxIterations: 10,
-      agent: sandcastle.claudeCode('claude-sonnet-5'),
+      agent: sandcastle.claudeCode('claude-sonnet-5-5'),
       promptFile: './.sandcastle/implement-prompt.md',
       promptArgs: { ISSUE_URL: issue.url, ISSUE_NUMBER: issueNumber, BRANCH: branch },
     });
@@ -204,7 +204,7 @@ async function main() {
     const review = await sandbox.run({
       name: 'review',
       maxIterations: 1,
-      agent: sandcastle.claudeCode('claude-opus-5'),
+      agent: sandcastle.claudeCode('claude-opus-5-5'),
       promptFile: './.sandcastle/review-prompt.md',
       promptArgs: { ISSUE_URL: issue.url, ISSUE_NUMBER: issueNumber, BRANCH: branch },
     });
@@ -220,7 +220,7 @@ async function main() {
       await sandbox.run({
         name: `gate-fix-${attempt}`,
         maxIterations: 20,
-        agent: sandcastle.claudeCode('claude-sonnet-5'),
+        agent: sandcastle.claudeCode('claude-sonnet-5-5'),
         prompt: fixPrompt(gate.failure!, attempt, MAX_GATE_FIX_ATTEMPTS),
       });
       await pushBranch(sandbox, `push:gate-fix-${attempt}`, { bestEffort: true });
