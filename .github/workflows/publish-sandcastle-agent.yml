@@ -55,6 +55,7 @@ jobs:
             node --version; npm --version; pnpm --version; gh --version | head -1
             cargo --version; anvil --version | head -1; solana-test-validator --version
             command -v envsubst
+            docker compose version
           '
 
       - name: Push

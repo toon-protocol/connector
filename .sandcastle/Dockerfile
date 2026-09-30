@@ -4,8 +4,9 @@
 # .github/workflows/publish-sandcastle-agent.yml, and each repo's agent-implement.yml
 # pulls it. It is the union of what those repos' gates need: Node 22 with npm and
 # pnpm (corepack, so each repo's `packageManager` field picks its pnpm version),
-# Rust, Foundry, the Solana CLI and envsubst. Change a pin here and every repo gets
-# it on the next publish, so check the other repos' CI pins before bumping one.
+# Rust, Foundry, the Solana CLI, envsubst, and the Docker CLI with compose (no
+# daemon). Change a pin here and every repo gets it on the next publish, so check
+# the other repos' CI pins before bumping one.
 #
 # NATIVE DEPS: the FULL `node:22-bookworm` image is built on
 # `buildpack-deps:bookworm`, which bundles build-essential (gcc/g++/make) and
@@ -39,6 +40,17 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
   && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
   | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
   && apt-get update && apt-get install -y gh \
+  && rm -rf /var/lib/apt/lists/*
+
+# The Docker CLI and its compose plugin, with no daemon: store's tests run
+# `docker compose config` to check its compose files, which only reads them. Without
+# the CLI, store's gate fails on every ticket (store#150). Nothing in the sandbox
+# can start containers, because there is no daemon and no socket.
+RUN install -m 0755 -d /etc/apt/keyrings \
+  && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" \
+  | tee /etc/apt/sources.list.d/docker.list > /dev/null \
+  && apt-get update && apt-get install -y docker-ce-cli docker-compose-plugin \
   && rm -rf /var/lib/apt/lists/*
 
 # Build-args for UID/GID alignment: sandcastle docker build-image
