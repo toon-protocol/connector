@@ -30,6 +30,12 @@ on:
   pull_request:
     branches:
       - '**'
+    # The first three are GitHub's defaults, spelled out because the no-op merge
+    # guard depends on `synchronize`: it is what catches a PR that BECOMES a no-op
+    # when its branch is updated onto a base that has since acquired the same
+    # content. `ready_for_review` is the one addition, so a draft turned ready is
+    # checked.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # Widening the trigger above put every stacked PR on the full Rust gate, so
 # stop paying for runs that are already obsolete: a force-push or a new commit
@@ -404,6 +410,30 @@ jobs:
             END { if (found) exit 1 }
           ' /tmp/cargo-test.log
 
+  # A PR whose merge result changes zero files must not merge green (connector#1008
+  # did, as an empty commit). Logic and rationale: tools/ci/check-noop-merge.sh. It
+  # is a job here, asserted on by `ci-status`, rather than a required check of its
+  # own: `CI Status Summary` is the one required context, so a red guard turns it
+  # red with no branch-protection change. On `push` the script passes plainly --
+  # not a job-level `if:`, since a skipped job is a non-success to the aggregate.
+  no-op-merge:
+    name: No-op merge guard
+    runs-on: ubuntu-latest
+    steps:
+      # Depth 3 covers the merge commit and both parents; nothing walks history.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - name: Self-test the guard
+        run: bash tools/ci/check-noop-merge.sh --self-test
+      - name: A merge that changes nothing must not merge green
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: bash tools/ci/check-noop-merge.sh
+
   # Summary job to provide clear CI status -- and the ONLY status branch
   # protection requires, which is why it runs on every PR (`if: always()`)
   # and why the docs-only skip is decided here and not by a workflow-level
@@ -421,6 +451,7 @@ jobs:
         security,
         devbox-validate,
         tracked-secrets,
+        no-op-merge,
       ]
     if: always()
 
@@ -437,6 +468,7 @@ jobs:
           echo "Job Results:"
           echo "  Lint & Format: ${{ needs.lint-and-format.result }}"
           echo "  Tracked Key Guard: ${{ needs.tracked-secrets.result }}"
+          echo "  No-op Merge Guard: ${{ needs.no-op-merge.result }}"
           echo "  Rust Workspace Gate: ${{ needs.rust-gate.result }}"
           echo "  Docs Gate: ${{ needs.docs-gate.result }}"
           echo "  Devbox Validation: ${{ needs.devbox-validate.result }}"
@@ -469,6 +501,7 @@ jobs:
           fi
           always "Lint & Format" "${{ needs.lint-and-format.result }}"
           always "Tracked Key Guard" "${{ needs.tracked-secrets.result }}"
+          always "No-op Merge Guard" "${{ needs.no-op-merge.result }}"
           heavy "Rust Workspace Gate" "${{ needs.rust-gate.result }}"
           heavy "Devbox Validation" "${{ needs.devbox-validate.result }}"
           if [[ "$CODE" == "false" ]]; then
