@@ -1,0 +1,63 @@
+# Publishes the one sandbox image every toon-protocol factory repo pulls:
+# ghcr.io/toon-protocol/sandcastle-agent. Its Dockerfile lives here
+# (.sandcastle/Dockerfile), so this is the only place it is built and pushed.
+#
+# It runs when that Dockerfile changes on main, and on dispatch. Dispatch it after
+# a new mattpocock-skills release to pick the plugin up, because the Dockerfile
+# installs the plugin's latest version and nothing in it changes when that does.
+#
+# Built with AGENT_UID/GID=1001, the GitHub-hosted runner's user, because every
+# consumer runs it on those runners. Tagged `latest` (what consumers pull) and with
+# the commit SHA (to pin or roll back).
+
+name: Publish sandcastle agent image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.sandcastle/Dockerfile'
+      - '.github/workflows/publish-sandcastle-agent.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-sandcastle-agent
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/toon-protocol/sandcastle-agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build
+        run: |
+          docker build --build-arg AGENT_UID=1001 --build-arg AGENT_GID=1001 \
+            -t "$IMAGE:latest" -t "$IMAGE:${{ github.sha }}" .sandcastle/
+
+      # The same checks agent-image.yml runs on a PR, against the image about to
+      # be published, so a broken image never becomes `latest`.
+      - name: Verify toolchain
+        run: |
+          docker run --rm --entrypoint bash "$IMAGE:latest" -lc '
+            set -e
+            test "$(id -u)" = 1001
+            claude plugin list | grep -q mattpocock-skills
+            node --version; npm --version; pnpm --version; gh --version | head -1
+            cargo --version; anvil --version | head -1; solana-test-validator --version
+            command -v envsubst
+          '
+
+      - name: Push
+        run: |
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
