@@ -126,7 +126,10 @@ async function pushBranch(
   try {
     const push = await sandbox.exec(
       `git -c credential.helper= -c credential.helper='${FRESH_CREDENTIAL_HELPER}' ` +
-        `push -u origin ${branch}`,
+        // --no-verify: this repo's husky pre-push hook runs a local test pass meant for
+        // people pushing by hand. The runner has just run CI's own gate, and the hook
+        // failing in the sandbox is what cost #1429 its final push.
+        `push --no-verify -u origin ${branch}`,
       { onLine: (line) => console.log(`  [${label}] ${line}`) }
     );
     if (push.exitCode !== 0) {
@@ -184,7 +187,7 @@ async function main() {
     const implement = await sandbox.run({
       name: 'implement',
       maxIterations: 10,
-      agent: sandcastle.claudeCode('claude-sonnet-5'),
+      agent: sandcastle.claudeCode('claude-sonnet-5-5'),
       promptFile: './.sandcastle/implement-prompt.md',
       promptArgs: { ISSUE_URL: issue.url, ISSUE_NUMBER: issueNumber, BRANCH: branch },
     });
@@ -204,9 +207,16 @@ async function main() {
     const review = await sandbox.run({
       name: 'review',
       maxIterations: 1,
-      agent: sandcastle.claudeCode('claude-opus-5'),
+      agent: sandcastle.claudeCode('claude-opus-5-5'),
       promptFile: './.sandcastle/review-prompt.md',
-      promptArgs: { ISSUE_URL: issue.url, ISSUE_NUMBER: issueNumber, BRANCH: branch },
+      // Not {{TARGET_BRANCH}}: inside createSandbox() sandcastle sets that built-in to the
+      // sandbox's own branch, so the review would diff the branch against itself.
+      promptArgs: {
+        ISSUE_URL: issue.url,
+        ISSUE_NUMBER: issueNumber,
+        BRANCH: branch,
+        BASE_BRANCH: BASE,
+      },
     });
     const summary = reviewSummary(review.stdout);
 
@@ -220,7 +230,7 @@ async function main() {
       await sandbox.run({
         name: `gate-fix-${attempt}`,
         maxIterations: 20,
-        agent: sandcastle.claudeCode('claude-sonnet-5'),
+        agent: sandcastle.claudeCode('claude-sonnet-5-5'),
         prompt: fixPrompt(gate.failure!, attempt, MAX_GATE_FIX_ATTEMPTS),
       });
       await pushBranch(sandbox, `push:gate-fix-${attempt}`, { bestEffort: true });
