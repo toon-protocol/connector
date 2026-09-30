@@ -359,8 +359,8 @@ mod tests {
         #[test]
         fn the_delta_across_the_old_u64_ceiling_is_exact(
             below in 0u128..=1000,
-            above in 0u128..=1000,
-            price in any::<u64>(),
+            above in 1u128..=1000,
+            price in prop_oneof![0u64..=2001, any::<u64>()],
         ) {
             let watermark_amount = u128::from(u64::MAX) - below;
             let cumulative_amount = u128::from(u64::MAX) + above;
@@ -372,6 +372,34 @@ mod tests {
                 prop_assert_eq!(reported, advanced);
                 prop_assert_eq!(reported_price, price);
             }
+
+            // The voucher path proper: freshness against the amount-only
+            // watermark, then value, across the same boundary.
+            let admission = validate_voucher(
+                voucher_watermark(watermark_amount, &[0x01]),
+                cumulative_amount,
+                &[0x02],
+                price,
+            );
+            if advanced >= u128::from(price) {
+                prop_assert_eq!(admission, Ok(VoucherAdmission::Advances { advanced }));
+            } else {
+                prop_assert_eq!(admission, Err(ClaimError::Underpayment { advanced, price }));
+            }
+            // And the other way across it: a voucher at or below a
+            // watermark above `u64::MAX` is stale, whatever it pays.
+            prop_assert_eq!(
+                validate_voucher(
+                    voucher_watermark(cumulative_amount, &[0x01]),
+                    watermark_amount,
+                    &[0x02],
+                    0,
+                ),
+                Err(ClaimError::AmountNotAdvancing {
+                    claimed: watermark_amount,
+                    watermark: cumulative_amount,
+                })
+            );
         }
     }
 

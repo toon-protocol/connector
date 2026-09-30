@@ -106,7 +106,7 @@ fn decode_hex(hex: &str) -> Option<Vec<u8>> {
 
 /// One line of the journal's on-disk encoding: a type tag followed by its
 /// fields, tab-separated -- deliberately not `serde_json` or a binary
-/// format: every field here is a `String` or `u64`, none can themselves
+/// format: every field here is a `String` or an integer, none can themselves
 /// contain a tab or newline (`channel_id`/`peer_id` are connector-assigned
 /// identifiers, not untrusted wire input), so this is the simplest format
 /// that round-trips exactly, human-readable in place, matching the

@@ -493,22 +493,88 @@ async fn a_voucher_on_a_channel_the_backend_does_not_admit_is_unknown() {
 /// ADR 0074 decision 3, amended 2026-09-30 (#1429): EVM's amount is `u128`,
 /// matching `x402BatchSettlement`'s own `maxClaimableAmount`, so a value
 /// above `u64::MAX` -- once refused as malformed -- is admitted exactly, and
-/// appears unchanged in the watermark.
+/// appears unchanged in the watermark, the journal line and the state a
+/// restart replays.
 #[tokio::test]
 async fn an_evm_voucher_amount_above_u64_is_admitted_exactly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("client-claims.journal");
     let backend = Arc::new(FakeBatchSettlement::new(u128::MAX));
-    let (gate, _journal) = gate_with(&backend);
-    let above = u128::from(u64::MAX) + 100;
-    let wide = signed_evm_voucher(above);
+    let above = u128::from(u64::MAX) + 1;
+    assert_eq!(above.to_string(), "18446744073709551616");
+    let exact = Some(Watermark {
+        cumulative_amount: above,
+    });
+    {
+        let gate = gate_over(Arc::new(FileJournal::open(&path).expect("opens")), &backend);
+        gate.ingest(&signed_evm_voucher(above), 0)
+            .await
+            .expect("a uint128 EVM amount above u64::MAX is admitted");
+        assert_eq!(gate.watermark(&channel_key()), exact);
+    }
 
-    gate.ingest(&wide, 0)
-        .await
-        .expect("a uint128 EVM amount above u64::MAX is admitted");
+    let text = std::fs::read_to_string(&path).expect("the journal file");
+    assert!(
+        text.lines().any(|line| line
+            .starts_with(&format!("inbound_claim_accepted\t{}\t", channel_key()))
+            && line.contains("\t18446744073709551616\t")),
+        "the journal line carries the exact amount: {text}"
+    );
+
+    let restarted = gate_over(
+        Arc::new(FileJournal::open(&path).expect("reopens")),
+        &backend,
+    );
+    assert_eq!(restarted.watermark(&channel_key()), exact);
+}
+
+/// A journal a pre-widening build wrote -- `u64`-sized decimal amounts, in
+/// the text that build produced -- replays to the same state under this one:
+/// the same watermark, and the same signed bytes a resend is recognised by.
+#[tokio::test]
+async fn a_journal_written_before_the_widening_replays_to_the_same_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("client-claims.journal");
+    let signature = |amount: u128| {
+        sign_voucher(&authorizer(), amount)
+            .trim_start_matches("0x")
+            .to_string()
+    };
+    let channel = channel_key();
+    std::fs::write(
+        &path,
+        format!(
+            "inbound_claim_accepted\t{channel}\t0\t100\t{}\n\
+             inbound_claim_accepted\t{channel}\t0\t250\t{}\n\
+             inbound_claim_rolled_back\t{channel}\t0\t250\n",
+            signature(100),
+            signature(250),
+        ),
+    )
+    .expect("an old-shape journal");
+
+    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let gate = gate_over(
+        Arc::new(FileJournal::open(&path).expect("reopens")),
+        &backend,
+    );
     assert_eq!(
         gate.watermark(&channel_key()),
         Some(Watermark {
-            cumulative_amount: above
+            cumulative_amount: 100
         })
+    );
+    gate.ingest(&signed_evm_voucher(100), 0)
+        .await
+        .expect("the same bytes, recognised from the old journal");
+    assert_eq!(
+        gate.ingest(&signed_evm_voucher(100), 100)
+            .await
+            .unwrap_err(),
+        ClaimIngestRejection::Underpayment {
+            advanced: 0,
+            price: 100
+        }
     );
 }
 

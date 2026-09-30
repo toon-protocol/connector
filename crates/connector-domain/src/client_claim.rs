@@ -311,8 +311,8 @@ pub enum ClientClaimError {
     /// truncated amount is a different voucher from the one the payer
     /// signed, and not one the chain would honour either.
     #[error(
-        "claim is structurally invalid: 'maxClaimableAmount' {amount} is above the {max} this \
-         connector's amounts can hold -- refused, not truncated",
+        "claim is structurally invalid: 'maxClaimableAmount' {amount} is above the {max} a \
+         Solana voucher's amount can hold -- refused, not truncated",
         max = u64::MAX
     )]
     AmountOutOfRange { amount: u128 },
@@ -680,6 +680,35 @@ mod tests {
 
     fn evm_voucher_json() -> String {
         evm_voucher_json_with(Some(&evm_channel_config_json()))
+    }
+
+    /// `decimal + addend`, as decimal text: schoolbook addition, for amounts
+    /// past what any integer type here holds.
+    fn add_decimal(decimal: &str, addend: u128) -> String {
+        let addend = addend.to_string();
+        let (mut left, mut right) = (decimal.bytes().rev(), addend.bytes().rev());
+        let (mut digits, mut carry) = (Vec::new(), 0);
+        loop {
+            let (a, b) = (left.next(), right.next());
+            if a.is_none() && b.is_none() && carry == 0 {
+                break;
+            }
+            let sum = a.map_or(0, |d| d - b'0') + b.map_or(0, |d| d - b'0') + carry;
+            digits.push(b'0' + sum % 10);
+            carry = sum / 10;
+        }
+        digits.reverse();
+        String::from_utf8(digits).expect("ASCII digits")
+    }
+
+    #[test]
+    fn add_decimal_adds_past_u128() {
+        assert_eq!(add_decimal("999", 1), "1000");
+        assert_eq!(add_decimal("0", 0), "0");
+        assert_eq!(
+            add_decimal(&u128::MAX.to_string(), 1),
+            "340282366920938463463374607431768211456"
+        );
     }
 
     fn evm_voucher_json_with(channel_config: Option<&str>) -> String {
@@ -1207,6 +1236,27 @@ mod tests {
             let json = evm_voucher_json().replace(r#""5000""#, &format!(r#""{amount}""#));
             let claim = parse_client_claim(&json).expect("any uint128 EVM amount is admitted");
             proptest::prop_assert_eq!(claim.transferred_amount(), amount);
+        }
+
+        /// And nothing wider than a `uint128` parses on either chain: every
+        /// decimal above `u128::MAX` is malformed, not clamped.
+        #[test]
+        fn a_voucher_amount_above_u128_is_always_malformed(
+            excess in proptest::prelude::any::<u128>(),
+            solana in proptest::prelude::any::<bool>(),
+        ) {
+            // `u128::MAX + 1 + excess`, as a decimal, since no wider integer
+            // can hold it.
+            let above = add_decimal(&add_decimal(&u128::MAX.to_string(), 1), excess);
+            let json = if solana {
+                solana_voucher_json().replace(r#""42""#, &format!(r#""{above}""#))
+            } else {
+                evm_voucher_json().replace(r#""5000""#, &format!(r#""{above}""#))
+            };
+            proptest::prop_assert!(matches!(
+                parse_client_claim(&json),
+                Err(ClientClaimError::Malformed(_))
+            ));
         }
 
         /// A Solana voucher keeps the old `u64` boundary: every `uint128`
