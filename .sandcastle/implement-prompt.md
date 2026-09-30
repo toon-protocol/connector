@@ -39,3 +39,7 @@ write the remaining steps to `.sandcastle/logs/handoff-{{ISSUE_NUMBER}}.md`, com
 `git add -f`, and end your turn. A fresh session continues from your commits.
 
 When the ticket is done and committed, output <promise>COMPLETE</promise>.
+
+If you stopped because you're blocked, output <promise>BLOCKED</promise> instead, after your
+comment on the issue. The runner then ends the run. Otherwise it starts another session, which
+hits the same blocker and posts the same comment again.

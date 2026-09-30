@@ -186,11 +186,21 @@ async function main() {
     //    on a large ticket, each continuing from the previous one's commits.
     const implement = await sandbox.run({
       name: 'implement',
+      completionSignal: ['<promise>COMPLETE</promise>', '<promise>BLOCKED</promise>'],
       maxIterations: 10,
       agent: sandcastle.claudeCode('claude-sonnet-5-5'),
       promptFile: './.sandcastle/implement-prompt.md',
       promptArgs: { ISSUE_URL: issue.url, ISSUE_NUMBER: issueNumber, BRANCH: branch },
     });
+
+    // A session that stops blocked has explained why on the issue. Ending here keeps
+    // the runner from starting nine more sessions that hit the same blocker and post
+    // the same comment (slop_machine#37 did exactly that).
+    if (implement.completionSignal === '<promise>BLOCKED</promise>') {
+      throw new Error(
+        'The implement session stopped blocked. It explained why in a comment on the issue.'
+      );
+    }
 
     // What matters is whether the branch has work on it, not whether this session
     // added any. A rerun of an issue whose earlier run committed the implementation
