@@ -17,11 +17,8 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "format": "prettier --write \"**/*.{ts,tsx,js,json,md}\"",
     "format:check": "prettier --check \"**/*.{ts,tsx,js,json,md}\"",
-    "sandcastle": "npx tsx .sandcastle/main.ts",
-    "sandcastle:plan": "npx tsx .sandcastle/plan-dry-run.ts",
+    "sandcastle:ready": "npx tsx .sandcastle/ready-issues.ts",
     "sandcastle:implement": "npx tsx .sandcastle/agent-implement-issue.ts",
-    "sandcastle:fix": "npx tsx .sandcastle/agent-fix-pr.ts",
-    "sandcastle:review": "npx tsx .sandcastle/agent-review-pr.ts",
     "prepare": "husky",
     "postinstall": "patch-package"
   },
@@ -35,8 +32,7 @@
     "patch-package": "^8.0.1",
     "prettier": "^3.2.5",
     "tsx": "^4.23.1",
-    "typescript": "^5.3.3",
-    "zod": "^3.25.76"
+    "typescript": "^5.3.3"
   },
   "engines": {
     "node": ">=22.12.0",

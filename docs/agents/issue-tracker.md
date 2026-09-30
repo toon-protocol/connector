@@ -27,12 +27,12 @@ When set to `yes`, PRs run through the same labels and states as issues, using t
 
 GitHub shares one number space across issues and PRs, so a bare `#42` may be either — resolve with `gh pr view 42` and fall back to `gh issue view 42`.
 
-## Do not touch the Sandcastle automation labels
+## `ready-for-agent` starts work
 
-`agent:implement` and `agent:review` are **not** triage labels — they are triggers. Applying
-`agent:implement` makes Sandcastle build the issue and open a PR; `agent:review` runs the
-single-pass reviewer on a PR. Never apply either as a way of recording a triage decision. The
-triage vocabulary is in `triage-labels.md` and is deliberately separate.
+Applying `ready-for-agent` queues an issue for the AFK factory (`agent-implement.yml`), which
+builds it and opens a PR once its blockers are closed. Record blockers with GitHub's native
+"blocked by" relationship, or under a `## Blocked by` heading as `to-tickets` writes them, so the
+factory waits for them. See `triage-labels.md`.
 
 ## When a skill says "publish to the issue tracker"
 

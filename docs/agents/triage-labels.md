@@ -26,18 +26,19 @@ The unused stock labels (`documentation`, `duplicate`, `good first issue`, `help
 `invalid`, `question`) were deleted at the same time; each carried zero issues, zero PRs and zero
 references. `bug`, `enhancement` and `released` were kept.
 
-## Labels these are deliberately NOT mapped to
+## These labels drive the AFK factory
 
-The repo already carries an automation vocabulary that looks adjacent but means something else.
-Keep them apart:
+There is no separate trigger label. `ready-for-agent` is the queue, as `to-spec`, `to-tickets`
+and `triage` assume: `.github/workflows/agent-implement.yml` picks up every open
+`ready-for-agent` issue whose blockers are closed, and turns it into a PR. The factory moves labels
+like this:
 
-- **`agent:implement`** — a Sandcastle **trigger**: applying it makes an agent build the issue and
-  open a PR. `ready-for-agent` is a _triage verdict_ ("this is specified well enough for an agent"),
-  which is a precondition for `agent:implement`, not a synonym. Deciding is not dispatching.
-- **`agent:review`** — a Sandcastle trigger that runs the single-pass reviewer on a PR. Not a
-  triage state at all.
-- **`needs:human`** — "requires human decision or clarification", which straddles `needs-info`
-  (waiting on the reporter) and `ready-for-human` (specified, needs a human to build it). The two
-  canonical labels split that ambiguity, so `needs:human` is left to its existing users.
-- **`tracking`** — an epic split by issue-decomposer. Orthogonal to triage; an epic can carry a
-  triage label too.
+- **`ready-for-agent`** on an issue: queued. Removed once the agent's PR is open. Put it back to
+  retry.
+- **`ready-for-human`** on a PR: the agent finished and the gate is green. A human merges.
+- **`needs-triage`** on an issue: the AFK run failed. The issue has a comment linking the run.
+
+A spec (an issue with sub-issues, or one written from the to-spec template) is never built
+directly, even with `ready-for-agent` on it. Its tickets are.
+
+The fleet-health and pin-drift alerts open their issues with `needs-triage` + `bug`.

@@ -34,10 +34,10 @@
 #
 #   * On failure this opens (or updates) a single rolling GitHub issue in this
 #     repo titled `[fleet-health] devnet fleet is unhealthy`, labelled
-#     `needs:human` + `bug`, carrying the full probe table and how to roll
-#     back. `needs:human` is the org's existing human-queue label
-#     (toon-meta#347), so the alert lands in a queue that is already swept
-#     rather than inventing a channel of its own. Opening an issue also emails
+#     `needs-triage` + `bug`, carrying the full probe table and how to roll
+#     back. `needs-triage` is the canonical triage label for "a maintainer
+#     needs to look at this", so the alert lands in the queue `/triage` already
+#     sweeps rather than inventing a channel of its own. Opening an issue also emails
 #     everyone watching the repo, which a failed scheduled run does not do
 #     reliably (GitHub mails only the cron's last editor).
 #   * While it stays red the alert's BODY is rewritten on every run -- so the
@@ -1144,7 +1144,7 @@ jobs:
           # alert on every run instead of updating one. Listing the label and
           # comparing titles exactly in jq has no such failure mode.
           EXISTING=$(gh issue list --repo "${{ github.repository }}" --state open \
-                       --label "needs:human" --limit 100 \
+                       --label "needs-triage" --limit 100 \
                        --json number,title \
                        --jq ".[] | select(.title == \"$ALERT_TITLE\") | .number" | head -1)
 
@@ -1375,7 +1375,7 @@ jobs:
           else
             gh issue create --repo "${{ github.repository }}" \
               --title "$ALERT_TITLE" \
-              --label "needs:human" --label "bug" \
+              --label "needs-triage" --label "bug" \
               --body-file "$BODY"
             echo "Opened a new alert."
           fi

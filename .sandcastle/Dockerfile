@@ -12,7 +12,7 @@
 # `build-essential python3` before the USER switch.)
 FROM node:22-bookworm
 
-# Links the published GHCR package (ghcr.io/toon-protocol/sandcastle-connector,
+# Links the published GHCR package (ghcr.io/toon-protocol/connector:sandcastle-agent,
 # see the pull step in .github/workflows/agent-implement.yml) to this repo.
 LABEL org.opencontainers.image.source="https://github.com/toon-protocol/connector"
 
@@ -43,6 +43,14 @@ USER ${AGENT_UID}:${AGENT_GID}
 
 # Install Claude Code CLI
 RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Matt Pocock's skills, the same plugin used interactively. The runner starts each agent
+# session with `/mattpocock-skills:implement` or `/mattpocock-skills:code-review`, so they
+# must be installed here. A fresh install doesn't know the official marketplace yet, so add
+# it first. This takes the plugin's latest release when the image is built; rebuild the
+# image to pick up a newer one.
+RUN /home/agent/.local/bin/claude plugin marketplace add anthropics/claude-plugins-official \
+  && /home/agent/.local/bin/claude plugin install mattpocock-skills@claude-plugins-official
 
 # ── Rust + Foundry ──────────────────────────────────────────────────────────
 # WHY: the #409 rewrite is Rust, and without these the implementer cannot run
