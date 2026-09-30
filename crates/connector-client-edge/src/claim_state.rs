@@ -469,7 +469,7 @@ async fn resolve_solana_voucher(
         channel_account_text,
         state,
         &channel_key,
-        channel.max_cumulative,
+        u128::from(channel.max_cumulative),
     )
 }
 
@@ -485,7 +485,7 @@ fn verified_voucher_state(
     channel_id: String,
     state: &ClientEdgeState,
     channel_key: &str,
-    max_cumulative: u64,
+    max_cumulative: u128,
 ) -> ChannelStateResult {
     let cumulative_claimed = state
         .claim_gate

@@ -232,7 +232,7 @@ fn fresh_expiry() -> u64 {
 /// One channel the receiving half has admitted, as the chain records it.
 struct AdmittedChannel {
     config: BatchChannelConfig,
-    max_cumulative: u64,
+    max_cumulative: u128,
 }
 
 /// What the book has accepted on one channel: the watermark, and the
@@ -240,7 +240,7 @@ struct AdmittedChannel {
 /// from a different voucher at the same amount.
 #[derive(Clone, Copy)]
 struct Accepted {
-    amount: u64,
+    amount: u128,
     signature: [u8; 65],
 }
 
@@ -286,7 +286,7 @@ impl VoucherBook {
     }
 
     /// Where `channel` stands, if anything was ever accepted on it.
-    fn watermark(&self, channel: &[u8; 32]) -> Option<u64> {
+    fn watermark(&self, channel: &[u8; 32]) -> Option<u128> {
         self.watermarks
             .lock()
             .expect("watermark lock")
@@ -332,7 +332,7 @@ impl VoucherBook {
         if verify_evm_voucher(
             &domain(),
             &channel_id,
-            u128::from(voucher.max_claimable_amount),
+            voucher.max_claimable_amount,
             &signature,
             &signer_address,
         ) {

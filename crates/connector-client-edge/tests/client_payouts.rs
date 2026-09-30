@@ -189,7 +189,7 @@ impl BatchSettlementChannels for ClientChannels {
             .find(|config| *channel_id == evm_batch_channel_id(&domain(), config))
             .map(|config| AdmittedEvmVoucherChannel {
                 config,
-                max_cumulative: CLIENT_COLLATERAL,
+                max_cumulative: u128::from(CLIENT_COLLATERAL),
             }))
     }
 

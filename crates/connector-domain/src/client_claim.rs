@@ -77,10 +77,11 @@ pub struct EvmVoucher {
     /// The channel the voucher signs, `0x` + 64 hex. Named by the voucher
     /// and verified on chain, never derived (ADR 0074 decision 2).
     pub channel_id: String,
-    /// The cumulative amount the voucher authorises. `uint128` on the wire;
-    /// a value this connector's `u64` amounts cannot hold is refused
-    /// ([`ClientClaimError::AmountOutOfRange`]), never truncated.
-    pub max_claimable_amount: u64,
+    /// The cumulative amount the voucher authorises. `uint128` on the wire
+    /// and `u128` here (ADR 0074 decision 3, amended 2026-09-30 #1429),
+    /// matching `x402BatchSettlement`'s own `uint128`. A string wider than
+    /// a `uint128` is malformed; nothing narrows it further.
+    pub max_claimable_amount: u128,
     /// `r ‖ s ‖ v`, `0x` + 130 hex.
     pub signature: String,
     /// Present on a channel's first voucher, and optional after.
@@ -96,6 +97,10 @@ pub struct SolanaVoucher {
     pub common: ClientClaimCommon,
     /// The channel account, base58. Canonical as it arrives.
     pub channel_id: String,
+    /// The signed message and SPL amounts are `u64` on Solana (ADR 0074
+    /// decision 3, amended 2026-09-30 #1429): unlike EVM, this width does
+    /// not widen. A value above `u64::MAX` is
+    /// [`ClientClaimError::AmountOutOfRange`], refused not truncated.
     pub max_claimable_amount: u64,
     /// Ed25519, base58 of 64 bytes.
     pub signature: String,
@@ -126,11 +131,13 @@ impl ClientClaim {
         }
     }
 
-    /// The voucher's cumulative amount: its `maxClaimableAmount`.
-    pub fn transferred_amount(&self) -> u64 {
+    /// The voucher's cumulative amount: its `maxClaimableAmount`, widened to
+    /// `u128` uniformly even though only EVM's own field is that wide (ADR
+    /// 0074 decision 3, amended 2026-09-30 #1429).
+    pub fn transferred_amount(&self) -> u128 {
         match self {
             ClientClaim::EvmVoucher(voucher) => voucher.max_claimable_amount,
-            ClientClaim::SolanaVoucher(voucher) => voucher.max_claimable_amount,
+            ClientClaim::SolanaVoucher(voucher) => u128::from(voucher.max_claimable_amount),
         }
     }
 
@@ -297,13 +304,15 @@ pub enum ClientClaimError {
          toon-channel claim"
     )]
     ToonChannel,
-    /// A voucher's amount is a valid `uint128` that this connector's `u64`
-    /// amount type cannot hold (ADR 0074 decision 3). Refused rather than
-    /// truncated: a truncated amount is a different voucher from the one
-    /// the payer signed, and not one the chain would honour either.
+    /// A Solana voucher's amount is a valid `uint128` on the wire that
+    /// cannot fit the `u64` the signed Solana message and SPL amounts hold
+    /// (ADR 0074 decision 3, amended 2026-09-30 #1429). EVM's own amount is
+    /// `u128` and never raises this. Refused rather than truncated: a
+    /// truncated amount is a different voucher from the one the payer
+    /// signed, and not one the chain would honour either.
     #[error(
-        "claim is structurally invalid: 'maxClaimableAmount' {amount} is above the {max} this \
-         connector's amounts can hold -- refused, not truncated",
+        "claim is structurally invalid: 'maxClaimableAmount' {amount} is above the {max} a \
+         Solana voucher's amount can hold -- refused, not truncated",
         max = u64::MAX
     )]
     AmountOutOfRange { amount: u128 },
@@ -470,21 +479,32 @@ fn require_batch_settlement(obj: &serde_json::Map<String, Value>) -> Result<(), 
     }
 }
 
-/// A voucher's `maxClaimableAmount`: a decimal string holding a `uint128`,
-/// which must also fit this connector's `u64` amounts. Anything wider than
-/// a `uint128` is not an amount any voucher could sign, so malformed; a
-/// valid `uint128` above `u64::MAX` is [`ClientClaimError::AmountOutOfRange`]
-/// -- refused, never truncated (ADR 0074 decision 3).
-fn required_voucher_amount(obj: &serde_json::Map<String, Value>) -> Result<u64, ClientClaimError> {
+/// A voucher's `maxClaimableAmount`: a decimal string holding a `uint128`.
+/// Anything wider than a `uint128` is not an amount any voucher could sign,
+/// so malformed -- the one check shared by both chains.
+fn required_voucher_amount_u128(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<u128, ClientClaimError> {
     let raw = required_str(obj, "maxClaimableAmount")?;
     if !raw.bytes().all(|b| b.is_ascii_digit()) {
         return Err(malformed(
             "'maxClaimableAmount' must be a non-negative integer string",
         ));
     }
-    let amount = raw
-        .parse::<u128>()
-        .map_err(|_| malformed("'maxClaimableAmount' does not fit in a uint128"))?;
+    raw.parse::<u128>()
+        .map_err(|_| malformed("'maxClaimableAmount' does not fit in a uint128"))
+}
+
+/// A Solana voucher's `maxClaimableAmount`, additionally narrowed to `u64`
+/// (ADR 0074 decision 3, amended 2026-09-30 #1429): the signed Solana
+/// message and SPL amounts are `u64` on chain, so a valid `uint128` above
+/// `u64::MAX` is [`ClientClaimError::AmountOutOfRange`] -- refused, never
+/// truncated. EVM has no such narrowing; see
+/// [`required_voucher_amount_u128`].
+fn required_voucher_amount_u64(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<u64, ClientClaimError> {
+    let amount = required_voucher_amount_u128(obj)?;
     u64::try_from(amount).map_err(|_| ClientClaimError::AmountOutOfRange { amount })
 }
 
@@ -555,7 +575,7 @@ fn parse_evm_voucher(
             "'channelId' must be 0x-prefixed 64-char hex (bytes32)",
         ));
     }
-    let max_claimable_amount = required_voucher_amount(obj)?;
+    let max_claimable_amount = required_voucher_amount_u128(obj)?;
     let signature = required_str(obj, "signature")?.to_string();
     if !is_hex_of_len(&signature, 130) {
         return Err(malformed(
@@ -582,7 +602,7 @@ fn parse_solana_voucher(
             "'channelId' must be a base58-encoded Solana address (32-44 chars)",
         ));
     }
-    let max_claimable_amount = required_voucher_amount(obj)?;
+    let max_claimable_amount = required_voucher_amount_u64(obj)?;
     let expires_at = obj
         .get("expiresAt")
         .and_then(Value::as_i64)
@@ -660,6 +680,35 @@ mod tests {
 
     fn evm_voucher_json() -> String {
         evm_voucher_json_with(Some(&evm_channel_config_json()))
+    }
+
+    /// `decimal + addend`, as decimal text: schoolbook addition, for amounts
+    /// past what any integer type here holds.
+    fn add_decimal(decimal: &str, addend: u128) -> String {
+        let addend = addend.to_string();
+        let (mut left, mut right) = (decimal.bytes().rev(), addend.bytes().rev());
+        let (mut digits, mut carry) = (Vec::new(), 0);
+        loop {
+            let (a, b) = (left.next(), right.next());
+            if a.is_none() && b.is_none() && carry == 0 {
+                break;
+            }
+            let sum = a.map_or(0, |d| d - b'0') + b.map_or(0, |d| d - b'0') + carry;
+            digits.push(b'0' + sum % 10);
+            carry = sum / 10;
+        }
+        digits.reverse();
+        String::from_utf8(digits).expect("ASCII digits")
+    }
+
+    #[test]
+    fn add_decimal_adds_past_u128() {
+        assert_eq!(add_decimal("999", 1), "1000");
+        assert_eq!(add_decimal("0", 0), "0");
+        assert_eq!(
+            add_decimal(&u128::MAX.to_string(), 1),
+            "340282366920938463463374607431768211456"
+        );
     }
 
     fn evm_voucher_json_with(channel_config: Option<&str>) -> String {
@@ -1112,23 +1161,38 @@ mod tests {
     }
 
     #[test]
-    fn a_voucher_amount_above_u64_is_refused_not_truncated() {
+    fn a_solana_voucher_amount_above_u64_is_refused_not_truncated() {
         let above = u128::from(u64::MAX) + 1;
-        let json = evm_voucher_json().replace(r#""5000""#, &format!(r#""{above}""#));
+        let json = solana_voucher_json().replace(r#""42""#, &format!(r#""{above}""#));
         assert_eq!(
             parse_client_claim(&json),
             Err(ClientClaimError::AmountOutOfRange { amount: above })
         );
     }
 
+    /// ADR 0074 decision 3, amended 2026-09-30 (#1429): EVM's amount is
+    /// `u128`, so a value above `u64::MAX` -- once refused -- is now
+    /// admitted exactly.
+    #[test]
+    fn an_evm_voucher_amount_above_u64_is_admitted_exactly() {
+        let above = u128::from(u64::MAX) + 1;
+        let json = evm_voucher_json().replace(r#""5000""#, &format!(r#""{above}""#));
+        let claim = parse_client_claim(&json).expect("a u128 amount is admitted");
+        assert_eq!(claim.transferred_amount(), above);
+    }
+
     #[test]
     fn a_voucher_amount_above_u128_is_malformed() {
-        let json =
-            evm_voucher_json().replace(r#""5000""#, r#""340282366920938463463374607431768211456""#);
-        assert!(matches!(
-            parse_client_claim(&json),
-            Err(ClientClaimError::Malformed(_))
-        ));
+        for json in [
+            evm_voucher_json().replace(r#""5000""#, r#""340282366920938463463374607431768211456""#),
+            solana_voucher_json()
+                .replace(r#""42""#, r#""340282366920938463463374607431768211456""#),
+        ] {
+            assert!(matches!(
+                parse_client_claim(&json),
+                Err(ClientClaimError::Malformed(_))
+            ));
+        }
     }
 
     #[test]
@@ -1164,15 +1228,47 @@ mod tests {
             }
         }
 
-        /// ADR 0074 decision 3: every `uint128` amount either parses to
-        /// exactly itself or is refused as out of range -- never truncated.
+        /// ADR 0074 decision 3, amended 2026-09-30 (#1429): every `uint128`
+        /// EVM amount parses to exactly itself -- EVM's amount is `u128`,
+        /// so nothing above `u64::MAX` is refused any more.
         #[test]
-        fn a_voucher_amount_is_exact_or_refused(amount in proptest::prelude::any::<u128>()) {
+        fn an_evm_voucher_amount_is_always_exact(amount in proptest::prelude::any::<u128>()) {
             let json = evm_voucher_json().replace(r#""5000""#, &format!(r#""{amount}""#));
+            let claim = parse_client_claim(&json).expect("any uint128 EVM amount is admitted");
+            proptest::prop_assert_eq!(claim.transferred_amount(), amount);
+        }
+
+        /// And nothing wider than a `uint128` parses on either chain: every
+        /// decimal above `u128::MAX` is malformed, not clamped.
+        #[test]
+        fn a_voucher_amount_above_u128_is_always_malformed(
+            excess in proptest::prelude::any::<u128>(),
+            solana in proptest::prelude::any::<bool>(),
+        ) {
+            // `u128::MAX + 1 + excess`, as a decimal, since no wider integer
+            // can hold it.
+            let above = add_decimal(&add_decimal(&u128::MAX.to_string(), 1), excess);
+            let json = if solana {
+                solana_voucher_json().replace(r#""42""#, &format!(r#""{above}""#))
+            } else {
+                evm_voucher_json().replace(r#""5000""#, &format!(r#""{above}""#))
+            };
+            proptest::prop_assert!(matches!(
+                parse_client_claim(&json),
+                Err(ClientClaimError::Malformed(_))
+            ));
+        }
+
+        /// A Solana voucher keeps the old `u64` boundary: every `uint128`
+        /// amount either parses to exactly itself or is refused as out of
+        /// range -- never truncated.
+        #[test]
+        fn a_solana_voucher_amount_is_exact_or_refused(amount in proptest::prelude::any::<u128>()) {
+            let json = solana_voucher_json().replace(r#""42""#, &format!(r#""{amount}""#));
             match parse_client_claim(&json) {
                 Ok(claim) => {
                     proptest::prop_assert!(amount <= u128::from(u64::MAX));
-                    proptest::prop_assert_eq!(u128::from(claim.transferred_amount()), amount);
+                    proptest::prop_assert_eq!(claim.transferred_amount(), amount);
                 }
                 Err(error) => {
                     proptest::prop_assert!(amount > u128::from(u64::MAX));

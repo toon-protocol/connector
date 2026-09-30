@@ -106,7 +106,7 @@ fn decode_hex(hex: &str) -> Option<Vec<u8>> {
 
 /// One line of the journal's on-disk encoding: a type tag followed by its
 /// fields, tab-separated -- deliberately not `serde_json` or a binary
-/// format: every field here is a `String` or `u64`, none can themselves
+/// format: every field here is a `String` or an integer, none can themselves
 /// contain a tab or newline (`channel_id`/`peer_id` are connector-assigned
 /// identifiers, not untrusted wire input), so this is the simplest format
 /// that round-trips exactly, human-readable in place, matching the
@@ -171,6 +171,7 @@ fn decode_line(line: &str) -> Result<JournalEntry, JournalError> {
     let fields: Vec<&str> = line.split('\t').collect();
     let corrupt = || JournalError::Corrupt(line.to_string());
     let parse_u64 = |s: &str| s.parse::<u64>().map_err(|_| corrupt());
+    let parse_u128 = |s: &str| s.parse::<u128>().map_err(|_| corrupt());
     match fields.as_slice() {
         ["outbound_claim_signed", peer_id, channel_id, nonce, cumulative_amount] => {
             Ok(JournalEntry::OutboundClaimSigned {
@@ -184,7 +185,7 @@ fn decode_line(line: &str) -> Result<JournalEntry, JournalError> {
             Ok(JournalEntry::InboundClaimAccepted {
                 channel_id: channel_id.to_string(),
                 nonce: parse_u64(nonce)?,
-                cumulative_amount: parse_u64(cumulative_amount)?,
+                cumulative_amount: parse_u128(cumulative_amount)?,
                 signature: decode_hex(signature).ok_or_else(corrupt)?,
             })
         }
@@ -203,7 +204,7 @@ fn decode_line(line: &str) -> Result<JournalEntry, JournalError> {
             Ok(JournalEntry::InboundClaimRolledBack {
                 channel_id: channel_id.to_string(),
                 nonce: parse_u64(nonce)?,
-                cumulative_amount: parse_u64(cumulative_amount)?,
+                cumulative_amount: parse_u128(cumulative_amount)?,
             })
         }
         ["batch_channel_admitted", channel_id, presentation] => {
@@ -435,5 +436,45 @@ mod tests {
         for entry in sample_entries() {
             assert_eq!(decode_line(&encode_line(&entry)).unwrap(), entry);
         }
+    }
+
+    /// ADR 0074 decision 3, amended 2026-09-30 (#1429): a journal line a
+    /// pre-widening build wrote -- a `u64`-range decimal amount, in the
+    /// exact text that build produced -- still decodes, now into a `u128`
+    /// field, unchanged.
+    #[test]
+    fn a_pre_widening_u64_range_journal_line_still_decodes() {
+        assert_eq!(
+            decode_line("inbound_claim_accepted\tevm:0xabcd\t0\t18446744073709551615\tdead")
+                .unwrap(),
+            JournalEntry::InboundClaimAccepted {
+                channel_id: "evm:0xabcd".to_string(),
+                nonce: 0,
+                cumulative_amount: u128::from(u64::MAX),
+                signature: vec![0xde, 0xad],
+            }
+        );
+        assert_eq!(
+            decode_line("inbound_claim_rolled_back\tevm:0xabcd\t0\t250").unwrap(),
+            JournalEntry::InboundClaimRolledBack {
+                channel_id: "evm:0xabcd".to_string(),
+                nonce: 0,
+                cumulative_amount: 250,
+            }
+        );
+    }
+
+    /// The widening's own point: a cumulative amount above what a `u64`
+    /// journal could ever have held decodes exactly, never truncated.
+    #[test]
+    fn an_inbound_claim_above_u64_round_trips() {
+        let above = u128::from(u64::MAX) + 1;
+        let entry = JournalEntry::InboundClaimAccepted {
+            channel_id: "evm:0xabcd".to_string(),
+            nonce: 0,
+            cumulative_amount: above,
+            signature: vec![0xab],
+        };
+        assert_eq!(decode_line(&encode_line(&entry)).unwrap(), entry);
     }
 }

@@ -1,5 +1,5 @@
 {
-  "schema_version": 7,
+  "schema_version": 8,
   "envelope": {
     "valid": [
       {
@@ -176,7 +176,7 @@
         "salt_hex": "8888888888888888888888888888888888888888888888888888888888888888"
       },
       "channel_id_hex": "9fef60db90d6858089c37c1ce52fc97b663353afe74f9d7fbdfa81199d032b70",
-      "max_claimable_amount": 250000,
+      "max_claimable_amount": "250000",
       "digest_hex": "cbed50e5d42ffaf6b166bcdc603da1675d7b348c6f23b0cfdfe0b167027bfb00",
       "signer_address_hex": "2a1477b2995862ff95f279eccaebcd7a331cba05",
       "signature_hex": "883045d2df57db6a3311ed7654458cf7652ba014200ecd51ce3aea098cecb7987390941b3924d7e8cf08a7df4d6b91c01eb52b5e90027cbf6c477e5ec70231631b",
@@ -189,7 +189,7 @@
       "channel_account_base58": "FKofLqjANDy2aC2bUL9ngacikfbfnUYqTWJ7MaW1PdNs",
       "authorized_signer_base58": "DMi7LBSjA2CW9hqKYaAL72c7rYsUG63dne2a8FUBwHZU",
       "signer_secret_hex": "d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0",
-      "max_claimable_amount": 250000,
+      "max_claimable_amount": "250000",
       "signed_message_hex": "5601d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d490d00300000000000000000000000000",
       "signature_base58": "3PNtjtqZdeh695xCF6JFjpwW8DvCaGLCiAnvuF1gZ4tfCBLfrVNHesNVJ65RuHnidMimGm9NrfFUxq7cKq4QHs1o",
       "json": "{\"blockchain\":\"solana\",\"channelId\":\"FKofLqjANDy2aC2bUL9ngacikfbfnUYqTWJ7MaW1PdNs\",\"expiresAt\":0,\"maxClaimableAmount\":\"250000\",\"messageId\":\"FKofLqjANDy2aC2bUL9ngacikfbfnUYqTWJ7MaW1PdNs:250000\",\"scheme\":\"batch-settlement\",\"senderId\":\"FKofLqjANDy2aC2bUL9ngacikfbfnUYqTWJ7MaW1PdNs\",\"signature\":\"3PNtjtqZdeh695xCF6JFjpwW8DvCaGLCiAnvuF1gZ4tfCBLfrVNHesNVJ65RuHnidMimGm9NrfFUxq7cKq4QHs1o\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}",
@@ -528,11 +528,31 @@
         "salt_hex": "6666666666666666666666666666666666666666666666666666666666666666"
       },
       "channel_id_hex": "88d37e9be679d5e46c7c1d073e6f41b5ec07cc5099319a49b80ba460f0d8055d",
-      "max_claimable_amount": 5000,
+      "max_claimable_amount": "5000",
       "digest_hex": "0485b41befd093f42efa53a626e86749b97998f0243e2c7f74b179851d880a8a",
       "signer_address_hex": "70997970c51812dc3a010c7d01b50e0d17dc79c8",
       "signature_hex": "6be416a12f0d5af512c04435315cc4235e915536d73175e05b08b597c160f0ac463b79066298bea17a15716eedbf07231ffbc514295c9057d8c195bebc8566241b",
       "json": "{\"blockchain\":\"evm\",\"channelConfig\":{\"payer\":\"0x1111111111111111111111111111111111111111\",\"payerAuthorizer\":\"0x70997970c51812dc3a010c7d01b50e0d17dc79c8\",\"receiver\":\"0x3333333333333333333333333333333333333333\",\"receiverAuthorizer\":\"0x4444444444444444444444444444444444444444\",\"salt\":\"0x6666666666666666666666666666666666666666666666666666666666666666\",\"token\":\"0x5555555555555555555555555555555555555555\",\"withdrawDelay\":86400},\"channelId\":\"0x88d37e9be679d5e46c7c1d073e6f41b5ec07cc5099319a49b80ba460f0d8055d\",\"maxClaimableAmount\":\"5000\",\"messageId\":\"vector-fixture:voucher:evm:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"0x70997970c51812dc3a010c7d01b50e0d17dc79c8\",\"signature\":\"0x6be416a12f0d5af512c04435315cc4235e915536d73175e05b08b597c160f0ac463b79066298bea17a15716eedbf07231ffbc514295c9057d8c195bebc8566241b\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}"
+    },
+    "evm_above_u64_max": {
+      "name": "claim_voucher_evm_above_u64_max",
+      "chain_id": 84532,
+      "verifying_contract_hex": "4020074e9df2ce1dee5a9c1b5c3f541d02a10003",
+      "channel_config": {
+        "payer_hex": "5ece25a145f0b1111591161904b9410ca4f9b446",
+        "payer_authorizer_hex": "5ece25a145f0b1111591161904b9410ca4f9b446",
+        "receiver_hex": "ecececececececececececececececececececec",
+        "receiver_authorizer_hex": "ecececececececececececececececececececec",
+        "token_hex": "5555555555555555555555555555555555555555",
+        "withdraw_delay": 86400,
+        "salt_hex": "edededededededededededededededededededededededededededededededed"
+      },
+      "channel_id_hex": "68f2c509d6424f377bebfe17d1be037dabad2dab41a2367f9a3a2b900329704a",
+      "max_claimable_amount": "18446744073709551616",
+      "digest_hex": "7e083685c3aaa441f13e296df8106b0dc03b8b68688eba998de2218e87c3a377",
+      "signer_address_hex": "5ece25a145f0b1111591161904b9410ca4f9b446",
+      "signature_hex": "5cd205932cf7febad1c61acfa6f2d2a5d27a6dca2177564a0671549593fbec3519ea9ea50607081dca4f17b00108847c59c0d41f39135b8cbdc7ca58f26981431c",
+      "json": "{\"blockchain\":\"evm\",\"channelConfig\":{\"payer\":\"0x5ece25a145f0b1111591161904b9410ca4f9b446\",\"payerAuthorizer\":\"0x5ece25a145f0b1111591161904b9410ca4f9b446\",\"receiver\":\"0xecececececececececececececececececececec\",\"receiverAuthorizer\":\"0xecececececececececececececececececececec\",\"salt\":\"0xedededededededededededededededededededededededededededededededed\",\"token\":\"0x5555555555555555555555555555555555555555\",\"withdrawDelay\":86400},\"channelId\":\"0x68f2c509d6424f377bebfe17d1be037dabad2dab41a2367f9a3a2b900329704a\",\"maxClaimableAmount\":\"18446744073709551616\",\"messageId\":\"vector-fixture:voucher:evm:above-u64-max\",\"scheme\":\"batch-settlement\",\"senderId\":\"0x5ece25a145f0b1111591161904b9410ca4f9b446\",\"signature\":\"0x5cd205932cf7febad1c61acfa6f2d2a5d27a6dca2177564a0671549593fbec3519ea9ea50607081dca4f17b00108847c59c0d41f39135b8cbdc7ca58f26981431c\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}"
     },
     "solana": {
       "name": "claim_voucher_solana",
@@ -540,7 +560,7 @@
       "channel_account_base58": "EBBduiozK9vBCemy4FcAjhVkby2FLPstxZxxN7jpgxtr",
       "signer_public_key_hex": "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b",
       "signer_public_key_base58": "AB3FQHskSYuWVw4M9EpGdxNzrAjBNiYGpbH4CVzLFene",
-      "max_claimable_amount": 5000,
+      "max_claimable_amount": "5000",
       "expires_at": 0,
       "signed_message_hex": "5601c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c388130000000000000000000000000000",
       "signature_hex": "347482945bb1d06372454c0f88c48934e7a0ab8042553132d4abb9937125281154f3bf945db285c9dd5bf1e252592b2d8122aa4ad357675f08a3590f0fa9a405",
@@ -550,9 +570,9 @@
     "amount_only_watermark": [
       {
         "name": "voucher_amount_equal_to_watermark_is_refused",
-        "watermark_amount": 1000,
+        "watermark_amount": "1000",
         "watermark_signature_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031",
-        "presented_amount": 1000,
+        "presented_amount": "1000",
         "presented_signature_hex": "f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132",
         "charge": 0,
         "outcome": "amount_not_advancing",
@@ -560,19 +580,19 @@
       },
       {
         "name": "voucher_amount_above_watermark_is_accepted",
-        "watermark_amount": 1000,
+        "watermark_amount": "1000",
         "watermark_signature_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031",
-        "presented_amount": 1500,
+        "presented_amount": "1500",
         "presented_signature_hex": "f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132",
         "charge": 500,
         "outcome": "advances",
-        "advanced": 500
+        "advanced": "500"
       },
       {
         "name": "byte_identical_voucher_retransmission_is_accepted_again",
-        "watermark_amount": 1000,
+        "watermark_amount": "1000",
         "watermark_signature_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031",
-        "presented_amount": 1000,
+        "presented_amount": "1000",
         "presented_signature_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031",
         "charge": 0,
         "outcome": "retransmission",
@@ -580,9 +600,9 @@
       },
       {
         "name": "byte_identical_voucher_retransmission_against_a_charge_is_underpayment",
-        "watermark_amount": 1000,
+        "watermark_amount": "1000",
         "watermark_signature_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031",
-        "presented_amount": 1000,
+        "presented_amount": "1000",
         "presented_signature_hex": "f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031",
         "charge": 100,
         "outcome": "underpayment",
@@ -728,7 +748,7 @@
         "salt_hex": "abababababababababababababababababababababababababababababababab"
       },
       "channel_id_hex": "ecc7c30afce3c1bd3123e300a2a1fe93987214a534f15c377ab88454b932b1c5",
-      "max_claimable_amount": 42000,
+      "max_claimable_amount": "42000",
       "digest_hex": "8d16e6e55359fe0c422ab2da218d2027c8898719426cb8bb6f893117a8b3768d",
       "signer_address_hex": "85da039974dc1fa5587bd8a52c4e4f8cbd484ac8",
       "signature_hex": "9bc2df17d04d555cb9db9dc1e2ff4a6793412afb5281764538d0d649fbf9cb9c373b20977e6e61dfa2fe42d52791b13fb6b5d94c1b3ebb1d09eea5307c4ad7961c",
@@ -740,7 +760,7 @@
       "channel_account_base58": "9NwekLkGKyq6JE1w63Sw5YhbGh5xWt8gHbeNE8ZHeJzf",
       "authorized_signer_base58": "2CdKcr7KWrteGiTHifFYAYkjqHvKoMydTnDLwrHjpmJS",
       "signer_secret_hex": "7172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f90",
-      "max_claimable_amount": 42000,
+      "max_claimable_amount": "42000",
       "signed_message_hex": "56017c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c10a40000000000000000000000000000",
       "signature_base58": "EcRKVsaadWKUjgtDwdv4Pg4wqNUd74Wbdx2PMdmGKzqhNXJGj9JBT1KrAvnZT2Zy3djEsmPcHYSHaZnmLoeoVzv",
       "json": "{\"blockchain\":\"solana\",\"channelId\":\"9NwekLkGKyq6JE1w63Sw5YhbGh5xWt8gHbeNE8ZHeJzf\",\"expiresAt\":0,\"maxClaimableAmount\":\"42000\",\"scheme\":\"batch-settlement\",\"signature\":\"EcRKVsaadWKUjgtDwdv4Pg4wqNUd74Wbdx2PMdmGKzqhNXJGj9JBT1KrAvnZT2Zy3djEsmPcHYSHaZnmLoeoVzv\"}",

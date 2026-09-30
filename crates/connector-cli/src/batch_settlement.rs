@@ -111,7 +111,7 @@ impl BatchSettlementChannels for BatchSettlementChannelsAdapter {
         let state = self.state_of(leg.backend.as_ref(), presentation).await;
         Ok(resolution(state)?.map(|state| AdmittedEvmVoucherChannel {
             config: *config,
-            max_cumulative: max_cumulative(&state),
+            max_cumulative: max_cumulative_evm(&state),
         }))
     }
 
@@ -130,7 +130,7 @@ impl BatchSettlementChannels for BatchSettlementChannelsAdapter {
             resolution(state)?.and_then(|state| match state.voucher_signer {
                 VoucherSigner::Solana(authorized_signer) => Some(AdmittedSolanaVoucherChannel {
                     authorized_signer,
-                    max_cumulative: max_cumulative(&state),
+                    max_cumulative: max_cumulative_solana(&state),
                 }),
                 // A Solana backend reporting an EVM signer is not a channel
                 // this gate can verify a voucher against.
@@ -214,14 +214,24 @@ fn resolution(
     }
 }
 
-/// The port's voucher ceiling, in the gate's `u64` amounts. A ceiling wider
-/// than any `u64` bounds nothing a voucher here can name, so it saturates.
+/// The port's voucher ceiling, in the gate's `u128` EVM amounts (ADR 0074
+/// decision 3, amended 2026-09-30 #1429): EVM's amount is `u128`, matching
+/// `x402BatchSettlement`'s own `maxClaimableAmount`, so the ceiling carries
+/// through exactly -- nothing narrows it here any more.
+fn max_cumulative_evm(state: &BatchChannelState) -> u128 {
+    state.voucher_ceiling()
+}
+
+/// The port's voucher ceiling, in the gate's `u64` Solana amounts. Solana's
+/// signed message and SPL amounts stay `u64` (ADR 0074 decision 3, amended
+/// 2026-09-30 #1429), so a ceiling wider than any `u64` bounds nothing a
+/// Solana voucher here can name, and it saturates.
 ///
 /// Saturating is right here and nowhere else a `u128` narrows: this is a
 /// bound, and clamping a bound down loses no value, where a voucher amount
-/// narrowed must never be dropped or truncated (ADR 0074 decision 3; the
-/// watchers log an out-of-range held amount as an error).
-fn max_cumulative(state: &BatchChannelState) -> u64 {
+/// narrowed must never be dropped or truncated. The EVM leg above no longer
+/// narrows at all.
+fn max_cumulative_solana(state: &BatchChannelState) -> u64 {
     u64::try_from(state.voucher_ceiling()).unwrap_or(u64::MAX)
 }
 
@@ -274,11 +284,11 @@ impl HeldVouchers for ClaimGateVouchers {
 }
 
 /// A journaled channel and its latest voucher, as the port names them.
-fn held_voucher(channel: JournaledBatchChannel, amount: u64, signature: Vec<u8>) -> HeldVoucher {
+fn held_voucher(channel: JournaledBatchChannel, amount: u128, signature: Vec<u8>) -> HeldVoucher {
     HeldVoucher {
         presentation: presentation(channel),
         voucher: Voucher {
-            cumulative_amount: u128::from(amount),
+            cumulative_amount: amount,
             signature,
         },
     }
@@ -369,14 +379,24 @@ mod tests {
             let found = resolution(Ok(state(status, 300, 700)))
                 .expect("found")
                 .expect("some");
-            assert_eq!(max_cumulative(&found), 1_000);
+            assert_eq!(max_cumulative_evm(&found), 1_000);
+            assert_eq!(max_cumulative_solana(&found), 1_000);
         }
     }
 
+    /// ADR 0074 decision 3, amended 2026-09-30 (#1429): EVM's ceiling is
+    /// `u128` and carries a value above `u64::MAX` through exactly.
     #[test]
-    fn a_ceiling_wider_than_u64_saturates_rather_than_wraps() {
+    fn an_evm_ceiling_above_u64_is_not_saturated() {
+        let above = u128::from(u64::MAX) + 1_000;
+        let wide = state(BatchChannelStatus::Open, above, 0);
+        assert_eq!(max_cumulative_evm(&wide), above);
+    }
+
+    #[test]
+    fn a_solana_ceiling_wider_than_u64_saturates_rather_than_wraps() {
         let wide = state(BatchChannelStatus::Open, u128::from(u64::MAX), 5);
-        assert_eq!(max_cumulative(&wide), u64::MAX);
+        assert_eq!(max_cumulative_solana(&wide), u64::MAX);
     }
 
     /// ADR 0074 decision 5: no voucher is accepted once a channel is

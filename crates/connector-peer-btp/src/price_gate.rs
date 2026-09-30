@@ -196,7 +196,7 @@ pub fn payment_required(
     peer_id: &str,
     prepare: &Prepare,
     ack: ClaimAckOutcome,
-    claimed: Option<u64>,
+    claimed: Option<u128>,
     prior_watermark: Option<Watermark>,
     enforcement: ForwardedClaimEnforcement,
 ) -> Option<PaymentRequired> {
@@ -252,7 +252,7 @@ pub fn payment_required(
             .saturating_sub(prior_watermark.map_or(0, |watermark| watermark.cumulative_amount)),
         _ => 0,
     };
-    let shortfall = required.saturating_sub(advanced);
+    let shortfall = u128::from(required).saturating_sub(advanced);
 
     if !enforcing {
         // Reachable for a forwarded arrival only -- the terminated arm above

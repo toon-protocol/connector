@@ -1,6 +1,9 @@
 # Wire vectors: the invariants behind them
 
 **Status:** **Live — the vector companion, role unchanged** (wayfinder map #1049, issue #1065).
+**`schema_version` 8** (issue #1429, ADR 0074 decision 3 amended 2026-09-30): an EVM voucher's
+`maxClaimableAmount` widens from `u64` to `u128`, and every `max_claimable_amount` field becomes a
+decimal string rather than a JSON number — invariant 7's own paragraph has the detail. Before that,
 **`schema_version` 7** (issue #1384, [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
 decision 14): every claim is an x402 voucher, and every `toon-channel` section — the EIP-712
 `BalanceProof` claim, the peer carriage's `toon-channel` claims, FLUSH and nonce cases, and the
@@ -11,7 +14,7 @@ client-edge carriage section only for the `payout-claim` TRANSFER (`payout_vouch
 added the client BTP auth frame's `channelChallenge` (`client_auth_channel_challenge`, invariant 11)
 and the `POST /ilp/claim-state` `"toon-channel-refused"` answer (`claim_state_toon_channel_refused`,
 invariant 12) — two elements decision 14 named but #1384 had not yet pinned — purely additively, so
-`schema_version` stays 7. _Originally:_
+`schema_version` stayed 7. _Originally:_
 Non-normative. Per [ADR 0021](../adr/0021-vectors-are-normative-prose-is-not.md), the
 committed vector set (`vectors/wire-vectors.json`) is the cross-repo contract; this document only
 names the invariants it is evidence of, written down before any vector was generated, per its own
@@ -155,6 +158,15 @@ charge is not zero. A strictly
 higher amount is accepted, by the difference. Also pinned: a Solana voucher's `expiresAt`
 must be `0` — x402 requires it, and the program refuses a nonzero one at `settle` with no state
 change — so the connector refuses it structurally, before any signature check.
+
+**Amended 2026-09-30 (#1429, `schema_version` 8):** an EVM voucher's `maxClaimableAmount` is
+`uint128` on the wire and `u128` in the connector, matching `x402BatchSettlement`'s own type —
+nothing above `u64::MAX` is refused any more. Solana's own amount stays `u64`, since the signed
+Solana message and SPL amounts are `u64` on chain, so a Solana voucher above `u64::MAX` is still
+refused. `claim_voucher` gains `evm_above_u64_max`, a `uint128` amount above `u64::MAX`, signed and
+verifying. Every `max_claimable_amount` in `claim_voucher`, `peer_carriage` and `payout_voucher`
+becomes a decimal string rather than a JSON number, for both chains, since a value that wide would
+lose precision read back as an IEEE double.
 
 Held open by `connector-domain`'s `claim::tests` module (the `voucher_*` property and worked-example
 tests over `validate_voucher`) and by `connector-signer`'s `voucher_signature::tests` (the EIP-712

@@ -270,6 +270,11 @@ pub(crate) async fn deliver_pending_claim(
             .deliver_transfer(
                 destination,
                 Some(generation),
+                // BTP's TRANSFER `amount` is a UInt64 on the wire (RFC 0023),
+                // so an EVM cumulative past `u64::MAX` is clamped here. That
+                // header figure is advisory: what the client lands is the
+                // voucher in the protocol data, which carries its `u128`
+                // exactly (ADR 0074 decision 3, amended #1429).
                 u64::try_from(payout.cumulative_amount()).unwrap_or(u64::MAX),
                 &[payout_voucher_protocol_data(&payout)],
                 now,

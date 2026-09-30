@@ -8794,7 +8794,7 @@ mod tests {
             }
         }
 
-        fn voucher_amount(covering: &Covering) -> u64 {
+        fn voucher_amount(covering: &Covering) -> u128 {
             let Covering::Voucher(json) = covering else {
                 panic!("expected a voucher, got {covering:?}");
             };
@@ -8819,7 +8819,7 @@ mod tests {
                 ));
             }
             let covered = next_hop.covered.lock().unwrap().clone();
-            let amounts: Vec<u64> = covered.iter().map(voucher_amount).collect();
+            let amounts: Vec<u128> = covered.iter().map(voucher_amount).collect();
             assert_eq!(amounts, vec![100, 200, 300]);
             assert_eq!(outbound.signed(&channel), Some(300), "journaled as signed");
             assert_eq!(receiver.asked.load(Ordering::SeqCst), 1);

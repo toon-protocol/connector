@@ -160,7 +160,25 @@ use serde::Serialize;
 /// carries it. A replaying SDK that still sends a claim with no `scheme` is
 /// sending a claim every connector refuses -- which is what this number
 /// exists to announce.
-pub const SCHEMA_VERSION: u32 = 7;
+/// **8** (issue #1429 / ADR 0074 decision 3, amended 2026-09-30): an EVM
+/// voucher's `maxClaimableAmount` widens from `u64` to `u128`, matching
+/// `x402BatchSettlement`'s own `uint128 maxClaimableAmount` -- a voucher
+/// above `u64::MAX` that every prior schema version refused as
+/// [`connector_domain::client_claim::ClientClaimError::AmountOutOfRange`]
+/// is now admitted exactly. Solana's own amount stays `u64`: the signed
+/// Solana message and SPL amounts are `u64` on chain, and a voucher above
+/// `u64::MAX` there is still refused. Every `max_claimable_amount` field in
+/// `claim_voucher`, `peer_carriage.voucher_evm`/`voucher_solana` and
+/// `payout_voucher` becomes a **decimal string**, not a JSON number, for
+/// both chains -- Solana's own value stays well under `2^53` today, but the
+/// family is now uniform so a consumer does not need to know which half of
+/// it is safe to read as a number. `claim_voucher` gains
+/// `evm_above_u64_max`, a `uint128` amount above `u64::MAX`, signed and
+/// verifying. A replaying SDK still reading `maxClaimableAmount` as a JSON
+/// number, or still refusing an EVM voucher above `u64::MAX`, is reading
+/// and refusing what this schema version exists to announce is no longer
+/// true.
+pub const SCHEMA_VERSION: u32 = 8;
 
 fn seq_bytes<const N: usize>(start: u8) -> [u8; N] {
     let mut out = [0u8; N];
@@ -629,7 +647,10 @@ pub struct EvmVoucherFacts {
     pub channel_config: VoucherEvmChannelConfigFields,
     /// `getChannelId(channel_config)`.
     pub channel_id_hex: String,
-    pub max_claimable_amount: u64,
+    /// A decimal string, not a JSON number (schema 8, ADR 0074 decision 3
+    /// amended 2026-09-30 #1429): EVM's amount is `u128` and can exceed
+    /// 2^53, past which a JSON-number reader silently loses precision.
+    pub max_claimable_amount: String,
     /// `getVoucherDigest(channel_id_hex, max_claimable_amount)`.
     pub digest_hex: String,
     /// `evm_voucher_signer(channel_config)`.
@@ -693,11 +714,11 @@ fn to_settlement_config(config: &BatchChannelConfig) -> EvmChannelConfig {
 fn sign_evm_voucher(
     signer: &LocalSigner,
     config: &BatchChannelConfig,
-    amount: u64,
+    amount: u128,
 ) -> (EvmVoucherFacts, EvmPresentation) {
     let domain = BatchSettlementDomain::x402(VOUCHER_EVM_CHAIN_ID);
     let channel_id = evm_batch_channel_id(&domain, config);
-    let digest = evm_voucher_digest(&domain, &channel_id, u128::from(amount));
+    let digest = evm_voucher_digest(&domain, &channel_id, amount);
     let mut signature = signer
         .sign(&digest)
         .expect("fixture signer signs its own digest")
@@ -705,13 +726,7 @@ fn sign_evm_voucher(
     signature[64] += 27;
     let voucher_signer = evm_voucher_signer(config);
     assert!(
-        verify_evm_voucher(
-            &domain,
-            &channel_id,
-            u128::from(amount),
-            &signature,
-            &voucher_signer
-        ),
+        verify_evm_voucher(&domain, &channel_id, amount, &signature, &voucher_signer),
         "a fixture voucher must verify against its channel's voucher signer"
     );
     let facts = EvmVoucherFacts {
@@ -719,7 +734,7 @@ fn sign_evm_voucher(
         verifying_contract_hex: hex_of(&X402_BATCH_SETTLEMENT_ADDRESS),
         channel_config: channel_config_fields(config),
         channel_id_hex: hex_of(&channel_id),
-        max_claimable_amount: amount,
+        max_claimable_amount: amount.to_string(),
         digest_hex: hex_of(&digest),
         signer_address_hex: hex_of(&voucher_signer),
         signature_hex: hex_of(&signature),
@@ -771,7 +786,10 @@ pub struct PeerVoucherSolanaCase {
     /// `authorized_signer`.
     pub authorized_signer_base58: String,
     pub signer_secret_hex: String,
-    pub max_claimable_amount: u64,
+    /// A decimal string (schema 8), matching every other voucher amount
+    /// field here -- Solana's own amount stays `u64`, well within safe
+    /// integer range, but the family is uniform.
+    pub max_claimable_amount: String,
     /// `solana_voucher_message(channel, amount, 0)`'s 50 bytes.
     pub signed_message_hex: String,
     pub signature_base58: String,
@@ -1018,7 +1036,7 @@ fn generate_peer_voucher_solana_case() -> PeerVoucherSolanaCase {
         channel_account_base58,
         authorized_signer_base58: bs58::encode(signer.public_key()).into_string(),
         signer_secret_hex: hex_of(&seed),
-        max_claimable_amount: amount,
+        max_claimable_amount: amount.to_string(),
         signed_message_hex: hex_of(&message),
         signature_base58: bs58::encode(signature).into_string(),
         json,
@@ -1648,7 +1666,8 @@ pub struct PayoutVoucherSolanaCase {
     /// `authorized_signer`.
     pub authorized_signer_base58: String,
     pub signer_secret_hex: String,
-    pub max_claimable_amount: u64,
+    /// A decimal string (schema 8); see [`PeerVoucherSolanaCase::max_claimable_amount`].
+    pub max_claimable_amount: String,
     pub signed_message_hex: String,
     pub signature_base58: String,
     pub json: String,
@@ -1700,7 +1719,7 @@ fn generate_payout_voucher_vectors() -> PayoutVoucherVectors {
     let client_payee: Address = [0x9a; 20];
     let config = outbound_channel_config(payer, client_payee, 0xab);
     let amount: u64 = 42_000;
-    let (facts, presentation) = sign_evm_voucher(&signer, &config, amount);
+    let (facts, presentation) = sign_evm_voucher(&signer, &config, u128::from(amount));
     let address = |bytes: &[u8; 20]| format!("0x{}", hex_of(bytes));
     let mut evm_json = serde_json::json!({
         "scheme": "batch-settlement",
@@ -1722,7 +1741,7 @@ fn generate_payout_voucher_vectors() -> PayoutVoucherVectors {
     let ClientClaim::EvmVoucher(voucher) = parse_payout_entry(&evm_json) else {
         panic!("an EVM payout voucher");
     };
-    assert_eq!(voucher.max_claimable_amount, amount);
+    assert_eq!(voucher.max_claimable_amount, u128::from(amount));
     assert!(voucher.channel_config.is_some());
     let evm = PayoutVoucherEvmCase {
         name: "payout_voucher_evm",
@@ -1765,7 +1784,7 @@ fn generate_payout_voucher_vectors() -> PayoutVoucherVectors {
         channel_account_base58,
         authorized_signer_base58: bs58::encode(solana_signer.public_key()).into_string(),
         signer_secret_hex: hex_of(&seed),
-        max_claimable_amount: solana_amount,
+        max_claimable_amount: solana_amount.to_string(),
         signed_message_hex: hex_of(&message),
         signature_base58: bs58::encode(signature).into_string(),
         btp_transfer_hex: hex_of(&payout_transfer(9_502, solana_amount, &solana_json)),
@@ -2017,7 +2036,9 @@ pub struct VoucherEvmCase {
     /// resolves to, and what a connector must recompute and match before
     /// trusting a channel's first-presented config (ADR 0074 decision 2).
     pub channel_id_hex: String,
-    pub max_claimable_amount: u64,
+    /// A decimal string, not a JSON number (schema 8); see
+    /// [`EvmVoucherFacts::max_claimable_amount`].
+    pub max_claimable_amount: String,
     /// `getVoucherDigest(channel_id_hex, max_claimable_amount)` -- what
     /// `signature_hex` actually signs.
     pub digest_hex: String,
@@ -2085,7 +2106,10 @@ fn generate_voucher_evm_case() -> VoucherEvmCase {
         panic!("expected an EVM voucher, got {parsed:?}");
     };
     assert_eq!(voucher.channel_id, channel_id_hex_0x);
-    assert_eq!(voucher.max_claimable_amount, max_claimable_amount);
+    assert_eq!(
+        voucher.max_claimable_amount,
+        u128::from(max_claimable_amount)
+    );
     let parsed_config = voucher
         .channel_config
         .as_ref()
@@ -2106,7 +2130,7 @@ fn generate_voucher_evm_case() -> VoucherEvmCase {
             salt_hex: hex_of(&config.salt),
         },
         channel_id_hex: hex_of(&channel_id),
-        max_claimable_amount,
+        max_claimable_amount: max_claimable_amount.to_string(),
         digest_hex: hex_of(&digest),
         signer_address_hex: hex_of(&signer),
         signature_hex: hex_of(&signature),
@@ -2127,7 +2151,8 @@ pub struct VoucherSolanaCase {
     /// chain and never from the claim.
     pub signer_public_key_hex: String,
     pub signer_public_key_base58: String,
-    pub max_claimable_amount: u64,
+    /// A decimal string (schema 8); see [`VoucherEvmCase::max_claimable_amount`].
+    pub max_claimable_amount: String,
     /// Always `0` (ADR 0074 decision 3); see `invalid[]` for the refusal of
     /// anything else.
     pub expires_at: i64,
@@ -2195,7 +2220,7 @@ fn generate_voucher_solana_case() -> VoucherSolanaCase {
         channel_account_base58,
         signer_public_key_hex: hex_of(&signer_public_key),
         signer_public_key_base58,
-        max_claimable_amount,
+        max_claimable_amount: max_claimable_amount.to_string(),
         expires_at,
         signed_message_hex: hex_of(&signed_message),
         signature_hex: hex_of(&signature),
@@ -2211,17 +2236,19 @@ fn generate_voucher_solana_case() -> VoucherSolanaCase {
 pub struct VoucherWatermarkCase {
     pub name: &'static str,
     /// `None` for a channel that has never accepted a voucher; otherwise
-    /// the amount and signature of the voucher that set the watermark.
-    pub watermark_amount: Option<u64>,
+    /// the amount and signature of the voucher that set the watermark. A
+    /// decimal string (schema 8): the amount-only watermark is `u128`
+    /// (ADR 0074 decision 3, amended 2026-09-30 #1429).
+    pub watermark_amount: Option<String>,
     pub watermark_signature_hex: Option<String>,
-    pub presented_amount: u64,
+    pub presented_amount: String,
     pub presented_signature_hex: String,
     pub charge: u64,
     /// `"advances"`, `"retransmission"`, `"amount_not_advancing"` or
     /// `"underpayment"`.
     pub outcome: &'static str,
     /// Set only when `outcome` is `"advances"`.
-    pub advanced: Option<u64>,
+    pub advanced: Option<String>,
 }
 
 /// Builds and self-verifies one [`VoucherWatermarkCase`]: calls the real
@@ -2232,12 +2259,12 @@ pub struct VoucherWatermarkCase {
 #[allow(clippy::too_many_arguments)]
 fn voucher_watermark_case(
     name: &'static str,
-    watermark: Option<(u64, &[u8])>,
-    presented_amount: u64,
+    watermark: Option<(u128, &[u8])>,
+    presented_amount: u128,
     presented_signature: &[u8],
     charge: u64,
     expected_outcome: &'static str,
-    expected_advanced: Option<u64>,
+    expected_advanced: Option<u128>,
 ) -> VoucherWatermarkCase {
     let domain_watermark = watermark.map(|(amount, signature)| VoucherWatermark {
         cumulative_amount: amount,
@@ -2268,13 +2295,13 @@ fn voucher_watermark_case(
 
     VoucherWatermarkCase {
         name,
-        watermark_amount: watermark.map(|(amount, _)| amount),
+        watermark_amount: watermark.map(|(amount, _)| amount.to_string()),
         watermark_signature_hex: watermark.map(|(_, signature)| hex_of(signature)),
-        presented_amount,
+        presented_amount: presented_amount.to_string(),
         presented_signature_hex: hex_of(presented_signature),
         charge,
         outcome: expected_outcome,
-        advanced: expected_advanced,
+        advanced: expected_advanced.map(|advanced| advanced.to_string()),
     }
 }
 
@@ -2376,12 +2403,75 @@ fn generate_voucher_invalid_cases(solana: &VoucherSolanaCase) -> Vec<VoucherInva
     }]
 }
 
+/// `claim_voucher_evm_above_u64_max`: schema 8's own point (#1429, ADR 0074
+/// decision 3 amended 2026-09-30). A `uint128` `maxClaimableAmount` above
+/// `u64::MAX`, which a pre-widening connector refused as
+/// [`ClientClaimError::AmountOutOfRange`], is now admitted exactly -- EVM's
+/// amount is `u128`, matching `x402BatchSettlement`'s own
+/// `maxClaimableAmount`. Solana's own amount stays `u64` and is not part of
+/// this case.
+fn generate_voucher_evm_above_u64_max_case() -> VoucherEvmCase {
+    let (signer, payer) = node_settlement_signer("vector-fixture-voucher-above-u64-max", 0xe1);
+    let config = outbound_channel_config(payer, [0xec; 20], 0xed);
+    let amount = u128::from(u64::MAX) + 1;
+    let (facts, presentation) = sign_evm_voucher(&signer, &config, amount);
+
+    let channel_id_hex_0x = format!("0x{}", hex_of(&presentation.channel_id));
+    let json = serde_json::json!({
+        "version": "1.0",
+        "blockchain": "evm",
+        "scheme": SCHEME_BATCH_SETTLEMENT,
+        "messageId": "vector-fixture:voucher:evm:above-u64-max",
+        "timestamp": "2030-01-01T00:00:00.000Z",
+        "senderId": format!("0x{}", facts.signer_address_hex),
+        "channelId": channel_id_hex_0x,
+        "maxClaimableAmount": amount.to_string(),
+        "signature": format!("0x{}", facts.signature_hex),
+        "channelConfig": {
+            "payer": format!("0x{}", hex_of(&config.payer)),
+            "payerAuthorizer": format!("0x{}", hex_of(&config.payer_authorizer)),
+            "receiver": format!("0x{}", hex_of(&config.receiver)),
+            "receiverAuthorizer": format!("0x{}", hex_of(&config.receiver_authorizer)),
+            "token": format!("0x{}", hex_of(&config.token)),
+            "withdrawDelay": config.withdraw_delay,
+            "salt": format!("0x{}", hex_of(&config.salt)),
+        },
+    })
+    .to_string();
+
+    let parsed = client_claim::parse_client_claim(&json).expect("the emitted voucher parses");
+    let ClientClaim::EvmVoucher(voucher) = &parsed else {
+        panic!("expected an EVM voucher, got {parsed:?}");
+    };
+    assert_eq!(voucher.channel_id, channel_id_hex_0x);
+    assert_eq!(
+        voucher.max_claimable_amount, amount,
+        "a uint128 amount above u64::MAX must parse to exactly itself, never truncated"
+    );
+
+    VoucherEvmCase {
+        name: "claim_voucher_evm_above_u64_max",
+        chain_id: facts.chain_id,
+        verifying_contract_hex: facts.verifying_contract_hex,
+        channel_config: facts.channel_config,
+        channel_id_hex: facts.channel_id_hex,
+        max_claimable_amount: facts.max_claimable_amount,
+        digest_hex: facts.digest_hex,
+        signer_address_hex: facts.signer_address_hex,
+        signature_hex: facts.signature_hex,
+        json,
+    }
+}
+
 /// ADR 0074 decision 7 / issue #1347: the x402 batch-settlement voucher's
 /// wire vectors. See this section's own doc comment above for the live
 /// cross-check against the deployed EVM contract.
 #[derive(Debug, Serialize)]
 pub struct ClaimVoucherVectors {
     pub evm: VoucherEvmCase,
+    /// Schema 8 (#1429): a `uint128` amount above `u64::MAX`, admitted
+    /// exactly. See [`generate_voucher_evm_above_u64_max_case`].
+    pub evm_above_u64_max: VoucherEvmCase,
     pub solana: VoucherSolanaCase,
     pub amount_only_watermark: Vec<VoucherWatermarkCase>,
     pub invalid: Vec<VoucherInvalidClaimCase>,
@@ -2389,12 +2479,14 @@ pub struct ClaimVoucherVectors {
 
 fn generate_claim_voucher_vectors() -> ClaimVoucherVectors {
     let evm = generate_voucher_evm_case();
+    let evm_above_u64_max = generate_voucher_evm_above_u64_max_case();
     let solana = generate_voucher_solana_case();
     let amount_only_watermark = generate_voucher_watermark_cases();
     let invalid = generate_voucher_invalid_cases(&solana);
 
     ClaimVoucherVectors {
         evm,
+        evm_above_u64_max,
         solana,
         amount_only_watermark,
         invalid,

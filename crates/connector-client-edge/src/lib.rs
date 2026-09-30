@@ -949,7 +949,7 @@ struct AdmittedClaim {
 /// to build one, so it can only ever come from the voucher itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AdmittedWatermark {
-    cumulative_amount: u64,
+    cumulative_amount: u128,
 }
 
 impl AdmittedWatermark {
@@ -3717,7 +3717,7 @@ mod tests {
         /// channel -- every test using this helper exercises the real
         /// verification path, not a bypass.
         pub(super) fn evm_claim_json(amount: u64) -> String {
-            test_support::signed_voucher(amount)
+            test_support::signed_voucher(u128::from(amount))
         }
 
         /// A voucher of cumulative `amount` whose signature is well-formed
@@ -3726,7 +3726,7 @@ mod tests {
         fn voucher_with_a_signature_that_signs_nothing(amount: u64) -> String {
             test_support::evm_voucher_with(
                 &test_support::config(),
-                amount,
+                u128::from(amount),
                 &format!("0x{}", "00".repeat(65)),
                 "client-1",
             )

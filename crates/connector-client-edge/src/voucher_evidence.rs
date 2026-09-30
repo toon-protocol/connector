@@ -88,7 +88,7 @@ fn voucher_ack(rejection: &ClaimIngestRejection) -> ClaimAckOutcome {
 /// amount, or a challenge's expiry. Two messages under two typehashes, so a
 /// signature over one never verifies as the other.
 enum EvmMessage {
-    Voucher { max_claimable_amount: u64 },
+    Voucher { max_claimable_amount: u128 },
     Challenge { expires: u64 },
 }
 
@@ -130,7 +130,7 @@ impl ClientClaimGate {
             } => verify_evm_voucher(
                 &domain,
                 &channel_id,
-                u128::from(max_claimable_amount),
+                max_claimable_amount,
                 signature,
                 &signer,
             ),

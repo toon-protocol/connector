@@ -137,7 +137,7 @@ impl BatchSettlementChannels for PaysThisNode {
         admitted.insert(*channel_id, config);
         Ok(Some(AdmittedEvmVoucherChannel {
             config,
-            max_cumulative: u64::try_from(DEPOSIT).expect("small"),
+            max_cumulative: DEPOSIT,
         }))
     }
 

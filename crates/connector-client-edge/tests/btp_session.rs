@@ -254,7 +254,7 @@ impl BatchSettlementChannels for OneChannel {
             (*channel_id == evm_batch_channel_id(&domain(), &config())).then_some(
                 AdmittedEvmVoucherChannel {
                     config: config(),
-                    max_cumulative: u64::MAX,
+                    max_cumulative: u128::MAX,
                 },
             ),
         )
