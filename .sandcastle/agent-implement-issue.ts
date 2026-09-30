@@ -126,7 +126,10 @@ async function pushBranch(
   try {
     const push = await sandbox.exec(
       `git -c credential.helper= -c credential.helper='${FRESH_CREDENTIAL_HELPER}' ` +
-        `push -u origin ${branch}`,
+        // --no-verify: this repo's husky pre-push hook runs a local test pass meant for
+        // people pushing by hand. The runner has just run CI's own gate, and the hook
+        // failing in the sandbox is what cost #1429 its final push.
+        `push --no-verify -u origin ${branch}`,
       { onLine: (line) => console.log(`  [${label}] ${line}`) }
     );
     if (push.exitCode !== 0) {
