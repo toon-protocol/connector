@@ -655,13 +655,15 @@ async fn concurrent_start_withdrawal_ends_with_one_withdrawal_pending() {
     }
 }
 
-/// The same crash window as above, past the withdraw delay: the loser's
-/// `finalizeWithdraw` is re-seeded behind the winner's, mines after it and
-/// reverts against a channel with nothing left pending. The port's contract
-/// suite already says a second sequential `finish_withdrawal` there answers
-/// `NoWithdrawalPending`, and a raced one must answer the same way rather
-/// than a spurious `Backend` error -- while the payer is paid back exactly
-/// once.
+/// The same crash window as above, past the withdraw delay. Either the
+/// loser's `finalizeWithdraw` is re-seeded behind the winner's, mines after
+/// it and reverts against a channel with nothing left pending -- and the
+/// port's contract suite already says a second sequential
+/// `finish_withdrawal` there answers `NoWithdrawalPending`, so a raced one
+/// must answer the same way rather than a spurious `Backend` error -- or
+/// both nodes signed the identical transaction and both wait on its one
+/// receipt, so both report the same state (#1433). Either way the payer is
+/// paid back exactly once.
 #[tokio::test]
 async fn concurrent_finish_withdrawal_pays_the_winner_once() {
     if !require_anvil() {
@@ -704,16 +706,31 @@ async fn concurrent_finish_withdrawal_pays_the_winner_once() {
             first.finish_withdrawal(&channel),
             second.finish_withdrawal(&channel)
         );
-        let (winner, loser_error) = match (first_result, second_result) {
-            (Ok(state), Err(error)) => (state, error),
-            (Err(error), Ok(state)) => (state, error),
-            other => panic!("race {race}: expected exactly one winner, got {other:?}"),
+        // Two nodes over one key can send the identical signed
+        // `finalizeWithdraw` (same nonce, same bytes): the node answers the
+        // second "already known", `send` counts that as a write sent, and
+        // both wait on the one transaction, so both succeed. Otherwise the
+        // loser's send was re-seeded behind the winner's and reverts, and it
+        // must answer what a second sequential call would. Either way the
+        // payer is paid back exactly once (asserted below).
+        let winner = match (first_result, second_result) {
+            (Ok(state), Ok(other)) => {
+                assert_eq!(
+                    state, other,
+                    "race {race}: two winners on one transaction report one outcome"
+                );
+                state
+            }
+            (Ok(state), Err(error)) | (Err(error), Ok(state)) => {
+                assert_eq!(
+                    error,
+                    BatchSettlementError::NoWithdrawalPending(channel.clone()),
+                    "race {race}: the loser sees exactly what a second sequential call would"
+                );
+                state
+            }
+            other => panic!("race {race}: expected at least one winner, got {other:?}"),
         };
-        assert_eq!(
-            loser_error,
-            BatchSettlementError::NoWithdrawalPending(channel.clone()),
-            "race {race}: the loser sees exactly what a second sequential call would"
-        );
         assert_eq!(
             winner.on_chain.status,
             BatchChannelStatus::Open,
