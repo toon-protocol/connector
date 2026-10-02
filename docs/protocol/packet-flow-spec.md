@@ -5,9 +5,10 @@
 issue #1065, and states the routing and reject rules that had never been written in one place.
 PF-14 – PF-17 are amended or retired by
 [ADR 0057](../adr/0057-minimum-delivery-is-retired-a-claim-bounds-erosion.md) (issue #1143), and
-PF-26 adds the forward's counterpart to PF-25 (issue #1448), and PF-02 and PF-23 are amended in place by
+PF-02 and PF-23 are amended in place by
 [ADR 0064](../adr/0064-a-deadline-bounds-the-wait-for-an-app-not-the-answer.md) (issue #1183); the
-rule numbers are kept and never reused.
+rule numbers are kept and never reused. PF-26, the forward's counterpart to PF-25, is added by
+issue #1448 with no record of its own: this document is normative for it.
 
 **Coverage:** none of PF-01 – PF-26 is vectored. This is a wire surface, so these rules enter
 [ADR 0045](../adr/0045-a-behavioural-rule-is-normative-prose-until-its-vector-lands.md)'s debt ledger;

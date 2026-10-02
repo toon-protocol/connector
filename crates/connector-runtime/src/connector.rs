@@ -41,8 +41,7 @@ use crate::outbound_voucher::{
 use crate::peer_route_store::{
     PeerRouteStore, PeerRouteStoreError, RuntimePeerChannel, RuntimePeering, RuntimePeers,
 };
-use crate::peer_transport::PeerForward;
-use crate::peer_transport::{PeerRegistrar, PeerTransport};
+use crate::peer_transport::{PeerForward, PeerRegistrar, PeerTransport};
 use crate::rate_table::SharedRateTable;
 use crate::route::{LeasedRoute, PeerRoute};
 use crate::self_description::{SelfDescriptionSource, UnreachableSelfDescription};
@@ -2820,7 +2819,7 @@ impl Connector {
                 outgoing.clone(),
                 riding,
                 outgoing_expires_at,
-                "the peer's answer",
+                "waiting for the peer's answer",
             )
             .await;
         if rode_a_voucher {
@@ -2861,7 +2860,7 @@ impl Connector {
                             outgoing,
                             covering,
                             outgoing_expires_at,
-                            "the peer's answer to the retry",
+                            "waiting for the peer's answer to the retry",
                         )
                         .await;
                     if retried_a_voucher {
@@ -3030,14 +3029,16 @@ impl Connector {
         };
         let now = self.now_unix();
         if !hop.synced.load(Ordering::Acquire) {
+            // The ask is signed too, so the turn just waited for is checked
+            // against the expiry before its challenge is.
+            let Some(budget) = self.wait_budget(outgoing_expires_at) else {
+                return Err(CoverError::OutOfTime(
+                    "after waiting for the channel's signing turn",
+                ));
+            };
             let expires = now + PEER_CHALLENGE_TTL_SECS;
             let synced = match outbound.sign_challenge(&hop.channel_id, expires).await {
                 Ok(signature) => {
-                    let Some(budget) = self.wait_budget(outgoing_expires_at) else {
-                        return Err(CoverError::OutOfTime(
-                            "after waiting for the channel's signing turn",
-                        ));
-                    };
                     match tokio::time::timeout(
                         budget,
                         hop.claim_state
@@ -9948,7 +9949,13 @@ mod tests {
             assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
             assert_eq!(started.elapsed(), std::time::Duration::from_secs(10));
             assert!(reject.message.contains("next-hop"), "{}", reject.message);
-            assert!(reject.message.contains("answer"), "{}", reject.message);
+            assert!(
+                reject
+                    .message
+                    .contains("ran out of time waiting for the peer's answer"),
+                "{}",
+                reject.message
+            );
             assert_eq!(reject.accumulated_cost, 0, "this connector's own reject");
             assert_eq!(outbound.signed(&channel), Some(100), "the voucher was sent");
 
