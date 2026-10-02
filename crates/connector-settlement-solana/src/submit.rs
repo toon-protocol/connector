@@ -147,7 +147,7 @@ pub(crate) async fn send_and_confirm(
 /// that it has not reached it. A constant of the binary, not a config key,
 /// and well inside a blockhash's lifetime (~60-90s), so the same signed bytes
 /// are still valid for as long as they are re-sent.
-pub(crate) const BEHIND_FOR: Duration = Duration::from_secs(20);
+const BEHIND_FOR: Duration = Duration::from_secs(20);
 
 /// The waits between repeats of a send the node is too far behind to take:
 /// doubling from 250ms, capped at 2s.
@@ -187,7 +187,7 @@ pub(crate) async fn send_and_confirm_after(
             .await
         {
             Ok(_) => break true,
-            Err(error) if is_min_context_slot_not_reached(&error) => {
+            Err(error) if min_context_slot.is_some() && is_min_context_slot_not_reached(&error) => {
                 let slot = min_context_slot.unwrap_or_default();
                 if behind_since.elapsed() + behind_wait >= BEHIND_FOR {
                     return Err(SubmitError::Behind {
@@ -720,6 +720,24 @@ mod tests {
         assert!(text.contains("never broadcast"), "{text}");
         assert!(text.contains("behind slot 77"), "{text}");
         assert!(text.contains("retrying is safe"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_send_that_names_no_slot_is_refused_by_a_not_reached_answer_as_before() {
+        let transaction = signed_transaction();
+        let rpc = node(
+            transaction.signatures[0],
+            |_| not_reached(),
+            |_| panic!("a send that was never taken has nothing to poll for"),
+            below_deadline,
+        )
+        .await;
+
+        let error = send_and_confirm(&client(&rpc), &transaction, LAST_VALID, FAST)
+            .await
+            .expect_err("refused");
+        assert!(matches!(error, SubmitError::Refused { .. }), "{error:?}");
+        assert_eq!(send_configs(&rpc).len(), 1, "not repeated");
     }
 
     #[tokio::test]

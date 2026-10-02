@@ -33,7 +33,6 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::submit::Confirmed;
 use connector_chain_rpc::retry_read;
 use connector_settlement::batch::{BatchSettlementError, ChannelPresentation, HeldVouchers};
 use connector_settlement::ChannelId;
@@ -47,6 +46,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
 
 use super::{backend_error, wire, SolanaBatchSettlement, SubmitFailure};
+use crate::submit::Confirmed;
 
 /// How often the watcher reads every sponsored channel. The grace period is
 /// at least this node's published minimum -- a day by default, never below

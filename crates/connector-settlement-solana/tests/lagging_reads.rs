@@ -602,16 +602,27 @@ enum Behind {
     Always,
 }
 
+/// Which `sendTransaction`s the payer's endpoint has seen since it was armed.
+#[derive(Default)]
+struct Armed {
+    mode: Option<Behind>,
+    sends: usize,
+    turned_away: bool,
+}
+
 #[derive(Clone)]
-struct SendPlan(Arc<Mutex<(Option<Behind>, usize, bool)>>);
+struct SendPlan(Arc<Mutex<Armed>>);
 
 impl SendPlan {
     fn new() -> SendPlan {
-        SendPlan(Arc::new(Mutex::new((None, 0, false))))
+        SendPlan(Arc::default())
     }
 
     fn arm(&self, mode: Behind) {
-        *self.0.lock().unwrap() = (Some(mode), 0, false);
+        *self.0.lock().unwrap() = Armed {
+            mode: Some(mode),
+            ..Armed::default()
+        };
     }
 
     fn script(&self) -> impl Fn(&RpcCall) -> RpcReply + Send + Sync + 'static {
@@ -621,15 +632,15 @@ impl SendPlan {
                 return RpcReply::Forward;
             }
             let mut plan = plan.lock().unwrap();
-            let Some(mode) = plan.0 else {
+            let Some(mode) = plan.mode else {
                 return RpcReply::Forward;
             };
-            plan.1 += 1;
-            match (plan.1, mode) {
+            plan.sends += 1;
+            match (plan.sends, mode) {
                 (1, _) | (_, Behind::Healthy) => RpcReply::Forward,
                 (_, Behind::Always) => not_reached(),
-                (_, Behind::Once) if !plan.2 => {
-                    plan.2 = true;
+                (_, Behind::Once) if !plan.turned_away => {
+                    plan.turned_away = true;
                     not_reached()
                 }
                 (_, Behind::Once) => RpcReply::Forward,

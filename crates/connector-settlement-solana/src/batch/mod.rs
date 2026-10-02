@@ -42,7 +42,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use connector_chain_rpc::{retry_read, solana::rpc_client, RpcTransport};
+use connector_chain_rpc::solana::{is_min_context_slot_not_reached, rpc_client};
+use connector_chain_rpc::{retry_read, RpcTransport};
 use connector_settlement::batch::{
     AdmissionRefusal, BatchChannelState, BatchChannelStatus, BatchSettlementBackend,
     BatchSettlementError, ChannelPresentation, Voucher, VoucherSigner,
@@ -423,11 +424,7 @@ impl SolanaBatchSettlement {
                     return Ok(self.channel_in(response.value))
                 }
                 Ok(_) => ReadAfter::Behind,
-                Err(error)
-                    if connector_chain_rpc::solana::is_min_context_slot_not_reached(&error) =>
-                {
-                    ReadAfter::Behind
-                }
+                Err(error) if is_min_context_slot_not_reached(&error) => ReadAfter::Behind,
                 Err(error) => ReadAfter::Failed(backend_error(error)),
             };
             match backoffs.next() {
@@ -1149,7 +1146,7 @@ mod tests {
                 .get_account_with_config(&Pubkey::new_unique(), config)
                 .await
                 .expect_err("the node answered an error");
-            assert_eq!(connector_chain_rpc::solana::is_min_context_slot_not_reached(&error), lagging, "{error}");
+            assert_eq!(is_min_context_slot_not_reached(&error), lagging, "{error}");
         }
     }
 }
