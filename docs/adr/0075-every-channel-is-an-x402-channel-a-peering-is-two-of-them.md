@@ -837,3 +837,41 @@ places and leaves the rest alone:
   now reads: it uses the one the operator names.
 - **Decision 3's EVM paying side is unchanged.** A node's own outbound deposit is sent by the node,
   from its settlement key, and pays its own gas; no facilitator is involved.
+
+## Update (issue #1446) — a packet never carried is not paid for
+
+The owner decided on 2026-10-02 that a packet that was never carried is not paid for on a
+batch-settlement channel. That is the rule [ADR 0028](0028-a-forwarded-route-is-priced-at-the-client-edge.md)
+set at the client edge (#1012), now applied to a peering. [0042](0042-a-packet-carries-its-claim.md)'s "a hop
+can take a claim and refuse to carry" stays as the description of what a _hostile_ hop can do, bounded by the
+per-peer cap; it is not how an honest pair behaves. Before this, a packet the next hop rejected — or that never
+reached it — left the payer's signed watermark raised, so the payer's next accepted voucher paid the hop for it
+and a forwarding connector took the loss. Three decisions:
+
+1. **The payer signs from the receiver's report.** A forward that rode a voucher and ended in a REJECT — every
+   reject code, whatever the ack said, and the locally synthesized `T01` where the peer was never reached —
+   sends the next forward on that channel to ask the next hop's `POST /ilp/claim-state` before it signs. The
+   payer's signed watermark becomes the receiver's figure, **lower or higher**, and the next voucher is that
+   figure plus the packet's amount. The lowering is a no-op when a later voucher has been signed on the channel
+   since the rejected one (the guard `ClientClaimGate::roll_back` applies), so a concurrent forward's voucher
+   is never signed below one still in flight; the hop is then asked again on the next forward. It never goes
+   below what the chain already shows claimed (decision 6: the chain is a lower bound). It is durable: the
+   journal gains `OutboundWatermarkSet`, which **overwrites** on replay where `OutboundVoucherSigned` folds by
+   max, as `InboundClaimRolledBack` does on the inbound side; and `BatchSettlementPayer::restore_outbound` sets
+   the watermark to the figure it is given (floored at the chain's), where it used to only raise it. When the
+   receiver cannot be asked, behaviour is as before: sign above the payer's own journal, and ask again next
+   time. A reject for a packet the receiver _did_ carry (a termination's reject, ADR 0064) needs no special
+   case: the receiver's report includes that voucher, so the payer signs above it.
+2. **The receiver refuses before admitting.** A voucher riding a packet to a destination nothing will carry —
+   no configured route, no runtime peer route, no active lease and no bound client session — is rejected `F02`
+   without its claim being ingested, on both carriages, from one definition
+   (`claim_must_not_be_admitted`), beside #869's envelope-target check. Such a destination has a charge of 0,
+   so the gate used to admit the voucher at its full amount. A greeting to an unmatched destination is still
+   greeted.
+3. **Nothing else is widened.** `roll_back_uncarried_forward` still acts only on a forwarded route, and ADR
+   0064's "a termination's reject rolls back nothing" is unchanged. A voucher that overpays a route it does
+   match is out of scope, as are the per-peer cap, fees, the voucher wire shape, the ack and
+   `vectors/wire-vectors.json`.
+
+**This amends decision 6**: the receiver's claim-state is the watermark authority after a reject as well as on
+restore, and what it reports may lower the payer's watermark as well as raise it.

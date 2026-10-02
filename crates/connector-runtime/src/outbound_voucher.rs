@@ -22,7 +22,10 @@
 //! receiver is asked anyway, once per process per channel and again after
 //! a voucher it did not accept: a node restored from an older journal
 //! would otherwise sign a voucher that fails to advance. What it answers
-//! only ever raises the watermark ([`crate::OutboundChannels::raise_watermark`]).
+//! raises the watermark when it is ahead of this node's, and LOWERS it when
+//! a forward that rode a voucher ended in a reject and the receiver holds
+//! less than this node signed: a packet never carried is not paid for
+//! (ADR 0075, issue #1446; [`crate::OutboundChannels::set_watermark`]).
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;

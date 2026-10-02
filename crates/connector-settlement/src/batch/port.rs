@@ -877,10 +877,11 @@ pub trait BatchSettlementPayer: Send + Sync {
 
     /// Bring back a channel this node opened in an earlier process, from its
     /// journaled `record`, so this half can read, top up, sign on and
-    /// withdraw from it again. `signed` is the highest amount this node
-    /// journaled a voucher for on it; the watermark restored is the larger
-    /// of that and what the chain shows landed, so it never goes backwards
-    /// and never below what the receiver already holds on chain.
+    /// withdraw from it again. `signed` is the watermark the caller stands
+    /// by -- its journaled figure, or the receiver's report after a reject
+    /// (ADR 0075 decision 6, amended by issue #1446); the watermark restored
+    /// is the larger of that and what the chain shows landed, so it is never
+    /// below what the receiver already holds on chain.
     ///
     /// Refuses a record for another chain
     /// ([`WrongChain`](BatchSettlementError::WrongChain)), one whose channel
@@ -888,8 +889,9 @@ pub trait BatchSettlementPayer: Send + Sync {
     /// ([`ChannelNotFound`](BatchSettlementError::ChannelNotFound): an open
     /// never sent, or not yet landed), and one naming a channel this node is
     /// not the payer of ([`NotOutbound`](BatchSettlementError::NotOutbound)).
-    /// Restoring a channel already known changes nothing but raises its
-    /// watermark to `signed` if that is higher.
+    /// Restoring a channel already known sets its watermark to that figure,
+    /// lowering it when `signed` is lower than the one held: the caller
+    /// decides, because a voucher a receiver never admitted is not owed.
     async fn restore_outbound(
         &self,
         record: &OutboundChannelRecord,

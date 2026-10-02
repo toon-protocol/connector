@@ -1352,7 +1352,7 @@ async fn handle_ilp(
     // of the claim (F00 rather than §1.3's F01/F03/T00 taxonomy): that
     // claim is never looked at on this path, since nothing about it could
     // make this packet deliverable.
-    if !state.connector.envelope_target_would_be_refused(&prepare) {
+    if !claim_must_not_be_admitted(&state, &prepare) {
         match extract_and_validate_claim(&headers, charge, &state).await {
             Err(rejection) => return claim_rejected_response(rejection, charge),
             // A claim that cleared the gate is this connector's evidence
@@ -1394,6 +1394,30 @@ async fn handle_ilp(
     )
     .await;
     packet_response(response)
+}
+
+/// Whether `prepare`'s covering claim must be left unadmitted because the
+/// packet is going to be refused without carrying anything -- one
+/// definition for both carriages, as every other rule they share has
+/// (issue #1446, client-edge-spec.md §9):
+///
+/// - its envelope's own target will be refused (`F00`, issue #869); or
+/// - its destination matches nothing at all -- no configured route, no
+///   runtime peer route, no active lease and no client session bound to it
+///   -- so routing answers `F02`. Such a destination has a charge of 0, so
+///   the gate would otherwise admit the voucher at its full amount and
+///   leave the payer's watermark spent on a packet nobody carried.
+///
+/// Routing still runs unchanged afterwards and raises the identical reject
+/// itself; only the claim is not looked at. A greeting is answered before
+/// this is asked.
+pub(crate) fn claim_must_not_be_admitted(state: &ClientEdgeState, prepare: &Prepare) -> bool {
+    state.connector.envelope_target_would_be_refused(prepare)
+        || (!state.connector.has_route(&prepare.destination)
+            && state
+                .session_registry
+                .resolve(&prepare.destination, now_unix())
+                .is_none())
 }
 
 /// Whether the single route lookup both carriages make (issue #701)
@@ -4056,6 +4080,58 @@ mod tests {
             let response = app.oneshot(valid_request).await.unwrap();
             let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
             Fulfill::decode(&bytes).expect("the unspent claim is still accepted");
+            assert_eq!(app_client.deliveries().len(), 1);
+        }
+
+        /// Issue #1446: a voucher riding a packet to a destination nothing
+        /// will carry is never ingested. An unrouted destination has a
+        /// charge of 0, so the gate used to admit the voucher at its full
+        /// amount and routing then answered `F02`, leaving the payer's
+        /// watermark spent on a packet nobody carried. Proven as #869's
+        /// test proves it: the identical voucher, resent to a served route
+        /// priced at its amount, still pays -- which it could not if the
+        /// `F02` had advanced the watermark (it would be refused `F03`,
+        /// "advances value by 0").
+        #[tokio::test]
+        async fn a_voucher_covering_a_packet_to_an_unrouted_destination_is_never_spent() {
+            let route =
+                StaticRoute::new_priced("g.example.app", "http://localhost:4000", 100).unwrap();
+            let app_client = Arc::new(FakeAppClient::new());
+            app_client.respond(route.handler_url(), answered(b"ok"));
+            let signer = test_signer();
+            let connector = Arc::new(
+                Connector::new(
+                    vec![route],
+                    vec![],
+                    app_client.clone(),
+                    Arc::new(InProcessPeerTransport::new()),
+                    test_clock(),
+                )
+                .with_identity_signer(signer.clone()),
+            );
+            let app = router_with_gate(connector, signer.clone(), None, test_gate(test_channels()));
+            let claim = evm_claim_json(100);
+
+            let (unrouted, _shared_secret) =
+                sealed_sample_prepare("g.nowhere.app", &signer.public_key().unwrap());
+            let response = app
+                .clone()
+                .oneshot(request_with_claim_header(&unrouted, CLAIM_HEADER, &claim))
+                .await
+                .unwrap();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            let reject = Reject::decode(&bytes).expect("decode reject");
+            assert_eq!(reject.code.as_str(), "F02");
+            assert!(app_client.deliveries().is_empty());
+
+            let (served, _shared_secret) =
+                sealed_sample_prepare("g.example.app", &signer.public_key().unwrap());
+            let response = app
+                .oneshot(request_with_claim_header(&served, CLAIM_HEADER, &claim))
+                .await
+                .unwrap();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            Fulfill::decode(&bytes).expect("the unspent voucher still pays");
             assert_eq!(app_client.deliveries().len(), 1);
         }
 

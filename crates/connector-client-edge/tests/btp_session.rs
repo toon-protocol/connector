@@ -737,6 +737,44 @@ async fn a_claim_covering_a_packet_refused_for_envelope_shape_is_never_spent_ove
     Fulfill::decode(&second.ilp_packet).expect("the unspent claim is still accepted");
 }
 
+/// Issue #1446, BTP-shaped: a voucher presented with a packet to a
+/// destination nothing will carry is rejected `F02` without being ingested,
+/// on this carriage exactly as on HTTP (§9's no-drift invariant). The
+/// identical voucher then pays for a packet to the served route, which it
+/// could not if the `F02` had advanced the watermark.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voucher_covering_a_packet_to_an_unrouted_destination_is_never_spent_over_btp() {
+    let (addr, signer) = serve_edge().await;
+    let mut session = connect(addr).await;
+    let receiver = signer.public_key().unwrap();
+    let claim = evm_claim_json(PRICE);
+
+    send(
+        &mut session,
+        btp_message(
+            1,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &sealed_prepare("g.nowhere.app", &receiver).encode(),
+        ),
+    )
+    .await;
+    let first = next_answer(&mut session).await;
+    let reject = Reject::decode(&first.ilp_packet).expect("an OER REJECT");
+    assert_eq!(reject.code.as_str(), "F02");
+
+    send(
+        &mut session,
+        btp_message(
+            2,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &sealed_prepare("g.test.app", &receiver).encode(),
+        ),
+    )
+    .await;
+    let second = next_answer(&mut session).await;
+    Fulfill::decode(&second.ilp_packet).expect("the unspent voucher still pays");
+}
+
 /// §1.9 step 4: a standalone claim is ingested fire-and-forget -- no
 /// response frame -- and genuinely advances the shared watermark: the auth
 /// frame sent after it is answered first (nothing answered the claim), and

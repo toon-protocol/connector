@@ -113,7 +113,9 @@ async fn send(session: &mut Session, frame: Vec<u8>) {
 
 /// Connect to the node at `node`, bind `address`, and pay the node
 /// `voucher` on the client's own channel -- riding a zero-value packet to
-/// nowhere, so its answer says the voucher has been judged and the session
+/// `g.toon.nowhere` -- a route the node's config must serve, since a voucher
+/// riding a packet to a destination nothing serves is never looked at (issue
+/// #1446) -- so its answer says the voucher has been judged and the session
 /// knows its payee.
 pub async fn client_session(node: SocketAddr, address: &str, voucher: &str) -> Session {
     let (mut session, _) = tokio_tungstenite::connect_async(format!("ws://{node}/ilp/btp"))
