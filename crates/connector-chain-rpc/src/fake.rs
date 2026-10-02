@@ -20,7 +20,9 @@
 //! pass a request through ([`RpcReply::Forward`]) or pass it through and then
 //! **lose the answer** ([`RpcReply::ForwardThenDrop`]). The second is the
 //! ambiguous send, reproduced exactly: the chain has the transaction and the
-//! client has no idea.
+//! client has no idea. A third, [`RpcReply::ForwardRewritten`], passes it
+//! through and **lies about the answer**, so a lie about a transaction can
+//! wait for the chain to have one to lie about.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -60,6 +62,9 @@ pub enum RpcReply {
     /// Pass the request to the upstream chain, then close the connection
     /// without returning the answer.
     ForwardThenDrop,
+    /// Pass the request to the upstream chain and return what the function
+    /// makes of its whole answer (`{"jsonrpc", "id", "result" | "error"}`).
+    ForwardRewritten(fn(Value) -> Value),
 }
 
 type Script = dyn Fn(&RpcCall) -> RpcReply + Send + Sync;
@@ -201,6 +206,11 @@ impl Connection {
                 RpcReply::ForwardThenDrop => {
                     self.forward(body).await;
                     return Ok(());
+                }
+                RpcReply::ForwardRewritten(rewrite) => {
+                    let answer = serde_json::from_slice(&self.forward(body).await)
+                        .expect("the upstream chain answers in JSON");
+                    json_response(rewrite(answer))
                 }
                 RpcReply::Slow(..) => unreachable!("unwrapped above"),
             };
