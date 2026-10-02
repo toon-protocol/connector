@@ -812,6 +812,7 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
         let (address, record) = self.outbound_record(channel)?;
         let no_withdrawal = || BatchSettlementError::NoWithdrawalPending(channel.clone());
         let account = self.read(&address).await?.ok_or_else(no_withdrawal)?;
+        let mut sealed_in = None;
         let account = match account.status {
             wire::ChannelStatus::Open | wire::ChannelStatus::Distributed => {
                 return Err(no_withdrawal())
@@ -828,12 +829,17 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
                         remaining_secs: u64::try_from(deadline - now).unwrap_or(u64::MAX),
                     });
                 }
-                self.submit(&[wire::seal_instruction(&self.program_id, &address)])
-                    .await?;
+                sealed_in = Some(
+                    self.submit_confirmed(&[wire::seal_instruction(&self.program_id, &address)])
+                        .await?,
+                );
                 self.read_existing(channel, &address).await?
             }
         };
 
+        // A `distribute` that follows this node's own `seal` names the slot
+        // the `seal` landed in; on a channel found already Sealed there is
+        // no such slot and it is sent as it always was.
         self.distribute(
             &SponsoredChannel {
                 address,
@@ -841,8 +847,19 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
             },
             &record.receiver,
             &self.treasury,
+            sealed_in.as_ref(),
         )
-        .await?;
+        .await
+        .map_err(|failure| match (failure.is_behind(), &sealed_in) {
+            (true, Some(seal)) => backend_error(format!(
+                "the seal confirmed (transaction {} in slot {}), but distribute could not be \
+                 sent: {}. Repeat the request to finish the withdrawal",
+                seal.signature,
+                seal.slot,
+                BatchSettlementError::from(failure)
+            )),
+            _ => BatchSettlementError::from(failure),
+        })?;
 
         // Inside its slot window a distributed channel stays allocated,
         // awaiting the receiver's `reclaim`; past it, `distribute`
