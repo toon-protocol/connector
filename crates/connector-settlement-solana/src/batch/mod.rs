@@ -42,7 +42,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use connector_chain_rpc::{retry_read, solana::rpc_client, RpcTransport};
+use connector_chain_rpc::solana::{is_min_context_slot_not_reached, rpc_client};
+use connector_chain_rpc::{retry_read, RpcTransport};
 use connector_settlement::batch::{
     AdmissionRefusal, BatchChannelState, BatchChannelStatus, BatchSettlementBackend,
     BatchSettlementError, ChannelPresentation, Voucher, VoucherSigner,
@@ -51,9 +52,7 @@ use connector_settlement::ChannelId;
 use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client::rpc_client::RpcClientConfig;
-use solana_rpc_client_api::client_error::ErrorKind;
 use solana_rpc_client_api::config::RpcAccountInfoConfig;
-use solana_rpc_client_api::request::RpcError;
 use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::instruction::Instruction;
@@ -62,7 +61,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
 
-use crate::submit::{send_and_confirm, ConfirmPolicy, Confirmed};
+use crate::submit::{send_and_confirm_after, ConfirmPolicy, Confirmed, SubmitError};
 
 /// The chain this backend answers for, in the port's spelling.
 const CHAIN: &str = "solana";
@@ -524,26 +523,40 @@ impl SolanaBatchSettlement {
         &self,
         instructions: &[Instruction],
     ) -> Result<Confirmed, BatchSettlementError> {
+        self.submit_after(instructions, None)
+            .await
+            .map_err(BatchSettlementError::from)
+    }
+
+    /// [`submit_confirmed`](Self::submit_confirmed), the send naming
+    /// `min_context_slot` when it is `Some`: the slot of a transaction of
+    /// this node's own that these instructions depend on.
+    async fn submit_after(
+        &self,
+        instructions: &[Instruction],
+        min_context_slot: Option<u64>,
+    ) -> Result<Confirmed, SubmitFailure> {
         let (blockhash, last_valid_block_height) = retry_read(|| {
             self.rpc
                 .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
         })
         .await
-        .map_err(backend_error)?;
+        .map_err(|error| SubmitFailure::Other(backend_error(error)))?;
         let transaction = Transaction::new_signed_with_payer(
             instructions,
             Some(&self.sponsor.pubkey()),
             &[&self.sponsor],
             blockhash,
         );
-        send_and_confirm(
+        send_and_confirm_after(
             &self.rpc,
             &transaction,
             last_valid_block_height,
             self.confirm,
+            min_context_slot,
         )
         .await
-        .map_err(backend_error)
+        .map_err(SubmitFailure::Send)
     }
 
     /// The cluster's Rent sysvar, read once per process: a cluster's rent
@@ -581,6 +594,31 @@ const LAGGING_READ_BACKOFFS: [Duration; 6] = [
     Duration::from_secs(2),
 ];
 
+/// Why [`SolanaBatchSettlement::submit_after`] confirmed nothing.
+enum SubmitFailure {
+    /// The send itself ended without the transaction confirming.
+    Send(SubmitError),
+    /// Nothing was sent: the blockhash could not be read.
+    Other(BatchSettlementError),
+}
+
+impl SubmitFailure {
+    /// The node stayed behind the slot the send named, so nothing was
+    /// broadcast and the cause is the node, not the transaction.
+    fn is_behind(&self) -> bool {
+        matches!(self, SubmitFailure::Send(SubmitError::Behind { .. }))
+    }
+}
+
+impl From<SubmitFailure> for BatchSettlementError {
+    fn from(failure: SubmitFailure) -> Self {
+        match failure {
+            SubmitFailure::Send(error) => backend_error(error),
+            SubmitFailure::Other(error) => error,
+        }
+    }
+}
+
 /// Why [`SolanaBatchSettlement::read_after`] gave no answer.
 enum ReadAfter {
     /// Every attempt was answered from before the slot.
@@ -599,23 +637,6 @@ impl ReadAfter {
             )),
             ReadAfter::Failed(error) => error,
         }
-    }
-}
-
-/// The node's "minimum context slot has not been reached" answer (-32016).
-///
-/// `get_account_with_config` rewraps a failed call as a `Custom` error whose
-/// text carries the node's (`AccountNotFound: pubkey=..: RPC response error
-/// -32016: ..`), so the code is looked for there as well as in a typed
-/// response error. Both are what the pinned `solana-rpc-client` 2.1.0 gives.
-fn is_min_context_slot_not_reached(error: &solana_rpc_client_api::client_error::Error) -> bool {
-    const CODE: i64 =
-        solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED;
-    match error.kind() {
-        ErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => *code == CODE,
-        _ => error
-            .to_string()
-            .contains(&format!("RPC response error {CODE}")),
     }
 }
 
