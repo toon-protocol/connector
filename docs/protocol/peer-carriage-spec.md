@@ -1395,11 +1395,11 @@ read as either verdict.
 hang forever. Both carriages now bound it structurally, because RFC-0023 requires a responder to
 answer every request and HTTP always answers. The deadline:
 
-| What was sent                              | Ack deadline                                                                                             |
-| ------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
-| a claim riding a PREPARE (either carriage) | the same deadline as the packet's own answer: the PREPARE's `expiresAt`, capped by `peerAnswerTimeoutMs` |
-| a FLUSH (BTP TRANSFER)                     | `claimAckTimeoutMs`                                                                                      |
-| a FLUSH (HTTP standalone claim POST)       | `claimAckTimeoutMs`, applied to the HTTP response                                                        |
+| What was sent                              | Ack deadline                                                                                                                                                                               |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| a claim riding a PREPARE (either carriage) | the same deadline as the packet's own answer: the sooner of the PREPARE's `expiresAt` and `peerAnswerTimeoutMs`. Ended by the expiry it is `R00`, by the timeout `T01` (packet-flow PF-26) |
+| a FLUSH (BTP TRANSFER)                     | `claimAckTimeoutMs`                                                                                                                                                                        |
+| a FLUSH (HTTP standalone claim POST)       | `claimAckTimeoutMs`, applied to the HTTP response                                                                                                                                          |
 
 `peerAnswerTimeoutMs` and `claimAckTimeoutMs` are per peering relation, both defaulting to
 **30 000 ms** — the value `connector-btp`'s existing `OUTBOUND_ANSWER_TIMEOUT` already uses, adopted

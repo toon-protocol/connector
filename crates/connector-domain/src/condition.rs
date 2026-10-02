@@ -122,6 +122,27 @@ pub fn delivery_budget(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> Option<
     (!is_expired(expires_at, now)).then(|| expires_at - now)
 }
 
+/// How long a *forward* may wait on anything -- the claim-state ask, the
+/// channel's signing turn, the peer's answer -- before the packet it carries
+/// has run out of time: everything left to `outgoing_expires_at`, the figure
+/// [`forwarded_expiry`] returned, and `None` when nothing is (`packet-flow-spec.md`
+/// PF-26). `None` means no voucher is signed and the peer is not asked.
+///
+/// The bound is the OUTGOING expiry, not the arriving one: that is the
+/// instant the sender is answered by, with the message window still in hand
+/// for the return leg. It is [`delivery_budget`]'s rule applied to a
+/// forward, and it is a *budget* for the same reason: it bounds how long to
+/// wait, and is never asked again about an answer that already arrived
+/// (ADR 0064). The peering's own answer timeout is a second, separate bound;
+/// whichever is sooner ends the wait, and which one it was decides the reject
+/// (`R00` for this one, `T01` for the timeout).
+pub fn forward_wait_budget(
+    outgoing_expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<TimeDelta> {
+    delivery_budget(outgoing_expires_at, now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,7 +282,70 @@ mod tests {
         assert_eq!(delivery_budget(now - Duration::seconds(1), now), None);
     }
 
+    #[test]
+    fn a_forward_may_wait_until_its_outgoing_expiry_and_no_longer() {
+        let now = at(2030, 1, 1, 0, 0, 0);
+        let outgoing = now + Duration::seconds(29);
+        assert_eq!(
+            forward_wait_budget(outgoing, now),
+            Some(Duration::seconds(29))
+        );
+        assert_eq!(forward_wait_budget(outgoing, outgoing), None);
+        assert_eq!(
+            forward_wait_budget(outgoing, outgoing + Duration::seconds(2)),
+            None
+        );
+    }
+
     proptest! {
+        /// PF-26: a forward's wait budget is strictly positive and ends
+        /// exactly at the outgoing expiry, whenever there is one -- so the
+        /// sender is answered before the arriving expiry by at least the
+        /// message window.
+        #[test]
+        fn a_forward_wait_budget_ends_at_the_outgoing_expiry(
+            expires_at_secs in 0i64..1_000_000_000,
+            remaining_millis in -5_000i64..60_000,
+        ) {
+            let expires_at = Utc.timestamp_opt(expires_at_secs, 0).unwrap();
+            let now = expires_at - Duration::milliseconds(remaining_millis);
+
+            match forwarded_expiry(expires_at, now) {
+                Some(outgoing) => {
+                    let budget = forward_wait_budget(outgoing, now).expect("alive");
+                    prop_assert!(budget > Duration::zero());
+                    prop_assert_eq!(now + budget, outgoing);
+                    prop_assert!(now + budget <= expires_at - FORWARDING_MESSAGE_WINDOW);
+                }
+                None => {
+                    // Nothing forwardable, and a clock that has run past the
+                    // would-be outgoing expiry has no budget either.
+                    let outgoing = expires_at - FORWARDING_MESSAGE_WINDOW;
+                    prop_assert_eq!(forward_wait_budget(outgoing, now), None);
+                }
+            }
+        }
+
+        /// The budget never grants time past the outgoing expiry: a later
+        /// clock only ever shrinks it, to nothing at the expiry itself.
+        #[test]
+        fn a_later_clock_only_shrinks_a_forward_wait_budget(
+            outgoing_secs in 0i64..1_000_000_000,
+            first_millis in -5_000i64..5_000,
+            gap_millis in 0i64..5_000,
+        ) {
+            let outgoing = Utc.timestamp_opt(outgoing_secs, 0).unwrap();
+            let earlier = outgoing - Duration::milliseconds(first_millis);
+            let later = earlier + Duration::milliseconds(gap_millis);
+            let a = forward_wait_budget(outgoing, earlier);
+            let b = forward_wait_budget(outgoing, later);
+            match (a, b) {
+                (Some(a), Some(b)) => prop_assert!(b <= a),
+                (None, Some(_)) => prop_assert!(false, "an expired forward regained time"),
+                _ => {}
+            }
+        }
+
         /// PF-19, both halves at once: a forward either keeps a whole
         /// message window back -- landing strictly before the expiry that
         /// arrived and strictly after `now`, so the packet that goes out is

@@ -51,7 +51,7 @@ use async_trait::async_trait;
 use connector_btp::{CLAIM_HEADER, PEER_CHALLENGE_HEADER};
 use connector_config::{PeerCarriage, PeerConfig};
 use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
-use connector_runtime::{ClaimAckOutcome, Covering, PeerForward, PeerTransport};
+use connector_runtime::{AnswerWait, ClaimAckOutcome, Covering, PeerForward, PeerTransport};
 use url::Url;
 
 use crate::headers::{self, Headers, PeerRequest, PeerResponse};
@@ -275,17 +275,21 @@ impl HttpPeerTransport {
         Headers::new()
     }
 
+    /// POST `request`, waiting at most `wait`. `Err(true)` is a wait that
+    /// ended at the packet's outgoing expiry (PF-26), `Err(false)` any other
+    /// failure to be answered, the answer timeout included.
     async fn post(
         &self,
         state: &RelationState,
         request: PeerRequest,
-        timeout: Duration,
-    ) -> Option<PeerResponse> {
+        wait: AnswerWait,
+    ) -> Result<PeerResponse, bool> {
+        let timeout = wait.span;
         let answered =
             tokio::time::timeout(timeout, self.client.post(&state.relation.endpoint, request))
                 .await;
         match answered {
-            Ok(Ok(response)) if response.answers_the_packet() => Some(response),
+            Ok(Ok(response)) if response.answers_the_packet() => Ok(response),
             // §6.2: `4xx`/`5xx` are reserved for a malformed request or a
             // connector fault -- there is no ILP answer, so there is nothing
             // to read, and in particular no ack to read off it.
@@ -296,7 +300,7 @@ impl HttpPeerTransport {
                     status = response.status,
                     "peer answered with no ILP body; {NAT_NOTE}"
                 );
-                None
+                Err(false)
             }
             // `HttpDialError` carries the endpoint it attempted but not the
             // peer id -- the client that mints one holds a URL and nothing
@@ -310,7 +314,7 @@ impl HttpPeerTransport {
                     %error,
                     "peer request failed; {NAT_NOTE}"
                 );
-                None
+                Err(false)
             }
             // §6.3 on expiry: the voucher is **not acknowledged**. The
             // peering is not torn down; the next forward asks the next hop's
@@ -320,9 +324,10 @@ impl HttpPeerTransport {
                     peer_id = %state.relation.peer_id,
                     endpoint = %state.relation.endpoint,
                     timeout_ms = timeout.as_millis(),
+                    ran_out_at_expiry = wait.ends_at_expiry,
                     "peer did not answer in time; {NAT_NOTE}"
                 );
-                None
+                Err(wait.ends_at_expiry)
             }
         }
     }
@@ -381,14 +386,19 @@ fn decode_answer(response: &PeerResponse) -> Option<PacketResponse> {
     Some(PacketResponse::Reject(reject))
 }
 
-#[async_trait]
-impl PeerTransport for HttpPeerTransport {
-    async fn forward(
+impl HttpPeerTransport {
+    /// [`PeerTransport::forward`], with every wait also ended at `budget`
+    /// when one is given -- the packet's outgoing expiry (PF-26). Waiting for
+    /// the relation's voucher-in-flight turn is bounded by it too, since that
+    /// is a wait on the forward path like any other.
+    async fn forward_bounded(
         &self,
         peer_id: &str,
         prepare: Prepare,
         covering: Option<Covering>,
+        budget: Option<Duration>,
     ) -> PeerForward {
+        let started = tokio::time::Instant::now();
         // A voucher or a challenge arrives rendered and rides its own header
         // verbatim (§1.4, §4).
         let rendered = match covering {
@@ -424,19 +434,32 @@ impl PeerTransport for HttpPeerTransport {
         // Requests carrying none are unconstrained, so the lock is taken
         // only when one rides.
         let _guard = if voucher {
-            Some(state.voucher_in_flight.lock().await)
+            match budget {
+                None => Some(state.voucher_in_flight.lock().await),
+                Some(budget) => {
+                    match tokio::time::timeout(budget, state.voucher_in_flight.lock()).await {
+                        Ok(guard) => Some(guard),
+                        Err(_) => return PeerForward::ran_out_at_expiry(peer_id),
+                    }
+                }
+            }
         } else {
             None
         };
+        // What the turn cost comes off the packet's budget; the answer
+        // timeout starts afresh, as it always did.
+        let budget = budget.map(|budget| budget.saturating_sub(started.elapsed()));
+        let wait = AnswerWait::new(state.relation.peer_answer_timeout, budget);
 
-        let Some(response) = self
-            .post(state, request, state.relation.peer_answer_timeout)
-            .await
-        else {
-            return PeerForward {
-                response: dial_failed(peer_id, &state.relation.endpoint),
-                ..PeerForward::unreachable(peer_id)
-            };
+        let response = match self.post(state, request, wait).await {
+            Ok(response) => response,
+            Err(true) => return PeerForward::ran_out_at_expiry(peer_id),
+            Err(false) => {
+                return PeerForward {
+                    response: dial_failed(peer_id, &state.relation.endpoint),
+                    ..PeerForward::unreachable(peer_id)
+                };
+            }
         };
 
         // §6.1/§6.2: the ack answers the voucher, independently of whatever
@@ -462,5 +485,28 @@ impl PeerTransport for HttpPeerTransport {
                 PeerForward::undecodable(peer_id, ack)
             }
         }
+    }
+}
+
+#[async_trait]
+impl PeerTransport for HttpPeerTransport {
+    async fn forward(
+        &self,
+        peer_id: &str,
+        prepare: Prepare,
+        covering: Option<Covering>,
+    ) -> PeerForward {
+        self.forward_bounded(peer_id, prepare, covering, None).await
+    }
+
+    async fn forward_within(
+        &self,
+        peer_id: &str,
+        prepare: Prepare,
+        covering: Option<Covering>,
+        budget: Duration,
+    ) -> PeerForward {
+        self.forward_bounded(peer_id, prepare, covering, Some(budget))
+            .await
     }
 }
