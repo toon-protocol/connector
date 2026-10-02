@@ -569,8 +569,9 @@ impl SolanaBatchSettlement {
 /// that expects an account a sponsor says exists) is repeated: the waits
 /// between its attempts, 7.75s in all. A constant of the binary, not a config
 /// key. `retry_read`'s three retries over 3.5s are too short for a node that
-/// is a few slots behind, and they repeat every error, which this must not:
-/// it repeats only an answer from before the slot (or no account yet).
+/// is a few slots behind, so a read bound to a slot repeats any failure for
+/// this long instead, and reports only an answer from before the slot as
+/// one that could not be read yet.
 const LAGGING_READ_BACKOFFS: [Duration; 6] = [
     Duration::from_millis(250),
     Duration::from_millis(500),
@@ -1087,6 +1088,44 @@ mod tests {
             assert_eq!(state.status, expected);
             assert_eq!(state.collateral, 0);
             assert_eq!(state.voucher_ceiling(), 300);
+        }
+    }
+
+    /// What the pinned client makes of a node's `-32016` to
+    /// `getAccountInfo`, and of any other error: only the first is an answer
+    /// from before the slot. The client rewraps the node's error as text, so
+    /// a client upgrade that changes that text must fail here, not turn
+    /// every lagging read into a plain failure.
+    #[tokio::test]
+    async fn a_min_context_slot_error_from_the_pinned_client_is_recognised() {
+        use connector_chain_rpc::{FakeRpc, RpcReply};
+
+        for (code, lagging) in [
+            (
+                solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED,
+                true,
+            ),
+            (-32005, false),
+        ] {
+            let fake = FakeRpc::spawn(move |_| RpcReply::Error {
+                code,
+                message: "no".to_string(),
+            })
+            .await;
+            let transport = RpcTransport::direct(&fake.url()).expect("transport");
+            let rpc = rpc_client(
+                &transport,
+                RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+            );
+            let config = RpcAccountInfoConfig {
+                min_context_slot: Some(1),
+                ..RpcAccountInfoConfig::default()
+            };
+            let error = rpc
+                .get_account_with_config(&Pubkey::new_unique(), config)
+                .await
+                .expect_err("the node answered an error");
+            assert_eq!(is_min_context_slot_not_reached(&error), lagging, "{error}");
         }
     }
 }

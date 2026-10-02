@@ -26,6 +26,7 @@ use connector_settlement_solana::test_support::{
 };
 use connector_settlement_solana::RpcTransport;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
@@ -35,7 +36,6 @@ use tokio::net::TcpListener;
 
 const ONE_DAY: u64 = 86_400;
 const DEPOSIT: u128 = 1_000;
-const MIN_CONTEXT_SLOT_NOT_REACHED: i64 = -32016;
 
 /// What the fake does with `getAccountInfo` once a send has gone through.
 #[derive(Default)]
@@ -103,7 +103,7 @@ impl Lag {
 
 fn not_reached() -> RpcReply {
     RpcReply::Error {
-        code: MIN_CONTEXT_SLOT_NOT_REACHED,
+        code: JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED,
         message: "Minimum context slot has not been reached".to_string(),
     }
 }
@@ -186,13 +186,10 @@ async fn sponsor_endpoint(receiver: Arc<SolanaBatchSettlement>, payer_lag: Lag) 
                 let vetted = receiver.vet_sponsored_open(&transaction).expect("vetted");
                 let channel = vetted.channel;
                 let (status, answer) = match receiver.sponsor_vetted(vetted).await {
-                    Ok(open) if *refusing.lock().unwrap() => {
-                        let _ = open;
-                        (
-                            "500 Internal Server Error",
-                            serde_json::json!({"error": "ChainUnavailable", "detail": "no"}),
-                        )
-                    }
+                    Ok(_) if *refusing.lock().unwrap() => (
+                        "500 Internal Server Error",
+                        serde_json::json!({"error": "ChainUnavailable", "detail": "no"}),
+                    ),
                     Ok(open) => (
                         "200 OK",
                         serde_json::json!({ "channelId": open.channel.to_string() }),

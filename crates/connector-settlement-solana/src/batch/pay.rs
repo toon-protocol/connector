@@ -60,7 +60,6 @@
 //! this: whether it rides the proxy is its own table's
 //! `rpc_via_socks_proxy` (ADR 0073).
 
-use crate::submit::Confirmed;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::MutexGuard;
@@ -83,6 +82,7 @@ use solana_sdk::transaction::VersionedTransaction;
 
 use super::sweep::SponsoredChannel;
 use super::{backend_error, sponsor, state_of, wire, SolanaBatchSettlement, CHAIN};
+use crate::submit::Confirmed;
 
 /// How long a post to a counterparty's sponsor endpoint may take. The
 /// sponsor answers only once its co-signed `open` has confirmed, which can

@@ -979,7 +979,9 @@ impl SolanaBatchSettlement {
         let account = self
             .read_existing_after(&id, &channel, &landed)
             .await
-            .map_err(|error| SponsorRefusal::NotAdmitted(error.to_string()))?;
+            .map_err(|error| {
+                SponsorRefusal::NotAdmitted(format!("the open confirmed, but {error}"))
+            })?;
         self.admit_account(&id, channel, &account)
             .map_err(|error| SponsorRefusal::NotAdmitted(error.to_string()))?;
 
