@@ -292,8 +292,8 @@ earlier `POST /peers`), by channel id on EVM or channel account on Solana, which
 node's outbound-channel journal or the node refuses to start, since it holds no terms for a channel
 it did not open; and `client_edge_url`, that hop's own `POST /ilp` endpoint, where
 `POST /ilp/claim-state` (`scheme: "batch-settlement"`) answers where this node's vouchers on the
-channel stand. That ask restores the channel's watermark after a lost journal and only ever raises
-it (§1.11). The signing key is the chain's settlement key, `[settlement.evm]`'s or
+channel stand. That ask restores the channel's watermark after a lost journal, and after a forward that
+ended in a reject sets it to the receiver's figure, lower or higher (§1.11, ADR 0075 issue #1446). The signing key is the chain's settlement key, `[settlement.evm]`'s or
 `[settlement.solana]`'s, and no second key exists (ADR 0030). The row requires the chain's
 `[settlement.<chain>]` table (`PayChannelWithoutX402`) and `state_dir`
 (`PayChannelsWithoutStateDir`). **The table is required of any peering a `[[routes]]` entry
@@ -790,8 +790,10 @@ fee)`, ADR 0042). The voucher is signed by the settlement key (`payerAuthorizer 
   decision 3).
 - **The receiver's `POST /ilp/claim-state` (`scheme: "batch-settlement"`) is the watermark authority
   on restore** (ADR 0075 decision 6). The payer asks it once per process for each hop, and again after
-  any voucher the receiver did not accept, and only ever raises its signed watermark to the answer; a
-  receiver that cannot be asked leaves the journaled watermark (never behind what was signed) standing,
+  any voucher the receiver did not accept and after any forward that rode a voucher and ended in a
+  REJECT, and sets its signed watermark to the answer — raising it, or lowering it when the packet
+  was never carried (ADR 0075, issue #1446), unless a later voucher has been signed since, and never
+  below what the chain shows claimed; a receiver that cannot be asked leaves the journaled watermark (never behind what was signed) standing,
   and is asked again on the next forward. The ask leaves on `socks_proxy` when the peer's client edge
   is an onion host, by the same host rule as the carriage; with no usable proxy it is refused by
   name and never dialed.

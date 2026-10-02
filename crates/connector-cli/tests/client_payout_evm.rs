@@ -84,6 +84,13 @@ fn node_files(
 client_edge_addr = "127.0.0.1:0"
 state_dir = "{state_dir}"
 
+# Where the client's voucher-carrying probe goes: a voucher riding a packet to
+# a destination nothing serves is never looked at (issue #1446).
+[[routes]]
+prefix = "g.toon.nowhere"
+handler_url = "http://localhost:4000/"
+price = 1
+
 [signer]
 key_file = "{signer_key}"
 

@@ -740,9 +740,10 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
                 signed: 0,
                 backed: 0,
             });
-            // Never backwards, and never below what the receiver has
-            // already landed, which this node must have signed.
-            outbound.signed = outbound.signed.max(signed).max(snapshot.total_claimed);
+            // The caller's figure, lower than the one held or higher, and
+            // never below what the receiver has already landed, which this
+            // node must have signed.
+            outbound.signed = signed.max(snapshot.total_claimed);
             outbound.backed = backing(&snapshot);
             outbound.signed
         };

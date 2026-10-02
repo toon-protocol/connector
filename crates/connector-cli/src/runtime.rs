@@ -2061,6 +2061,13 @@ btp_endpoint = "wss://apex.example/ilp/btp"
                 r#"
 client_edge_addr = "127.0.0.1:0"
 
+# A destination something serves: a claim riding a packet to one nothing
+# serves is never looked at (issue #1446).
+[[routes]]
+prefix = "g.example.unmatched"
+handler_url = "http://localhost:4000/"
+price = 1
+
 [signer]
 key_file = "{}"
 "#,
@@ -2133,6 +2140,13 @@ key_file = "{}"
             format!(
                 r#"
 client_edge_addr = "127.0.0.1:0"
+
+# A destination something serves: a claim riding a packet to one nothing
+# serves is never looked at (issue #1446).
+[[routes]]
+prefix = "g.example.unmatched"
+handler_url = "http://localhost:4000/"
+price = 1
 
 [signer]
 key_file = "{}"

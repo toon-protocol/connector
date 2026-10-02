@@ -857,7 +857,7 @@ async fn handle_frame(
     // still routes `prepare` unchanged and raises the identical F00
     // itself.
     let admitted = match claim_json {
-        Some(json) if !state.connector.envelope_target_would_be_refused(&prepare) => {
+        Some(json) if !crate::claim_must_not_be_admitted(state, &prepare) => {
             match state.claim_gate.admit(&json, charge).await {
                 Ok(accepted) => Some(accepted),
                 Err(rejection) => {
@@ -1081,7 +1081,19 @@ mod tests {
         let gate = test_support::voucher_gate().with_payout_ledger(
             ledger_paying(test_support::address_of(&test_support::authorizer())).await,
         );
-        let state = Arc::new(test_state(gate));
+        let mut state = test_state(gate);
+        // A destination something serves: a claim to one nothing serves is
+        // never looked at (issue #1446), so would never be refused by name.
+        state.connector = Arc::new(connector_runtime::Connector::new(
+            vec![connector_config::StaticRoute::new("g.nowhere", "http://localhost:4000").unwrap()],
+            vec![],
+            Arc::new(connector_runtime::FakeAppClient::new()),
+            Arc::new(connector_runtime::InProcessPeerTransport::new()),
+            Arc::new(connector_runtime::TestClock::new(
+                chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2030, 1, 1, 0, 0, 0).unwrap(),
+            )),
+        ));
+        let state = Arc::new(state);
         let prepare = Prepare {
             amount: 0,
             expires_at: chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2031, 1, 1, 0, 0, 0)

@@ -101,7 +101,7 @@ that FULFILLs is unaffected and still advances the watermark by exactly `price`,
 This is the same "charged for an attempt the connector itself decided not to render" defect issues
 #869/#944 closed one hop earlier — here the hop is the hand-off to the next connector rather than
 this one's own app, and the claim can only be evaluated after the fact rather than predicted before
-it, so the fix is a rollback rather than a pre-admission refusal.
+it, so the fix is a rollback rather than a pre-admission refusal. The same rule now holds on a peering, and an unrouted destination is refused before admitting too: [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md), issue #1446 update.
 
 ## What this does not change
 
