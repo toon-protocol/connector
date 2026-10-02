@@ -367,6 +367,25 @@ const WATCHTOWER_MANAGED_SERVICES: &[&str] = &[
     "store",
 ];
 
+/// The Onboarder (the x402 facilitator, deployed from `toon-protocol/infra`) is
+/// discovered by its auto-apply timer, so without a probe arm the alert is red
+/// on every run for a healthy host. It is probed on both layers: the container
+/// healthcheck on the host, and `/health` across the edge. Deleting either
+/// would only surface as a standing alert, so it is asserted here.
+#[test]
+fn fleet_health_probes_the_onboarder_on_both_layers() {
+    assert!(
+        FLEET_HEALTH_WORKFLOW.contains("|onboarder)"),
+        "fleet-health.yml has no on-host probe arm for the `onboarder` service; \
+         it would report `NO PROBE DEFINED` on every run."
+    );
+    assert!(
+        FLEET_HEALTH_WORKFLOW.contains("https://onboard.$D/health 200"),
+        "fleet-health.yml no longer requests the Onboarder's `/health` across \
+         the edge and expects 200."
+    );
+}
+
 /// A Watchtower-managed service with no serving probe is the gap toon-meta#403
 /// filed and never built ("Watchtower does no health-gating; a bad image
 /// auto-deploys and the container just crash-loops"). `fleet-health.yml`
