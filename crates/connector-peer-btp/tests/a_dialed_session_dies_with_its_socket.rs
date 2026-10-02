@@ -6,8 +6,9 @@
 //! one test is the exception it needs, and it is the exception because the
 //! defect lived precisely in the half a port hides: `ws`'s dialed session
 //! splits the websocket, and its two halves fail independently. A peer that
-//! restarts closes the connection, which the read half sees at once and the
-//! write half learns only on its next write -- so the writer sat waiting on
+//! restarts closes the connection, which the read half sees as soon as the
+//! kernel reports it and the write half learns only on its next write -- so
+//! the writer sat waiting on
 //! a channel that was still open over a socket that was not, the dial side
 //! read that channel as a live session, wrote the next PREPARE into it and
 //! then waited out the answer timeout for a RESPONSE no read loop was left
@@ -16,6 +17,12 @@
 //! What is asserted here is the repair, in the terms a caller has: the
 //! session says it is gone, and a send on it fails **at once** rather than
 //! hanging until `OUTBOUND_ANSWER_TIMEOUT`.
+//!
+//! Issue #1454 is the same defect one step earlier: a frame already written
+//! when the socket closes. Nothing was left to answer it, so it too waited
+//! out the timeout. It is now answered at the close with
+//! `ClosedBeforeAnswer` -- not `SessionGone`, because it *was* written and
+//! must not be resent.
 //!
 //! # Why `ws://` is the faithful scheme for this
 //!

@@ -206,9 +206,9 @@ impl TungsteniteDialer {
         //
         // It ends when the read loop does. The two halves of a split socket
         // fail independently -- a peer that restarts closes the connection,
-        // which the *read* half sees as soon as the kernel
-        // reports it and the write half learns only on its next write -- so a writer still waiting on its channel is a
-        // live send half over a dead socket. That is what made a payee's
+        // which the *read* half sees as soon as the kernel reports it and
+        // the write half learns only on its next write -- so a writer still
+        // waiting on its channel is a live send half over a dead socket. That is what made a payee's
         // restart cost a packet (issue #1240): the dial side kept handing
         // out a handle whose reply channel was still open, wrote the next
         // PREPARE into it, and then waited out the answer timeout for a

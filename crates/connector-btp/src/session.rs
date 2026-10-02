@@ -223,12 +223,14 @@ impl BtpSessionHandle {
     /// Whether this session is dead: its writer is gone, so nothing more
     /// can be written on it and nothing more can ever answer.
     ///
-    /// Readable *before* a caller commits a frame to it, which
-    /// [`OriginateError::SessionGone`] only is after. A carriage that caches a
-    /// session across packets -- the peer carriage's dial side does -- needs
-    /// that: a peer's restart leaves a handle behind whose session died with
-    /// the socket, and answering `T01` off it rather than redialling is
-    /// issue #1240. It is a one-way door, `false` until the writer exits and
+    /// The counterpart of [`OriginateError::SessionGone`], readable
+    /// *before* a caller commits a frame to it. (A session that dies *after*
+    /// the frame was written answers [`OriginateError::ClosedBeforeAnswer`]
+    /// instead, issue #1454.) A carriage that caches a session across
+    /// packets -- the peer carriage's dial side does -- needs that: a
+    /// peer's restart leaves a handle behind whose session died with the
+    /// socket, and answering `T01` off it rather than redialling is issue
+    /// #1240. It is a one-way door, `false` until the writer exits and
     /// `true` forever after, so a `false` may always be stale by the time it
     /// is read; the send's own `SessionGone` is what settles it.
     ///
@@ -434,5 +436,18 @@ mod tests {
             .await
             .expect_err("nothing could ever read the write");
         assert_eq!(error, OriginateError::SessionGone);
+    }
+
+    /// Issue #1454: once the table is closed, a request reserved on it is
+    /// answered at once rather than left waiting for an answer nothing is
+    /// left to deliver.
+    #[tokio::test]
+    async fn a_reservation_on_a_closed_table_is_answered_at_once() {
+        let outbound = OutboundRequests::new();
+        outbound.close();
+
+        let (_, rx) = outbound.reserve();
+
+        assert!(rx.await.is_err(), "the closed table holds no sender");
     }
 }

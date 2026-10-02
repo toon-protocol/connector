@@ -55,7 +55,7 @@ use connector_btp::{
 };
 use connector_config::StaticRoute;
 use connector_domain::client_claim::{ClientClaim, EvmVoucherChannelConfig};
-use connector_domain::{EnvelopeRequest, EnvelopeResponse, PacketResponse, Prepare};
+use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, PacketResponse, Prepare};
 use connector_peer_btp::accept::{PeerAcceptPolicy, PeerSession, SessionEnd};
 use connector_peer_btp::challenge_json::{self, PeerRoleChallenge};
 use connector_peer_btp::dial::{DialError, PeerDialer, PeerRelation};
@@ -1147,7 +1147,7 @@ async fn a_packet_after_the_far_side_restarts_is_redialled_rather_than_refused()
 // ─── issue #1454: a session that closes after the frame was written ───
 
 /// A payee whose first session reads a frame and then closes without
-/// answering it, and whose later sessions answer everything. Every frame
+/// answering it, and whose later sessions fulfil everything. Every frame
 /// any session read is counted, so a test can say how many copies of one
 /// PREPARE the peer received across all of them.
 struct ClosesAfterReading {
@@ -1173,7 +1173,11 @@ impl PeerDialer for ClosesAfterReading {
                     outbound.close();
                     return;
                 }
-                let answer = encode_response(frame.request_id, &[], &[]);
+                let fulfill = Fulfill {
+                    fulfillment: [7; 32],
+                    data: Vec::new(),
+                };
+                let answer = encode_response(frame.request_id, &[], &fulfill.encode());
                 let _ = outbound.resolve(decode_frame(&answer).expect("our own encoder"));
             }
         });
@@ -1195,7 +1199,7 @@ async fn a_frame_written_into_a_session_that_closes_is_rejected_t01_and_not_rese
     let transport = transport(Arc::clone(&dialer) as Arc<dyn PeerDialer>);
 
     let first = tokio::time::timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(2),
         transport.forward(PEER_ID, prepare("g.nowhere"), None),
     )
     .await
@@ -1203,7 +1207,11 @@ async fn a_frame_written_into_a_session_that_closes_is_rejected_t01_and_not_rese
     match first.response {
         PacketResponse::Reject(reject) => {
             assert_eq!(reject.code.as_str(), "T01");
-            assert!(reject.message.contains(PEER_ID));
+            assert!(reject.message.contains(PEER_ID), "{reject:?}");
+            assert!(
+                reject.message.contains("wss://peer.example/btp"),
+                "§2.2: the T01 names the endpoint too: {reject:?}"
+            );
         }
         other => panic!("expected T01, got {other:?}"),
     }
@@ -1215,11 +1223,15 @@ async fn a_frame_written_into_a_session_that_closes_is_rejected_t01_and_not_rese
     assert_eq!(dialer.dials.load(Ordering::SeqCst), 1, "no second attempt");
 
     let second = transport.forward(PEER_ID, prepare("g.nowhere"), None).await;
+    assert!(
+        matches!(second.response, PacketResponse::Fulfill(_)),
+        "the next packet was fulfilled: {:?}",
+        second.response
+    );
     assert_eq!(
         received.load(Ordering::SeqCst),
         2,
-        "the next packet was written to the fresh session: {:?}",
-        second.response
+        "the first PREPARE was not resent on the fresh session"
     );
     assert_eq!(dialer.dials.load(Ordering::SeqCst), 2, "on a fresh session");
 }
@@ -1255,7 +1267,7 @@ async fn a_symmetric_session_answers_a_waiting_send_when_its_socket_closes() {
         .expect("the peer is listening");
 
     let sent = tokio::time::timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(2),
         handle.send_message(&[], b"not a packet"),
     )
     .await
@@ -1293,7 +1305,11 @@ async fn a_peer_that_cannot_be_dialed_rejects_t01_and_was_never_reached() {
     match response {
         PacketResponse::Reject(reject) => {
             assert_eq!(reject.code.as_str(), "T01");
-            assert!(reject.message.contains(PEER_ID));
+            assert!(reject.message.contains(PEER_ID), "{reject:?}");
+            assert!(
+                reject.message.contains("wss://peer.example/btp"),
+                "§2.2: the T01 names the endpoint too: {reject:?}"
+            );
         }
         other => panic!("expected T01, got {other:?}"),
     }
