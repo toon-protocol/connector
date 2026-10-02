@@ -33,6 +33,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::submit::Confirmed;
 use connector_chain_rpc::retry_read;
 use connector_settlement::batch::{BatchSettlementError, ChannelPresentation, HeldVouchers};
 use connector_settlement::ChannelId;
@@ -45,7 +46,7 @@ use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
 
-use super::{backend_error, wire, SolanaBatchSettlement};
+use super::{backend_error, wire, SolanaBatchSettlement, SubmitFailure};
 
 /// How often the watcher reads every sponsored channel. The grace period is
 /// at least this node's published minimum -- a day by default, never below
@@ -256,7 +257,10 @@ impl SolanaBatchSettlement {
                 self.submit(&[wire::seal_instruction(&self.program_id, address)])
                     .await
             }
-            Step::Distribute => self.distribute(channel, &self.receiver(), treasury).await,
+            Step::Distribute => self
+                .distribute(channel, &self.receiver(), treasury, None)
+                .await
+                .map_err(BatchSettlementError::from),
         }
     }
 
@@ -272,16 +276,23 @@ impl SolanaBatchSettlement {
     /// same on every cluster, so each known one is tried in turn; a wrong one
     /// fails the preflight simulation and costs nothing. The one that works
     /// is remembered in `treasury`.
+    ///
+    /// `after` is the `seal` this node's own `finish_withdrawal` just saw
+    /// confirm: the send names its slot, so a node that has not reached it
+    /// cannot simulate `distribute` against the channel still Closing. Such a
+    /// node ends the loop over owners, since no other owner would fare
+    /// better and the error should name the lag, not the last owner.
     pub(super) async fn distribute(
         &self,
         channel: &SponsoredChannel,
         receiver: &Pubkey,
         treasury: &Mutex<Option<Pubkey>>,
-    ) -> Result<(), BatchSettlementError> {
+        after: Option<&Confirmed>,
+    ) -> Result<(), SubmitFailure> {
         let account = &channel.account;
         let mint = retry_read(|| self.rpc.get_account(&account.mint))
             .await
-            .map_err(backend_error)?;
+            .map_err(|error| SubmitFailure::Other(backend_error(error)))?;
         let token_program = mint.owner;
         let sponsor = self.sponsor.pubkey();
         let recipients = wire::sole_recipient(receiver);
@@ -318,11 +329,15 @@ impl SolanaBatchSettlement {
                     &recipients,
                 ),
             ];
-            match self.submit(&instructions).await {
-                Ok(()) => {
+            match self
+                .submit_after(&instructions, after.map(|seal| seal.slot))
+                .await
+            {
+                Ok(_) => {
                     *treasury.lock().expect("treasury lock poisoned") = Some(owner);
                     return Ok(());
                 }
+                Err(error) if error.is_behind() => return Err(error),
                 Err(error) => last = Some(error),
             }
         }

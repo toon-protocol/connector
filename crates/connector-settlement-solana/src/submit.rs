@@ -17,6 +17,8 @@
 //! - [`SubmitError::Failed`]: it landed and failed on chain;
 //! - [`SubmitError::Refused`]: the node answered the send with an error
 //!   (a failed preflight), so it was never broadcast;
+//! - [`SubmitError::Behind`]: the send named a minimum slot and the node
+//!   stayed behind it for [`BEHIND_FOR`], so it was never broadcast;
 //! - [`SubmitError::Expired`]: the chain passed the `lastValidBlockHeight`
 //!   of the transaction's blockhash without it landing, so it **cannot**
 //!   land any more and a retry is safe;
@@ -32,7 +34,7 @@
 
 use std::time::{Duration, Instant};
 
-use connector_chain_rpc::solana::answered;
+use connector_chain_rpc::solana::{answered, is_min_context_slot_not_reached};
 use connector_chain_rpc::RpcTransport;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client::rpc_client::SerializableTransaction;
@@ -79,6 +81,16 @@ pub(crate) enum SubmitError {
     Refused {
         signature: Signature,
         reason: String,
+    },
+    #[error(
+        "transaction {signature} was never broadcast: the RPC node stayed behind slot \
+         {min_context_slot} for {waited_secs}s and would not simulate it from an earlier one. \
+         Nothing reached the chain, so retrying is safe"
+    )]
+    Behind {
+        signature: Signature,
+        min_context_slot: u64,
+        waited_secs: u64,
     },
     #[error("transaction {signature} landed and failed on chain: {error}")]
     Failed {
@@ -128,6 +140,33 @@ pub(crate) async fn send_and_confirm(
     last_valid_block_height: u64,
     policy: ConfirmPolicy,
 ) -> Result<Confirmed, SubmitError> {
+    send_and_confirm_after(rpc, transaction, last_valid_block_height, policy, None).await
+}
+
+/// How long a send naming a minimum slot is repeated while the node answers
+/// that it has not reached it. A constant of the binary, not a config key,
+/// and well inside a blockhash's lifetime (~60-90s), so the same signed bytes
+/// are still valid for as long as they are re-sent.
+pub(crate) const BEHIND_FOR: Duration = Duration::from_secs(20);
+
+/// The waits between repeats of a send the node is too far behind to take:
+/// doubling from 250ms, capped at 2s.
+const BEHIND_BACKOFF_START: Duration = Duration::from_millis(250);
+const BEHIND_BACKOFF_CAP: Duration = Duration::from_secs(2);
+
+/// [`send_and_confirm`], with the first send naming `min_context_slot` when
+/// it is `Some`: the slot of a transaction of this node's own that this one
+/// depends on. Preflight stays on, so the node simulates from that slot or
+/// later. A node that answers it has not reached the slot is waited out for
+/// [`BEHIND_FOR`], the same signed bytes sent again each time, and then
+/// reported as [`SubmitError::Behind`].
+pub(crate) async fn send_and_confirm_after(
+    rpc: &RpcClient,
+    transaction: &impl SerializableTransaction,
+    last_valid_block_height: u64,
+    policy: ConfirmPolicy,
+    min_context_slot: Option<u64>,
+) -> Result<Confirmed, SubmitError> {
     // The fee payer's signature: every caller has signed as fee payer
     // before it gets here.
     let signature = *transaction.get_signature();
@@ -137,24 +176,41 @@ pub(crate) async fn send_and_confirm(
         skip_preflight: false,
         preflight_commitment: Some(CommitmentLevel::Confirmed),
         encoding: Some(UiTransactionEncoding::Base64),
+        min_context_slot,
         ..RpcSendTransactionConfig::default()
     };
-    let mut acknowledged = match rpc
-        .send_transaction_with_config(transaction, first_send)
-        .await
-    {
-        Ok(_) => true,
-        Err(error) if answered(&error) => {
-            return Err(SubmitError::Refused {
-                signature,
-                reason: error.to_string(),
-            })
+    let behind_since = Instant::now();
+    let mut behind_wait = BEHIND_BACKOFF_START;
+    let mut acknowledged = loop {
+        match rpc
+            .send_transaction_with_config(transaction, first_send)
+            .await
+        {
+            Ok(_) => break true,
+            Err(error) if is_min_context_slot_not_reached(&error) => {
+                let slot = min_context_slot.unwrap_or_default();
+                if behind_since.elapsed() + behind_wait >= BEHIND_FOR {
+                    return Err(SubmitError::Behind {
+                        signature,
+                        min_context_slot: slot,
+                        waited_secs: behind_since.elapsed().as_secs(),
+                    });
+                }
+                tokio::time::sleep(behind_wait).await;
+                behind_wait = behind_wait.saturating_mul(2).min(BEHIND_BACKOFF_CAP);
+            }
+            Err(error) if answered(&error) => {
+                return Err(SubmitError::Refused {
+                    signature,
+                    reason: error.to_string(),
+                })
+            }
+            // The answer was lost, not given: the node may have the
+            // transaction. Poll for it exactly as if it had said yes, and
+            // re-send the same signed bytes until it has; re-sending one
+            // signature cannot run it twice.
+            Err(_) => break false,
         }
-        // The answer was lost, not given: the node may have the
-        // transaction. Poll for it exactly as if it had said yes, and
-        // re-send the same signed bytes until it has; re-sending one
-        // signature cannot run it twice.
-        Err(_) => false,
     };
 
     // The last time any read answered. `Unknown` is measured from here, so
@@ -574,6 +630,96 @@ mod tests {
             .await
             .expect("a lost answer is not a failed send");
         assert!(resent.load(Ordering::SeqCst) >= 1);
+    }
+
+    fn not_reached() -> RpcReply {
+        RpcReply::Error {
+            code: solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED,
+            message: "Minimum context slot has not been reached".to_string(),
+        }
+    }
+
+    /// The configs of every `sendTransaction` a node was sent.
+    fn send_configs(rpc: &FakeRpc) -> Vec<serde_json::Value> {
+        rpc.calls()
+            .into_iter()
+            .filter(|call| call.method == "sendTransaction")
+            .map(|call| call.params[1].clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_send_that_names_no_slot_names_no_min_context_slot_on_the_wire() {
+        let transaction = signed_transaction();
+        let rpc = node(
+            transaction.signatures[0],
+            accepted,
+            |_| status(None, "confirmed"),
+            below_deadline,
+        )
+        .await;
+
+        send_and_confirm(&client(&rpc), &transaction, LAST_VALID, FAST)
+            .await
+            .expect("confirmed");
+        let configs = send_configs(&rpc);
+        assert_eq!(configs.len(), 1);
+        // The SDK serializes an unset option as `null`, as it does `maxRetries`.
+        assert!(configs[0]["minContextSlot"].is_null(), "{configs:?}");
+    }
+
+    #[tokio::test]
+    async fn a_node_behind_the_named_slot_is_waited_out_with_the_same_bytes_and_preflight_on() {
+        let transaction = signed_transaction();
+        let rpc = node(
+            transaction.signatures[0],
+            |call| {
+                if call.nth < 2 {
+                    not_reached()
+                } else {
+                    accepted(call)
+                }
+            },
+            |_| status(None, "confirmed"),
+            below_deadline,
+        )
+        .await;
+
+        send_and_confirm_after(&client(&rpc), &transaction, LAST_VALID, FAST, Some(77))
+            .await
+            .expect("a node that catches up takes the send");
+        let sends: Vec<_> = rpc
+            .calls()
+            .into_iter()
+            .filter(|call| call.method == "sendTransaction")
+            .collect();
+        assert_eq!(sends.len(), 3);
+        for call in &sends {
+            assert_eq!(call.params[0], sends[0].params[0], "the same signed bytes");
+            assert_eq!(call.params[1]["minContextSlot"], json!(77));
+            assert_eq!(call.params[1]["skipPreflight"], json!(false));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_that_stays_behind_is_reported_behind_not_refused() {
+        let transaction = signed_transaction();
+        let rpc = node(
+            transaction.signatures[0],
+            |_| not_reached(),
+            |_| panic!("a send that was never taken has nothing to poll for"),
+            below_deadline,
+        )
+        .await;
+
+        let error = send_and_confirm_after(&client(&rpc), &transaction, LAST_VALID, FAST, Some(77))
+            .await
+            .expect_err("the node never caught up");
+        let text = error.to_string();
+        assert!(matches!(error, SubmitError::Behind { .. }), "{error:?}");
+        assert!(text.contains("never broadcast"), "{text}");
+        assert!(text.contains("behind slot 77"), "{text}");
+        assert!(text.contains("retrying is safe"), "{text}");
     }
 
     #[tokio::test]

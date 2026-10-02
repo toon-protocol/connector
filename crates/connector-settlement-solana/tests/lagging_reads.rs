@@ -218,12 +218,14 @@ async fn sponsor_endpoint(receiver: Arc<SolanaBatchSettlement>, payer_lag: Lag) 
 }
 
 struct World {
+    min_grace_period_secs: u64,
     validator: SolanaValidator,
     rpc: RpcClient,
     mint: Pubkey,
     payer: Arc<SolanaBatchSettlement>,
     payer_fake: FakeRpc,
     payer_lag: Lag,
+    payer_sends: SendPlan,
     receiver: Arc<SolanaBatchSettlement>,
     receiver_fake: FakeRpc,
     receiver_lag: Lag,
@@ -231,6 +233,12 @@ struct World {
 }
 
 async fn world() -> World {
+    world_admitting(ONE_DAY).await
+}
+
+/// A world whose receiver admits a `grace_period` of at least
+/// `min_grace_period_secs`.
+async fn world_admitting(min_grace_period_secs: u64) -> World {
     let validator = SolanaValidator::spawn().await;
     let rpc =
         RpcClient::new_with_commitment(validator.rpc_url.clone(), CommitmentConfig::confirmed());
@@ -244,16 +252,30 @@ async fn world() -> World {
     mint_to(&rpc, &authority, &mint, &payer_key.pubkey(), 1_000_000).await;
 
     let (payer_lag, receiver_lag) = (Lag::default(), Lag::default());
-    let payer_fake = FakeRpc::spawn_in_front_of(&validator.rpc_url, payer_lag.script()).await;
+    let payer_sends = SendPlan::new();
+    let (reads, sends) = (payer_lag.script(), payer_sends.script());
+    let payer_fake =
+        FakeRpc::spawn_in_front_of(&validator.rpc_url, move |call| match sends(call) {
+            RpcReply::Forward => reads(call),
+            answer => answer,
+        })
+        .await;
     let receiver_fake = FakeRpc::spawn_in_front_of(&validator.rpc_url, receiver_lag.script()).await;
     let connect = |fake: &FakeRpc, key: &Keypair| {
         let transport = RpcTransport::direct(&fake.url()).expect("transport");
         let seed = seed_of(key);
         async move {
             Arc::new(
-                SolanaBatchSettlement::connect(&transport, &seed, mint, 6, ONE_DAY, 1)
-                    .await
-                    .expect("connect"),
+                SolanaBatchSettlement::connect(
+                    &transport,
+                    &seed,
+                    mint,
+                    6,
+                    min_grace_period_secs,
+                    1,
+                )
+                .await
+                .expect("connect"),
             )
         }
     };
@@ -262,12 +284,14 @@ async fn world() -> World {
     assert_eq!(payer.settlement_key(), payer_key.pubkey());
     let sponsor = sponsor_endpoint(Arc::clone(&receiver), payer_lag.clone()).await;
     World {
+        min_grace_period_secs,
         validator,
         rpc,
         mint,
         payer,
         payer_fake,
         payer_lag,
+        payer_sends,
         receiver,
         receiver_fake,
         receiver_lag,
@@ -281,7 +305,7 @@ impl World {
             sponsor: self.receiver.sponsor().to_bytes(),
             receiver: self.receiver.receiver().to_bytes(),
             mint: self.mint.to_bytes(),
-            min_grace_period_secs: ONE_DAY,
+            min_grace_period_secs: self.min_grace_period_secs,
             min_deposit: 1,
             sponsor_endpoint: self.sponsor.url.clone(),
         })
@@ -566,4 +590,238 @@ async fn a_payer_that_never_sees_the_account_keeps_the_channel_and_adopts_it_lat
     w.payer.open_prepared(&record).await.expect("adopted");
     assert_eq!(*w.sponsor.posts.lock().unwrap(), posts, "no second post");
     w.payer.outbound_state(&channel).await.expect("recorded");
+}
+
+/// What the payer's endpoint does with the `sendTransaction`s that follow
+/// the `seal` of a `finish_withdrawal`: the first send after arming is the
+/// `seal` and is always forwarded.
+#[derive(Clone, Copy, PartialEq)]
+enum Behind {
+    Healthy,
+    Once,
+    Always,
+}
+
+#[derive(Clone)]
+struct SendPlan(Arc<Mutex<(Option<Behind>, usize, bool)>>);
+
+impl SendPlan {
+    fn new() -> SendPlan {
+        SendPlan(Arc::new(Mutex::new((None, 0, false))))
+    }
+
+    fn arm(&self, mode: Behind) {
+        *self.0.lock().unwrap() = (Some(mode), 0, false);
+    }
+
+    fn script(&self) -> impl Fn(&RpcCall) -> RpcReply + Send + Sync + 'static {
+        let plan = Arc::clone(&self.0);
+        move |call| {
+            if call.method != "sendTransaction" {
+                return RpcReply::Forward;
+            }
+            let mut plan = plan.lock().unwrap();
+            let Some(mode) = plan.0 else {
+                return RpcReply::Forward;
+            };
+            plan.1 += 1;
+            match (plan.1, mode) {
+                (1, _) | (_, Behind::Healthy) => RpcReply::Forward,
+                (_, Behind::Always) => not_reached(),
+                (_, Behind::Once) if !plan.2 => {
+                    plan.2 = true;
+                    not_reached()
+                }
+                (_, Behind::Once) => RpcReply::Forward,
+            }
+        }
+    }
+}
+
+async fn token_balance(rpc: &RpcClient, owner: &Pubkey, mint: &Pubkey) -> u64 {
+    let ata = spl_associated_token_account::get_associated_token_address(owner, mint);
+    match rpc.get_token_account_balance(&ata).await {
+        Ok(balance) => balance.amount.parse().expect("an amount"),
+        Err(_) => 0,
+    }
+}
+
+fn sends_to(fake: &FakeRpc) -> Vec<RpcCall> {
+    fake.calls()
+        .into_iter()
+        .filter(|call| call.method == "sendTransaction")
+        .collect()
+}
+
+impl World {
+    /// A channel whose withdrawal is pending and whose grace period (one
+    /// second) has run, with the payer's balance before it is finished.
+    async fn closing(&self) -> (ChannelId, u64) {
+        let (channel, _) = self.open().await;
+        self.payer.start_withdrawal(&channel).await.expect("close");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        (channel, self.payer_tokens().await)
+    }
+
+    async fn payer_tokens(&self) -> u64 {
+        token_balance(&self.rpc, &self.payer.settlement_key(), &self.mint).await
+    }
+
+    /// The slot a send the payer's endpoint was given landed in.
+    async fn slot_of(&self, call: &RpcCall) -> u64 {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(call.params[0].as_str().expect("base64 transaction"))
+            .expect("base64");
+        let transaction: VersionedTransaction =
+            bincode::deserialize(&bytes).expect("a transaction");
+        self.rpc
+            .get_signature_statuses(&[transaction.signatures[0]])
+            .await
+            .expect("statuses")
+            .value
+            .remove(0)
+            .expect("the transaction landed")
+            .slot
+    }
+}
+
+#[tokio::test]
+async fn the_distribute_after_a_confirmed_seal_names_the_slot_the_seal_landed_in() {
+    if !require_solana_test_validator() {
+        return;
+    }
+    let w = world_admitting(1).await;
+    let (channel, before) = w.closing().await;
+    let first = sends_to(&w.payer_fake).len();
+    w.payer_sends.arm(Behind::Healthy);
+    w.payer.finish_withdrawal(&channel).await.expect("finish");
+    assert_eq!(w.payer_tokens().await - before, DEPOSIT as u64);
+
+    let sends = sends_to(&w.payer_fake)[first..].to_vec();
+    assert_eq!(sends.len(), 2, "a seal, then a distribute");
+    let seal_slot = w.slot_of(&sends[0]).await;
+    assert!(sends[0].params[1]["minContextSlot"].is_null());
+    assert_eq!(sends[1].params[1]["minContextSlot"], seal_slot);
+    assert_eq!(sends[1].params[1]["skipPreflight"], false);
+}
+
+#[tokio::test]
+async fn a_distribute_send_answered_minimum_context_slot_not_reached_once_is_repeated() {
+    if !require_solana_test_validator() {
+        return;
+    }
+    let w = world_admitting(1).await;
+    let (channel, before) = w.closing().await;
+    let first = sends_to(&w.payer_fake).len();
+    w.payer_sends.arm(Behind::Once);
+    let state = w.payer.finish_withdrawal(&channel).await.expect("finish");
+    assert_eq!(state.on_chain.status, BatchChannelStatus::Sealed);
+    assert_eq!(w.payer_tokens().await - before, DEPOSIT as u64);
+
+    let sends = sends_to(&w.payer_fake)[first..].to_vec();
+    assert_eq!(
+        sends.len(),
+        3,
+        "a seal, a distribute turned away, the same again"
+    );
+    assert_eq!(
+        sends[1].params[0], sends[2].params[0],
+        "the same signed bytes"
+    );
+    assert_eq!(sends[1].params[1], sends[2].params[1]);
+}
+
+#[tokio::test]
+async fn a_node_that_never_reaches_the_seals_slot_fails_naming_it_and_tries_one_treasury_owner() {
+    if !require_solana_test_validator() {
+        return;
+    }
+    let w = world_admitting(1).await;
+    let (channel, before) = w.closing().await;
+    let first = sends_to(&w.payer_fake).len();
+    w.payer_sends.arm(Behind::Always);
+    let started = std::time::Instant::now();
+    let error = w
+        .payer
+        .finish_withdrawal(&channel)
+        .await
+        .expect_err("the node never caught up")
+        .to_string();
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    assert!(error.contains("seal confirmed"), "{error}");
+    assert!(error.contains("behind"), "{error}");
+    assert!(error.contains("retrying is safe"), "{error}");
+    assert!(!error.contains("simulation"), "{error}");
+
+    let sends = sends_to(&w.payer_fake)[first..].to_vec();
+    assert!(sends.len() > 2, "the distribute was repeated");
+    let mut owners: Vec<_> = sends[1..]
+        .iter()
+        .map(|call| call.params[0].clone())
+        .collect();
+    owners.dedup();
+    assert_eq!(
+        owners.len(),
+        1,
+        "one treasury owner, one signed transaction"
+    );
+    assert_eq!(w.payer_tokens().await, before, "nothing was paid out");
+
+    // The seal landed, so a repeat over a healthy endpoint distributes the
+    // channel it finds Sealed, with no slot to name.
+    w.payer_sends.arm(Behind::Healthy);
+    let first = sends_to(&w.payer_fake).len();
+    w.payer.finish_withdrawal(&channel).await.expect("finish");
+    assert_eq!(w.payer_tokens().await - before, DEPOSIT as u64);
+    let sends = sends_to(&w.payer_fake)[first..].to_vec();
+    assert!(sends[0].params[1]["minContextSlot"].is_null());
+}
+
+#[tokio::test]
+async fn a_validator_answers_a_send_naming_a_slot_it_has_not_reached_and_does_not_land_it() {
+    if !require_solana_test_validator() {
+        return;
+    }
+    use solana_rpc_client_api::config::RpcSendTransactionConfig;
+    use solana_sdk::transaction::Transaction;
+    let validator = SolanaValidator::spawn().await;
+    let rpc =
+        RpcClient::new_with_commitment(validator.rpc_url.clone(), CommitmentConfig::confirmed());
+    let payer = Keypair::new();
+    fund(&rpc, &payer.pubkey()).await;
+    let transaction = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer.pubkey(),
+            &Keypair::new().pubkey(),
+            1,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer],
+        rpc.get_latest_blockhash().await.expect("blockhash"),
+    );
+    let slot = rpc.get_slot().await.expect("slot");
+    let error = rpc
+        .send_transaction_with_config(
+            &transaction,
+            RpcSendTransactionConfig {
+                skip_preflight: false,
+                min_context_slot: Some(slot + 1_000_000),
+                ..RpcSendTransactionConfig::default()
+            },
+        )
+        .await
+        .expect_err("the validator has not reached that slot");
+    assert!(
+        connector_chain_rpc::solana::is_min_context_slot_not_reached(&error),
+        "{error}"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let status = rpc
+        .get_signature_statuses(&[transaction.signatures[0]])
+        .await
+        .expect("statuses")
+        .value
+        .remove(0);
+    assert!(status.is_none(), "it was never broadcast: {status:?}");
 }
