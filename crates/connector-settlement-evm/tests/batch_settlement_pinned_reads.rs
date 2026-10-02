@@ -13,7 +13,7 @@ use std::sync::Arc;
 use connector_chain_rpc::{FakeRpc, RpcReply};
 use connector_settlement::batch::{
     BatchChannelStatus, BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer,
-    ChannelPresentation, EvmReceiverTerms, ReceiverTerms,
+    EvmReceiverTerms, ReceiverTerms,
 };
 use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
@@ -243,7 +243,12 @@ async fn an_open_survives_an_endpoint_that_lacks_the_block_once() {
         .await
         .expect("open");
     let channel = opened.presentation.channel().clone();
-    assert!(lagging.pinned_blocks().len() >= 2, "the read was repeated");
+    let head = lagging.head().await;
+    assert_eq!(
+        lagging.pinned_blocks(),
+        vec![head, head],
+        "the read was repeated at the deposit's block"
+    );
     lagging
         .payer
         .sign_voucher(&channel, 1_000)
@@ -392,8 +397,4 @@ async fn a_start_withdrawal_whose_block_never_arrives_backs_nothing() {
             "{refused:?}"
         );
     }
-    assert!(matches!(
-        opened.presentation,
-        ChannelPresentation::Evm { .. }
-    ));
 }

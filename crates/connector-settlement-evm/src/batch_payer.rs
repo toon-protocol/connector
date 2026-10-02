@@ -410,21 +410,14 @@ impl EvmBatchSettlementBackend {
         config: &EvmChannelConfig,
         confirmed: Option<(&str, &TransactionReceipt)>,
     ) -> Result<OutboundChannelState, BatchSettlementError> {
-        let (snapshot, state) = match confirmed {
-            None => self.observe_outbound(channel, config).await?,
-            Some((what, receipt)) => {
-                let snapshot = self
-                    .snapshot_after(admitted_id(channel)?, receipt)
-                    .await
-                    .map_err(|error| unread_after_write(what, error))?;
-                let signed = self.require_outbound(channel)?.signed;
-                let state = OutboundChannelState {
-                    on_chain: self.state(channel, config, &snapshot),
-                    signed,
-                };
-                (snapshot, state)
-            }
+        let snapshot = match confirmed {
+            None => self.snapshot(admitted_id(channel)?).await?,
+            Some((what, receipt)) => self
+                .snapshot_after(admitted_id(channel)?, receipt)
+                .await
+                .map_err(|error| unread_after_write(what, error))?,
         };
+        let state = self.outbound_from(channel, config, &snapshot)?;
         self.record_backing(channel, backing(&snapshot));
         Ok(state)
     }
@@ -436,12 +429,22 @@ impl EvmBatchSettlementBackend {
         config: &EvmChannelConfig,
     ) -> Result<(Snapshot, OutboundChannelState), BatchSettlementError> {
         let snapshot = self.snapshot(admitted_id(channel)?).await?;
-        let signed = self.require_outbound(channel)?.signed;
-        let state = OutboundChannelState {
-            on_chain: self.state(channel, config, &snapshot),
-            signed,
-        };
+        let state = self.outbound_from(channel, config, &snapshot)?;
         Ok((snapshot, state))
+    }
+
+    /// `snapshot` of `channel` as this node reports it.
+    fn outbound_from(
+        &self,
+        channel: &ChannelId,
+        config: &EvmChannelConfig,
+        snapshot: &Snapshot,
+    ) -> Result<OutboundChannelState, BatchSettlementError> {
+        let signed = self.require_outbound(channel)?.signed;
+        Ok(OutboundChannelState {
+            on_chain: self.state(channel, config, snapshot),
+            signed,
+        })
     }
 
     /// A `start_withdrawal` or `finish_withdrawal` send failed with `error`:
@@ -892,13 +895,10 @@ impl BatchSettlementPayer for EvmBatchSettlementBackend {
                 }
             }
         }
-        match &confirmed {
-            Some(receipt) => {
-                self.read_outbound(channel, &config, Some(("initiateWithdraw", receipt)))
-                    .await
-            }
-            None => self.read_outbound(channel, &config, None).await,
-        }
+        let confirmed = confirmed
+            .as_ref()
+            .map(|receipt| ("initiateWithdraw", receipt));
+        self.read_outbound(channel, &config, confirmed).await
     }
 
     /// `finalizeWithdraw`, once the chain's clock has passed
