@@ -119,3 +119,49 @@ async fn a_send_on_a_session_whose_socket_died_fails_at_once_rather_than_waiting
         "expected SessionGone, got {sent:?}"
     );
 }
+
+/// Issue #1454: accepts one websocket, reads the first frame, and closes
+/// without answering it.
+async fn a_peer_that_reads_then_closes() -> Url {
+    use futures_util::StreamExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+    let endpoint = Url::parse(&format!(
+        "ws://{}/ilp/btp",
+        listener.local_addr().expect("bound")
+    ))
+    .expect("a well-formed endpoint");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("the dial arrives");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("the websocket handshake completes");
+        let _ = socket.next().await;
+        drop(socket);
+    });
+    endpoint
+}
+
+/// A frame written into a session that then closes is answered at the close
+/// with `ClosedBeforeAnswer` -- neither `SessionGone` (which says it was
+/// never written, and licenses a resend) nor a wait out `Timeout`.
+async fn assert_closes_answer_a_waiting_send(dialer: TungsteniteDialer) {
+    let endpoint = a_peer_that_reads_then_closes().await;
+    let handle = dialer
+        .dial("peer-b", &endpoint)
+        .await
+        .expect("the peer is listening");
+
+    let sent = tokio::time::timeout(PROMPTLY, handle.send_message(&[], b"not a packet"))
+        .await
+        .expect("the close answers the waiting send");
+
+    assert!(
+        matches!(sent, Err(OriginateError::ClosedBeforeAnswer)),
+        "expected ClosedBeforeAnswer, got {sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_ask_only_session_answers_a_waiting_send_when_its_socket_closes() {
+    assert_closes_answer_a_waiting_send(TungsteniteDialer::new()).await;
+}

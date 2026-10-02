@@ -69,7 +69,17 @@ pub const OUTBOUND_ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`reserve`](Self::reserve) to originate a request.
 pub struct OutboundRequests {
     next_id: AtomicU32,
-    pending: Mutex<HashMap<u32, oneshot::Sender<BtpFrame>>>,
+    pending: Mutex<Pending>,
+}
+
+/// The reservations still waiting, and whether the session has closed under
+/// them. `closed` is what keeps a reservation made *after*
+/// [`OutboundRequests::close`] from waiting for an answer nothing is left to
+/// deliver.
+#[derive(Default)]
+struct Pending {
+    waiting: HashMap<u32, oneshot::Sender<BtpFrame>>,
+    closed: bool,
 }
 
 impl Default for OutboundRequests {
@@ -86,7 +96,7 @@ impl OutboundRequests {
             // overlap with the low ids a client's own counter is likely to
             // pick, and this session's ids are free to start anywhere.
             next_id: AtomicU32::new(1),
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(Pending::default()),
         }
     }
 
@@ -99,10 +109,14 @@ impl OutboundRequests {
         let (tx, rx) = oneshot::channel();
         let mut pending = self.pending.lock().expect("not poisoned");
         let mut id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        while pending.contains_key(&id) {
+        while pending.waiting.contains_key(&id) {
             id = self.next_id.fetch_add(1, Ordering::Relaxed);
         }
-        pending.insert(id, tx);
+        // A closed session answers at once (no wait for the timeout): dropping the sender is what
+        // `await_answer` reads as "closed under the request".
+        if !pending.closed {
+            pending.waiting.insert(id, tx);
+        }
         (id, rx)
     }
 
@@ -116,6 +130,7 @@ impl OutboundRequests {
             .pending
             .lock()
             .expect("not poisoned")
+            .waiting
             .remove(&frame.request_id);
         match sender {
             Some(sender) => {
@@ -131,7 +146,22 @@ impl OutboundRequests {
         self.pending
             .lock()
             .expect("not poisoned")
+            .waiting
             .remove(&request_id);
+    }
+
+    /// The session's read loop ended: answer every request still waiting on
+    /// it, now, with [`OriginateError::ClosedBeforeAnswer`] rather than
+    /// leaving each to run out [`OUTBOUND_ANSWER_TIMEOUT`]. Whatever is
+    /// reserved afterwards is answered the same way.
+    ///
+    /// A carriage whose session can end calls this when its read loop does:
+    /// the cached handle keeps this table alive, so nothing else would ever
+    /// drop the waiting senders.
+    pub fn close(&self) {
+        let mut pending = self.pending.lock().expect("not poisoned");
+        pending.closed = true;
+        pending.waiting.clear();
     }
 }
 
@@ -143,6 +173,12 @@ pub enum OriginateError {
     /// The request was written but no RESPONSE/ERROR arrived within
     /// [`OUTBOUND_ANSWER_TIMEOUT`].
     Timeout,
+    /// The request was written and the session closed before it was
+    /// answered ([`OutboundRequests::close`]). Like [`Self::Timeout`], the
+    /// far side may have acted on the frame, so a caller must not send it
+    /// again; unlike it, this is known at the close rather than after the
+    /// wait.
+    ClosedBeforeAnswer,
 }
 
 /// A handle a session hands out for originating a MESSAGE or TRANSFER on
@@ -176,7 +212,7 @@ impl BtpSessionHandle {
         }
         match tokio::time::timeout(OUTBOUND_ANSWER_TIMEOUT, rx).await {
             Ok(Ok(frame)) => Ok(frame),
-            Ok(Err(_)) => Err(OriginateError::SessionGone),
+            Ok(Err(_)) => Err(OriginateError::ClosedBeforeAnswer),
             Err(_) => {
                 self.outbound.cancel(request_id);
                 Err(OriginateError::Timeout)
@@ -187,8 +223,8 @@ impl BtpSessionHandle {
     /// Whether this session is dead: its writer is gone, so nothing more
     /// can be written on it and nothing more can ever answer.
     ///
-    /// The counterpart of [`OriginateError::SessionGone`], readable
-    /// *before* a caller commits a frame to it. A carriage that caches a
+    /// Readable *before* a caller commits a frame to it, which
+    /// [`OriginateError::SessionGone`] only is after. A carriage that caches a
     /// session across packets -- the peer carriage's dial side does -- needs
     /// that: a peer's restart leaves a handle behind whose session died with
     /// the socket, and answering `T01` off it rather than redialling is

@@ -1144,6 +1144,128 @@ async fn a_packet_after_the_far_side_restarts_is_redialled_rather_than_refused()
     );
 }
 
+// ─── issue #1454: a session that closes after the frame was written ───
+
+/// A payee whose first session reads a frame and then closes without
+/// answering it, and whose later sessions answer everything. Every frame
+/// any session read is counted, so a test can say how many copies of one
+/// PREPARE the peer received across all of them.
+struct ClosesAfterReading {
+    received: Arc<AtomicUsize>,
+    dials: AtomicUsize,
+}
+
+#[async_trait]
+impl PeerDialer for ClosesAfterReading {
+    async fn dial(&self, _peer_id: &str, _endpoint: &Url) -> Result<BtpSessionHandle, DialError> {
+        let first = self.dials.fetch_add(1, Ordering::SeqCst) == 0;
+        let (to_peer, mut to_peer_rx) = mpsc::channel::<Vec<u8>>(32);
+        let outbound = Arc::new(OutboundRequests::new());
+        let handle = BtpSessionHandle::new(to_peer, Arc::clone(&outbound));
+        let received = Arc::clone(&self.received);
+        tokio::spawn(async move {
+            while let Some(bytes) = to_peer_rx.recv().await {
+                received.fetch_add(1, Ordering::SeqCst);
+                let frame = decode_frame(&bytes).expect("our own encoder");
+                if first {
+                    // The read loop ends: what `ws` does on a closed socket.
+                    drop(to_peer_rx);
+                    outbound.close();
+                    return;
+                }
+                let answer = encode_response(frame.request_id, &[], &[]);
+                let _ = outbound.resolve(decode_frame(&answer).expect("our own encoder"));
+            }
+        });
+        Ok(handle)
+    }
+}
+
+/// **Issue #1454.** A frame written into a session that then closes is
+/// rejected `T01` at the close, not at the answer timeout, and is **not**
+/// resent (§2.6): the peer may have acted on it. The next packet is carried
+/// on a fresh session.
+#[tokio::test]
+async fn a_frame_written_into_a_session_that_closes_is_rejected_t01_and_not_resent() {
+    let received = Arc::new(AtomicUsize::new(0));
+    let dialer = Arc::new(ClosesAfterReading {
+        received: Arc::clone(&received),
+        dials: AtomicUsize::new(0),
+    });
+    let transport = transport(Arc::clone(&dialer) as Arc<dyn PeerDialer>);
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(3),
+        transport.forward(PEER_ID, prepare("g.nowhere"), None),
+    )
+    .await
+    .expect("answered at the close, not at the answer timeout");
+    match first.response {
+        PacketResponse::Reject(reject) => {
+            assert_eq!(reject.code.as_str(), "T01");
+            assert!(reject.message.contains(PEER_ID));
+        }
+        other => panic!("expected T01, got {other:?}"),
+    }
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        1,
+        "the PREPARE reached the peer once, across every session"
+    );
+    assert_eq!(dialer.dials.load(Ordering::SeqCst), 1, "no second attempt");
+
+    let second = transport.forward(PEER_ID, prepare("g.nowhere"), None).await;
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        2,
+        "the next packet was written to the fresh session: {:?}",
+        second.response
+    );
+    assert_eq!(dialer.dials.load(Ordering::SeqCst), 2, "on a fresh session");
+}
+
+/// Issue #1454, the symmetric dialed session (the ask-only one is covered in
+/// `a_dialed_session_dies_with_its_socket`): over a real socket whose far end
+/// reads the frame and closes, the waiting send is answered at the close.
+#[tokio::test]
+async fn a_symmetric_session_answers_a_waiting_send_when_its_socket_closes() {
+    use futures_util::StreamExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a free port");
+    let endpoint = Url::parse(&format!(
+        "ws://{}/ilp/btp",
+        listener.local_addr().expect("bound")
+    ))
+    .expect("a well-formed endpoint");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("the dial arrives");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("the websocket handshake completes");
+        let _ = socket.next().await;
+        drop(socket);
+    });
+
+    let book = ChannelBook::new();
+    let handle = connector_peer_btp::TungsteniteDialer::serving(carriage(payee(), &book))
+        .dial(PEER_ID, &endpoint)
+        .await
+        .expect("the peer is listening");
+
+    let sent = tokio::time::timeout(
+        Duration::from_secs(3),
+        handle.send_message(&[], b"not a packet"),
+    )
+    .await
+    .expect("the close answers the waiting send");
+    assert_eq!(
+        sent.err(),
+        Some(connector_btp::OriginateError::ClosedBeforeAnswer)
+    );
+}
+
 // ─── §2.2: a peer that cannot be dialed ───
 
 /// §2.2: whether the remote exposes what we dial is not locally
