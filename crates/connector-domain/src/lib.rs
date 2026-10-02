@@ -48,8 +48,8 @@ pub use claim::{
     VoucherWatermark, Watermark, VOUCHER_WATERMARK_NONCE,
 };
 pub use condition::{
-    delivery_budget, forwarded_expiry, fulfillment_matches_condition, is_expired,
-    FORWARDING_MESSAGE_WINDOW,
+    delivery_budget, forward_wait_budget, forwarded_expiry, fulfillment_matches_condition,
+    is_expired, FORWARDING_MESSAGE_WINDOW,
 };
 pub use envelope::{EnvelopeError, EnvelopeRequest, EnvelopeResponse};
 pub use error::PacketError;
