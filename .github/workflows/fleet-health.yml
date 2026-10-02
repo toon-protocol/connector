@@ -83,9 +83,9 @@
 # to a node's bundle without saying how to tell whether it is serving is the
 # omission this file exists to refuse.
 #
-# Today that discovers ten containers: `connector` in each of the four node
+# Today that discovers eleven containers: `connector` in each of the four node
 # projects, `relay`, `store`, `gas-station`, `gateway`, the edge's `caddy`,
-# and the faucet.
+# the Onboarder (the x402 facilitator, `onboarder`), and the faucet.
 #
 # Two probe layers, because each catches what the other cannot:
 #
@@ -110,8 +110,9 @@
 #        - `relay-ws.devnet…/` → **426 Upgrade Required**, the honest liveness
 #          signal for a WebSocket-only endpoint (a 200 there would mean
 #          something other than the relay is answering)
-#        - `dvm.devnet…/health`, `gas.devnet…/health`, `faucet.devnet…/health`
-#          → 200 (each is the app behind the node, not its connector)
+#        - `dvm.devnet…/health`, `gas.devnet…/health`, `faucet.devnet…/health`,
+#          `onboard.devnet…/health` → 200 (each is the app behind the node, not
+#          its connector; the Onboarder is not a node and has no connector)
 #        - `gw.devnet…/` and a fresh random `<label>.gw.devnet…/` → **503**
 #          with `toon-gateway-reason: no_grant`: the gateway answered and
 #          dialled nobody, which is its healthy, empty state.
@@ -674,7 +675,7 @@ jobs:
                   fi
                 fi
                 ;;
-              relay|store|gas-station|gateway|faucet|caddy)
+              relay|store|gas-station|gateway|faucet|caddy|onboarder)
                 # Each of these defines a container HEALTHCHECK, read above,
                 # rather than having its probe restated here. Without one the
                 # probe is blind, and that is a failure, not a pass.
@@ -791,6 +792,7 @@ jobs:
           https://gw.$D/ 503 no_grant
           https://$LABEL.gw.$D/ 503 no_grant
           https://faucet.$D/health 200
+          https://onboard.$D/health 200
           EOF
           cat /tmp/public.tsv
 
@@ -1291,6 +1293,7 @@ jobs:
             echo "| \`gas\` | toon-protocol/gas-station | \`/root/gas-station\` |"
             echo "| \`gateway\` | toon-protocol/gateway | \`/root/gateway\` |"
             echo "| \`edge\` | toon-protocol/infra (\`edge/deploy\`) | \`/root/infra/edge\` |"
+            echo "| \`onboarder\` | toon-protocol/infra (\`onboarder/deploy\`) | \`/root/infra/onboarder\` |"
             echo "| \`linode-faucet\` | toon-protocol/connector (\`infra/linode-faucet\`), **hand-deployed, no timer** | \`/root/faucet-connector\` |"
             echo ""
             echo '```sh'
