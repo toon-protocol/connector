@@ -39,6 +39,7 @@ pub use sweep::{
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use connector_chain_rpc::{retry_read, solana::rpc_client, RpcTransport};
@@ -47,8 +48,13 @@ use connector_settlement::batch::{
     BatchSettlementError, ChannelPresentation, Voucher, VoucherSigner,
 };
 use connector_settlement::ChannelId;
+use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client::rpc_client::RpcClientConfig;
+use solana_rpc_client_api::client_error::ErrorKind;
+use solana_rpc_client_api::config::RpcAccountInfoConfig;
+use solana_rpc_client_api::request::RpcError;
+use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::program_pack::Pack;
@@ -56,7 +62,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
 
-use crate::submit::{send_and_confirm, ConfirmPolicy};
+use crate::submit::{send_and_confirm, ConfirmPolicy, Confirmed};
 
 /// The chain this backend answers for, in the port's spelling.
 const CHAIN: &str = "solana";
@@ -362,10 +368,15 @@ impl SolanaBatchSettlement {
         })
         .await
         .map_err(backend_error)?;
-        Ok(response
-            .value
+        Ok(self.channel_in(response.value))
+    }
+
+    /// The channel an account holds: owned by this program and parsing as a
+    /// `Channel`. The one owner check and the one `ChannelAccount::parse`.
+    fn channel_in(&self, account: Option<Account>) -> Option<wire::ChannelAccount> {
+        account
             .filter(|account| account.owner == self.program_id)
-            .and_then(|account| wire::ChannelAccount::parse(&account.data)))
+            .and_then(|account| wire::ChannelAccount::parse(&account.data))
     }
 
     /// [`read`](Self::read), with "nothing there" as the port's
@@ -378,6 +389,101 @@ impl SolanaBatchSettlement {
         self.read(address)
             .await?
             .ok_or_else(|| BatchSettlementError::ChannelNotFound(channel.clone()))
+    }
+
+    /// Read the channel at `address` the way [`read`](Self::read) does, for
+    /// a caller that has just seen `landed` confirm: the answer must come
+    /// from a slot no earlier than the one `landed` is in. Behind a
+    /// load-balanced endpoint a read can be answered by a node that has not
+    /// reached that slot, and would show the channel as it was before.
+    ///
+    /// The slot goes to the node as `minContextSlot`, and the answer's own
+    /// context slot is checked too, since a node that ignores the parameter
+    /// must not be trusted on the first check alone. Either kind of stale
+    /// answer is repeated for [`LAGGING_READ_BACKOFFS`] before it is
+    /// reported as [`ReadAfter::Behind`]. Any other failure is repeated for
+    /// as long, and reported as the last one.
+    async fn read_after(
+        &self,
+        address: &Pubkey,
+        landed: &Confirmed,
+    ) -> Result<Option<wire::ChannelAccount>, ReadAfter> {
+        let config = RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64),
+            commitment: Some(CommitmentConfig::confirmed()),
+            min_context_slot: Some(landed.slot),
+            ..RpcAccountInfoConfig::default()
+        };
+        let mut backoffs = LAGGING_READ_BACKOFFS.iter();
+        loop {
+            let failure = match self
+                .rpc
+                .get_account_with_config(address, config.clone())
+                .await
+            {
+                Ok(response) if response.context.slot >= landed.slot => {
+                    return Ok(self.channel_in(response.value))
+                }
+                Ok(_) => ReadAfter::Behind,
+                Err(error) if is_min_context_slot_not_reached(&error) => ReadAfter::Behind,
+                Err(error) => ReadAfter::Failed(backend_error(error)),
+            };
+            match backoffs.next() {
+                Some(wait) => tokio::time::sleep(*wait).await,
+                None => return Err(failure),
+            }
+        }
+    }
+
+    /// [`read_after`](Self::read_after), with "nothing there" as
+    /// [`ChannelNotFound`](BatchSettlementError::ChannelNotFound) and a node
+    /// that never reached the slot as an error saying the transaction
+    /// confirmed and its result could not be read yet.
+    async fn read_existing_after(
+        &self,
+        channel: &ChannelId,
+        address: &Pubkey,
+        landed: &Confirmed,
+    ) -> Result<wire::ChannelAccount, BatchSettlementError> {
+        self.read_after(address, landed)
+            .await
+            .map_err(|failure| failure.into_error(landed))?
+            .ok_or_else(|| BatchSettlementError::ChannelNotFound(channel.clone()))
+    }
+
+    /// Read the channel at `address` until an account shows, for a caller
+    /// with no transaction of its own to bind the read to. "No account" is
+    /// the only stale answer such a read can get, so repeating while it
+    /// finds none is sound here and nowhere else. `None` when none showed
+    /// within [`LAGGING_READ_BACKOFFS`].
+    async fn read_until_present(
+        &self,
+        address: &Pubkey,
+    ) -> Result<Option<wire::ChannelAccount>, BatchSettlementError> {
+        let mut backoffs = LAGGING_READ_BACKOFFS.iter();
+        loop {
+            let read = self.read(address).await?;
+            if read.is_some() {
+                return Ok(read);
+            }
+            match backoffs.next() {
+                Some(wait) => tokio::time::sleep(*wait).await,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Admit `account`, read at `address`: the half of
+    /// [`admit`](BatchSettlementBackend::admit) after the read.
+    fn admit_account(
+        &self,
+        channel: &ChannelId,
+        address: Pubkey,
+        account: &wire::ChannelAccount,
+    ) -> Result<BatchChannelState, BatchSettlementError> {
+        let state = self.vet(channel, &address, account)?;
+        self.admitted().insert(address);
+        Ok(state)
     }
 
     /// Judge the account read at `address` for admission: first that it is
@@ -409,6 +515,15 @@ impl SolanaBatchSettlement {
     /// Sign `instructions` with the sponsor key, as fee payer and as every
     /// signer they name, and wait for their outcome.
     async fn submit(&self, instructions: &[Instruction]) -> Result<(), BatchSettlementError> {
+        self.submit_confirmed(instructions).await.map(|_| ())
+    }
+
+    /// [`submit`](Self::submit), handing back the signature and the slot the
+    /// transaction landed in, for a caller that reads the chain after it.
+    async fn submit_confirmed(
+        &self,
+        instructions: &[Instruction],
+    ) -> Result<Confirmed, BatchSettlementError> {
         let (blockhash, last_valid_block_height) = retry_read(|| {
             self.rpc
                 .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
@@ -428,7 +543,6 @@ impl SolanaBatchSettlement {
             self.confirm,
         )
         .await
-        .map(|_signature| ())
         .map_err(backend_error)
     }
 
@@ -448,6 +562,60 @@ impl SolanaBatchSettlement {
         // A racing request may have set it first, to the same value.
         let _ = self.cluster_rent.set(rent.clone());
         Ok(rent)
+    }
+}
+
+/// How long a read that must not be older than a confirmed transaction (or
+/// that expects an account a sponsor says exists) is repeated: the waits
+/// between its attempts, 7.75s in all. A constant of the binary, not a config
+/// key. `retry_read`'s three retries over 3.5s are too short for a node that
+/// is a few slots behind, so a read bound to a slot repeats any failure for
+/// this long instead, and reports only an answer from before the slot as
+/// one that could not be read yet.
+const LAGGING_READ_BACKOFFS: [Duration; 6] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(2),
+    Duration::from_secs(2),
+];
+
+/// Why [`SolanaBatchSettlement::read_after`] gave no answer.
+enum ReadAfter {
+    /// Every attempt was answered from before the slot.
+    Behind,
+    /// The last attempt could not be answered at all.
+    Failed(BatchSettlementError),
+}
+
+impl ReadAfter {
+    fn into_error(self, landed: &Confirmed) -> BatchSettlementError {
+        match self {
+            ReadAfter::Behind => BatchSettlementError::Backend(format!(
+                "transaction {} confirmed in slot {}, but its result could not be read yet: the \
+                 RPC endpoint has not reached that slot",
+                landed.signature, landed.slot
+            )),
+            ReadAfter::Failed(error) => error,
+        }
+    }
+}
+
+/// The node's "minimum context slot has not been reached" answer (-32016).
+///
+/// `get_account_with_config` rewraps a failed call as a `Custom` error whose
+/// text carries the node's (`AccountNotFound: pubkey=..: RPC response error
+/// -32016: ..`), so the code is looked for there as well as in a typed
+/// response error. Both are what the pinned `solana-rpc-client` 2.1.0 gives.
+fn is_min_context_slot_not_reached(error: &solana_rpc_client_api::client_error::Error) -> bool {
+    const CODE: i64 =
+        solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED;
+    match error.kind() {
+        ErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => *code == CODE,
+        _ => error
+            .to_string()
+            .contains(&format!("RPC response error {CODE}")),
     }
 }
 
@@ -578,9 +746,7 @@ impl BatchSettlementBackend for SolanaBatchSettlement {
         };
         let address = address_of(&channel)?;
         let account = self.read_existing(&channel, &address).await?;
-        let state = self.vet(&channel, &address, &account)?;
-        self.admitted().insert(address);
-        Ok(state)
+        self.admit_account(&channel, address, &account)
     }
 
     /// [`admit`](BatchSettlementBackend::admit) without the admission rules:
@@ -701,9 +867,9 @@ impl BatchSettlementBackend for SolanaBatchSettlement {
                 &signature,
             )
         };
-        self.submit(&instructions).await?;
+        let landed = self.submit_confirmed(&instructions).await?;
 
-        let account = self.read_existing(channel, &address).await?;
+        let account = self.read_existing_after(channel, &address, &landed).await?;
         Ok(state_of(channel, &account))
     }
 }
@@ -922,6 +1088,44 @@ mod tests {
             assert_eq!(state.status, expected);
             assert_eq!(state.collateral, 0);
             assert_eq!(state.voucher_ceiling(), 300);
+        }
+    }
+
+    /// What the pinned client makes of a node's `-32016` to
+    /// `getAccountInfo`, and of any other error: only the first is an answer
+    /// from before the slot. The client rewraps the node's error as text, so
+    /// a client upgrade that changes that text must fail here, not turn
+    /// every lagging read into a plain failure.
+    #[tokio::test]
+    async fn a_min_context_slot_error_from_the_pinned_client_is_recognised() {
+        use connector_chain_rpc::{FakeRpc, RpcReply};
+
+        for (code, lagging) in [
+            (
+                solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED,
+                true,
+            ),
+            (-32005, false),
+        ] {
+            let fake = FakeRpc::spawn(move |_| RpcReply::Error {
+                code,
+                message: "no".to_string(),
+            })
+            .await;
+            let transport = RpcTransport::direct(&fake.url()).expect("transport");
+            let rpc = rpc_client(
+                &transport,
+                RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+            );
+            let config = RpcAccountInfoConfig {
+                min_context_slot: Some(1),
+                ..RpcAccountInfoConfig::default()
+            };
+            let error = rpc
+                .get_account_with_config(&Pubkey::new_unique(), config)
+                .await
+                .expect_err("the node answered an error");
+            assert_eq!(is_min_context_slot_not_reached(&error), lagging, "{error}");
         }
     }
 }
