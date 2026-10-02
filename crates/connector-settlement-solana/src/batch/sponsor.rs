@@ -73,7 +73,6 @@ use std::str::FromStr;
 use base64::Engine as _;
 use bincode::Options as _;
 use connector_chain_rpc::retry_read;
-use connector_settlement::batch::{BatchSettlementBackend, ChannelPresentation};
 use connector_settlement::ChannelId;
 use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -962,7 +961,7 @@ impl SolanaBatchSettlement {
         })
         .await
         .map_err(|error| SponsorRefusal::ChainUnavailable(error.to_string()))?;
-        let signature = send_and_confirm(
+        let landed = send_and_confirm(
             &self.rpc,
             &transaction,
             last_valid_block_height,
@@ -970,12 +969,19 @@ impl SolanaBatchSettlement {
         )
         .await
         .map_err(|error| SponsorRefusal::SubmissionFailed(error.to_string()))?;
+        let signature = landed.signature;
 
-        self.admit(ChannelPresentation::Solana {
-            channel: ChannelId(channel.to_string()),
-        })
-        .await
-        .map_err(|error| SponsorRefusal::NotAdmitted(error.to_string()))?;
+        // Read from the slot the open landed in, not from whichever node a
+        // load balancer picks: one a slot behind finds no account, and the
+        // refusal would name a channel that exists and whose rent this node
+        // has paid.
+        let id = ChannelId(channel.to_string());
+        let account = self
+            .read_existing_after(&id, &channel, &landed)
+            .await
+            .map_err(|error| SponsorRefusal::NotAdmitted(error.to_string()))?;
+        self.admit_account(&id, channel, &account)
+            .map_err(|error| SponsorRefusal::NotAdmitted(error.to_string()))?;
 
         Ok(SponsoredOpen {
             channel,

@@ -107,6 +107,15 @@ pub(crate) enum SubmitError {
     },
 }
 
+/// A transaction that landed and succeeded: its signature, and the slot it
+/// landed in. A read that follows it must not be answered from a slot before
+/// this one (`SolanaBatchSettlement::read_after`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Confirmed {
+    pub signature: Signature,
+    pub slot: u64,
+}
+
 /// Send `transaction` (already signed over a blockhash whose
 /// `lastValidBlockHeight` is `last_valid_block_height`) and wait until its
 /// outcome is known. See the module doc for the outcomes.
@@ -118,7 +127,7 @@ pub(crate) async fn send_and_confirm(
     transaction: &impl SerializableTransaction,
     last_valid_block_height: u64,
     policy: ConfirmPolicy,
-) -> Result<Signature, SubmitError> {
+) -> Result<Confirmed, SubmitError> {
     // The fee payer's signature: every caller has signed as fee payer
     // before it gets here.
     let signature = *transaction.get_signature();
@@ -156,7 +165,7 @@ pub(crate) async fn send_and_confirm(
     loop {
         let mut failed = false;
         match poll_status(rpc, &signature, false).await {
-            Ok(PollStatus::Confirmed) => return Ok(signature),
+            Ok(PollStatus::Confirmed(slot)) => return Ok(Confirmed { signature, slot }),
             Ok(PollStatus::Failed(error)) => return Err(SubmitError::Failed { signature, error }),
             Ok(PollStatus::Unseen) => last_answer = Instant::now(),
             Err(error) => {
@@ -179,7 +188,7 @@ pub(crate) async fn send_and_confirm(
                 // look fails, the loop comes round again rather than
                 // guessing.
                 match poll_status(rpc, &signature, true).await {
-                    Ok(PollStatus::Confirmed) => return Ok(signature),
+                    Ok(PollStatus::Confirmed(slot)) => return Ok(Confirmed { signature, slot }),
                     Ok(PollStatus::Failed(error)) => {
                         return Err(SubmitError::Failed { signature, error })
                     }
@@ -246,8 +255,8 @@ const EXPIRY_MARGIN: u64 = 20;
 
 /// What one status poll said.
 enum PollStatus {
-    /// Landed and succeeded, at `confirmed` or deeper.
-    Confirmed,
+    /// Landed and succeeded, at `confirmed` or deeper, in this slot.
+    Confirmed(u64),
     /// Landed and failed on chain.
     Failed(TransactionError),
     /// Not seen, or seen but not yet confirmed.
@@ -277,7 +286,7 @@ async fn poll_status(
         return Ok(PollStatus::Failed(error));
     }
     if status.satisfies_commitment(CommitmentConfig::confirmed()) {
-        return Ok(PollStatus::Confirmed);
+        return Ok(PollStatus::Confirmed(status.slot));
     }
     Ok(PollStatus::Unseen)
 }
@@ -414,7 +423,7 @@ mod tests {
         let signature = send_and_confirm(&client(&rpc), &transaction, LAST_VALID, FAST)
             .await
             .expect("the transaction landed, and failed polls must not say otherwise");
-        assert_eq!(signature, transaction.signatures[0]);
+        assert_eq!(signature.signature, transaction.signatures[0]);
     }
 
     #[tokio::test]
