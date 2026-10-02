@@ -14,8 +14,8 @@ use connector_config::{
 use connector_domain::x402::X402PaymentRequired;
 use connector_domain::{
     amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_fee, delivery_budget,
-    forwarded_expiry, is_expired, is_valid_ilp_address, select_route, AssetId, EnvelopeRequest,
-    Fulfill, PacketResponse, Prepare, Price, RateLookup, Reject, RejectCode,
+    forward_wait_budget, forwarded_expiry, is_expired, is_valid_ilp_address, select_route, AssetId,
+    EnvelopeRequest, Fulfill, PacketResponse, Prepare, Price, RateLookup, Reject, RejectCode,
     FORWARDING_MESSAGE_WINDOW,
 };
 use connector_settlement::ChannelId;
@@ -41,6 +41,7 @@ use crate::outbound_voucher::{
 use crate::peer_route_store::{
     PeerRouteStore, PeerRouteStoreError, RuntimePeerChannel, RuntimePeering, RuntimePeers,
 };
+use crate::peer_transport::PeerForward;
 use crate::peer_transport::{PeerRegistrar, PeerTransport};
 use crate::rate_table::SharedRateTable;
 use crate::route::{LeasedRoute, PeerRoute};
@@ -715,6 +716,15 @@ enum Arrival<'a> {
     /// the key's chain and not its id -- so a channel this node discovered
     /// on chain is denominated exactly like a declared one.
     ClientChannel(&'a str),
+}
+
+/// Why a forward could not be covered: it could not be signed, or the packet
+/// ran out of time before it could be (`packet-flow-spec.md` PF-26). The
+/// second names the wait it ran out in and is answered `R00`; the first is
+/// answered as it always was.
+enum CoverError {
+    Failed(String),
+    OutOfTime(&'static str),
 }
 
 /// One next hop this connector pays over its own outbound x402 channel
@@ -2571,6 +2581,19 @@ impl Connector {
     /// change: a shorter expiry needs no agreement from the peer receiving
     /// it.
     ///
+    /// # The packet's time is spent on every wait (PF-26)
+    ///
+    /// The outgoing expiry above is not checked once and forgotten. It
+    /// bounds the claim-state ask, the wait for the channel's signing turn
+    /// and the wait for the peer's answer -- on either carriage, through
+    /// [`connector_domain::forward_wait_budget`] -- and is read again at the
+    /// last point before a voucher (or challenge) is signed, so a packet
+    /// that ran out of time while this forward queued or asked is refused
+    /// `R00` with nothing signed. A wait that ended at the expiry is `R00`;
+    /// one that ended at the peering's answer timeout, with time left, is
+    /// `T01`. An answer that arrived inside the bound is relayed, whatever
+    /// the clock says afterwards.
+    ///
     /// # Covering (issue #881), and the retry arm beside it
     ///
     /// [`Connector::cover_forward`] signs for exactly this packet's own
@@ -2761,9 +2784,19 @@ impl Connector {
         // either: the voucher is journaled by `OutboundChannels`, and its
         // watermark authority on restore is the RECEIVER, asked over
         // `claim_state` (ADR 0075 decision 6).
-        let riding = match self.cover_forward(peer_id, forwarded_amount).await {
+        let riding = match self
+            .cover_forward(peer_id, forwarded_amount, outgoing_expires_at)
+            .await
+        {
             Ok(covering) => covering,
-            Err(reason) => {
+            Err(CoverError::OutOfTime(wait)) => {
+                return PacketResponse::Reject(self.out_of_time_reject(
+                    peer_id,
+                    outgoing_expires_at,
+                    wait,
+                ));
+            }
+            Err(CoverError::Failed(reason)) => {
                 tracing::warn!(
                     peer_id,
                     %reason,
@@ -2782,8 +2815,13 @@ impl Connector {
         let (riding, rode_amount) = riding;
         let rode_a_voucher = matches!(riding, Covering::Voucher(_));
         let mut answer = self
-            .peer_transport
-            .forward(peer_id, outgoing.clone(), Some(riding))
+            .forward_bounded(
+                peer_id,
+                outgoing.clone(),
+                riding,
+                outgoing_expires_at,
+                "the peer's answer",
+            )
             .await;
         if rode_a_voucher {
             self.note_voucher_outcome(
@@ -2795,36 +2833,56 @@ impl Connector {
         }
 
         if let Some(terms) = answer.payment_required.take() {
-            if let Some((covering, retry_amount)) = self.cover_greeted_packet(peer_id, &terms).await
+            match self
+                .cover_greeted_packet(peer_id, &terms, outgoing_expires_at)
+                .await
             {
-                tracing::info!(
-                    peer_id,
-                    price = terms.price().unwrap_or_default(),
-                    "covering a greeted forward and retrying it once"
-                );
-                let retried_a_voucher = matches!(covering, Covering::Voucher(_));
-                answer = self
-                    .peer_transport
-                    .forward(peer_id, outgoing, Some(covering))
-                    .await;
-                if retried_a_voucher {
-                    self.note_voucher_outcome(
+                // The retry ran out of time before it could be signed. The
+                // first answer was only a greeting, so this is the answer
+                // the sender gets, and no second voucher exists (PF-26).
+                Err(CoverError::OutOfTime(wait)) => {
+                    return PacketResponse::Reject(self.out_of_time_reject(
                         peer_id,
-                        retry_amount,
-                        answer.ack,
-                        matches!(answer.response, PacketResponse::Reject(_)),
-                    );
+                        outgoing_expires_at,
+                        wait,
+                    ));
                 }
-                // Bounded: whatever the retry answered is the answer. A
-                // second greeting is logged with its terms and relayed, not
-                // covered again.
-                if let Some(again) = &answer.payment_required {
-                    tracing::warn!(
+                Err(CoverError::Failed(_)) => {}
+                Ok((covering, retry_amount)) => {
+                    tracing::info!(
                         peer_id,
-                        price = again.price().unwrap_or_default(),
-                        resource = %again.resource.url,
-                        "peer demanded payment again after a covering claim -- not retrying"
+                        price = terms.price().unwrap_or_default(),
+                        "covering a greeted forward and retrying it once"
                     );
+                    let retried_a_voucher = matches!(covering, Covering::Voucher(_));
+                    answer = self
+                        .forward_bounded(
+                            peer_id,
+                            outgoing,
+                            covering,
+                            outgoing_expires_at,
+                            "the peer's answer to the retry",
+                        )
+                        .await;
+                    if retried_a_voucher {
+                        self.note_voucher_outcome(
+                            peer_id,
+                            retry_amount,
+                            answer.ack,
+                            matches!(answer.response, PacketResponse::Reject(_)),
+                        );
+                    }
+                    // Bounded: whatever the retry answered is the answer. A
+                    // second greeting is logged with its terms and relayed,
+                    // not covered again.
+                    if let Some(again) = &answer.payment_required {
+                        tracing::warn!(
+                            peer_id,
+                            price = again.price().unwrap_or_default(),
+                            resource = %again.resource.url,
+                            "peer demanded payment again after a covering claim -- not retrying"
+                        );
+                    }
                 }
             }
         }
@@ -2892,7 +2950,12 @@ impl Connector {
     /// 0075 decision 6), whether a runtime peering registered that channel
     /// (`register_voucher_hop`) or a `[[pay_channels]]` row did
     /// ([`Connector::with_config_pay_channel`]).
-    async fn cover_forward(&self, peer_id: &str, amount: u64) -> Result<(Covering, u128), String> {
+    async fn cover_forward(
+        &self,
+        peer_id: &str,
+        amount: u64,
+        outgoing_expires_at: DateTime<Utc>,
+    ) -> Result<(Covering, u128), CoverError> {
         let Some(hop) = self.outbound_voucher_hops.load().get(peer_id).cloned() else {
             // Nothing has armed this peering -- no `[[pay_channels]]` row
             // at boot, and no runtime peering (ADR 0058) -- so there is
@@ -2902,13 +2965,14 @@ impl Connector {
             // (`ConfigError::PayChannelUnbound`), so a file that loaded
             // cannot reach this; a leased or runtime-installed route (ADR
             // 0028) can, and is refused here rather than carried free.
-            return Err(format!(
+            return Err(CoverError::Failed(format!(
                 "no outbound channel is registered to pay peer '{peer_id}' on -- neither a \
                  '[[pay_channels]]' row nor a runtime peering (ADR 0058) has named one -- and a \
                  connector covers every PREPARE it sends (ADR 0042)"
-            ));
+            )));
         };
-        self.cover_with_voucher(peer_id, &hop, amount).await
+        self.cover_with_voucher(peer_id, &hop, amount, outgoing_expires_at)
+            .await
     }
 
     /// Cover a forward to `peer_id` over this node's own outbound x402
@@ -2936,34 +3000,66 @@ impl Connector {
         peer_id: &str,
         hop: &VoucherHop,
         amount: u64,
-    ) -> Result<(Covering, u128), String> {
+        outgoing_expires_at: DateTime<Utc>,
+    ) -> Result<(Covering, u128), CoverError> {
         let Some(outbound) = self.outbound_channels.as_ref() else {
-            return Err(format!(
+            return Err(CoverError::Failed(format!(
                 "peer '{peer_id}' is paid over x402 channel {} and this node has no x402 \
                  batch-settlement backend to sign on",
                 hop.channel_id
-            ));
+            )));
         };
         let Some(presentation) = outbound.presentation(&hop.channel_id) else {
-            return Err(format!(
+            return Err(CoverError::Failed(format!(
                 "peer '{peer_id}' is paid over x402 channel {}, which this node's outbound \
                  channel journal does not hold",
                 hop.channel_id
+            )));
+        };
+        // PF-26: every wait below ends at the packet's outgoing expiry, and
+        // the expiry is read again after each one, so a packet that ran out
+        // of time while this forward queued, asked, or both is refused
+        // before anything is signed.
+        let Some(budget) = self.wait_budget(outgoing_expires_at) else {
+            return Err(CoverError::OutOfTime("before the channel's signing turn"));
+        };
+        let Ok(_signing) = tokio::time::timeout(budget, hop.signing.lock()).await else {
+            return Err(CoverError::OutOfTime(
+                "waiting for the channel's signing turn",
             ));
         };
         let now = self.now_unix();
-        let _signing = hop.signing.lock().await;
         if !hop.synced.load(Ordering::Acquire) {
             let expires = now + PEER_CHALLENGE_TTL_SECS;
             let synced = match outbound.sign_challenge(&hop.channel_id, expires).await {
-                Ok(signature) => match hop
-                    .claim_state
-                    .watermark(&presentation, expires, &signature)
+                Ok(signature) => {
+                    let Some(budget) = self.wait_budget(outgoing_expires_at) else {
+                        return Err(CoverError::OutOfTime(
+                            "after waiting for the channel's signing turn",
+                        ));
+                    };
+                    match tokio::time::timeout(
+                        budget,
+                        hop.claim_state
+                            .watermark(&presentation, expires, &signature),
+                    )
                     .await
-                {
-                    Ok(remote) => self.apply_receivers_watermark(outbound, hop, remote).await,
-                    Err(reason) => Err(reason),
-                },
+                    {
+                        // The ask was given up at the packet's own expiry:
+                        // the forward is refused, not carried on without it.
+                        // (An ask that FAILS inside the budget is the arm
+                        // below, and the forward carries on.)
+                        Err(_) => {
+                            return Err(CoverError::OutOfTime(
+                                "asking the next hop where the channel's watermark stands",
+                            ));
+                        }
+                        Ok(Ok(remote)) => {
+                            self.apply_receivers_watermark(outbound, hop, remote).await
+                        }
+                        Ok(Err(reason)) => Err(reason),
+                    }
+                }
                 Err(error) => Err(error.to_string()),
             };
             match synced {
@@ -2977,6 +3073,13 @@ impl Connector {
                 ),
             }
         }
+        // The last point before anything is signed (PF-26): after the turn
+        // and the ask, and for a packet that moves no value as much as for
+        // one that does.
+        if self.wait_budget(outgoing_expires_at).is_none() {
+            return Err(CoverError::OutOfTime("before signing"));
+        }
+        let now = self.now_unix().max(now);
         if amount == 0 {
             // ADR 0075 decision 5: a packet that moves no value carries no
             // voucher, and carries the challenge so the far end can still
@@ -2985,7 +3088,7 @@ impl Connector {
             let signature = outbound
                 .sign_challenge(&hop.channel_id, expires)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| CoverError::Failed(error.to_string()))?;
             return Ok((
                 Covering::Challenge(
                     challenge_entry(&presentation, expires, &signature).to_string(),
@@ -2998,7 +3101,7 @@ impl Connector {
         let voucher = outbound
             .sign_voucher(&hop.channel_id, cumulative)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| CoverError::Failed(error.to_string()))?;
         Ok((
             Covering::Voucher(voucher_json(
                 &presentation,
@@ -3012,6 +3115,65 @@ impl Connector {
             )),
             cumulative,
         ))
+    }
+
+    /// What is left of a forward's budget to wait (PF-26): the time to the
+    /// packet's outgoing expiry, or `None` once that has passed.
+    fn wait_budget(&self, outgoing_expires_at: DateTime<Utc>) -> Option<std::time::Duration> {
+        forward_wait_budget(outgoing_expires_at, self.clock.now())?
+            .to_std()
+            .ok()
+    }
+
+    /// The `R00` a forward earns by running out of time at `wait` (PF-26),
+    /// in the style of PF-19's: the peer, the expiry and which wait it was.
+    /// This connector's own reject, so it carries no fee.
+    fn out_of_time_reject(
+        &self,
+        peer_id: &str,
+        outgoing_expires_at: DateTime<Utc>,
+        wait: &str,
+    ) -> Reject {
+        Reject {
+            code: RejectCode::r00_transfer_timed_out(),
+            triggered_by: String::new(),
+            message: format!(
+                "forwarding to peer '{peer_id}' ran out of time {wait}: the packet's outgoing \
+                 expiry, {}, had passed",
+                outgoing_expires_at.to_rfc3339()
+            ),
+            data: Vec::new(),
+            accumulated_cost: 0,
+        }
+    }
+
+    /// Hand `outgoing` to the peer transport, waiting no longer than the
+    /// packet's outgoing expiry allows (PF-26) -- the one bound both
+    /// carriages are held to. A wait that ended at the expiry comes back
+    /// with this connector's own `R00` in place of the transport's
+    /// placeholder, and is otherwise an unanswered forward: no peer reached,
+    /// nothing acknowledged. A packet with no time left is never sent.
+    async fn forward_bounded(
+        &self,
+        peer_id: &str,
+        outgoing: Prepare,
+        covering: Covering,
+        outgoing_expires_at: DateTime<Utc>,
+        wait: &str,
+    ) -> PeerForward {
+        let mut answer = match self.wait_budget(outgoing_expires_at) {
+            Some(budget) => {
+                self.peer_transport
+                    .forward_within(peer_id, outgoing, Some(covering), budget)
+                    .await
+            }
+            None => PeerForward::ran_out_at_expiry(peer_id),
+        };
+        if answer.ran_out_at_expiry {
+            answer.response =
+                PacketResponse::Reject(self.out_of_time_reject(peer_id, outgoing_expires_at, wait));
+        }
+        answer
     }
 
     /// Bring this node's signed watermark on `hop`'s channel to the
@@ -3089,21 +3251,25 @@ impl Connector {
     /// its own quoted price once, on the same outbound x402 channel (ADR
     /// 0075 decision 6).
     ///
-    /// `None` -- with the reason logged, never silently -- when this node
-    /// has no outbound channel registered for the hop, or cannot sign on
-    /// it. The caller then relays the peer's refusal as it stands; nothing
-    /// is ever emitted claiming to have paid when it has not.
+    /// [`CoverError::Failed`] -- with the reason logged, never silently --
+    /// when this node has no outbound channel registered for the hop, or
+    /// cannot sign on it. The caller then relays the peer's refusal as it
+    /// stands; nothing is ever emitted claiming to have paid when it has
+    /// not. [`CoverError::OutOfTime`] when the packet ran out of time before
+    /// the retry could be signed: no second voucher exists and the caller
+    /// refuses `R00` (PF-26).
     async fn cover_greeted_packet(
         &self,
         peer_id: &str,
         terms: &X402PaymentRequired,
-    ) -> Option<(Covering, u128)> {
+        outgoing_expires_at: DateTime<Utc>,
+    ) -> Result<(Covering, u128), CoverError> {
         let Some(hop) = self.outbound_voucher_hops.load().get(peer_id).cloned() else {
             tracing::warn!(
                 peer_id,
                 "peer quoted x402 terms but no outbound channel is registered to pay it on"
             );
-            return None;
+            return Err(CoverError::Failed(String::new()));
         };
         hop.synced.store(false, Ordering::Release);
         let Some(price) = terms.price() else {
@@ -3111,14 +3277,17 @@ impl Connector {
             // refuses an unreadable amount), and still not defaulted to
             // zero: a free ride is exactly what must not be inferred.
             tracing::warn!(peer_id, "peer quoted x402 terms with no readable price");
-            return None;
+            return Err(CoverError::Failed(String::new()));
         };
-        match self.cover_with_voucher(peer_id, &hop, price).await {
-            Ok(covering) => Some(covering),
-            Err(reason) => {
+        match self
+            .cover_with_voucher(peer_id, &hop, price, outgoing_expires_at)
+            .await
+        {
+            Err(CoverError::Failed(reason)) => {
                 tracing::warn!(peer_id, %reason, "could not sign a voucher covering the peer's terms");
-                None
+                Err(CoverError::Failed(reason))
             }
+            other => other,
         }
     }
 
@@ -8825,6 +8994,20 @@ mod tests {
             Arc<OutboundChannels>,
             String,
         ) {
+            peered_on_clock(exit, test_clock()).await
+        }
+
+        /// [`peered_on`], on a clock the test holds.
+        async fn peered_on_clock(
+            exit: PayerExit,
+            clock: Arc<TestClock>,
+        ) -> (
+            Connector,
+            Arc<NextHop>,
+            Arc<Receiver>,
+            Arc<OutboundChannels>,
+            String,
+        ) {
             let settles_on = match exit {
                 PayerExit::Withdrawal => (SettlementChain::Evm, "eip155:31337"),
                 PayerExit::Close => (SettlementChain::Solana, "solana:test"),
@@ -8865,7 +9048,7 @@ mod tests {
                 vec![PeerRoute::new("g.example.next", "next-hop")],
                 Arc::new(FakeAppClient::new()),
                 Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
-                test_clock(),
+                clock,
             )
             .with_peer_fees([("next-hop".to_string(), FEE)])
             .with_outbound_channels(
@@ -9076,8 +9259,16 @@ mod tests {
             let (connector, next_hop, receiver, outbound, channel) = peered().await;
             let hop = connector.outbound_voucher_hops.load()["next-hop"].clone();
             // Two forwards in flight at once: vouchers 100 and 200.
-            let (_, first) = connector.cover_forward("next-hop", 100).await.unwrap();
-            let (_, second) = connector.cover_forward("next-hop", 100).await.unwrap();
+            let (_, first) = connector
+                .cover_forward("next-hop", 100, far_future())
+                .await
+                .ok()
+                .unwrap();
+            let (_, second) = connector
+                .cover_forward("next-hop", 100, far_future())
+                .await
+                .ok()
+                .unwrap();
             assert_eq!((first, second), (100, 200));
             // The first is rejected; the receiver has seen neither.
             connector.note_voucher_outcome("next-hop", first, ClaimAckOutcome::NotSent, true);
@@ -9451,6 +9642,588 @@ mod tests {
             );
 
             assert_eq!(connector.peer_asset("ambiguous"), None);
+        }
+
+        // ---- PF-26: a forward's waits end at its outgoing expiry ----
+
+        /// A packet with `seconds` left on the test clock's instant.
+        fn prepare_expiring_in(amount: u64, seconds: i64) -> Prepare {
+            Prepare {
+                expires_at: test_clock().now() + Duration::seconds(seconds),
+                ..prepare(amount)
+            }
+        }
+
+        /// What an x402 greeting quotes, as the carriages read it.
+        fn quoted_terms(price: u64) -> X402PaymentRequired {
+            connector_domain::x402::parse_greeting(
+                format!(
+                    r#"{{"x402Version":2,"resource":{{"url":"g.example.next"}},
+                    "extensions":{{"toon":{{"info":{{"amount":"{price}","ilpAddress":"g.example.next"}}}}}}}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("terms")
+        }
+
+        /// A receiver that answers only after `by` has passed on the clock the
+        /// connector reads.
+        struct AnswersAfter {
+            clock: Arc<TestClock>,
+            by: Duration,
+        }
+
+        #[async_trait]
+        impl VoucherStateSource for AnswersAfter {
+            async fn watermark(
+                &self,
+                _presentation: &ChannelPresentation,
+                _expires: u64,
+                _signature: &[u8],
+            ) -> Result<u128, String> {
+                self.clock.advance(self.by);
+                Ok(0)
+            }
+        }
+
+        /// A receiver that never answers.
+        struct Silent;
+
+        #[async_trait]
+        impl VoucherStateSource for Silent {
+            async fn watermark(
+                &self,
+                _presentation: &ChannelPresentation,
+                _expires: u64,
+                _signature: &[u8],
+            ) -> Result<u128, String> {
+                std::future::pending().await
+            }
+        }
+
+        /// A peer that never answers, behind a transport with an answer
+        /// timeout of its own -- what both carriages are, from here.
+        struct NeverAnswers {
+            answer_timeout: std::time::Duration,
+            sent: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl PeerTransport for NeverAnswers {
+            async fn forward(
+                &self,
+                peer_id: &str,
+                prepare: Prepare,
+                covering: Option<Covering>,
+            ) -> PeerForward {
+                self.forward_within(peer_id, prepare, covering, std::time::Duration::MAX)
+                    .await
+            }
+
+            async fn forward_within(
+                &self,
+                peer_id: &str,
+                _prepare: Prepare,
+                _covering: Option<Covering>,
+                budget: std::time::Duration,
+            ) -> PeerForward {
+                self.sent.fetch_add(1, Ordering::SeqCst);
+                let wait = crate::AnswerWait::new(self.answer_timeout, Some(budget));
+                let _ = tokio::time::timeout(wait.span, std::future::pending::<()>()).await;
+                if wait.ends_at_expiry {
+                    PeerForward::ran_out_at_expiry(peer_id)
+                } else {
+                    PeerForward::unreachable(peer_id)
+                }
+            }
+        }
+
+        /// A next hop that quotes terms on the first forward -- after the
+        /// clock has moved on by `by` -- and fulfils anything after.
+        struct GreetsThenFulfils {
+            clock: Arc<TestClock>,
+            by: Duration,
+            sent: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl PeerTransport for GreetsThenFulfils {
+            async fn forward(
+                &self,
+                _peer_id: &str,
+                _prepare: Prepare,
+                _covering: Option<Covering>,
+            ) -> PeerForward {
+                if self.sent.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.clock.advance(self.by);
+                    return PeerForward::quoted(
+                        PacketResponse::Reject(Reject {
+                            code: RejectCode::f06_unexpected_payment(),
+                            triggered_by: String::new(),
+                            message: "pay".to_string(),
+                            data: Vec::new(),
+                            accumulated_cost: 0,
+                        }),
+                        ClaimAckOutcome::NotSent,
+                        quoted_terms(500),
+                    );
+                }
+                PeerForward::answered(
+                    PacketResponse::Fulfill(Fulfill {
+                        fulfillment: [7; 32],
+                        data: Vec::new(),
+                    }),
+                    ClaimAckOutcome::Accepted,
+                )
+            }
+        }
+
+        /// A next hop that answers a fulfilment, having let the clock run past
+        /// the packet's expiry first: an answer already in hand is relayed.
+        struct AnswersLate {
+            clock: Arc<TestClock>,
+        }
+
+        #[async_trait]
+        impl PeerTransport for AnswersLate {
+            async fn forward(
+                &self,
+                _peer_id: &str,
+                _prepare: Prepare,
+                _covering: Option<Covering>,
+            ) -> PeerForward {
+                self.clock.advance(Duration::seconds(120));
+                PeerForward::answered(
+                    PacketResponse::Fulfill(Fulfill {
+                        fulfillment: [9; 32],
+                        data: b"late".to_vec(),
+                    }),
+                    ClaimAckOutcome::Accepted,
+                )
+            }
+        }
+
+        /// An expiry no test reaches.
+        fn far_future() -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2040, 1, 1, 0, 0, 0).unwrap()
+        }
+
+        fn reject_of(response: PacketResponse) -> Reject {
+            match response {
+                PacketResponse::Reject(reject) => reject,
+                other => panic!("expected a reject, got {other:?}"),
+            }
+        }
+
+        /// Everything the connector holds for `peering`, wired onto
+        /// `transport` and `receiver` instead of the defaults.
+        async fn peered_with(
+            clock: &Arc<TestClock>,
+            transport: Arc<dyn PeerTransport>,
+            receiver: Arc<dyn VoucherStateSource>,
+        ) -> (Connector, Arc<OutboundChannels>, String) {
+            let (_, _, _, outbound, channel) =
+                peered_on_clock(PayerExit::Withdrawal, Arc::clone(clock)).await;
+            let connector = Connector::new(
+                vec![],
+                vec![PeerRoute::new("g.example.next", "next-hop")],
+                Arc::new(FakeAppClient::new()),
+                transport,
+                Arc::clone(clock) as Arc<dyn Clock>,
+            )
+            .with_peer_fees([("next-hop".to_string(), FEE)])
+            .with_outbound_channels(
+                Arc::clone(&outbound),
+                vec![(SettlementChain::Evm, "eip155:31337".to_string())],
+            );
+            connector.insert_voucher_hop("next-hop", &channel, receiver);
+            (connector, outbound, channel)
+        }
+
+        /// PF-26: an ask answered after the packet's outgoing expiry refuses
+        /// the forward `R00`; nothing is signed, journaled or sent.
+        #[tokio::test]
+        async fn an_ask_answered_after_the_expiry_signs_nothing() {
+            let clock = test_clock();
+            let next_hop = Arc::new(NextHop {
+                covered: Mutex::new(Vec::new()),
+                ack: Mutex::new(ClaimAckOutcome::Accepted),
+                outcomes: Mutex::new(std::collections::VecDeque::new()),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
+                Arc::new(AnswersAfter {
+                    clock: Arc::clone(&clock),
+                    by: Duration::seconds(60),
+                }),
+            )
+            .await;
+
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(110, 30)).await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert!(reject.message.contains("next-hop"), "{}", reject.message);
+            assert!(
+                reject.message.contains("before signing"),
+                "{}",
+                reject.message
+            );
+            assert_eq!(reject.accumulated_cost, 0);
+            assert_eq!(outbound.signed(&channel), Some(0), "nothing was signed");
+            assert!(next_hop.covered.lock().unwrap().is_empty(), "nothing sent");
+        }
+
+        /// PF-26: an ask that never answers is given up at the outgoing
+        /// expiry, well before the peering's answer timeout.
+        #[tokio::test(start_paused = true)]
+        async fn an_ask_that_never_answers_is_given_up_at_the_expiry() {
+            let clock = test_clock();
+            let next_hop = Arc::new(NextHop {
+                covered: Mutex::new(Vec::new()),
+                ack: Mutex::new(ClaimAckOutcome::Accepted),
+                outcomes: Mutex::new(std::collections::VecDeque::new()),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
+                Arc::new(Silent),
+            )
+            .await;
+
+            let started = tokio::time::Instant::now();
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(110, 6)).await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert_eq!(
+                started.elapsed(),
+                std::time::Duration::from_secs(5),
+                "the outgoing expiry is the arriving one less the message window"
+            );
+            assert_eq!(outbound.signed(&channel), Some(0));
+            assert!(next_hop.covered.lock().unwrap().is_empty());
+        }
+
+        /// An ask that fails while the packet still has time is logged and
+        /// the forward carries on, as it did before PF-26.
+        #[tokio::test]
+        async fn an_ask_that_fails_with_time_left_carries_on() {
+            let (connector, next_hop, receiver, outbound, channel) = peered().await;
+            receiver.down.store(true, Ordering::SeqCst);
+
+            assert!(matches!(
+                connector.handle_prepare(prepare_expiring_in(110, 30)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            assert_eq!(receiver.asked.load(Ordering::SeqCst), 1);
+            assert_eq!(voucher_amounts(&next_hop).await, vec![100]);
+            assert_eq!(outbound.signed(&channel), Some(100));
+        }
+
+        /// PF-26: a peer that never answers, to a packet that expires before
+        /// the answer timeout, is answered `R00` at the outgoing expiry -- and
+        /// the voucher it carried is not paid for by the next one.
+        #[tokio::test(start_paused = true)]
+        async fn a_peer_that_never_answers_is_answered_r00_at_the_expiry() {
+            let clock = test_clock();
+            let transport = Arc::new(NeverAnswers {
+                answer_timeout: std::time::Duration::from_secs(30),
+                sent: AtomicUsize::new(0),
+            });
+            let receiver = Arc::new(Receiver {
+                watermark: AtomicU64::new(0),
+                asked: AtomicUsize::new(0),
+                down: AtomicBool::new(false),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&transport) as Arc<dyn PeerTransport>,
+                Arc::clone(&receiver) as Arc<dyn VoucherStateSource>,
+            )
+            .await;
+
+            let started = tokio::time::Instant::now();
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(110, 11)).await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(10));
+            assert!(reject.message.contains("next-hop"), "{}", reject.message);
+            assert!(reject.message.contains("answer"), "{}", reject.message);
+            assert_eq!(reject.accumulated_cost, 0, "this connector's own reject");
+            assert_eq!(outbound.signed(&channel), Some(100), "the voucher was sent");
+
+            // And the next forward asks the receiver where it stands.
+            let asked = receiver.asked.load(Ordering::SeqCst);
+            connector.handle_prepare(prepare_expiring_in(110, 11)).await;
+            assert_eq!(receiver.asked.load(Ordering::SeqCst), asked + 1);
+        }
+
+        /// PF-26: the same peer, to a packet that outlives the answer timeout,
+        /// is `T01` at that timeout, as it always was.
+        #[tokio::test(start_paused = true)]
+        async fn a_peer_that_never_answers_is_t01_at_the_answer_timeout() {
+            let clock = test_clock();
+            let transport = Arc::new(NeverAnswers {
+                answer_timeout: std::time::Duration::from_secs(30),
+                sent: AtomicUsize::new(0),
+            });
+            let (connector, _outbound, _channel) = peered_with(
+                &clock,
+                Arc::clone(&transport) as Arc<dyn PeerTransport>,
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            let started = tokio::time::Instant::now();
+            let reject = reject_of(
+                connector
+                    .handle_prepare(prepare_expiring_in(110, 300))
+                    .await,
+            );
+
+            assert_eq!(reject.code, RejectCode::t01_peer_unreachable());
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(30));
+        }
+
+        /// PF-26: the default bound on a transport that has no carriage of its
+        /// own to tidy still ends the wait at the expiry.
+        #[tokio::test(start_paused = true)]
+        async fn the_default_bound_ends_a_wait_at_the_expiry() {
+            struct Hangs;
+            #[async_trait]
+            impl PeerTransport for Hangs {
+                async fn forward(
+                    &self,
+                    _peer_id: &str,
+                    _prepare: Prepare,
+                    _covering: Option<Covering>,
+                ) -> PeerForward {
+                    std::future::pending().await
+                }
+            }
+            let clock = test_clock();
+            let (connector, _outbound, _channel) = peered_with(
+                &clock,
+                Arc::new(Hangs),
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(110, 4)).await);
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+        }
+
+        /// PF-26: an answer that arrives inside the bound is relayed whatever
+        /// the clock says afterwards -- expiry is not checked against work
+        /// already done.
+        #[tokio::test]
+        async fn an_answer_inside_the_bound_is_relayed_unchanged() {
+            let clock = test_clock();
+            let (connector, _outbound, _channel) = peered_with(
+                &clock,
+                Arc::new(AnswersLate {
+                    clock: Arc::clone(&clock),
+                }),
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            let PacketResponse::Fulfill(fulfill) =
+                connector.handle_prepare(prepare_expiring_in(110, 30)).await
+            else {
+                panic!("a late-but-real answer is relayed");
+            };
+            assert_eq!(fulfill.data, b"late");
+        }
+
+        /// PF-26: a greeted forward whose packet ran out of time before the
+        /// retry is refused `R00`, and no second voucher is signed.
+        #[tokio::test]
+        async fn a_greeted_forward_out_of_time_signs_no_second_voucher() {
+            let clock = test_clock();
+            let transport = Arc::new(GreetsThenFulfils {
+                clock: Arc::clone(&clock),
+                by: Duration::seconds(60),
+                sent: AtomicUsize::new(0),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&transport) as Arc<dyn PeerTransport>,
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(110, 30)).await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert_eq!(transport.sent.load(Ordering::SeqCst), 1, "no retry sent");
+            assert_eq!(
+                outbound.signed(&channel),
+                Some(100),
+                "only the first voucher exists"
+            );
+        }
+
+        /// ... and the same greeted forward with time to spare is retried once.
+        #[tokio::test]
+        async fn a_greeted_forward_with_time_left_is_still_retried() {
+            let clock = test_clock();
+            let transport = Arc::new(GreetsThenFulfils {
+                clock: Arc::clone(&clock),
+                by: Duration::seconds(1),
+                sent: AtomicUsize::new(0),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&transport) as Arc<dyn PeerTransport>,
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            assert!(matches!(
+                connector.handle_prepare(prepare_expiring_in(110, 30)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            assert_eq!(transport.sent.load(Ordering::SeqCst), 2);
+            // The first voucher's packet was refused unpaid (#1446), so the
+            // retry signs from where the receiver stands.
+            assert_eq!(outbound.signed(&channel), Some(500));
+        }
+
+        /// PF-26: a forward that moves no value signs and sends no challenge
+        /// for a packet whose ask outlived it.
+        #[tokio::test]
+        async fn a_zero_value_forward_out_of_time_sends_no_challenge() {
+            let clock = test_clock();
+            let next_hop = Arc::new(NextHop {
+                covered: Mutex::new(Vec::new()),
+                ack: Mutex::new(ClaimAckOutcome::Accepted),
+                outcomes: Mutex::new(std::collections::VecDeque::new()),
+            });
+            let (connector, _outbound, _channel) = peered_with(
+                &clock,
+                Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
+                Arc::new(AnswersAfter {
+                    clock: Arc::clone(&clock),
+                    by: Duration::seconds(60),
+                }),
+            )
+            .await;
+            let connector = connector.with_peer_fees([("next-hop".to_string(), 0)]);
+
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(0, 30)).await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert!(next_hop.covered.lock().unwrap().is_empty(), "no challenge");
+        }
+
+        /// PF-26: a forward that waited for the channel's signing turn past
+        /// its outgoing expiry signs nothing.
+        #[tokio::test(start_paused = true)]
+        async fn a_forward_that_waited_for_the_signing_turn_past_the_expiry_signs_nothing() {
+            let clock = test_clock();
+            let next_hop = Arc::new(NextHop {
+                covered: Mutex::new(Vec::new()),
+                ack: Mutex::new(ClaimAckOutcome::Accepted),
+                outcomes: Mutex::new(std::collections::VecDeque::new()),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+            let hop = connector
+                .outbound_voucher_hops
+                .load()
+                .get("next-hop")
+                .cloned()
+                .expect("the hop");
+            // Another forward holds the channel's turn for longer than this
+            // packet has.
+            let _turn = hop.signing.lock().await;
+
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(110, 4)).await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert!(
+                reject.message.contains("signing turn"),
+                "{}",
+                reject.message
+            );
+            assert_eq!(outbound.signed(&channel), Some(0));
+            assert!(next_hop.covered.lock().unwrap().is_empty());
+        }
+
+        /// ... and one whose clock ran past the expiry while it queued is
+        /// refused at the last point before signing, whatever the lock said.
+        #[tokio::test]
+        async fn a_forward_whose_clock_ran_out_while_it_queued_signs_nothing() {
+            let clock = test_clock();
+            let next_hop = Arc::new(NextHop {
+                covered: Mutex::new(Vec::new()),
+                ack: Mutex::new(ClaimAckOutcome::Accepted),
+                outcomes: Mutex::new(std::collections::VecDeque::new()),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
+                Arc::new(AnswersAfter {
+                    clock: Arc::clone(&clock),
+                    by: Duration::seconds(0),
+                }),
+            )
+            .await;
+            let hop = connector
+                .outbound_voucher_hops
+                .load()
+                .get("next-hop")
+                .cloned()
+                .expect("the hop");
+            // Synced already, so the ask is not what moves the clock: the
+            // turn is.
+            hop.synced.store(true, Ordering::SeqCst);
+            let turn = hop.signing.lock().await;
+            let forward = connector.handle_prepare(prepare_expiring_in(110, 30));
+            tokio::pin!(forward);
+            assert!(
+                tokio::time::timeout(std::time::Duration::ZERO, &mut forward)
+                    .await
+                    .is_err(),
+                "queued behind the turn"
+            );
+            clock.advance(Duration::seconds(60));
+            drop(turn);
+
+            let reject = reject_of(forward.await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert_eq!(outbound.signed(&channel), Some(0));
+            assert!(next_hop.covered.lock().unwrap().is_empty());
         }
     }
 }

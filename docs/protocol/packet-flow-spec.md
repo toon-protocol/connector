@@ -5,11 +5,11 @@
 issue #1065, and states the routing and reject rules that had never been written in one place.
 PF-14 – PF-17 are amended or retired by
 [ADR 0057](../adr/0057-minimum-delivery-is-retired-a-claim-bounds-erosion.md) (issue #1143), and
-PF-02 and PF-23 are amended in place by
+PF-26 adds the forward's counterpart to PF-25 (issue #1448), and PF-02 and PF-23 are amended in place by
 [ADR 0064](../adr/0064-a-deadline-bounds-the-wait-for-an-app-not-the-answer.md) (issue #1183); the
 rule numbers are kept and never reused.
 
-**Coverage:** none of PF-01 – PF-25 is vectored. This is a wire surface, so these rules enter
+**Coverage:** none of PF-01 – PF-26 is vectored. This is a wire surface, so these rules enter
 [ADR 0045](../adr/0045-a-behavioural-rule-is-normative-prose-until-its-vector-lands.md)'s debt ledger;
 issue #1084 owns the burn-down order.
 
@@ -143,6 +143,24 @@ A hop whose packet has no more time left than the window it must keep back MUST 
 rather than forward one with a dead window — the same code, and the same fact one hop later, as
 PF-02's already-expired arrival. Shortening is unilateral: a peer handed a shorter expiry than the
 one that arrived here needs to agree to nothing, so this is not a wire change and never was.
+
+**PF-26** `[connector]` — **A forward's waits are bounded by the packet's outgoing expiry, and nothing
+is signed for a packet that is out of time.** The outgoing expiry is the arriving one less PF-19's
+message window. Every wait a forward makes — the claim-state ask, the channel's signing turn behind
+another forward, and the peer's answer, on either carriage — MUST end at that expiry when it is
+sooner than the peering's answer timeout. The expiry MUST be checked again after every wait that
+precedes signing, at the last point before a voucher (or, for a packet that moves no value, the
+peer-role challenge) is signed; a packet out of time there is refused `R00`, with nothing signed,
+nothing journaled and nothing sent. A wait that ran out **at the expiry** is `R00` — PF-02's fact and
+PF-19's code; one that ran out **at the peering's answer timeout** with the packet still alive is
+`T01`. An answer that arrives within the bound MUST be relayed, whatever the clock says afterwards:
+as PF-25 does for a termination, a forward MUST NOT re-check expiry against an answer already
+received. A wait ended by the expiry is otherwise an unanswered forward: a voucher it carried is not
+acknowledged, the reject is this connector's own and adds no fee to `accumulated_cost`, and the next
+forward on the channel asks the receiver where it stands before signing. A claim-state ask that
+fails, or that ends at the answer timeout while the packet still has time, is logged and the forward
+carries on. The retry of a greeted forward (PF-19's covering retry) follows the same rules against
+the same outgoing expiry.
 
 ---
 
