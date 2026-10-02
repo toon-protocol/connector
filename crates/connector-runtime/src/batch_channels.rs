@@ -18,7 +18,9 @@
 //!    `OutboundChannelAbandoned` once it provably never will (a Solana
 //!    `open` whose blockhash expired);
 //! 3. `OutboundVoucherSigned` for every voucher signed, **before** the
-//!    voucher is handed to anyone.
+//!    voucher is handed to anyone; and `OutboundWatermarkSet`, which a replay
+//!    sets rather than folds by max, when the receiver reports less than was
+//!    signed after a forward ended in a reject (issue #1446).
 //!
 //! What each crash leaves, and what the next attempt does:
 //!
@@ -36,9 +38,9 @@
 //! with one opening deposit however many times it is sent -- the settlement
 //! port's contract suite holds all three implementations to that.
 //!
-//! A restart restores every channel with the highest voucher journaled on
-//! it, never below what the chain shows landed, so the signed watermark
-//! never goes backwards. A node that lost this journal entirely restores
+//! A restart restores every channel with the watermark the journal ends on
+//! -- the highest voucher, unless a later `OutboundWatermarkSet` lowered it
+//! -- never below what the chain shows landed. A node that lost this journal entirely restores
 //! its watermark from the receiver's `POST /ilp/claim-state` instead, which
 //! is the peering's to wire (issue #1378).
 
@@ -317,6 +319,18 @@ impl OutboundChannels {
                         by_key.get(&channel_id).and_then(|id| channels.get_mut(id))
                     {
                         tracked.signed = tracked.signed.max(cumulative_amount);
+                    }
+                }
+                // Overwrites, where the voucher above folds by max: it
+                // exists to move a watermark down (issue #1446).
+                JournalEntry::OutboundWatermarkSet {
+                    channel_id,
+                    cumulative_amount,
+                } => {
+                    if let Some(tracked) =
+                        by_key.get(&channel_id).and_then(|id| channels.get_mut(id))
+                    {
+                        tracked.signed = cumulative_amount;
                     }
                 }
                 // Another book's entry kinds never reach this file.
@@ -629,33 +643,50 @@ impl OutboundChannels {
         Ok(None)
     }
 
-    /// Raise an outbound channel's signed watermark to `amount`, where the
-    /// receiver reports holding a voucher that high (ADR 0075 decision 6:
-    /// the receiver's `POST /ilp/claim-state` is the watermark authority on
-    /// restore). A node that lost its journal would otherwise sign a voucher
-    /// that fails to advance; one that did not already stands at least this
-    /// high, and nothing changes.
+    /// Set an outbound channel's signed watermark to `amount`, the figure
+    /// the receiver reports holding a voucher for (ADR 0075 decision 6: the
+    /// receiver's `POST /ilp/claim-state` is the watermark authority, on
+    /// restore and after a reject, issue #1446). Higher than this node's
+    /// own, a node that lost its journal would otherwise sign a voucher that
+    /// fails to advance; lower, a voucher the receiver never admitted paid
+    /// for a packet it never carried, and the next voucher is signed above
+    /// the receiver's figure rather than above that one. Never below what
+    /// the chain shows landed, which the payer enforces. Returns the
+    /// watermark now standing.
     ///
-    /// Journaled as a signed voucher before it is believed, because it is
-    /// one: the receiver holds a voucher at `amount` only if this node's key
-    /// signed it.
-    pub async fn raise_watermark(&self, id: &str, amount: u128) -> Result<u128, BatchChannelError> {
+    /// Raising is journaled as a signed voucher before it is believed,
+    /// because it is one: the receiver holds a voucher at `amount` only if
+    /// this node's key signed it. Lowering is journaled as an
+    /// `OutboundWatermarkSet`, which a replay sets rather than folds by max.
+    ///
+    /// The caller decides that lowering is safe -- that no voucher has been
+    /// signed on the channel since the rejected one -- and holds the
+    /// channel's signing lock across the decision and this call.
+    pub async fn set_watermark(&self, id: &str, amount: u128) -> Result<u128, BatchChannelError> {
         let id = canonical_id(id);
         let tracked = self.tracked(&id)?;
-        if amount <= tracked.signed {
+        if amount == tracked.signed {
             return Ok(tracked.signed);
         }
         let payer = Arc::clone(self.payer(tracked.chain)?);
-        self.append(JournalEntry::OutboundVoucherSigned {
-            channel_id: journal_key(tracked.chain, tracked.record.channel()),
-            cumulative_amount: amount,
+        let channel_id = journal_key(tracked.chain, tracked.record.channel());
+        self.append(if amount > tracked.signed {
+            JournalEntry::OutboundVoucherSigned {
+                channel_id,
+                cumulative_amount: amount,
+            }
+        } else {
+            JournalEntry::OutboundWatermarkSet {
+                channel_id,
+                cumulative_amount: amount,
+            }
         })?;
-        payer.restore_outbound(&tracked.record, amount).await?;
+        let state = payer.restore_outbound(&tracked.record, amount).await?;
         if let Some(tracked) = self.channels().get_mut(&id) {
-            tracked.signed = tracked.signed.max(amount);
+            tracked.signed = state.signed;
             tracked.restored = true;
         }
-        Ok(amount)
+        Ok(state.signed)
     }
 
     /// The channel as its receiver is shown it -- on EVM with the config its
@@ -1222,6 +1253,43 @@ mod tests {
             assert_eq!(topped.on_chain.collateral, 1_500);
             assert_eq!(outbound.claims().len(), 1);
             assert_eq!(outbound.claims()[0].cumulative_amount, 301);
+        }
+    }
+
+    /// Issue #1446: a watermark lowered to the receiver's figure is durable.
+    /// The voucher entries fold by max, so without an entry that overwrites
+    /// on replay a restart would sign from the old, higher figure again --
+    /// and the chain's landed figure still bounds it from below.
+    #[tokio::test]
+    async fn a_lowered_watermark_survives_a_journal_replay() {
+        for exit in [PayerExit::Withdrawal, PayerExit::Close] {
+            let world = World::new(exit);
+            let journal = Arc::new(InMemoryJournal::new());
+            let outbound = world.boot(Arc::clone(&journal) as Arc<dyn Journal>).await;
+            let (state, _) = outbound
+                .open(world.receiver.published_terms(), 1_000)
+                .await
+                .expect("open");
+            let id = state.on_chain.id.0.clone();
+            outbound.sign_voucher(&id, 100).await.expect("sign");
+            outbound.sign_voucher(&id, 300).await.expect("sign");
+
+            assert_eq!(outbound.set_watermark(&id, 100).await.unwrap(), 100);
+            assert_eq!(outbound.signed(&id), Some(100));
+
+            let restarted = world.boot(Arc::clone(&journal) as Arc<dyn Journal>).await;
+            assert_eq!(restarted.signed(&id), Some(100), "replay sets, not max");
+            assert_eq!(
+                restarted
+                    .sign_voucher(&id, 150)
+                    .await
+                    .unwrap()
+                    .cumulative_amount,
+                150,
+                "the next voucher is signed above the lowered figure"
+            );
+            // A raise is still a raise.
+            assert_eq!(restarted.set_watermark(&id, 500).await.unwrap(), 500);
         }
     }
 

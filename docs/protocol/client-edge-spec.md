@@ -456,7 +456,10 @@ Two rules attach to the forwarded case and to nothing else. A client-edge PREPAR
 forwarded destination is refused `F03_INVALID_AMOUNT` when its declared `amount` exceeds that
 `price` — this connector never puts more value on the peer semantics than it collected, and the
 refusal is decided before the claim is ingested so a packet that will not be carried never spends
-a watermark. And a _peer-role_ PREPARE is never answered with this greeting at all
+a watermark. The same holds of a PREPARE to a destination nothing will carry — no configured route,
+no runtime peer route, no active lease, no bound client session: it is rejected `F02` without its
+claim being ingested, on both carriages ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md),
+issue #1446). And a _peer-role_ PREPARE is never answered with this greeting at all
 (`peer-carriage-spec.md` §3.1): everything in this section is the client-facing direction.
 
 This is **answering, not announcing** ([ADR 0022](../adr/0022-a-connector-answers-it-does-not-announce.md)):

@@ -630,9 +630,10 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
                 backed: 0,
                 finished: None,
             });
-            // Never backwards, and never below what the receiver has
-            // already landed, which this node must have signed.
-            entry.signed = entry.signed.max(signed).max(u128::from(account.settled));
+            // The caller's figure, lower than the one held or higher, and
+            // never below what the receiver has already landed, which this
+            // node must have signed.
+            entry.signed = signed.max(u128::from(account.settled));
             entry.backed = on_chain.voucher_ceiling();
             entry.signed
         };

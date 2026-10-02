@@ -27,7 +27,7 @@
 //!   the forward carries. After a restart, or a journal that lost the latest
 //!   vouchers, the **next hop's** `POST /ilp/claim-state` (`scheme:
 //!   "batch-settlement"`) is asked where the channel stands, and the answer
-//!   only ever raises the watermark (decision 6). That is what
+//!   sets the watermark, higher or lower (decision 6, issue #1446). That is what
 //!   `client_edge_url` is for.
 //!
 //! The inbound half -- the channel the peer pays this node on -- is
