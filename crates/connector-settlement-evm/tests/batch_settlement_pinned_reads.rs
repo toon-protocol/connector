@@ -77,7 +77,7 @@ impl Lagging {
             if call.method == "eth_call"
                 && is_pinned(&call.params)
                 && script_lacking
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                         (left > 0).then(|| if left == NEVER { left } else { left - 1 })
                     })
                     .is_ok()
