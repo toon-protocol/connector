@@ -67,7 +67,7 @@ pub use peer_route_store::{
     PeerRouteStore, PeerRouteStoreError, RuntimePeerChannel, RuntimePeering, RuntimePeers,
 };
 pub use peer_transport::{
-    InProcessPeerTransport, PeerForward, PeerRegistrar, PeerTransport, NO_SOCKS_PROXY,
+    AnswerWait, InProcessPeerTransport, PeerForward, PeerRegistrar, PeerTransport, NO_SOCKS_PROXY,
 };
 // ADR 0058's one operator write: establish a peering from a URL.
 pub use peering::{ChannelBranch, EstablishPeeringError, EstablishedChannel, PeeringEstablished};

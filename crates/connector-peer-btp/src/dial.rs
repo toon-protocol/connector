@@ -46,7 +46,7 @@ use connector_btp::{
 use connector_config::{PeerCarriage, PeerConfig};
 use connector_domain::x402::{GreetingError, X402PaymentRequired};
 use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
-use connector_runtime::{ClaimAckOutcome, Covering, PeerForward, PeerTransport};
+use connector_runtime::{AnswerWait, ClaimAckOutcome, Covering, PeerForward, PeerTransport};
 use url::Url;
 
 use crate::claim_json;
@@ -288,43 +288,65 @@ impl BtpPeerTransport {
     async fn answered<F, Fut>(
         &self,
         state: &RelationState,
-        timeout: Duration,
+        budget: Option<Duration>,
         send: F,
-    ) -> Option<BtpFrame>
+    ) -> Result<BtpFrame, bool>
     where
         F: Fn(BtpSessionHandle) -> Fut,
         Fut: std::future::Future<Output = Result<BtpFrame, OriginateError>>,
     {
+        let started = tokio::time::Instant::now();
         for attempt in 0..2 {
-            let handle = match self.session(state).await {
+            // Dialling is a wait on the forward path too, and ends at the
+            // packet's expiry like the answer does (PF-26). Nothing has been
+            // written yet, so there is no session to forget.
+            let handle = match budget {
+                None => self.session(state).await,
+                Some(budget) => match tokio::time::timeout(
+                    budget.saturating_sub(started.elapsed()),
+                    self.session(state),
+                )
+                .await
+                {
+                    Ok(dialled) => dialled,
+                    Err(_) => return Err(true),
+                },
+            };
+            let handle = match handle {
                 Ok(handle) => handle,
                 Err(error) => {
                     tracing::warn!(%error, "peer dial failed");
-                    return None;
+                    return Err(false);
                 }
             };
-            match tokio::time::timeout(timeout, send(handle)).await {
-                Ok(Ok(frame)) => return Some(frame),
+            let wait = AnswerWait::new(
+                state.relation.peer_answer_timeout,
+                budget.map(|budget| budget.saturating_sub(started.elapsed())),
+            );
+            match tokio::time::timeout(wait.span, send(handle)).await {
+                Ok(Ok(frame)) => return Ok(frame),
                 // Nothing was written. `session` sees the same closed
                 // channel this error was raised from, so the next turn of
                 // the loop dials rather than handing back the corpse.
                 Ok(Err(OriginateError::SessionGone)) if attempt == 0 => {
                     tracing::info!(
                         peer_id = %state.relation.peer_id,
+                        endpoint = %state.relation.endpoint,
                         "peer session was gone under a send; redialling and sending once more"
                     );
                 }
                 // §6.3 on expiry: nothing here decides the voucher rode or
                 // did not -- the caller does. Forgetting the session is
                 // what stops the next frame being written into a socket
-                // nobody reads.
-                _ => {
+                // nobody reads. A wait that ended at the packet's expiry
+                // leaves it exactly so, and is never retried (PF-26).
+                outcome => {
                     self.drop_session(state).await;
-                    return None;
+                    return Err(outcome.is_err() && wait.ends_at_expiry);
                 }
             }
         }
-        None
+        Err(false)
     }
 
     /// Forget the session after a failure, so the next packet dials a new
@@ -455,6 +477,31 @@ impl PeerTransport for BtpPeerTransport {
         prepare: Prepare,
         covering: Option<Covering>,
     ) -> PeerForward {
+        self.forward_bounded(peer_id, prepare, covering, None).await
+    }
+
+    async fn forward_within(
+        &self,
+        peer_id: &str,
+        prepare: Prepare,
+        covering: Option<Covering>,
+        budget: Duration,
+    ) -> PeerForward {
+        self.forward_bounded(peer_id, prepare, covering, Some(budget))
+            .await
+    }
+}
+
+impl BtpPeerTransport {
+    /// [`PeerTransport::forward`], with every wait also ended at `budget`
+    /// when one is given -- the packet's outgoing expiry (PF-26).
+    async fn forward_bounded(
+        &self,
+        peer_id: &str,
+        prepare: Prepare,
+        covering: Option<Covering>,
+        budget: Option<Duration>,
+    ) -> PeerForward {
         let Some(state) = self.relation(peer_id) else {
             return PeerForward::unreachable(peer_id);
         };
@@ -488,15 +535,15 @@ impl PeerTransport for BtpPeerTransport {
         let packet = prepare.encode();
         let (entries, packet) = (&entries, &packet);
         let answered = self
-            .answered(
-                state,
-                state.relation.peer_answer_timeout,
-                move |handle| async move { handle.send_message(entries, packet).await },
-            )
+            .answered(state, budget, move |handle| async move {
+                handle.send_message(entries, packet).await
+            })
             .await;
 
-        let Some(frame) = answered else {
-            return unreachable_at(peer_id, &state.relation.endpoint);
+        let frame = match answered {
+            Ok(frame) => frame,
+            Err(true) => return PeerForward::ran_out_at_expiry(peer_id),
+            Err(false) => return unreachable_at(peer_id, &state.relation.endpoint),
         };
         // An ERROR means the peer could not decode our frame: there is no
         // ILP answer at all, so nothing was forwarded and no fee of ours
