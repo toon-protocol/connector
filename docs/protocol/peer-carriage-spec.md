@@ -943,6 +943,14 @@ carries the same nonce, which is exactly the case §6.3 requires a payee to answ
 > banked at either end, so the payer retransmits it rather than advancing past it — which is §6.3's
 > byte-identical retransmission arriving by a different road.
 
+> **Recorded 2026-10-02 (issue #1454).** A frame written into a session that then closes is answered
+> `T01` **at the close**, not at the answer timeout, and is **not** resent. Before this, the dial side
+> stopped a closed session's writer but nothing answered the requests still waiting on it, so each
+> ran out `OUTBOUND_ANSWER_TIMEOUT` (or the peering's `peer_answer_timeout`) before being rejected.
+> A close does not prove the far side never acted on the frame, so the rule above stands: only a
+> frame that was never written is sent once more. The dead session is not handed out again; the next
+> packet dials a fresh one.
+
 ---
 
 ## 3. Frame carriage

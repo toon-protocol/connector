@@ -233,9 +233,9 @@ impl SessionRegistry {
             .send_message(protocol_data, ilp_packet)
             .await
             .map_err(|error| match error {
-                OriginateError::SessionGone | OriginateError::Timeout => {
-                    no_live_session_reject(address)
-                }
+                OriginateError::SessionGone
+                | OriginateError::Timeout
+                | OriginateError::ClosedBeforeAnswer => no_live_session_reject(address),
             })
     }
 
@@ -260,9 +260,9 @@ impl SessionRegistry {
             .send_transfer(amount, protocol_data)
             .await
             .map_err(|error| match error {
-                OriginateError::SessionGone | OriginateError::Timeout => {
-                    no_live_session_reject(address)
-                }
+                OriginateError::SessionGone
+                | OriginateError::Timeout
+                | OriginateError::ClosedBeforeAnswer => no_live_session_reject(address),
             })
     }
 

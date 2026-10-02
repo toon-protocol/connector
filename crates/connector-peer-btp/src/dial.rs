@@ -283,7 +283,10 @@ impl BtpPeerTransport {
     /// **never written** -- sending it again on a fresh session is the same
     /// packet reaching the peer once, not a second packet. A *timeout* is
     /// the opposite case: the frame is on the wire and the peer may be
-    /// acting on it, so that one is never retried, only reported. A voucher
+    /// acting on it, so that one is never retried, only reported. So is a
+    /// session that closed after the frame was written
+    /// ([`OriginateError::ClosedBeforeAnswer`], issue #1454): it is reported
+    /// at the close rather than at the timeout, and not resent. A voucher
     /// riding the retry is the one that did not go, byte for byte.
     async fn answered<F, Fut>(
         &self,
