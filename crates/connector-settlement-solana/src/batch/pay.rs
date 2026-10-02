@@ -82,6 +82,7 @@ use solana_sdk::transaction::VersionedTransaction;
 
 use super::sweep::SponsoredChannel;
 use super::{backend_error, sponsor, state_of, wire, SolanaBatchSettlement, CHAIN};
+use crate::submit::Confirmed;
 
 /// How long a post to a counterparty's sponsor endpoint may take. The
 /// sponsor answers only once its co-signed `open` has confirmed, which can
@@ -411,7 +412,7 @@ impl SolanaBatchSettlement {
         channel: &Pubkey,
         failure: SponsorFailure,
     ) -> BatchSettlementError {
-        match self.read(channel).await {
+        match self.read_until_present(channel).await {
             Ok(Some(_)) => BatchSettlementError::Backend(format!(
                 "the sponsor endpoint answered {failure}, but channel {channel} exists on chain; \
                  it is recorded as this node's, to withdraw from"
@@ -422,6 +423,35 @@ impl SolanaBatchSettlement {
             }
             Err(_) => failure.into_error(),
         }
+    }
+
+    /// [`outbound_state`](BatchSettlementPayer::outbound_state), read from
+    /// the slot `landed` is in when it names one: the form `top_up` and
+    /// `start_withdrawal` use after their own confirmed transaction. The port
+    /// method itself reads the chain as it stands.
+    async fn outbound_state_after(
+        &self,
+        channel: &ChannelId,
+        landed: Option<&Confirmed>,
+    ) -> Result<OutboundChannelState, BatchSettlementError> {
+        let (address, record) = self.outbound_record(channel)?;
+        let read = match landed {
+            Some(landed) => self
+                .read_after(&address, landed)
+                .await
+                .map_err(|failure| failure.into_error(landed))?,
+            None => self.read(&address).await?,
+        };
+        let on_chain = match read {
+            Some(account) => state_of(channel, &account),
+            None => record
+                .finished
+                .ok_or_else(|| BatchSettlementError::ChannelNotFound(channel.clone()))?,
+        };
+        Ok(OutboundChannelState {
+            on_chain,
+            signed: record.signed,
+        })
     }
 }
 
@@ -594,7 +624,15 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
             Err(failure) => return Err(self.after_failed_open(&channel, failure).await),
         }
 
-        let account = self.read_existing(&id, &channel).await?;
+        // The sponsor says the open landed, and the slot it landed in is not
+        // in its answer, so the read repeats while it finds no account.
+        let Some(account) = self.read_until_present(&channel).await? else {
+            return Err(BatchSettlementError::Backend(format!(
+                "the sponsor endpoint answered that the open landed as {channel}, but this \
+                 node's RPC endpoint shows no such account yet. The node keeps the channel as its \
+                 own, with its deposit in it: opening the same record again adopts it"
+            )));
+        };
         if !self.built_as_recorded(&channel, &account, &receiver, deposit_units) {
             return Err(not_as_built(&account));
         }
@@ -674,16 +712,17 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
                 "a top-up of {increment} does not fit payment-channels' u64"
             ))
         })?;
-        self.submit(&[wire::top_up_instruction(
-            &self.program_id,
-            &self.sponsor.pubkey(),
-            &address,
-            &account.mint,
-            &spl_token::id(),
-            increment,
-        )])
-        .await?;
-        let state = self.outbound_state(channel).await?;
+        let landed = self
+            .submit_confirmed(&[wire::top_up_instruction(
+                &self.program_id,
+                &self.sponsor.pubkey(),
+                &address,
+                &account.mint,
+                &spl_token::id(),
+                increment,
+            )])
+            .await?;
+        let state = self.outbound_state_after(channel, Some(&landed)).await?;
         self.set_backed(&address, state.on_chain.voucher_ceiling());
         Ok(state)
     }
@@ -737,21 +776,27 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
             .read(&address)
             .await?
             .ok_or_else(|| BatchSettlementError::ChannelSealed(channel.clone()))?;
-        match account.status {
+        let landed = match account.status {
             wire::ChannelStatus::Open => {
-                self.submit(&[wire::request_close_instruction(
-                    &self.program_id,
-                    &self.sponsor.pubkey(),
-                    &address,
-                )])
-                .await?;
+                let landed = self
+                    .submit_confirmed(&[wire::request_close_instruction(
+                        &self.program_id,
+                        &self.sponsor.pubkey(),
+                        &address,
+                    )])
+                    .await?;
+                // The close confirmed: the channel is Closing whatever a
+                // node that has not seen it says, so nothing is backed
+                // until a read from its slot says what is.
+                self.set_backed(&address, 0);
+                Some(landed)
             }
-            wire::ChannelStatus::Closing => {}
+            wire::ChannelStatus::Closing => None,
             wire::ChannelStatus::Sealed | wire::ChannelStatus::Distributed => {
                 return Err(BatchSettlementError::ChannelSealed(channel.clone()))
             }
-        }
-        let state = self.outbound_state(channel).await?;
+        };
+        let state = self.outbound_state_after(channel, landed.as_ref()).await?;
         self.set_backed(&address, state.on_chain.voucher_ceiling());
         Ok(state)
     }
@@ -825,17 +870,7 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
         &self,
         channel: &ChannelId,
     ) -> Result<OutboundChannelState, BatchSettlementError> {
-        let (address, record) = self.outbound_record(channel)?;
-        let on_chain = match self.read(&address).await? {
-            Some(account) => state_of(channel, &account),
-            None => record
-                .finished
-                .ok_or_else(|| BatchSettlementError::ChannelNotFound(channel.clone()))?,
-        };
-        Ok(OutboundChannelState {
-            on_chain,
-            signed: record.signed,
-        })
+        self.outbound_state_after(channel, None).await
     }
 
     /// Ed25519 over `"toon-voucher-claim-state-challenge-v1" ‖
