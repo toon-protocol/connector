@@ -195,12 +195,12 @@ others down with it, ADR 0001) and root-disk usage under 90%.
 From the runner, over the public internet, one request per public hostname, with an **expected**
 answer rather than just "not 5xx":
 
-| Hostname                                                                                      | Expected                                     | Why                                                                                                                        |
-| --------------------------------------------------------------------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `proxy.{relay,ario,gas,gateway}.devnet…/ilp/identity`                                         | 200                                          | crosses the edge                                                                                                           |
-| `relay-ws.devnet…/`                                                                           | **426** Upgrade Required                     | the honest liveness signal for a WebSocket-only endpoint; a 200 there would mean something _other_ than the relay answered |
-| `dvm.devnet…/health`, `gas.devnet…/health`, `faucet.devnet…/health`, `onboard.devnet…/health` | 200                                          | the app behind the node, not its connector; the Onboarder publishes no host port, so the edge is the only way in           |
-| `gw.devnet…/` and a fresh random `<label>.gw.devnet…/`                                        | **503** with `toon-gateway-reason: no_grant` | the gateway's healthy, empty state — it answered and dialled nobody                                                        |
+| Hostname                                                                                      | Expected                                     | Why                                                                                                                                |
+| --------------------------------------------------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `proxy.{relay,ario,gas,gateway}.devnet…/ilp/identity`                                         | 200                                          | crosses the edge                                                                                                                   |
+| `relay-ws.devnet…/`                                                                           | **426** Upgrade Required                     | the honest liveness signal for a WebSocket-only endpoint; a 200 there would mean something _other_ than the relay answered         |
+| `dvm.devnet…/health`, `gas.devnet…/health`, `faucet.devnet…/health`, `onboard.devnet…/health` | 200                                          | the app behind the node, not its connector; the Onboarder is not a node and publishes no host port, so the edge is the only way in |
+| `gw.devnet…/` and a fresh random `<label>.gw.devnet…/`                                        | **503** with `toon-gateway-reason: no_grant` | the gateway's healthy, empty state — it answered and dialled nobody                                                                |
 
 ### How you find out
 
