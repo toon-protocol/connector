@@ -8,6 +8,7 @@ license.workspace = true
 test-util = []
 
 [dependencies]
+connector-btp = { path = "../connector-btp" }
 connector-client-edge = { path = "../connector-client-edge" }
 connector-domain = { path = "../connector-domain" }
 connector-runtime = { path = "../connector-runtime" }

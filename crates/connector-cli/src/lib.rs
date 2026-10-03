@@ -268,8 +268,14 @@ fn describe_send(outcome: &send::SendOutcome) -> String {
              one this wrap derives (ADR 0019). --seal-to almost certainly names a different node \
              from the one that actually terminated the packet."
         ),
-        send::Outcome::Rejected { code, message } => {
-            format!("REJECT {code} -- {head}\n{message}")
+        send::Outcome::Rejected {
+            code,
+            message,
+            accumulated_cost,
+        } => {
+            format!(
+                "REJECT {code} -- {head}\n{message}\naccumulated cost: {accumulated_cost} base units"
+            )
         }
         send::Outcome::NotSent => {
             format!("DRY RUN -- would have sent {head}. Nothing was sent and nothing was paid.")
@@ -469,6 +475,21 @@ fn parse_socks_proxy(value: &str) -> Result<Url, CliError> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn the_summary_of_a_reject_states_its_accumulated_cost() {
+        let summary = describe_send(&send::SendOutcome {
+            destination: "g.example.app".to_string(),
+            amount: 1,
+            keyid: "k".to_string(),
+            outcome: send::Outcome::Rejected {
+                code: "F02".to_string(),
+                message: "no route".to_string(),
+                accumulated_cost: 37,
+            },
+        });
+        assert!(summary.contains("accumulated cost: 37"), "{summary}");
+    }
 
     #[test]
     fn missing_path_argument_is_a_usage_error() {
