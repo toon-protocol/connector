@@ -1211,16 +1211,12 @@ fn the_two_hop_path_adds_up_across_the_table_and_the_configs() {
 
     for (constant, why) in [
         (
-            format!("AMOUNT={}", forward.price),
-            "the path's cost, A's price",
+            format!("AMOUNT={price}"),
+            "all of it is forwarded: an operator's own packet pays A no fee (#1466)",
         ),
         (
             format!("PRICE={price}"),
             "what each voucher must advance B by",
-        ),
-        (
-            format!("FEE={}", peering.fee),
-            "what A must be left holding",
         ),
         (
             "CROSSINGS=2".to_string(),
@@ -1342,7 +1338,9 @@ fn the_mixed_chain_path_is_one_prefix_per_hop_and_one_flat_fee_per_hop() {
     let owed_at_b = first.price - first_fee;
     let owed_at_c = second.price - second_fee;
     for constant in [
-        format!("AMOUNT={}", first.price),
+        // An operator's own packet pays A no fee, so what it sends is what
+        // A forwards, and that is exactly B's price (#1466).
+        format!("AMOUNT={}", second.price),
         format!("OWED_AT_B={owed_at_b}"),
         format!("OWED_AT_C={owed_at_c}"),
         "CROSSINGS=2".to_string(),
@@ -1574,7 +1572,7 @@ fn the_dealing_crossing_is_covered_for_the_converted_figure() {
     );
 
     for constant in [
-        format!("AMOUNT={}", first.price),
+        format!("AMOUNT={}", second.price),
         format!("OWED_AT_B={DEALING_OWED_AT_B}"),
         format!("OWED_AT_C={DEALING_OWED_AT_C}"),
         "CROSSINGS=2".to_string(),
@@ -1952,15 +1950,12 @@ fn the_onion_sidecars_agree_to_the_terms_and_persist_the_hidden_service() {
 
 #[test]
 fn the_onion_rehearsal_reads_the_payees_own_voucher_journal() {
-    let table = topology("onion");
     let b = load("local/onion/connector-b.toml", ONION_B);
     let sender = onion_service("sender");
     let price = flat(b.routes()[0].price());
-    let fee = table.peering("a-b").fee;
     for constant in [
         format!("PRICE={price}"),
-        format!("FEE={fee}"),
-        format!("AMOUNT={}", price + fee),
+        format!("AMOUNT={price}"),
         "CROSSINGS=2".to_string(),
     ] {
         assert!(

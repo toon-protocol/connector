@@ -697,11 +697,13 @@ pub enum ConfigPeeringError {
 /// keeps it that way, so each carriage hands the connector the leg it
 /// authenticated.
 ///
-/// There is no third variant, and the absence is load-bearing: an arrival
-/// with no channel behind it -- an operator write, a test calling
-/// [`Connector::handle_prepare`] directly -- is `None` rather than a
-/// variant of this, because there is nothing to resolve rather than a
-/// denomination that happens to be unknown.
+/// There is no channel-less denominated variant, and the absence is
+/// load-bearing: an arrival with no channel behind it -- the operator's own
+/// origination, a test calling [`Connector::handle_prepare`] directly --
+/// resolves to no denomination, because there is nothing to resolve rather
+/// than a denomination that happens to be unknown. The operator's origination
+/// is named ([`Arrival::Operator`]) only because it pays no fee (#1466); it
+/// crosses no boundary exactly as `None` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrival<'a> {
     /// A peer arrival, named by the peering both carriages authenticate
@@ -715,6 +717,12 @@ enum Arrival<'a> {
     /// the key's chain and not its id -- so a channel this node discovered
     /// on chain is denominated exactly like a declared one.
     ClientChannel(&'a str),
+    /// The operator's own origination (`POST /packets`, ADR 0061's update
+    /// for #1466). It arrived over no peering and no channel, so it crosses
+    /// no denomination boundary, and a fee pays for carrying someone else's
+    /// packet, which this is not: [`Connector::forward_via_peer_route`]
+    /// charges it none.
+    Operator,
 }
 
 /// Why a forward could not be covered: it could not be signed, or the packet
@@ -1027,8 +1035,9 @@ impl Connector {
     /// `None` covers three cases that all forward the same way -- the two
     /// legs hold one token, this node declares none, or the packet named no
     /// arriving leg at all. That last one is the case worth stating: an
-    /// operator write, or any caller of [`Self::handle_prepare`] itself,
-    /// carries no channel and therefore no unit, so nothing can be said
+    /// operator write ([`Arrival::Operator`]), or any caller of
+    /// [`Self::handle_prepare`] itself, carries no channel and therefore no
+    /// unit, so nothing can be said
     /// about what it arrived in and this node forwards it as it always did.
     /// A client-edge delivery is no longer one of those: since issue #1301
     /// it carries the channel key its claim cleared, and on a dealing node
@@ -1041,6 +1050,7 @@ impl Connector {
         outgoing_peer_id: &str,
     ) -> Option<(&AssetId, &AssetId)> {
         let incoming = match arrived? {
+            Arrival::Operator => return None,
             Arrival::Peer(peer_id) => self.peer_asset(peer_id)?,
             Arrival::ClientChannel(channel_key) => self.client_channel_assets.asset(channel_key)?,
         };
@@ -1989,6 +1999,19 @@ impl Connector {
         .await
     }
 
+    /// Entry point for a packet the operator originates (`POST /packets`):
+    /// [`Self::handle_prepare`], except that it pays this node no fee. A fee
+    /// is charged for carrying someone else's packet; the operator's own is
+    /// not that (ADR 0061, update for #1466). The forwarded amount, and the
+    /// voucher covering it, is the packet's own amount, an amount below the
+    /// peering's fee is not refused `R01`, and a relayed reject's
+    /// `accumulated_cost` does not gain this node's fee. The per-packet cap
+    /// still applies, and no denomination is crossed.
+    pub async fn originate_prepare(&self, prepare: Prepare) -> PacketResponse {
+        self.handle_prepare_spanned(prepare, None, Some(Arrival::Operator))
+            .await
+    }
+
     /// The one body [`Self::handle_prepare_with_client_channel`] and
     /// [`Self::handle_peer_prepare`] share: open the `"packet"` span and
     /// route inside it.
@@ -2289,7 +2312,9 @@ impl Connector {
         let response = self
             .forward_via_peer_route(&peer_route, prepare, arrived)
             .await;
-        if matches!(response, PacketResponse::Fulfill(_)) {
+        if matches!(response, PacketResponse::Fulfill(_))
+            && !matches!(arrived, Some(Arrival::Operator))
+        {
             self.metrics
                 .record_fee_earned(self.fee_for(peer_route.peer_id()));
         }
@@ -2651,7 +2676,12 @@ impl Connector {
         // the OUTGOING leg, which is the peering it is attached to, so on a
         // crossing it is subtracted after the conversion and not before.
         let peer_id = peer_route.peer_id();
-        let fee = self.fee_for(peer_id);
+        // An operator's own packet pays no fee: a fee is charged for carrying
+        // someone else's packet (ADR 0061, update for #1466).
+        let fee = match arrived {
+            Some(Arrival::Operator) => 0,
+            _ => self.fee_for(peer_id),
+        };
 
         // The two arms ADR 0071 decision 2 keeps apart. A forward that
         // crosses no denomination boundary -- every forward on a node that
@@ -4850,6 +4880,96 @@ mod tests {
             "second-hop",
         );
         (first_hop, second_hop_app_client)
+    }
+
+    /// #1466: the operator's own packet pays this node no fee, so what it
+    /// sends is what is forwarded -- shown against the cap, which is
+    /// measured on the forwarded amount, and against a fee larger than the
+    /// packet, which would otherwise be refused `R01`.
+    #[tokio::test]
+    async fn an_originated_packet_forwards_its_whole_amount_and_is_not_refused_for_the_fee() {
+        // Fee 10, cap 100. 105 from a client forwards 95 and clears the cap;
+        // originated, it forwards 105 and does not.
+        let (first_hop, _) = capped_hop_pair(10, vec![("second-hop".to_string(), 100)]);
+        let response = first_hop
+            .originate_prepare(prepare_with_amount("g.example.app", 105))
+            .await;
+        match response {
+            PacketResponse::Reject(reject) => {
+                assert_eq!(reject.code.as_str(), "T04");
+                assert!(reject.message.contains("105"), "{}", reject.message);
+            }
+            other => panic!("expected the cap to refuse 105, got {other:?}"),
+        }
+        let response = first_hop
+            .handle_prepare(prepare_with_amount("g.example.app", 105))
+            .await;
+        assert!(
+            matches!(response, PacketResponse::Fulfill(_)),
+            "a client's 105 forwards 95, under the cap: {response:?}"
+        );
+
+        // Amount 4 under a fee of 10: the client is refused R01, the
+        // operator's own packet is forwarded.
+        let (first_hop, second_hop_app_client) = capped_hop_pair(10, vec![]);
+        let response = first_hop
+            .handle_prepare(prepare_with_amount("g.example.app", 4))
+            .await;
+        assert!(matches!(&response, PacketResponse::Reject(r) if r.code.as_str() == "R01"));
+        assert!(second_hop_app_client.deliveries().is_empty());
+        let response = first_hop
+            .originate_prepare(prepare_with_amount("g.example.app", 4))
+            .await;
+        assert!(
+            matches!(response, PacketResponse::Fulfill(_)),
+            "{response:?}"
+        );
+        assert_eq!(second_hop_app_client.deliveries().len(), 1);
+    }
+
+    /// #1466: a reject relayed to the operator does not gain this node's
+    /// fee; the same reject relayed to a client does.
+    #[tokio::test]
+    async fn a_reject_relayed_to_the_operator_does_not_gain_this_nodes_fee() {
+        let second_hop = Arc::new(Connector::new(
+            vec![],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let mut peer_transport = InProcessPeerTransport::new();
+        peer_transport.add_peer("second-hop", second_hop);
+        let first_hop = covering(
+            Connector::new(
+                vec![],
+                vec![PeerRoute::new("g.example.app", "second-hop")],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(peer_transport),
+                test_clock(),
+            )
+            .with_peer_fees([("second-hop".to_string(), 10)]),
+            "second-hop",
+        );
+
+        for (originated, expected) in [(true, 0), (false, 10)] {
+            let prepare = prepare_with_amount("g.example.app", 100);
+            let response = if originated {
+                first_hop.originate_prepare(prepare).await
+            } else {
+                first_hop.handle_prepare(prepare).await
+            };
+            match response {
+                PacketResponse::Reject(reject) => {
+                    assert_eq!(reject.code.as_str(), "F02");
+                    assert_eq!(
+                        reject.accumulated_cost, expected,
+                        "originated: {originated}"
+                    );
+                }
+                other => panic!("expected a reject, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -9492,6 +9612,35 @@ mod tests {
             assert_eq!(challenge["channelId"], channel.as_str());
             assert!(challenge["channelConfig"].is_object());
             assert_eq!(outbound.signed(&channel), Some(0), "nothing was signed");
+        }
+
+        /// #1466 on a peering that charges a fee: the operator's own packet
+        /// is covered for its whole amount, and one moving no value is
+        /// forwarded under the challenge rather than refused `R01`.
+        #[tokio::test]
+        async fn an_originated_packet_is_covered_for_its_whole_amount() {
+            let (connector, next_hop, _receiver, outbound, channel) = peered().await;
+            assert!(matches!(
+                connector.originate_prepare(prepare(110)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            assert_eq!(voucher_amounts(&next_hop).await, vec![110]);
+            assert_eq!(outbound.signed(&channel), Some(110));
+
+            assert!(matches!(
+                connector.originate_prepare(prepare(0)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            let covered = next_hop.covered.lock().unwrap().clone();
+            assert!(
+                matches!(covered.last(), Some(Covering::Challenge(_))),
+                "expected the challenge, got {covered:?}"
+            );
+            assert_eq!(
+                outbound.signed(&channel),
+                Some(110),
+                "nothing more was signed"
+            );
         }
 
         /// Removing the peering stops signing on its outbound channel, which

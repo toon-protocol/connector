@@ -179,11 +179,11 @@ services:
       - |
         set -e
         . /app/rehearsal.sh
-        # 1200 is this path's COST (`CONTEXT.md`) IN THE SENDER'S OWN UNIT,
-        # and on this topology that qualification is the whole of ADR 0071
-        # decision 7: the sender pays A's posted price in µUSDC and never meets
-        # a 9-decimal figure. 1200 leaves, A keeps its flat 100, and 1100 µUSDC
-        # arrives at the boundary; what leaves it is
+        # 1100 is what the sender sends, IN THE SENDER'S OWN UNIT, and on this
+        # topology that qualification is the whole of ADR 0071 decision 7: the
+        # sender never meets a 9-decimal figure. A charges its operator's own
+        # packet no fee (ADR 0061, #1466), so 1100 µUSDC arrives at the
+        # boundary; what leaves it is
         #
         #   floor(1100 * 4000/1 * 99/100) - 6000 = 4350000
         #
@@ -192,7 +192,7 @@ services:
         # or the outgoing FEE having moved -- or the boundary not converting
         # at all, which would put 1100 there and fulfil every packet
         # regardless.
-        AMOUNT=1200
+        AMOUNT=1100
         OWED_AT_B=1100
         OWED_AT_C=4350000
         CROSSINGS=2

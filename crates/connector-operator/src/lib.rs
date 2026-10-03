@@ -417,7 +417,7 @@ async fn metrics(State(state): State<OperatorState>) -> Response {
 
 /// `POST /packets`: an operator originates a packet outward, exactly as
 /// the client edge does for an external caller -- decode a [`Prepare`],
-/// call [`Connector::handle_prepare`] once, encode the outcome. The one
+/// call [`Connector::originate_prepare`] once, encode the outcome. The one
 /// difference is what happens first: [`authenticate_write`] must accept
 /// the request's RFC 9421 signature before any of that runs.
 async fn originate_packet(
@@ -436,10 +436,11 @@ async fn originate_packet(
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
-    // An operator-originated packet is handed to the connector exactly as
-    // a client's is. It declares no floor of its own: the
-    // `minimum_delivery = prepare.amount` convention that used to live
-    // here was a third convention no record ever carried, and it made
+    // An operator-originated packet is handed to the connector as an
+    // origination, which pays this node no fee (ADR 0061, #1466). It
+    // declares no floor of its own: the `minimum_delivery = prepare.amount`
+    // convention that used to live here was a third convention no record
+    // ever carried, and it made
     // `amount - fee >= minimum_delivery` unsatisfiable for any non-zero
     // fee, so a fee-charging peering could never carry an operator's
     // packet at all (ADR 0057, issue #1143). What bounds erosion now is
@@ -447,7 +448,7 @@ async fn originate_packet(
     // The cost never rides the OER encoding of a REJECT (ADR 0011), so it
     // goes beside it on every REJECT, zero included: "absent" never has to
     // carry meaning. The client edge's own answer does exactly that.
-    connector_client_edge::packet_response(state.connector.handle_prepare(prepare).await)
+    connector_client_edge::packet_response(state.connector.originate_prepare(prepare).await)
 }
 
 /// A `POST /routes/leased` request body: create or renew a leased route
@@ -1902,21 +1903,35 @@ mod tests {
 
         /// Issue #1460: a REJECT answered by `POST /packets` carries its
         /// accumulated cost in `TOON-Accumulated-Cost`, because the cost never
-        /// rides the OER bytes (ADR 0011). One forwarding hop charging 7, relaying
-        /// a REJECT its peer genuinely decided on, is the smallest path whose
-        /// cost is not zero.
+        /// rides the OER bytes (ADR 0011). The operator's own node charges its
+        /// origination no fee (#1466), so the smallest path whose cost is not
+        /// zero is one hop further out: the peer it forwards to charges 7 and
+        /// relays a REJECT its own peer genuinely decided on.
         #[tokio::test]
-        async fn a_reject_relayed_through_a_paying_hop_carries_that_hops_fee() {
+        async fn a_reject_relayed_through_a_charging_peer_carries_that_peers_fee() {
             use connector_runtime::PeerRoute;
 
             let keypair = keypair();
             let clock = Arc::new(TestClock::new(chrono::Utc::now()));
-            let second_hop = Arc::new(Connector::new(
+            let third_hop = Arc::new(Connector::new(
                 vec![],
                 vec![],
                 Arc::new(FakeAppClient::new()),
                 Arc::new(InProcessPeerTransport::new()),
                 clock.clone(),
+            ));
+            let mut second_hop_transport = InProcessPeerTransport::new();
+            second_hop_transport.add_peer("third-hop", third_hop);
+            let second_hop = Arc::new(covering(
+                Connector::new(
+                    vec![],
+                    vec![PeerRoute::new("g.example", "third-hop")],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(second_hop_transport),
+                    clock.clone(),
+                )
+                .with_peer_fees([("third-hop".to_string(), 7)]),
+                "third-hop",
             ));
             let mut peer_transport = InProcessPeerTransport::new();
             peer_transport.add_peer("second-hop", second_hop);
@@ -1927,8 +1942,7 @@ mod tests {
                     Arc::new(FakeAppClient::new()),
                     Arc::new(peer_transport),
                     clock,
-                )
-                .with_peer_fees([("second-hop".to_string(), 7)]),
+                ),
                 "second-hop",
             ));
             let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));

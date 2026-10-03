@@ -67,8 +67,9 @@ btp_endpoint = "ws://placeholderplaceholderplaceholderplaceholderplaceholderb.an
 
 # ── The terminated route ─────────────────────────────────────────────────────
 # `price = 1000`, paid by a voucher A signs BEFORE each packet is sent (ADR
-# 0042, ADR 0075 decision 6) -- 1200 sent, A's fee of 200 kept, 1000
-# forwarded, exactly this price.
+# 0042, ADR 0075 decision 6) -- the rehearsal's 1000
+# sent, A's operator's own packet and so charged no fee (ADR 0061, #1466),
+# forwarded whole: exactly this price.
 #
 # `transport = "http"` is the PEER-ROLE PROOF, mirrored from `two-hop`: A
 # peers with B over BTP, a CLIENT arriving over BTP is refused a route pinned
