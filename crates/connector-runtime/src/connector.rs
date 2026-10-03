@@ -2071,7 +2071,10 @@ impl Connector {
                         prepare.destination, charge, prepare.amount
                     ),
                     data: Vec::new(),
-                    accumulated_cost: 0,
+                    // The glossary's Cost: this refusal is the terminating
+                    // hop's, so it states the charge its upstream hops add
+                    // their fees to (as `handle_probe` does at the edge).
+                    accumulated_cost: charge,
                 });
                 return self.finish(reject);
             }
@@ -7959,7 +7962,7 @@ mod tests {
             match response {
                 PacketResponse::Reject(reject) => {
                     assert_eq!(reject.code.as_str(), "F03");
-                    assert_eq!(reject.accumulated_cost, 0);
+                    assert_eq!(reject.accumulated_cost, 25);
                 }
                 other => panic!("expected an F03 reject, got {other:?}"),
             }
@@ -8211,6 +8214,7 @@ mod tests {
             match response {
                 PacketResponse::Reject(reject) => {
                     assert_eq!(reject.code.as_str(), "F03");
+                    assert_eq!(reject.accumulated_cost, charge);
                     assert!(
                         reject.message.contains(&charge.to_string()),
                         "the refusal must name what this packet costs, got: {}",
