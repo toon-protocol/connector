@@ -306,7 +306,13 @@ pub fn payment_required(
                 }
             },
             data: Vec::new(),
-            accumulated_cost: 0,
+            // A terminating refusal states the route's charge for this
+            // packet (the glossary's Cost); a forward's refusal states none,
+            // its cost being the downstream hops' to add.
+            accumulated_cost: match route.kind {
+                ClientRouteKind::Terminated => required,
+                ClientRouteKind::Forwarded => 0,
+            },
         },
         // A peering has no bootstrap identity to advertise and no client
         // session to lease: the peer already knows this node, and what it

@@ -537,6 +537,21 @@ fn spawn_payee(
     tempfile::NamedTempFile,
     tempfile::NamedTempFile,
 ) {
+    spawn_payee_priced(fixture, state_dir, stub_app_addr, 0)
+}
+
+/// [`spawn_payee`], terminating [`APP_PREFIX`] at `price`.
+fn spawn_payee_priced(
+    fixture: &PeerFixture,
+    state_dir: &std::path::Path,
+    stub_app_addr: &str,
+    price: u64,
+) -> (
+    ConnectorProcess,
+    tempfile::NamedTempFile,
+    tempfile::NamedTempFile,
+    tempfile::NamedTempFile,
+) {
     let key_file = write_raw_key_file(PAYEE_SIGNER_SEED);
     let settlement_key = settlement_key_file(PAYEE_SETTLEMENT_KEY);
     let config = write_config(&format!(
@@ -551,7 +566,7 @@ key_file = "{key_file}"
 [[routes]]
 prefix = "{APP_PREFIX}"
 handler_url = "http://{stub_app_addr}"
-price = 0
+price = {price}
 
 # The peering this node accepts. No `endpoint`: the payer dials us.
 [[peers]]
@@ -1199,6 +1214,76 @@ async fn a_client_may_not_declare_more_than_the_forwarded_route_charges() {
         journaled(payee_state.path(), &fixture.payer_channel).is_empty(),
         "and nothing crossed the peering"
     );
+}
+
+/// **A refusal at a priced termination states its charge, and the hop that
+/// carried the packet adds its fee** (the glossary's Cost): a sender reading
+/// a refused packet off the payer learns `PEER_FEE` plus the payee's price,
+/// not the fee alone. The payee's price is one unit more than the payer
+/// forwards, so its gate refuses `F06` on the real peering.
+#[tokio::test]
+async fn a_refusal_across_a_peering_states_the_fee_plus_the_termination_charge_over_btp() {
+    a_refusal_across_a_peering_states_the_fee_plus_the_charge(Carriage::Btp).await;
+}
+
+#[tokio::test]
+async fn a_refusal_across_a_peering_states_the_fee_plus_the_termination_charge_over_http() {
+    a_refusal_across_a_peering_states_the_fee_plus_the_charge(Carriage::Http).await;
+}
+
+async fn a_refusal_across_a_peering_states_the_fee_plus_the_charge(carriage: Carriage) {
+    let Some(fixture) = PeerFixture::spawn().await else {
+        return;
+    };
+    let payee_state = tempfile::tempdir().expect("temp payee state dir");
+    let stub_app = spawn_stub_app();
+    let charge = FORWARDED + 1;
+    let (payee, _payee_config, _payee_key, _payee_settlement) =
+        spawn_payee_priced(&fixture, payee_state.path(), &stub_app.addr, charge);
+    let payee_client_edge = format!("http://{}/ilp", payee.client_edge_addr);
+    let (payer, _payer_config, _payer_key, _payer_settlement) = spawn_payer(
+        &fixture,
+        carriage,
+        &payee_endpoint(carriage, &payee),
+        &payee_client_edge,
+    );
+
+    let payee_identity = identity_from_key_seed(PAYEE_SIGNER_SEED);
+    let (data, _shared_secret) = sealed_prepare_data(b"underpaid", &payee_identity);
+    let prepare = Prepare {
+        amount: CLIENT_PRICE,
+        ..sample_prepare(APP_PREFIX, data)
+    };
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/ilp", payer.client_edge_addr))
+        .header(
+            "ilp-payment-channel-claim",
+            BASE64.encode(fixture.client_claim(1)),
+        )
+        .body(prepare.encode())
+        .send()
+        .await
+        .expect("POST /ilp");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let accumulated_cost = response
+        .headers()
+        .get("toon-accumulated-cost")
+        .expect("every REJECT this edge answers carries its running cost")
+        .to_str()
+        .expect("the accumulated-cost header is ASCII")
+        .to_string();
+    let body = response.bytes().await.expect("response body").to_vec();
+    let reject = Reject::decode(&body).expect("an underpaid packet is refused, not fulfilled");
+    // `F06` from the payee's price gate or `F03` from the arrival's own
+    // amount check, whichever the carriage reaches first: both state the
+    // charge.
+    assert!(
+        ["F03", "F06"].contains(&reject.code.as_str()),
+        "{} {}",
+        reject.code.as_str(),
+        reject.message
+    );
+    assert_eq!(accumulated_cost, (PEER_FEE + charge).to_string());
 }
 
 // ---------------------------------------------------------------------------
