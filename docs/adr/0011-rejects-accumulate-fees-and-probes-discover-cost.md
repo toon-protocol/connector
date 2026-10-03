@@ -81,3 +81,12 @@ the answer is still cacheable because ADR 0010's fees are flat. Probe economics 
 no revision: a probe carries a small amount by construction, so what a forwarding connector now
 covers on one is a micropayment, against an abuser who must still fund a channel per identity and is
 still rate-limited per that identity.
+
+## Update (#1467, decided in #1461)
+
+**An `R01` marks a partial sum.** A hop that refuses a packet `R01` because its own fee exceeds
+the amount the packet carries sets `accumulated_cost` to that fee — on a denomination boundary
+(ADR 0071), in the incoming leg's unit, converted the way a relayed reject's cost is. Hops
+upstream add theirs on the way back, so the sender reads the least amount that gets a packet past
+the hop that refused it, without parsing the message. Any other reject's sum is for the whole path
+the packet travelled; an `R01`'s stops at the hop it could not pay.

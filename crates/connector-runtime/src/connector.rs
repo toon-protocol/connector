@@ -2450,7 +2450,11 @@ impl Connector {
                     cost_before_rate_and_fee(0, rate, fee)
                 ),
                 data: Vec::new(),
-                accumulated_cost: 0,
+                // This hop's own fee, in the incoming leg's unit -- the same
+                // arithmetic a relayed reject's cost crosses back with, so
+                // the figure is readable where it lands. `R01` marks a
+                // partial sum: the packet stopped at this hop.
+                accumulated_cost: cost_before_rate_and_fee(0, rate, fee),
             }),
             None => Err(Reject {
                 code: RejectCode::t04_insufficient_liquidity(),
@@ -2678,7 +2682,10 @@ impl Connector {
                             peer_id, fee, prepare.amount, fee
                         ),
                         data: Vec::new(),
-                        accumulated_cost: 0,
+                        // This hop's own fee: upstream hops add theirs on the
+                        // way back, so the sender reads the least amount that
+                        // gets past this hop. `R01` marks a partial sum.
+                        accumulated_cost: fee,
                     });
                 };
                 forwarded_amount
@@ -4700,11 +4707,78 @@ mod tests {
                 assert_eq!(reject.code.as_str(), "R01");
                 assert!(reject.message.contains("10"), "{}", reject.message);
                 assert!(reject.message.contains('4'), "{}", reject.message);
+                // The refusing hop's own fee: a partial sum, stopped here.
+                assert_eq!(reject.accumulated_cost, 10);
             }
             other => panic!("expected a reject, got {other:?}"),
         }
         // Never forwarded a smaller amount hoping the far end would cope.
         assert!(second_hop_app_client.deliveries().is_empty());
+    }
+
+    /// A packet that pays the first fee-charging hop and not the second
+    /// comes back with both fees summed, and a packet carrying exactly that
+    /// sum is not refused `R01` by either hop.
+    #[tokio::test]
+    async fn an_r01_at_the_second_hop_sums_both_fees_and_that_sum_clears_it() {
+        let last_route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
+        let last_client = Arc::new(FakeAppClient::new());
+        last_client.respond(last_route.handler_url(), answered(b""));
+        let last = Arc::new(Connector::new(
+            vec![last_route],
+            vec![],
+            last_client,
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let mut to_last = InProcessPeerTransport::new();
+        to_last.add_peer("last", last);
+        let middle = Arc::new(covering(
+            Connector::new(
+                vec![],
+                vec![PeerRoute::new("g.example.app", "last")],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(to_last),
+                test_clock(),
+            )
+            .with_peer_fees([("last".to_string(), 10)]),
+            "last",
+        ));
+        let mut to_middle = InProcessPeerTransport::new();
+        to_middle.add_peer("middle", middle);
+        let first = covering(
+            Connector::new(
+                vec![],
+                vec![PeerRoute::new("g.example.app", "middle")],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(to_middle),
+                test_clock(),
+            )
+            .with_peer_fees([("middle".to_string(), 3)]),
+            "middle",
+        );
+
+        // 5 pays the first fee (3) and leaves 2, short of the second (10).
+        let reject = match first
+            .handle_prepare(prepare_with_amount("g.example.app", 5))
+            .await
+        {
+            PacketResponse::Reject(reject) => reject,
+            other => panic!("expected a reject, got {other:?}"),
+        };
+        assert_eq!(reject.code.as_str(), "R01");
+        assert_eq!(reject.accumulated_cost, 13);
+
+        let again = first
+            .handle_prepare(prepare_with_amount(
+                "g.example.app",
+                reject.accumulated_cost,
+            ))
+            .await;
+        assert!(
+            !matches!(&again, PacketResponse::Reject(r) if r.code.as_str() == "R01"),
+            "the returned figure must get past both hops: {again:?}"
+        );
     }
 
     // -- ADR 0042's cap: the largest amount this connector will forward to
@@ -5353,7 +5427,17 @@ mod tests {
         // `ceil((0 + 4) / (1/3))` = 12 incoming units, the smallest arrival
         // that leaves anything at all.
         assert!(reject.message.contains("12"), "{}", reject.message);
+        // The same figure, in the incoming leg's unit, as the cost.
+        assert_eq!(reject.accumulated_cost, 12);
         assert!(peer.carried().is_empty());
+
+        // Carrying exactly that figure is not refused `R01` by this hop.
+        let again = arrives_from_upstream(&hop, 12).await;
+        assert!(
+            !matches!(&again, PacketResponse::Reject(r) if r.code.as_str() == "R01"),
+            "12 incoming units must clear the hop: {again:?}"
+        );
+        assert_eq!(peer.carried().len(), 1);
     }
 
     /// The other `None` [`amount_after_rate_and_fee`] answers, and the
@@ -8122,9 +8206,11 @@ mod tests {
 
             match response {
                 Ok(PacketResponse::Reject(reject)) => {
-                    // The peer was never reached, so this hop adds nothing
-                    // -- the figure is honest about what was traversed.
-                    assert_eq!(reject.accumulated_cost, 0);
+                    // The probe's amount cannot pay this hop's fee, so the
+                    // hop refuses `R01` and reports that fee: the peer was
+                    // never reached, and the sum is partial.
+                    assert_eq!(reject.code.as_str(), "R01");
+                    assert_eq!(reject.accumulated_cost, 7);
                 }
                 other => panic!("expected a reject, got {other:?}"),
             }
