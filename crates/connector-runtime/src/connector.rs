@@ -697,11 +697,13 @@ pub enum ConfigPeeringError {
 /// keeps it that way, so each carriage hands the connector the leg it
 /// authenticated.
 ///
-/// There is no third variant, and the absence is load-bearing: an arrival
-/// with no channel behind it -- an operator write, a test calling
-/// [`Connector::handle_prepare`] directly -- is `None` rather than a
-/// variant of this, because there is nothing to resolve rather than a
-/// denomination that happens to be unknown.
+/// There is no channel-less denominated variant, and the absence is
+/// load-bearing: an arrival with no channel behind it -- the operator's own
+/// origination, a test calling [`Connector::handle_prepare`] directly --
+/// resolves to no denomination, because there is nothing to resolve rather
+/// than a denomination that happens to be unknown. The operator's origination
+/// is named ([`Arrival::Operator`]) only because it pays no fee (#1466); it
+/// crosses no boundary exactly as `None` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrival<'a> {
     /// A peer arrival, named by the peering both carriages authenticate
@@ -1033,8 +1035,9 @@ impl Connector {
     /// `None` covers three cases that all forward the same way -- the two
     /// legs hold one token, this node declares none, or the packet named no
     /// arriving leg at all. That last one is the case worth stating: an
-    /// operator write, or any caller of [`Self::handle_prepare`] itself,
-    /// carries no channel and therefore no unit, so nothing can be said
+    /// operator write ([`Arrival::Operator`]), or any caller of
+    /// [`Self::handle_prepare`] itself, carries no channel and therefore no
+    /// unit, so nothing can be said
     /// about what it arrived in and this node forwards it as it always did.
     /// A client-edge delivery is no longer one of those: since issue #1301
     /// it carries the channel key its claim cleared, and on a dealing node
@@ -9449,6 +9452,35 @@ mod tests {
             assert_eq!(challenge["channelId"], channel.as_str());
             assert!(challenge["channelConfig"].is_object());
             assert_eq!(outbound.signed(&channel), Some(0), "nothing was signed");
+        }
+
+        /// #1466 on a peering that charges a fee: the operator's own packet
+        /// is covered for its whole amount, and one moving no value is
+        /// forwarded under the challenge rather than refused `R01`.
+        #[tokio::test]
+        async fn an_originated_packet_is_covered_for_its_whole_amount() {
+            let (connector, next_hop, _receiver, outbound, channel) = peered().await;
+            assert!(matches!(
+                connector.originate_prepare(prepare(110)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            assert_eq!(voucher_amounts(&next_hop).await, vec![110]);
+            assert_eq!(outbound.signed(&channel), Some(110));
+
+            assert!(matches!(
+                connector.originate_prepare(prepare(0)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            let covered = next_hop.covered.lock().unwrap().clone();
+            assert!(
+                matches!(covered.last(), Some(Covering::Challenge(_))),
+                "expected the challenge, got {covered:?}"
+            );
+            assert_eq!(
+                outbound.signed(&channel),
+                Some(110),
+                "nothing more was signed"
+            );
         }
 
         /// Removing the peering stops signing on its outbound channel, which

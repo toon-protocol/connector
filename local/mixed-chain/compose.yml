@@ -231,8 +231,9 @@ services:
           --amount       "$$AMOUNT" \
           --body         /app/data/payload.json \
           --expect-fulfill
-        # 1100 leaves the sender and A covers B for all of it; B keeps
-        # 50 and covers C for 1050. A's own fee is waived on its operator's packet.
+        # 1100 leaves the sender and A covers B for all of it, since A's
+        # fee is waived on its operator's own packet; B keeps 50 and covers C
+        # for 1050.
         paid /app/b-state "$$A_B" "B (EVM)" "$$((CROSSINGS + 1))" "$$OWED_AT_B"
         paid /app/c-state "$$B_C" "C (Solana)" "$$CROSSINGS" "$$OWED_AT_C"
         echo "--- both peerings paid for every crossing: $$OWED_AT_B at B, $$OWED_AT_C at C"

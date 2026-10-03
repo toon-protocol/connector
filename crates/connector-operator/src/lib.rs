@@ -439,9 +439,10 @@ async fn originate_packet(
     };
 
     // An operator-originated packet is handed to the connector as an
-    // origination, which pays this node no fee (ADR 0061, #1466). It declares no floor of its own: the
-    // `minimum_delivery = prepare.amount` convention that used to live
-    // here was a third convention no record ever carried, and it made
+    // origination, which pays this node no fee (ADR 0061, #1466). It
+    // declares no floor of its own: the `minimum_delivery = prepare.amount`
+    // convention that used to live here was a third convention no record
+    // ever carried, and it made
     // `amount - fee >= minimum_delivery` unsatisfiable for any non-zero
     // fee, so a fee-charging peering could never carry an operator's
     // packet at all (ADR 0057, issue #1143). What bounds erosion now is
