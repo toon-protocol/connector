@@ -39,7 +39,7 @@ Pin a **release handle** — `rust-<handle>`, a UTC date and that day's ordinal.
 Handles are immutable and never moved:
 
 ```bash
-docker pull ghcr.io/toon-protocol/connector:rust-2026.08.28.1
+docker pull ghcr.io/toon-protocol/connector:rust-2026.09.29.1
 mkdir -p node/config node/data && cd node
 openssl rand -hex 32 > data/signer.key && chmod 600 data/signer.key
 ```
@@ -54,7 +54,7 @@ has the full tag table.
 > arm64 host), pull and run it under emulation:
 >
 > ```bash
-> docker pull --platform linux/amd64 ghcr.io/toon-protocol/connector:rust-2026.08.28.1
+> docker pull --platform linux/amd64 ghcr.io/toon-protocol/connector:rust-2026.09.29.1
 > ```
 >
 > and add `platform: linux/amd64` next to `image:` on the `connector` service in
@@ -65,7 +65,7 @@ has the full tag table.
 ```yaml
 services:
   connector:
-    image: ghcr.io/toon-protocol/connector:rust-2026.08.28.1
+    image: ghcr.io/toon-protocol/connector:rust-2026.09.29.1
     command: ['/app/config/connector.toml']
     volumes:
       - ./config/connector.toml:/app/config/connector.toml:ro
