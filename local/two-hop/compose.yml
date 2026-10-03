@@ -185,6 +185,27 @@ services:
             --body         /app/data/payload.json \
             --expect-fulfill
         }
+        # Probe before paying (ADR 0011): an amount-0 packet is refused, and
+        # the refusal states what the path costs. A charges its operator's own
+        # packet nothing, so the figure is B's PRICE and no more. It must be
+        # asserted on the printed figure -- the probe exits zero on any cost.
+        echo '--- probe: what does a packet to B cost, before any is sent'
+        probed=$$(/usr/local/bin/connector probe \
+          --operator     http://connector-a:3000 \
+          --operator-key /app/data/operator-send.key \
+          --to           g.local.two-hop.b.app \
+          --seal-to      http://connector-b:3000/ilp \
+          --target       / \
+          --body         /app/data/payload.json \
+          --json)
+        echo "$$probed"
+        case "$$probed" in
+          *'"accumulatedCost":'"$$PRICE"'}'* | *'"accumulatedCost":'"$$PRICE"',*) ;;
+          *)
+            echo "PROBE: the path to B must cost $$PRICE (B's price, A taking no fee)." >&2
+            exit 1
+            ;;
+        esac
         echo '--- crossing 1: priced at B, covered by A before it is sent'
         send
         echo '--- crossing 2: the covering voucher must ADVANCE, not repeat'

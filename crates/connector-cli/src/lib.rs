@@ -25,6 +25,7 @@
 
 mod batch_settlement;
 mod peer_transport;
+mod probe;
 mod runtime;
 mod send;
 mod sponsor;
@@ -63,6 +64,8 @@ pub enum CliError {
     Runtime(RuntimeError),
     /// The `send` subcommand ran and failed.
     Send(send::SendError),
+    /// The `probe` subcommand ran and learned no cost.
+    Probe(probe::ProbeError),
 }
 
 impl fmt::Display for CliError {
@@ -72,6 +75,7 @@ impl fmt::Display for CliError {
             CliError::Config(source) => write!(f, "{source}"),
             CliError::Runtime(source) => write!(f, "{source}"),
             CliError::Send(source) => write!(f, "{source}"),
+            CliError::Probe(source) => write!(f, "{source}"),
         }
     }
 }
@@ -87,6 +91,12 @@ impl From<ConfigError> for CliError {
 impl From<RuntimeError> for CliError {
     fn from(source: RuntimeError) -> Self {
         CliError::Runtime(source)
+    }
+}
+
+impl From<probe::ProbeError> for CliError {
+    fn from(source: probe::ProbeError) -> Self {
+        CliError::Probe(source)
     }
 }
 
@@ -108,6 +118,7 @@ impl From<send::SendError> for CliError {
 /// a shell user would type anyway.
 const ANNOUNCE_VERB: &str = "announce";
 const SEND_VERB: &str = "send";
+const PROBE_VERB: &str = "probe";
 
 const USAGE: &str = "usage:\n  \
      connector <config-file>\n  \
@@ -115,7 +126,10 @@ const USAGE: &str = "usage:\n  \
      --seal-to <url> [--amount <n>] [--target <path>] [--method <verb>] \
      [--body <file|-> ] [--expires-in <seconds>] [--socks-proxy <socks5h-url>] \
      [--expect-fulfill] [--dry-run]\n  \
-     connector send --operator-key <file> --print-keyid";
+     connector send --operator-key <file> --print-keyid\n  \
+     connector probe --operator <url> --operator-key <file> --to <ilp-address> \
+     --seal-to <url> [--amount <n>] [--target <path>] [--method <verb>] \
+     [--body <file|-> ] [--expires-in <seconds>] [--socks-proxy <socks5h-url>] [--json]";
 
 /// What the process arguments asked for, before anything has been loaded.
 #[derive(Debug, PartialEq, Eq)]
@@ -129,6 +143,12 @@ enum Invocation {
         /// `large_enum_variant`, which would otherwise make every parse
         /// carry a send's worth of stack for the sake of a config path.
         options: Box<send::SendOptions>,
+    },
+    /// `connector probe`: send an ordinary packet and read the cost off its
+    /// reject (ADR 0011).
+    Probe {
+        options: Box<send::SendOptions>,
+        json: bool,
     },
     /// `connector send --operator-key <file> --print-keyid`: derive and print
     /// the allowlist value for a key file, touching no network.
@@ -150,7 +170,12 @@ fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Invocation, CliError> {
         // argument at all, so a bare `connector send` is a usage error rather
         // than two possible readings.
         let rest: Vec<&str> = args[2..].iter().map(AsRef::as_ref).collect();
-        return parse_send_args(&rest);
+        return parse_send_args(&rest, SEND_VERB);
+    }
+
+    if first == PROBE_VERB {
+        let rest: Vec<&str> = args[2..].iter().map(AsRef::as_ref).collect();
+        return parse_send_args(&rest, PROBE_VERB);
     }
 
     if first == ANNOUNCE_VERB {
@@ -180,9 +205,9 @@ fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Invocation, CliError> {
 pub fn load_config<S: AsRef<str>>(args: &[S]) -> Result<Config, CliError> {
     let path = match parse_args(args)? {
         Invocation::Serve { config_path } => config_path,
-        Invocation::Send { .. } | Invocation::PrintKeyid { .. } => {
+        Invocation::Send { .. } | Invocation::Probe { .. } | Invocation::PrintKeyid { .. } => {
             return Err(CliError::Usage(format!(
-                "'{SEND_VERB}' loads no configuration: it is a client of another node's operator \
+                "'{SEND_VERB}' and '{PROBE_VERB}' load no configuration: it is a client of another node's operator \
                  surface, not a node.\n\n{USAGE}"
             )))
         }
@@ -243,6 +268,16 @@ pub async fn run<S: AsRef<str>>(args: &[S]) -> Result<Command, CliError> {
                 summary: describe_send(&outcome),
             })
         }
+        Invocation::Probe { options, json } => {
+            let report = probe::probe(&options).await?;
+            Ok(Command::Finished {
+                summary: if json {
+                    probe::describe_json(&report)
+                } else {
+                    probe::describe(&report)
+                },
+            })
+        }
         Invocation::PrintKeyid { key_file } => Ok(Command::Finished {
             summary: send::print_keyid(&key_file)?,
         }),
@@ -284,7 +319,8 @@ fn describe_send(outcome: &send::SendOutcome) -> String {
 }
 
 /// Parse everything after `connector send`.
-fn parse_send_args(rest: &[&str]) -> Result<Invocation, CliError> {
+fn parse_send_args(rest: &[&str], verb: &str) -> Result<Invocation, CliError> {
+    let probing = verb == PROBE_VERB;
     let mut operator_url: Option<String> = None;
     let mut operator_key_file: Option<String> = None;
     let mut destination: Option<String> = None;
@@ -298,6 +334,7 @@ fn parse_send_args(rest: &[&str]) -> Result<Invocation, CliError> {
     let mut dry_run = false;
     let mut expect_fulfill = false;
     let mut print_keyid = false;
+    let mut json = false;
 
     let mut index = 0;
     while index < rest.len() {
@@ -324,12 +361,13 @@ fn parse_send_args(rest: &[&str]) -> Result<Invocation, CliError> {
             continue;
         }
         match argument {
-            "--dry-run" => dry_run = true,
-            "--expect-fulfill" => expect_fulfill = true,
-            "--print-keyid" => print_keyid = true,
+            "--dry-run" if !probing => dry_run = true,
+            "--expect-fulfill" if !probing => expect_fulfill = true,
+            "--print-keyid" if !probing => print_keyid = true,
+            "--json" if probing => json = true,
             other => {
                 return Err(CliError::Usage(format!(
-                    "unexpected argument '{other}' -- '{SEND_VERB}' takes no positional \
+                    "unexpected argument '{other}' -- '{verb}' takes no positional \
                      arguments\n\n{USAGE}"
                 )))
             }
@@ -338,7 +376,7 @@ fn parse_send_args(rest: &[&str]) -> Result<Invocation, CliError> {
     }
 
     let required = |value: Option<String>, flag: &str, why: &str| {
-        value.ok_or_else(|| CliError::Usage(format!("send needs {flag}: {why}\n\n{USAGE}")))
+        value.ok_or_else(|| CliError::Usage(format!("{verb} needs {flag}: {why}\n\n{USAGE}")))
     };
 
     // `--print-keyid` reads one file and prints one line. It deliberately
@@ -403,39 +441,42 @@ fn parse_send_args(rest: &[&str]) -> Result<Invocation, CliError> {
         })?,
     };
 
-    Ok(Invocation::Send {
-        options: Box::new(send::SendOptions {
-            operator_url: required(
-                operator_url,
-                "--operator <url>",
-                "the node whose operator surface originates the packet",
-            )?,
-            operator_key_file: required(
-                operator_key_file,
-                "--operator-key <file>",
-                "the ed25519 key whose public half is on that node's [operator] write_keys",
-            )?,
-            destination: required(
-                destination,
-                "--to <ilp-address>",
-                "the packet's destination",
-            )?,
-            seal_to: required(
-                seal_to,
-                "--seal-to <url>",
-                "the connector's URL, the one whose GET returns its self-description (ADR 0050) \
+    let options = Box::new(send::SendOptions {
+        operator_url: required(
+            operator_url,
+            "--operator <url>",
+            "the node whose operator surface originates the packet",
+        )?,
+        operator_key_file: required(
+            operator_key_file,
+            "--operator-key <file>",
+            "the ed25519 key whose public half is on that node's [operator] write_keys",
+        )?,
+        destination: required(
+            destination,
+            "--to <ilp-address>",
+            "the packet's destination",
+        )?,
+        seal_to: required(
+            seal_to,
+            "--seal-to <url>",
+            "the connector's URL, the one whose GET returns its self-description (ADR 0050) \
              -- a payload is sealed to the terminating node (ADR 0018), which in a multi-hop \
              topology is not the node given to --operator",
-            )?,
-            amount,
-            target: target.unwrap_or_else(|| "/".to_string()),
-            method: method.unwrap_or_else(|| "POST".to_string()),
-            body,
-            expires_in_seconds,
-            socks_proxy,
-            dry_run,
-            expect_fulfill,
-        }),
+        )?,
+        amount,
+        target: target.unwrap_or_else(|| "/".to_string()),
+        method: method.unwrap_or_else(|| "POST".to_string()),
+        body,
+        expires_in_seconds,
+        socks_proxy,
+        dry_run,
+        expect_fulfill,
+    });
+    Ok(if probing {
+        Invocation::Probe { options, json }
+    } else {
+        Invocation::Send { options }
     })
 }
 
@@ -648,6 +689,43 @@ key_file = "{}"
                 "and how to serve a file that is genuinely called that: {message}"
             );
         }
+    }
+
+    /// `probe` takes what `send` takes to form a packet, sends amount 0 unless
+    /// told otherwise, and offers `--json` in place of the gate flags.
+    #[test]
+    fn probe_parses_like_send_and_defaults_to_amount_zero() {
+        let mut args = vec!["connector", "probe"];
+        args.extend([
+            "--operator",
+            "http://a:3000",
+            "--operator-key",
+            "k",
+            "--to",
+            "g.b.app",
+            "--seal-to",
+            "http://b:3000/ilp",
+            "--socks-proxy",
+            "socks5h://127.0.0.1:9050",
+            "--json",
+        ]);
+        let Invocation::Probe { options, json } = parse_args(&args).expect("a probe") else {
+            panic!("these arguments must be a probe");
+        };
+        assert_eq!(options.amount, 0);
+        assert!(json);
+        assert!(options.socks_proxy.is_some());
+        assert!(!options.expect_fulfill && !options.dry_run);
+    }
+
+    #[test]
+    fn probe_refuses_the_flags_that_belong_to_send() {
+        for flag in ["--expect-fulfill", "--dry-run", "--print-keyid"] {
+            let result = parse_args(&["connector", "probe", flag]);
+            assert!(matches!(result, Err(CliError::Usage(_))), "{flag}");
+        }
+        let result = parse_args(&["connector", "send", "--json"]);
+        assert!(matches!(result, Err(CliError::Usage(_))));
     }
 
     /// `send` is untouched by the removal: it is a client of *another* node's
