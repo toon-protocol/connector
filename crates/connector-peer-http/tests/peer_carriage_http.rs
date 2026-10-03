@@ -1654,6 +1654,7 @@ async fn a_voucher_that_does_not_cover_the_routes_price_is_refused_with_the_gree
 
     assert_eq!(ack_on(&response), Some(ClaimAckOutcome::Accepted));
     assert_eq!(reject_code(&response), "F06");
+    assert_eq!(response.headers.get(ACCUMULATED_COST_HEADER), Some("25"));
     assert!(response.headers.get(PAYMENT_REQUIRED_HEADER).is_some());
     assert!(app_client.deliveries().is_empty());
 }
@@ -1688,6 +1689,10 @@ async fn a_peer_voucher_must_cover_the_schedule_at_this_packets_length() {
 
     assert_eq!(ack_on(&response), Some(ClaimAckOutcome::Accepted));
     assert_eq!(reject_code(&response), "F06");
+    assert_eq!(
+        response.headers.get(ACCUMULATED_COST_HEADER),
+        Some(expected.to_string().as_str())
+    );
     let terms = parse_greeting(&base64_decode(
         response
             .headers
