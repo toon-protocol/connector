@@ -207,7 +207,7 @@ services:
             ;;
         esac
         case "$$probed" in
-          *'"accumulatedCost":'"$$PRICE"'}'* | *'"accumulatedCost":'"$$PRICE"',*) ;;
+          *'"accumulatedCost":'"$$PRICE"'}'* | *'"accumulatedCost":'"$$PRICE"','*) ;;
           *)
             echo "PROBE: the path to B must cost $$PRICE (B's price, A taking no fee)." >&2
             exit 1
