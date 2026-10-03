@@ -35,15 +35,18 @@ const NO_ANSWER_CODES: [&str; 7] = ["F00", "F01", "F02", "R00", "T00", "T01", "T
 /// ADR 0051).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CostReading {
-    /// The cost on the reject is the whole path's: every hop answered, and
-    /// the reject came from the end of it. This is every code not named below,
-    /// `T04` and codes this connector has never heard of included.
+    /// The cost on the reject is the whole path's: the fees of every hop the
+    /// packet travelled, which is what a packet of this size must carry to be
+    /// delivered. This is every code not named below, `T04` and codes this
+    /// connector has never heard of included.
     Complete,
-    /// The cost is a partial sum: `R01`, a reject from a hop that could not
-    /// carry the packet on, so the figure covers the path only up to there.
+    /// The cost is a partial sum: `R01`, a hop whose fee exceeded the amount.
+    /// The figure is the least amount that gets a packet past that hop; probe
+    /// again with it to read on.
     Partial,
     /// The reject states no cost: `F00`, `F01`, `F02`, `R00`, `T00`, `T01` or
-    /// `T05`. The figure on it, if any, is not an answer.
+    /// `T05`. The figure on it is the fees of a path that did not reach where
+    /// it was going, or of a packet no path would carry, and is not an answer.
     NoAnswer,
 }
 
