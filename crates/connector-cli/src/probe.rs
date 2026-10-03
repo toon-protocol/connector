@@ -31,6 +31,34 @@ use crate::send::{self, Outcome, SendError, SendOptions};
 /// 0051).
 const NO_ANSWER_CODES: [&str; 7] = ["F00", "F01", "F02", "R00", "T00", "T01", "T05"];
 
+/// What a reject's code says about the accumulated cost it carries (ADR 0011,
+/// ADR 0051).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostReading {
+    /// The cost on the reject is the whole path's: every hop answered, and
+    /// the reject came from the end of it. This is every code not named below,
+    /// `T04` and codes this connector has never heard of included.
+    Complete,
+    /// The cost is a partial sum: `R01`, a reject from a hop that could not
+    /// carry the packet on, so the figure covers the path only up to there.
+    Partial,
+    /// The reject states no cost: `F00`, `F01`, `F02`, `R00`, `T00`, `T01` or
+    /// `T05`. The figure on it, if any, is not an answer.
+    NoAnswer,
+}
+
+/// Read what a reject code tells a probe about cost. Takes the exact code
+/// text; every string has an answer.
+pub fn reject_cost_reading(code: &str) -> CostReading {
+    if NO_ANSWER_CODES.contains(&code) {
+        CostReading::NoAnswer
+    } else if code == "R01" {
+        CostReading::Partial
+    } else {
+        CostReading::Complete
+    }
+}
+
 /// What a probe learned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Finding {
@@ -147,27 +175,23 @@ pub fn classify(outcome: Outcome) -> Result<Finding, ProbeError> {
             code,
             message,
             accumulated_cost: cost,
-        } => {
-            if NO_ANSWER_CODES.contains(&code.as_str()) {
-                Err(ProbeError::NoAnswer {
-                    code,
-                    message,
-                    cost,
-                })
-            } else if code == "R01" {
-                Ok(Finding::Partial {
-                    code,
-                    message,
-                    cost,
-                })
-            } else {
-                Ok(Finding::Complete {
-                    code,
-                    message,
-                    cost,
-                })
-            }
-        }
+        } => match reject_cost_reading(&code) {
+            CostReading::NoAnswer => Err(ProbeError::NoAnswer {
+                code,
+                message,
+                cost,
+            }),
+            CostReading::Partial => Ok(Finding::Partial {
+                code,
+                message,
+                cost,
+            }),
+            CostReading::Complete => Ok(Finding::Complete {
+                code,
+                message,
+                cost,
+            }),
+        },
     }
 }
 

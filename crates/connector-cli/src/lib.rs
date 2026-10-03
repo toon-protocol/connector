@@ -43,6 +43,7 @@ use url::Url;
 // node's `RateSources` meet, and the reader that supplies the EVM one
 // (issue #1293) is a crate of its own. A map rather than a source, because
 // decision 3 puts a token's pools on that token's own chain (issue #1302).
+pub use probe::{reject_cost_reading, CostReading};
 pub use runtime::{build, router, spawn_rate_pollers, Runtime, RuntimeError};
 
 // The Solana sponsor endpoint on its own (ADR 0074 decision 9), for a test
