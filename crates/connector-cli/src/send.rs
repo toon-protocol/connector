@@ -103,10 +103,12 @@ pub struct SendOptions {
     pub operator_key_file: String,
     /// The ILP address the packet is bound for.
     pub destination: String,
-    /// The packet's amount. Each hop it crosses takes that peering's flat
-    /// fee out of it (ADR 0010), so this must cover the terminating side's
-    /// price plus every fee on the way; the packet declares no floor of its
-    /// own (ADR 0057).
+    /// The packet's amount. The node it is handed to (`--operator`) takes no
+    /// fee on it: a fee pays for carrying someone else's packet (ADR 0061,
+    /// #1466). Each hop after that takes its peering's flat fee out of it
+    /// (ADR 0010), so this must cover the terminating side's price plus
+    /// every fee on the way from the second node on; the packet declares no
+    /// floor of its own (ADR 0057).
     pub amount: u64,
     /// The connector that will TERMINATE this packet, as its self-description
     /// URL (ADR 0050) -- the one whose `GET` answers with the identity the

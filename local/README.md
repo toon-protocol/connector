@@ -522,7 +522,7 @@ connector send \
   --operator-key local/.keys/two-hop/connector-a/operator-send.key \
   --to        g.local.two-hop.b.app \       # the ILP destination
   --seal-to   http://127.0.0.1:3002/ilp \   # the connector that TERMINATES it (B)
-  --amount    1100 \
+  --amount    1000 \
   --body      payload.json \
   --expect-fulfill
 ```

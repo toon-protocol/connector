@@ -187,14 +187,13 @@ services:
       - |
         set -e
         . /app/rehearsal.sh
-        # 1200 is this path's COST (`CONTEXT.md`), and equals A's own
-        # client-edge `price`: A's fee of 100 plus B's fee of 50 plus the 1050
-        # that reaches C's unpriced termination (issue #1144). Each hop takes a
-        # FLAT number of base units and forwards the rest, so 1200 leaves the
-        # sender, 1100 crosses the chain boundary and 1050 is delivered.
+        # 1100 is what A forwards: the packet is the operator's own, so A
+        # charges it no fee (ADR 0061, #1466). B's fee of 50 is taken from a
+        # packet B carries for someone else, so 1100 leaves the sender, 1100
+        # arrives at B and 1050 is delivered to C's unpriced termination.
         # `local_topologies_load.rs` holds these figures to keys.sh's table and
         # C's committed price.
-        AMOUNT=1200
+        AMOUNT=1100
         OWED_AT_B=1100
         OWED_AT_C=1050
         CROSSINGS=2
@@ -232,8 +231,8 @@ services:
           --amount       "$$AMOUNT" \
           --body         /app/data/payload.json \
           --expect-fulfill
-        # 1200 leaves the sender; A keeps 100 and covers B for 1100; B keeps
-        # 50 and covers C for 1050. Two hops, two flat fees, one packet.
+        # 1100 leaves the sender and A covers B for all of it; B keeps
+        # 50 and covers C for 1050. A's own fee is waived on its operator's packet.
         paid /app/b-state "$$A_B" "B (EVM)" "$$((CROSSINGS + 1))" "$$OWED_AT_B"
         paid /app/c-state "$$B_C" "C (Solana)" "$$CROSSINGS" "$$OWED_AT_C"
         echo "--- both peerings paid for every crossing: $$OWED_AT_B at B, $$OWED_AT_C at C"

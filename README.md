@@ -1056,7 +1056,7 @@ docker run --rm --network connector_default \
     --to           g.lab.a.app \
     --seal-to      http://node-a:3000/ilp \
     --target       / \
-    --amount       1100 \
+    --amount       1000 \
     --body         /data/payload.json \
     --expect-fulfill
 ```
@@ -1071,8 +1071,10 @@ wrong:
   `REJECT F01 -- gift wrap could not be opened: …`, which is the one mistake
   here that announces itself.
 - **`--seal-to` takes a self-description URL**, ending in `/ilp`, not an origin.
-- **`--amount` is the path's cost**, not the route's price: every hop's fee plus
-  the terminating price. 100 + 1000 = 1100. One unit short and the packet comes
+- **`--amount` is the path's cost to you**, not the route's price: the
+  terminating price plus the fee of every hop _after_ the node you hand it to.
+  That node charges its operator's own packet nothing, so here there is no
+  other hop and the cost is 1000. One unit short and the packet comes
   back `REJECT F03 -- claim rejected: advances value by 999, less than this
 route's price of 1000`.
 

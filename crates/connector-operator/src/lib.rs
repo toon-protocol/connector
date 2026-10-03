@@ -419,7 +419,7 @@ async fn metrics(State(state): State<OperatorState>) -> Response {
 
 /// `POST /packets`: an operator originates a packet outward, exactly as
 /// the client edge does for an external caller -- decode a [`Prepare`],
-/// call [`Connector::handle_prepare`] once, encode the outcome. The one
+/// call [`Connector::originate_prepare`] once, encode the outcome. The one
 /// difference is what happens first: [`authenticate_write`] must accept
 /// the request's RFC 9421 signature before any of that runs.
 async fn originate_packet(
@@ -438,15 +438,15 @@ async fn originate_packet(
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
-    // An operator-originated packet is handed to the connector exactly as
-    // a client's is. It declares no floor of its own: the
+    // An operator-originated packet is handed to the connector as an
+    // origination, which pays this node no fee (ADR 0061, #1466). It declares no floor of its own: the
     // `minimum_delivery = prepare.amount` convention that used to live
     // here was a third convention no record ever carried, and it made
     // `amount - fee >= minimum_delivery` unsatisfiable for any non-zero
     // fee, so a fee-charging peering could never carry an operator's
     // packet at all (ADR 0057, issue #1143). What bounds erosion now is
     // the claim covering each crossing.
-    let encoded = match state.connector.handle_prepare(prepare).await {
+    let encoded = match state.connector.originate_prepare(prepare).await {
         PacketResponse::Fulfill(fulfill) => fulfill.encode(),
         PacketResponse::Reject(reject) => reject.encode(),
     };

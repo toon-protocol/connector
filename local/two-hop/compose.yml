@@ -148,8 +148,10 @@ services:
   #
   # Then B's own journal (local/rehearsal.sh's `paid`): exactly one voucher
   # per crossing on A's channel, each advancing B's watermark by exactly the
-  # PRICE A forwarded -- so A kept exactly its FEE of the AMOUNT it collected,
-  # ADR 0010's earnings rule measured on a running image.
+  # PRICE A forwarded. The operator's own packet pays A no fee (ADR 0061,
+  # #1466), so A forwards the whole AMOUNT; the peering's fee is still above
+  # zero (`local_topologies_load.rs`), so a node that charged it would forward
+  # less than B's price and be refused.
   sender:
     image: connector-rust:local
     profiles: [sender]
@@ -161,23 +163,15 @@ services:
         # The figures this rehearsal is written around, and the arithmetic
         # that relates them (ADR 0028, ADR 0010, issue #1144):
         #
-        #   AMOUNT = FEE + PRICE -- the path's COST (`CONTEXT.md`): A's fee for
-        #     carrying the packet plus the price of the route B terminates. It
-        #     is also exactly A's own client-edge `price` for the prefix.
+        #   AMOUNT = PRICE -- the packet is the operator's own, so A charges
+        #     it no fee (ADR 0061, #1466) and forwards all of it.
         #   PRICE  -- B's committed price, and therefore the whole of what A
         #     forwards, so the coverage gate has no slack.
-        #   FEE    -- A's fee on the peering (keys.sh's table), and what A must
-        #     be left holding.
         #   DEPOSIT -- what keys.sh topped A's channel up to.
-        AMOUNT=1100
+        AMOUNT=1000
         PRICE=1000
-        FEE=100
         CROSSINGS=2
         DEPOSIT=100000000
-        if [ "$$((AMOUNT - PRICE))" != "$$FEE" ]; then
-          echo "AMOUNT - PRICE is not FEE: this rehearsal's own figures disagree." >&2
-          exit 1
-        fi
         CHANNEL=$$(peering_key a-b)
         channel_holds "$$CHANNEL" "$$DEPOSIT" a-b
         send() {
@@ -196,7 +190,7 @@ services:
         echo '--- crossing 2: the covering voucher must ADVANCE, not repeat'
         send
         paid /app/payee-state "$$CHANNEL" B "$$CROSSINGS" "$$PRICE"
-        echo "--- the peering paid B $$PRICE for each of $$CROSSINGS crossings; A kept $$FEE of each $$AMOUNT"
+        echo "--- the peering paid B $$PRICE for each of $$CROSSINGS crossings; A takes no fee on its operator's own packet"
     volumes:
       # A's keys: the sender signs the operator write with A's allowlisted key
       # and posts the fixture body from the same directory.

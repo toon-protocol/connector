@@ -435,7 +435,10 @@ peering, held by the peering, denominated in that peering's unit — which at a 
 denomination is the **outgoing** leg's, subtracted after the conversion and not before
 ([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). What varies
 by destination is the **price**; what a hop earns for crossing a denomination is the **spread**,
-a separate earning.
+a separate earning. A fee is for carrying someone else's packet, so a packet the node's own
+operator originates (`POST /packets`) pays that node no fee, and the node's fee is no part of
+that packet's cost ([ADR 0061](docs/adr/0061-a-fee-attaches-to-a-peering-not-to-a-route.md),
+update for #1466).
 _Avoid_: commission; using fee for the dealing margin — that is the **spread**
 
 **Price**:

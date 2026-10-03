@@ -20,8 +20,8 @@
 //! 1. **The peering forwards and is paid in both directions**, over both
 //!    carriages: every forward carries a voucher on the payer's own outbound
 //!    channel, the payee journals it against the channel's one watermark,
-//!    and each voucher advances it by exactly what was forwarded (the price,
-//!    the payer's fee kept back -- ADR 0061).
+//!    and each voucher advances it by exactly what was forwarded (the price;
+//!    the operator's own packet pays its node no fee -- ADR 0061, #1466).
 //! 2. **A payer whose outbound journal lost its latest vouchers recovers
 //!    from the next hop's `POST /ilp/claim-state`** (decision 6): restored
 //!    from a backup taken right after the open, it asks the payee where the
@@ -67,9 +67,13 @@ const APP_PRICE: u64 = 1_000;
 /// 0061). Non-zero so "advanced by exactly the forwarded amount" measures
 /// the fee rather than the request.
 const PEER_FEE: u64 = 50;
-/// What a packet originated at one node carries to leave `APP_PRICE` at the
-/// other after the fee.
-const AMOUNT: u64 = APP_PRICE + PEER_FEE;
+/// What a client of one node pays for a route to the other: the app's price
+/// plus the peering's fee.
+const ROUTE_PRICE: u64 = APP_PRICE + PEER_FEE;
+/// What a packet originated at one node carries. An operator's own packet
+/// pays its node no fee (ADR 0061, #1466), so all of it is forwarded and
+/// this is exactly what reaches the other node.
+const AMOUNT: u64 = APP_PRICE;
 /// Each node's opening deposit on its own outbound channel.
 const DEPOSIT: u128 = 10_000;
 /// Each node's settlement account's USDC.
@@ -349,7 +353,7 @@ key_file = "{settlement_key}"
 [[routes]]
 prefix = "g.example.{other}"
 peer_id = "{other}"
-price = {AMOUNT}
+price = {ROUTE_PRICE}
 
 [[peers]]
 id = "{other}"
@@ -575,7 +579,8 @@ async fn a_config_declared_peering_pays_both_ways(carriage: Carriage, offset: u1
             a.inbound_watermark(&b_to_a).await,
             crossing * APP_PRICE,
             "A's watermark on B's channel advanced by exactly what B forwarded: the packet \
-             carried {AMOUNT}, B kept its {PEER_FEE} fee, and {APP_PRICE} reached A"
+             carried {AMOUNT}, B charged its own operator's packet no fee, and {APP_PRICE} \
+             reached A"
         );
     }
     assert_eq!(a.journaled(&b_to_a), vec![APP_PRICE, 2 * APP_PRICE]);
