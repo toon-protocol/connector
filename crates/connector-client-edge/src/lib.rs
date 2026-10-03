@@ -1013,8 +1013,10 @@ async fn extract_and_validate_claim(
 /// `TOON-Accumulated-Cost` (issue #548). Every REJECT this edge answers
 /// with goes through here, so none can report an outcome without also
 /// reporting what reaching it cost; a FULFILL carries no such header,
-/// having been paid for rather than priced.
-fn packet_response(response: PacketResponse) -> Response {
+/// having been paid for rather than priced. The operator surface's
+/// `POST /packets` answers through it too (issue #1460), so the rule has
+/// one implementation.
+pub fn packet_response(response: PacketResponse) -> Response {
     match response {
         PacketResponse::Fulfill(fulfill) => (
             StatusCode::OK,

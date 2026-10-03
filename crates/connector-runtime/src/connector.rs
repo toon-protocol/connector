@@ -2842,55 +2842,76 @@ impl Connector {
         }
 
         if let Some(terms) = answer.payment_required.take() {
-            match self
-                .cover_greeted_packet(peer_id, &terms, outgoing_expires_at)
-                .await
-            {
-                // The retry ran out of time before it could be signed. The
-                // first answer was only a greeting, so this is the answer
-                // the sender gets, and no second voucher exists (PF-26).
-                Err(CoverError::OutOfTime(wait)) => {
-                    return PacketResponse::Reject(self.out_of_time_reject(
-                        peer_id,
-                        outgoing_expires_at,
-                        wait,
-                    ));
-                }
-                Err(CoverError::Failed(_)) => {}
-                Ok((covering, retry_amount)) => {
-                    tracing::info!(
-                        peer_id,
-                        price = terms.price().unwrap_or_default(),
-                        "covering a greeted forward and retrying it once"
+            // A retry changes the voucher and not the packet, so it can only
+            // succeed when the packet's own amount clears the price quoted
+            // for it: the peer's `F03` ("costs P but carried only A") would
+            // otherwise follow a second admitted voucher (#1462). Sign
+            // nothing and relay the refusal, naming both figures.
+            if let Some(price) = terms.price().filter(|price| forwarded_amount < *price) {
+                tracing::warn!(
+                    peer_id,
+                    price,
+                    amount = forwarded_amount,
+                    "peer quoted a price this packet's amount cannot cover -- not retrying"
+                );
+                if let PacketResponse::Reject(reject) = &mut answer.response {
+                    reject.message = format!(
+                        "{} (peer '{peer_id}' quotes {price} for this packet, which carried only \
+                         {forwarded_amount}: raise the amount to at least {price})",
+                        reject.message
                     );
-                    let retried_a_voucher = matches!(covering, Covering::Voucher(_));
-                    answer = self
-                        .forward_bounded(
+                }
+            } else {
+                match self
+                    .cover_greeted_packet(peer_id, &terms, outgoing_expires_at)
+                    .await
+                {
+                    // The retry ran out of time before it could be signed. The
+                    // first answer was only a greeting, so this is the answer
+                    // the sender gets, and no second voucher exists (PF-26).
+                    Err(CoverError::OutOfTime(wait)) => {
+                        return PacketResponse::Reject(self.out_of_time_reject(
                             peer_id,
-                            outgoing,
-                            covering,
                             outgoing_expires_at,
-                            "waiting for the peer's answer to the retry",
-                        )
-                        .await;
-                    if retried_a_voucher {
-                        self.note_voucher_outcome(
-                            peer_id,
-                            retry_amount,
-                            answer.ack,
-                            matches!(answer.response, PacketResponse::Reject(_)),
-                        );
+                            wait,
+                        ));
                     }
-                    // Bounded: whatever the retry answered is the answer. A
-                    // second greeting is logged with its terms and relayed,
-                    // not covered again.
-                    if let Some(again) = &answer.payment_required {
-                        tracing::warn!(
+                    Err(CoverError::Failed(_)) => {}
+                    Ok((covering, retry_amount)) => {
+                        tracing::info!(
                             peer_id,
-                            price = again.price().unwrap_or_default(),
-                            resource = %again.resource.url,
-                            "peer demanded payment again after a covering claim -- not retrying"
+                            price = terms.price().unwrap_or_default(),
+                            "covering a greeted forward and retrying it once"
                         );
+                        let retried_a_voucher = matches!(covering, Covering::Voucher(_));
+                        answer = self
+                            .forward_bounded(
+                                peer_id,
+                                outgoing,
+                                covering,
+                                outgoing_expires_at,
+                                "waiting for the peer's answer to the retry",
+                            )
+                            .await;
+                        if retried_a_voucher {
+                            self.note_voucher_outcome(
+                                peer_id,
+                                retry_amount,
+                                answer.ack,
+                                matches!(answer.response, PacketResponse::Reject(_)),
+                            );
+                        }
+                        // Bounded: whatever the retry answered is the answer. A
+                        // second greeting is logged with its terms and relayed,
+                        // not covered again.
+                        if let Some(again) = &answer.payment_required {
+                            tracing::warn!(
+                                peer_id,
+                                price = again.price().unwrap_or_default(),
+                                resource = %again.resource.url,
+                                "peer demanded payment again after a covering claim -- not retrying"
+                            );
+                        }
                     }
                 }
             }
@@ -9901,7 +9922,10 @@ mod tests {
                             accumulated_cost: 0,
                         }),
                         ClaimAckOutcome::NotSent,
-                        quoted_terms(500),
+                        // What the forwarded packet itself carries: a retry
+                        // can only succeed on a packet that covers the price
+                        // (#1462).
+                        quoted_terms(100),
                     );
                 }
                 PeerForward::answered(
@@ -10249,7 +10273,44 @@ mod tests {
             assert_eq!(transport.sent.load(Ordering::SeqCst), 2);
             // The first voucher's packet was refused unpaid (#1446), so the
             // retry signs from where the receiver stands.
-            assert_eq!(outbound.signed(&channel), Some(500));
+            assert_eq!(outbound.signed(&channel), Some(100));
+        }
+
+        /// #1462: a greeted forward whose amount is below the quoted price is
+        /// not retried: no second voucher, and the reject names both figures.
+        #[tokio::test]
+        async fn a_greeted_forward_below_the_price_is_not_retried() {
+            let clock = test_clock();
+            let transport = Arc::new(GreetsThenFulfils {
+                clock: Arc::clone(&clock),
+                by: Duration::seconds(1),
+                sent: AtomicUsize::new(0),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&transport) as Arc<dyn PeerTransport>,
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            // 105 less the peering's fee of 10 forwards 95, under the 100 quoted.
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(105, 30)).await);
+
+            assert_eq!(transport.sent.load(Ordering::SeqCst), 1, "no retry sent");
+            assert_eq!(
+                outbound.signed(&channel),
+                Some(95),
+                "only the first voucher"
+            );
+            assert!(
+                reject.message.contains("100") && reject.message.contains("95"),
+                "{}",
+                reject.message
+            );
         }
 
         /// PF-26: a forward that moves no value signs and sends no challenge
