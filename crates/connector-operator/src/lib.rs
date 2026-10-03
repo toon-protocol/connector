@@ -87,7 +87,7 @@ use serde::{Deserialize, Serialize};
 
 use connector_client_edge::ClientClaimGate;
 use connector_domain::x402::X402BatchSettlementTerms;
-use connector_domain::{PacketResponse, Prepare, Price};
+use connector_domain::{Prepare, Price};
 use connector_runtime::{
     BatchChannelError, BatchChannelView, BatchChannels, ClaimBookKind, ClaimDirection, ClaimScheme,
     ClaimView, Connector, DeclaredRates, EstablishPeeringError, LeaseRouteError, LeasedRouteView,
@@ -98,8 +98,6 @@ use connector_settlement::batch::BatchSettlementError;
 use connector_signer::{derive_evm_address, to_hex, Signer, SignerError};
 use url::Url;
 use write_auth::{authenticate_write, AuditRecord, WriteAuth};
-
-const OCTET_STREAM: &str = "application/octet-stream";
 
 /// This node's own identity: the active signing key and the address
 /// derived from it (ADR 0012's signer, read rather than exercised).
@@ -446,30 +444,10 @@ async fn originate_packet(
     // fee, so a fee-charging peering could never carry an operator's
     // packet at all (ADR 0057, issue #1143). What bounds erosion now is
     // the claim covering each crossing.
-    match state.connector.handle_prepare(prepare).await {
-        PacketResponse::Fulfill(fulfill) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, OCTET_STREAM)],
-            fulfill.encode(),
-        )
-            .into_response(),
-        // The cost never rides the OER encoding of a REJECT (ADR 0011), so
-        // it goes beside it on every REJECT, zero included: "absent" never
-        // has to carry meaning. The client edge and the peer HTTP edge
-        // follow the same rule.
-        PacketResponse::Reject(reject) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, OCTET_STREAM),
-                (
-                    header::HeaderName::from_static(connector_btp::ACCUMULATED_COST_HEADER),
-                    reject.accumulated_cost.to_string().as_str(),
-                ),
-            ],
-            reject.encode(),
-        )
-            .into_response(),
-    }
+    // The cost never rides the OER encoding of a REJECT (ADR 0011), so it
+    // goes beside it on every REJECT, zero included: "absent" never has to
+    // carry meaning. The client edge's own answer does exactly that.
+    connector_client_edge::packet_response(state.connector.handle_prepare(prepare).await)
 }
 
 /// A `POST /routes/leased` request body: create or renew a leased route

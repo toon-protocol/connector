@@ -8,7 +8,6 @@ license.workspace = true
 test-util = []
 
 [dependencies]
-connector-btp = { path = "../connector-btp" }
 connector-client-edge = { path = "../connector-client-edge" }
 connector-domain = { path = "../connector-domain" }
 connector-runtime = { path = "../connector-runtime" }
@@ -31,6 +30,9 @@ bs58 = "0.5"
 url = "2"
 
 [dev-dependencies]
+# `ACCUMULATED_COST_HEADER`: the one spelling of the header `POST /packets`
+# answers a REJECT with (issue #1460).
+connector-btp = { path = "../connector-btp" }
 connector-config = { path = "../connector-config" }
 # `test-support` for `covering_fake`: a payable hop for a test that forwards
 # (ADR 0042, ADR 0075 decision 6).

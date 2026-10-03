@@ -372,6 +372,29 @@ pub fn print_keyid(key_file: &str) -> Result<String, SendError> {
     Ok(keyid_hex(&read_key_file(key_file)?))
 }
 
+/// A REJECT's accumulated cost, read off its `TOON-Accumulated-Cost`
+/// response header. Absent reads as zero, so `send` still works against a
+/// node built before the header existed. A header that is not a decimal
+/// `u64` is an error, not a cost: unlike the peer carriages' readers, which
+/// fold it to zero, this one reports a figure to an operator, and a figure
+/// it made up would be a lie.
+fn reject_accumulated_cost(header: Option<&[u8]>) -> Result<u64, SendError> {
+    let Some(value) = header else {
+        return Ok(0);
+    };
+    std::str::from_utf8(value)
+        .ok()
+        .filter(|text| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or_else(|| {
+            SendError::Undecodable(format!(
+                "the REJECT's {} header is not a decimal u64: {:?}",
+                connector_btp::ACCUMULATED_COST_HEADER,
+                String::from_utf8_lossy(value)
+            ))
+        })
+}
+
 /// Form the packet, sign the write, and hand it to the operator surface.
 pub async fn send(options: &SendOptions) -> Result<SendOutcome, SendError> {
     let keypair = read_key_file(&options.operator_key_file)?;
@@ -486,23 +509,7 @@ pub async fn send(options: &SendOptions) -> Result<SendOutcome, SendError> {
             Ok(reject) => Outcome::Rejected {
                 code: reject.code.as_str().to_string(),
                 message: reject.message,
-                // Absent reads as zero, so this works against a node built
-                // before the header existed. A header that is not a decimal
-                // `u64` is an error, not a cost.
-                accumulated_cost: match cost_header {
-                    None => 0,
-                    Some(value) => std::str::from_utf8(&value)
-                        .ok()
-                        .filter(|text| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
-                        .and_then(|text| text.parse::<u64>().ok())
-                        .ok_or_else(|| {
-                            SendError::Undecodable(format!(
-                                "the REJECT's {} header is not a decimal u64: {:?}",
-                                connector_btp::ACCUMULATED_COST_HEADER,
-                                String::from_utf8_lossy(&value)
-                            ))
-                        })?,
-                },
+                accumulated_cost: reject_accumulated_cost(cost_header.as_deref())?,
             },
             Err(reject_error) => {
                 return Err(SendError::Undecodable(format!(
