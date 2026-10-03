@@ -1,6 +1,6 @@
 # Rejects accumulate fees; a probe is how cost is discovered
 
-**Status:** Accepted, amended by [0042](0042-a-packet-carries-its-claim.md) (fee honesty is bounded, not self-enforcing), extended by [0044](0044-a-probe-answers-what-a-route-costs-and-what-it-does.md) (a probe also answers what a route _does_) and by [0065-price](0065-a-price-is-a-schedule-over-payload-length.md) (a price may vary with payload length, so cacheability moves to the published schedule). Fee accumulation, the probe, and the sum-never-breakdown rule are unchanged.
+**Status:** Accepted, amended by [0042](0042-a-packet-carries-its-claim.md) (fee honesty is bounded, not self-enforcing), extended by [0044](0044-a-probe-answers-what-a-route-costs-and-what-it-does.md) (a probe also answers what a route _does_) and by [0065-price](0065-a-price-is-a-schedule-over-payload-length.md) (a price may vary with payload length, so cacheability moves to the published schedule), and amended by #1467 (an `R01` carries the refusing hop's fee, so its sum is partial). Fee accumulation, the probe, and the sum-never-breakdown rule are unchanged.
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 
@@ -81,3 +81,12 @@ the answer is still cacheable because ADR 0010's fees are flat. Probe economics 
 no revision: a probe carries a small amount by construction, so what a forwarding connector now
 covers on one is a micropayment, against an abuser who must still fund a channel per identity and is
 still rate-limited per that identity.
+
+## Update (issue #1467, decided in #1461) — an `R01` carries the refusing hop's fee
+
+**An `R01` marks a partial sum.** A hop that refuses a packet `R01` because its own fee exceeds
+the amount the packet carries sets `accumulated_cost` to that fee — on a denomination boundary
+(ADR 0071), in the incoming leg's unit, converted the way a relayed reject's cost is. Hops
+upstream add theirs on the way back, so the sender reads the least amount that gets a packet past
+the hop that refused it, without parsing the message. Any other reject's sum is for the whole path
+the packet travelled; an `R01`'s stops at the hop it could not pay.

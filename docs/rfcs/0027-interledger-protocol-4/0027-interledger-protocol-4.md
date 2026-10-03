@@ -131,7 +131,11 @@ public key ‖ AEAD(32-byte shared secret ‖ OER request envelope)`, sealed by
   **PF-18**). `R01` survives narrowed to this RFC's own "too little to forward"
   sense after minimum delivery was retired
   ([ADR 0057](../../adr/0057-minimum-delivery-is-retired-a-claim-bounds-erosion.md);
-  **PF-14**).
+  **PF-14**). An `R01` also marks a **partial** accumulated cost: the refusing
+  hop's own fee is in the sum, but nothing beyond it is, because the packet
+  stopped there
+  ([ADR 0011](../../adr/0011-rejects-accumulate-fees-and-probes-discover-cost.md),
+  #1467).
 - **A hop applies its own rate to `amount` — this RFC's own model. What differs
   is the police, not the rewrite.** Where a forward's incoming and outgoing
   channels hold different tokens, this connector converts at a rate it has
