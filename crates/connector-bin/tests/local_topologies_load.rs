@@ -1091,11 +1091,18 @@ fn the_two_hop_rehearsal_probes_before_it_sends_and_asserts_the_figure() {
     let probe = compose
         .find("connector probe")
         .expect("two-hop's sender must run `connector probe`");
-    let first_send = compose.find("send\n").expect("two-hop's sender must send");
+    let first_send = compose
+        .find("crossing 1")
+        .expect("two-hop's sender must send");
     assert!(probe < first_send, "the probe comes before the first send");
+    let probing = &compose[probe..first_send];
     assert!(
-        compose.contains("accumulatedCost") && compose.contains("exit 1"),
-        "the probe's figure must be asserted, not merely printed"
+        probing.contains("--json")
+            && probing.contains("\"outcome\":\"complete\"")
+            && probing.contains("\"accumulatedCost\":'\"$$PRICE\"")
+            && probing.contains("exit 1"),
+        "the probe's outcome and figure must be asserted before the first send, not merely \
+         printed:\n{probing}"
     );
 }
 

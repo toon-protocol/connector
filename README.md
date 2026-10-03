@@ -1042,11 +1042,12 @@ curl -s -H "Authorization: Bearer $(cat "$LAB"/node-b/data/operator-bearer-token
 #### 7. Probe the path, then send a packet across it
 
 Learn what the path costs before paying it. `connector probe` takes what `send`
-takes to form a packet and sends it at `--amount 0` (the default), which no hop
-can afford, so it is refused and the refusal states the cost
-([ADR 0011](docs/adr/0011-rejects-accumulate-fees-and-probes-discover-cost.md)).
-A probe is an ordinary packet through the same `POST /packets`; nothing is
-paid. Give it the payload you mean to send, because a route may price by size:
+takes to form a packet and sends it at `--amount 0` (the default), so a priced
+route, or a hop charging a fee on the way, refuses it and the refusal states the
+cost ([ADR 0011](docs/adr/0011-rejects-accumulate-fees-and-probes-discover-cost.md)).
+A probe is an ordinary packet through the same `POST /packets`; at amount 0
+nothing is paid. Give it the payload you mean to send, because a route may
+price by size:
 
 ```bash
 echo '{"hello":"from a paid packet"}' > "$LAB"/node-b/data/payload.json

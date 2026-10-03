@@ -200,6 +200,13 @@ services:
           --json)
         echo "$$probed"
         case "$$probed" in
+          *'"outcome":"complete"'*) ;;
+          *)
+            echo "PROBE: an amount-0 probe of B's priced route must read a complete sum." >&2
+            exit 1
+            ;;
+        esac
+        case "$$probed" in
           *'"accumulatedCost":'"$$PRICE"'}'* | *'"accumulatedCost":'"$$PRICE"',*) ;;
           *)
             echo "PROBE: the path to B must cost $$PRICE (B's price, A taking no fee)." >&2

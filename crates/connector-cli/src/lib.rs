@@ -207,8 +207,8 @@ pub fn load_config<S: AsRef<str>>(args: &[S]) -> Result<Config, CliError> {
         Invocation::Serve { config_path } => config_path,
         Invocation::Send { .. } | Invocation::Probe { .. } | Invocation::PrintKeyid { .. } => {
             return Err(CliError::Usage(format!(
-                "'{SEND_VERB}' and '{PROBE_VERB}' load no configuration: it is a client of another node's operator \
-                 surface, not a node.\n\n{USAGE}"
+                "'{SEND_VERB}' and '{PROBE_VERB}' load no configuration: each is a client of another node's \
+                 operator surface, not a node.\n\n{USAGE}"
             )))
         }
     };
@@ -269,7 +269,13 @@ pub async fn run<S: AsRef<str>>(args: &[S]) -> Result<Command, CliError> {
             })
         }
         Invocation::Probe { options, json } => {
-            let report = probe::probe(&options).await?;
+            let report = probe::probe(&options).await.map_err(|error| {
+                if json {
+                    probe::ProbeError::Json(error.to_json())
+                } else {
+                    error
+                }
+            })?;
             Ok(Command::Finished {
                 summary: if json {
                     probe::describe_json(&report)

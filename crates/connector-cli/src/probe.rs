@@ -17,16 +17,19 @@
 //! * A fulfil means the amount covered the path and the packet was delivered
 //!   and paid for.
 //!
-//! A reject that says nothing about cost -- no route (`F02`), the packet out
-//! of time (`R00`), this node's own fault (`T00`), a peer or app that did not
-//! answer (`T01`), a rate limit (`T05`) -- is a failure: the figure on it is
-//! the fees of a path that did not reach where it was going.
+//! A reject that says nothing about cost -- the packet itself refused as
+//! unreadable (`F00`, `F01`), no route (`F02`), the packet out of time
+//! (`R00`), this node's own fault (`T00`), a peer or app that did not answer
+//! (`T01`), a rate limit (`T05`) -- is a failure: the figure on it is the fees
+//! of a path that did not reach where it was going, or of a packet no path
+//! would carry.
 
 use crate::send::{self, Outcome, SendError, SendOptions};
 
 /// The reject codes whose accumulated cost is not an answer, because the
-/// path did not exist or did not answer (ADR 0051).
-const NO_ANSWER_CODES: [&str; 5] = ["F02", "R00", "T00", "T01", "T05"];
+/// packet was unreadable, or the path did not exist or did not answer (ADR
+/// 0051).
+const NO_ANSWER_CODES: [&str; 7] = ["F00", "F01", "F02", "R00", "T00", "T01", "T05"];
 
 /// What a probe learned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +73,9 @@ pub enum ProbeError {
     /// `--dry-run` reached a probe. Not offered on the command line; kept so
     /// the match over [`Outcome`] is exhaustive without a panic.
     NotSent,
+    /// One of the above, already rendered as `--json` asked
+    /// ([`ProbeError::to_json`]), so the process's error line is the object.
+    Json(String),
 }
 
 impl std::fmt::Display for ProbeError {
@@ -82,9 +88,9 @@ impl std::fmt::Display for ProbeError {
                 cost,
             } => write!(
                 f,
-                "the probe learned no cost: REJECT {code} -- {message}. The path does not exist \
-                 or did not answer, so the {cost} base units on the reject are not what it \
-                 costs."
+                "the probe learned no cost: REJECT {code} -- {message}. The packet was \
+                 unreadable, or the path does not exist or did not answer, so the {cost} base \
+                 units on the reject are not what it costs."
             ),
             ProbeError::WrongFulfillment => write!(
                 f,
@@ -92,11 +98,38 @@ impl std::fmt::Display for ProbeError {
                  does not match the one this probe's gift wrap derives (ADR 0019)"
             ),
             ProbeError::NotSent => write!(f, "nothing was sent"),
+            ProbeError::Json(rendered) => write!(f, "{rendered}"),
         }
     }
 }
 
 impl std::error::Error for ProbeError {}
+
+impl ProbeError {
+    /// The failure as one JSON object, for `--json`: `outcome` is
+    /// `"failed"`, and a reject's `code`, `message` and `accumulatedCost`
+    /// ride beside it exactly as they do on an answer.
+    pub fn to_json(&self) -> String {
+        let value = match self {
+            ProbeError::NoAnswer {
+                code,
+                message,
+                cost,
+            } => serde_json::json!({
+                "outcome": "failed",
+                "code": code,
+                "message": message,
+                "accumulatedCost": cost,
+            }),
+            ProbeError::Json(rendered) => return rendered.clone(),
+            other => serde_json::json!({
+                "outcome": "failed",
+                "message": other.to_string(),
+            }),
+        };
+        value.to_string()
+    }
+}
 
 impl From<SendError> for ProbeError {
     fn from(source: SendError) -> Self {
@@ -187,22 +220,12 @@ pub fn describe_json(report: &ProbeReport) -> String {
             code,
             message,
             cost,
-        }
-        | Finding::Partial {
+        } => rejected_json(report, "complete", code, message, *cost),
+        Finding::Partial {
             code,
             message,
             cost,
-        } => {
-            let outcome = if code == "R01" { "partial" } else { "complete" };
-            serde_json::json!({
-                "outcome": outcome,
-                "destination": report.destination,
-                "amount": report.amount,
-                "code": code,
-                "message": message,
-                "accumulatedCost": cost,
-            })
-        }
+        } => rejected_json(report, "partial", code, message, *cost),
         Finding::Delivered { status, body } => serde_json::json!({
             "outcome": "delivered",
             "destination": report.destination,
@@ -213,6 +236,23 @@ pub fn describe_json(report: &ProbeReport) -> String {
         }),
     };
     value.to_string()
+}
+
+fn rejected_json(
+    report: &ProbeReport,
+    outcome: &str,
+    code: &str,
+    message: &str,
+    cost: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": outcome,
+        "destination": report.destination,
+        "amount": report.amount,
+        "code": code,
+        "message": message,
+        "accumulatedCost": cost,
+    })
 }
 
 #[cfg(test)]
@@ -295,5 +335,20 @@ mod tests {
         };
         assert!(describe(&partial).contains("PARTIAL"));
         assert!(describe(&partial).contains("--amount 5"));
+        let json: serde_json::Value = serde_json::from_str(&describe_json(&partial)).unwrap();
+        assert_eq!(json["outcome"], "partial");
+    }
+
+    /// `--json` carries a failure's code, message and cost too: a script
+    /// reading the machine form must not have to parse the prose to learn
+    /// why a probe learned nothing.
+    #[test]
+    fn a_failure_in_json_carries_the_code_message_and_cost() {
+        let error = classify(rejected("F02", 0)).unwrap_err();
+        let json: serde_json::Value = serde_json::from_str(&error.to_json()).unwrap();
+        assert_eq!(json["outcome"], "failed");
+        assert_eq!(json["code"], "F02");
+        assert_eq!(json["message"], "m");
+        assert_eq!(json["accumulatedCost"], 0);
     }
 }
