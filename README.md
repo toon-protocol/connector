@@ -1308,7 +1308,8 @@ bump that pin.
 [devnet faucet](https://faucet.devnet.toonprotocol.dev). **Mainnet**: TOON's own
 retired contracts and program exist on Base and Solana mainnet-beta (records
 under [`docs/deployments/`](docs/deployments/)), run by a third-party operator;
-this build settles on x402's instead. **The fleet's production tier is still
+this build settles on x402's instead, and that operator's node has run it on
+both mainnets since 2026-09-29, its TOON channels drained. **The fleet's production tier is still
 named and empty** (ADR 0056): no fleet machine, no fleet key.
 
 ---
