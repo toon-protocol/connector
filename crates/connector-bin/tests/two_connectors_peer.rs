@@ -540,7 +540,7 @@ fn spawn_payee(
     spawn_payee_priced(fixture, state_dir, stub_app_addr, 0)
 }
 
-/// [`spawn_payee`], terminating [`APP_PREFIX`] at `price`.
+/// [`spawn_payee`] with the terminated route priced at `price`.
 fn spawn_payee_priced(
     fixture: &PeerFixture,
     state_dir: &std::path::Path,
@@ -1213,6 +1213,58 @@ async fn a_client_may_not_declare_more_than_the_forwarded_route_charges() {
     assert!(
         journaled(payee_state.path(), &fixture.payer_channel).is_empty(),
         "and nothing crossed the peering"
+    );
+}
+
+/// **A packet whose forwarded amount is below the terminating route's price
+/// is not paid for twice** (#1462). The payee greets the forward with its
+/// terms; a retry changes the voucher and not the packet, so it could only
+/// end `F03` after a second admitted voucher. The payer signs none: the
+/// payee's journal holds the one voucher the forward rode.
+#[tokio::test]
+async fn a_forward_below_the_terminating_price_is_not_retried_over_btp() {
+    let Some(fixture) = PeerFixture::spawn().await else {
+        return;
+    };
+    let payee_state = tempfile::tempdir().expect("temp payee state dir");
+    let stub_app = spawn_stub_app();
+    let price = FORWARDED + 5;
+    let (payee, _payee_config, _payee_key, _payee_settlement) =
+        spawn_payee_priced(&fixture, payee_state.path(), &stub_app.addr, price);
+    let payee_client_edge = format!("http://{}/ilp", payee.client_edge_addr);
+    let (payer, _payer_config, _payer_key, _payer_settlement) = spawn_payer(
+        &fixture,
+        Carriage::Btp,
+        &payee_endpoint(Carriage::Btp, &payee),
+        &payee_client_edge,
+    );
+
+    let payee_identity = identity_from_key_seed(PAYEE_SIGNER_SEED);
+    let (data, _shared) = sealed_prepare_data(b"too cheap", &payee_identity);
+    let prepare = Prepare {
+        amount: CLIENT_PRICE,
+        ..sample_prepare(APP_PREFIX, data)
+    };
+    let (status, answer, _ack) = post_peer_request(
+        &reqwest::Client::new(),
+        &payer.client_edge_addr,
+        Some(&fixture.client_claim(1)),
+        &prepare,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let reject = Reject::decode(&answer).expect("a packet below the price is refused");
+    assert!(
+        reject.message.contains(&price.to_string())
+            && reject.message.contains(&FORWARDED.to_string()),
+        "the reject must name the quoted price {price} and the amount {FORWARDED}: {}",
+        reject.message
+    );
+    assert_eq!(
+        journaled(payee_state.path(), &fixture.payer_channel),
+        vec![FORWARDED],
+        "the payee must hold one voucher, not a second for the price. Journal was:\n{}",
+        client_edge_journal(payee_state.path())
     );
 }
 

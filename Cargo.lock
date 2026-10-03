@@ -1073,6 +1073,7 @@ dependencies = [
  "base64 0.22.1",
  "bs58",
  "chrono",
+ "connector-btp",
  "connector-client-edge",
  "connector-config",
  "connector-domain",
