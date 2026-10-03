@@ -349,7 +349,8 @@ step that replaces it, never left beside it.
 
 **Kept:** the deployment records under `packages/*/deployments/` move to `docs/deployments/`. The
 contracts and program stay on chain — nothing can delete them — and one third-party operator's
-channels live on them until drained.
+channels live on them until drained. (They were drained on 2026-09-29 and 2026-09-30; see "Draining a
+node with live TOON channels".)
 
 ### 13. The local stack
 
@@ -463,6 +464,11 @@ The fleet holds none: its production tier is empty (0056) and no devnet node's c
 a peering (0042). One third-party operator's mainnet node does, on the Base mainnet `TokenNetwork` and
 the Solana mainnet-beta program. The procedure is **documented, not automated**, and the release notes
 carry it:
+
+> **Done, 2026-09-30.** That node ran this procedure: its four TOON channels (one on the Base mainnet
+> `TokenNetwork`, three on the Solana mainnet-beta program) had their latest claims landed and were
+> closed on 2026-09-29, and the last two settled on 2026-09-30. It has run the x402-only release since
+> 2026-09-29. No node known to this record holds a live TOON channel now.
 
 1. Stay on the **last release that supports TOON channels** (named in the release notes of the first
    release that does not).
