@@ -404,6 +404,10 @@ Two mechanisms sit behind the write half that [ADR 0008](../adr/0008-operator-su
 Decision does not name — **replay rejection**, and the **audit log** the retained signatures are
 exposed through. Both are live and both are load-bearing for OP-05 and OP-02.
 
+A REJECT answered by `POST /packets` carries the `TOON-Accumulated-Cost` response header — a decimal
+`u64`, present on every REJECT and zero included, as on the client edge and the peer HTTP edge —
+because the cost never rides the OER encoding (ADR 0011). A FULFILL carries no such header.
+
 `GET /metrics` is Prometheus text exposition format; every other read is JSON.
 
 ---

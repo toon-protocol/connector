@@ -55,7 +55,9 @@ use connector_btp::{
 };
 use connector_config::StaticRoute;
 use connector_domain::client_claim::{ClientClaim, EvmVoucherChannelConfig};
-use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, PacketResponse, Prepare};
+use connector_domain::{
+    EnvelopeRequest, EnvelopeResponse, Fulfill, PacketResponse, Prepare, Price,
+};
 use connector_peer_btp::accept::{PeerAcceptPolicy, PeerSession, SessionEnd};
 use connector_peer_btp::challenge_json::{self, PeerRoleChallenge};
 use connector_peer_btp::dial::{DialError, PeerDialer, PeerRelation};
@@ -1735,11 +1737,50 @@ async fn a_voucher_that_does_not_cover_the_routes_price_is_refused() {
 
     assert_eq!(ack, ClaimAckOutcome::Accepted);
     match response {
-        PacketResponse::Reject(reject) => assert_eq!(reject.code.as_str(), "F06"),
+        PacketResponse::Reject(reject) => {
+            assert_eq!(reject.code.as_str(), "F06");
+            // The terminating hop states its charge, so upstream fees add to it.
+            assert_eq!(reject.accumulated_cost, 25);
+        }
         other => panic!("expected an F06 reject, got {other:?}"),
     }
     assert!(payment_required.is_some());
     assert!(app_client.deliveries().is_empty());
+}
+
+/// On a route that prices by size, the refusal carries the schedule at the
+/// refused packet's own payload length: two lengths, two figures.
+#[tokio::test]
+async fn a_refusal_at_a_size_priced_route_carries_the_charge_for_its_length() {
+    let book = ChannelBook::new();
+    let route = StaticRoute::new_scheduled(
+        "g.example.app",
+        "http://localhost:4000",
+        Price::scheduled(25, 10),
+    )
+    .unwrap();
+    let app_client = serving_app(&route, b"free service");
+    let connector = bound(node(vec![route], Arc::clone(&app_client)));
+    let (_, transport) = dialing(carriage(connector, &book));
+
+    let mut costs = Vec::new();
+    for len in [10usize, 3000] {
+        let (mut sealed, _) = sealed_prepare(25);
+        sealed.data = vec![0xab; len];
+        let expected = Price::scheduled(25, 10).charge(sealed.data.len());
+        let PeerForward { response, .. } = transport
+            .forward(PEER_ID, sealed, paid_with(payer_voucher(1)))
+            .await;
+        match response {
+            PacketResponse::Reject(reject) => {
+                assert_eq!(reject.code.as_str(), "F06");
+                assert_eq!(reject.accumulated_cost, expected);
+                costs.push(reject.accumulated_cost);
+            }
+            other => panic!("expected an F06 reject, got {other:?}"),
+        }
+    }
+    assert_ne!(costs[0], costs[1]);
 }
 
 /// The boundary this gate exists to leave open: a voucher whose advance
@@ -2051,7 +2092,12 @@ async fn a_forwarded_arrival_that_undercovers_is_refused_once_this_peering_enfor
         .await;
 
     match response {
-        PacketResponse::Reject(reject) => assert_eq!(reject.code.as_str(), "F06"),
+        PacketResponse::Reject(reject) => {
+            assert_eq!(reject.code.as_str(), "F06");
+            // A forwarded route's refusal states no charge: that is the
+            // downstream hops' to add.
+            assert_eq!(reject.accumulated_cost, 0);
+        }
         other => panic!("expected an F06 reject, got {other:?}"),
     }
     let terms = payment_required.expect("the x402 greeting rode the reject");

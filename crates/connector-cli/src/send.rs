@@ -162,8 +162,15 @@ pub enum Outcome {
     /// panicked on: it is a real wire condition and the operator needs to
     /// see it named, not as a decode failure further down.
     FulfilledWithWrongFulfillment,
-    /// A REJECT.
-    Rejected { code: String, message: String },
+    /// A REJECT. `accumulated_cost` comes from the `TOON-Accumulated-Cost`
+    /// response header, never from the decoded [`Reject`], whose own field
+    /// is always zero after `decode` (ADR 0011). A node that sent no header
+    /// reads as zero.
+    Rejected {
+        code: String,
+        message: String,
+        accumulated_cost: u64,
+    },
     /// `--dry-run`: nothing was sent.
     NotSent,
 }
@@ -367,6 +374,29 @@ pub fn print_keyid(key_file: &str) -> Result<String, SendError> {
     Ok(keyid_hex(&read_key_file(key_file)?))
 }
 
+/// A REJECT's accumulated cost, read off its `TOON-Accumulated-Cost`
+/// response header. Absent reads as zero, so `send` still works against a
+/// node built before the header existed. A header that is not a decimal
+/// `u64` is an error, not a cost: unlike the peer carriages' readers, which
+/// fold it to zero, this one reports a figure to an operator, and a figure
+/// it made up would be a lie.
+fn reject_accumulated_cost(header: Option<&[u8]>) -> Result<u64, SendError> {
+    let Some(value) = header else {
+        return Ok(0);
+    };
+    std::str::from_utf8(value)
+        .ok()
+        .filter(|text| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or_else(|| {
+            SendError::Undecodable(format!(
+                "the REJECT's {} header is not a decimal u64: {:?}",
+                connector_btp::ACCUMULATED_COST_HEADER,
+                String::from_utf8_lossy(value)
+            ))
+        })
+}
+
 /// Form the packet, sign the write, and hand it to the operator surface.
 pub async fn send(options: &SendOptions) -> Result<SendOutcome, SendError> {
     let keypair = read_key_file(&options.operator_key_file)?;
@@ -435,6 +465,10 @@ pub async fn send(options: &SendOptions) -> Result<SendOutcome, SendError> {
         })?;
 
     let status = response.status();
+    let cost_header = response
+        .headers()
+        .get(connector_btp::ACCUMULATED_COST_HEADER)
+        .map(|value| value.as_bytes().to_vec());
     let bytes = response
         .bytes()
         .await
@@ -477,6 +511,7 @@ pub async fn send(options: &SendOptions) -> Result<SendOutcome, SendError> {
             Ok(reject) => Outcome::Rejected {
                 code: reject.code.as_str().to_string(),
                 message: reject.message,
+                accumulated_cost: reject_accumulated_cost(cost_header.as_deref())?,
             },
             Err(reject_error) => {
                 return Err(SendError::Undecodable(format!(
@@ -488,7 +523,13 @@ pub async fn send(options: &SendOptions) -> Result<SendOutcome, SendError> {
 
     if options.expect_fulfill && !matches!(outcome, Outcome::Fulfilled { .. }) {
         return Err(SendError::NotFulfilled(match &outcome {
-            Outcome::Rejected { code, message } => format!("REJECT {code} -- {message}"),
+            Outcome::Rejected {
+                code,
+                message,
+                accumulated_cost,
+            } => format!(
+                "REJECT {code} -- {message} (accumulated cost {accumulated_cost} base units)"
+            ),
             Outcome::FulfilledWithWrongFulfillment => {
                 "the fulfilment did not match the one this sender's own gift wrap derives, so \
                  whatever answered was not the node --seal-to names"
@@ -617,6 +658,79 @@ mod tests {
         );
     }
 
+    /// A REJECT's cost rides beside it in `TOON-Accumulated-Cost` (ADR
+    /// 0011); `send` reports it from there, in the outcome, the printed
+    /// summary and the `--expect-fulfill` failure.
+    #[tokio::test]
+    async fn a_reject_carrying_the_cost_header_reports_that_cost() {
+        let identity = serve_identity(a_real_identity());
+        let operator = serve_operator_reject_with_cost_header(Some("37"));
+        let key_file = operator_key_file();
+        let mut options = send_options(&format!("http://{operator}"), &identity, &key_file, None);
+
+        let outcome = send(&options).await.expect("a REJECT is an answer");
+        let Outcome::Rejected {
+            accumulated_cost, ..
+        } = outcome.outcome
+        else {
+            panic!("expected a REJECT: {outcome:?}");
+        };
+        assert_eq!(accumulated_cost, 37);
+
+        options.expect_fulfill = true;
+        let error = send(&options).await.expect_err("not fulfilled");
+        assert!(matches!(error, SendError::NotFulfilled(_)));
+        assert!(error.to_string().contains("accumulated cost 37"), "{error}");
+    }
+
+    /// A node built before the header existed sends none: that is zero, not
+    /// a failure.
+    #[tokio::test]
+    async fn a_reject_with_no_cost_header_reports_zero() {
+        let identity = serve_identity(a_real_identity());
+        let operator = serve_operator_reject_with_cost_header(None);
+        let key_file = operator_key_file();
+
+        let outcome = send(&send_options(
+            &format!("http://{operator}"),
+            &identity,
+            &key_file,
+            None,
+        ))
+        .await
+        .expect("an absent header is not a failure");
+        let Outcome::Rejected {
+            accumulated_cost, ..
+        } = outcome.outcome
+        else {
+            panic!("expected a REJECT: {outcome:?}");
+        };
+        assert_eq!(accumulated_cost, 0);
+    }
+
+    /// A header that is present but not a decimal `u64` is never read as a
+    /// real cost.
+    #[tokio::test]
+    async fn a_reject_with_a_malformed_cost_header_is_an_error() {
+        let identity = serve_identity(a_real_identity());
+        let key_file = operator_key_file();
+        for bad in ["abc", "-1", "+5", "", "18446744073709551616"] {
+            let operator = serve_operator_reject_with_cost_header(Some(bad));
+            let error = send(&send_options(
+                &format!("http://{operator}"),
+                &identity,
+                &key_file,
+                None,
+            ))
+            .await
+            .expect_err("a malformed cost header must not be read as a cost");
+            assert!(
+                matches!(error, SendError::Undecodable(_)),
+                "{bad:?}: {error}"
+            );
+        }
+    }
+
     // ── Which socket each of the two dials left on (ADR 0070 decision 5) ──
     //
     // `connector send` dials twice, and the flag applies the same
@@ -687,13 +801,32 @@ mod tests {
     /// decoded -- which is a stronger statement about the dial than a
     /// connection error would be.
     fn serve_operator_reject() -> std::net::SocketAddr {
+        serve_operator_reject_with_cost_header(None)
+    }
+
+    /// The same, answering with a `TOON-Accumulated-Cost` header of exactly
+    /// the given text, or none at all.
+    fn serve_operator_reject_with_cost_header(
+        cost_header: Option<&'static str>,
+    ) -> std::net::SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let app = Router::new().route(
             "/packets",
-            post(|| async {
+            post(move || async move {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    "content-type",
+                    axum::http::HeaderValue::from_static("application/octet-stream"),
+                );
+                if let Some(value) = cost_header {
+                    headers.insert(
+                        connector_btp::ACCUMULATED_COST_HEADER,
+                        axum::http::HeaderValue::from_static(value),
+                    );
+                }
                 (
-                    [("content-type", "application/octet-stream")],
+                    headers,
                     Reject {
                         code: RejectCode::f02_unreachable(),
                         triggered_by: "g.test.operator".to_string(),
