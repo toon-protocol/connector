@@ -1081,6 +1081,31 @@ fn every_peered_rehearsal_reads_the_chain_and_the_payees_voucher_journal() {
     }
 }
 
+/// **two-hop probes before it sends** (ADR 0011): the rehearsal reads the
+/// path's cost off an amount-0 `connector probe` and asserts it is B's price,
+/// which A's operator-origination charges nothing on top of (#1466). The probe
+/// exits zero on any cost, so only the asserted figure can fail the run.
+#[test]
+fn the_two_hop_rehearsal_probes_before_it_sends_and_asserts_the_figure() {
+    let compose = code(TWO_HOP_COMPOSE);
+    let probe = compose
+        .find("connector probe")
+        .expect("two-hop's sender must run `connector probe`");
+    let first_send = compose
+        .find("crossing 1")
+        .expect("two-hop's sender must send");
+    assert!(probe < first_send, "the probe comes before the first send");
+    let probing = &compose[probe..first_send];
+    assert!(
+        probing.contains("--json")
+            && probing.contains("\"outcome\":\"complete\"")
+            && probing.contains("\"accumulatedCost\":'\"$$PRICE\"")
+            && probing.contains("exit 1"),
+        "the probe's outcome and figure must be asserted before the first send, not merely \
+         printed:\n{probing}"
+    );
+}
+
 /// Every EVM rehearsal checks the collateral keys.sh tops the payer up to.
 #[test]
 fn every_rehearsal_checks_the_deposit_keys_sh_makes() {

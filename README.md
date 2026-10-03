@@ -1039,15 +1039,43 @@ curl -s -H "Authorization: Bearer $(cat "$LAB"/node-b/data/operator-bearer-token
   $B/routes/peers | jq
 ```
 
-#### 7. Send a packet across it
+#### 7. Probe the path, then send a packet across it
 
-`connector send` is the binary's second verb. It forms a real packet, seals it,
-signs the write and reports the outcome:
+Learn what the path costs before paying it. `connector probe` takes what `send`
+takes to form a packet and sends it at `--amount 0` (the default), so a priced
+route, or a hop charging a fee on the way, refuses it and the refusal states the
+cost ([ADR 0011](docs/adr/0011-rejects-accumulate-fees-and-probes-discover-cost.md)).
+A probe is an ordinary packet through the same `POST /packets`; at amount 0
+nothing is paid. Give it the payload you mean to send, because a route may
+price by size:
 
 ```bash
 echo '{"hello":"from a paid packet"}' > "$LAB"/node-b/data/payload.json
 chmod a+r "$LAB"/node-b/data/payload.json
 
+docker run --rm --network connector_default \
+  -v "$LAB/node-b/data:/data:ro" \
+  $IMAGE probe \
+    --operator     http://node-b:3000 \
+    --operator-key /data/operator-send.key \
+    --to           g.lab.a.app \
+    --seal-to      http://node-a:3000/ilp \
+    --body         /data/payload.json
+```
+
+It prints one of three answers and exits zero on each: `COST <n>`, the whole
+path's cost for a packet this size; `PARTIAL COST <n>`, an `R01` that stopped at
+a hop it could not pay, where `<n>` is the amount to carry past that hop (probe
+again with `--amount <n>` to read on); or `DELIVERED`, when `--amount` already
+covered the path and the packet was sent and paid for. A path that does not
+exist or did not answer (no route, a timeout, an unreachable peer) exits
+non-zero. `--json` prints the code, message and `accumulatedCost` as one object.
+
+Then send it, with the amount the probe named. `connector send` is the binary's
+verb for that: it forms a real packet, seals it, signs the write and reports the
+outcome:
+
+```bash
 docker run --rm --network connector_default \
   -v "$LAB/node-b/data:/data:ro" \
   $IMAGE send \
