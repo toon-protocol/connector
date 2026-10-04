@@ -3454,6 +3454,34 @@ write_keys = ["{key}"]
         let operator = config.operator().expect("operator config");
         assert_eq!(operator.bearer_token(), "secret-token");
         assert_eq!(operator.write_keys().len(), 1);
+        assert_eq!(operator.packet_history(), 0);
+    }
+
+    /// Issue #1477: `packet_history` is an optional key under
+    /// `deny_unknown_fields`, read through `Config::load` as written.
+    #[test]
+    fn an_operator_section_with_a_packet_history_loads() {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let config = with_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[operator]
+bearer_token = "secret-token"
+write_keys = ["{key}"]
+packet_history = 500
+"#,
+                key_path.display()
+            )
+        })
+        .expect("load");
+
+        let operator = config.operator().expect("operator config");
+        assert_eq!(operator.packet_history(), 500);
     }
 
     /// Issue #1003, end to end through `Config::load`: the shape the store
