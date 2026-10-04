@@ -45,6 +45,11 @@ use url::Url;
 // decision 3 puts a token's pools on that token's own chain (issue #1302).
 pub use runtime::{build, router, spawn_rate_pollers, Runtime, RuntimeError};
 
+// What a reject code says about cost, on its own (issue #1475): a dependent
+// crate holding only a reject's code asks here rather than keep its own copy
+// of the codes. `connector probe` reaches its verdict through the same rule.
+pub use probe::{reject_cost_reading, CostReading};
+
 // The Solana sponsor endpoint on its own (ADR 0074 decision 9), for a test
 // that stands a counterparty up with nothing but it: the Solana paying half
 // opens its channels through exactly this endpoint of another node (ADR 0075
