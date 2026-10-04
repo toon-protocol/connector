@@ -1236,6 +1236,7 @@ that will do the signing.
 | `GET /identity`      | This node's operator-facing identity.                     |
 | `GET /audit-log`     | Every accepted write, with the key that made it.          |
 | `GET /metrics`       | Prometheus text.                                          |
+| `GET /packets`       | Recent packets, newest first; in memory (ADR 0077).       |
 
 `/metrics` is a bearer-gated read like any other, and there is no unauthenticated
 metrics path: absent `[operator]`, `/metrics` is not mounted and answers 404

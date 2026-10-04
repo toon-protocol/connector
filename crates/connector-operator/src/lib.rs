@@ -210,6 +210,7 @@ pub fn router_with_batch_channels(
         .route("/identity", get(identity))
         .route("/audit-log", get(audit_log))
         .route("/metrics", get(metrics))
+        .route("/packets", get(packet_history))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token,
@@ -413,6 +414,22 @@ async fn metrics(State(state): State<OperatorState>) -> Response {
         state.connector.metrics().encode(),
     )
         .into_response()
+}
+
+/// What `GET /packets` accepts.
+#[derive(serde::Deserialize)]
+struct PacketHistoryQuery {
+    limit: Option<usize>,
+}
+
+/// `GET /packets`: the recent packets this node handled, newest first
+/// (ADR 0077). Always `200`, including when no history is kept. A read like
+/// any other: bearer token, nothing else.
+async fn packet_history(
+    State(state): State<OperatorState>,
+    axum::extract::Query(query): axum::extract::Query<PacketHistoryQuery>,
+) -> Json<connector_runtime::PacketHistoryView> {
+    Json(state.connector.packet_history(query.limit))
 }
 
 /// `POST /packets`: an operator originates a packet outward, exactly as
@@ -1327,6 +1344,90 @@ mod tests {
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("toon_fees_earned_total"));
+    }
+
+    fn router_over(connector: Arc<Connector>) -> Router {
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
+        router(
+            connector,
+            empty_claim_gate(),
+            signer,
+            "correct-token".to_string(),
+            vec![],
+            None,
+        )
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn packets_answers_off_when_no_history_is_kept_and_requires_the_bearer_token() {
+        let app = test_router(vec![], "correct-token");
+
+        let unauthenticated = get(app.clone(), "/packets", None).await;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let response = get(app, "/packets", Some("correct-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({"enabled": false, "capacity": 0, "dropped": 0, "packets": []})
+        );
+    }
+
+    #[tokio::test]
+    async fn packets_lists_the_recent_packets_newest_first_and_honours_limit() {
+        let connector = Arc::new(
+            Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            )
+            .with_packet_history(5),
+        );
+        for destination in ["g.one", "g.two", "g.three"] {
+            connector
+                .handle_prepare(connector_domain::Prepare {
+                    amount: 9,
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    greeting: false,
+                    destination: destination.to_string(),
+                    data: Vec::new(),
+                })
+                .await;
+        }
+        for _ in 0..500 {
+            if connector.packet_history(None).packets.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let app = router_over(connector);
+
+        let all = body_json(get(app.clone(), "/packets", Some("correct-token")).await).await;
+        assert_eq!(all["enabled"], true);
+        assert_eq!(all["capacity"], 5);
+        assert_eq!(all["dropped"], 0);
+        let destinations: Vec<_> = all["packets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["destination"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(destinations, ["g.three", "g.two", "g.one"]);
+        assert_eq!(all["packets"][0]["outcome"], "rejected");
+        assert_eq!(all["packets"][0]["code"], "F02");
+        assert_eq!(all["packets"][0]["amount"], 9);
+        assert!(all["packets"][0].get("direction").is_none());
+
+        let newest = body_json(get(app, "/packets?limit=1", Some("correct-token")).await).await;
+        assert_eq!(newest["packets"].as_array().unwrap().len(), 1);
+        assert_eq!(newest["packets"][0]["destination"], "g.three");
     }
 
     #[tokio::test]
