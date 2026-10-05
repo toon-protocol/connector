@@ -54,6 +54,10 @@ pub(crate) struct RawOperatorConfig {
     write_keys: Option<Vec<String>>,
     #[serde(default)]
     write_keys_file: Option<PathBuf>,
+    /// How many recent packets to keep in memory for `GET /packets`
+    /// (ADR 0077). Absent or `0` keeps none; not a required key.
+    #[serde(default)]
+    packet_history: Option<usize>,
 }
 
 /// The literal bearer token never reaches a [`fmt::Debug`] rendering, for
@@ -74,6 +78,7 @@ impl fmt::Debug for RawOperatorConfig {
             .field("bearer_token_file", &self.bearer_token_file)
             .field("write_keys", &self.write_keys)
             .field("write_keys_file", &self.write_keys_file)
+            .field("packet_history", &self.packet_history)
             .finish()
     }
 }
@@ -87,6 +92,7 @@ impl fmt::Debug for RawOperatorConfig {
 pub struct OperatorConfig {
     bearer_token: String,
     write_keys: Vec<[u8; 32]>,
+    packet_history: usize,
 }
 
 /// Same redaction as [`RawOperatorConfig`]'s, one step further along: a
@@ -100,6 +106,7 @@ impl fmt::Debug for OperatorConfig {
                 "write_keys",
                 &format_args!("{} key(s)", self.write_keys.len()),
             )
+            .field("packet_history", &self.packet_history)
             .finish()
     }
 }
@@ -116,6 +123,12 @@ impl OperatorConfig {
     /// lifetime (ADR 0009), so revocation is never a live operation.
     pub fn write_keys(&self) -> &[[u8; 32]] {
         &self.write_keys
+    }
+
+    /// How many recent packets the node keeps in memory for the operator to
+    /// watch (ADR 0077); `0` keeps none.
+    pub fn packet_history(&self) -> usize {
+        self.packet_history
     }
 }
 
@@ -302,6 +315,7 @@ pub(crate) fn resolve_operator(
     Ok(Some(OperatorConfig {
         bearer_token,
         write_keys,
+        packet_history: raw.packet_history.unwrap_or(0),
     }))
 }
 
@@ -320,7 +334,21 @@ mod tests {
             bearer_token_file: None,
             write_keys: Some(write_keys.iter().map(|k| k.to_string()).collect()),
             write_keys_file: None,
+            packet_history: None,
         }
+    }
+
+    #[test]
+    fn packet_history_is_off_unless_configured() {
+        let off = resolve_operator(Some(raw("token", &[KEY])))
+            .expect("resolve")
+            .expect("some");
+        assert_eq!(off.packet_history(), 0);
+
+        let mut on = raw("token", &[KEY]);
+        on.packet_history = Some(500);
+        let on = resolve_operator(Some(on)).expect("resolve").expect("some");
+        assert_eq!(on.packet_history(), 500);
     }
 
     /// A temp file holding `contents`, kept alive by the caller -- dropping
@@ -414,6 +442,7 @@ mod tests {
             bearer_token_file: Some(token.path().to_path_buf()),
             write_keys: None,
             write_keys_file: Some(keys.path().to_path_buf()),
+            packet_history: None,
         }))
         .expect("resolve")
         .expect("some");
@@ -435,6 +464,7 @@ mod tests {
             bearer_token_file: Some(token.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            packet_history: None,
         }))
         .expect("resolve")
         .expect("some");
@@ -455,6 +485,7 @@ mod tests {
             bearer_token_file: Some(token.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            packet_history: None,
         }))
         .expect("resolve")
         .expect("some");
@@ -489,6 +520,7 @@ mod tests {
             bearer_token_file: None,
             write_keys: None,
             write_keys_file: Some(keys.path().to_path_buf()),
+            packet_history: None,
         }))
         .expect("resolve")
         .expect("some");
@@ -510,6 +542,7 @@ mod tests {
             bearer_token_file: Some(token.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            packet_history: None,
         }));
 
         let message = result.expect_err("ambiguous").to_string();
@@ -526,6 +559,7 @@ mod tests {
             bearer_token_file: None,
             write_keys: Some(vec![OTHER_KEY.to_string()]),
             write_keys_file: Some(keys.path().to_path_buf()),
+            packet_history: None,
         }));
 
         let message = result.expect_err("ambiguous").to_string();
@@ -542,6 +576,7 @@ mod tests {
             bearer_token_file: Some(PathBuf::from("/nonexistent/operator-bearer-token")),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            packet_history: None,
         }));
 
         let message = result.expect_err("missing file").to_string();
@@ -559,6 +594,7 @@ mod tests {
             bearer_token_file: None,
             write_keys: None,
             write_keys_file: Some(PathBuf::from("/nonexistent/operator-write-keys")),
+            packet_history: None,
         }));
 
         let message = result.expect_err("missing file").to_string();
@@ -581,6 +617,7 @@ mod tests {
             bearer_token_file: Some(dir.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            packet_history: None,
         }));
 
         let message = result.expect_err("not a file").to_string();
@@ -598,6 +635,7 @@ mod tests {
             bearer_token_file: Some(file.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            packet_history: None,
         }));
 
         let message = result.expect_err("unreadable").to_string();
@@ -614,6 +652,7 @@ mod tests {
                 bearer_token_file: Some(token.path().to_path_buf()),
                 write_keys: Some(vec![KEY.to_string()]),
                 write_keys_file: None,
+                packet_history: None,
             }));
 
             let message = result
@@ -635,6 +674,7 @@ mod tests {
                 bearer_token_file: None,
                 write_keys: None,
                 write_keys_file: Some(keys.path().to_path_buf()),
+                packet_history: None,
             }));
 
             let message = result
@@ -653,6 +693,7 @@ mod tests {
             bearer_token_file: None,
             write_keys: None,
             write_keys_file: Some(keys.path().to_path_buf()),
+            packet_history: None,
         }));
 
         let error = result.expect_err("malformed entry");

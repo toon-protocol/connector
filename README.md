@@ -1236,11 +1236,16 @@ that will do the signing.
 | `GET /identity`      | This node's operator-facing identity.                     |
 | `GET /audit-log`     | Every accepted write, with the key that made it.          |
 | `GET /metrics`       | Prometheus text.                                          |
+| `GET /packets`       | Recent packets, newest first; in memory (ADR 0077).       |
 
 `/metrics` is a bearer-gated read like any other, and there is no unauthenticated
 metrics path: absent `[operator]`, `/metrics` is not mounted and answers 404
 rather than 401. A _public_ status page — one strangers load — therefore needs a
 server-side holder for the token, never the token embedded in the page.
+
+`GET /packets` keeps nothing unless `[operator] packet_history = n` asks it to
+hold the last `n` packets. It is a window for watching, lost on restart, and not
+a record of anything.
 
 There is also no dedicated health route. What a container healthcheck probes
 instead is `GET /ilp/identity` on the client edge, which is free and

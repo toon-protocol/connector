@@ -559,6 +559,13 @@ A build that makes a configuration a box already runs invalid — a new required
 field, a narrowed type. It may never ride an automatic tag move: either the change is made
 backward-compatible first, or a promotion lands the config before the image.
 
+**Packet history**:
+The recent packets a connector handled, held in memory for its operator to watch; bounded, lossy
+and gone on restart; never a record, and never read by anything that decides a packet's fate. A
+packet is **delivered** when it ended at one of the connector's apps, **forwarded** when it arrived
+from one side and left toward a peer, and **sent** when the operator originated it.
+_Avoid_: packet log, audit log, transaction history
+
 **Promotion**:
 Moving the tag a box follows to one specific build, deliberately. The only moment at which a
 candidate image and the fleet's committed configuration are in the same place, and therefore the

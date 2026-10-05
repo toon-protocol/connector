@@ -782,6 +782,13 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // gap 3), so a peering established at runtime picks its carriage by
     // exactly the rule a config-file peering does.
     .with_peer_allow_plaintext_endpoints(config.peer_allow_plaintext_endpoints())
+    // ADR 0077: the operator's bounded, in-memory packet history, off unless
+    // `[operator] packet_history` names a size.
+    .with_packet_history(
+        config
+            .operator()
+            .map_or(0, |operator| operator.packet_history()),
+    )
     // Issue #884: the routing table IS the relationship set enforced at
     // load (`connector-config`'s `UnknownPeerId` check), so a runtime
     // write must never be able to add, update or remove a peer id the

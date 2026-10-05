@@ -38,6 +38,9 @@ use crate::outbound_voucher::{
     challenge_entry, voucher_json, HttpVoucherState, UnreachableVoucherState, VoucherStateSource,
     PEER_CHALLENGE_TTL_SECS,
 };
+use crate::packet_history::{
+    clip_message, Direction, Outcome, PacketHistory, PacketHistoryView, PacketRow,
+};
 use crate::peer_route_store::{
     PeerRouteStore, PeerRouteStoreError, RuntimePeerChannel, RuntimePeering, RuntimePeers,
 };
@@ -632,6 +635,9 @@ pub struct Connector {
     /// that is how "the forwarding path does no I/O" is kept true by
     /// construction rather than by discipline (decision 6).
     rate_table: Option<SharedRateTable>,
+    /// The bounded, lossy packet history an operator watches (ADR 0077).
+    /// Written by [`Self::finish`] and read by nothing that decides a packet.
+    history: Option<PacketHistory>,
 }
 
 /// Why a config-declared x402 peering could not be wired at boot (ADR 0075
@@ -723,6 +729,18 @@ enum Arrival<'a> {
     /// packet, which this is not: [`Connector::forward_via_peer_route`]
     /// charges it none.
     Operator,
+}
+
+/// What the packet history needs to know about one packet by the time
+/// [`Connector::finish`] sees its outcome (ADR 0077). Built only when a
+/// history is kept, so a node with none allocates nothing for it.
+struct Trace {
+    destination: String,
+    amount: u64,
+    from_peer: Option<String>,
+    from_channel: Option<String>,
+    direction: Option<Direction>,
+    to_peer: Option<String>,
 }
 
 /// Why a forward could not be covered: it could not be signed, or the packet
@@ -830,6 +848,24 @@ impl Connector {
             peering_assets: PeeringAssets::default(),
             client_channel_assets: ClientChannelAssets::default(),
             rate_table: None,
+            history: None,
+        }
+    }
+
+    /// Keep the `capacity` most recent packets in memory for the operator
+    /// surface's `GET /packets` (ADR 0077). `0` keeps none. Spawns the
+    /// collector task, so it must be called inside a tokio runtime.
+    pub fn with_packet_history(mut self, capacity: usize) -> Self {
+        self.history = (capacity > 0).then(|| PacketHistory::spawn(capacity));
+        self
+    }
+
+    /// What `GET /packets` answers: the newest `limit` rows, newest first, or
+    /// the "off" answer on a node that keeps no history.
+    pub fn packet_history(&self, limit: Option<usize>) -> PacketHistoryView {
+        match &self.history {
+            Some(history) => history.view(limit),
+            None => PacketHistoryView::off(),
         }
     }
 
@@ -2099,7 +2135,11 @@ impl Connector {
                     // their fees to (as `handle_probe` does at the edge).
                     accumulated_cost: charge,
                 });
-                return self.finish(reject);
+                let mut trace = self.trace(&prepare, arrived_from.map(Arrival::Peer));
+                if let Some(trace) = trace.as_mut() {
+                    trace.direction = Some(Direction::Delivered);
+                }
+                return self.finish(reject, trace, None);
             }
         }
 
@@ -2242,8 +2282,10 @@ impl Connector {
         // per-packet trace without a config change on the boxes.
         tracing::debug!("packet received");
 
+        let mut trace = self.trace(&prepare, arrived);
+
         if let Some(reject) = self.reject_ineligible(&prepare) {
-            return self.finish(PacketResponse::Reject(reject));
+            return self.finish(PacketResponse::Reject(reject), trace, None);
         }
 
         // Issue #452: `leased_routes_snapshot` is one lock-free `Arc`
@@ -2280,13 +2322,17 @@ impl Connector {
             .flatten()
             .max_by_key(|(len, target)| (*len, target.rank()))
         else {
-            return self.finish(PacketResponse::Reject(Reject {
-                code: RejectCode::f02_unreachable(),
-                triggered_by: String::new(),
-                message: format!("no route to destination '{}'", prepare.destination),
-                data: Vec::new(),
-                accumulated_cost: 0,
-            }));
+            return self.finish(
+                PacketResponse::Reject(Reject {
+                    code: RejectCode::f02_unreachable(),
+                    triggered_by: String::new(),
+                    message: format!("no route to destination '{}'", prepare.destination),
+                    data: Vec::new(),
+                    accumulated_cost: 0,
+                }),
+                trace,
+                None,
+            );
         };
 
         // A `Cow`, not a plain clone (issue #884): the `RuntimePeer` arm
@@ -2299,33 +2345,50 @@ impl Connector {
         let peer_route: Cow<'_, PeerRoute> = match target {
             RouteTarget::App(index) => {
                 tracing::debug!(handler_url = %self.routes[index].handler_url(), "routed to app");
+                if let Some(trace) = trace.as_mut() {
+                    trace.direction.get_or_insert(Direction::Delivered);
+                }
                 let response = self
                     .deliver_to_app(&self.routes[index], prepare, client_channel_id)
                     .await;
-                return self.finish(response);
+                return self.finish(response, trace, None);
             }
             RouteTarget::Peer(index) => Cow::Borrowed(&self.peer_routes[index]),
             RouteTarget::Leased(index) => Cow::Borrowed(active_leased[index].as_peer_route()),
             RouteTarget::RuntimePeer(route) => Cow::Owned(route),
         };
         tracing::debug!(peer_id = %peer_route.peer_id(), "routed to peer");
+        if let Some(trace) = trace.as_mut() {
+            trace.direction.get_or_insert(Direction::Forwarded);
+            trace.to_peer = Some(peer_route.peer_id().to_string());
+        }
         let response = self
             .forward_via_peer_route(&peer_route, prepare, arrived)
             .await;
+        let mut fee = None;
         if matches!(response, PacketResponse::Fulfill(_))
             && !matches!(arrived, Some(Arrival::Operator))
         {
-            self.metrics
-                .record_fee_earned(self.fee_for(peer_route.peer_id()));
+            let earned = self.fee_for(peer_route.peer_id());
+            self.metrics.record_fee_earned(earned);
+            fee = Some(earned);
         }
-        self.finish(response)
+        self.finish(response, trace, fee)
     }
 
     /// Record the packet's final outcome -- metrics and a log line -- and
     /// pass it through unchanged. The single choke point every return path
     /// in [`Self::handle_prepare_traced`] goes through, so no outcome can be
     /// reported without also being counted.
-    fn finish(&self, response: PacketResponse) -> PacketResponse {
+    fn finish(
+        &self,
+        response: PacketResponse,
+        trace: Option<Trace>,
+        fee: Option<u64>,
+    ) -> PacketResponse {
+        if let (Some(history), Some(trace)) = (&self.history, trace) {
+            history.record(self.row_for(trace, &response, fee));
+        }
         match &response {
             PacketResponse::Fulfill(_) => {
                 self.metrics.record_fulfill();
@@ -2341,6 +2404,51 @@ impl Connector {
             }
         }
         response
+    }
+
+    /// The facts [`Self::finish`] files for one packet, if a history is kept.
+    fn trace(&self, prepare: &Prepare, arrived: Option<Arrival<'_>>) -> Option<Trace> {
+        self.history.as_ref()?;
+        Some(Trace {
+            destination: prepare.destination.to_string(),
+            amount: prepare.amount,
+            from_peer: match arrived {
+                Some(Arrival::Peer(id)) => Some(id.to_string()),
+                _ => None,
+            },
+            from_channel: match arrived {
+                Some(Arrival::ClientChannel(key)) => Some(key.to_string()),
+                _ => None,
+            },
+            // The operator's own origination is `sent` whatever becomes of it,
+            // including when no route is ever chosen.
+            direction: matches!(arrived, Some(Arrival::Operator)).then_some(Direction::Sent),
+            to_peer: None,
+        })
+    }
+
+    fn row_for(&self, trace: Trace, response: &PacketResponse, fee: Option<u64>) -> PacketRow {
+        let (outcome, code, message) = match response {
+            PacketResponse::Fulfill(_) => (Outcome::Fulfilled, None, None),
+            PacketResponse::Reject(reject) => (
+                Outcome::Rejected,
+                Some(reject.code.as_str().to_string()),
+                Some(clip_message(&reject.message)),
+            ),
+        };
+        PacketRow {
+            time: self.clock.now(),
+            direction: trace.direction,
+            destination: trace.destination,
+            from_peer: trace.from_peer,
+            from_channel: trace.from_channel,
+            to_peer: trace.to_peer,
+            amount: trace.amount,
+            fee,
+            outcome,
+            code,
+            message,
+        }
     }
 
     /// Cross a **denomination boundary**: what this hop forwards to
@@ -10580,6 +10688,303 @@ mod tests {
             assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
             assert_eq!(outbound.signed(&channel), Some(0));
             assert!(next_hop.covered.lock().unwrap().is_empty());
+        }
+    }
+
+    /// ADR 0077: the packet history -- what it files for each packet
+    /// `toon_packets_total` counts, and that filing it never slows a packet.
+    mod packet_history {
+        use super::*;
+        use crate::packet_history::PacketHistory;
+
+        /// The history is filled by a collector task, so a read waits until
+        /// it holds `rows` rows.
+        async fn history_of(connector: &Connector, rows: usize) -> Vec<PacketRow> {
+            for _ in 0..500 {
+                let view = connector.packet_history(None);
+                if view.packets.len() >= rows {
+                    return view.packets;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("the history never reached {rows} rows");
+        }
+
+        fn app_connector(price: u64, capacity: usize) -> (Connector, Arc<FakeAppClient>) {
+            let route =
+                StaticRoute::new_priced("g.example.app", "http://localhost:4000", price).unwrap();
+            let app_client = Arc::new(FakeAppClient::new());
+            app_client.respond(route.handler_url(), answered(b"ok"));
+            let connector = connector_with(vec![route], app_client.clone(), test_clock())
+                .with_packet_history(capacity);
+            (connector, app_client)
+        }
+
+        /// A first hop forwarding `g.example.app` to a second hop that
+        /// terminates it, with a fee of 7 on that peering.
+        fn forwarding_hop(capacity: usize) -> Connector {
+            let route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
+            let app_client = Arc::new(FakeAppClient::new());
+            app_client.respond(route.handler_url(), answered(b""));
+            let second_hop = Arc::new(
+                Connector::new(
+                    vec![route],
+                    vec![],
+                    app_client,
+                    Arc::new(InProcessPeerTransport::new()),
+                    test_clock(),
+                )
+                .with_identity_signer(identity_signer()),
+            );
+            let mut transport = InProcessPeerTransport::new();
+            transport.add_peer("second-hop", second_hop);
+            covering(
+                Connector::new(
+                    vec![],
+                    vec![PeerRoute::new("g.example.app", "second-hop")],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(transport),
+                    test_clock(),
+                )
+                .with_peer_fees([("second-hop".to_string(), 7)])
+                .with_packet_history(capacity),
+                "second-hop",
+            )
+        }
+
+        #[tokio::test]
+        async fn a_node_with_no_history_answers_off_and_keeps_nothing() {
+            for capacity in [0, 5] {
+                let route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
+                let app_client = Arc::new(FakeAppClient::new());
+                app_client.respond(route.handler_url(), answered(b"ok"));
+                let connector = connector_with(vec![route], app_client, test_clock());
+                let connector = if capacity == 0 {
+                    connector.with_packet_history(0)
+                } else {
+                    connector
+                };
+                connector
+                    .handle_prepare(prepare("g.example.app", b"hi"))
+                    .await;
+                tokio::task::yield_now().await;
+                assert_eq!(connector.packet_history(None), PacketHistoryView::off());
+            }
+        }
+
+        #[tokio::test]
+        async fn a_delivery_names_the_channel_that_admitted_it() {
+            let (connector, _app) = app_connector(0, 10);
+
+            connector
+                .handle_prepare_with_client_channel(
+                    prepare_with_amount("g.example.app", 42),
+                    Some("evm:0xabc"),
+                )
+                .await;
+
+            let rows = history_of(&connector, 1).await;
+            let row = &rows[0];
+            assert_eq!(row.direction, Some(Direction::Delivered));
+            assert_eq!(row.destination, "g.example.app");
+            assert_eq!(row.from_channel.as_deref(), Some("evm:0xabc"));
+            assert_eq!(row.from_peer, None);
+            assert_eq!(row.to_peer, None);
+            assert_eq!(row.amount, 42);
+            assert_eq!(row.fee, None);
+            assert_eq!(row.outcome, Outcome::Fulfilled);
+            assert_eq!((row.code.as_deref(), row.message.as_deref()), (None, None));
+            let view = connector.packet_history(None);
+            assert!(view.enabled);
+            assert_eq!((view.capacity, view.dropped), (10, 0));
+            let json = serde_json::to_value(row).unwrap();
+            assert_eq!(json["time"], "2030-01-01T00:00:00.000Z");
+            assert_eq!(json["direction"], "delivered");
+            assert!(json.get("from_peer").is_none());
+        }
+
+        #[tokio::test]
+        async fn a_forward_names_both_peers_and_the_fee_it_kept() {
+            let hop = forwarding_hop(10);
+
+            let response = hop
+                .handle_peer_prepare(Some("upstream"), prepare_with_amount("g.example.app", 100))
+                .await;
+            assert!(matches!(response, PacketResponse::Fulfill(_)));
+
+            let rows = history_of(&hop, 1).await;
+            let row = &rows[0];
+            assert_eq!(row.direction, Some(Direction::Forwarded));
+            assert_eq!(row.from_peer.as_deref(), Some("upstream"));
+            assert_eq!(row.from_channel, None);
+            assert_eq!(row.to_peer.as_deref(), Some("second-hop"));
+            assert_eq!(row.amount, 100);
+            assert_eq!(row.fee, Some(7));
+            assert_eq!(row.outcome, Outcome::Fulfilled);
+            assert!(hop.metrics().encode().contains("toon_fees_earned_total 7"));
+        }
+
+        #[tokio::test]
+        async fn an_originated_packet_is_sent_and_earns_no_fee() {
+            let hop = forwarding_hop(10);
+
+            let response = hop
+                .originate_prepare(prepare_with_amount("g.example.app", 100))
+                .await;
+            assert!(matches!(response, PacketResponse::Fulfill(_)));
+
+            let rows = history_of(&hop, 1).await;
+            let row = &rows[0];
+            assert_eq!(row.direction, Some(Direction::Sent));
+            assert_eq!((&row.from_peer, &row.from_channel), (&None, &None));
+            assert_eq!(row.to_peer.as_deref(), Some("second-hop"));
+            assert_eq!(row.amount, 100);
+            assert_eq!(row.fee, None);
+        }
+
+        #[tokio::test]
+        async fn an_originated_packet_for_this_nodes_own_app_is_sent_with_no_peer() {
+            let (connector, _app) = app_connector(0, 10);
+
+            connector
+                .originate_prepare(prepare_with_amount("g.example.app", 5))
+                .await;
+
+            let rows = history_of(&connector, 1).await;
+            assert_eq!(rows[0].direction, Some(Direction::Sent));
+            assert_eq!(rows[0].to_peer, None);
+            assert_eq!(rows[0].outcome, Outcome::Fulfilled);
+        }
+
+        #[tokio::test]
+        async fn a_reject_carries_its_code_and_an_unroutable_arrival_no_direction() {
+            let connector = connector_with(vec![], Arc::new(FakeAppClient::new()), test_clock())
+                .with_packet_history(10);
+
+            connector.handle_prepare(prepare("g.nowhere", b"hi")).await;
+            let mut expired = prepare("g.nowhere", b"hi");
+            expired.expires_at = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
+            connector.handle_prepare(expired.clone()).await;
+            connector.originate_prepare(expired).await;
+
+            let rows = history_of(&connector, 3).await;
+            // Newest first: the originated expiry, the expiry, the no-route.
+            assert_eq!(rows[0].direction, Some(Direction::Sent));
+            assert_eq!(rows[0].code.as_deref(), Some("R00"));
+            assert_eq!(rows[1].direction, None);
+            assert_eq!(rows[1].code.as_deref(), Some("R00"));
+            assert_eq!(rows[1].message.as_deref(), Some("prepare has expired"));
+            assert_eq!(rows[2].direction, None);
+            assert_eq!(rows[2].code.as_deref(), Some("F02"));
+            assert!(rows[2].message.as_deref().unwrap().contains("g.nowhere"));
+            assert_eq!(rows[2].outcome, Outcome::Rejected);
+        }
+
+        #[tokio::test]
+        async fn an_underpriced_peer_arrival_is_a_delivered_reject_from_that_peer() {
+            let (connector, _app) = app_connector(25, 10);
+
+            connector
+                .handle_peer_prepare(Some("upstream"), prepare_with_amount("g.example.app", 10))
+                .await;
+
+            let rows = history_of(&connector, 1).await;
+            assert_eq!(rows[0].direction, Some(Direction::Delivered));
+            assert_eq!(rows[0].from_peer.as_deref(), Some("upstream"));
+            assert_eq!(rows[0].code.as_deref(), Some("F03"));
+            assert_eq!(rows[0].amount, 10);
+        }
+
+        #[tokio::test]
+        async fn the_history_gains_one_row_per_packet_the_counter_counts() {
+            let (connector, _app) = app_connector(25, 100);
+
+            connector
+                .handle_prepare(prepare_with_amount("g.example.app", 30))
+                .await;
+            connector
+                .handle_peer_prepare(Some("upstream"), prepare_with_amount("g.example.app", 1))
+                .await;
+            connector.handle_prepare(prepare("g.nowhere", b"x")).await;
+            connector
+                .originate_prepare(prepare_with_amount("g.example.app", 30))
+                .await;
+            // A probe answered at the edge is no packet at all.
+            connector.recognize_channel("evm:0xabc");
+            connector
+                .handle_probe("evm:0xabc", prepare("g.example.app", b"x"))
+                .await
+                .unwrap();
+
+            let rows = history_of(&connector, 4).await;
+            let counted = connector.metrics().encode();
+            assert!(counted.contains(r#"toon_packets_total{outcome="fulfill"} 2"#));
+            assert!(counted.contains(r#"toon_packets_total{outcome="reject"} 2"#));
+            assert_eq!(rows.len(), 4);
+            assert_eq!(connector.packet_history(None).dropped, 0);
+        }
+
+        #[tokio::test]
+        async fn the_history_keeps_only_its_capacity_and_limit_returns_the_newest() {
+            let (connector, _app) = app_connector(0, 3);
+
+            for amount in 1..=5 {
+                connector
+                    .handle_prepare(prepare_with_amount("g.example.app", amount))
+                    .await;
+            }
+            // Wait for the collector to have filed all five.
+            for _ in 0..500 {
+                if connector
+                    .packet_history(None)
+                    .packets
+                    .first()
+                    .map(|r| r.amount)
+                    == Some(5)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+
+            let amounts = |limit| {
+                connector
+                    .packet_history(limit)
+                    .packets
+                    .iter()
+                    .map(|row| row.amount)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(amounts(None), vec![5, 4, 3]);
+            assert_eq!(amounts(Some(2)), vec![5, 4]);
+            assert_eq!(connector.packet_history(None).dropped, 0);
+        }
+
+        // Multi-threaded: the stalled collector blocks its worker thread on
+        // the ring's lock, and a current-thread runtime has only the one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_packet_completes_while_the_history_cannot_take_a_row_and_is_counted_dropped() {
+            let (connector, _app) = app_connector(0, 10);
+            let stalled = connector.history.as_ref().unwrap().stall_collector();
+            // One row waits in the collector's hands, the queue holds the
+            // bound, and everything after that has nowhere to go.
+            let packets = PacketHistory::QUEUE_BOUND + 10;
+
+            for _ in 0..packets {
+                let response = connector
+                    .handle_prepare(prepare_with_amount("g.example.app", 1))
+                    .await;
+                assert!(matches!(response, PacketResponse::Fulfill(_)));
+                tokio::task::yield_now().await;
+            }
+
+            let dropped = connector.history.as_ref().unwrap().dropped();
+            assert!(dropped >= 9, "dropped was {dropped}");
+            drop(stalled);
+            let counted = connector.metrics().encode();
+            assert!(counted.contains(&format!(
+                r#"toon_packets_total{{outcome="fulfill"}} {packets}"#
+            )));
         }
     }
 }
