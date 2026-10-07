@@ -289,7 +289,11 @@ impl HttpPeerTransport {
             tokio::time::timeout(timeout, self.client.post(&state.relation.endpoint, request))
                 .await;
         match answered {
-            Ok(Ok(response)) if response.answers_the_packet() => Ok(response),
+            Ok(Ok(response))
+                if response.answers_the_packet() || response.quoted_terms().is_some() =>
+            {
+                Ok(response)
+            }
             // §6.2: `4xx`/`5xx` are reserved for a malformed request or a
             // connector fault -- there is no ILP answer, so there is nothing
             // to read, and in particular no ack to read off it.
@@ -472,13 +476,40 @@ impl HttpPeerTransport {
             ClaimAckOutcome::NotSent
         };
 
+        // A `402` with readable terms is the far node's client edge greeting
+        // a claimless packet (#1481). It carries no ILP body, so the reject
+        // is this carriage's reading of it, built as the BTP greeting is: an
+        // `F06` stating the charge quoted for this packet, with the terms
+        // reported beside it for the connector's one retry-or-decline rule.
+        // The ack is never read off it: no voucher was admitted.
+        if let Some(terms) = response.quoted_terms() {
+            tracing::info!(
+                peer_id,
+                price = terms.price().unwrap_or_default(),
+                resource = %terms.resource.url,
+                required_transport = terms.required_transport().unwrap_or_default(),
+                "peer answered a forwarded PREPARE with a 402 and x402 terms"
+            );
+            let reject = Reject {
+                code: RejectCode::f06_unexpected_payment(),
+                triggered_by: String::new(),
+                message: "No payment channel claim attached".to_string(),
+                data: Vec::new(),
+                accumulated_cost: terms.price().unwrap_or_default(),
+            };
+            return PeerForward::quoted(
+                PacketResponse::Reject(reject),
+                ClaimAckOutcome::NotSent,
+                terms,
+            );
+        }
+
         match decode_answer(&response) {
-            // No terms are ever reported on this carriage: reading the HTTP
-            // 402's own `payment-required` body is issue #874's BTP-side
-            // change and has no twin here yet, so a peer that greets this
-            // connector over HTTP is reported as an ordinary refusal --
-            // absence of terms, never an unreadable greeting silently
-            // downgraded (see `PeerForward::payment_required`).
+            // An ordinary answer quotes no terms on this carriage: the peer
+            // price gate's `200` is not read for a `Payment-Required` header
+            // (it would turn greeted retries on for bound peers). Absence of
+            // terms, never an unreadable greeting silently downgraded (see
+            // `PeerForward::payment_required`).
             Some(answer) => PeerForward::answered(answer, ack),
             None => {
                 tracing::warn!(peer_id, "peer answer carried no decodable ILP packet");

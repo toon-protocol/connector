@@ -2996,6 +2996,14 @@ impl Connector {
                     "peer quoted a price this packet's amount cannot cover -- not retrying"
                 );
                 if let PacketResponse::Reject(reject) = &mut answer.response {
+                    // A far node that greets with a cost of 0 (one deployed
+                    // before the greeting stated its charge) still quoted a
+                    // price: state it, before the handling below adds this
+                    // hop's fee or converts across a boundary. A cost the
+                    // peer did state is left alone, so nothing counts twice.
+                    if reject.accumulated_cost == 0 {
+                        reject.accumulated_cost = price;
+                    }
                     reject.message = format!(
                         "{} (peer '{peer_id}' quotes {price} for this packet, which carried only \
                          {forwarded_amount}: raise the amount to at least {price})",
@@ -10162,6 +10170,9 @@ mod tests {
             clock: Arc<TestClock>,
             by: Duration,
             sent: AtomicUsize,
+            /// The cost the greeting's reject states: 0 from a node deployed
+            /// before the greeting stated its charge.
+            states: u64,
         }
 
         #[async_trait]
@@ -10180,7 +10191,7 @@ mod tests {
                             triggered_by: String::new(),
                             message: "pay".to_string(),
                             data: Vec::new(),
-                            accumulated_cost: 0,
+                            accumulated_cost: self.states,
                         }),
                         ClaimAckOutcome::NotSent,
                         // What the forwarded packet itself carries: a retry
@@ -10484,6 +10495,7 @@ mod tests {
                 clock: Arc::clone(&clock),
                 by: Duration::seconds(60),
                 sent: AtomicUsize::new(0),
+                states: 0,
             });
             let (connector, outbound, channel) = peered_with(
                 &clock,
@@ -10515,6 +10527,7 @@ mod tests {
                 clock: Arc::clone(&clock),
                 by: Duration::seconds(1),
                 sent: AtomicUsize::new(0),
+                states: 0,
             });
             let (connector, outbound, channel) = peered_with(
                 &clock,
@@ -10546,6 +10559,7 @@ mod tests {
                 clock: Arc::clone(&clock),
                 by: Duration::seconds(1),
                 sent: AtomicUsize::new(0),
+                states: 0,
             });
             let (connector, outbound, channel) = peered_with(
                 &clock,
@@ -10572,6 +10586,37 @@ mod tests {
                 "{}",
                 reject.message
             );
+            // The peer stated no cost, so the quoted price stands in for it
+            // and this hop's fee of 10 is added on top.
+            assert_eq!(reject.accumulated_cost, 110);
+        }
+
+        /// #1481: a far side that already states its charge is not counted
+        /// twice by the decline.
+        #[tokio::test]
+        async fn a_declined_greeting_that_states_its_charge_is_not_counted_twice() {
+            let clock = test_clock();
+            let transport = Arc::new(GreetsThenFulfils {
+                clock: Arc::clone(&clock),
+                by: Duration::seconds(1),
+                sent: AtomicUsize::new(0),
+                states: 100,
+            });
+            let (connector, _outbound, _channel) = peered_with(
+                &clock,
+                Arc::clone(&transport) as Arc<dyn PeerTransport>,
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(105, 30)).await);
+
+            assert_eq!(transport.sent.load(Ordering::SeqCst), 1, "no retry sent");
+            assert_eq!(reject.accumulated_cost, 110);
         }
 
         /// PF-26: a forward that moves no value signs and sends no challenge

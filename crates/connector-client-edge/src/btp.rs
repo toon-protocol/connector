@@ -810,7 +810,9 @@ async fn handle_frame(
             triggered_by: String::new(),
             message: "No payment channel claim attached".to_string(),
             data: Vec::new(),
-            accumulated_cost: 0,
+            // The charge the terms above quote for this packet (0 for a
+            // `greeting` declared on an unpriced destination).
+            accumulated_cost: charge,
         };
         return reply(
             replies,
