@@ -1,6 +1,6 @@
 # A route declares its request shape, and the connector never reads it
 
-**Status:** Accepted — **built** (#1210). Extends [0050](0050-a-connectors-url-resolves-to-its-self-description.md) and [0046](0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md): the self-description and the greeting stay the client's only surface, and this record adds one more fact to what they publish. Does not build [0044](0044-a-probe-answers-what-a-route-costs-and-what-it-does.md), which remains **not yet built** — see "Not the same as a description" below.
+**Status:** Accepted — **built** (#1210); amended by #1479 (the runtime write carries `request` too — see the Amendment below). Extends [0050](0050-a-connectors-url-resolves-to-its-self-description.md) and [0046](0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md): the self-description and the greeting stay the client's only surface, and this record adds one more fact to what they publish. Does not build [0044](0044-a-probe-answers-what-a-route-costs-and-what-it-does.md), which remains **not yet built** — see "Not the same as a description" below.
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 
@@ -116,3 +116,13 @@ own rule.** Adding a recognized key to a `deny_unknown_fields` schema needs the 
 the binary that requires it moves past a node's pin — the usual rule for any new key, and `request`
 is not an exception to it. No fleet node's config is changed by this record; that is deliberately out
 of scope (issue #1210's own scope note) and happens per node when its repository bumps its pin.
+
+## Amendment (issue #1479, 2026-10-07): the runtime write carries `request` too
+
+`POST /routes/peers` accepts an optional `request`, with the meaning and opacity above: the connector
+checks only that it is a JSON object (anything else is a `400`) and never reads inside it. It is
+stored on the durable runtime peer/route row (omitted when absent, so a route without one is
+persisted and published as before), replaced whole by the next write to the prefix, and published by
+`GET /ilp` and the x402 greeting through `Connector::client_route`. `GET /routes/peers` reports it
+on config and runtime rows alike. This makes "a forwarded route can carry one too" true of a route
+through a peering made with `POST /peers`, which a config `[[routes]]` row cannot name.

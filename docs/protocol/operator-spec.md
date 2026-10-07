@@ -215,7 +215,10 @@ Raising it is an operator decision, or a controller's: post the same `id` again 
 removes one.
 
 **A route through the peering is a second, separate write** — `POST /routes/peers { prefix, peer_id,
-price }` — because a peering and a route are different decisions and one may exist without the other.
+price, request? }` — because a peering and a route are different decisions and one may exist without
+the other. The optional `request` is a JSON object, opaque to the node
+([ADR 0067](../adr/0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md)): any
+other JSON type is a `400`, and a re-post without it clears it.
 Onboarding is those two calls, with `POST /channels` still available for an operator who wants to open
 a channel on their own terms first; this write then _finds_ it.
 

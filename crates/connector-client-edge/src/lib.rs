@@ -3549,7 +3549,7 @@ mod tests {
             )
             .expect("add a runtime peer");
         connector
-            .upsert_runtime_peer_route("g.later", "later", Price::flat(42))
+            .upsert_runtime_peer_route("g.later", "later", Price::flat(42), None)
             .expect("add a runtime route");
 
         let second = self_description_of(router_with_node_facts(
@@ -3572,6 +3572,77 @@ mod tests {
             ]),
             "a route written after boot is in the next answer: nothing here is snapshotted"
         );
+    }
+
+    /// Issue #1479: a runtime peer route's `request` is published on its
+    /// `GET /ilp` entry and on the greeting for a destination under its
+    /// prefix -- both read through `Connector::client_route` -- and a
+    /// re-post of the prefix without one takes it off both.
+    #[tokio::test]
+    async fn a_runtime_peer_routes_request_is_on_the_self_description_and_the_greeting() {
+        let connector = Arc::new(covering(
+            Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                test_clock(),
+            ),
+            "later",
+        ));
+        connector
+            .upsert_runtime_peer(
+                "later",
+                RuntimePeering {
+                    endpoint: Some("https://later.example/ilp".to_string()),
+                    channels: vec![RuntimePeerChannel::Evm {
+                        channel_id: format!("0x{}", "ab".repeat(32)),
+                        counterparty_key: "0x00000000000000000000000000000000000000aa".to_string(),
+                        chain_id: 31337,
+                        token_network: "0x00000000000000000000000000000000000000bb".to_string(),
+                    }],
+                    ..RuntimePeering::default()
+                },
+            )
+            .expect("add a runtime peer");
+        let declared = serde_json::json!({"protocol": "nip90", "kinds": [5096]});
+        let published = |connector: Arc<Connector>| async move {
+            let document = self_description_of(router(connector.clone(), test_signer())).await;
+            let request = Request::builder()
+                .method("POST")
+                .uri("/ilp")
+                .body(Body::from(sample_prepare("g.later.app").encode()))
+                .unwrap();
+            let response = router(connector, test_signer())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            let greeting: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            (document["routes"].clone(), greeting)
+        };
+
+        connector
+            .upsert_runtime_peer_route("g.later", "later", Price::flat(42), Some(declared.clone()))
+            .expect("add a runtime route with a request");
+        let (routes, greeting) = published(connector.clone()).await;
+        assert_eq!(
+            routes,
+            serde_json::json!([{ "prefix": "g.later", "price": "42", "request": declared }])
+        );
+        assert_eq!(greeting["request"], declared);
+
+        connector
+            .upsert_runtime_peer_route("g.later", "later", Price::flat(42), None)
+            .expect("re-post the route without a request");
+        let (routes, greeting) = published(connector).await;
+        assert_eq!(
+            routes,
+            serde_json::json!([{ "prefix": "g.later", "price": "42" }]),
+            "a re-post without `request` publishes the route exactly as before"
+        );
+        assert!(greeting.get("request").is_none(), "{greeting}");
     }
 
     /// ND-11: the greeting is a PROJECTION of the same source, so the two

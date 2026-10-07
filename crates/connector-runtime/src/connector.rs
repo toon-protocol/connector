@@ -87,6 +87,10 @@ pub enum PeerRouteTableError {
     InvalidPrefix(String),
     #[error("peer id must not be empty")]
     InvalidPeerId,
+    /// A route's `request` (ADR 0067) must be a JSON object; the connector
+    /// checks that and never reads inside it.
+    #[error("route '{0}': `request` must be a JSON object")]
+    InvalidRequest(String),
     /// The config file already names this peer id or route prefix
     /// (`[[peers]]` / `[[routes]]`). A runtime write can never add,
     /// change or remove a config-file row -- config always wins, and it
@@ -1860,6 +1864,7 @@ impl Connector {
         prefix: impl Into<String>,
         peer_id: impl Into<String>,
         price: Price,
+        request: Option<serde_json::Value>,
     ) -> Result<PeerRouteView, PeerRouteTableError> {
         let prefix = prefix.into();
         let peer_id = peer_id.into();
@@ -1882,7 +1887,11 @@ impl Connector {
                 Some(_) => {}
             }
         }
-        let route = PeerRoute::new_scheduled(prefix.clone(), peer_id.clone(), price);
+        if request.as_ref().is_some_and(|value| !value.is_object()) {
+            return Err(PeerRouteTableError::InvalidRequest(prefix));
+        }
+        let route = PeerRoute::new_scheduled(prefix.clone(), peer_id.clone(), price)
+            .with_request(request.clone());
         let mut routes = (*self.runtime_peer_routes_snapshot()).clone();
         routes.insert(prefix.clone(), route);
         self.persist_runtime_table(&self.runtime_peers_snapshot(), &routes)?;
@@ -1892,6 +1901,7 @@ impl Connector {
             peer_id,
             price,
             source: RouteSource::Runtime,
+            request,
         })
     }
 
@@ -1929,6 +1939,7 @@ impl Connector {
                 peer_id: route.peer_id().to_string(),
                 price: route.price(),
                 source: RouteSource::Config,
+                request: route.request().cloned(),
             })
             .collect();
         views.extend(
@@ -1939,6 +1950,7 @@ impl Connector {
                     peer_id: route.peer_id().to_string(),
                     price: route.price(),
                     source: RouteSource::Runtime,
+                    request: route.request().cloned(),
                 }),
         );
         views
@@ -3857,15 +3869,11 @@ impl Connector {
                     kind: ClientRouteKind::Forwarded,
                     request: self.peer_routes[index].request().cloned(),
                 },
-                // A runtime-pushed peer route (issue #884) carries no
-                // `request` table: it is written through the operator
-                // surface, not `[[routes]]`, so there is no config-file row
-                // for one to live on.
                 ConfiguredTarget::RuntimePeer(route) => ClientRouteFacts {
                     price: route.price(),
                     transport_policy: TransportPolicy::Both,
                     kind: ClientRouteKind::Forwarded,
-                    request: None,
+                    request: route.request().cloned(),
                 },
             })
     }
@@ -8680,7 +8688,7 @@ mod tests {
                 .upsert_runtime_peer("runtime-hop", peering(0))
                 .unwrap();
             first_hop
-                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::FREE)
+                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::FREE, None)
                 .unwrap();
             let (sealed, shared_secret) = sealed_prepare(b"hello");
 
@@ -8718,12 +8726,85 @@ mod tests {
                 .upsert_runtime_peer("runtime-hop", peering(0))
                 .unwrap();
             connector
-                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::flat(25))
+                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::flat(25), None)
                 .unwrap();
 
             let facts = connector.client_route("g.example.app").unwrap();
             assert_eq!(facts.price, Price::flat(25));
             assert_eq!(facts.kind, ClientRouteKind::Forwarded);
+        }
+
+        /// ADR 0067: a runtime peer route's `request` is published through
+        /// `client_route` and `peer_routes_view` verbatim, a re-post
+        /// without one clears it, and a non-object is refused with the
+        /// table untouched.
+        #[test]
+        fn a_runtime_peer_routes_request_is_published_replaced_and_validated() {
+            let connector = covering(
+                Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    test_clock(),
+                ),
+                "runtime-hop",
+            );
+            connector
+                .upsert_runtime_peer("runtime-hop", peering(0))
+                .unwrap();
+            let request = serde_json::json!({ "any": { "keys": true } });
+            let view = connector
+                .upsert_runtime_peer_route(
+                    "g.example.app",
+                    "runtime-hop",
+                    Price::flat(25),
+                    Some(request.clone()),
+                )
+                .unwrap();
+            assert_eq!(view.request.as_ref(), Some(&request));
+            assert_eq!(
+                connector.client_route("g.example.app").unwrap().request,
+                Some(request.clone())
+            );
+            assert_eq!(
+                connector.peer_routes_view()[0].request.as_ref(),
+                Some(&request)
+            );
+
+            for bad in [
+                serde_json::json!("s"),
+                serde_json::json!(1),
+                serde_json::json!([]),
+                serde_json::json!(null),
+                serde_json::json!(true),
+            ] {
+                let error = connector
+                    .upsert_runtime_peer_route(
+                        "g.example.app",
+                        "runtime-hop",
+                        Price::FREE,
+                        Some(bad),
+                    )
+                    .unwrap_err();
+                assert!(matches!(error, PeerRouteTableError::InvalidRequest(_)));
+                assert!(error.to_string().contains("request"));
+            }
+            assert_eq!(
+                connector.client_route("g.example.app").unwrap().request,
+                Some(request)
+            );
+
+            connector
+                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::flat(25), None)
+                .unwrap();
+            assert_eq!(
+                connector.client_route("g.example.app").unwrap().request,
+                None
+            );
+            assert_eq!(connector.peer_routes_view()[0].request, None);
+            let json = serde_json::to_string(&connector.peer_routes_view()[0]).unwrap();
+            assert!(!json.contains("request"), "{json}");
         }
 
         /// The precedence rule (issue #884): a runtime write can never add,
@@ -8771,14 +8852,14 @@ mod tests {
             .with_config_peer_ids(["configured-peer".to_string()]);
 
             let error = connector
-                .upsert_runtime_peer_route("g.example.app", "configured-peer", Price::FREE)
+                .upsert_runtime_peer_route("g.example.app", "configured-peer", Price::FREE, None)
                 .unwrap_err();
             assert!(
                 matches!(error, PeerRouteTableError::OwnedByConfig(prefix) if prefix == "g.example.app")
             );
 
             let error = connector
-                .upsert_runtime_peer_route("g.example.peer", "configured-peer", Price::FREE)
+                .upsert_runtime_peer_route("g.example.peer", "configured-peer", Price::FREE, None)
                 .unwrap_err();
             assert!(
                 matches!(error, PeerRouteTableError::OwnedByConfig(prefix) if prefix == "g.example.peer")
@@ -8801,7 +8882,7 @@ mod tests {
             );
 
             let error = connector
-                .upsert_runtime_peer_route("g.example.app", "nobody", Price::FREE)
+                .upsert_runtime_peer_route("g.example.app", "nobody", Price::FREE, None)
                 .unwrap_err();
             assert!(matches!(
                 error,
@@ -8827,7 +8908,12 @@ mod tests {
             .with_config_peer_ids(["configured-peer".to_string()]);
 
             let view = connector
-                .upsert_runtime_peer_route("g.example.new", "configured-peer", Price::flat(10))
+                .upsert_runtime_peer_route(
+                    "g.example.new",
+                    "configured-peer",
+                    Price::flat(10),
+                    None,
+                )
                 .unwrap();
             assert_eq!(view.peer_id, "configured-peer");
             assert_eq!(view.source, RouteSource::Runtime);
@@ -8853,7 +8939,7 @@ mod tests {
                 .upsert_runtime_peer("runtime-hop", peering(0))
                 .unwrap();
             connector
-                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::FREE)
+                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::FREE, None)
                 .unwrap();
 
             let error = connector.remove_runtime_peer("runtime-hop").unwrap_err();
@@ -8965,7 +9051,7 @@ mod tests {
                 .upsert_runtime_peer("runtime-hop", peering(0))
                 .unwrap();
             connector
-                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::FREE)
+                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::FREE, None)
                 .unwrap();
             let (sealed, shared_secret) = sealed_prepare(b"hello");
 
@@ -9006,7 +9092,12 @@ mod tests {
                 .upsert_runtime_peer("apex-relay-2", peering(3))
                 .unwrap();
             before_restart
-                .upsert_runtime_peer_route("g.example.relay2", "apex-relay-2", Price::flat(25))
+                .upsert_runtime_peer_route(
+                    "g.example.relay2",
+                    "apex-relay-2",
+                    Price::flat(25),
+                    None,
+                )
                 .unwrap();
             assert_eq!(before_restart.peers().len(), 1);
 
@@ -9063,7 +9154,8 @@ mod tests {
             let connector = covering(
                 Connector::new(
                     vec![],
-                    vec![PeerRoute::new("g.example.configured", "configured-peer")],
+                    vec![PeerRoute::new("g.example.configured", "configured-peer")
+                        .with_request(Some(serde_json::json!({ "protocol": "nip90" })))],
                     Arc::new(FakeAppClient::new()),
                     Arc::new(InProcessPeerTransport::new()),
                     test_clock(),
@@ -9076,7 +9168,12 @@ mod tests {
                 .upsert_runtime_peer("runtime-peer", peering(2))
                 .unwrap();
             connector
-                .upsert_runtime_peer_route("g.example.runtime", "runtime-peer", Price::flat(5))
+                .upsert_runtime_peer_route(
+                    "g.example.runtime",
+                    "runtime-peer",
+                    Price::flat(5),
+                    None,
+                )
                 .unwrap();
 
             let mut peers = connector.peers();
@@ -9113,12 +9210,14 @@ mod tests {
                         peer_id: "configured-peer".to_string(),
                         price: Price::FREE,
                         source: RouteSource::Config,
+                        request: Some(serde_json::json!({ "protocol": "nip90" })),
                     },
                     PeerRouteView {
                         prefix: "g.example.runtime".to_string(),
                         peer_id: "runtime-peer".to_string(),
                         price: Price::flat(5),
                         source: RouteSource::Runtime,
+                        request: None,
                     },
                 ]
             );
@@ -9138,7 +9237,7 @@ mod tests {
                 .unwrap();
 
             let error = connector
-                .upsert_runtime_peer_route("not an ilp address", "runtime-hop", Price::FREE)
+                .upsert_runtime_peer_route("not an ilp address", "runtime-hop", Price::FREE, None)
                 .unwrap_err();
             assert!(matches!(error, PeerRouteTableError::InvalidPrefix(_)));
         }
@@ -9214,7 +9313,7 @@ mod tests {
             .with_runtime_peer_route_store(store, peers, routes);
 
             let error = connector
-                .upsert_runtime_peer_route("g.example.runtime", "legacy-hop", Price::flat(25))
+                .upsert_runtime_peer_route("g.example.runtime", "legacy-hop", Price::flat(25), None)
                 .unwrap_err();
 
             assert!(
