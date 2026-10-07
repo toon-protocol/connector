@@ -1246,6 +1246,104 @@ async fn a_non_200_answer_is_no_ilp_answer_at_all() {
     );
 }
 
+/// A client that answers a `402` carrying `header` as `Payment-Required`.
+struct Greets(Option<String>);
+
+#[async_trait]
+impl PeerHttpClient for Greets {
+    async fn post(
+        &self,
+        _endpoint: &Url,
+        _request: PeerRequest,
+    ) -> Result<PeerResponse, HttpDialError> {
+        let mut response = PeerResponse::refused(402);
+        if let Some(value) = &self.0 {
+            response
+                .headers
+                .push(connector_btp::PAYMENT_REQUIRED_HEADER, value.clone());
+        }
+        Ok(response)
+    }
+}
+
+const GREETING_TERMS: &[u8] = br#"{"x402Version":2,"resource":{"url":"g.nowhere"},
+    "extensions":{"toon":{"info":{"amount":"700","ilpAddress":"g.nowhere"}}}}"#;
+
+/// #1481: a `402` carrying readable terms is the far node's client edge
+/// greeting a claimless packet. It is an answer: an `F06` stating the quoted
+/// charge, the terms reported beside it, the peer counted as reached, and no
+/// voucher acknowledged.
+#[tokio::test]
+async fn a_402_with_terms_is_an_answer_quoting_the_charge() {
+    let header = connector_peer_http::headers::payment_required_header_value(GREETING_TERMS);
+    let transport = transport(Arc::new(Greets(Some(header))));
+
+    let forward = transport.forward(PEER_ID, prepare("g.nowhere"), None).await;
+
+    assert!(forward.reached_peer);
+    assert_eq!(forward.ack, ClaimAckOutcome::NotSent);
+    assert_eq!(forward.payment_required.expect("terms").price(), Some(700));
+    match forward.response {
+        PacketResponse::Reject(reject) => {
+            assert_eq!(reject.code.as_str(), "F06");
+            assert_eq!(reject.accumulated_cost, 700);
+            assert!(
+                !reject.message.contains("unreachable"),
+                "{}",
+                reject.message
+            );
+        }
+        other => panic!("expected F06, got {other:?}"),
+    }
+}
+
+/// #1481: a `402` whose terms are missing or unreadable is still no answer.
+#[tokio::test]
+async fn a_402_without_readable_terms_is_still_a_failed_dial() {
+    for header in [
+        None,
+        Some("not base64 !!".to_string()),
+        Some(connector_peer_http::headers::payment_required_header_value(
+            b"{ truncated",
+        )),
+    ] {
+        let transport = transport(Arc::new(Greets(header)));
+        let forward = transport.forward(PEER_ID, prepare("g.nowhere"), None).await;
+        assert!(!forward.reached_peer);
+        assert!(forward.payment_required.is_none());
+        match forward.response {
+            PacketResponse::Reject(reject) => assert_eq!(reject.code.as_str(), "T01"),
+            other => panic!("expected T01, got {other:?}"),
+        }
+    }
+}
+
+/// #1481: terms riding any other non-`200` status are not read.
+#[tokio::test]
+async fn terms_on_a_5xx_are_not_read() {
+    let header = connector_peer_http::headers::payment_required_header_value(GREETING_TERMS);
+    struct Fault(String);
+    #[async_trait]
+    impl PeerHttpClient for Fault {
+        async fn post(
+            &self,
+            _endpoint: &Url,
+            _request: PeerRequest,
+        ) -> Result<PeerResponse, HttpDialError> {
+            let mut response = PeerResponse::refused(503);
+            response
+                .headers
+                .push(connector_btp::PAYMENT_REQUIRED_HEADER, self.0.clone());
+            Ok(response)
+        }
+    }
+    let forward = transport(Arc::new(Fault(header)))
+        .forward(PEER_ID, prepare("g.nowhere"), None)
+        .await;
+    assert!(!forward.reached_peer);
+    assert!(forward.payment_required.is_none());
+}
+
 // ─── §2.2, §2.4, §6.4(1): what cannot be reached, and why ───
 
 /// §2.2: whether the remote exposes what we dial is not locally detectable,

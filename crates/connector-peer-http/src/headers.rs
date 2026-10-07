@@ -179,6 +179,22 @@ impl PeerResponse {
     pub fn answers_the_packet(&self) -> bool {
         self.status == 200
     }
+
+    /// The x402 terms a `402` response quotes in `Payment-Required`, when it
+    /// is one and they read. A `402` is the client edge's greeting (a far
+    /// node that decided the client role for this sender): it has no ILP
+    /// body, but it *is* an answer -- the peer was reached and named its
+    /// price. `None` for any other status, a missing header, or terms that
+    /// do not parse; none of those is an answer, and none is read as one.
+    #[must_use]
+    pub fn quoted_terms(&self) -> Option<connector_domain::x402::X402PaymentRequired> {
+        if self.status != 402 {
+            return None;
+        }
+        let value = self.headers.get(connector_btp::PAYMENT_REQUIRED_HEADER)?;
+        let bytes = STANDARD.decode(value.trim()).ok()?;
+        connector_domain::x402::parse_greeting(&bytes).ok()
+    }
 }
 
 /// A claim header whose base64 layer would not decode.

@@ -1354,6 +1354,11 @@ Therefore, normatively:
   undecodable frames (`client-edge-spec.md` §1.9 step 6).
 - A rejected claim MUST NOT be expressed as a non-`200` HTTP status. `4xx`/`5xx` remain reserved
   for a malformed request or a connector fault, i.e. cases where there is no ILP answer at all.
+  One `4xx` is read as an answer when dialing: a `402` whose `Payment-Required` header carries
+  readable x402 terms is a far node's client edge greeting a claimless packet (issue #1481). The
+  dialer reports it as the BTP dialer reports a greeted `F06` — a reject `F06` whose accumulated
+  cost is the quoted charge, with the terms beside it — and reads no ack off it. A `402` with no
+  readable terms, and every other non-`200`, is a failed dial (`T01`).
 - A rejected claim MUST NOT change the packet's own outcome, its `accumulatedCost`, or its fee
   accounting.
 - The **consequence** is policy above the carriage: the payee's watermark did not advance, so it
