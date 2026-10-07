@@ -553,6 +553,7 @@ fn peer_route_table_error_response(error: PeerRouteTableError) -> Response {
         PeerRouteTableError::UnknownPeerId { .. }
         | PeerRouteTableError::InvalidPrefix(_)
         | PeerRouteTableError::InvalidPeerId
+        | PeerRouteTableError::InvalidRequest(_)
         | PeerRouteTableError::PeerChannelUnbound(_)
         | PeerRouteTableError::PeerHasNoPayChannel { .. } => {
             (StatusCode::BAD_REQUEST, error.to_string()).into_response()
@@ -781,6 +782,18 @@ struct UpsertPeerRouteRequest {
     prefix: String,
     peer_id: String,
     price: Price,
+    /// Opaque to the connector (ADR 0067); only checked to be an object.
+    /// Deserialized through `present` so an explicit `null` is kept and
+    /// refused rather than read as absent.
+    #[serde(default, deserialize_with = "present")]
+    request: Option<serde_json::Value>,
+}
+
+fn present<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
 /// `POST /routes/peers`: issue #884's runtime peer-route write.
@@ -801,10 +814,12 @@ async fn upsert_peer_route(
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
-    match state
-        .connector
-        .upsert_runtime_peer_route(request.prefix, request.peer_id, request.price)
-    {
+    match state.connector.upsert_runtime_peer_route(
+        request.prefix,
+        request.peer_id,
+        request.price,
+        request.request,
+    ) {
         Ok(view) => Json(view).into_response(),
         Err(error) => peer_route_table_error_response(error),
     }
@@ -2825,6 +2840,84 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        /// ADR 0067: `request` rides `POST /routes/peers`, comes back on
+        /// the write and on `GET /routes/peers`, a re-post without it
+        /// clears it, and a non-object is `400` with the table unchanged.
+        #[tokio::test]
+        async fn a_peer_routes_request_is_stored_cleared_and_validated() {
+            let keypair = keypair();
+            let app = router_with(vec![keypair.public.to_bytes()]).await;
+            let addr = serve_self_description(COUNTERPARTY_SETTLEMENT);
+            app.clone()
+                .oneshot(signed(
+                    &keypair,
+                    "POST",
+                    "/peers",
+                    peer_body("runtime-hop", addr, 3),
+                ))
+                .await
+                .unwrap();
+            let post = |body: serde_json::Value| {
+                signed(
+                    &keypair,
+                    "POST",
+                    "/routes/peers",
+                    serde_json::to_vec(&body).unwrap(),
+                )
+            };
+            let read = |app: axum::Router| async move {
+                let response = get(app, "/routes/peers", Some("correct-token")).await;
+                let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap()
+            };
+            let request = serde_json::json!({ "anything": ["goes"] });
+
+            let response = app
+                .clone()
+                .oneshot(post(serde_json::json!({
+                    "prefix": "g.example.runtime", "peer_id": "runtime-hop",
+                    "price": 25, "request": request,
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(created["request"], request);
+            assert_eq!(read(app.clone()).await[0]["request"], request);
+
+            for bad in [
+                serde_json::json!("s"),
+                serde_json::json!(1),
+                serde_json::json!([]),
+                serde_json::json!(null),
+                serde_json::json!(false),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(post(serde_json::json!({
+                        "prefix": "g.example.runtime", "peer_id": "runtime-hop",
+                        "price": 25, "request": bad,
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                assert!(String::from_utf8_lossy(&bytes).contains("request"));
+            }
+            assert_eq!(read(app.clone()).await[0]["request"], request);
+
+            let response = app
+                .clone()
+                .oneshot(post(serde_json::json!({
+                    "prefix": "g.example.runtime", "peer_id": "runtime-hop", "price": 25,
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(read(app).await[0].get("request").is_none());
         }
 
         /// A validly signed `DELETE /peers/:id` removes a runtime peer

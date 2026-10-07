@@ -1000,7 +1000,12 @@ mod tests {
             [RuntimePeerChannel::EvmVoucher { .. }]
         ));
         connector
-            .upsert_runtime_peer_route("g.example.peer", "node-b", connector_domain::Price::FREE)
+            .upsert_runtime_peer_route(
+                "g.example.peer",
+                "node-b",
+                connector_domain::Price::FREE,
+                None,
+            )
             .expect("a peering paid over its own outbound channel is routable");
 
         let repeated = connector
@@ -1202,7 +1207,12 @@ mod tests {
             }]
         );
         connector
-            .upsert_runtime_peer_route("g.example.peer", "node-b", connector_domain::Price::FREE)
+            .upsert_runtime_peer_route(
+                "g.example.peer",
+                "node-b",
+                connector_domain::Price::FREE,
+                None,
+            )
             .expect("a peering paid over its own outbound channel is routable");
 
         let repeated = connector

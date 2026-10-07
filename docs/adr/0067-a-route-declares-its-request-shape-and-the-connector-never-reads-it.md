@@ -116,3 +116,13 @@ own rule.** Adding a recognized key to a `deny_unknown_fields` schema needs the 
 the binary that requires it moves past a node's pin — the usual rule for any new key, and `request`
 is not an exception to it. No fleet node's config is changed by this record; that is deliberately out
 of scope (issue #1210's own scope note) and happens per node when its repository bumps its pin.
+
+## Amendment, 2026-10-07 — the runtime write carries `request` too
+
+`POST /routes/peers` accepts an optional `request`, with the meaning and opacity above: the connector
+checks only that it is a JSON object (anything else is a `400`) and never reads inside it. It is
+stored on the durable runtime peer/route row (omitted when absent, so a route without one is
+persisted and published as before), replaced whole by the next write to the prefix, and published by
+`GET /ilp` and the x402 greeting through `Connector::client_route`. `GET /routes/peers` reports it
+on config and runtime rows alike. This makes "a forwarded route can carry one too" true of a route
+through a peering made with `POST /peers`, which a config `[[routes]]` row cannot name.

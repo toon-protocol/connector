@@ -109,6 +109,10 @@ pub struct PeerRouteView {
     pub peer_id: String,
     pub price: Price,
     pub source: RouteSource,
+    /// What a client should send to use this route (ADR 0067), opaque to
+    /// the connector. Omitted, never `null`, when the route has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<serde_json::Value>,
 }
 
 /// A claim as seen by the operator surface (issue #423): one entry per

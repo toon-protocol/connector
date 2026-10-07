@@ -3549,7 +3549,7 @@ mod tests {
             )
             .expect("add a runtime peer");
         connector
-            .upsert_runtime_peer_route("g.later", "later", Price::flat(42))
+            .upsert_runtime_peer_route("g.later", "later", Price::flat(42), None)
             .expect("add a runtime route");
 
         let second = self_description_of(router_with_node_facts(
