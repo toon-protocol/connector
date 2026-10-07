@@ -471,7 +471,11 @@ async fn a_claimless_prepare_to_a_priced_route_is_refused_with_the_terms() {
     let reject = Reject::decode(&answer.ilp_packet).expect("an OER REJECT");
     assert_eq!(reject.code.as_str(), "F06");
     assert_eq!(reject.message, "No payment channel claim attached");
-    assert_eq!(pd(&answer, "toon-accumulated-cost"), Some(b"0".as_slice()));
+    // The greeting states the charge its terms quote (#1481).
+    assert_eq!(
+        pd(&answer, "toon-accumulated-cost"),
+        Some(PRICE.to_string().as_bytes())
+    );
     let terms: serde_json::Value =
         serde_json::from_slice(pd(&answer, "payment-required").expect("the terms ride along"))
             .expect("the terms are the §1.4 JSON");

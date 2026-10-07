@@ -1062,7 +1062,9 @@ silently dropped exactly as it was before TRANSFER existed.
    RESPONSE carrying an `F06` (Unexpected Payment) REJECT, message
    `No payment channel claim attached`, with the x402 v2 terms JSON — byte-identical to §1.4's
    body — as a protocolData entry named `payment-required` (again mirroring the HTTP header of
-   the same name). A claimless PREPARE to an unpriced route passes through unchanged, as on HTTP —
+   the same name). The REJECT's accumulated cost (`toon-accumulated-cost`) is the route's charge for
+   that packet — the price schedule at the packet's own payload length, the figure the terms quote
+   (issue #1481); a `greeting` on an unpriced destination states `0`. A claimless PREPARE to an unpriced route passes through unchanged, as on HTTP —
    unless, per §1.4's issue #807 update, the PREPARE itself declares `greeting`, in which case this
    same `F06` greeting fires regardless of destination or price.
 5. **Standalone claim**: a MESSAGE with an empty `ilpPacket` and a `payment-channel-claim` entry
