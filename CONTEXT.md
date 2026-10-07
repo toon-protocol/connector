@@ -46,7 +46,7 @@ reads one is reading text from a stranger. _(Decided and not yet built — ADR 0
 **Request**:
 The operator-declared table naming what a client must send to use a route — protocol, parameters,
 whatever the app behind it expects. Written as `[[routes]] request = { ... }`, converted to JSON at
-load and published verbatim on that route's self-description entry and on the greeting for that
+load — or, for a runtime peer route, as a JSON object on `POST /routes/peers` — and published verbatim on that route's self-description entry and on the greeting for that
 destination; the connector confirms only that it **is** a table and reads none of its keys. Sourced
 by the operator writing it down, never by asking the app — matching the declaration against what the
 app actually registered is the app's own repository's problem, not this one's (ADR 0067). Absent,

@@ -189,7 +189,7 @@ This is the group that spells out the nginx sentence at the top of this page.
 | [0022](0022-a-connector-answers-it-does-not-announce.md)                            | A connector answers when asked; it still never announces             | Accepted — one consequence lost to 0027                                                                 |
 | [0046](0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md)       | The kind:10032 announce is removed; a connector needs no relay       | Accepted — **built** (#1074); **retires 0030**; restores 0022, 0006; extended by 0067                   |
 | [0050](0050-a-connectors-url-resolves-to-its-self-description.md)                   | A connector's URL resolves to its self-description                   | Accepted — **built** (#1080); completes 0022; extended by 0067; amended by 0075 (`settlements` dropped) |
-| [0067](0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md) | A route declares its request shape, and the connector never reads it | Accepted — **built** (#1210); extends 0050, 0046                                                        |
+| [0067](0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md) | A route declares its request shape, and the connector never reads it | Accepted — **built** (#1210); extends 0050, 0046; amended by #1479 (runtime routes carry `request`)     |
 | [0072](0072-a-carriage-pin-is-published-on-the-route-that-enforces-it.md)           | A carriage pin is published on the route that enforces it            | Accepted — **built** (TOON_Network#111); extends 0050; completes the half of #701 that 0046 claimed     |
 
 ---

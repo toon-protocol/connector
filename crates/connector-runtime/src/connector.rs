@@ -1871,9 +1871,6 @@ impl Connector {
         if !is_valid_ilp_address(&prefix) {
             return Err(PeerRouteTableError::InvalidPrefix(prefix));
         }
-        if request.as_ref().is_some_and(|value| !value.is_object()) {
-            return Err(PeerRouteTableError::InvalidRequest(prefix));
-        }
         if self.config_owns_prefix(&prefix) {
             return Err(PeerRouteTableError::OwnedByConfig(prefix));
         }
@@ -1889,6 +1886,9 @@ impl Connector {
                 }
                 Some(_) => {}
             }
+        }
+        if request.as_ref().is_some_and(|value| !value.is_object()) {
+            return Err(PeerRouteTableError::InvalidRequest(prefix));
         }
         let route = PeerRoute::new_scheduled(prefix.clone(), peer_id.clone(), price)
             .with_request(request.clone());
@@ -9146,7 +9146,8 @@ mod tests {
             let connector = covering(
                 Connector::new(
                     vec![],
-                    vec![PeerRoute::new("g.example.configured", "configured-peer")],
+                    vec![PeerRoute::new("g.example.configured", "configured-peer")
+                        .with_request(Some(serde_json::json!({ "protocol": "nip90" })))],
                     Arc::new(FakeAppClient::new()),
                     Arc::new(InProcessPeerTransport::new()),
                     test_clock(),
@@ -9201,7 +9202,7 @@ mod tests {
                         peer_id: "configured-peer".to_string(),
                         price: Price::FREE,
                         source: RouteSource::Config,
-                        request: None,
+                        request: Some(serde_json::json!({ "protocol": "nip90" })),
                     },
                     PeerRouteView {
                         prefix: "g.example.runtime".to_string(),

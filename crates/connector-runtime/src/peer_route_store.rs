@@ -718,7 +718,8 @@ mod tests {
         assert_eq!(read_routes["g.example.without"].request(), None);
     }
 
-    /// A table written before routes carried a `request` still loads.
+    /// A table written before routes carried a `request` still loads, and
+    /// re-saving its route writes no `request` member.
     #[test]
     fn a_table_written_before_request_existed_still_loads() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -729,8 +730,12 @@ mod tests {
         )
         .expect("write");
 
-        let (_store, _, routes) = PeerRouteStore::open(&path).expect("open");
+        let (store, peers, routes) = PeerRouteStore::open(&path).expect("open");
         assert_eq!(routes["g.example.old"].request(), None);
+
+        store.persist(&peers, &routes).expect("re-save");
+        let text = fs::read_to_string(&path).expect("read table");
+        assert!(!text.contains("\"request\""), "{text}");
     }
 
     /// ADR 0058: the endpoint, the edge identity and the channel binding

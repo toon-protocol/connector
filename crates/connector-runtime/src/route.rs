@@ -67,9 +67,10 @@ impl PeerRoute {
     /// Attach what a client should send to use this route (issue #1210) --
     /// `connector-cli` calls this with the config-file row's own
     /// `connector_config::PeerRouteConfig::request` when it builds this
-    /// route from `[[routes]]`. A route built any other way -- a lease, or
-    /// a test that does not care -- keeps `None`, the value every
-    /// constructor above already gives it.
+    /// route from `[[routes]]`, and the runtime peer/route table with the
+    /// `request` a `POST /routes/peers` carried (issue #1479). A route built
+    /// any other way -- a lease, or a test that does not care -- keeps
+    /// `None`, the value every constructor above already gives it.
     pub fn with_request(mut self, request: Option<serde_json::Value>) -> PeerRoute {
         self.request = request;
         self
@@ -96,8 +97,8 @@ impl PeerRoute {
     }
 
     /// What a client should send to use this route (issue #1210). `None`
-    /// on a route built with no [`PeerRoute::with_request`] call -- every
-    /// route before this issue, and every leased route today.
+    /// on a route built with no [`PeerRoute::with_request`] call, or with
+    /// `None` -- every leased route, and any peer route declared without one.
     pub fn request(&self) -> Option<&serde_json::Value> {
         self.request.as_ref()
     }
