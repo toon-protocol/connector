@@ -560,7 +560,7 @@ If you discover a bug or systematic issue:
 - **What is where**: [docs/architecture/source-tree.md](docs/architecture/source-tree.md)
 - **Why it is that way**: [docs/adr/README.md](docs/adr/README.md)
 - **What a word means here**: [CONTEXT.md](CONTEXT.md)
-- **Running a node rather than changing one**: [README.md](README.md)
+- **Running a node rather than changing one**: [README.md](README.md) and [docs/guide/](docs/guide/run-a-node.md)
 - **GitHub Discussions**: [Discussions](https://github.com/toon-protocol/connector/discussions)
 
 ## Coding Standards
