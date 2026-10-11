@@ -471,7 +471,11 @@ async fn a_claimless_prepare_to_a_priced_route_is_refused_with_the_terms() {
     let reject = Reject::decode(&answer.ilp_packet).expect("an OER REJECT");
     assert_eq!(reject.code.as_str(), "F06");
     assert_eq!(reject.message, "No payment channel claim attached");
-    assert_eq!(pd(&answer, "toon-accumulated-cost"), Some(b"0".as_slice()));
+    // The greeting states the charge its terms quote (#1481).
+    assert_eq!(
+        pd(&answer, "toon-accumulated-cost"),
+        Some(PRICE.to_string().as_bytes())
+    );
     let terms: serde_json::Value =
         serde_json::from_slice(pd(&answer, "payment-required").expect("the terms ride along"))
             .expect("the terms are the §1.4 JSON");
@@ -735,6 +739,44 @@ async fn a_claim_covering_a_packet_refused_for_envelope_shape_is_never_spent_ove
     .await;
     let second = next_answer(&mut session).await;
     Fulfill::decode(&second.ilp_packet).expect("the unspent claim is still accepted");
+}
+
+/// Issue #1446, BTP-shaped: a voucher presented with a packet to a
+/// destination nothing will carry is rejected `F02` without being ingested,
+/// on this carriage exactly as on HTTP (§9's no-drift invariant). The
+/// identical voucher then pays for a packet to the served route, which it
+/// could not if the `F02` had advanced the watermark.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voucher_covering_a_packet_to_an_unrouted_destination_is_never_spent_over_btp() {
+    let (addr, signer) = serve_edge().await;
+    let mut session = connect(addr).await;
+    let receiver = signer.public_key().unwrap();
+    let claim = evm_claim_json(PRICE);
+
+    send(
+        &mut session,
+        btp_message(
+            1,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &sealed_prepare("g.nowhere.app", &receiver).encode(),
+        ),
+    )
+    .await;
+    let first = next_answer(&mut session).await;
+    let reject = Reject::decode(&first.ilp_packet).expect("an OER REJECT");
+    assert_eq!(reject.code.as_str(), "F02");
+
+    send(
+        &mut session,
+        btp_message(
+            2,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &sealed_prepare("g.test.app", &receiver).encode(),
+        ),
+    )
+    .await;
+    let second = next_answer(&mut session).await;
+    Fulfill::decode(&second.ilp_packet).expect("the unspent voucher still pays");
 }
 
 /// §1.9 step 4: a standalone claim is ingested fire-and-forget -- no

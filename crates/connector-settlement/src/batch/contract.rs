@@ -900,14 +900,23 @@ where
             .expect("restoring again")
             .signed,
         450,
-        "restoring a known channel raises its watermark and never lowers it"
+        "restoring a known channel raises its watermark"
+    );
+    assert_eq!(
+        node.restore_outbound(&record, 420)
+            .await
+            .expect("restoring again")
+            .signed,
+        420,
+        "and lowers it, when the caller stands by a lower figure (issue #1446)"
     );
     assert_eq!(
         node.restore_outbound(&record, 10)
             .await
             .expect("restoring again")
             .signed,
-        450
+        400,
+        "but never below what the chain shows landed"
     );
 
     // ...and winds down like any other.

@@ -75,9 +75,13 @@ const APP_PRICE: u64 = 1_000;
 /// 0061). Non-zero on purpose: it is what makes "advanced by exactly the
 /// forwarded amount" a measurement of the fee rather than of the request.
 const PEER_FEE: u64 = 50;
-/// What a packet originated at one node carries to leave `APP_PRICE` at the
-/// other after the peering fee (ADR 0010, ADR 0028).
-const AMOUNT: u64 = APP_PRICE + PEER_FEE;
+/// What a client of one node pays for a route to the other: the app's price
+/// plus the peering's fee (ADR 0010, ADR 0028).
+const ROUTE_PRICE: u64 = APP_PRICE + PEER_FEE;
+/// What a packet originated at one node carries. An operator's own packet
+/// pays its node no fee (ADR 0061, #1466), so all of it is forwarded and
+/// this is exactly what reaches the other node.
+const AMOUNT: u64 = APP_PRICE;
 /// The opening deposit each node puts behind its own outbound channel.
 const DEPOSIT: u64 = 10_000;
 /// Each node's settlement key's mock USDC, minted by the fixture.
@@ -465,7 +469,7 @@ key_file = "{settlement_key}"
             serde_json::json!({
                 "prefix": format!("g.example.{}", other.name),
                 "peer_id": other.name,
-                "price": AMOUNT,
+                "price": ROUTE_PRICE,
             }),
         )
         .await;
@@ -683,7 +687,7 @@ async fn two_nodes_peer_over_two_solana_channels(
             a.inbound_watermark(&b_to_a).await,
             crossing * APP_PRICE,
             "A's watermark on B's channel advanced by exactly what B forwarded: the packet \
-             carried {AMOUNT}, B kept its {PEER_FEE} fee (ADR 0061), and {APP_PRICE} reached A"
+             carried {AMOUNT}, B charged its own operator's packet no fee (ADR 0061, #1466), and {APP_PRICE} reached A"
         );
     }
     assert_eq!(a.journaled(&b_to_a), vec![APP_PRICE, 2 * APP_PRICE]);
@@ -696,9 +700,9 @@ async fn two_nodes_peer_over_two_solana_channels(
     assert_eq!(b.journaled(&a_to_b), vec![APP_PRICE]);
 
     // ── A zero-value packet carries the challenge, and no voucher ───────
-    // Only a peering with no fee can carry one (a fee leaves nothing to
-    // forward, R01), so B reprices its peering -- a repeat of the write,
-    // which finds its channel and opens nothing.
+    // B reprices its peering to no fee -- a repeat of the write, which finds
+    // its channel and opens nothing. (An originated packet pays no fee, so
+    // this no longer decides whether the packet is refused.)
     let repriced = b.peer_with(&a, 0).await;
     assert_eq!(repriced["channel"]["status"], "found");
     assert_eq!(repriced["channel"]["id"], b_to_a.as_str());

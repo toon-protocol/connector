@@ -832,7 +832,9 @@ impl BatchSettlementPayer for InMemoryBatchSettlement {
         let landed = stored.landed;
         let mut outbound = self.outbound();
         let watermark = outbound.entry(channel.clone()).or_insert(0);
-        *watermark = (*watermark).max(signed).max(landed);
+        // The caller's figure is the watermark, lower than the one held
+        // or higher; only the chain is a lower bound on it.
+        *watermark = signed.max(landed);
         let watermark = *watermark;
         drop(outbound);
         self.outbound_state_of(&ledger, &channel, watermark)

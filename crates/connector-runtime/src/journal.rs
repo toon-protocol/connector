@@ -164,6 +164,10 @@ fn encode_line(entry: &JournalEntry) -> String {
             channel_id,
             cumulative_amount,
         } => format!("outbound_voucher_signed\t{channel_id}\t{cumulative_amount}"),
+        JournalEntry::OutboundWatermarkSet {
+            channel_id,
+            cumulative_amount,
+        } => format!("outbound_watermark_set\t{channel_id}\t{cumulative_amount}"),
     }
 }
 
@@ -227,6 +231,12 @@ fn decode_line(line: &str) -> Result<JournalEntry, JournalError> {
         }),
         ["outbound_voucher_signed", channel_id, cumulative_amount] => {
             Ok(JournalEntry::OutboundVoucherSigned {
+                channel_id: channel_id.to_string(),
+                cumulative_amount: cumulative_amount.parse::<u128>().map_err(|_| corrupt())?,
+            })
+        }
+        ["outbound_watermark_set", channel_id, cumulative_amount] => {
+            Ok(JournalEntry::OutboundWatermarkSet {
                 channel_id: channel_id.to_string(),
                 cumulative_amount: cumulative_amount.parse::<u128>().map_err(|_| corrupt())?,
             })
@@ -353,6 +363,10 @@ mod tests {
             JournalEntry::OutboundVoucherSigned {
                 channel_id: "evm:0xef01".to_string(),
                 cumulative_amount: u128::MAX,
+            },
+            JournalEntry::OutboundWatermarkSet {
+                channel_id: "evm:0xef01".to_string(),
+                cumulative_amount: 7,
             },
         ]
     }

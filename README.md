@@ -18,7 +18,7 @@ file, sits in front of your app, and settles on EVM and Solana.
 [**Run a node**](docs/guide/run-a-node.md) · [**Put your app behind it**](docs/guide/put-your-app-behind-it.md) · [**Get paid**](docs/guide/get-paid.md) · [**Peer**](docs/guide/peering.md) · [**Operator surface**](docs/guide/operator-surface.md) · [**Guides**](#guides) · [**Contributing**](CONTRIBUTING.md)
 
 ```sh
-docker pull ghcr.io/toon-protocol/connector:rust-2026.08.28.1
+docker pull ghcr.io/toon-protocol/connector:rust-2026.09.29.1
 ```
 
 </div>
@@ -30,7 +30,7 @@ price, and it collects that price from whoever calls — in tokens, per request,
 without your app knowing payment exists.
 
 ```sh
-docker pull ghcr.io/toon-protocol/connector:rust-2026.08.28.1   # a release handle, never moved
+docker pull ghcr.io/toon-protocol/connector:rust-2026.09.29.1   # a release handle, never moved
 openssl rand -hex 32 > data/signer.key                          # the node's identity key
 docker compose up -d                                            # one binary, one config file
 curl http://localhost:3000/ilp                                  # ask the node what it is

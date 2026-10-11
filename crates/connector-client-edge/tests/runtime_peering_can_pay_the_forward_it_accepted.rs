@@ -354,7 +354,7 @@ async fn a_runtime_established_peering_can_pay_the_forward_it_accepted() {
     assert_eq!(established.channel.status, ChannelBranch::Created);
     let channel = established.channel.id.clone();
     payer
-        .upsert_runtime_peer_route(PREFIX, PEER_ID, Price::FREE)
+        .upsert_runtime_peer_route(PREFIX, PEER_ID, Price::FREE, None)
         .expect("a peering paid over its own outbound channel is routable");
 
     // ── Two crossings, each covered by a voucher ────────────────────────
@@ -423,7 +423,7 @@ async fn a_peering_with_a_binding_but_no_paying_hop_cannot_pay_a_route_to_it() {
         .expect("a peering with a binding is accepted at write time");
 
     let error = connector
-        .upsert_runtime_peer_route("g.example.half", "half-bound", Price::FREE)
+        .upsert_runtime_peer_route("g.example.half", "half-bound", Price::FREE, None)
         .expect_err("no paying hop was ever registered for this peering");
     assert!(
         matches!(error, PeerRouteTableError::PeerHasNoPayChannel { .. }),

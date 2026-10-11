@@ -87,7 +87,7 @@ use serde::{Deserialize, Serialize};
 
 use connector_client_edge::ClientClaimGate;
 use connector_domain::x402::X402BatchSettlementTerms;
-use connector_domain::{PacketResponse, Prepare, Price};
+use connector_domain::{Prepare, Price};
 use connector_runtime::{
     BatchChannelError, BatchChannelView, BatchChannels, ClaimBookKind, ClaimDirection, ClaimScheme,
     ClaimView, Connector, DeclaredRates, EstablishPeeringError, LeaseRouteError, LeasedRouteView,
@@ -98,8 +98,6 @@ use connector_settlement::batch::BatchSettlementError;
 use connector_signer::{derive_evm_address, to_hex, Signer, SignerError};
 use url::Url;
 use write_auth::{authenticate_write, AuditRecord, WriteAuth};
-
-const OCTET_STREAM: &str = "application/octet-stream";
 
 /// This node's own identity: the active signing key and the address
 /// derived from it (ADR 0012's signer, read rather than exercised).
@@ -212,6 +210,7 @@ pub fn router_with_batch_channels(
         .route("/identity", get(identity))
         .route("/audit-log", get(audit_log))
         .route("/metrics", get(metrics))
+        .route("/packets", get(packet_history))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token,
@@ -417,9 +416,25 @@ async fn metrics(State(state): State<OperatorState>) -> Response {
         .into_response()
 }
 
+/// What `GET /packets` accepts.
+#[derive(serde::Deserialize)]
+struct PacketHistoryQuery {
+    limit: Option<usize>,
+}
+
+/// `GET /packets`: the recent packets this node handled, newest first
+/// (ADR 0077). Always `200`, including when no history is kept. A read like
+/// any other: bearer token, nothing else.
+async fn packet_history(
+    State(state): State<OperatorState>,
+    axum::extract::Query(query): axum::extract::Query<PacketHistoryQuery>,
+) -> Json<connector_runtime::PacketHistoryView> {
+    Json(state.connector.packet_history(query.limit))
+}
+
 /// `POST /packets`: an operator originates a packet outward, exactly as
 /// the client edge does for an external caller -- decode a [`Prepare`],
-/// call [`Connector::handle_prepare`] once, encode the outcome. The one
+/// call [`Connector::originate_prepare`] once, encode the outcome. The one
 /// difference is what happens first: [`authenticate_write`] must accept
 /// the request's RFC 9421 signature before any of that runs.
 async fn originate_packet(
@@ -438,25 +453,19 @@ async fn originate_packet(
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
-    // An operator-originated packet is handed to the connector exactly as
-    // a client's is. It declares no floor of its own: the
-    // `minimum_delivery = prepare.amount` convention that used to live
-    // here was a third convention no record ever carried, and it made
+    // An operator-originated packet is handed to the connector as an
+    // origination, which pays this node no fee (ADR 0061, #1466). It
+    // declares no floor of its own: the `minimum_delivery = prepare.amount`
+    // convention that used to live here was a third convention no record
+    // ever carried, and it made
     // `amount - fee >= minimum_delivery` unsatisfiable for any non-zero
     // fee, so a fee-charging peering could never carry an operator's
     // packet at all (ADR 0057, issue #1143). What bounds erosion now is
     // the claim covering each crossing.
-    let encoded = match state.connector.handle_prepare(prepare).await {
-        PacketResponse::Fulfill(fulfill) => fulfill.encode(),
-        PacketResponse::Reject(reject) => reject.encode(),
-    };
-
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, OCTET_STREAM)],
-        encoded,
-    )
-        .into_response()
+    // The cost never rides the OER encoding of a REJECT (ADR 0011), so it
+    // goes beside it on every REJECT, zero included: "absent" never has to
+    // carry meaning. The client edge's own answer does exactly that.
+    connector_client_edge::packet_response(state.connector.originate_prepare(prepare).await)
 }
 
 /// A `POST /routes/leased` request body: create or renew a leased route
@@ -544,6 +553,7 @@ fn peer_route_table_error_response(error: PeerRouteTableError) -> Response {
         PeerRouteTableError::UnknownPeerId { .. }
         | PeerRouteTableError::InvalidPrefix(_)
         | PeerRouteTableError::InvalidPeerId
+        | PeerRouteTableError::InvalidRequest(_)
         | PeerRouteTableError::PeerChannelUnbound(_)
         | PeerRouteTableError::PeerHasNoPayChannel { .. } => {
             (StatusCode::BAD_REQUEST, error.to_string()).into_response()
@@ -772,6 +782,18 @@ struct UpsertPeerRouteRequest {
     prefix: String,
     peer_id: String,
     price: Price,
+    /// Opaque to the connector (ADR 0067); only checked to be an object.
+    /// Deserialized through `present` so an explicit `null` is kept and
+    /// refused rather than read as absent.
+    #[serde(default, deserialize_with = "present")]
+    request: Option<serde_json::Value>,
+}
+
+fn present<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
 /// `POST /routes/peers`: issue #884's runtime peer-route write.
@@ -792,10 +814,12 @@ async fn upsert_peer_route(
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
-    match state
-        .connector
-        .upsert_runtime_peer_route(request.prefix, request.peer_id, request.price)
-    {
+    match state.connector.upsert_runtime_peer_route(
+        request.prefix,
+        request.peer_id,
+        request.price,
+        request.request,
+    ) {
         Ok(view) => Json(view).into_response(),
         Err(error) => peer_route_table_error_response(error),
     }
@@ -1335,6 +1359,90 @@ mod tests {
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("toon_fees_earned_total"));
+    }
+
+    fn router_over(connector: Arc<Connector>) -> Router {
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
+        router(
+            connector,
+            empty_claim_gate(),
+            signer,
+            "correct-token".to_string(),
+            vec![],
+            None,
+        )
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn packets_answers_off_when_no_history_is_kept_and_requires_the_bearer_token() {
+        let app = test_router(vec![], "correct-token");
+
+        let unauthenticated = get(app.clone(), "/packets", None).await;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let response = get(app, "/packets", Some("correct-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({"enabled": false, "capacity": 0, "dropped": 0, "packets": []})
+        );
+    }
+
+    #[tokio::test]
+    async fn packets_lists_the_recent_packets_newest_first_and_honours_limit() {
+        let connector = Arc::new(
+            Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            )
+            .with_packet_history(5),
+        );
+        for destination in ["g.one", "g.two", "g.three"] {
+            connector
+                .handle_prepare(connector_domain::Prepare {
+                    amount: 9,
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    greeting: false,
+                    destination: destination.to_string(),
+                    data: Vec::new(),
+                })
+                .await;
+        }
+        for _ in 0..500 {
+            if connector.packet_history(None).packets.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let app = router_over(connector);
+
+        let all = body_json(get(app.clone(), "/packets", Some("correct-token")).await).await;
+        assert_eq!(all["enabled"], true);
+        assert_eq!(all["capacity"], 5);
+        assert_eq!(all["dropped"], 0);
+        let destinations: Vec<_> = all["packets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["destination"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(destinations, ["g.three", "g.two", "g.one"]);
+        assert_eq!(all["packets"][0]["outcome"], "rejected");
+        assert_eq!(all["packets"][0]["code"], "F02");
+        assert_eq!(all["packets"][0]["amount"], 9);
+        assert!(all["packets"][0].get("direction").is_none());
+
+        let newest = body_json(get(app, "/packets?limit=1", Some("correct-token")).await).await;
+        assert_eq!(newest["packets"].as_array().unwrap().len(), 1);
+        assert_eq!(newest["packets"][0]["destination"], "g.three");
     }
 
     #[tokio::test]
@@ -1909,6 +2017,169 @@ mod tests {
             assert_eq!(log[0]["path"], "/packets");
         }
 
+        /// Issue #1460: a REJECT answered by `POST /packets` carries its
+        /// accumulated cost in `TOON-Accumulated-Cost`, because the cost never
+        /// rides the OER bytes (ADR 0011). The operator's own node charges its
+        /// origination no fee (#1466), so the smallest path whose cost is not
+        /// zero is one hop further out: the peer it forwards to charges 7 and
+        /// relays a REJECT its own peer genuinely decided on.
+        #[tokio::test]
+        async fn a_reject_relayed_through_a_charging_peer_carries_that_peers_fee() {
+            use connector_runtime::PeerRoute;
+
+            let keypair = keypair();
+            let clock = Arc::new(TestClock::new(chrono::Utc::now()));
+            let third_hop = Arc::new(Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                clock.clone(),
+            ));
+            let mut second_hop_transport = InProcessPeerTransport::new();
+            second_hop_transport.add_peer("third-hop", third_hop);
+            let second_hop = Arc::new(covering(
+                Connector::new(
+                    vec![],
+                    vec![PeerRoute::new("g.example", "third-hop")],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(second_hop_transport),
+                    clock.clone(),
+                )
+                .with_peer_fees([("third-hop".to_string(), 7)]),
+                "third-hop",
+            ));
+            let mut peer_transport = InProcessPeerTransport::new();
+            peer_transport.add_peer("second-hop", second_hop);
+            let connector = Arc::new(covering(
+                Connector::new(
+                    vec![],
+                    vec![PeerRoute::new("g.example", "second-hop")],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(peer_transport),
+                    clock,
+                ),
+                "second-hop",
+            ));
+            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
+            let app = router(
+                connector,
+                empty_claim_gate(),
+                signer,
+                "correct-token".to_string(),
+                vec![keypair.public.to_bytes()],
+                None,
+            );
+
+            let mut prepare = sample_prepare();
+            prepare.destination = "g.example.remote".to_string();
+            prepare.amount = 100;
+            let body = prepare.encode();
+            let (sig_input, sig, digest) = sign(&keypair, &body, 9_999_999_999);
+
+            let response = app
+                .oneshot(packets_request(
+                    body,
+                    Some(&sig_input),
+                    Some(&sig),
+                    Some(&digest),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(connector_btp::ACCUMULATED_COST_HEADER)
+                    .map(|value| value.to_str().unwrap()),
+                Some("7")
+            );
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            let reject = connector_domain::Reject::decode(&bytes).expect("decode reject");
+            assert_eq!(reject.code, RejectCode::f02_unreachable());
+        }
+
+        /// A FULFILL has no cost to report, so it carries no such header.
+        #[tokio::test]
+        async fn a_fulfill_answered_by_packets_carries_no_cost_header() {
+            use connector_domain::{EnvelopeRequest, EnvelopeResponse};
+            use connector_runtime::AppOutcome;
+            use connector_signer::giftwrap::seal_request;
+
+            let keypair = keypair();
+            let route = connector_config::StaticRoute::new("g.example.app", "http://app.example/")
+                .expect("a valid route");
+            let app_client = Arc::new(FakeAppClient::new());
+            app_client.respond(
+                route.handler_url(),
+                AppOutcome::Answered {
+                    response: EnvelopeResponse {
+                        status: 200,
+                        headers: vec![],
+                        body: b"delivered".to_vec(),
+                    },
+                },
+            );
+            let identity = LocalSigner::generate("operator-test-identity");
+            let identity_public_key = identity.public_key().expect("a public key");
+            let connector = Arc::new(
+                Connector::new(
+                    vec![route],
+                    vec![],
+                    app_client,
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(TestClock::new(chrono::Utc::now())),
+                )
+                .with_identity_signer(Arc::new(identity)),
+            );
+            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
+            let app = router(
+                connector,
+                empty_claim_gate(),
+                signer,
+                "correct-token".to_string(),
+                vec![keypair.public.to_bytes()],
+                None,
+            );
+
+            let plaintext = EnvelopeRequest {
+                method: "POST".to_string(),
+                target: "/".to_string(),
+                headers: vec![],
+                body: b"hello".to_vec(),
+            }
+            .encode();
+            let (data, _shared_secret) =
+                seal_request(&plaintext, &identity_public_key).expect("seal");
+            let mut prepare = sample_prepare();
+            prepare.destination = "g.example.app".to_string();
+            prepare.data = data;
+            let body = prepare.encode();
+            let (sig_input, sig, digest) = sign(&keypair, &body, 9_999_999_999);
+
+            let response = app
+                .oneshot(packets_request(
+                    body,
+                    Some(&sig_input),
+                    Some(&sig),
+                    Some(&digest),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response
+                    .headers()
+                    .get(connector_btp::ACCUMULATED_COST_HEADER)
+                    .is_none(),
+                "a FULFILL carries no cost header"
+            );
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            connector_domain::Fulfill::decode(&bytes).expect("a FULFILL");
+        }
+
         #[tokio::test]
         async fn a_read_route_still_requires_the_bearer_token_and_not_a_write_signature() {
             let app = router_with_write_keys(vec![]);
@@ -1968,11 +2239,18 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            let cost_header = response
+                .headers()
+                .get(connector_btp::ACCUMULATED_COST_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned());
 
             let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
             let reject = connector_domain::Reject::decode(&bytes).expect("decode reject");
             assert_eq!(reject.code, RejectCode::t01_peer_unreachable());
             assert!(reject.message.contains("peer-1"), "{}", reject.message);
+            // Present on every REJECT, whatever its value; `decode` leaves
+            // the field zero because the cost never rides the OER bytes.
+            assert_eq!(cost_header.as_deref(), Some("0"));
         }
     }
 
@@ -2562,6 +2840,84 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        /// ADR 0067: `request` rides `POST /routes/peers`, comes back on
+        /// the write and on `GET /routes/peers`, a re-post without it
+        /// clears it, and a non-object is `400` with the table unchanged.
+        #[tokio::test]
+        async fn a_peer_routes_request_is_stored_cleared_and_validated() {
+            let keypair = keypair();
+            let app = router_with(vec![keypair.public.to_bytes()]).await;
+            let addr = serve_self_description(COUNTERPARTY_SETTLEMENT);
+            app.clone()
+                .oneshot(signed(
+                    &keypair,
+                    "POST",
+                    "/peers",
+                    peer_body("runtime-hop", addr, 3),
+                ))
+                .await
+                .unwrap();
+            let post = |body: serde_json::Value| {
+                signed(
+                    &keypair,
+                    "POST",
+                    "/routes/peers",
+                    serde_json::to_vec(&body).unwrap(),
+                )
+            };
+            let read = |app: axum::Router| async move {
+                let response = get(app, "/routes/peers", Some("correct-token")).await;
+                let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap()
+            };
+            let request = serde_json::json!({ "anything": ["goes"] });
+
+            let response = app
+                .clone()
+                .oneshot(post(serde_json::json!({
+                    "prefix": "g.example.runtime", "peer_id": "runtime-hop",
+                    "price": 25, "request": request,
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(created["request"], request);
+            assert_eq!(read(app.clone()).await[0]["request"], request);
+
+            for bad in [
+                serde_json::json!("s"),
+                serde_json::json!(1),
+                serde_json::json!([]),
+                serde_json::json!(null),
+                serde_json::json!(false),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(post(serde_json::json!({
+                        "prefix": "g.example.runtime", "peer_id": "runtime-hop",
+                        "price": 25, "request": bad,
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                assert!(String::from_utf8_lossy(&bytes).contains("request"));
+            }
+            assert_eq!(read(app.clone()).await[0]["request"], request);
+
+            let response = app
+                .clone()
+                .oneshot(post(serde_json::json!({
+                    "prefix": "g.example.runtime", "peer_id": "runtime-hop", "price": 25,
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(read(app).await[0].get("request").is_none());
         }
 
         /// A validly signed `DELETE /peers/:id` removes a runtime peer

@@ -84,6 +84,12 @@ pub struct PeerForward {
     /// and no terms rather than degrade an unreadable greeting into a free
     /// ride (see `connector_domain::x402::GreetingError`).
     pub payment_required: Option<Box<X402PaymentRequired>>,
+    /// The forward was given up because the packet's outgoing expiry came
+    /// first (`packet-flow-spec.md` PF-26), as opposed to the peering's
+    /// answer timeout. Only [`PeerTransport::forward_within`] ever sets it,
+    /// and when it is set `response` is a placeholder: the forwarding path
+    /// replaces it with its own `R00`, which names the wait that ran out.
+    pub ran_out_at_expiry: bool,
 }
 
 impl PeerForward {
@@ -94,6 +100,7 @@ impl PeerForward {
             ack,
             reached_peer: true,
             payment_required: None,
+            ran_out_at_expiry: false,
         }
     }
 
@@ -108,6 +115,7 @@ impl PeerForward {
             ack,
             reached_peer: true,
             payment_required: Some(Box::new(terms)),
+            ran_out_at_expiry: false,
         }
     }
 
@@ -119,6 +127,18 @@ impl PeerForward {
             ack: ClaimAckOutcome::NotSent,
             reached_peer: false,
             payment_required: None,
+            ran_out_at_expiry: false,
+        }
+    }
+
+    /// The packet's outgoing expiry ended the wait before the peer answered
+    /// and before the peering's answer timeout did (PF-26). Unreachable in
+    /// every other respect -- nothing acknowledged, no fee of the caller's --
+    /// except that the forwarding path answers `R00` rather than `T01`.
+    pub fn ran_out_at_expiry(peer_id: &str) -> PeerForward {
+        PeerForward {
+            ran_out_at_expiry: true,
+            ..PeerForward::unreachable(peer_id)
         }
     }
 
@@ -153,6 +173,60 @@ pub trait PeerTransport: Send + Sync {
         prepare: Prepare,
         covering: Option<Covering>,
     ) -> PeerForward;
+
+    /// [`PeerTransport::forward`], giving up after `budget` -- what is left
+    /// of the packet's outgoing expiry (`packet-flow-spec.md` PF-26,
+    /// [`connector_domain::forward_wait_budget`]). A wait ended by the
+    /// budget is [`PeerForward::ran_out_at_expiry`]; one ended by the
+    /// peering's own answer timeout, which an implementation that has one
+    /// applies on top of this, stays the `T01` it always was.
+    ///
+    /// The default bounds the whole call, which is right for any transport
+    /// whose only wait is the answer. A carriage with state to tidy when a
+    /// wait is abandoned overrides it, and takes its bound from
+    /// [`AnswerWait::new`] so that both carriages share one definition of
+    /// "the sooner of the two".
+    async fn forward_within(
+        &self,
+        peer_id: &str,
+        prepare: Prepare,
+        covering: Option<Covering>,
+        budget: std::time::Duration,
+    ) -> PeerForward {
+        match tokio::time::timeout(budget, self.forward(peer_id, prepare, covering)).await {
+            Ok(answer) => answer,
+            Err(_) => PeerForward::ran_out_at_expiry(peer_id),
+        }
+    }
+}
+
+/// How long one wait on a peer's answer may last, and what ends it: the
+/// peering's answer timeout, or -- when it is sooner -- the packet's outgoing
+/// expiry (PF-26). The one definition both carriages use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnswerWait {
+    /// The longest to wait.
+    pub span: std::time::Duration,
+    /// Whether `span` is the packet's expiry rather than the answer timeout.
+    pub ends_at_expiry: bool,
+}
+
+impl AnswerWait {
+    /// The sooner of `answer_timeout` and `budget`; a tie is the answer
+    /// timeout's, because a wait ended by it is `T01` as it has always been.
+    /// `budget` is `None` for a forward that carries no expiry bound.
+    pub fn new(answer_timeout: std::time::Duration, budget: Option<std::time::Duration>) -> Self {
+        match budget {
+            Some(budget) if budget < answer_timeout => AnswerWait {
+                span: budget,
+                ends_at_expiry: true,
+            },
+            _ => AnswerWait {
+                span: answer_timeout,
+                ends_at_expiry: false,
+            },
+        }
+    }
 }
 
 /// Adds and removes a **carriage** while the process serves (ADR 0058).
@@ -373,6 +447,30 @@ mod tests {
         Arc::new(TestClock::new(
             Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap(),
         ))
+    }
+
+    #[test]
+    fn an_answer_wait_ends_at_the_sooner_of_the_two_bounds() {
+        use std::time::Duration;
+        let timeout = Duration::from_secs(30);
+
+        assert_eq!(
+            AnswerWait::new(timeout, Some(Duration::from_secs(5))),
+            AnswerWait {
+                span: Duration::from_secs(5),
+                ends_at_expiry: true
+            }
+        );
+        assert_eq!(
+            AnswerWait::new(timeout, Some(Duration::from_secs(60))),
+            AnswerWait {
+                span: timeout,
+                ends_at_expiry: false
+            }
+        );
+        // A tie is the answer timeout's, so it stays the `T01` it was.
+        assert!(!AnswerWait::new(timeout, Some(timeout)).ends_at_expiry);
+        assert!(!AnswerWait::new(timeout, None).ends_at_expiry);
     }
 
     #[tokio::test]

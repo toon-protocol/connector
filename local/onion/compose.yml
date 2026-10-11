@@ -269,19 +269,15 @@ services:
       - |
         set -e
         . /app/rehearsal.sh
-        # Figures and arithmetic as `two-hop`'s, with a larger fee so the two
-        # topologies cannot mask each other's drift: A collects 1200, keeps
-        # its 200 (keys.sh's table), and forwards B's committed price of 1000.
-        AMOUNT=1200
+        # Figures as `two-hop`'s: the operator's own packet pays A no fee
+        # (ADR 0061, #1466), so A forwards all of the 1000 it is sent, which
+        # is B's committed price. The peering still carries a fee (keys.sh's
+        # table), so a node that charged it would forward less and be refused.
+        AMOUNT=1000
         PRICE=1000
-        FEE=200
         CROSSINGS=2
         DEPOSIT=100000000
         PROXY=socks5h://anon-a:9050
-        if [ "$$((AMOUNT - PRICE))" != "$$FEE" ]; then
-          echo "AMOUNT - PRICE is not FEE: this rehearsal's own figures disagree." >&2
-          exit 1
-        fi
         # B's self-description URL, as keys.sh read it out of anon-b's own
         # HiddenServiceDir/hostname -- never a committed value.
         if [ ! -s /app/b-onion-hostname ]; then

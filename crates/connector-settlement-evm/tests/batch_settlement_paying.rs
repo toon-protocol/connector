@@ -526,20 +526,19 @@ async fn an_opening_deposit_that_lands_behind_a_lost_confirmation_is_kept() {
     x402.mint(token, payer_own, FUNDED).await;
     let receiver = build_node(&anvil.rpc_url, COUNTERPARTY_PRIVATE_KEY, token).await;
 
-    let payer_address = format!("{payer_own:?}");
-    let lying = FakeRpc::spawn_in_front_of(&anvil.rpc_url, move |call| {
+    // The lie is told about the chain's own receipt, so not before the
+    // deposit is mined: a revert reported ahead of the block sends the
+    // payer to read a chain the deposit has not reached yet.
+    let lying = FakeRpc::spawn_in_front_of(&anvil.rpc_url, |call| {
         if call.method != "eth_getTransactionReceipt" {
             return RpcReply::Forward;
         }
-        RpcReply::Result(serde_json::json!({
-            "transactionHash": call.params[0],
-            "transactionIndex": "0x0",
-            "from": payer_address,
-            "cumulativeGasUsed": "0x0",
-            "logs": [],
-            "logsBloom": format!("0x{}", "00".repeat(256)),
-            "status": "0x0",
-        }))
+        RpcReply::ForwardRewritten(|mut answer| {
+            if answer["result"].is_object() {
+                answer["result"]["status"] = serde_json::json!("0x0");
+            }
+            answer
+        })
     })
     .await;
     let payer = EvmBatchSettlementBackend::connect(

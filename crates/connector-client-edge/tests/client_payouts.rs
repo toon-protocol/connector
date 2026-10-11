@@ -306,8 +306,12 @@ async fn serve(outbound: Arc<OutboundChannels>) -> SocketAddr {
         Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap(),
     ));
     let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("payout-edge"));
+    // The probe below needs somewhere to go: a voucher riding a packet to a
+    // destination nothing serves is never looked at (issue #1446).
     let connector = Arc::new(Connector::new(
-        vec![],
+        vec![
+            connector_config::StaticRoute::new("g.toon.nowhere", "http://localhost:4000").unwrap(),
+        ],
         vec![],
         Arc::new(FakeAppClient::new()),
         Arc::new(InProcessPeerTransport::new()),
@@ -437,7 +441,8 @@ async fn client_session(addr: SocketAddr, voucher: &str) -> Session {
     )
     .await;
     assert_eq!(next_frame(&mut session).await.frame_type, BTP_RESPONSE);
-    // The voucher rides a zero-value packet to nowhere, so its answer says
+    // The voucher rides a zero-value packet to a route that answers nothing
+    // useful, so its answer says
     // the voucher has been judged -- a standalone claim is answered with
     // nothing, and a buyer racing it could arrive before it is.
     let probe = Prepare {

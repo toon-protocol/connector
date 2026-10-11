@@ -292,8 +292,8 @@ earlier `POST /peers`), by channel id on EVM or channel account on Solana, which
 node's outbound-channel journal or the node refuses to start, since it holds no terms for a channel
 it did not open; and `client_edge_url`, that hop's own `POST /ilp` endpoint, where
 `POST /ilp/claim-state` (`scheme: "batch-settlement"`) answers where this node's vouchers on the
-channel stand. That ask restores the channel's watermark after a lost journal and only ever raises
-it (§1.11). The signing key is the chain's settlement key, `[settlement.evm]`'s or
+channel stand. That ask restores the channel's watermark after a lost journal, and after a forward that
+ended in a reject sets it to the receiver's figure, lower or higher (§1.11, ADR 0075 issue #1446). The signing key is the chain's settlement key, `[settlement.evm]`'s or
 `[settlement.solana]`'s, and no second key exists (ADR 0030). The row requires the chain's
 `[settlement.<chain>]` table (`PayChannelWithoutX402`) and `state_dir`
 (`PayChannelsWithoutStateDir`). **The table is required of any peering a `[[routes]]` entry
@@ -790,8 +790,10 @@ fee)`, ADR 0042). The voucher is signed by the settlement key (`payerAuthorizer 
   decision 3).
 - **The receiver's `POST /ilp/claim-state` (`scheme: "batch-settlement"`) is the watermark authority
   on restore** (ADR 0075 decision 6). The payer asks it once per process for each hop, and again after
-  any voucher the receiver did not accept, and only ever raises its signed watermark to the answer; a
-  receiver that cannot be asked leaves the journaled watermark (never behind what was signed) standing,
+  any voucher the receiver did not accept and after any forward that rode a voucher and ended in a
+  REJECT, and sets its signed watermark to the answer — raising it, or lowering it when the packet
+  was never carried (ADR 0075, issue #1446), unless a later voucher has been signed since, and never
+  below what the chain shows claimed; a receiver that cannot be asked leaves the journaled watermark (never behind what was signed) standing,
   and is asked again on the next forward. The ask leaves on `socks_proxy` when the peer's client edge
   is an onion host, by the same host rule as the carriage; with no usable proxy it is refused by
   name and never dialed.
@@ -940,6 +942,14 @@ carries the same nonce, which is exactly the case §6.3 requires a payee to answ
 > cumulative, and the second was fulfilled. A claim covering a packet that was never written is not
 > banked at either end, so the payer retransmits it rather than advancing past it — which is §6.3's
 > byte-identical retransmission arriving by a different road.
+
+> **Recorded 2026-10-02 (issue #1454).** A frame written into a session that then closes is answered
+> `T01` **at the close**, not at the answer timeout, and is **not** resent. Before this, the dial side
+> stopped a closed session's writer but nothing answered the requests still waiting on it, so each
+> ran out `OUTBOUND_ANSWER_TIMEOUT` (or the peering's `peer_answer_timeout`) before being rejected.
+> A close does not prove the far side never acted on the frame, so the rule above stands: only a
+> frame that was never written is sent once more. The dead session is not handed out again; the next
+> packet dials a fresh one.
 
 ---
 
@@ -1344,6 +1354,11 @@ Therefore, normatively:
   undecodable frames (`client-edge-spec.md` §1.9 step 6).
 - A rejected claim MUST NOT be expressed as a non-`200` HTTP status. `4xx`/`5xx` remain reserved
   for a malformed request or a connector fault, i.e. cases where there is no ILP answer at all.
+  One `4xx` is read as an answer when dialing: a `402` whose `Payment-Required` header carries
+  readable x402 terms is a far node's client edge greeting a claimless packet (issue #1481). The
+  dialer reports it as the BTP dialer reports a greeted `F06` — a reject `F06` whose accumulated
+  cost is the quoted charge, with the terms beside it — and reads no ack off it. A `402` with no
+  readable terms, and every other non-`200`, is a failed dial (`T01`).
 - A rejected claim MUST NOT change the packet's own outcome, its `accumulatedCost`, or its fee
   accounting.
 - The **consequence** is policy above the carriage: the payee's watermark did not advance, so it
@@ -1385,11 +1400,11 @@ read as either verdict.
 hang forever. Both carriages now bound it structurally, because RFC-0023 requires a responder to
 answer every request and HTTP always answers. The deadline:
 
-| What was sent                              | Ack deadline                                                                                             |
-| ------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
-| a claim riding a PREPARE (either carriage) | the same deadline as the packet's own answer: the PREPARE's `expiresAt`, capped by `peerAnswerTimeoutMs` |
-| a FLUSH (BTP TRANSFER)                     | `claimAckTimeoutMs`                                                                                      |
-| a FLUSH (HTTP standalone claim POST)       | `claimAckTimeoutMs`, applied to the HTTP response                                                        |
+| What was sent                              | Ack deadline                                                                                                                                                                               |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| a claim riding a PREPARE (either carriage) | the same deadline as the packet's own answer: the sooner of the PREPARE's `expiresAt` and `peerAnswerTimeoutMs`. Ended by the expiry it is `R00`, by the timeout `T01` (packet-flow PF-26) |
+| a FLUSH (BTP TRANSFER)                     | `claimAckTimeoutMs`                                                                                                                                                                        |
+| a FLUSH (HTTP standalone claim POST)       | `claimAckTimeoutMs`, applied to the HTTP response                                                                                                                                          |
 
 `peerAnswerTimeoutMs` and `claimAckTimeoutMs` are per peering relation, both defaulting to
 **30 000 ms** — the value `connector-btp`'s existing `OUTBOUND_ANSWER_TIMEOUT` already uses, adopted

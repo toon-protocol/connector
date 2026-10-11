@@ -49,7 +49,7 @@ forwarding and prepayment cannot both be true."
 **That argument is correct, and this record overrides it deliberately.** ADR 0031 asserted the
 argument "remains sound and is not disturbed here" while doing precisely the thing it forbids; the
 inversion was real and went unstated. Stating it: under this record the condition stops being an
-economic guarantee and becomes a delivery proof. A hop can take a claim and refuse to carry.
+economic guarantee and becomes a delivery proof. A hop can take a claim and refuse to carry. (Between an honest pair that is not so: a packet never carried is not paid for, [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)'s issue #1446 update.)
 
 What answers the objection is not a protocol guarantee but two bounds, and Interledger has always
 worked this way:

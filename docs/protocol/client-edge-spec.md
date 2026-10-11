@@ -456,7 +456,10 @@ Two rules attach to the forwarded case and to nothing else. A client-edge PREPAR
 forwarded destination is refused `F03_INVALID_AMOUNT` when its declared `amount` exceeds that
 `price` — this connector never puts more value on the peer semantics than it collected, and the
 refusal is decided before the claim is ingested so a packet that will not be carried never spends
-a watermark. And a _peer-role_ PREPARE is never answered with this greeting at all
+a watermark. The same holds of a PREPARE to a destination nothing will carry — no configured route,
+no runtime peer route, no active lease, no bound client session: it is rejected `F02` without its
+claim being ingested, on both carriages ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md),
+issue #1446). And a _peer-role_ PREPARE is never answered with this greeting at all
 (`peer-carriage-spec.md` §3.1): everything in this section is the client-facing direction.
 
 This is **answering, not announcing** ([ADR 0022](../adr/0022-a-connector-answers-it-does-not-announce.md)):
@@ -1059,7 +1062,9 @@ silently dropped exactly as it was before TRANSFER existed.
    RESPONSE carrying an `F06` (Unexpected Payment) REJECT, message
    `No payment channel claim attached`, with the x402 v2 terms JSON — byte-identical to §1.4's
    body — as a protocolData entry named `payment-required` (again mirroring the HTTP header of
-   the same name). A claimless PREPARE to an unpriced route passes through unchanged, as on HTTP —
+   the same name). The REJECT's accumulated cost (`toon-accumulated-cost`) is the route's charge for
+   that packet — the price schedule at the packet's own payload length, the figure the terms quote
+   (issue #1481); a `greeting` on an unpriced destination states `0`. A claimless PREPARE to an unpriced route passes through unchanged, as on HTTP —
    unless, per §1.4's issue #807 update, the PREPARE itself declares `greeting`, in which case this
    same `F06` greeting fires regardless of destination or price.
 5. **Standalone claim**: a MESSAGE with an empty `ilpPacket` and a `payment-channel-claim` entry

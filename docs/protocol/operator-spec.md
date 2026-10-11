@@ -215,7 +215,10 @@ Raising it is an operator decision, or a controller's: post the same `id` again 
 removes one.
 
 **A route through the peering is a second, separate write** — `POST /routes/peers { prefix, peer_id,
-price }` — because a peering and a route are different decisions and one may exist without the other.
+price, request? }` — because a peering and a route are different decisions and one may exist without
+the other. The optional `request` is a JSON object, opaque to the node
+([ADR 0067](../adr/0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md)): any
+other JSON type is a `400`, and a re-post without it clears it.
 Onboarding is those two calls, with `POST /channels` still available for an operator who wants to open
 a channel on their own terms first; this write then _finds_ it.
 
@@ -403,6 +406,10 @@ through exactly the lines above from the operator's browser
 Two mechanisms sit behind the write half that [ADR 0008](../adr/0008-operator-surface-splits-read-from-write.md)'s
 Decision does not name — **replay rejection**, and the **audit log** the retained signatures are
 exposed through. Both are live and both are load-bearing for OP-05 and OP-02.
+
+A REJECT answered by `POST /packets` carries the `TOON-Accumulated-Cost` response header — a decimal
+`u64`, present on every REJECT and zero included, as on the client edge and the peer HTTP edge —
+because the cost never rides the OER encoding (ADR 0011). A FULFILL carries no such header.
 
 `GET /metrics` is Prometheus text exposition format; every other read is JSON.
 

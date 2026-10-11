@@ -782,6 +782,13 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // gap 3), so a peering established at runtime picks its carriage by
     // exactly the rule a config-file peering does.
     .with_peer_allow_plaintext_endpoints(config.peer_allow_plaintext_endpoints())
+    // ADR 0077: the operator's bounded, in-memory packet history, off unless
+    // `[operator] packet_history` names a size.
+    .with_packet_history(
+        config
+            .operator()
+            .map_or(0, |operator| operator.packet_history()),
+    )
     // Issue #884: the routing table IS the relationship set enforced at
     // load (`connector-config`'s `UnknownPeerId` check), so a runtime
     // write must never be able to add, update or remove a peer id the
@@ -2061,6 +2068,13 @@ btp_endpoint = "wss://apex.example/ilp/btp"
                 r#"
 client_edge_addr = "127.0.0.1:0"
 
+# A destination something serves: a claim riding a packet to one nothing
+# serves is never looked at (issue #1446).
+[[routes]]
+prefix = "g.example.unmatched"
+handler_url = "http://localhost:4000/"
+price = 1
+
 [signer]
 key_file = "{}"
 "#,
@@ -2133,6 +2147,13 @@ key_file = "{}"
             format!(
                 r#"
 client_edge_addr = "127.0.0.1:0"
+
+# A destination something serves: a claim riding a packet to one nothing
+# serves is never looked at (issue #1446).
+[[routes]]
+prefix = "g.example.unmatched"
+handler_url = "http://localhost:4000/"
+price = 1
 
 [signer]
 key_file = "{}"

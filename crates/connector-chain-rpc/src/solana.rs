@@ -39,6 +39,23 @@ pub fn answered(error: &ClientError) -> bool {
     )
 }
 
+/// The node's "minimum context slot has not been reached" answer (-32016).
+///
+/// `get_account_with_config` rewraps a failed call as a `Custom` error whose
+/// text carries the node's (`AccountNotFound: pubkey=..: RPC response error
+/// -32016: ..`), so the code is looked for there as well as in a typed
+/// response error. Both are what the pinned `solana-rpc-client` 2.1.0 gives.
+pub fn is_min_context_slot_not_reached(error: &ClientError) -> bool {
+    const CODE: i64 =
+        solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED;
+    match error.kind() {
+        ErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => *code == CODE,
+        _ => error
+            .to_string()
+            .contains(&format!("RPC response error {CODE}")),
+    }
+}
+
 /// The SDK's `HttpSender` over the transport's client, retrying a refusal
 /// (403 or 429) with backoff.
 pub struct RefusalRetrying {

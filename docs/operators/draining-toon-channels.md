@@ -21,6 +21,11 @@ node ADR 0075 knew of with a live TOON channel, on the Base mainnet
 anyone else who deployed this connector against either of those contracts
 before this release.
 
+That node has since drained: it landed and closed its four TOON channels on
+2026-09-29, settled the last of them on 2026-09-30, and has run the x402-only
+release since 2026-09-29. What is left of this file's audience is the second
+group.
+
 If your node's journal holds no `toon-channel` entry, this procedure does not
 apply to you: upgrade normally.
 

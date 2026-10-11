@@ -10,6 +10,7 @@ mod journal;
 mod metrics;
 mod operator_view;
 mod outbound_voucher;
+mod packet_history;
 mod peer_route_store;
 mod peer_transport;
 mod peering;
@@ -57,6 +58,7 @@ pub use operator_view::{
     ClaimBookKind, ClaimDirection, ClaimScheme, ClaimView, DeclaredRates, LeasedRouteView,
     PeerRouteView, PeerView, RateView, RateViewState, RefusedRefreshView, RouteSource, RouteView,
 };
+pub use packet_history::{Direction, Outcome, PacketHistoryView, PacketRow};
 // What this node puts on a peer carriage when it pays over one of its own
 // x402 channels (ADR 0075 decisions 5 and 6), and how it asks the receiver
 // where that channel's watermark stands.
@@ -67,7 +69,7 @@ pub use peer_route_store::{
     PeerRouteStore, PeerRouteStoreError, RuntimePeerChannel, RuntimePeering, RuntimePeers,
 };
 pub use peer_transport::{
-    InProcessPeerTransport, PeerForward, PeerRegistrar, PeerTransport, NO_SOCKS_PROXY,
+    AnswerWait, InProcessPeerTransport, PeerForward, PeerRegistrar, PeerTransport, NO_SOCKS_PROXY,
 };
 // ADR 0058's one operator write: establish a peering from a URL.
 pub use peering::{ChannelBranch, EstablishPeeringError, EstablishedChannel, PeeringEstablished};

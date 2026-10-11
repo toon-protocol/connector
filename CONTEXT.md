@@ -46,7 +46,7 @@ reads one is reading text from a stranger. _(Decided and not yet built — ADR 0
 **Request**:
 The operator-declared table naming what a client must send to use a route — protocol, parameters,
 whatever the app behind it expects. Written as `[[routes]] request = { ... }`, converted to JSON at
-load and published verbatim on that route's self-description entry and on the greeting for that
+load — or, for a runtime peer route, as a JSON object on `POST /routes/peers` — and published verbatim on that route's self-description entry and on the greeting for that
 destination; the connector confirms only that it **is** a table and reads none of its keys. Sourced
 by the operator writing it down, never by asking the app — matching the declaration against what the
 app actually registered is the app's own repository's problem, not this one's (ADR 0067). Absent,
@@ -435,7 +435,10 @@ peering, held by the peering, denominated in that peering's unit — which at a 
 denomination is the **outgoing** leg's, subtracted after the conversion and not before
 ([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). What varies
 by destination is the **price**; what a hop earns for crossing a denomination is the **spread**,
-a separate earning.
+a separate earning. A fee is for carrying someone else's packet, so a packet the node's own
+operator originates (`POST /packets`) pays that node no fee, and the node's fee is no part of
+that packet's cost ([ADR 0061](docs/adr/0061-a-fee-attaches-to-a-peering-not-to-a-route.md),
+update for #1466).
 _Avoid_: commission; using fee for the dealing margin — that is the **spread**
 
 **Price**:
@@ -555,6 +558,13 @@ _Avoid_: DVM
 A build that makes a configuration a box already runs invalid — a new required key, a renamed
 field, a narrowed type. It may never ride an automatic tag move: either the change is made
 backward-compatible first, or a promotion lands the config before the image.
+
+**Packet history**:
+The recent packets a connector handled, held in memory for its operator to watch; bounded, lossy
+and gone on restart; never a record, and never read by anything that decides a packet's fate. A
+packet is **delivered** when it ended at one of the connector's apps, **forwarded** when it arrived
+from one side and left toward a peer, and **sent** when the operator originated it.
+_Avoid_: packet log, audit log, transaction history
 
 **Promotion**:
 Moving the tag a box follows to one specific build, deliberately. The only moment at which a

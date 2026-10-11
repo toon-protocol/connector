@@ -14,8 +14,8 @@ use connector_config::{
 use connector_domain::x402::X402PaymentRequired;
 use connector_domain::{
     amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_fee, delivery_budget,
-    forwarded_expiry, is_expired, is_valid_ilp_address, select_route, AssetId, EnvelopeRequest,
-    Fulfill, PacketResponse, Prepare, Price, RateLookup, Reject, RejectCode,
+    forward_wait_budget, forwarded_expiry, is_expired, is_valid_ilp_address, select_route, AssetId,
+    EnvelopeRequest, Fulfill, PacketResponse, Prepare, Price, RateLookup, Reject, RejectCode,
     FORWARDING_MESSAGE_WINDOW,
 };
 use connector_settlement::ChannelId;
@@ -38,10 +38,13 @@ use crate::outbound_voucher::{
     challenge_entry, voucher_json, HttpVoucherState, UnreachableVoucherState, VoucherStateSource,
     PEER_CHALLENGE_TTL_SECS,
 };
+use crate::packet_history::{
+    clip_message, Direction, Outcome, PacketHistory, PacketHistoryView, PacketRow,
+};
 use crate::peer_route_store::{
     PeerRouteStore, PeerRouteStoreError, RuntimePeerChannel, RuntimePeering, RuntimePeers,
 };
-use crate::peer_transport::{PeerRegistrar, PeerTransport};
+use crate::peer_transport::{PeerForward, PeerRegistrar, PeerTransport};
 use crate::rate_table::SharedRateTable;
 use crate::route::{LeasedRoute, PeerRoute};
 use crate::self_description::{SelfDescriptionSource, UnreachableSelfDescription};
@@ -84,6 +87,10 @@ pub enum PeerRouteTableError {
     InvalidPrefix(String),
     #[error("peer id must not be empty")]
     InvalidPeerId,
+    /// A route's `request` (ADR 0067) must be a JSON object; the connector
+    /// checks that and never reads inside it.
+    #[error("route '{0}': `request` must be a JSON object")]
+    InvalidRequest(String),
     /// The config file already names this peer id or route prefix
     /// (`[[peers]]` / `[[routes]]`). A runtime write can never add,
     /// change or remove a config-file row -- config always wins, and it
@@ -632,6 +639,9 @@ pub struct Connector {
     /// that is how "the forwarding path does no I/O" is kept true by
     /// construction rather than by discipline (decision 6).
     rate_table: Option<SharedRateTable>,
+    /// The bounded, lossy packet history an operator watches (ADR 0077).
+    /// Written by [`Self::finish`] and read by nothing that decides a packet.
+    history: Option<PacketHistory>,
 }
 
 /// Why a config-declared x402 peering could not be wired at boot (ADR 0075
@@ -697,11 +707,13 @@ pub enum ConfigPeeringError {
 /// keeps it that way, so each carriage hands the connector the leg it
 /// authenticated.
 ///
-/// There is no third variant, and the absence is load-bearing: an arrival
-/// with no channel behind it -- an operator write, a test calling
-/// [`Connector::handle_prepare`] directly -- is `None` rather than a
-/// variant of this, because there is nothing to resolve rather than a
-/// denomination that happens to be unknown.
+/// There is no channel-less denominated variant, and the absence is
+/// load-bearing: an arrival with no channel behind it -- the operator's own
+/// origination, a test calling [`Connector::handle_prepare`] directly --
+/// resolves to no denomination, because there is nothing to resolve rather
+/// than a denomination that happens to be unknown. The operator's origination
+/// is named ([`Arrival::Operator`]) only because it pays no fee (#1466); it
+/// crosses no boundary exactly as `None` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrival<'a> {
     /// A peer arrival, named by the peering both carriages authenticate
@@ -715,6 +727,33 @@ enum Arrival<'a> {
     /// the key's chain and not its id -- so a channel this node discovered
     /// on chain is denominated exactly like a declared one.
     ClientChannel(&'a str),
+    /// The operator's own origination (`POST /packets`, ADR 0061's update
+    /// for #1466). It arrived over no peering and no channel, so it crosses
+    /// no denomination boundary, and a fee pays for carrying someone else's
+    /// packet, which this is not: [`Connector::forward_via_peer_route`]
+    /// charges it none.
+    Operator,
+}
+
+/// What the packet history needs to know about one packet by the time
+/// [`Connector::finish`] sees its outcome (ADR 0077). Built only when a
+/// history is kept, so a node with none allocates nothing for it.
+struct Trace {
+    destination: String,
+    amount: u64,
+    from_peer: Option<String>,
+    from_channel: Option<String>,
+    direction: Option<Direction>,
+    to_peer: Option<String>,
+}
+
+/// Why a forward could not be covered: it could not be signed, or the packet
+/// ran out of time before it could be (`packet-flow-spec.md` PF-26). The
+/// second names the wait it ran out in and is answered `R00`; the first is
+/// answered as it always was.
+enum CoverError {
+    Failed(String),
+    OutOfTime(&'static str),
 }
 
 /// One next hop this connector pays over its own outbound x402 channel
@@ -731,6 +770,11 @@ struct VoucherHop {
     /// stands since it last had cause to -- once per process, and again
     /// after a voucher the hop did not accept.
     synced: Arc<AtomicBool>,
+    /// The highest voucher amount a forward rode and was then rejected on
+    /// since the hop last answered `claim_state`, or 0 for none (issue
+    /// #1446): the figure the next sync may lower the signed watermark
+    /// from, and only while nothing later has been signed above it.
+    rejected_through: Arc<Mutex<u128>>,
     /// Serialises reading the signed watermark and signing above it, so two
     /// concurrent forwards never both sign the same next amount.
     signing: Arc<tokio::sync::Mutex<()>>,
@@ -808,6 +852,24 @@ impl Connector {
             peering_assets: PeeringAssets::default(),
             client_channel_assets: ClientChannelAssets::default(),
             rate_table: None,
+            history: None,
+        }
+    }
+
+    /// Keep the `capacity` most recent packets in memory for the operator
+    /// surface's `GET /packets` (ADR 0077). `0` keeps none. Spawns the
+    /// collector task, so it must be called inside a tokio runtime.
+    pub fn with_packet_history(mut self, capacity: usize) -> Self {
+        self.history = (capacity > 0).then(|| PacketHistory::spawn(capacity));
+        self
+    }
+
+    /// What `GET /packets` answers: the newest `limit` rows, newest first, or
+    /// the "off" answer on a node that keeps no history.
+    pub fn packet_history(&self, limit: Option<usize>) -> PacketHistoryView {
+        match &self.history {
+            Some(history) => history.view(limit),
+            None => PacketHistoryView::off(),
         }
     }
 
@@ -1013,8 +1075,9 @@ impl Connector {
     /// `None` covers three cases that all forward the same way -- the two
     /// legs hold one token, this node declares none, or the packet named no
     /// arriving leg at all. That last one is the case worth stating: an
-    /// operator write, or any caller of [`Self::handle_prepare`] itself,
-    /// carries no channel and therefore no unit, so nothing can be said
+    /// operator write ([`Arrival::Operator`]), or any caller of
+    /// [`Self::handle_prepare`] itself, carries no channel and therefore no
+    /// unit, so nothing can be said
     /// about what it arrived in and this node forwards it as it always did.
     /// A client-edge delivery is no longer one of those: since issue #1301
     /// it carries the channel key its claim cleared, and on a dealing node
@@ -1027,6 +1090,7 @@ impl Connector {
         outgoing_peer_id: &str,
     ) -> Option<(&AssetId, &AssetId)> {
         let incoming = match arrived? {
+            Arrival::Operator => return None,
             Arrival::Peer(peer_id) => self.peer_asset(peer_id)?,
             Arrival::ClientChannel(channel_key) => self.client_channel_assets.asset(channel_key)?,
         };
@@ -1454,6 +1518,7 @@ impl Connector {
             channel_id: channel_id.to_string(),
             claim_state,
             synced: Arc::new(AtomicBool::new(false)),
+            rejected_through: Arc::new(Mutex::new(0)),
             signing: Arc::new(tokio::sync::Mutex::new(())),
         };
         self.outbound_voucher_hops.rcu(|current| {
@@ -1799,6 +1864,7 @@ impl Connector {
         prefix: impl Into<String>,
         peer_id: impl Into<String>,
         price: Price,
+        request: Option<serde_json::Value>,
     ) -> Result<PeerRouteView, PeerRouteTableError> {
         let prefix = prefix.into();
         let peer_id = peer_id.into();
@@ -1821,7 +1887,11 @@ impl Connector {
                 Some(_) => {}
             }
         }
-        let route = PeerRoute::new_scheduled(prefix.clone(), peer_id.clone(), price);
+        if request.as_ref().is_some_and(|value| !value.is_object()) {
+            return Err(PeerRouteTableError::InvalidRequest(prefix));
+        }
+        let route = PeerRoute::new_scheduled(prefix.clone(), peer_id.clone(), price)
+            .with_request(request.clone());
         let mut routes = (*self.runtime_peer_routes_snapshot()).clone();
         routes.insert(prefix.clone(), route);
         self.persist_runtime_table(&self.runtime_peers_snapshot(), &routes)?;
@@ -1831,6 +1901,7 @@ impl Connector {
             peer_id,
             price,
             source: RouteSource::Runtime,
+            request,
         })
     }
 
@@ -1868,6 +1939,7 @@ impl Connector {
                 peer_id: route.peer_id().to_string(),
                 price: route.price(),
                 source: RouteSource::Config,
+                request: route.request().cloned(),
             })
             .collect();
         views.extend(
@@ -1878,6 +1950,7 @@ impl Connector {
                     peer_id: route.peer_id().to_string(),
                     price: route.price(),
                     source: RouteSource::Runtime,
+                    request: route.request().cloned(),
                 }),
         );
         views
@@ -1974,6 +2047,19 @@ impl Connector {
         .await
     }
 
+    /// Entry point for a packet the operator originates (`POST /packets`):
+    /// [`Self::handle_prepare`], except that it pays this node no fee. A fee
+    /// is charged for carrying someone else's packet; the operator's own is
+    /// not that (ADR 0061, update for #1466). The forwarded amount, and the
+    /// voucher covering it, is the packet's own amount, an amount below the
+    /// peering's fee is not refused `R01`, and a relayed reject's
+    /// `accumulated_cost` does not gain this node's fee. The per-packet cap
+    /// still applies, and no denomination is crossed.
+    pub async fn originate_prepare(&self, prepare: Prepare) -> PacketResponse {
+        self.handle_prepare_spanned(prepare, None, Some(Arrival::Operator))
+            .await
+    }
+
     /// The one body [`Self::handle_prepare_with_client_channel`] and
     /// [`Self::handle_peer_prepare`] share: open the `"packet"` span and
     /// route inside it.
@@ -2056,9 +2142,16 @@ impl Connector {
                         prepare.destination, charge, prepare.amount
                     ),
                     data: Vec::new(),
-                    accumulated_cost: 0,
+                    // The glossary's Cost: this refusal is the terminating
+                    // hop's, so it states the charge its upstream hops add
+                    // their fees to (as `handle_probe` does at the edge).
+                    accumulated_cost: charge,
                 });
-                return self.finish(reject);
+                let mut trace = self.trace(&prepare, arrived_from.map(Arrival::Peer));
+                if let Some(trace) = trace.as_mut() {
+                    trace.direction = Some(Direction::Delivered);
+                }
+                return self.finish(reject, trace, None);
             }
         }
 
@@ -2201,8 +2294,10 @@ impl Connector {
         // per-packet trace without a config change on the boxes.
         tracing::debug!("packet received");
 
+        let mut trace = self.trace(&prepare, arrived);
+
         if let Some(reject) = self.reject_ineligible(&prepare) {
-            return self.finish(PacketResponse::Reject(reject));
+            return self.finish(PacketResponse::Reject(reject), trace, None);
         }
 
         // Issue #452: `leased_routes_snapshot` is one lock-free `Arc`
@@ -2239,13 +2334,17 @@ impl Connector {
             .flatten()
             .max_by_key(|(len, target)| (*len, target.rank()))
         else {
-            return self.finish(PacketResponse::Reject(Reject {
-                code: RejectCode::f02_unreachable(),
-                triggered_by: String::new(),
-                message: format!("no route to destination '{}'", prepare.destination),
-                data: Vec::new(),
-                accumulated_cost: 0,
-            }));
+            return self.finish(
+                PacketResponse::Reject(Reject {
+                    code: RejectCode::f02_unreachable(),
+                    triggered_by: String::new(),
+                    message: format!("no route to destination '{}'", prepare.destination),
+                    data: Vec::new(),
+                    accumulated_cost: 0,
+                }),
+                trace,
+                None,
+            );
         };
 
         // A `Cow`, not a plain clone (issue #884): the `RuntimePeer` arm
@@ -2258,31 +2357,50 @@ impl Connector {
         let peer_route: Cow<'_, PeerRoute> = match target {
             RouteTarget::App(index) => {
                 tracing::debug!(handler_url = %self.routes[index].handler_url(), "routed to app");
+                if let Some(trace) = trace.as_mut() {
+                    trace.direction.get_or_insert(Direction::Delivered);
+                }
                 let response = self
                     .deliver_to_app(&self.routes[index], prepare, client_channel_id)
                     .await;
-                return self.finish(response);
+                return self.finish(response, trace, None);
             }
             RouteTarget::Peer(index) => Cow::Borrowed(&self.peer_routes[index]),
             RouteTarget::Leased(index) => Cow::Borrowed(active_leased[index].as_peer_route()),
             RouteTarget::RuntimePeer(route) => Cow::Owned(route),
         };
         tracing::debug!(peer_id = %peer_route.peer_id(), "routed to peer");
+        if let Some(trace) = trace.as_mut() {
+            trace.direction.get_or_insert(Direction::Forwarded);
+            trace.to_peer = Some(peer_route.peer_id().to_string());
+        }
         let response = self
             .forward_via_peer_route(&peer_route, prepare, arrived)
             .await;
-        if matches!(response, PacketResponse::Fulfill(_)) {
-            self.metrics
-                .record_fee_earned(self.fee_for(peer_route.peer_id()));
+        let mut fee = None;
+        if matches!(response, PacketResponse::Fulfill(_))
+            && !matches!(arrived, Some(Arrival::Operator))
+        {
+            let earned = self.fee_for(peer_route.peer_id());
+            self.metrics.record_fee_earned(earned);
+            fee = Some(earned);
         }
-        self.finish(response)
+        self.finish(response, trace, fee)
     }
 
     /// Record the packet's final outcome -- metrics and a log line -- and
     /// pass it through unchanged. The single choke point every return path
     /// in [`Self::handle_prepare_traced`] goes through, so no outcome can be
     /// reported without also being counted.
-    fn finish(&self, response: PacketResponse) -> PacketResponse {
+    fn finish(
+        &self,
+        response: PacketResponse,
+        trace: Option<Trace>,
+        fee: Option<u64>,
+    ) -> PacketResponse {
+        if let (Some(history), Some(trace)) = (&self.history, trace) {
+            history.record(self.row_for(trace, &response, fee));
+        }
         match &response {
             PacketResponse::Fulfill(_) => {
                 self.metrics.record_fulfill();
@@ -2298,6 +2416,51 @@ impl Connector {
             }
         }
         response
+    }
+
+    /// The facts [`Self::finish`] files for one packet, if a history is kept.
+    fn trace(&self, prepare: &Prepare, arrived: Option<Arrival<'_>>) -> Option<Trace> {
+        self.history.as_ref()?;
+        Some(Trace {
+            destination: prepare.destination.to_string(),
+            amount: prepare.amount,
+            from_peer: match arrived {
+                Some(Arrival::Peer(id)) => Some(id.to_string()),
+                _ => None,
+            },
+            from_channel: match arrived {
+                Some(Arrival::ClientChannel(key)) => Some(key.to_string()),
+                _ => None,
+            },
+            // The operator's own origination is `sent` whatever becomes of it,
+            // including when no route is ever chosen.
+            direction: matches!(arrived, Some(Arrival::Operator)).then_some(Direction::Sent),
+            to_peer: None,
+        })
+    }
+
+    fn row_for(&self, trace: Trace, response: &PacketResponse, fee: Option<u64>) -> PacketRow {
+        let (outcome, code, message) = match response {
+            PacketResponse::Fulfill(_) => (Outcome::Fulfilled, None, None),
+            PacketResponse::Reject(reject) => (
+                Outcome::Rejected,
+                Some(reject.code.as_str().to_string()),
+                Some(clip_message(&reject.message)),
+            ),
+        };
+        PacketRow {
+            time: self.clock.now(),
+            direction: trace.direction,
+            destination: trace.destination,
+            from_peer: trace.from_peer,
+            from_channel: trace.from_channel,
+            to_peer: trace.to_peer,
+            amount: trace.amount,
+            fee,
+            outcome,
+            code,
+            message,
+        }
     }
 
     /// Cross a **denomination boundary**: what this hop forwards to
@@ -2420,23 +2583,30 @@ impl Connector {
         // subtraction cannot fail, so `None` here is the outgoing leg's
         // `u64` ceiling and `Some` is the fee having eaten everything.
         match amount_after_rate_and_fee(amount, rate, 0) {
-            Some(converted) => Err(Reject {
-                code: RejectCode::r01_insufficient_source_amount(),
-                triggered_by: String::new(),
-                // Named in both units, because on a crossing the sender's
-                // "send more" is a figure in its OWN unit and the fee is
-                // not: `cost_before_rate_and_fee` un-converts the threshold
-                // back across the boundary, which is decision 7's
-                // arithmetic used one packet early.
-                message: format!(
-                    "peer '{peer_id}' charges a fee of {fee} in {outgoing}, and this packet's \
-                     {amount} in {incoming} converts to only {converted} at the declared rate \
-                     {rate}: nothing would be left to forward. Send more than {}",
-                    cost_before_rate_and_fee(0, rate, fee)
-                ),
-                data: Vec::new(),
-                accumulated_cost: 0,
-            }),
+            Some(converted) => {
+                // This hop's own fee, in the incoming leg's unit -- the same
+                // arithmetic a relayed reject's cost crosses back with, so
+                // the figure is readable where it lands. `R01` marks a
+                // partial sum: the packet stopped at this hop.
+                let threshold = cost_before_rate_and_fee(0, rate, fee);
+                Err(Reject {
+                    code: RejectCode::r01_insufficient_source_amount(),
+                    triggered_by: String::new(),
+                    // Named in both units, because on a crossing the sender's
+                    // "send more" is a figure in its OWN unit and the fee is
+                    // not: `cost_before_rate_and_fee` un-converts the threshold
+                    // back across the boundary, which is decision 7's
+                    // arithmetic used one packet early.
+                    message: format!(
+                        "peer '{peer_id}' charges a fee of {fee} in {outgoing}, and this packet's \
+                         {amount} in {incoming} converts to only {converted} at the declared \
+                         rate {rate}: nothing would be left to forward. Send more than \
+                         {threshold}"
+                    ),
+                    data: Vec::new(),
+                    accumulated_cost: threshold,
+                })
+            }
             None => Err(Reject {
                 code: RejectCode::t04_insufficient_liquidity(),
                 triggered_by: String::new(),
@@ -2565,6 +2735,19 @@ impl Connector {
     /// change: a shorter expiry needs no agreement from the peer receiving
     /// it.
     ///
+    /// # The packet's time is spent on every wait (PF-26)
+    ///
+    /// The outgoing expiry above is not checked once and forgotten. It
+    /// bounds the claim-state ask, the wait for the channel's signing turn
+    /// and the wait for the peer's answer -- on either carriage, through
+    /// [`connector_domain::forward_wait_budget`] -- and is read again at the
+    /// last point before a voucher (or challenge) is signed, so a packet
+    /// that ran out of time while this forward queued or asked is refused
+    /// `R00` with nothing signed. A wait that ended at the expiry is `R00`;
+    /// one that ended at the peering's answer timeout, with time left, is
+    /// `T01`. An answer that arrived inside the bound is relayed, whatever
+    /// the clock says afterwards.
+    ///
     /// # Covering (issue #881), and the retry arm beside it
     ///
     /// [`Connector::cover_forward`] signs for exactly this packet's own
@@ -2613,7 +2796,12 @@ impl Connector {
         // the OUTGOING leg, which is the peering it is attached to, so on a
         // crossing it is subtracted after the conversion and not before.
         let peer_id = peer_route.peer_id();
-        let fee = self.fee_for(peer_id);
+        // An operator's own packet pays no fee: a fee is charged for carrying
+        // someone else's packet (ADR 0061, update for #1466).
+        let fee = match arrived {
+            Some(Arrival::Operator) => 0,
+            _ => self.fee_for(peer_id),
+        };
 
         // The two arms ADR 0071 decision 2 keeps apart. A forward that
         // crosses no denomination boundary -- every forward on a node that
@@ -2650,7 +2838,10 @@ impl Connector {
                             peer_id, fee, prepare.amount, fee
                         ),
                         data: Vec::new(),
-                        accumulated_cost: 0,
+                        // This hop's own fee: upstream hops add theirs on the
+                        // way back, so the sender reads the least amount that
+                        // gets past this hop. `R01` marks a partial sum.
+                        accumulated_cost: fee,
                     });
                 };
                 forwarded_amount
@@ -2755,9 +2946,19 @@ impl Connector {
         // either: the voucher is journaled by `OutboundChannels`, and its
         // watermark authority on restore is the RECEIVER, asked over
         // `claim_state` (ADR 0075 decision 6).
-        let riding = match self.cover_forward(peer_id, forwarded_amount).await {
+        let riding = match self
+            .cover_forward(peer_id, forwarded_amount, outgoing_expires_at)
+            .await
+        {
             Ok(covering) => covering,
-            Err(reason) => {
+            Err(CoverError::OutOfTime(wait)) => {
+                return PacketResponse::Reject(self.out_of_time_reject(
+                    peer_id,
+                    outgoing_expires_at,
+                    wait,
+                ));
+            }
+            Err(CoverError::Failed(reason)) => {
                 tracing::warn!(
                     peer_id,
                     %reason,
@@ -2773,40 +2974,106 @@ impl Connector {
                 });
             }
         };
+        let (riding, rode_amount) = riding;
         let rode_a_voucher = matches!(riding, Covering::Voucher(_));
         let mut answer = self
-            .peer_transport
-            .forward(peer_id, outgoing.clone(), Some(riding))
+            .forward_bounded(
+                peer_id,
+                outgoing.clone(),
+                riding,
+                outgoing_expires_at,
+                "waiting for the peer's answer",
+            )
             .await;
         if rode_a_voucher {
-            self.note_voucher_ack(peer_id, answer.ack);
+            self.note_voucher_outcome(
+                peer_id,
+                rode_amount,
+                answer.ack,
+                matches!(answer.response, PacketResponse::Reject(_)),
+            );
         }
 
         if let Some(terms) = answer.payment_required.take() {
-            if let Some(covering) = self.cover_greeted_packet(peer_id, &terms).await {
-                tracing::info!(
+            // A retry changes the voucher and not the packet, so it can only
+            // succeed when the packet's own amount clears the price quoted
+            // for it: the peer's `F03` ("costs P but carried only A") would
+            // otherwise follow a second admitted voucher (#1462). Sign
+            // nothing and relay the refusal, naming both figures.
+            if let Some(price) = terms.price().filter(|price| forwarded_amount < *price) {
+                tracing::warn!(
                     peer_id,
-                    price = terms.price().unwrap_or_default(),
-                    "covering a greeted forward and retrying it once"
+                    price,
+                    amount = forwarded_amount,
+                    "peer quoted a price this packet's amount cannot cover -- not retrying"
                 );
-                let retried_a_voucher = matches!(covering, Covering::Voucher(_));
-                answer = self
-                    .peer_transport
-                    .forward(peer_id, outgoing, Some(covering))
-                    .await;
-                if retried_a_voucher {
-                    self.note_voucher_ack(peer_id, answer.ack);
-                }
-                // Bounded: whatever the retry answered is the answer. A
-                // second greeting is logged with its terms and relayed, not
-                // covered again.
-                if let Some(again) = &answer.payment_required {
-                    tracing::warn!(
-                        peer_id,
-                        price = again.price().unwrap_or_default(),
-                        resource = %again.resource.url,
-                        "peer demanded payment again after a covering claim -- not retrying"
+                if let PacketResponse::Reject(reject) = &mut answer.response {
+                    // A far node that greets with a cost of 0 (one deployed
+                    // before the greeting stated its charge) still quoted a
+                    // price: state it, before the handling below adds this
+                    // hop's fee or converts across a boundary. A cost the
+                    // peer did state is left alone, so nothing counts twice.
+                    if reject.accumulated_cost == 0 {
+                        reject.accumulated_cost = price;
+                    }
+                    reject.message = format!(
+                        "{} (peer '{peer_id}' quotes {price} for this packet, which carried only \
+                         {forwarded_amount}: raise the amount to at least {price})",
+                        reject.message
                     );
+                }
+            } else {
+                match self
+                    .cover_greeted_packet(peer_id, &terms, outgoing_expires_at)
+                    .await
+                {
+                    // The retry ran out of time before it could be signed. The
+                    // first answer was only a greeting, so this is the answer
+                    // the sender gets, and no second voucher exists (PF-26).
+                    Err(CoverError::OutOfTime(wait)) => {
+                        return PacketResponse::Reject(self.out_of_time_reject(
+                            peer_id,
+                            outgoing_expires_at,
+                            wait,
+                        ));
+                    }
+                    Err(CoverError::Failed(_)) => {}
+                    Ok((covering, retry_amount)) => {
+                        tracing::info!(
+                            peer_id,
+                            price = terms.price().unwrap_or_default(),
+                            "covering a greeted forward and retrying it once"
+                        );
+                        let retried_a_voucher = matches!(covering, Covering::Voucher(_));
+                        answer = self
+                            .forward_bounded(
+                                peer_id,
+                                outgoing,
+                                covering,
+                                outgoing_expires_at,
+                                "waiting for the peer's answer to the retry",
+                            )
+                            .await;
+                        if retried_a_voucher {
+                            self.note_voucher_outcome(
+                                peer_id,
+                                retry_amount,
+                                answer.ack,
+                                matches!(answer.response, PacketResponse::Reject(_)),
+                            );
+                        }
+                        // Bounded: whatever the retry answered is the answer. A
+                        // second greeting is logged with its terms and relayed,
+                        // not covered again.
+                        if let Some(again) = &answer.payment_required {
+                            tracing::warn!(
+                                peer_id,
+                                price = again.price().unwrap_or_default(),
+                                resource = %again.resource.url,
+                                "peer demanded payment again after a covering claim -- not retrying"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2874,7 +3141,12 @@ impl Connector {
     /// 0075 decision 6), whether a runtime peering registered that channel
     /// (`register_voucher_hop`) or a `[[pay_channels]]` row did
     /// ([`Connector::with_config_pay_channel`]).
-    async fn cover_forward(&self, peer_id: &str, amount: u64) -> Result<Covering, String> {
+    async fn cover_forward(
+        &self,
+        peer_id: &str,
+        amount: u64,
+        outgoing_expires_at: DateTime<Utc>,
+    ) -> Result<(Covering, u128), CoverError> {
         let Some(hop) = self.outbound_voucher_hops.load().get(peer_id).cloned() else {
             // Nothing has armed this peering -- no `[[pay_channels]]` row
             // at boot, and no runtime peering (ADR 0058) -- so there is
@@ -2884,13 +3156,14 @@ impl Connector {
             // (`ConfigError::PayChannelUnbound`), so a file that loaded
             // cannot reach this; a leased or runtime-installed route (ADR
             // 0028) can, and is refused here rather than carried free.
-            return Err(format!(
+            return Err(CoverError::Failed(format!(
                 "no outbound channel is registered to pay peer '{peer_id}' on -- neither a \
                  '[[pay_channels]]' row nor a runtime peering (ADR 0058) has named one -- and a \
                  connector covers every PREPARE it sends (ADR 0042)"
-            ));
+            )));
         };
-        self.cover_with_voucher(peer_id, &hop, amount).await
+        self.cover_with_voucher(peer_id, &hop, amount, outgoing_expires_at)
+            .await
     }
 
     /// Cover a forward to `peer_id` over this node's own outbound x402
@@ -2898,57 +3171,92 @@ impl Connector {
     /// signed watermark plus `amount`, signed and journaled before the
     /// packet leaves -- or, for a packet that moves no value, no voucher at
     /// all and the voucher claim-state challenge instead, which proves the
-    /// peer role at the far end and moves nothing.
+    /// peer role at the far end and moves nothing. The second half of the
+    /// answer is the cumulative amount the voucher was signed for, 0 for a
+    /// challenge.
     ///
-    /// The watermark signed above is this node's own journaled one, raised
+    /// The watermark signed above is this node's own journaled one, set
     /// first to whatever the receiver's `POST /ilp/claim-state` reports
-    /// when this process has not asked yet, or has had a voucher refused
-    /// since: the receiver is the authority on restore, and a node restored
-    /// from an older journal would otherwise sign a voucher that fails to
-    /// advance. A receiver that cannot be asked leaves the journaled
-    /// watermark standing -- it is never behind what this node signed -- and
-    /// is asked again next time.
+    /// when this process has not asked yet, or a forward that rode a voucher
+    /// has been rejected since: the receiver is the authority on restore and
+    /// after a reject. Ahead of this node, a node restored from an older
+    /// journal would otherwise sign a voucher that fails to advance; behind
+    /// it, the rejected packet was never carried and is not paid for by the
+    /// next voucher (ADR 0075, issue #1446) -- unless a later voucher has
+    /// been signed since, which is never undercut. A receiver that cannot be
+    /// asked leaves the journaled watermark standing -- it is never behind
+    /// what this node signed -- and is asked again next time.
     async fn cover_with_voucher(
         &self,
         peer_id: &str,
         hop: &VoucherHop,
         amount: u64,
-    ) -> Result<Covering, String> {
+        outgoing_expires_at: DateTime<Utc>,
+    ) -> Result<(Covering, u128), CoverError> {
         let Some(outbound) = self.outbound_channels.as_ref() else {
-            return Err(format!(
+            return Err(CoverError::Failed(format!(
                 "peer '{peer_id}' is paid over x402 channel {} and this node has no x402 \
                  batch-settlement backend to sign on",
                 hop.channel_id
-            ));
+            )));
         };
         let Some(presentation) = outbound.presentation(&hop.channel_id) else {
-            return Err(format!(
+            return Err(CoverError::Failed(format!(
                 "peer '{peer_id}' is paid over x402 channel {}, which this node's outbound \
                  channel journal does not hold",
                 hop.channel_id
+            )));
+        };
+        // PF-26: every wait below ends at the packet's outgoing expiry, and
+        // the expiry is read again after each one, so a packet that ran out
+        // of time while this forward queued, asked, or both is refused
+        // before anything is signed.
+        let Some(budget) = self.wait_budget(outgoing_expires_at) else {
+            return Err(CoverError::OutOfTime("before the channel's signing turn"));
+        };
+        let Ok(_signing) = tokio::time::timeout(budget, hop.signing.lock()).await else {
+            return Err(CoverError::OutOfTime(
+                "waiting for the channel's signing turn",
             ));
         };
         let now = self.now_unix();
-        let _signing = hop.signing.lock().await;
         if !hop.synced.load(Ordering::Acquire) {
+            // The ask is signed too, so the turn just waited for is checked
+            // against the expiry before its challenge is.
+            let Some(budget) = self.wait_budget(outgoing_expires_at) else {
+                return Err(CoverError::OutOfTime(
+                    "after waiting for the channel's signing turn",
+                ));
+            };
             let expires = now + PEER_CHALLENGE_TTL_SECS;
             let synced = match outbound.sign_challenge(&hop.channel_id, expires).await {
-                Ok(signature) => match hop
-                    .claim_state
-                    .watermark(&presentation, expires, &signature)
+                Ok(signature) => {
+                    match tokio::time::timeout(
+                        budget,
+                        hop.claim_state
+                            .watermark(&presentation, expires, &signature),
+                    )
                     .await
-                {
-                    Ok(remote) => outbound
-                        .raise_watermark(&hop.channel_id, remote)
-                        .await
-                        .map(|_| true)
-                        .map_err(|error| error.to_string()),
-                    Err(reason) => Err(reason),
-                },
+                    {
+                        // The ask was given up at the packet's own expiry:
+                        // the forward is refused, not carried on without it.
+                        // (An ask that FAILS inside the budget is the arm
+                        // below, and the forward carries on.)
+                        Err(_) => {
+                            return Err(CoverError::OutOfTime(
+                                "asking the next hop where the channel's watermark stands",
+                            ));
+                        }
+                        Ok(Ok(remote)) => {
+                            self.apply_receivers_watermark(outbound, hop, remote).await
+                        }
+                        Ok(Err(reason)) => Err(reason),
+                    }
+                }
                 Err(error) => Err(error.to_string()),
             };
             match synced {
-                Ok(_) => hop.synced.store(true, Ordering::Release),
+                Ok(synced) => hop.synced.store(synced, Ordering::Release),
                 Err(reason) => tracing::warn!(
                     peer_id,
                     channel = %hop.channel_id,
@@ -2958,6 +3266,13 @@ impl Connector {
                 ),
             }
         }
+        // The last point before anything is signed (PF-26): after the turn
+        // and the ask, and for a packet that moves no value as much as for
+        // one that does.
+        if self.wait_budget(outgoing_expires_at).is_none() {
+            return Err(CoverError::OutOfTime("before signing"));
+        }
+        let now = self.now_unix().max(now);
         if amount == 0 {
             // ADR 0075 decision 5: a packet that moves no value carries no
             // voucher, and carries the challenge so the far end can still
@@ -2966,46 +3281,161 @@ impl Connector {
             let signature = outbound
                 .sign_challenge(&hop.channel_id, expires)
                 .await
-                .map_err(|error| error.to_string())?;
-            return Ok(Covering::Challenge(
-                challenge_entry(&presentation, expires, &signature).to_string(),
+                .map_err(|error| CoverError::Failed(error.to_string()))?;
+            return Ok((
+                Covering::Challenge(
+                    challenge_entry(&presentation, expires, &signature).to_string(),
+                ),
+                0,
             ));
         }
         let signed = outbound.signed(&hop.channel_id).unwrap_or(0);
+        let cumulative = signed + u128::from(amount);
         let voucher = outbound
-            .sign_voucher(&hop.channel_id, signed + u128::from(amount))
+            .sign_voucher(&hop.channel_id, cumulative)
             .await
-            .map_err(|error| error.to_string())?;
-        Ok(Covering::Voucher(voucher_json(
-            &presentation,
-            &voucher,
-            &voucher_sender(&presentation),
-            &self
-                .clock
-                .now()
-                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                .to_string(),
-        )))
+            .map_err(|error| CoverError::Failed(error.to_string()))?;
+        Ok((
+            Covering::Voucher(voucher_json(
+                &presentation,
+                &voucher,
+                &voucher_sender(&presentation),
+                &self
+                    .clock
+                    .now()
+                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                    .to_string(),
+            )),
+            cumulative,
+        ))
     }
 
-    /// A voucher's verdict, as the next hop acknowledged it (ADR 0075
-    /// decision 6): one it did not accept sends the next forward to ask
-    /// the hop's `POST /ilp/claim-state` where the channel stands before
-    /// signing again, rather than signing above a watermark the hop
-    /// disagrees with. `NotSent` -- no ack read at all -- changes nothing.
-    fn note_voucher_ack(&self, peer_id: &str, ack: ClaimAckOutcome) {
-        if let ClaimAckOutcome::Rejected(reason) = ack {
-            if let Some(hop) = self.outbound_voucher_hops.load().get(peer_id) {
-                tracing::warn!(
-                    peer_id,
-                    channel = %hop.channel_id,
-                    ?reason,
-                    "the next hop refused this node's voucher; asking it where the channel \
-                     stands before the next one"
-                );
-                hop.synced.store(false, Ordering::Release);
-            }
+    /// What is left of a forward's budget to wait (PF-26): the time to the
+    /// packet's outgoing expiry, or `None` once that has passed.
+    fn wait_budget(&self, outgoing_expires_at: DateTime<Utc>) -> Option<std::time::Duration> {
+        forward_wait_budget(outgoing_expires_at, self.clock.now())?
+            .to_std()
+            .ok()
+    }
+
+    /// The `R00` a forward earns by running out of time at `wait` (PF-26),
+    /// in the style of PF-19's: the peer, the expiry and which wait it was.
+    /// This connector's own reject, so it carries no fee.
+    fn out_of_time_reject(
+        &self,
+        peer_id: &str,
+        outgoing_expires_at: DateTime<Utc>,
+        wait: &str,
+    ) -> Reject {
+        Reject {
+            code: RejectCode::r00_transfer_timed_out(),
+            triggered_by: String::new(),
+            message: format!(
+                "forwarding to peer '{peer_id}' ran out of time {wait}: the packet's outgoing \
+                 expiry, {}, had passed",
+                outgoing_expires_at.to_rfc3339()
+            ),
+            data: Vec::new(),
+            accumulated_cost: 0,
         }
+    }
+
+    /// Hand `outgoing` to the peer transport, waiting no longer than the
+    /// packet's outgoing expiry allows (PF-26) -- the one bound both
+    /// carriages are held to. A wait that ended at the expiry comes back
+    /// with this connector's own `R00` in place of the transport's
+    /// placeholder, and is otherwise an unanswered forward: no peer reached,
+    /// nothing acknowledged. A packet with no time left is never sent.
+    async fn forward_bounded(
+        &self,
+        peer_id: &str,
+        outgoing: Prepare,
+        covering: Covering,
+        outgoing_expires_at: DateTime<Utc>,
+        wait: &str,
+    ) -> PeerForward {
+        let mut answer = match self.wait_budget(outgoing_expires_at) {
+            Some(budget) => {
+                self.peer_transport
+                    .forward_within(peer_id, outgoing, Some(covering), budget)
+                    .await
+            }
+            None => PeerForward::ran_out_at_expiry(peer_id),
+        };
+        if answer.ran_out_at_expiry {
+            answer.response =
+                PacketResponse::Reject(self.out_of_time_reject(peer_id, outgoing_expires_at, wait));
+        }
+        answer
+    }
+
+    /// Bring this node's signed watermark on `hop`'s channel to the
+    /// `remote` figure the receiver reported; whether the hop is now synced.
+    /// Called with the hop's signing lock held.
+    ///
+    /// Ahead of this node, the watermark is raised. Behind it, it is lowered
+    /// only when a forward that rode a voucher was rejected and nothing has
+    /// been signed above that voucher since (`rejected_through`, the same
+    /// guard `ClientClaimGate::roll_back` applies): a concurrent forward's
+    /// voucher is never undercut, and the hop stays unsynced to be asked
+    /// again once it has landed or been rejected. With no reject to explain
+    /// it, a receiver behind this node's journal changes nothing.
+    async fn apply_receivers_watermark(
+        &self,
+        outbound: &OutboundChannels,
+        hop: &VoucherHop,
+        remote: u128,
+    ) -> Result<bool, String> {
+        let signed = outbound.signed(&hop.channel_id).unwrap_or(0);
+        let rejected_through = *hop.rejected_through.lock().expect("rejected lock poisoned");
+        if remote == signed || (remote < signed && rejected_through == 0) {
+            return Ok(true);
+        }
+        if remote < signed && signed > rejected_through {
+            return Ok(false);
+        }
+        outbound
+            .set_watermark(&hop.channel_id, remote)
+            .await
+            .map_err(|error| error.to_string())?;
+        *hop.rejected_through.lock().expect("rejected lock poisoned") = 0;
+        Ok(true)
+    }
+
+    /// How a forward that rode a voucher for `cumulative` ended (ADR 0075
+    /// decision 6, issue #1446). One the next hop did not accept, or any
+    /// REJECT at all -- whatever the ack said, and the `T01` this transport
+    /// synthesizes where the hop was never reached -- sends the next forward
+    /// to ask the hop's `POST /ilp/claim-state` where the channel stands
+    /// before signing again, and records that this voucher is one the answer
+    /// may take back. `NotSent` with a fulfilment changes nothing.
+    fn note_voucher_outcome(
+        &self,
+        peer_id: &str,
+        cumulative: u128,
+        ack: ClaimAckOutcome,
+        rejected: bool,
+    ) {
+        let refused = matches!(ack, ClaimAckOutcome::Rejected(_));
+        if !refused && !rejected {
+            return;
+        }
+        let Some(hop) = self.outbound_voucher_hops.load().get(peer_id).cloned() else {
+            return;
+        };
+        tracing::warn!(
+            peer_id,
+            channel = %hop.channel_id,
+            ?ack,
+            rejected,
+            "a forward that rode this node's voucher did not end as paid for; asking the next \
+             hop where the channel stands before the next one"
+        );
+        if rejected {
+            let mut through = hop.rejected_through.lock().expect("rejected lock poisoned");
+            *through = (*through).max(cumulative);
+        }
+        hop.synced.store(false, Ordering::Release);
     }
 
     /// Cover the terms `peer_id` just quoted, ready to ride one retry of the
@@ -3014,21 +3444,25 @@ impl Connector {
     /// its own quoted price once, on the same outbound x402 channel (ADR
     /// 0075 decision 6).
     ///
-    /// `None` -- with the reason logged, never silently -- when this node
-    /// has no outbound channel registered for the hop, or cannot sign on
-    /// it. The caller then relays the peer's refusal as it stands; nothing
-    /// is ever emitted claiming to have paid when it has not.
+    /// [`CoverError::Failed`] -- with the reason logged, never silently --
+    /// when this node has no outbound channel registered for the hop, or
+    /// cannot sign on it. The caller then relays the peer's refusal as it
+    /// stands; nothing is ever emitted claiming to have paid when it has
+    /// not. [`CoverError::OutOfTime`] when the packet ran out of time before
+    /// the retry could be signed: no second voucher exists and the caller
+    /// refuses `R00` (PF-26).
     async fn cover_greeted_packet(
         &self,
         peer_id: &str,
         terms: &X402PaymentRequired,
-    ) -> Option<Covering> {
+        outgoing_expires_at: DateTime<Utc>,
+    ) -> Result<(Covering, u128), CoverError> {
         let Some(hop) = self.outbound_voucher_hops.load().get(peer_id).cloned() else {
             tracing::warn!(
                 peer_id,
                 "peer quoted x402 terms but no outbound channel is registered to pay it on"
             );
-            return None;
+            return Err(CoverError::Failed(String::new()));
         };
         hop.synced.store(false, Ordering::Release);
         let Some(price) = terms.price() else {
@@ -3036,14 +3470,17 @@ impl Connector {
             // refuses an unreadable amount), and still not defaulted to
             // zero: a free ride is exactly what must not be inferred.
             tracing::warn!(peer_id, "peer quoted x402 terms with no readable price");
-            return None;
+            return Err(CoverError::Failed(String::new()));
         };
-        match self.cover_with_voucher(peer_id, &hop, price).await {
-            Ok(covering) => Some(covering),
-            Err(reason) => {
+        match self
+            .cover_with_voucher(peer_id, &hop, price, outgoing_expires_at)
+            .await
+        {
+            Err(CoverError::Failed(reason)) => {
                 tracing::warn!(peer_id, %reason, "could not sign a voucher covering the peer's terms");
-                None
+                Err(CoverError::Failed(reason))
             }
+            other => other,
         }
     }
 
@@ -3432,15 +3869,11 @@ impl Connector {
                     kind: ClientRouteKind::Forwarded,
                     request: self.peer_routes[index].request().cloned(),
                 },
-                // A runtime-pushed peer route (issue #884) carries no
-                // `request` table: it is written through the operator
-                // surface, not `[[routes]]`, so there is no config-file row
-                // for one to live on.
                 ConfiguredTarget::RuntimePeer(route) => ClientRouteFacts {
                     price: route.price(),
                     transport_policy: TransportPolicy::Both,
                     kind: ClientRouteKind::Forwarded,
-                    request: None,
+                    request: route.request().cloned(),
                 },
             })
     }
@@ -3548,6 +3981,26 @@ impl Connector {
             &request.target,
         )
         .is_err()
+    }
+
+    /// Whether any route this connector holds -- configured, runtime peer
+    /// or an active lease -- matches `destination`: the question
+    /// [`Self::handle_prepare`] answers `F02` to when the answer is no.
+    /// Decided without routing anything, so the client edge can ask it
+    /// *before* admitting a covering claim (issue #1446): a packet nothing
+    /// will carry must not spend the watermark it rode in on. The caller
+    /// adds the one source this connector cannot see, a client session
+    /// bound to the destination.
+    pub fn has_route(&self, destination: &str) -> bool {
+        if self.select_configured_route(destination).is_some() {
+            return true;
+        }
+        let leased_routes = self.leased_routes_snapshot();
+        let now = self.clock.now();
+        leased_routes.values().any(|route| {
+            !is_expired(route.expires_at(), now)
+                && select_route(destination, &[route.prefix()]).is_some()
+        })
     }
 
     /// Whether a strictly longer-prefix active lease beats the configured
@@ -4435,11 +4888,78 @@ mod tests {
                 assert_eq!(reject.code.as_str(), "R01");
                 assert!(reject.message.contains("10"), "{}", reject.message);
                 assert!(reject.message.contains('4'), "{}", reject.message);
+                // The refusing hop's own fee: a partial sum, stopped here.
+                assert_eq!(reject.accumulated_cost, 10);
             }
             other => panic!("expected a reject, got {other:?}"),
         }
         // Never forwarded a smaller amount hoping the far end would cope.
         assert!(second_hop_app_client.deliveries().is_empty());
+    }
+
+    /// A packet that pays the first fee-charging hop and not the second
+    /// comes back with both fees summed, and a packet carrying exactly that
+    /// sum is not refused `R01` by either hop.
+    #[tokio::test]
+    async fn an_r01_at_the_second_hop_sums_both_fees_and_that_sum_clears_it() {
+        let last_route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
+        let last_client = Arc::new(FakeAppClient::new());
+        last_client.respond(last_route.handler_url(), answered(b""));
+        let last = Arc::new(Connector::new(
+            vec![last_route],
+            vec![],
+            last_client,
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let mut to_last = InProcessPeerTransport::new();
+        to_last.add_peer("last", last);
+        let middle = Arc::new(covering(
+            Connector::new(
+                vec![],
+                vec![PeerRoute::new("g.example.app", "last")],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(to_last),
+                test_clock(),
+            )
+            .with_peer_fees([("last".to_string(), 10)]),
+            "last",
+        ));
+        let mut to_middle = InProcessPeerTransport::new();
+        to_middle.add_peer("middle", middle);
+        let first = covering(
+            Connector::new(
+                vec![],
+                vec![PeerRoute::new("g.example.app", "middle")],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(to_middle),
+                test_clock(),
+            )
+            .with_peer_fees([("middle".to_string(), 3)]),
+            "middle",
+        );
+
+        // 5 pays the first fee (3) and leaves 2, short of the second (10).
+        let reject = match first
+            .handle_prepare(prepare_with_amount("g.example.app", 5))
+            .await
+        {
+            PacketResponse::Reject(reject) => reject,
+            other => panic!("expected a reject, got {other:?}"),
+        };
+        assert_eq!(reject.code.as_str(), "R01");
+        assert_eq!(reject.accumulated_cost, 13);
+
+        let again = first
+            .handle_prepare(prepare_with_amount(
+                "g.example.app",
+                reject.accumulated_cost,
+            ))
+            .await;
+        assert!(
+            !matches!(&again, PacketResponse::Reject(r) if r.code.as_str() == "R01"),
+            "the returned figure must get past both hops: {again:?}"
+        );
     }
 
     // -- ADR 0042's cap: the largest amount this connector will forward to
@@ -4484,6 +5004,96 @@ mod tests {
             "second-hop",
         );
         (first_hop, second_hop_app_client)
+    }
+
+    /// #1466: the operator's own packet pays this node no fee, so what it
+    /// sends is what is forwarded -- shown against the cap, which is
+    /// measured on the forwarded amount, and against a fee larger than the
+    /// packet, which would otherwise be refused `R01`.
+    #[tokio::test]
+    async fn an_originated_packet_forwards_its_whole_amount_and_is_not_refused_for_the_fee() {
+        // Fee 10, cap 100. 105 from a client forwards 95 and clears the cap;
+        // originated, it forwards 105 and does not.
+        let (first_hop, _) = capped_hop_pair(10, vec![("second-hop".to_string(), 100)]);
+        let response = first_hop
+            .originate_prepare(prepare_with_amount("g.example.app", 105))
+            .await;
+        match response {
+            PacketResponse::Reject(reject) => {
+                assert_eq!(reject.code.as_str(), "T04");
+                assert!(reject.message.contains("105"), "{}", reject.message);
+            }
+            other => panic!("expected the cap to refuse 105, got {other:?}"),
+        }
+        let response = first_hop
+            .handle_prepare(prepare_with_amount("g.example.app", 105))
+            .await;
+        assert!(
+            matches!(response, PacketResponse::Fulfill(_)),
+            "a client's 105 forwards 95, under the cap: {response:?}"
+        );
+
+        // Amount 4 under a fee of 10: the client is refused R01, the
+        // operator's own packet is forwarded.
+        let (first_hop, second_hop_app_client) = capped_hop_pair(10, vec![]);
+        let response = first_hop
+            .handle_prepare(prepare_with_amount("g.example.app", 4))
+            .await;
+        assert!(matches!(&response, PacketResponse::Reject(r) if r.code.as_str() == "R01"));
+        assert!(second_hop_app_client.deliveries().is_empty());
+        let response = first_hop
+            .originate_prepare(prepare_with_amount("g.example.app", 4))
+            .await;
+        assert!(
+            matches!(response, PacketResponse::Fulfill(_)),
+            "{response:?}"
+        );
+        assert_eq!(second_hop_app_client.deliveries().len(), 1);
+    }
+
+    /// #1466: a reject relayed to the operator does not gain this node's
+    /// fee; the same reject relayed to a client does.
+    #[tokio::test]
+    async fn a_reject_relayed_to_the_operator_does_not_gain_this_nodes_fee() {
+        let second_hop = Arc::new(Connector::new(
+            vec![],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let mut peer_transport = InProcessPeerTransport::new();
+        peer_transport.add_peer("second-hop", second_hop);
+        let first_hop = covering(
+            Connector::new(
+                vec![],
+                vec![PeerRoute::new("g.example.app", "second-hop")],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(peer_transport),
+                test_clock(),
+            )
+            .with_peer_fees([("second-hop".to_string(), 10)]),
+            "second-hop",
+        );
+
+        for (originated, expected) in [(true, 0), (false, 10)] {
+            let prepare = prepare_with_amount("g.example.app", 100);
+            let response = if originated {
+                first_hop.originate_prepare(prepare).await
+            } else {
+                first_hop.handle_prepare(prepare).await
+            };
+            match response {
+                PacketResponse::Reject(reject) => {
+                    assert_eq!(reject.code.as_str(), "F02");
+                    assert_eq!(
+                        reject.accumulated_cost, expected,
+                        "originated: {originated}"
+                    );
+                }
+                other => panic!("expected a reject, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -5088,7 +5698,63 @@ mod tests {
         // `ceil((0 + 4) / (1/3))` = 12 incoming units, the smallest arrival
         // that leaves anything at all.
         assert!(reject.message.contains("12"), "{}", reject.message);
+        // The same figure, in the incoming leg's unit, as the cost.
+        assert_eq!(reject.accumulated_cost, 12);
         assert!(peer.carried().is_empty());
+
+        // Carrying exactly that figure is not refused `R01` by this hop.
+        let again = arrives_from_upstream(&hop, 12).await;
+        assert!(
+            !matches!(&again, PacketResponse::Reject(r) if r.code.as_str() == "R01"),
+            "12 incoming units must clear the hop: {again:?}"
+        );
+        assert_eq!(peer.carried().len(), 1);
+    }
+
+    /// An `R01` at a hop BEYOND a boundary, relayed back across it: the
+    /// refusing hop's fee in its own incoming unit, then the entry hop's
+    /// fee added and the whole un-converted into the sender's unit -- and a
+    /// packet carrying exactly that figure gets past both hops.
+    #[tokio::test]
+    async fn an_r01_beyond_a_boundary_sums_both_fees_in_the_senders_unit() {
+        let far = Arc::new(CarriesAndRemembers::quoting(0));
+        let middle = Arc::new(dealing_hop_over(
+            far.clone(),
+            &[(UPSTREAM, ANYONE), ("second-hop", USDC_SOLANA)],
+            // 0.001 USDC on Solana.
+            1_000,
+            u64::MAX,
+            Some(declaring(ANYONE, USDC_SOLANA, 1, USDC_TO_ANYONE)),
+            test_clock(),
+        ));
+        let entry = dealing_hop_over(
+            Arc::new(HandsOnNaming {
+                downstream: middle,
+                arrives_as: UPSTREAM.to_string(),
+            }),
+            &[(UPSTREAM, USDC), ("second-hop", ANYONE)],
+            // 0.001 ANYONE.
+            1_000_000_000_000_000,
+            u64::MAX,
+            Some(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
+            test_clock(),
+        );
+
+        // 500 USDC units pay the entry hop's 250 and leave 0.001 ANYONE,
+        // which converts to 250 of the middle hop's units, short of its
+        // 1000 fee.
+        let reject = refusal(arrives_from_upstream(&entry, 500).await);
+        assert_eq!(reject.code.as_str(), "R01");
+        // 1000 for the middle hop's fee and 250 for the entry hop's, in USDC.
+        assert_eq!(reject.accumulated_cost, 1_250);
+        assert!(far.carried().is_empty());
+
+        let again = arrives_from_upstream(&entry, reject.accumulated_cost).await;
+        assert!(
+            !matches!(&again, PacketResponse::Reject(r) if r.code.as_str() == "R01"),
+            "the returned figure must get past both hops: {again:?}"
+        );
+        assert_eq!(far.carried().len(), 1);
     }
 
     /// The other `None` [`amount_after_rate_and_fee`] answers, and the
@@ -7540,7 +8206,7 @@ mod tests {
             match response {
                 PacketResponse::Reject(reject) => {
                     assert_eq!(reject.code.as_str(), "F03");
-                    assert_eq!(reject.accumulated_cost, 0);
+                    assert_eq!(reject.accumulated_cost, 25);
                 }
                 other => panic!("expected an F03 reject, got {other:?}"),
             }
@@ -7792,6 +8458,7 @@ mod tests {
             match response {
                 PacketResponse::Reject(reject) => {
                     assert_eq!(reject.code.as_str(), "F03");
+                    assert_eq!(reject.accumulated_cost, charge);
                     assert!(
                         reject.message.contains(&charge.to_string()),
                         "the refusal must name what this packet costs, got: {}",
@@ -7857,9 +8524,11 @@ mod tests {
 
             match response {
                 Ok(PacketResponse::Reject(reject)) => {
-                    // The peer was never reached, so this hop adds nothing
-                    // -- the figure is honest about what was traversed.
-                    assert_eq!(reject.accumulated_cost, 0);
+                    // The probe's amount cannot pay this hop's fee, so the
+                    // hop refuses `R01` and reports that fee: the peer was
+                    // never reached, and the sum is partial.
+                    assert_eq!(reject.code.as_str(), "R01");
+                    assert_eq!(reject.accumulated_cost, 7);
                 }
                 other => panic!("expected a reject, got {other:?}"),
             }
@@ -8019,7 +8688,7 @@ mod tests {
                 .upsert_runtime_peer("runtime-hop", peering(0))
                 .unwrap();
             first_hop
-                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::FREE)
+                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::FREE, None)
                 .unwrap();
             let (sealed, shared_secret) = sealed_prepare(b"hello");
 
@@ -8057,12 +8726,85 @@ mod tests {
                 .upsert_runtime_peer("runtime-hop", peering(0))
                 .unwrap();
             connector
-                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::flat(25))
+                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::flat(25), None)
                 .unwrap();
 
             let facts = connector.client_route("g.example.app").unwrap();
             assert_eq!(facts.price, Price::flat(25));
             assert_eq!(facts.kind, ClientRouteKind::Forwarded);
+        }
+
+        /// ADR 0067: a runtime peer route's `request` is published through
+        /// `client_route` and `peer_routes_view` verbatim, a re-post
+        /// without one clears it, and a non-object is refused with the
+        /// table untouched.
+        #[test]
+        fn a_runtime_peer_routes_request_is_published_replaced_and_validated() {
+            let connector = covering(
+                Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    test_clock(),
+                ),
+                "runtime-hop",
+            );
+            connector
+                .upsert_runtime_peer("runtime-hop", peering(0))
+                .unwrap();
+            let request = serde_json::json!({ "any": { "keys": true } });
+            let view = connector
+                .upsert_runtime_peer_route(
+                    "g.example.app",
+                    "runtime-hop",
+                    Price::flat(25),
+                    Some(request.clone()),
+                )
+                .unwrap();
+            assert_eq!(view.request.as_ref(), Some(&request));
+            assert_eq!(
+                connector.client_route("g.example.app").unwrap().request,
+                Some(request.clone())
+            );
+            assert_eq!(
+                connector.peer_routes_view()[0].request.as_ref(),
+                Some(&request)
+            );
+
+            for bad in [
+                serde_json::json!("s"),
+                serde_json::json!(1),
+                serde_json::json!([]),
+                serde_json::json!(null),
+                serde_json::json!(true),
+            ] {
+                let error = connector
+                    .upsert_runtime_peer_route(
+                        "g.example.app",
+                        "runtime-hop",
+                        Price::FREE,
+                        Some(bad),
+                    )
+                    .unwrap_err();
+                assert!(matches!(error, PeerRouteTableError::InvalidRequest(_)));
+                assert!(error.to_string().contains("request"));
+            }
+            assert_eq!(
+                connector.client_route("g.example.app").unwrap().request,
+                Some(request)
+            );
+
+            connector
+                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::flat(25), None)
+                .unwrap();
+            assert_eq!(
+                connector.client_route("g.example.app").unwrap().request,
+                None
+            );
+            assert_eq!(connector.peer_routes_view()[0].request, None);
+            let json = serde_json::to_string(&connector.peer_routes_view()[0]).unwrap();
+            assert!(!json.contains("request"), "{json}");
         }
 
         /// The precedence rule (issue #884): a runtime write can never add,
@@ -8110,14 +8852,14 @@ mod tests {
             .with_config_peer_ids(["configured-peer".to_string()]);
 
             let error = connector
-                .upsert_runtime_peer_route("g.example.app", "configured-peer", Price::FREE)
+                .upsert_runtime_peer_route("g.example.app", "configured-peer", Price::FREE, None)
                 .unwrap_err();
             assert!(
                 matches!(error, PeerRouteTableError::OwnedByConfig(prefix) if prefix == "g.example.app")
             );
 
             let error = connector
-                .upsert_runtime_peer_route("g.example.peer", "configured-peer", Price::FREE)
+                .upsert_runtime_peer_route("g.example.peer", "configured-peer", Price::FREE, None)
                 .unwrap_err();
             assert!(
                 matches!(error, PeerRouteTableError::OwnedByConfig(prefix) if prefix == "g.example.peer")
@@ -8140,7 +8882,7 @@ mod tests {
             );
 
             let error = connector
-                .upsert_runtime_peer_route("g.example.app", "nobody", Price::FREE)
+                .upsert_runtime_peer_route("g.example.app", "nobody", Price::FREE, None)
                 .unwrap_err();
             assert!(matches!(
                 error,
@@ -8166,7 +8908,12 @@ mod tests {
             .with_config_peer_ids(["configured-peer".to_string()]);
 
             let view = connector
-                .upsert_runtime_peer_route("g.example.new", "configured-peer", Price::flat(10))
+                .upsert_runtime_peer_route(
+                    "g.example.new",
+                    "configured-peer",
+                    Price::flat(10),
+                    None,
+                )
                 .unwrap();
             assert_eq!(view.peer_id, "configured-peer");
             assert_eq!(view.source, RouteSource::Runtime);
@@ -8192,7 +8939,7 @@ mod tests {
                 .upsert_runtime_peer("runtime-hop", peering(0))
                 .unwrap();
             connector
-                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::FREE)
+                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::FREE, None)
                 .unwrap();
 
             let error = connector.remove_runtime_peer("runtime-hop").unwrap_err();
@@ -8304,7 +9051,7 @@ mod tests {
                 .upsert_runtime_peer("runtime-hop", peering(0))
                 .unwrap();
             connector
-                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::FREE)
+                .upsert_runtime_peer_route("g.example.app", "runtime-hop", Price::FREE, None)
                 .unwrap();
             let (sealed, shared_secret) = sealed_prepare(b"hello");
 
@@ -8345,7 +9092,12 @@ mod tests {
                 .upsert_runtime_peer("apex-relay-2", peering(3))
                 .unwrap();
             before_restart
-                .upsert_runtime_peer_route("g.example.relay2", "apex-relay-2", Price::flat(25))
+                .upsert_runtime_peer_route(
+                    "g.example.relay2",
+                    "apex-relay-2",
+                    Price::flat(25),
+                    None,
+                )
                 .unwrap();
             assert_eq!(before_restart.peers().len(), 1);
 
@@ -8402,7 +9154,8 @@ mod tests {
             let connector = covering(
                 Connector::new(
                     vec![],
-                    vec![PeerRoute::new("g.example.configured", "configured-peer")],
+                    vec![PeerRoute::new("g.example.configured", "configured-peer")
+                        .with_request(Some(serde_json::json!({ "protocol": "nip90" })))],
                     Arc::new(FakeAppClient::new()),
                     Arc::new(InProcessPeerTransport::new()),
                     test_clock(),
@@ -8415,7 +9168,12 @@ mod tests {
                 .upsert_runtime_peer("runtime-peer", peering(2))
                 .unwrap();
             connector
-                .upsert_runtime_peer_route("g.example.runtime", "runtime-peer", Price::flat(5))
+                .upsert_runtime_peer_route(
+                    "g.example.runtime",
+                    "runtime-peer",
+                    Price::flat(5),
+                    None,
+                )
                 .unwrap();
 
             let mut peers = connector.peers();
@@ -8452,12 +9210,14 @@ mod tests {
                         peer_id: "configured-peer".to_string(),
                         price: Price::FREE,
                         source: RouteSource::Config,
+                        request: Some(serde_json::json!({ "protocol": "nip90" })),
                     },
                     PeerRouteView {
                         prefix: "g.example.runtime".to_string(),
                         peer_id: "runtime-peer".to_string(),
                         price: Price::flat(5),
                         source: RouteSource::Runtime,
+                        request: None,
                     },
                 ]
             );
@@ -8477,7 +9237,7 @@ mod tests {
                 .unwrap();
 
             let error = connector
-                .upsert_runtime_peer_route("not an ilp address", "runtime-hop", Price::FREE)
+                .upsert_runtime_peer_route("not an ilp address", "runtime-hop", Price::FREE, None)
                 .unwrap_err();
             assert!(matches!(error, PeerRouteTableError::InvalidPrefix(_)));
         }
@@ -8553,7 +9313,7 @@ mod tests {
             .with_runtime_peer_route_store(store, peers, routes);
 
             let error = connector
-                .upsert_runtime_peer_route("g.example.runtime", "legacy-hop", Price::flat(25))
+                .upsert_runtime_peer_route("g.example.runtime", "legacy-hop", Price::flat(25), None)
                 .unwrap_err();
 
             assert!(
@@ -8632,6 +9392,8 @@ mod tests {
         struct Receiver {
             watermark: AtomicU64,
             asked: AtomicUsize,
+            /// Whether the receiver cannot be reached.
+            down: AtomicBool,
         }
 
         #[async_trait]
@@ -8644,6 +9406,9 @@ mod tests {
             ) -> Result<u128, String> {
                 assert!(!signature.is_empty(), "the ask is signed");
                 self.asked.fetch_add(1, Ordering::SeqCst);
+                if self.down.load(Ordering::SeqCst) {
+                    return Err("receiver unreachable".to_string());
+                }
                 Ok(u128::from(self.watermark.load(Ordering::SeqCst)))
             }
         }
@@ -8653,6 +9418,15 @@ mod tests {
         struct NextHop {
             covered: Mutex<Vec<Covering>>,
             ack: Mutex<ClaimAckOutcome>,
+            /// What the next forwards end in, front first; a fulfilment
+            /// once it is empty.
+            outcomes: Mutex<std::collections::VecDeque<Outcome>>,
+        }
+
+        enum Outcome {
+            Reject(RejectCode),
+            /// The transport never reached the peer (a synthesized `T01`).
+            Unreachable,
         }
 
         #[async_trait]
@@ -8669,6 +9443,22 @@ mod tests {
                     _ => ClaimAckOutcome::NotSent,
                 };
                 self.covered.lock().unwrap().push(covering);
+                match self.outcomes.lock().unwrap().pop_front() {
+                    Some(Outcome::Reject(code)) => {
+                        return PeerForward::answered(
+                            PacketResponse::Reject(Reject {
+                                code,
+                                triggered_by: String::new(),
+                                message: "refused".to_string(),
+                                data: Vec::new(),
+                                accumulated_cost: 0,
+                            }),
+                            ack,
+                        )
+                    }
+                    Some(Outcome::Unreachable) => return PeerForward::unreachable("next-hop"),
+                    None => {}
+                }
                 PeerForward::answered(
                     PacketResponse::Fulfill(Fulfill {
                         fulfillment: [7; 32],
@@ -8693,6 +9483,20 @@ mod tests {
         /// (`Close`) fake chain.
         async fn peered_on(
             exit: PayerExit,
+        ) -> (
+            Connector,
+            Arc<NextHop>,
+            Arc<Receiver>,
+            Arc<OutboundChannels>,
+            String,
+        ) {
+            peered_on_clock(exit, test_clock()).await
+        }
+
+        /// [`peered_on`], on a clock the test holds.
+        async fn peered_on_clock(
+            exit: PayerExit,
+            clock: Arc<TestClock>,
         ) -> (
             Connector,
             Arc<NextHop>,
@@ -8728,17 +9532,19 @@ mod tests {
             let next_hop = Arc::new(NextHop {
                 covered: Mutex::new(Vec::new()),
                 ack: Mutex::new(ClaimAckOutcome::Accepted),
+                outcomes: Mutex::new(std::collections::VecDeque::new()),
             });
             let receiver = Arc::new(Receiver {
                 watermark: AtomicU64::new(0),
                 asked: AtomicUsize::new(0),
+                down: AtomicBool::new(false),
             });
             let connector = Connector::new(
                 vec![],
                 vec![PeerRoute::new("g.example.next", "next-hop")],
                 Arc::new(FakeAppClient::new()),
                 Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
-                test_clock(),
+                clock,
             )
             .with_peer_fees([("next-hop".to_string(), FEE)])
             .with_outbound_channels(
@@ -8854,6 +9660,153 @@ mod tests {
             assert_eq!(voucher_amount(&next_hop.covered.lock().unwrap()[1]), 9_100);
         }
 
+        async fn voucher_amounts(next_hop: &NextHop) -> Vec<u128> {
+            next_hop
+                .covered
+                .lock()
+                .unwrap()
+                .iter()
+                .map(voucher_amount)
+                .collect()
+        }
+
+        /// Issue #1446: a packet the next hop rejected without admitting its
+        /// voucher is not paid for by the next voucher. The receiver reports
+        /// nothing held, so the payer signs the next voucher from there --
+        /// below its own journal.
+        #[tokio::test]
+        async fn a_rejected_forward_is_not_paid_for_by_the_next_voucher() {
+            let (connector, next_hop, _receiver, outbound, channel) = peered().await;
+            next_hop
+                .outcomes
+                .lock()
+                .unwrap()
+                .push_back(Outcome::Reject(RejectCode::f02_unreachable()));
+            assert!(matches!(
+                connector.handle_prepare(prepare(110)).await,
+                PacketResponse::Reject(_)
+            ));
+            assert!(matches!(
+                connector.handle_prepare(prepare(110)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            assert_eq!(voucher_amounts(&next_hop).await, vec![100, 100]);
+            assert_eq!(outbound.signed(&channel), Some(100));
+        }
+
+        /// The same where the peer was never reached: a locally synthesized
+        /// `T01`, whose voucher never left the process.
+        #[tokio::test]
+        async fn a_forward_that_never_reached_the_peer_is_not_paid_for_either() {
+            let (connector, next_hop, _receiver, _outbound, _channel) = peered().await;
+            next_hop
+                .outcomes
+                .lock()
+                .unwrap()
+                .push_back(Outcome::Unreachable);
+            connector.handle_prepare(prepare(110)).await;
+            assert!(matches!(
+                connector.handle_prepare(prepare(110)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            assert_eq!(voucher_amounts(&next_hop).await, vec![100, 100]);
+        }
+
+        /// A voucher refused as underpaying (`F03`) is not carried by the
+        /// next one.
+        #[tokio::test]
+        async fn a_voucher_refused_as_underpaying_is_not_carried_by_the_next() {
+            let (connector, next_hop, _receiver, _outbound, _channel) = peered().await;
+            *next_hop.ack.lock().unwrap() =
+                ClaimAckOutcome::Rejected(ClaimRejectReason::AmountNotAdvancing);
+            next_hop
+                .outcomes
+                .lock()
+                .unwrap()
+                .push_back(Outcome::Reject(RejectCode::f03_invalid_amount()));
+            connector.handle_prepare(prepare(110)).await;
+            *next_hop.ack.lock().unwrap() = ClaimAckOutcome::Accepted;
+            connector.handle_prepare(prepare(110)).await;
+            assert_eq!(voucher_amounts(&next_hop).await, vec![100, 100]);
+        }
+
+        /// A reject for a packet the receiver DID carry (a termination's
+        /// reject, ADR 0064) needs no special case: the receiver's report
+        /// includes that voucher, so the payer signs above it.
+        #[tokio::test]
+        async fn a_reject_for_a_carried_packet_is_still_paid_for() {
+            let (connector, next_hop, receiver, _outbound, _channel) = peered().await;
+            next_hop
+                .outcomes
+                .lock()
+                .unwrap()
+                .push_back(Outcome::Reject(RejectCode::f99_application_error()));
+            connector.handle_prepare(prepare(110)).await;
+            receiver.watermark.store(100, Ordering::SeqCst);
+            connector.handle_prepare(prepare(110)).await;
+            assert_eq!(voucher_amounts(&next_hop).await, vec![100, 200]);
+        }
+
+        /// A voucher rejected while a later one on the same channel has been
+        /// signed does not lower the watermark: a concurrent forward's
+        /// voucher is never signed below one still in flight.
+        #[tokio::test]
+        async fn a_rejection_never_lowers_below_a_later_voucher() {
+            let (connector, next_hop, receiver, outbound, channel) = peered().await;
+            let hop = connector.outbound_voucher_hops.load()["next-hop"].clone();
+            // Two forwards in flight at once: vouchers 100 and 200.
+            let (_, first) = connector
+                .cover_forward("next-hop", 100, far_future())
+                .await
+                .ok()
+                .unwrap();
+            let (_, second) = connector
+                .cover_forward("next-hop", 100, far_future())
+                .await
+                .ok()
+                .unwrap();
+            assert_eq!((first, second), (100, 200));
+            // The first is rejected; the receiver has seen neither.
+            connector.note_voucher_outcome("next-hop", first, ClaimAckOutcome::NotSent, true);
+            connector.handle_prepare(prepare(110)).await;
+            assert_eq!(voucher_amounts(&next_hop).await, vec![300]);
+            assert_eq!(outbound.signed(&channel), Some(300));
+            // Once for the first forward's initial sync, once after the reject.
+            assert_eq!(receiver.asked.load(Ordering::SeqCst), 2);
+            assert!(
+                !hop.synced.load(Ordering::SeqCst),
+                "not lowered, so the hop is asked again rather than believed"
+            );
+        }
+
+        /// When the receiver cannot be asked after a reject, behaviour is as
+        /// before: sign above this node's own journal, and ask again on the
+        /// forward after.
+        #[tokio::test]
+        async fn when_the_receiver_cannot_be_asked_the_payer_signs_above_its_journal() {
+            let (connector, next_hop, receiver, _outbound, _channel) = peered().await;
+            next_hop
+                .outcomes
+                .lock()
+                .unwrap()
+                .push_back(Outcome::Reject(RejectCode::f02_unreachable()));
+            connector.handle_prepare(prepare(110)).await;
+            receiver.down.store(true, Ordering::SeqCst);
+            let asked = receiver.asked.load(Ordering::SeqCst);
+            connector.handle_prepare(prepare(110)).await;
+            assert_eq!(receiver.asked.load(Ordering::SeqCst), asked + 1);
+            connector.handle_prepare(prepare(110)).await;
+            assert_eq!(
+                receiver.asked.load(Ordering::SeqCst),
+                asked + 2,
+                "asked again on the forward after"
+            );
+            assert_eq!(voucher_amounts(&next_hop).await, vec![100, 200, 300]);
+            receiver.down.store(false, Ordering::SeqCst);
+            connector.handle_prepare(prepare(110)).await;
+            assert_eq!(voucher_amounts(&next_hop).await[3], 400);
+        }
+
         /// ADR 0075 decision 5: a packet that moves no value carries no
         /// voucher, and carries the peer-role challenge so the next hop can
         /// attribute it to the peering; nothing is signed or journaled.
@@ -8874,6 +9827,35 @@ mod tests {
             assert_eq!(challenge["channelId"], channel.as_str());
             assert!(challenge["channelConfig"].is_object());
             assert_eq!(outbound.signed(&channel), Some(0), "nothing was signed");
+        }
+
+        /// #1466 on a peering that charges a fee: the operator's own packet
+        /// is covered for its whole amount, and one moving no value is
+        /// forwarded under the challenge rather than refused `R01`.
+        #[tokio::test]
+        async fn an_originated_packet_is_covered_for_its_whole_amount() {
+            let (connector, next_hop, _receiver, outbound, channel) = peered().await;
+            assert!(matches!(
+                connector.originate_prepare(prepare(110)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            assert_eq!(voucher_amounts(&next_hop).await, vec![110]);
+            assert_eq!(outbound.signed(&channel), Some(110));
+
+            assert!(matches!(
+                connector.originate_prepare(prepare(0)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            let covered = next_hop.covered.lock().unwrap().clone();
+            assert!(
+                matches!(covered.last(), Some(Covering::Challenge(_))),
+                "expected the challenge, got {covered:?}"
+            );
+            assert_eq!(
+                outbound.signed(&channel),
+                Some(110),
+                "nothing more was signed"
+            );
         }
 
         /// Removing the peering stops signing on its outbound channel, which
@@ -9185,6 +10167,968 @@ mod tests {
             );
 
             assert_eq!(connector.peer_asset("ambiguous"), None);
+        }
+
+        // ---- PF-26: a forward's waits end at its outgoing expiry ----
+
+        /// A packet with `seconds` left on the test clock's instant.
+        fn prepare_expiring_in(amount: u64, seconds: i64) -> Prepare {
+            Prepare {
+                expires_at: test_clock().now() + Duration::seconds(seconds),
+                ..prepare(amount)
+            }
+        }
+
+        /// What an x402 greeting quotes, as the carriages read it.
+        fn quoted_terms(price: u64) -> X402PaymentRequired {
+            connector_domain::x402::parse_greeting(
+                format!(
+                    r#"{{"x402Version":2,"resource":{{"url":"g.example.next"}},
+                    "extensions":{{"toon":{{"info":{{"amount":"{price}","ilpAddress":"g.example.next"}}}}}}}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("terms")
+        }
+
+        /// A receiver that answers only after `by` has passed on the clock the
+        /// connector reads.
+        struct AnswersAfter {
+            clock: Arc<TestClock>,
+            by: Duration,
+        }
+
+        #[async_trait]
+        impl VoucherStateSource for AnswersAfter {
+            async fn watermark(
+                &self,
+                _presentation: &ChannelPresentation,
+                _expires: u64,
+                _signature: &[u8],
+            ) -> Result<u128, String> {
+                self.clock.advance(self.by);
+                Ok(0)
+            }
+        }
+
+        /// A receiver that never answers.
+        struct Silent;
+
+        #[async_trait]
+        impl VoucherStateSource for Silent {
+            async fn watermark(
+                &self,
+                _presentation: &ChannelPresentation,
+                _expires: u64,
+                _signature: &[u8],
+            ) -> Result<u128, String> {
+                std::future::pending().await
+            }
+        }
+
+        /// A peer that never answers, behind a transport with an answer
+        /// timeout of its own -- what both carriages are, from here.
+        struct NeverAnswers {
+            answer_timeout: std::time::Duration,
+            sent: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl PeerTransport for NeverAnswers {
+            async fn forward(
+                &self,
+                peer_id: &str,
+                prepare: Prepare,
+                covering: Option<Covering>,
+            ) -> PeerForward {
+                self.forward_within(peer_id, prepare, covering, std::time::Duration::MAX)
+                    .await
+            }
+
+            async fn forward_within(
+                &self,
+                peer_id: &str,
+                _prepare: Prepare,
+                _covering: Option<Covering>,
+                budget: std::time::Duration,
+            ) -> PeerForward {
+                self.sent.fetch_add(1, Ordering::SeqCst);
+                let wait = crate::AnswerWait::new(self.answer_timeout, Some(budget));
+                let _ = tokio::time::timeout(wait.span, std::future::pending::<()>()).await;
+                if wait.ends_at_expiry {
+                    PeerForward::ran_out_at_expiry(peer_id)
+                } else {
+                    PeerForward::unreachable(peer_id)
+                }
+            }
+        }
+
+        /// A next hop that quotes terms on the first forward -- after the
+        /// clock has moved on by `by` -- and fulfils anything after.
+        struct GreetsThenFulfils {
+            clock: Arc<TestClock>,
+            by: Duration,
+            sent: AtomicUsize,
+            /// The cost the greeting's reject states: 0 from a node deployed
+            /// before the greeting stated its charge.
+            states: u64,
+        }
+
+        #[async_trait]
+        impl PeerTransport for GreetsThenFulfils {
+            async fn forward(
+                &self,
+                _peer_id: &str,
+                _prepare: Prepare,
+                _covering: Option<Covering>,
+            ) -> PeerForward {
+                if self.sent.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.clock.advance(self.by);
+                    return PeerForward::quoted(
+                        PacketResponse::Reject(Reject {
+                            code: RejectCode::f06_unexpected_payment(),
+                            triggered_by: String::new(),
+                            message: "pay".to_string(),
+                            data: Vec::new(),
+                            accumulated_cost: self.states,
+                        }),
+                        ClaimAckOutcome::NotSent,
+                        // What the forwarded packet itself carries: a retry
+                        // can only succeed on a packet that covers the price
+                        // (#1462).
+                        quoted_terms(100),
+                    );
+                }
+                PeerForward::answered(
+                    PacketResponse::Fulfill(Fulfill {
+                        fulfillment: [7; 32],
+                        data: Vec::new(),
+                    }),
+                    ClaimAckOutcome::Accepted,
+                )
+            }
+        }
+
+        /// A next hop that answers a fulfilment, having let the clock run past
+        /// the packet's expiry first: an answer already in hand is relayed.
+        struct AnswersLate {
+            clock: Arc<TestClock>,
+        }
+
+        #[async_trait]
+        impl PeerTransport for AnswersLate {
+            async fn forward(
+                &self,
+                _peer_id: &str,
+                _prepare: Prepare,
+                _covering: Option<Covering>,
+            ) -> PeerForward {
+                self.clock.advance(Duration::seconds(120));
+                PeerForward::answered(
+                    PacketResponse::Fulfill(Fulfill {
+                        fulfillment: [9; 32],
+                        data: b"late".to_vec(),
+                    }),
+                    ClaimAckOutcome::Accepted,
+                )
+            }
+        }
+
+        /// An expiry no test reaches.
+        fn far_future() -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2040, 1, 1, 0, 0, 0).unwrap()
+        }
+
+        fn reject_of(response: PacketResponse) -> Reject {
+            match response {
+                PacketResponse::Reject(reject) => reject,
+                other => panic!("expected a reject, got {other:?}"),
+            }
+        }
+
+        /// Everything the connector holds for `peering`, wired onto
+        /// `transport` and `receiver` instead of the defaults.
+        async fn peered_with(
+            clock: &Arc<TestClock>,
+            transport: Arc<dyn PeerTransport>,
+            receiver: Arc<dyn VoucherStateSource>,
+        ) -> (Connector, Arc<OutboundChannels>, String) {
+            let (_, _, _, outbound, channel) =
+                peered_on_clock(PayerExit::Withdrawal, Arc::clone(clock)).await;
+            let connector = Connector::new(
+                vec![],
+                vec![PeerRoute::new("g.example.next", "next-hop")],
+                Arc::new(FakeAppClient::new()),
+                transport,
+                Arc::clone(clock) as Arc<dyn Clock>,
+            )
+            .with_peer_fees([("next-hop".to_string(), FEE)])
+            .with_outbound_channels(
+                Arc::clone(&outbound),
+                vec![(SettlementChain::Evm, "eip155:31337".to_string())],
+            );
+            connector.insert_voucher_hop("next-hop", &channel, receiver);
+            (connector, outbound, channel)
+        }
+
+        /// PF-26: an ask answered after the packet's outgoing expiry refuses
+        /// the forward `R00`; nothing is signed, journaled or sent.
+        #[tokio::test]
+        async fn an_ask_answered_after_the_expiry_signs_nothing() {
+            let clock = test_clock();
+            let next_hop = Arc::new(NextHop {
+                covered: Mutex::new(Vec::new()),
+                ack: Mutex::new(ClaimAckOutcome::Accepted),
+                outcomes: Mutex::new(std::collections::VecDeque::new()),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
+                Arc::new(AnswersAfter {
+                    clock: Arc::clone(&clock),
+                    by: Duration::seconds(60),
+                }),
+            )
+            .await;
+
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(110, 30)).await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert!(reject.message.contains("next-hop"), "{}", reject.message);
+            assert!(
+                reject.message.contains("before signing"),
+                "{}",
+                reject.message
+            );
+            assert_eq!(reject.accumulated_cost, 0);
+            assert_eq!(outbound.signed(&channel), Some(0), "nothing was signed");
+            assert!(next_hop.covered.lock().unwrap().is_empty(), "nothing sent");
+        }
+
+        /// PF-26: an ask that never answers is given up at the outgoing
+        /// expiry, well before the peering's answer timeout.
+        #[tokio::test(start_paused = true)]
+        async fn an_ask_that_never_answers_is_given_up_at_the_expiry() {
+            let clock = test_clock();
+            let next_hop = Arc::new(NextHop {
+                covered: Mutex::new(Vec::new()),
+                ack: Mutex::new(ClaimAckOutcome::Accepted),
+                outcomes: Mutex::new(std::collections::VecDeque::new()),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
+                Arc::new(Silent),
+            )
+            .await;
+
+            let started = tokio::time::Instant::now();
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(110, 6)).await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert_eq!(
+                started.elapsed(),
+                std::time::Duration::from_secs(5),
+                "the outgoing expiry is the arriving one less the message window"
+            );
+            assert_eq!(outbound.signed(&channel), Some(0));
+            assert!(next_hop.covered.lock().unwrap().is_empty());
+        }
+
+        /// An ask that fails while the packet still has time is logged and
+        /// the forward carries on, as it did before PF-26.
+        #[tokio::test]
+        async fn an_ask_that_fails_with_time_left_carries_on() {
+            let (connector, next_hop, receiver, outbound, channel) = peered().await;
+            receiver.down.store(true, Ordering::SeqCst);
+
+            assert!(matches!(
+                connector.handle_prepare(prepare_expiring_in(110, 30)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            assert_eq!(receiver.asked.load(Ordering::SeqCst), 1);
+            assert_eq!(voucher_amounts(&next_hop).await, vec![100]);
+            assert_eq!(outbound.signed(&channel), Some(100));
+        }
+
+        /// PF-26: a peer that never answers, to a packet that expires before
+        /// the answer timeout, is answered `R00` at the outgoing expiry -- and
+        /// the voucher it carried is not paid for by the next one.
+        #[tokio::test(start_paused = true)]
+        async fn a_peer_that_never_answers_is_answered_r00_at_the_expiry() {
+            let clock = test_clock();
+            let transport = Arc::new(NeverAnswers {
+                answer_timeout: std::time::Duration::from_secs(30),
+                sent: AtomicUsize::new(0),
+            });
+            let receiver = Arc::new(Receiver {
+                watermark: AtomicU64::new(0),
+                asked: AtomicUsize::new(0),
+                down: AtomicBool::new(false),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&transport) as Arc<dyn PeerTransport>,
+                Arc::clone(&receiver) as Arc<dyn VoucherStateSource>,
+            )
+            .await;
+
+            let started = tokio::time::Instant::now();
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(110, 11)).await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(10));
+            assert!(reject.message.contains("next-hop"), "{}", reject.message);
+            assert!(
+                reject
+                    .message
+                    .contains("ran out of time waiting for the peer's answer"),
+                "{}",
+                reject.message
+            );
+            assert_eq!(reject.accumulated_cost, 0, "this connector's own reject");
+            assert_eq!(outbound.signed(&channel), Some(100), "the voucher was sent");
+
+            // And the next forward asks the receiver where it stands.
+            let asked = receiver.asked.load(Ordering::SeqCst);
+            connector.handle_prepare(prepare_expiring_in(110, 11)).await;
+            assert_eq!(receiver.asked.load(Ordering::SeqCst), asked + 1);
+        }
+
+        /// PF-26: the same peer, to a packet that outlives the answer timeout,
+        /// is `T01` at that timeout, as it always was.
+        #[tokio::test(start_paused = true)]
+        async fn a_peer_that_never_answers_is_t01_at_the_answer_timeout() {
+            let clock = test_clock();
+            let transport = Arc::new(NeverAnswers {
+                answer_timeout: std::time::Duration::from_secs(30),
+                sent: AtomicUsize::new(0),
+            });
+            let (connector, _outbound, _channel) = peered_with(
+                &clock,
+                Arc::clone(&transport) as Arc<dyn PeerTransport>,
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            let started = tokio::time::Instant::now();
+            let reject = reject_of(
+                connector
+                    .handle_prepare(prepare_expiring_in(110, 300))
+                    .await,
+            );
+
+            assert_eq!(reject.code, RejectCode::t01_peer_unreachable());
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(30));
+        }
+
+        /// PF-26: the default bound on a transport that has no carriage of its
+        /// own to tidy still ends the wait at the expiry.
+        #[tokio::test(start_paused = true)]
+        async fn the_default_bound_ends_a_wait_at_the_expiry() {
+            struct Hangs;
+            #[async_trait]
+            impl PeerTransport for Hangs {
+                async fn forward(
+                    &self,
+                    _peer_id: &str,
+                    _prepare: Prepare,
+                    _covering: Option<Covering>,
+                ) -> PeerForward {
+                    std::future::pending().await
+                }
+            }
+            let clock = test_clock();
+            let (connector, _outbound, _channel) = peered_with(
+                &clock,
+                Arc::new(Hangs),
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(110, 4)).await);
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+        }
+
+        /// PF-26: an answer that arrives inside the bound is relayed whatever
+        /// the clock says afterwards -- expiry is not checked against work
+        /// already done.
+        #[tokio::test]
+        async fn an_answer_inside_the_bound_is_relayed_unchanged() {
+            let clock = test_clock();
+            let (connector, _outbound, _channel) = peered_with(
+                &clock,
+                Arc::new(AnswersLate {
+                    clock: Arc::clone(&clock),
+                }),
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            let PacketResponse::Fulfill(fulfill) =
+                connector.handle_prepare(prepare_expiring_in(110, 30)).await
+            else {
+                panic!("a late-but-real answer is relayed");
+            };
+            assert_eq!(fulfill.data, b"late");
+        }
+
+        /// PF-26: a greeted forward whose packet ran out of time before the
+        /// retry is refused `R00`, and no second voucher is signed.
+        #[tokio::test]
+        async fn a_greeted_forward_out_of_time_signs_no_second_voucher() {
+            let clock = test_clock();
+            let transport = Arc::new(GreetsThenFulfils {
+                clock: Arc::clone(&clock),
+                by: Duration::seconds(60),
+                sent: AtomicUsize::new(0),
+                states: 0,
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&transport) as Arc<dyn PeerTransport>,
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(110, 30)).await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert_eq!(transport.sent.load(Ordering::SeqCst), 1, "no retry sent");
+            assert_eq!(
+                outbound.signed(&channel),
+                Some(100),
+                "only the first voucher exists"
+            );
+        }
+
+        /// ... and the same greeted forward with time to spare is retried once.
+        #[tokio::test]
+        async fn a_greeted_forward_with_time_left_is_still_retried() {
+            let clock = test_clock();
+            let transport = Arc::new(GreetsThenFulfils {
+                clock: Arc::clone(&clock),
+                by: Duration::seconds(1),
+                sent: AtomicUsize::new(0),
+                states: 0,
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&transport) as Arc<dyn PeerTransport>,
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            assert!(matches!(
+                connector.handle_prepare(prepare_expiring_in(110, 30)).await,
+                PacketResponse::Fulfill(_)
+            ));
+            assert_eq!(transport.sent.load(Ordering::SeqCst), 2);
+            // The first voucher's packet was refused unpaid (#1446), so the
+            // retry signs from where the receiver stands.
+            assert_eq!(outbound.signed(&channel), Some(100));
+        }
+
+        /// #1462: a greeted forward whose amount is below the quoted price is
+        /// not retried: no second voucher, and the reject names both figures.
+        #[tokio::test]
+        async fn a_greeted_forward_below_the_price_is_not_retried() {
+            let clock = test_clock();
+            let transport = Arc::new(GreetsThenFulfils {
+                clock: Arc::clone(&clock),
+                by: Duration::seconds(1),
+                sent: AtomicUsize::new(0),
+                states: 0,
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&transport) as Arc<dyn PeerTransport>,
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            // 105 less the peering's fee of 10 forwards 95, under the 100 quoted.
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(105, 30)).await);
+
+            assert_eq!(transport.sent.load(Ordering::SeqCst), 1, "no retry sent");
+            assert_eq!(
+                outbound.signed(&channel),
+                Some(95),
+                "only the first voucher"
+            );
+            assert!(
+                reject.message.contains("100") && reject.message.contains("95"),
+                "{}",
+                reject.message
+            );
+            // The peer stated no cost, so the quoted price stands in for it
+            // and this hop's fee of 10 is added on top.
+            assert_eq!(reject.accumulated_cost, 110);
+        }
+
+        /// #1481: a far side that already states its charge is not counted
+        /// twice by the decline.
+        #[tokio::test]
+        async fn a_declined_greeting_that_states_its_charge_is_not_counted_twice() {
+            let clock = test_clock();
+            let transport = Arc::new(GreetsThenFulfils {
+                clock: Arc::clone(&clock),
+                by: Duration::seconds(1),
+                sent: AtomicUsize::new(0),
+                states: 100,
+            });
+            let (connector, _outbound, _channel) = peered_with(
+                &clock,
+                Arc::clone(&transport) as Arc<dyn PeerTransport>,
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(105, 30)).await);
+
+            assert_eq!(transport.sent.load(Ordering::SeqCst), 1, "no retry sent");
+            assert_eq!(reject.accumulated_cost, 110);
+        }
+
+        /// PF-26: a forward that moves no value signs and sends no challenge
+        /// for a packet whose ask outlived it.
+        #[tokio::test]
+        async fn a_zero_value_forward_out_of_time_sends_no_challenge() {
+            let clock = test_clock();
+            let next_hop = Arc::new(NextHop {
+                covered: Mutex::new(Vec::new()),
+                ack: Mutex::new(ClaimAckOutcome::Accepted),
+                outcomes: Mutex::new(std::collections::VecDeque::new()),
+            });
+            let (connector, _outbound, _channel) = peered_with(
+                &clock,
+                Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
+                Arc::new(AnswersAfter {
+                    clock: Arc::clone(&clock),
+                    by: Duration::seconds(60),
+                }),
+            )
+            .await;
+            let connector = connector.with_peer_fees([("next-hop".to_string(), 0)]);
+
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(0, 30)).await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert!(next_hop.covered.lock().unwrap().is_empty(), "no challenge");
+        }
+
+        /// PF-26: a forward that waited for the channel's signing turn past
+        /// its outgoing expiry signs nothing.
+        #[tokio::test(start_paused = true)]
+        async fn a_forward_that_waited_for_the_signing_turn_past_the_expiry_signs_nothing() {
+            let clock = test_clock();
+            let next_hop = Arc::new(NextHop {
+                covered: Mutex::new(Vec::new()),
+                ack: Mutex::new(ClaimAckOutcome::Accepted),
+                outcomes: Mutex::new(std::collections::VecDeque::new()),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
+                Arc::new(Receiver {
+                    watermark: AtomicU64::new(0),
+                    asked: AtomicUsize::new(0),
+                    down: AtomicBool::new(false),
+                }),
+            )
+            .await;
+            let hop = connector
+                .outbound_voucher_hops
+                .load()
+                .get("next-hop")
+                .cloned()
+                .expect("the hop");
+            // Another forward holds the channel's turn for longer than this
+            // packet has.
+            let _turn = hop.signing.lock().await;
+
+            let reject = reject_of(connector.handle_prepare(prepare_expiring_in(110, 4)).await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert!(
+                reject.message.contains("signing turn"),
+                "{}",
+                reject.message
+            );
+            assert_eq!(outbound.signed(&channel), Some(0));
+            assert!(next_hop.covered.lock().unwrap().is_empty());
+        }
+
+        /// ... and one whose clock ran past the expiry while it queued is
+        /// refused at the last point before signing, whatever the lock said.
+        #[tokio::test]
+        async fn a_forward_whose_clock_ran_out_while_it_queued_signs_nothing() {
+            let clock = test_clock();
+            let next_hop = Arc::new(NextHop {
+                covered: Mutex::new(Vec::new()),
+                ack: Mutex::new(ClaimAckOutcome::Accepted),
+                outcomes: Mutex::new(std::collections::VecDeque::new()),
+            });
+            let (connector, outbound, channel) = peered_with(
+                &clock,
+                Arc::clone(&next_hop) as Arc<dyn PeerTransport>,
+                Arc::new(AnswersAfter {
+                    clock: Arc::clone(&clock),
+                    by: Duration::seconds(0),
+                }),
+            )
+            .await;
+            let hop = connector
+                .outbound_voucher_hops
+                .load()
+                .get("next-hop")
+                .cloned()
+                .expect("the hop");
+            // Synced already, so the ask is not what moves the clock: the
+            // turn is.
+            hop.synced.store(true, Ordering::SeqCst);
+            let turn = hop.signing.lock().await;
+            let forward = connector.handle_prepare(prepare_expiring_in(110, 30));
+            tokio::pin!(forward);
+            assert!(
+                tokio::time::timeout(std::time::Duration::ZERO, &mut forward)
+                    .await
+                    .is_err(),
+                "queued behind the turn"
+            );
+            clock.advance(Duration::seconds(60));
+            drop(turn);
+
+            let reject = reject_of(forward.await);
+
+            assert_eq!(reject.code, RejectCode::r00_transfer_timed_out());
+            assert_eq!(outbound.signed(&channel), Some(0));
+            assert!(next_hop.covered.lock().unwrap().is_empty());
+        }
+    }
+
+    /// ADR 0077: the packet history -- what it files for each packet
+    /// `toon_packets_total` counts, and that filing it never slows a packet.
+    mod packet_history {
+        use super::*;
+        use crate::packet_history::PacketHistory;
+
+        /// The history is filled by a collector task, so a read waits until
+        /// it holds `rows` rows.
+        async fn history_of(connector: &Connector, rows: usize) -> Vec<PacketRow> {
+            for _ in 0..500 {
+                let view = connector.packet_history(None);
+                if view.packets.len() >= rows {
+                    return view.packets;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("the history never reached {rows} rows");
+        }
+
+        fn app_connector(price: u64, capacity: usize) -> (Connector, Arc<FakeAppClient>) {
+            let route =
+                StaticRoute::new_priced("g.example.app", "http://localhost:4000", price).unwrap();
+            let app_client = Arc::new(FakeAppClient::new());
+            app_client.respond(route.handler_url(), answered(b"ok"));
+            let connector = connector_with(vec![route], app_client.clone(), test_clock())
+                .with_packet_history(capacity);
+            (connector, app_client)
+        }
+
+        /// A first hop forwarding `g.example.app` to a second hop that
+        /// terminates it, with a fee of 7 on that peering.
+        fn forwarding_hop(capacity: usize) -> Connector {
+            let route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
+            let app_client = Arc::new(FakeAppClient::new());
+            app_client.respond(route.handler_url(), answered(b""));
+            let second_hop = Arc::new(
+                Connector::new(
+                    vec![route],
+                    vec![],
+                    app_client,
+                    Arc::new(InProcessPeerTransport::new()),
+                    test_clock(),
+                )
+                .with_identity_signer(identity_signer()),
+            );
+            let mut transport = InProcessPeerTransport::new();
+            transport.add_peer("second-hop", second_hop);
+            covering(
+                Connector::new(
+                    vec![],
+                    vec![PeerRoute::new("g.example.app", "second-hop")],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(transport),
+                    test_clock(),
+                )
+                .with_peer_fees([("second-hop".to_string(), 7)])
+                .with_packet_history(capacity),
+                "second-hop",
+            )
+        }
+
+        #[tokio::test]
+        async fn a_node_with_no_history_answers_off_and_keeps_nothing() {
+            for capacity in [0, 5] {
+                let route = StaticRoute::new("g.example.app", "http://localhost:4000").unwrap();
+                let app_client = Arc::new(FakeAppClient::new());
+                app_client.respond(route.handler_url(), answered(b"ok"));
+                let connector = connector_with(vec![route], app_client, test_clock());
+                let connector = if capacity == 0 {
+                    connector.with_packet_history(0)
+                } else {
+                    connector
+                };
+                connector
+                    .handle_prepare(prepare("g.example.app", b"hi"))
+                    .await;
+                tokio::task::yield_now().await;
+                assert_eq!(connector.packet_history(None), PacketHistoryView::off());
+            }
+        }
+
+        #[tokio::test]
+        async fn a_delivery_names_the_channel_that_admitted_it() {
+            let (connector, _app) = app_connector(0, 10);
+
+            connector
+                .handle_prepare_with_client_channel(
+                    prepare_with_amount("g.example.app", 42),
+                    Some("evm:0xabc"),
+                )
+                .await;
+
+            let rows = history_of(&connector, 1).await;
+            let row = &rows[0];
+            assert_eq!(row.direction, Some(Direction::Delivered));
+            assert_eq!(row.destination, "g.example.app");
+            assert_eq!(row.from_channel.as_deref(), Some("evm:0xabc"));
+            assert_eq!(row.from_peer, None);
+            assert_eq!(row.to_peer, None);
+            assert_eq!(row.amount, 42);
+            assert_eq!(row.fee, None);
+            assert_eq!(row.outcome, Outcome::Fulfilled);
+            assert_eq!((row.code.as_deref(), row.message.as_deref()), (None, None));
+            let view = connector.packet_history(None);
+            assert!(view.enabled);
+            assert_eq!((view.capacity, view.dropped), (10, 0));
+            let json = serde_json::to_value(row).unwrap();
+            assert_eq!(json["time"], "2030-01-01T00:00:00.000Z");
+            assert_eq!(json["direction"], "delivered");
+            assert!(json.get("from_peer").is_none());
+        }
+
+        #[tokio::test]
+        async fn a_forward_names_both_peers_and_the_fee_it_kept() {
+            let hop = forwarding_hop(10);
+
+            let response = hop
+                .handle_peer_prepare(Some("upstream"), prepare_with_amount("g.example.app", 100))
+                .await;
+            assert!(matches!(response, PacketResponse::Fulfill(_)));
+
+            let rows = history_of(&hop, 1).await;
+            let row = &rows[0];
+            assert_eq!(row.direction, Some(Direction::Forwarded));
+            assert_eq!(row.from_peer.as_deref(), Some("upstream"));
+            assert_eq!(row.from_channel, None);
+            assert_eq!(row.to_peer.as_deref(), Some("second-hop"));
+            assert_eq!(row.amount, 100);
+            assert_eq!(row.fee, Some(7));
+            assert_eq!(row.outcome, Outcome::Fulfilled);
+            assert!(hop.metrics().encode().contains("toon_fees_earned_total 7"));
+        }
+
+        #[tokio::test]
+        async fn an_originated_packet_is_sent_and_earns_no_fee() {
+            let hop = forwarding_hop(10);
+
+            let response = hop
+                .originate_prepare(prepare_with_amount("g.example.app", 100))
+                .await;
+            assert!(matches!(response, PacketResponse::Fulfill(_)));
+
+            let rows = history_of(&hop, 1).await;
+            let row = &rows[0];
+            assert_eq!(row.direction, Some(Direction::Sent));
+            assert_eq!((&row.from_peer, &row.from_channel), (&None, &None));
+            assert_eq!(row.to_peer.as_deref(), Some("second-hop"));
+            assert_eq!(row.amount, 100);
+            assert_eq!(row.fee, None);
+        }
+
+        #[tokio::test]
+        async fn an_originated_packet_for_this_nodes_own_app_is_sent_with_no_peer() {
+            let (connector, _app) = app_connector(0, 10);
+
+            connector
+                .originate_prepare(prepare_with_amount("g.example.app", 5))
+                .await;
+
+            let rows = history_of(&connector, 1).await;
+            assert_eq!(rows[0].direction, Some(Direction::Sent));
+            assert_eq!(rows[0].to_peer, None);
+            assert_eq!(rows[0].outcome, Outcome::Fulfilled);
+        }
+
+        #[tokio::test]
+        async fn a_reject_carries_its_code_and_an_unroutable_arrival_no_direction() {
+            let connector = connector_with(vec![], Arc::new(FakeAppClient::new()), test_clock())
+                .with_packet_history(10);
+
+            connector.handle_prepare(prepare("g.nowhere", b"hi")).await;
+            let mut expired = prepare("g.nowhere", b"hi");
+            expired.expires_at = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
+            connector.handle_prepare(expired.clone()).await;
+            connector.originate_prepare(expired).await;
+
+            let rows = history_of(&connector, 3).await;
+            // Newest first: the originated expiry, the expiry, the no-route.
+            assert_eq!(rows[0].direction, Some(Direction::Sent));
+            assert_eq!(rows[0].code.as_deref(), Some("R00"));
+            assert_eq!(rows[1].direction, None);
+            assert_eq!(rows[1].code.as_deref(), Some("R00"));
+            assert_eq!(rows[1].message.as_deref(), Some("prepare has expired"));
+            assert_eq!(rows[2].direction, None);
+            assert_eq!(rows[2].code.as_deref(), Some("F02"));
+            assert!(rows[2].message.as_deref().unwrap().contains("g.nowhere"));
+            assert_eq!(rows[2].outcome, Outcome::Rejected);
+        }
+
+        #[tokio::test]
+        async fn an_underpriced_peer_arrival_is_a_delivered_reject_from_that_peer() {
+            let (connector, _app) = app_connector(25, 10);
+
+            connector
+                .handle_peer_prepare(Some("upstream"), prepare_with_amount("g.example.app", 10))
+                .await;
+
+            let rows = history_of(&connector, 1).await;
+            assert_eq!(rows[0].direction, Some(Direction::Delivered));
+            assert_eq!(rows[0].from_peer.as_deref(), Some("upstream"));
+            assert_eq!(rows[0].code.as_deref(), Some("F03"));
+            assert_eq!(rows[0].amount, 10);
+        }
+
+        #[tokio::test]
+        async fn the_history_gains_one_row_per_packet_the_counter_counts() {
+            let (connector, _app) = app_connector(25, 100);
+
+            connector
+                .handle_prepare(prepare_with_amount("g.example.app", 30))
+                .await;
+            connector
+                .handle_peer_prepare(Some("upstream"), prepare_with_amount("g.example.app", 1))
+                .await;
+            connector.handle_prepare(prepare("g.nowhere", b"x")).await;
+            connector
+                .originate_prepare(prepare_with_amount("g.example.app", 30))
+                .await;
+            // A probe answered at the edge is no packet at all.
+            connector.recognize_channel("evm:0xabc");
+            connector
+                .handle_probe("evm:0xabc", prepare("g.example.app", b"x"))
+                .await
+                .unwrap();
+
+            let rows = history_of(&connector, 4).await;
+            let counted = connector.metrics().encode();
+            assert!(counted.contains(r#"toon_packets_total{outcome="fulfill"} 2"#));
+            assert!(counted.contains(r#"toon_packets_total{outcome="reject"} 2"#));
+            assert_eq!(rows.len(), 4);
+            assert_eq!(connector.packet_history(None).dropped, 0);
+        }
+
+        #[tokio::test]
+        async fn the_history_keeps_only_its_capacity_and_limit_returns_the_newest() {
+            let (connector, _app) = app_connector(0, 3);
+
+            for amount in 1..=5 {
+                connector
+                    .handle_prepare(prepare_with_amount("g.example.app", amount))
+                    .await;
+            }
+            // Wait for the collector to have filed all five.
+            for _ in 0..500 {
+                if connector
+                    .packet_history(None)
+                    .packets
+                    .first()
+                    .map(|r| r.amount)
+                    == Some(5)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+
+            let amounts = |limit| {
+                connector
+                    .packet_history(limit)
+                    .packets
+                    .iter()
+                    .map(|row| row.amount)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(amounts(None), vec![5, 4, 3]);
+            assert_eq!(amounts(Some(2)), vec![5, 4]);
+            assert_eq!(connector.packet_history(None).dropped, 0);
+        }
+
+        // Multi-threaded: the stalled collector blocks its worker thread on
+        // the ring's lock, and a current-thread runtime has only the one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_packet_completes_while_the_history_cannot_take_a_row_and_is_counted_dropped() {
+            let (connector, _app) = app_connector(0, 10);
+            let stalled = connector.history.as_ref().unwrap().stall_collector();
+            // One row waits in the collector's hands, the queue holds the
+            // bound, and everything after that has nowhere to go.
+            let packets = PacketHistory::QUEUE_BOUND + 10;
+
+            for _ in 0..packets {
+                let response = connector
+                    .handle_prepare(prepare_with_amount("g.example.app", 1))
+                    .await;
+                assert!(matches!(response, PacketResponse::Fulfill(_)));
+                tokio::task::yield_now().await;
+            }
+
+            let dropped = connector.history.as_ref().unwrap().dropped();
+            assert!(dropped >= 9, "dropped was {dropped}");
+            drop(stalled);
+            let counted = connector.metrics().encode();
+            assert!(counted.contains(&format!(
+                r#"toon_packets_total{{outcome="fulfill"}} {packets}"#
+            )));
         }
     }
 }
