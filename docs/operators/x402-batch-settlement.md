@@ -9,7 +9,7 @@ channel lives in x402's audited `x402BatchSettlement` contract; on Solana in sol
 
 This page is for an operator with a priced route. It covers what a paying client does end to end,
 what your node does in return, every config key involved, who pays gas and why, and which tokens
-work. The README's [step 3](../../README.md#3-get-paid) is the short version.
+work. The guide's [step 3](../guide/get-paid.md) is the short version.
 
 The wire rules are [`client-edge-spec.md`](../protocol/client-edge-spec.md) §1.3, §1.4, §1.9, §1.10
 and §1.11. The keys are [`configuration-spec.md`](../protocol/configuration-spec.md). The exact
@@ -193,7 +193,7 @@ A channel's first accepted voucher journals the channel itself (`BatchChannelAdm
 
 `POST /channels/:id/land` lands an inbound channel's latest voucher now. It is the manual lever for
 planned maintenance. `GET /channels` and `GET /claims` show each channel with its direction,
-collateral and watermark. See the README's [operator surface](../../README.md#the-operator-surface).
+collateral and watermark. See the guide to the [operator surface](../guide/operator-surface.md).
 
 The one-day default minimum for `withdrawDelay` and `grace_period` is the window a delayed or
 censored landing transaction still has. Lowering it toward the 900-second floor narrows that

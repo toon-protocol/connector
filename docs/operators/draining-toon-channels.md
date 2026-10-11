@@ -190,8 +190,8 @@ With the journal clear, pull the release you actually want to run and rewrite
   `voucher_signer`, chain read from the spelling, optional
   `inbound_channel`) and every `[[pay_channels]]` row to the new shape
   (`peer_id` + `outbound_channel`, already opened via `POST /channels` and
-  journaled + `client_edge_url`) — see the top-level
-  [`README.md`](../../README.md#4-peer-with-another-node) and
+  journaled + `client_edge_url`) — see the
+  [peering guide](../guide/peering.md) and
   [`configuration-spec.md`](../protocol/configuration-spec.md) §2.4.
 
 See [the release notes](../releases/x402-only.md) for the full before-and-after

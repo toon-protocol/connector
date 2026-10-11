@@ -8,7 +8,7 @@ or make any other write, from a shell or a CI job rather than a browser.
 
 ## The gap this closes
 
-`docs/protocol/operator-spec.md` and the README's ["Signing a write"](../../README.md#signing-a-write)
+`docs/protocol/operator-spec.md` and the operator-surface guide's ["Signing a write"](../guide/operator-surface.md#signing-a-write)
 section state the rule: a write needs an RFC 9421 HTTP Message Signature, `alg="ed25519"`, over
 exactly `@method`, `@path` and `content-digest`, from a key on `[operator] write_keys`, with an RFC
 9530 `Content-Digest` binding the body. What neither ever gave you was something that produces one.
@@ -67,9 +67,9 @@ Content-Digest: sha-256=:...:
 ```
 
 `fee` and `max_packet_amount` are the calling operator's own policy about this counterparty — see
-the README's [Peering](../../README.md#peering) section for what each means. A `502` back means the
+the [Peering](../guide/peering.md) guide for what each means. A `502` back means the
 URL was unreachable, redirected, or described a node with no shared settlement chain — "about them,"
-in the README's own words; a `400` is about the request itself.
+in that guide's own words; a `400` is about the request itself.
 
 ## How it works
 
