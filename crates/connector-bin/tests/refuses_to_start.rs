@@ -1563,3 +1563,111 @@ btp_endpoint = "wss://node.example/ilp/btp"
         );
     }
 }
+
+fn state_dir_config(key_file: &std::path::Path, state_dir: Option<&std::path::Path>) -> String {
+    let state_dir = state_dir.map_or_else(String::new, |dir| {
+        format!("state_dir = \"{}\"", dir.display())
+    });
+    format!(
+        r#"
+client_edge_addr = "127.0.0.1:0"
+{state_dir}
+
+[signer]
+key_file = "{key_file}"
+"#,
+        key_file = key_file.display(),
+    )
+}
+
+/// Every file under `dir` with its bytes, so a test can say a second
+/// process left the first one's files exactly as they were.
+fn files_with_contents(dir: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .expect("read state_dir")
+        .map(|entry| {
+            let path = entry.expect("dir entry").path();
+            (
+                path.file_name().expect("file name").to_owned(),
+                std::fs::read(&path).expect("read file"),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Issue #1318: a second process over a live node's `state_dir` refuses to
+/// start, naming the directory, and leaves the first one's files alone.
+#[tokio::test]
+async fn a_second_process_over_a_held_state_dir_refuses_to_start() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    // A journal with a line in it, so a truncation or rewrite would show.
+    write_journal(
+        state_dir.path(),
+        "client-edge-claims.log",
+        &[connector_domain::JournalEntry::OutboundVoucherSigned {
+            channel_id: format!("evm:0x{}", "cd".repeat(32)),
+            cumulative_amount: 10,
+        }],
+    );
+    let first_config = write_config(&state_dir_config(key_file.path(), Some(state_dir.path())));
+    let mut first = spawn(first_config.path());
+    let first_addr = wait_for_listen_addr(&mut first);
+    let before = files_with_contents(state_dir.path());
+
+    // A different ephemeral port is what the config's `:0` already gives:
+    // only the lock can be what stops this one.
+    let second_config = write_config(&state_dir_config(key_file.path(), Some(state_dir.path())));
+    let output = run(Some(second_config.path()));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&state_dir.path().display().to_string())
+            && stderr.contains("held by another connector process"),
+        "expected the error to name the held state_dir, got: {stderr}"
+    );
+    assert_eq!(files_with_contents(state_dir.path()), before);
+    let response = reqwest::get(format!("http://{first_addr}/ilp"))
+        .await
+        .expect("the first node is still serving");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _ = first.kill();
+    let _ = first.wait();
+}
+
+/// The lock is the operating system's, so a node killed outright leaves
+/// nothing to clean up.
+#[test]
+fn a_killed_node_leaves_its_state_dir_free_to_boot() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let config = write_config(&state_dir_config(key_file.path(), Some(state_dir.path())));
+    let mut first = spawn(config.path());
+    wait_for_listen_addr(&mut first);
+    first.kill().expect("SIGKILL the first node");
+    first.wait().expect("reap the first node");
+
+    let mut second = spawn(config.path());
+    wait_for_listen_addr(&mut second);
+    let _ = second.kill();
+    let _ = second.wait();
+}
+
+/// A node with no `state_dir` takes no lock: two of them both serve.
+#[test]
+fn two_nodes_without_a_state_dir_both_serve() {
+    let key_file = write_raw_key_file();
+    let config = write_config(&state_dir_config(key_file.path(), None));
+    let mut first = spawn(config.path());
+    let mut second = spawn(config.path());
+    let first_addr = wait_for_listen_addr(&mut first);
+    let second_addr = wait_for_listen_addr(&mut second);
+    assert_ne!(first_addr, second_addr);
+    for child in [&mut first, &mut second] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
