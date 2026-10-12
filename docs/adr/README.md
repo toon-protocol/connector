@@ -1,6 +1,6 @@
 # Architecture decision records
 
-78 records. **Every one now carries a `**Status:**` line under its title** — that line, not this
+79 records. **Every one now carries a `**Status:**` line under its title** — that line, not this
 index, is the authority for whether a record is live. This page is the map: what is live, grouped
 by area; what is dead, grouped by what killed it; and what the folder still says that the code no
 longer does.
@@ -17,7 +17,7 @@ The numbers are permanent and are never reused or renumbered — they are cited 
 times across this repo and from `toon-meta`, `relay` and `store`. This index groups them by
 scope; it does not move them.
 
-> **0065 is taken twice, and stays that way.** Seventy-eight records, seventy-seven numbers.
+> **0065 is taken twice, and stays that way.** Seventy-nine records, seventy-eight numbers.
 > [_A price is a schedule over payload length_](0065-a-price-is-a-schedule-over-payload-length.md)
 > (#984) and [_Mina leaves the repository_](0065-mina-leaves-the-repository.md) (#1205) were both
 > written on branches cut while 0064 was the folder's highest number, and both landed on `main` on
@@ -101,7 +101,7 @@ not change what anything else must do.
 | [0005](0005-claims-are-truth-balances-are-a-projection.md)                                   | Claims are the source of truth; balances are a projection                    | Accepted, amended by 0033 and 0074; amended by 0075 (voucher watermark only; outbound channel config)                                                          |
 | [0006](0006-the-connector-is-mechanism-not-policy.md)                                        | The connector is mechanism; discovery and route policy live outside it       | Accepted — restored in full by 0043                                                                                                                            |
 | [0007](0007-testing-doctrine-fakes-yes-mocks-no.md)                                          | Property tests over a pure core; fakes are allowed, mocks are not            | Accepted                                                                                                                                                       |
-| [0008](0008-operator-surface-splits-read-from-write.md)                                      | The operator surface splits read authority from write authority              | Accepted — extended by 0066                                                                                                                                    |
+| [0008](0008-operator-surface-splits-read-from-write.md)                                      | The operator surface splits read authority from write authority              | Accepted — extended by 0066, 0078                                                                                                                              |
 | [0009](0009-one-typed-config-file-no-environment-layer.md)                                   | Configuration is one typed file with no environment-variable layer           | Accepted — extended by 0034; amended by #1057                                                                                                                  |
 | [0012](0012-a-signer-and-a-treasury-not-a-wallet.md)                                         | The connector holds a signer and a treasury, not a wallet                    | Accepted in part — the treasury half is gone                                                                                                                   |
 | [0014](0014-metrics-surface-and-packet-correlated-logs.md)                                   | The metrics surface is decided, not accreted                                 | Accepted, amended by 0033 and 0069 (cross-hop correlation by execution condition is retired, not replaced) and 0077 (a read beside the metrics, no new metric) |
@@ -115,6 +115,7 @@ not change what anything else must do.
 | [0063](0063-the-ilp-packet-is-toons-dialect-not-rfc-0027s.md)                                | The ILP packet is TOON's dialect, not RFC 0027's                             | Accepted — ratifies the shipped encoding (#1174)                                                                                                               |
 | [0066](0066-the-operator-dashboard-is-a-page-the-surface-serves-and-signs-in-the-browser.md) | The operator dashboard is a page the surface serves; it signs in the browser | Accepted — **built**; extends 0008; amended by 0077 (the node keeps a bounded packet history)                                                                  |
 | [0077](0077-the-node-keeps-a-bounded-packet-history-for-watching.md)                         | The node keeps a bounded packet history, for watching and for nothing else   | Accepted — **built** (#1477); amends 0066 and 0014                                                                                                             |
+| [0078](0078-a-controllers-write-key-carries-a-scope-and-two-limits.md)                       | A controller's write key carries a scope and two limits                      | Accepted (2026-10-11, #1485) — **not yet built**; extends 0008                                                                                                 |
 
 ---
 
