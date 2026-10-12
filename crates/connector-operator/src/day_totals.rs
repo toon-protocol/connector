@@ -61,7 +61,7 @@ impl fmt::Display for SpendRefusal {
         match self {
             SpendRefusal::OverPacket { amount, limit } => write!(
                 f,
-                "spending limit: a packet of {amount} is above this key's per-packet figure of {limit} (ADR 0078)"
+                "spending-limit: a packet of {amount} is above this key's per-packet figure of {limit} (ADR 0078)"
             ),
             SpendRefusal::OverDay {
                 amount,
@@ -69,11 +69,11 @@ impl fmt::Display for SpendRefusal {
                 limit,
             } => write!(
                 f,
-                "spending limit: a packet of {amount} would take this key's total for the UTC day from {counted} above its per-day figure of {limit} (ADR 0078)"
+                "spending-limit: a packet of {amount} would take this key's total for the UTC day from {counted} above its per-day figure of {limit} (ADR 0078)"
             ),
             SpendRefusal::Unrecorded(error) => write!(
                 f,
-                "spending limit: this key's count could not be journaled ({error}), so the packet is refused (ADR 0078)"
+                "spending-limit: this key's count could not be journaled ({error}), so the packet is refused (ADR 0078)"
             ),
         }
     }
@@ -120,6 +120,9 @@ impl std::error::Error for DayTotalsError {}
 struct Inner {
     file: File,
     totals: HashMap<(CountKind, String, String), u64>,
+    /// Set when a failed append could not be rolled back: the file may end in
+    /// a torn line the next append would glue onto, so nothing more counts.
+    broken: Option<String>,
 }
 
 /// Per-key, per-UTC-day running totals, durable across restarts.
@@ -164,8 +167,29 @@ impl DayTotals {
         }
         Ok(DayTotals {
             clock,
-            inner: Mutex::new(Inner { file, totals }),
+            inner: Mutex::new(Inner {
+                file,
+                totals,
+                broken: None,
+            }),
         })
+    }
+
+    /// A journal whose appends fail: replayed from `path` like any other,
+    /// then holding a read-only handle on it, so every write is refused by the
+    /// operating system rather than by a stand-in (ADR 0007).
+    #[cfg(test)]
+    pub(crate) fn unwritable(
+        path: &Path,
+        clock: Arc<dyn Clock>,
+    ) -> Result<DayTotals, DayTotalsError> {
+        let totals = DayTotals::open(path, clock)?;
+        totals.inner.lock().expect("day totals lock poisoned").file =
+            File::open(path).map_err(|source| DayTotalsError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Ok(totals)
     }
 
     fn today(&self) -> String {
@@ -197,8 +221,13 @@ impl DayTotals {
                 limit: limit.per_write,
             });
         }
-        let day = self.today();
         let mut inner = self.inner.lock().expect("day totals lock poisoned");
+        if let Some(error) = &inner.broken {
+            return Err(SpendRefusal::Unrecorded(error.clone()));
+        }
+        // Read under the lock, so a count is never made against a day another
+        // writer has already moved past.
+        let day = self.today();
         let slot = (CountKind::Spending, key.to_string(), day.clone());
         let counted = inner.totals.get(&slot).copied().unwrap_or(0);
         match counted.checked_add(amount) {
@@ -220,12 +249,77 @@ impl DayTotals {
         // One `write_all`, so the line and its newline reach the file together.
         let mut line = serde_json::to_string(&record).expect("a count record serialises");
         line.push('\n');
-        inner
-            .file
+        let file = &mut inner.file;
+        let before = file
+            .metadata()
+            .map_err(|error| SpendRefusal::Unrecorded(error.to_string()))?
+            .len();
+        if let Err(error) = file
             .write_all(line.as_bytes())
-            .and_then(|()| inner.file.sync_data())
-            .map_err(|error| SpendRefusal::Unrecorded(error.to_string()))?;
+            .and_then(|()| file.sync_data())
+        {
+            // A partial line left on disk would be glued to the next one and
+            // refuse the next boot, and a refused packet is never sent, so its
+            // bytes are cut off again. If they cannot be, nothing more counts.
+            if let Err(truncate) = file.set_len(before) {
+                inner.broken = Some(format!(
+                    "{error}; the partial line could not be removed: {truncate}"
+                ));
+            }
+            return Err(SpendRefusal::Unrecorded(error.to_string()));
+        }
         inner.totals.insert(slot, counted + amount);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use connector_runtime::TestClock;
+
+    fn clock() -> Arc<dyn Clock> {
+        use chrono::TimeZone;
+        Arc::new(TestClock::new(
+            chrono::Utc.with_ymd_and_hms(2030, 1, 1, 12, 0, 0).unwrap(),
+        ))
+    }
+
+    const LIMIT: SpendingLimit = SpendingLimit {
+        per_write: 10,
+        per_day: 100,
+    };
+
+    #[test]
+    fn a_count_that_cannot_be_appended_is_refused_and_moves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("totals");
+        DayTotals::open(&path, clock())
+            .unwrap()
+            .count_spending("k", 4, LIMIT)
+            .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let totals = DayTotals::unwritable(&path, clock()).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                totals.count_spending("k", 1, LIMIT),
+                Err(SpendRefusal::Unrecorded(_))
+            ));
+        }
+        assert_eq!(totals.spent_today("k"), 4);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(DayTotals::open(&path, clock()).unwrap().spent_today("k"), 4);
+    }
+
+    #[test]
+    fn a_corrupt_journal_refuses_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("totals");
+        std::fs::write(&path, "{\"kind\":\"spending\",\"key\":\"k\"\n").unwrap();
+        assert!(matches!(
+            DayTotals::open(&path, clock()),
+            Err(DayTotalsError::Corrupt { line: 1, .. })
+        ));
     }
 }

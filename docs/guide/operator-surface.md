@@ -73,7 +73,7 @@ A scope is a non-empty list of named writes: `packets`, `peers` (`POST /peers`,
 restart.
 
 A write from a restricted key outside its scope, or after its `expires`, is answered
-**`403`** with a body naming the reason (`scope`, `expiry` or `spending limit`), before anything is
+**`403`** with a body naming the reason (`scope`, `expiry` or `spending-limit`), before anything is
 signed, journaled or sent. It is not in `GET /audit-log`; it is a log line and a count
 on `toon_writes_refused_total{reason}`. `401` stays the answer to a missing, bad,
 replayed or unlisted signature. `GET /write-keys` lists every write key — its key

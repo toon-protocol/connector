@@ -3562,7 +3562,7 @@ mod tests {
 
             let (status, body) = send(&app, &key, 11).await;
             assert_eq!(status, StatusCode::FORBIDDEN);
-            assert!(body.contains("spending limit"), "{body}");
+            assert!(body.starts_with("spending-limit:"), "{body}");
             assert_eq!(counted_today(&app).await, 0);
             assert_eq!(read(&app, "/audit-log").await, "[]");
 
@@ -3679,12 +3679,34 @@ mod tests {
 
         #[tokio::test]
         async fn a_count_that_cannot_be_journaled_refuses_the_packet() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("totals");
+            let clock = Arc::new(TestClock::new(day(1)));
             let key = Keypair::generate(&mut OsRng);
-            let app = app(vec![], vec![controller(&key, limit(10, 100))], None);
+            let connector = Arc::new(Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            ));
+            let app = router_with_controller_keys(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                vec![],
+                vec![controller(&key, limit(10, 100))],
+                Some(DayTotals::unwritable(&path, clock).expect("journal opens")),
+                None,
+                None,
+            );
             let (status, body) = send(&app, &key, 1).await;
             assert_eq!(status, StatusCode::FORBIDDEN);
             assert!(body.contains("journaled"), "{body}");
             assert_eq!(read(&app, "/audit-log").await, "[]");
+            assert_eq!(counted_today(&app).await, 0);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
         }
 
         #[tokio::test]
