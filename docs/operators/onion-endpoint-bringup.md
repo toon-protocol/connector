@@ -200,7 +200,8 @@ in your head and in the same review:
 A persisted `HiddenServiceDir` keeps the address across container and host restarts. It does **not**
 keep it across an `anon` upgrade that crosses a TLD era (#1320). A v3 address is
 `base32(PUBKEY ‖ CHECKSUM ‖ VERSION)` with `CHECKSUM = SHA3_256(prefix ‖ PUBKEY ‖ VERSION)[:2]`, and
-the prefix is inside the hash, so the same `hs_ed25519_secret_key` yields a different address in each era:
+the prefix is inside the hash, so the same `hs_ed25519_secret_key` yields a different address in
+each era:
 
 | `anon` tag | TLD       | checksum prefix    |
 | ---------- | --------- | ------------------ |
@@ -208,11 +209,12 @@ the prefix is inside the hash, so the same `hs_ed25519_secret_key` yields a diff
 | v0.4.9.13  | `.anon`   | `.anon checksum`   |
 | v0.4.10.2  | `.anyone` | `.anyone checksum` |
 
-The new daemon silently rewrites `hostname` and leaves the key file untouched. The address changes in
-the TLD and in characters 52–55 only — the public key is the first 51, and the 56th encodes the
-version — so the old and new addresses look almost the same. Treat such an upgrade as an **address
-rotation**, not a routine version bump: every counterparty holding the old address dials a dead
-endpoint, so coordinate it with all of them beforehand.
+(v0.4.9.13's `.anon` is not a host the connector accepts; it is listed because a daemon may pass
+through it.) The new daemon silently rewrites `hostname` and leaves the key file untouched. The
+address changes in the TLD and in characters 52–55 only — the first 51 are the public key alone, and
+the 56th encodes the version — so the old and new addresses look almost the same. Treat such an
+upgrade as an **address rotation**, not a routine version bump: every counterparty holding the old
+address dials a dead endpoint, so coordinate it with all of them beforehand.
 
 Use a **named volume**, not a path in the writable layer and not a host bind mount you have to
 `chown` — the same argument that puts `/app/state` on one. Back it up if losing the address would
@@ -432,5 +434,5 @@ through costs nothing.
 
 Neither rollback touches the daemon, the volume or the address. Leaving the sidecar running with its
 `HiddenServiceDir` intact is what makes the next attempt cheap — the address is the expensive thing
-to lose, and it is the one thing here nothing can regenerate for you (short of an `anon` upgrade across a TLD era, which
-replaces it — step 3).
+to lose, and it is the one thing here nothing can regenerate for you (short of an `anon` upgrade
+across a TLD era, which replaces it — step 3).
