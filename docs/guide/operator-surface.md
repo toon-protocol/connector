@@ -63,6 +63,11 @@ expires = "2026-12-31T00:00:00Z"   # optional, RFC 3339
 key            = "<64 hex ed25519 public key>"
 scope          = ["packets"]
 spending_limit = { per_write = 1000, per_day = 50000 }   # required with `packets`; both figures
+
+[funder]
+key           = "<64 hex ed25519 public key>"
+scope         = ["peers", "channels-fund"]
+deposit_limit = { per_write = 5000000, per_day = 20000000 }   # required with `peers`, `channels-open` or `channels-fund`
 ```
 
 A scope is a non-empty list of named writes: `packets`, `peers` (`POST /peers`,
@@ -73,12 +78,12 @@ A scope is a non-empty list of named writes: `packets`, `peers` (`POST /peers`,
 restart.
 
 A write from a restricted key outside its scope, or after its `expires`, is answered
-**`403`** with a body naming the reason (`scope`, `expiry` or `spending-limit`), before anything is
+**`403`** with a body naming the reason (`scope`, `expiry`, `spending-limit` or `deposit-limit`), before anything is
 signed, journaled or sent. It is not in `GET /audit-log`; it is a log line and a count
 on `toon_writes_refused_total{reason}`. `401` stays the answer to a missing, bad,
 replayed or unlisted signature. `GET /write-keys` lists every write key — its key
-id, whether it is restricted, its scope, its expiry and — for a key with a spending limit — the
-limit and what the key has counted today.
+id, whether it is restricted, its scope, its expiry and — for a key with a spending or a deposit
+limit — the limit and what the key has counted today against each.
 
 ### The spending limit
 
@@ -100,8 +105,8 @@ day above `per_day`. Nothing is signed or sent and no audit record is kept.
   appended before the packet is handed to the connector; a packet whose count cannot be
   appended is refused. A restart does not reset the day, and neither does removing an entry
   and adding it back. The total starts again at the next UTC day.
-- A node that states a `spending_limit` needs a `state_dir`, and refuses to start without one.
-  It also refuses to start when the journal exists but cannot be replayed.
+- A node that states a `spending_limit` or a `deposit_limit` needs a `state_dir`, and refuses to
+  start without one. It also refuses to start when the journal exists but cannot be replayed.
 - A key on `write_keys` is never counted or limited. Only packets a write key originates
   count — not packets arriving at the client edge or from a peering.
 - The refused-write counter `toon_writes_refused_total` gains the reason `spending-limit`.
@@ -112,9 +117,31 @@ unknown write; a key is not 64 hex characters or appears twice, or is also on
 states only one of its `per_write` and `per_day`; or the file is missing or
 unreadable. An entry whose `expires` has already passed is not a refusal to start.
 
-**The deposit limit is not enforced yet.** An entry that states a `deposit_limit` is refused
-at boot, so no release accepts a limit it does not hold. The scopes that require one —
-`peers`, `channels-open` and `channels-fund` — therefore cannot be declared until it is.
+### The deposit limit
+
+A key whose scope includes `peers`, `channels-open` or `channels-fund` states a
+`deposit_limit`: `per_write`, the most one deposit may put into a channel, and `per_day`, the
+most the key may deposit in a UTC day. Both are required together. A deposit is answered
+`403` naming the deposit limit when it is above `per_write`, or would take the key's deposit
+total for the current UTC day above `per_day`. Nothing is journaled as a channel, signed or sent.
+
+- **What counts.** `POST /peers` and `POST /channels` count their `deposit`, when the write opens
+  a channel. A repeat that finds an existing channel, or resumes an open already journaled,
+  counts nothing. `POST /channels/:id/fund` counts its `amount` every time, because it is an
+  increment.
+- **When.** A deposit counts when its channel write is journaled, before the transaction is
+  sent. A deposit whose transaction then fails is not given back, and a withdrawal gives nothing
+  back.
+- **A total of its own.** Deposits and packets are counted apart: a key that deposits 100 and
+  sends 100 in packets has 100 against each limit, because a deposit stays the node's own money
+  and a packet does not.
+- **The figure is bare**, as the spending limit's is: the amount is added in the base units of
+  the channel it is paid over, with no asset and no conversion.
+- The count goes in the same journal under `state_dir` as the spending limit's, with the same
+  rules: appended before the write proceeds, refused if it cannot be appended, kept by key,
+  surviving a restart and starting again at the next UTC day. A key on `write_keys` is never
+  counted.
+- `toon_writes_refused_total` gains the reason `deposit-limit`.
 
 ## Reads
 

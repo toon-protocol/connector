@@ -99,7 +99,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-use crate::batch_channels::{receiver_terms, BatchChannelError};
+use crate::batch_channels::{receiver_terms, BatchChannelError, DepositGate};
 use crate::connector::{hex_lower, Connector, PeerRouteTableError};
 use crate::operator_view::PeerView;
 use crate::peer_route_store::{RuntimePeerChannel, RuntimePeering};
@@ -249,6 +249,25 @@ impl Connector {
         chain: Option<SettlementChain>,
         deposit: Option<u128>,
     ) -> Result<PeeringEstablished, EstablishPeeringError> {
+        self.establish_peering_with(id, url, fee, max_packet_amount, chain, deposit, None)
+            .await
+    }
+
+    /// [`Connector::establish_peering`], counting the opening `deposit` with
+    /// `gate` when -- and only when -- the write journals a new channel
+    /// (ADR 0078 decision 4): a repeat that finds or resumes one counts
+    /// nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn establish_peering_with(
+        &self,
+        id: impl Into<String>,
+        url: &Url,
+        fee: u64,
+        max_packet_amount: u64,
+        chain: Option<SettlementChain>,
+        deposit: Option<u128>,
+        gate: Option<&dyn DepositGate>,
+    ) -> Result<PeeringEstablished, EstablishPeeringError> {
         let id = id.into();
         self.refuse_unlandable_peering(&id)?;
 
@@ -270,7 +289,7 @@ impl Connector {
 
         let shared = self.shared_settlement(&document, chain, url)?;
         let (binding, channel) = self
-            .open_peering_channel(&id, url, &shared, deposit)
+            .open_peering_channel(&id, url, &shared, deposit, gate)
             .await?;
 
         let peering = RuntimePeering {
@@ -313,6 +332,7 @@ impl Connector {
         url: &Url,
         shared: &SharedSettlement,
         deposit: Option<u128>,
+        gate: Option<&dyn DepositGate>,
     ) -> Result<(RuntimePeerChannel, EstablishedChannel), EstablishPeeringError> {
         let url_text = url.to_string();
         let chain = shared.chain();
@@ -371,7 +391,7 @@ impl Connector {
                 // The id comes back off the chain: `open` restores the
                 // channel from it before answering, so a row written here is
                 // a row backed by a channel the chain confirmed.
-                let (state, _resumed) = outbound.open(receiver_terms, deposit).await?;
+                let (state, _resumed) = outbound.open_with(receiver_terms, deposit, gate).await?;
                 (state.on_chain.id.0, ChannelBranch::Created)
             }
         };
@@ -1048,6 +1068,65 @@ mod tests {
             .expect("re-establish");
         assert_eq!(again.channel.status, ChannelBranch::Created);
         assert_ne!(again.channel.id, established.channel.id);
+    }
+
+    /// A gate that adds up what it is asked to count and refuses past a ceiling.
+    struct Ceiling {
+        counted: std::sync::Mutex<u128>,
+        ceiling: u128,
+    }
+
+    impl DepositGate for Ceiling {
+        fn count(&self, amount: u128) -> Result<(), String> {
+            let mut counted = self.counted.lock().unwrap();
+            if *counted + amount > self.ceiling {
+                return Err("deposit-limit: over the ceiling".to_string());
+            }
+            *counted += amount;
+            Ok(())
+        }
+    }
+
+    /// ADR 0078 decision 4: a peering that opens a channel counts its
+    /// deposit, a refused one opens nothing, and a repeat that finds the
+    /// channel counts nothing.
+    #[tokio::test]
+    async fn a_peering_counts_the_deposit_of_a_channel_it_opens_and_a_repeat_counts_nothing() {
+        let (connector, payer) = paying_node(Some([0x02; 20])).await;
+        let gate = Ceiling {
+            counted: std::sync::Mutex::new(0),
+            ceiling: 1_500,
+        };
+
+        let error = connector
+            .establish_peering_with("node-b", &url(), 5, 0, None, Some(2_000), Some(&gate))
+            .await
+            .expect_err("over the ceiling");
+        assert!(
+            matches!(
+                error,
+                EstablishPeeringError::Outbound(BatchChannelError::DepositRefused(_))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(payer.balance(), 10_000, "a refused deposit sends nothing");
+        assert_eq!(*gate.counted.lock().unwrap(), 0);
+        assert!(connector.outbound_channels().unwrap().claims().is_empty());
+
+        let created = connector
+            .establish_peering_with("node-b", &url(), 5, 0, None, Some(1_000), Some(&gate))
+            .await
+            .expect("within the ceiling");
+        assert_eq!(created.channel.status, ChannelBranch::Created);
+        assert_eq!(*gate.counted.lock().unwrap(), 1_000);
+
+        // Found: the deposit would be refused if it were counted.
+        let found = connector
+            .establish_peering_with("node-b", &url(), 5, 0, None, Some(1_400), Some(&gate))
+            .await
+            .expect("a repeat finds the channel");
+        assert_eq!(found.channel.status, ChannelBranch::Found);
+        assert_eq!(*gate.counted.lock().unwrap(), 1_000);
     }
 
     /// A counterparty that publishes no voucher signer could never have its

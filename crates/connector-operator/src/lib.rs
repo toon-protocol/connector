@@ -90,6 +90,7 @@ use connector_client_edge::ClientClaimGate;
 use connector_config::{ControllerKey, WriteScope};
 use connector_domain::x402::X402BatchSettlementTerms;
 use connector_domain::{Prepare, Price};
+use connector_runtime::DepositGate;
 use connector_runtime::{
     BatchChannelError, BatchChannelView, BatchChannels, ClaimBookKind, ClaimDirection, ClaimScheme,
     ClaimView, Connector, DeclaredRates, EstablishPeeringError, LeaseRouteError, LeasedRouteView,
@@ -227,7 +228,7 @@ pub fn router_with_controller_keys(
         write_auth: Arc::new(WriteAuth::with_controller_keys(
             write_keys,
             controller_keys,
-            day_totals,
+            day_totals.map(Arc::new),
         )),
         rates: declared_rates,
         batch: batch_channels,
@@ -324,7 +325,7 @@ fn require_write_auth(
     uri: &Uri,
     headers: &HeaderMap,
     body: &Bytes,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<String, (StatusCode, String)> {
     authenticate_write(
         &state.write_auth,
         write,
@@ -333,7 +334,7 @@ fn require_write_auth(
         headers,
         body,
     )
-    .map(|_| ())
+    .map(|verified| verified.keyid)
     .map_err(|error| match error.refusal_reason() {
         // The signature verified: the caller is known, and what it asked is
         // outside its authority (ADR 0078). Nothing was signed, journaled or
@@ -773,11 +774,11 @@ async fn upsert_peer(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) =
-        require_write_auth(&state, WriteScope::Peers, &method, &uri, &headers, &body)
+    let keyid = match require_write_auth(&state, WriteScope::Peers, &method, &uri, &headers, &body)
     {
-        return error.into_response();
-    }
+        Ok(keyid) => keyid,
+        Err(error) => return error.into_response(),
+    };
 
     let request: UpsertPeerRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
@@ -799,20 +800,27 @@ async fn upsert_peer(
         Some(Err(error)) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
+    let gate = state.write_auth.deposit_gate(&keyid);
     match state
         .connector
-        .establish_peering(
+        .establish_peering_with(
             request.id,
             &url,
             request.fee,
             request.max_packet_amount,
             chain,
             request.deposit,
+            gate.as_ref().map(|gate| gate as &dyn DepositGate),
         )
         .await
     {
         Ok(established) => Json(established).into_response(),
-        Err(error) => establish_peering_error_response(error),
+        Err(error) => {
+            if let EstablishPeeringError::Outbound(outbound) = &error {
+                note_deposit_refused(&state, &method, &uri, outbound);
+            }
+            establish_peering_error_response(error)
+        }
     }
 }
 
@@ -977,6 +985,29 @@ const NOT_AN_OUTBOUND_X402_CHANNEL: &str =
      toon-channel funding, on either chain, is retired (ADR 0075) -- a peering pays over the \
      outbound x402 channel POST /peers opens and funds, so top that one up instead";
 
+/// A deposit refused by a controller's deposit limit is counted and logged
+/// like the other refusals (ADR 0078 decision 9). The channel write refused
+/// it before journaling or sending anything.
+fn note_deposit_refused(
+    state: &OperatorState,
+    method: &Method,
+    uri: &Uri,
+    error: &BatchChannelError,
+) {
+    if matches!(error, BatchChannelError::DepositRefused(_)) {
+        state
+            .connector
+            .metrics()
+            .record_write_refused("deposit-limit");
+        tracing::warn!(
+            method = method.as_str(),
+            path = uri.path(),
+            reason = "deposit-limit",
+            "operator write refused: {error}"
+        );
+    }
+}
+
 /// The status a failed x402 channel operation answers with.
 ///
 /// - `503`: this node has no x402 backend on that chain -- its own config.
@@ -988,6 +1019,7 @@ const NOT_AN_OUTBOUND_X402_CHANNEL: &str =
 ///   open, an RPC that failed.
 /// - `500`: the journal could not be written, so nothing was sent.
 /// - `400`: everything the request itself got wrong.
+/// - `403`: a controller's deposit limit refused the deposit (ADR 0078).
 fn batch_channel_error_response(error: BatchChannelError) -> Response {
     let status = match &error {
         BatchChannelError::NoBackend(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -997,6 +1029,7 @@ fn batch_channel_error_response(error: BatchChannelError) -> Response {
         BatchChannelError::StillOpening(_) => StatusCode::CONFLICT,
         BatchChannelError::InvalidTerms(_) => StatusCode::BAD_REQUEST,
         BatchChannelError::Journal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        BatchChannelError::DepositRefused(_) => StatusCode::FORBIDDEN,
         BatchChannelError::Settlement(settlement) => match settlement {
             BatchSettlementError::WithdrawalNotDue { .. }
             | BatchSettlementError::NoWithdrawalPending(_)
@@ -1046,7 +1079,7 @@ async fn open_channel(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(
+    let keyid = match require_write_auth(
         &state,
         WriteScope::ChannelsOpen,
         &method,
@@ -1054,8 +1087,9 @@ async fn open_channel(
         &headers,
         &body,
     ) {
-        return error.into_response();
-    }
+        Ok(keyid) => keyid,
+        Err(error) => return error.into_response(),
+    };
 
     let fields: serde_json::Map<String, serde_json::Value> = match serde_json::from_slice(&body) {
         Ok(fields) => fields,
@@ -1064,7 +1098,7 @@ async fn open_channel(
     if !fields.contains_key("terms") {
         return (StatusCode::BAD_REQUEST, TOON_CHANNEL_OPEN_RETIRED).into_response();
     }
-    open_outbound_channel(&state, &body).await
+    open_outbound_channel(&state, &method, &uri, &keyid, &body).await
 }
 
 /// The answer to an x402 `POST /channels`: the channel, and whether this
@@ -1076,7 +1110,13 @@ struct OpenedOutboundChannel {
     resumed: bool,
 }
 
-async fn open_outbound_channel(state: &OperatorState, body: &Bytes) -> Response {
+async fn open_outbound_channel(
+    state: &OperatorState,
+    method: &Method,
+    uri: &Uri,
+    keyid: &str,
+    body: &Bytes,
+) -> Response {
     let Some(batch) = state.batch.as_ref() else {
         return no_batch_backend();
     };
@@ -1095,12 +1135,21 @@ async fn open_outbound_channel(state: &OperatorState, body: &Bytes) -> Response 
                 .into_response()
         }
     };
+    let gate = state.write_auth.deposit_gate(keyid);
     match batch
-        .open(&request.terms, url.as_ref(), request.deposit)
+        .open_with(
+            &request.terms,
+            url.as_ref(),
+            request.deposit,
+            gate.as_ref().map(|gate| gate as &dyn DepositGate),
+        )
         .await
     {
         Ok((channel, resumed)) => Json(OpenedOutboundChannel { channel, resumed }).into_response(),
-        Err(error) => batch_channel_error_response(error),
+        Err(error) => {
+            note_deposit_refused(state, method, uri, &error);
+            batch_channel_error_response(error)
+        }
     }
 }
 
@@ -1118,7 +1167,7 @@ async fn fund_channel(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(
+    let keyid = match require_write_auth(
         &state,
         WriteScope::ChannelsFund,
         &method,
@@ -1126,8 +1175,9 @@ async fn fund_channel(
         &headers,
         &body,
     ) {
-        return error.into_response();
-    }
+        Ok(keyid) => keyid,
+        Err(error) => return error.into_response(),
+    };
     // `total` is named before the body is parsed: it was toon-channel funding
     // to an absolute figure, retired by ADR 0075, and a body carrying it is
     // refused as that rather than as an unknown field.
@@ -1157,9 +1207,21 @@ async fn fund_channel(
     if !batch.outbound().knows(&channel_id) {
         return (StatusCode::BAD_REQUEST, NOT_AN_OUTBOUND_X402_CHANNEL).into_response();
     }
-    match batch.outbound().top_up(&channel_id, request.amount).await {
-        Ok(state) => Json(batch.outbound().view_of(&state)).into_response(),
-        Err(error) => batch_channel_error_response(error),
+    let gate = state.write_auth.deposit_gate(&keyid);
+    match batch
+        .outbound()
+        .top_up_with(
+            &channel_id,
+            request.amount,
+            gate.as_ref().map(|gate| gate as &dyn DepositGate),
+        )
+        .await
+    {
+        Ok(topped) => Json(batch.outbound().view_of(&topped)).into_response(),
+        Err(error) => {
+            note_deposit_refused(&state, &method, &uri, &error);
+            batch_channel_error_response(error)
+        }
     }
 }
 
@@ -2684,7 +2746,7 @@ mod tests {
         /// it dials, which settlement address it derives a channel from --
         /// is the behaviour under test. A fake handing back a value would
         /// skip the fetch, which is the half that is new.
-        fn serve_self_description(settlement_address: &str) -> SocketAddr {
+        pub(super) fn serve_self_description(settlement_address: &str) -> SocketAddr {
             // The fake chain's settled token: what the counterparty's x402
             // terms must name for this node's paying half to open on them.
             let ReceiverTerms::Evm(fake) =
@@ -2750,7 +2812,8 @@ mod tests {
         /// publishes it. Deliberately not this node's own and deliberately
         /// not an edge identity: the channel derives from the settlement
         /// address of the chain in question.
-        const COUNTERPARTY_SETTLEMENT: &str = "0x00000000000000000000000000000000000000aa";
+        pub(super) const COUNTERPARTY_SETTLEMENT: &str =
+            "0x00000000000000000000000000000000000000aa";
 
         /// The CAIP-2 network both nodes' x402 terms name.
         const NETWORK: &str = "eip155:31337";
@@ -3748,6 +3811,481 @@ mod tests {
             assert!(read(&app, "/metrics")
                 .await
                 .contains(r#"toon_writes_refused_total{reason="spending-limit"} 1"#));
+        }
+    }
+
+    /// A controller's deposit limit (ADR 0078): a channel open or top-up is
+    /// refused `403` above the per-write figure or past the day's, counts
+    /// when its channel write is journaled whatever becomes of the
+    /// transaction, and is a total of its own.
+    mod deposit_limit_writes {
+        use super::*;
+        use crate::rfc9421::sign_request;
+        use connector_config::DepositLimit;
+        use connector_runtime::OutboundChannels;
+        use connector_settlement::batch::{
+            BatchSettlementBackend, BatchSettlementPayer, InMemoryBatchChain,
+            InMemoryBatchSettlement, PayerExit,
+        };
+        use ed25519_dalek::Keypair;
+        use rand::rngs::OsRng;
+        use std::path::Path;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::RwLock;
+        use tower::ServiceExt;
+
+        static CREATED: AtomicU64 = AtomicU64::new(50_000);
+
+        fn day(day: u32) -> chrono::DateTime<chrono::Utc> {
+            use chrono::TimeZone;
+            chrono::Utc
+                .with_ymd_and_hms(2030, 1, day, 12, 0, 0)
+                .unwrap()
+        }
+
+        fn controller(keypair: &Keypair, per_write: u64, per_day: u64) -> ControllerKey {
+            ControllerKey::new(
+                "agent",
+                keypair.public.to_bytes(),
+                vec![
+                    WriteScope::Peers,
+                    WriteScope::ChannelsOpen,
+                    WriteScope::ChannelsFund,
+                    WriteScope::Packets,
+                ],
+                None,
+            )
+            .with_deposit_limit(DepositLimit { per_write, per_day })
+            .with_spending_limit(connector_config::SpendingLimit {
+                per_write: 1_000,
+                per_day: 1_000,
+            })
+        }
+
+        /// A node `0x01` holding 10,000 on a fake chain with `0x02`, whose
+        /// surface counts `controllers` into `journal`.
+        async fn node(
+            controllers: Vec<ControllerKey>,
+            journal: (&Path, Arc<TestClock>),
+        ) -> (Router, Arc<InMemoryBatchSettlement>) {
+            let chain = InMemoryBatchChain::new(PayerExit::Withdrawal);
+            let this = Arc::new(InMemoryBatchSettlement::on(
+                Arc::clone(&chain),
+                0x01,
+                86_400,
+            ));
+            this.fund(10_000);
+            let outbound = Arc::new(
+                OutboundChannels::restore(
+                    Arc::new(InMemoryJournal::new()),
+                    vec![(
+                        SettlementChain::Evm,
+                        Arc::clone(&this) as Arc<dyn BatchSettlementPayer>,
+                    )],
+                )
+                .await
+                .expect("an empty journal replays"),
+            );
+            let batch = Arc::new(BatchChannels::new(
+                Arc::clone(&outbound),
+                vec![(
+                    SettlementChain::Evm,
+                    Arc::clone(&this) as Arc<dyn BatchSettlementBackend>,
+                )],
+                Arc::new(RwLock::new(Vec::new()))
+                    as Arc<dyn connector_settlement::batch::HeldVouchers>,
+                Vec::new(),
+            ));
+            // A peering opens on the same outbound channels a `POST
+            // /channels` does, so the two count into one day.
+            let connector = Arc::new(
+                Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(TestClock::new(chrono::Utc::now())),
+                )
+                .with_outbound_channels(
+                    outbound,
+                    vec![(SettlementChain::Evm, "eip155:31337".to_string())],
+                )
+                .with_self_description_source(Arc::new(
+                    connector_runtime::BoundedHttpSelfDescription::new(true, None),
+                ))
+                .with_peer_allow_plaintext_endpoints(true),
+            );
+            let app = router_with_controller_keys(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                vec![],
+                controllers,
+                Some(DayTotals::open(journal.0, journal.1).expect("journal opens")),
+                None,
+                Some(batch),
+            );
+            (app, this)
+        }
+
+        async fn send(
+            app: &Router,
+            keypair: &Keypair,
+            path: &str,
+            body: serde_json::Value,
+        ) -> (StatusCode, String) {
+            let body = serde_json::to_vec(&body).unwrap();
+            let created = CREATED.fetch_add(1, Ordering::SeqCst);
+            let (sig_input, sig, digest) =
+                sign_request(keypair, "POST", path, &body, created, Some(9_999_999_999));
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        fn terms() -> serde_json::Value {
+            let address = format!("0x{}", "02".repeat(20));
+            serde_json::json!({
+                "network": "eip155:31337",
+                "asset": format!("0x{}", "70".repeat(20)),
+                "payTo": address,
+                "receiverAuthorizer": address,
+                "withdrawDelay": 86_400,
+                "name": "USDC",
+                "version": "2",
+            })
+        }
+
+        async fn open(app: &Router, key: &Keypair, deposit: u64) -> (StatusCode, String) {
+            send(
+                app,
+                key,
+                "/channels",
+                serde_json::json!({ "terms": terms(), "deposit": deposit }),
+            )
+            .await
+        }
+
+        async fn fund(app: &Router, key: &Keypair, id: &str, amount: u64) -> (StatusCode, String) {
+            send(
+                app,
+                key,
+                &format!("/channels/{id}/fund"),
+                serde_json::json!({ "amount": amount }),
+            )
+            .await
+        }
+
+        fn channel_id(body: &str) -> String {
+            let opened: serde_json::Value = serde_json::from_str(body).unwrap();
+            opened["id"].as_str().expect("an id").to_string()
+        }
+
+        async fn read(app: &Router, path: &str) -> String {
+            let response = get(app.clone(), path, Some("correct-token")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        async fn write_keys(app: &Router) -> serde_json::Value {
+            serde_json::from_str::<serde_json::Value>(&read(app, "/write-keys").await).unwrap()[0]
+                .clone()
+        }
+
+        #[tokio::test]
+        async fn a_deposit_above_the_per_write_figure_is_refused_and_nothing_is_journaled() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let (app, chain) = node(
+                vec![controller(&key, 500, 2_000)],
+                (&dir.path().join("totals"), clock),
+            )
+            .await;
+
+            let (status, body) = open(&app, &key, 501).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.starts_with("deposit-limit:"), "{body}");
+            assert_eq!(chain.balance(), 10_000, "nothing was sent");
+            assert_eq!(read(&app, "/channels").await, "[]", "nothing was journaled");
+            assert_eq!(write_keys(&app).await["deposit_limit"]["counted_today"], 0);
+
+            // The same figure by fund, on a channel the key could open.
+            let (status, body) = open(&app, &key, 500).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let id = channel_id(&body);
+            let (status, body) = fund(&app, &key, &id, 501).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.starts_with("deposit-limit:"), "{body}");
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                500
+            );
+        }
+
+        #[tokio::test]
+        async fn opens_and_funds_share_the_day_and_the_write_that_passes_it_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let (app, chain) = node(
+                vec![controller(&key, 500, 1_200)],
+                (&dir.path().join("totals"), clock.clone()),
+            )
+            .await;
+
+            let (status, body) = open(&app, &key, 500).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let id = channel_id(&body);
+            // A fund is an increment, counted every time.
+            for _ in 0..2 {
+                let (status, body) = fund(&app, &key, &id, 300).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                1_100
+            );
+            let (status, body) = fund(&app, &key, &id, 101).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.contains("per-day"), "{body}");
+            assert_eq!(chain.balance(), 10_000 - 1_100);
+            let (status, _) = open(&app, &key, 100).await;
+            assert_eq!(status, StatusCode::OK, "what fits still goes through");
+            assert!(read(&app, "/metrics")
+                .await
+                .contains(r#"toon_writes_refused_total{reason="deposit-limit"} 1"#));
+
+            clock.set(day(2));
+            assert_eq!(write_keys(&app).await["deposit_limit"]["counted_today"], 0);
+            let (status, body) = fund(&app, &key, &id, 300).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        async fn peer(app: &Router, key: &Keypair, deposit: u64) -> (StatusCode, String) {
+            let addr = super::runtime_peer_route_writes::serve_self_description(
+                super::runtime_peer_route_writes::COUNTERPARTY_SETTLEMENT,
+            );
+            send(
+                app,
+                key,
+                "/peers",
+                serde_json::json!({
+                    "id": "node-b",
+                    "url": format!("http://{addr}/ilp"),
+                    "fee": 0,
+                    "deposit": deposit,
+                }),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_peering_deposit_and_a_fund_share_the_day_and_a_repeat_peering_counts_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let (app, chain) = node(
+                vec![controller(&key, 500, 800)],
+                (&dir.path().join("totals"), clock),
+            )
+            .await;
+
+            let (status, body) = peer(&app, &key, 501).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.starts_with("deposit-limit:"), "{body}");
+            assert_eq!(chain.balance(), 10_000, "nothing was sent");
+            assert_eq!(read(&app, "/channels").await, "[]", "nothing was journaled");
+
+            let (status, body) = peer(&app, &key, 500).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let established: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(established["channel"]["status"], "created");
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                500
+            );
+
+            // Found: counted, this would pass the per-day figure.
+            let (status, body) = peer(&app, &key, 500).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let found: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(found["channel"]["status"], "found");
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                500
+            );
+
+            let channels: serde_json::Value =
+                serde_json::from_str(&read(&app, "/channels").await).unwrap();
+            let id = channels[0]["id"].as_str().expect("an id").to_string();
+            let (status, body) = fund(&app, &key, &id, 301).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.contains("per-day"), "{body}");
+            let (status, body) = fund(&app, &key, &id, 300).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                800
+            );
+        }
+
+        #[tokio::test]
+        async fn a_deposit_whose_transaction_fails_still_counts() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let (app, chain) = node(
+                vec![controller(&key, 50_000, 50_000)],
+                (&dir.path().join("totals"), clock),
+            )
+            .await;
+
+            // The node holds 10,000: the chain refuses the deposit.
+            let (status, body) = open(&app, &key, 20_000).await;
+            assert_ne!(status, StatusCode::OK, "{body}");
+            assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(chain.balance(), 10_000);
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                20_000
+            );
+        }
+
+        #[tokio::test]
+        async fn deposits_and_packets_are_counted_apart() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let (app, _) = node(
+                vec![controller(&key, 500, 500)],
+                (&dir.path().join("totals"), clock),
+            )
+            .await;
+
+            let (status, body) = open(&app, &key, 400).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let packet = Prepare {
+                amount: 300,
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(1),
+                greeting: false,
+                destination: "g.example.nowhere".to_string(),
+                data: vec![],
+            }
+            .encode();
+            let created = CREATED.fetch_add(1, Ordering::SeqCst);
+            let (sig_input, sig, digest) = sign_request(
+                &key,
+                "POST",
+                "/packets",
+                &packet,
+                created,
+                Some(9_999_999_999),
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/packets")
+                        .header("signature-input", sig_input)
+                        .header("signature", sig)
+                        .header("content-digest", digest)
+                        .body(Body::from(packet))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+            let view = write_keys(&app).await;
+            assert_eq!(view["deposit_limit"]["counted_today"], 400);
+            assert_eq!(view["spending_limit"]["counted_today"], 300);
+            assert_eq!(
+                view["deposit_limit"],
+                serde_json::json!({"per_write": 500, "per_day": 500, "counted_today": 400})
+            );
+        }
+
+        #[tokio::test]
+        async fn the_total_survives_a_restart() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("totals");
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            {
+                let (app, _) = node(vec![controller(&key, 500, 600)], (&path, clock.clone())).await;
+                let (status, body) = open(&app, &key, 400).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+            let (app, _) = node(vec![controller(&key, 500, 600)], (&path, clock)).await;
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                400
+            );
+            assert_eq!(open(&app, &key, 300).await.0, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn a_write_key_is_never_counted_or_limited() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("totals");
+            let clock = Arc::new(TestClock::new(day(1)));
+            let operator = Keypair::generate(&mut OsRng);
+            let other = Keypair::generate(&mut OsRng);
+            let chain = InMemoryBatchChain::new(PayerExit::Withdrawal);
+            let this = Arc::new(InMemoryBatchSettlement::on(chain, 0x01, 86_400));
+            this.fund(10_000);
+            let outbound = OutboundChannels::restore(
+                Arc::new(InMemoryJournal::new()),
+                vec![(
+                    SettlementChain::Evm,
+                    Arc::clone(&this) as Arc<dyn BatchSettlementPayer>,
+                )],
+            )
+            .await
+            .unwrap();
+            let batch = Arc::new(BatchChannels::new(
+                Arc::new(outbound),
+                vec![(
+                    SettlementChain::Evm,
+                    Arc::clone(&this) as Arc<dyn BatchSettlementBackend>,
+                )],
+                Arc::new(RwLock::new(Vec::new()))
+                    as Arc<dyn connector_settlement::batch::HeldVouchers>,
+                Vec::new(),
+            ));
+            let app = router_with_controller_keys(
+                Arc::new(Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(TestClock::new(chrono::Utc::now())),
+                )),
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                vec![operator.public.to_bytes()],
+                vec![controller(&other, 1, 1)],
+                Some(DayTotals::open(&path, clock).unwrap()),
+                None,
+                Some(batch),
+            );
+            let (status, body) = open(&app, &operator, 5_000).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
         }
     }
 

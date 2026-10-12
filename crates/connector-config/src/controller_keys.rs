@@ -14,12 +14,10 @@
 //! expires = "2026-12-31T00:00:00Z"   # optional, RFC 3339
 //! ```
 //!
-//! An entry that carries `packets` states a `spending_limit` (`per_write` and
-//! `per_day`, both): the operator surface counts it (ADR 0078). The deposit
-//! limit is parsed and validated here, but this build does not count it, so
-//! an entry that states one is refused by name
-//! ([`ConfigError::ControllerLimitsNotEnforced`]): no release accepts a limit
-//! it does not hold.
+//! An entry that carries `packets` states a `spending_limit`, and one that
+//! carries `peers`, `channels-open` or `channels-fund` a `deposit_limit`
+//! (each `per_write` and `per_day`, both): the operator surface counts them
+//! (ADR 0078).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -99,6 +97,14 @@ pub struct SpendingLimit {
     pub per_day: u64,
 }
 
+/// A deposit limit (ADR 0078): the most a key may put into channels, per
+/// write and per UTC day, as one bare figure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepositLimit {
+    pub per_write: u64,
+    pub per_day: u64,
+}
+
 /// A restricted write key. Every boot refusal is checked where the file is
 /// parsed; [`ControllerKey::new`] itself validates nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +114,7 @@ pub struct ControllerKey {
     scope: Vec<WriteScope>,
     expires: Option<u64>,
     spending_limit: Option<SpendingLimit>,
+    deposit_limit: Option<DepositLimit>,
 }
 
 impl ControllerKey {
@@ -125,7 +132,14 @@ impl ControllerKey {
             scope,
             expires,
             spending_limit: None,
+            deposit_limit: None,
         }
+    }
+
+    /// The same key carrying a deposit limit.
+    pub fn with_deposit_limit(mut self, limit: DepositLimit) -> ControllerKey {
+        self.deposit_limit = Some(limit);
+        self
     }
 
     /// The same key carrying a spending limit.
@@ -159,6 +173,11 @@ impl ControllerKey {
     /// What the key may send in packets, if the entry states a limit.
     pub fn spending_limit(&self) -> Option<SpendingLimit> {
         self.spending_limit
+    }
+
+    /// What the key may put into channels, if the entry states a limit.
+    pub fn deposit_limit(&self) -> Option<DepositLimit> {
+        self.deposit_limit
     }
 }
 
@@ -306,13 +325,6 @@ pub(crate) fn parse_controller_keys(
             }
         }
 
-        if raw.deposit_limit.is_some() {
-            return Err(ConfigError::ControllerLimitsNotEnforced {
-                path: path.to_path_buf(),
-                entry: name,
-            });
-        }
-
         let expires = match &raw.expires {
             None => None,
             Some(text) => {
@@ -334,6 +346,13 @@ pub(crate) fn parse_controller_keys(
         }) = raw.spending_limit
         {
             controller = controller.with_spending_limit(SpendingLimit { per_write, per_day });
+        }
+        if let Some(RawLimit {
+            per_write: Some(per_write),
+            per_day: Some(per_day),
+        }) = raw.deposit_limit
+        {
+            controller = controller.with_deposit_limit(DepositLimit { per_write, per_day });
         }
         out.push(controller);
     }
@@ -502,12 +521,17 @@ mod tests {
     }
 
     #[test]
-    fn a_stated_deposit_limit_is_refused_because_it_is_not_yet_enforced() {
-        let result = parse(&format!(
-            "[a]\nkey = \"{KEY}\"\nscope = [\"channels-land\"]\ndeposit_limit = {{ per_write = 1, per_day = 5 }}\n"
-        ));
-        assert!(
-            matches!(result, Err(ConfigError::ControllerLimitsNotEnforced { entry, .. }) if entry == "a")
+    fn a_deposit_limit_resolves_with_both_figures() {
+        let keys = parse(&format!(
+            "[a]\nkey = \"{KEY}\"\nscope = [\"peers\"]\ndeposit_limit = {{ per_write = 1, per_day = 5 }}\n"
+        ))
+        .expect("parses");
+        assert_eq!(
+            keys[0].deposit_limit(),
+            Some(DepositLimit {
+                per_write: 1,
+                per_day: 5
+            })
         );
     }
 
@@ -524,6 +548,22 @@ mod tests {
                 per_day: 5
             })
         );
+    }
+
+    #[test]
+    fn a_peers_scope_with_a_deposit_limit_boots_and_without_one_is_refused() {
+        assert!(parse(&format!(
+            "[a]\nkey = \"{KEY}\"\nscope = [\"peers\"]\ndeposit_limit = {{ per_write = 1, per_day = 5 }}\n"
+        ))
+        .is_ok());
+        let result = parse(&format!("[a]\nkey = \"{KEY}\"\nscope = [\"peers\"]\n"));
+        assert!(matches!(
+            result,
+            Err(ConfigError::ControllerLimitRequired {
+                limit: "deposit_limit",
+                ..
+            })
+        ));
     }
 
     #[test]

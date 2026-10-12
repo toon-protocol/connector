@@ -40,7 +40,7 @@ pub use app_client::{AppClient, AppOutcome, Delivery, FakeAppClient, HttpAppClie
 pub use attribution::{AMOUNT_HEADER, CHAIN_HEADER, PAYER_HEADER};
 pub use batch_channels::{
     receiver_terms, BatchChannelError, BatchChannelView, BatchChannelViewStatus, BatchChannels,
-    ChannelDirection, OutboundChannels, WithdrawStep,
+    ChannelDirection, DepositGate, OutboundChannels, WithdrawStep,
 };
 pub use claim::{ClaimAckOutcome, ClaimRejectReason, Covering};
 pub use clock::{Clock, SystemClock, TestClock};

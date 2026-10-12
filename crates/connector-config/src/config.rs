@@ -632,18 +632,21 @@ impl Config {
             });
         }
 
-        // A spending limit counts in a journal under `state_dir` (ADR 0078
-        // decision 8); a node with nowhere to keep it would hand every key a
-        // fresh day on each restart.
+        // A spending or deposit limit counts in a journal under `state_dir`
+        // (ADR 0078 decision 8); a node with nowhere to keep it would hand
+        // every key a fresh day on each restart.
         if state_dir.is_none() {
-            if let Some(controller) = operator.as_ref().and_then(|operator| {
-                operator
-                    .controller_keys()
-                    .iter()
-                    .find(|key| key.spending_limit().is_some())
-            }) {
-                return Err(ConfigError::SpendingLimitWithoutStateDir {
+            for controller in operator.as_ref().map_or(&[][..], |o| o.controller_keys()) {
+                let limit = if controller.spending_limit().is_some() {
+                    "spending limit"
+                } else if controller.deposit_limit().is_some() {
+                    "deposit limit"
+                } else {
+                    continue;
+                };
+                return Err(ConfigError::LimitWithoutStateDir {
                     entry: controller.name().to_string(),
+                    limit,
                 });
             }
         }
@@ -3136,7 +3139,45 @@ controller_keys_file = "{}"
 
         expect_error(
             result,
-            |error| matches!(error, ConfigError::SpendingLimitWithoutStateDir { entry } if entry == "agent"),
+            |error| matches!(error, ConfigError::LimitWithoutStateDir { entry, limit } if entry == "agent" && *limit == "spending limit"),
+        );
+    }
+
+    #[test]
+    fn rejects_a_deposit_limit_with_no_state_dir() {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut controllers = tempfile::NamedTempFile::new().expect("temp controllers file");
+        std::io::Write::write_all(
+            &mut controllers,
+            format!(
+                "[agent]\nkey = \"{key}\"\nscope = [\"channels-fund\"]\n\
+                 deposit_limit = {{ per_write = 1, per_day = 5 }}\n"
+            )
+            .as_bytes(),
+        )
+        .expect("write controllers");
+        let result = with_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[operator]
+bearer_token = "secret-token"
+write_keys = ["{}"]
+controller_keys_file = "{}"
+"#,
+                key_path.display(),
+                "f".repeat(64),
+                controllers.path().display(),
+            )
+        });
+
+        expect_error(
+            result,
+            |error| matches!(error, ConfigError::LimitWithoutStateDir { entry, limit } if entry == "agent" && *limit == "deposit limit"),
         );
     }
 

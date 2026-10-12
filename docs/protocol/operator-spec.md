@@ -411,7 +411,7 @@ controller_keys_file` ([ADR 0078](../adr/0078-a-controllers-write-key-carries-a-
 carries a **scope** — a list of the named writes `packets`, `peers`, `routes-peers`, `routes-leased`,
 `channels-open`, `channels-fund`, `channels-withdraw` and `channels-land` (a `DELETE` belongs to the
 name of its `POST`) — and an optional expiry. A verified signature from such a key outside its scope or
-after its expiry is answered `403` naming the reason (`scope`, `expiry` or `spending-limit`), before anything is signed,
+after its expiry is answered `403` naming the reason (`scope`, `expiry`, `spending-limit` or `deposit-limit`), before anything is signed,
 journaled or sent; it is not retained in the audit log, and counts on `toon_writes_refused_total`. `401`
 remains the answer to a signature that is missing, bad, replayed or unlisted.
 
@@ -424,8 +424,18 @@ holding tokens of different decimals it adds unlike units. The count is journale
 by key, before the packet is handed on; a packet whose count cannot be journaled is refused; a restart,
 or removing and re-adding the entry, does not reset the day. A key on `write_keys` is never counted,
 and only packets a write key originates count. `GET /write-keys` shows each restricted key's limit and
-`counted_today`. This build refuses at boot an entry that states a deposit limit, since it is not
-enforced yet.
+`counted_today`.
+
+A key whose scope includes `peers`, `channels-open` or `channels-fund` carries a **deposit limit**,
+`per_write` and `per_day`, both required, counted apart from the spending limit. A deposit is refused
+`403` when it is above `per_write`, or would take the key's deposit total for the current UTC day above
+`per_day`; nothing is journaled as a channel, signed or sent. `POST /peers` and `POST /channels` count
+their `deposit` when the write opens a channel — a repeat that finds or resumes a channel counts
+nothing — and `POST /channels/:id/fund` counts its `amount` every time, since it is an increment. A
+deposit counts when its channel write is journaled, before the transaction is sent; a deposit whose
+transaction fails, and a withdrawal, give nothing back. The count is journaled in the same file and
+under the same rules as the spending limit's, and `GET /write-keys` shows the deposit limit and its
+`counted_today` beside it.
 
 Two mechanisms sit behind the write half that [ADR 0008](../adr/0008-operator-surface-splits-read-from-write.md)'s
 Decision does not name — **replay rejection**, and the **audit log** the retained signatures are

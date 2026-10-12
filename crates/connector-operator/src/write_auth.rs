@@ -10,7 +10,7 @@
 //! asserting that something happened.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
@@ -19,7 +19,7 @@ use base64::Engine;
 use connector_config::{ControllerKey, WriteScope};
 use serde::Serialize;
 
-use crate::day_totals::{DayTotals, SpendRefusal};
+use crate::day_totals::{CountKind, CountRefusal, DayTotals, Figures};
 use crate::rfc9421::{verify_write_signature, VerifiedWrite, WriteAuthError};
 
 /// A retained record of one authenticated write: the signature itself,
@@ -48,16 +48,46 @@ pub struct WriteKeyView {
     pub expires: Option<String>,
     /// The spending limit and what the key has counted against it today
     /// (ADR 0078 decision 11); `None` for a key with no limit.
-    pub spending_limit: Option<SpendingLimitView>,
+    pub spending_limit: Option<LimitView>,
+    /// The deposit limit and what the key has counted against it today
+    /// (ADR 0078 decision 11); `None` for a key with no limit.
+    pub deposit_limit: Option<LimitView>,
 }
 
-/// A restricted key's spending limit, as `GET /write-keys` shows it.
+/// A restricted key's spending or deposit limit, as `GET /write-keys` shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SpendingLimitView {
+pub struct LimitView {
     pub per_write: u64,
     pub per_day: u64,
     /// Counted against `per_day` so far in the current UTC day.
     pub counted_today: u64,
+}
+
+/// A restricted key's deposit count: what the channel writes ask before they
+/// journal or send a deposit.
+pub struct KeyDeposits {
+    key: String,
+    limit: Option<connector_config::DepositLimit>,
+    totals: Option<Arc<DayTotals>>,
+}
+
+impl connector_runtime::DepositGate for KeyDeposits {
+    fn count(&self, amount: u128) -> Result<(), String> {
+        let refusal = match (&self.totals, self.limit) {
+            (Some(totals), Some(limit)) => totals
+                .count(CountKind::Deposit, &self.key, amount, limit)
+                .err(),
+            (None, _) => Some(CountRefusal::Unrecorded {
+                kind: CountKind::Deposit,
+                error: "this node keeps no day totals".to_string(),
+            }),
+            (_, None) => Some(CountRefusal::Unrecorded {
+                kind: CountKind::Deposit,
+                error: "this key states no deposit limit".to_string(),
+            }),
+        };
+        refusal.map_or(Ok(()), |refusal| Err(refusal.to_string()))
+    }
 }
 
 fn to_hex(bytes: &[u8; 32]) -> String {
@@ -88,7 +118,7 @@ pub struct WriteAuth {
     /// The restricted keys (ADR 0078), by key.
     restricted: HashMap<[u8; 32], ControllerKey>,
     /// Where spending limits count (ADR 0078 decision 8).
-    day_totals: Option<DayTotals>,
+    day_totals: Option<Arc<DayTotals>>,
     seen_signatures: Mutex<HashMap<Vec<u8>, u64>>,
     audit_log: Mutex<Vec<AuditRecord>>,
 }
@@ -103,7 +133,7 @@ impl WriteAuth {
     pub fn with_controller_keys(
         write_keys: Vec<[u8; 32]>,
         controller_keys: Vec<ControllerKey>,
-        day_totals: Option<DayTotals>,
+        day_totals: Option<Arc<DayTotals>>,
     ) -> WriteAuth {
         let allowlist = write_keys
             .iter()
@@ -195,15 +225,21 @@ impl WriteAuth {
                         connector_domain::Prepare::decode(body),
                     ) {
                         let refusal = match &self.day_totals {
-                            Some(totals) => {
-                                totals.count_spending(&key_hex, prepare.amount, limit).err()
-                            }
-                            None => Some(SpendRefusal::Unrecorded(
-                                "this node keeps no day totals".to_string(),
-                            )),
+                            Some(totals) => totals
+                                .count(
+                                    CountKind::Spending,
+                                    &key_hex,
+                                    u128::from(prepare.amount),
+                                    limit,
+                                )
+                                .err(),
+                            None => Some(CountRefusal::Unrecorded {
+                                kind: CountKind::Spending,
+                                error: "this node keeps no day totals".to_string(),
+                            }),
                         };
                         if let Some(refusal) = refusal {
-                            return Err(WriteAuthError::SpendingLimit(refusal));
+                            return Err(WriteAuthError::LimitRefused(refusal));
                         }
                     }
                 }
@@ -226,6 +262,35 @@ impl WriteAuth {
         Ok(verified)
     }
 
+    fn limit_view(
+        &self,
+        controller: &ControllerKey,
+        kind: CountKind,
+        figures: Figures,
+    ) -> LimitView {
+        LimitView {
+            per_write: figures.per_write,
+            per_day: figures.per_day,
+            counted_today: self.day_totals.as_ref().map_or(0, |totals| {
+                totals.counted_today(kind, &to_hex(controller.key()))
+            }),
+        }
+    }
+
+    /// Where the deposits of the write just authenticated under `keyid` are
+    /// counted (ADR 0078 decision 4): `None` for a key on `write_keys`, which
+    /// is never counted or limited. A restricted key that states no deposit
+    /// limit gets a gate that refuses -- config makes that unreachable for any
+    /// scope that deposits, and a deposit nothing bounds is not made.
+    pub fn deposit_gate(&self, keyid: &str) -> Option<KeyDeposits> {
+        let controller = verified_key(keyid).and_then(|key| self.restricted.get(&key))?;
+        Some(KeyDeposits {
+            key: to_hex(controller.key()),
+            limit: controller.deposit_limit(),
+            totals: self.day_totals.clone(),
+        })
+    }
+
     /// Every write key, for `GET /write-keys`: the operator's first, then
     /// the controllers' in name order.
     pub fn keys(&self) -> Vec<WriteKeyView> {
@@ -239,29 +304,28 @@ impl WriteAuth {
                 scope: WriteScope::ALL.iter().map(|s| s.name()).collect(),
                 expires: None,
                 spending_limit: None,
+                deposit_limit: None,
             })
             .collect();
         let mut controllers: Vec<&ControllerKey> = self.restricted.values().collect();
         controllers.sort_by(|a, b| a.name().cmp(b.name()));
-        views.extend(controllers.into_iter().map(|controller| WriteKeyView {
-            keyid: to_hex(controller.key()),
-            restricted: true,
-            name: Some(controller.name().to_string()),
-            scope: controller.scope().iter().map(|s| s.name()).collect(),
-            spending_limit: controller.spending_limit().map(|limit| {
-                SpendingLimitView {
-                    per_write: limit.per_write,
-                    per_day: limit.per_day,
-                    counted_today: self
-                        .day_totals
-                        .as_ref()
-                        .map_or(0, |totals| totals.spent_today(&to_hex(controller.key()))),
-                }
-            }),
-            expires: controller.expires().and_then(|at| {
-                chrono::DateTime::from_timestamp(i64::try_from(at).ok()?, 0)
-                    .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-            }),
+        views.extend(controllers.into_iter().map(|controller| {
+            WriteKeyView {
+                keyid: to_hex(controller.key()),
+                restricted: true,
+                name: Some(controller.name().to_string()),
+                scope: controller.scope().iter().map(|s| s.name()).collect(),
+                spending_limit: controller
+                    .spending_limit()
+                    .map(|limit| self.limit_view(controller, CountKind::Spending, limit.into())),
+                deposit_limit: controller
+                    .deposit_limit()
+                    .map(|limit| self.limit_view(controller, CountKind::Deposit, limit.into())),
+                expires: controller.expires().and_then(|at| {
+                    chrono::DateTime::from_timestamp(i64::try_from(at).ok()?, 0)
+                        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                }),
+            }
         }));
         views
     }

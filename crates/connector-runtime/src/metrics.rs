@@ -115,7 +115,7 @@ impl Metrics {
     }
 
     /// An operator write refused to a key whose signature verified but whose
-    /// authority does not cover it (ADR 0078): `reason` is `scope` or `expiry`.
+    /// authority does not cover it (ADR 0078): `reason` is `scope`, `expiry`, `spending-limit` or `deposit-limit`.
     pub fn record_write_refused(&self, reason: &str) {
         self.writes_refused_total.with_label_values(&[reason]).inc();
     }
