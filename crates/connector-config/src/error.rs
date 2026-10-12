@@ -206,7 +206,7 @@ pub enum ConfigError {
     },
 
     #[error(
-        "controller key '{entry}' in {path} states a spending or deposit limit, and limits are \
+        "controller key '{entry}' in {path} states a deposit limit, and the deposit limit is \
          not yet enforced by this build: refusing to start rather than accept a limit the node \
          does not hold (ADR 0078)"
     )]
@@ -949,6 +949,15 @@ pub enum ConfigError {
          this node can write, and mount it so it outlives the container"
     )]
     SettlementWithoutStateDir,
+
+    /// A spending limit is counted in a journal under `state_dir` (ADR 0078
+    /// decision 8); without one the count would not survive a restart.
+    #[error(
+        "controller key '{entry}' states a spending limit but 'state_dir' is not set: the day's \
+         count is journaled under state_dir, and a count held only in memory would reset the \
+         day at every restart. Set a top-level state_dir to a directory this node can write"
+    )]
+    SpendingLimitWithoutStateDir { entry: String },
 
     #[error("state_dir '{path}' exists but is not a directory")]
     StateDirNotADirectory { path: PathBuf },

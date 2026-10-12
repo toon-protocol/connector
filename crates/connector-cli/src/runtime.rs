@@ -111,6 +111,10 @@ pub enum RuntimeError {
     /// watermarks this node cannot vouch for, which is exactly the defect
     /// issue #605 describes.
     JournalUnreplayable { path: PathBuf, source: JournalError },
+    /// The controller day-totals journal under `state_dir` could not be
+    /// opened or replayed (ADR 0078 decision 8): refused rather than let a
+    /// key's day reset.
+    DayTotalsUnusable(connector_operator::DayTotalsError),
     /// Issue #884's runtime peer/route table under `state_dir` exists but
     /// could not be read (unreadable, or corrupt JSON) -- refusing to
     /// start rather than serve with a table this node cannot vouch for,
@@ -265,6 +269,7 @@ impl fmt::Display for RuntimeError {
                  refuses to start rather than resume from watermarks it cannot vouch for",
                 path.display()
             ),
+            RuntimeError::DayTotalsUnusable(error) => write!(f, "{error}"),
             RuntimeError::RuntimePeerRouteTableUnusable { path, source } => write!(
                 f,
                 "failed to read the runtime peer/route table at {}: {source} -- the connector \
@@ -1694,6 +1699,19 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     Ok(match config.operator() {
         Some(operator) => {
             let batch_channels = batch_channels_for_operator(runtime, &claim_gate);
+            // A spending limit counts in a journal under `state_dir` (ADR
+            // 0078 decision 8), opened here so a node with nowhere to write
+            // it fails at boot rather than at a controller's first packet.
+            let day_totals = match config.state_dir() {
+                Some(state_dir) => Some(
+                    connector_operator::DayTotals::open(
+                        &state_dir.join(connector_operator::DAY_TOTALS_JOURNAL),
+                        Arc::new(connector_runtime::SystemClock),
+                    )
+                    .map_err(RuntimeError::DayTotalsUnusable)?,
+                ),
+                None => None,
+            };
             app.merge(connector_operator::router_with_controller_keys(
                 connector,
                 claim_gate,
@@ -1701,6 +1719,7 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
                 operator.bearer_token().to_string(),
                 operator.write_keys().to_vec(),
                 operator.controller_keys().to_vec(),
+                day_totals,
                 declared_rates(runtime, config),
                 batch_channels,
             ))

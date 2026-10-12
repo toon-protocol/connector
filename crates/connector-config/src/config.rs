@@ -632,6 +632,22 @@ impl Config {
             });
         }
 
+        // A spending limit counts in a journal under `state_dir` (ADR 0078
+        // decision 8); a node with nowhere to keep it would hand every key a
+        // fresh day on each restart.
+        if state_dir.is_none() {
+            if let Some(controller) = operator.as_ref().and_then(|operator| {
+                operator
+                    .controller_keys()
+                    .iter()
+                    .find(|key| key.spending_limit().is_some())
+            }) {
+                return Err(ConfigError::SpendingLimitWithoutStateDir {
+                    entry: controller.name().to_string(),
+                });
+            }
+        }
+
         // A node that can accept a claim must be able to remember having
         // accepted it (issue #605). Refused here, at load, rather than at
         // the first claim: a node whose watermarks live only in memory
@@ -3081,6 +3097,46 @@ key_file = "{key_file}"
                 && message.contains("removed with the raw-TCP transport")
                 && message.contains(BRINGUP_DOC),
             "got: {message}"
+        );
+    }
+
+    /// A spending limit's day total is journaled under `state_dir` (ADR
+    /// 0078 decision 8), so a node stating one with no `state_dir` is refused.
+    #[test]
+    fn rejects_a_spending_limit_with_no_state_dir() {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut controllers = tempfile::NamedTempFile::new().expect("temp controllers file");
+        std::io::Write::write_all(
+            &mut controllers,
+            format!(
+                "[agent]\nkey = \"{key}\"\nscope = [\"packets\"]\n\
+                 spending_limit = {{ per_write = 1, per_day = 5 }}\n"
+            )
+            .as_bytes(),
+        )
+        .expect("write controllers");
+        let result = with_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[operator]
+bearer_token = "secret-token"
+write_keys = ["{}"]
+controller_keys_file = "{}"
+"#,
+                key_path.display(),
+                "f".repeat(64),
+                controllers.path().display(),
+            )
+        });
+
+        expect_error(
+            result,
+            |error| matches!(error, ConfigError::SpendingLimitWithoutStateDir { entry } if entry == "agent"),
         );
     }
 

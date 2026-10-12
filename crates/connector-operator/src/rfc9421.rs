@@ -99,16 +99,20 @@ pub enum WriteAuthError {
     /// The signature verifies, and the key is a controller's restricted key
     /// past its expiry (ADR 0078). A `403`, like `OutOfScope`.
     KeyExpired,
+    /// The signature verifies, the packet is in scope, and the key's spending
+    /// limit refuses it (ADR 0078). A `403`.
+    SpendingLimit(crate::day_totals::SpendRefusal),
 }
 
 impl WriteAuthError {
-    /// The reason a verified key was refused (`"scope"` or `"expiry"`), or
+    /// The reason a verified key was refused (`"scope"`, `"expiry"` or `"spending-limit"`), or
     /// `None` for a signature that did not verify. It labels the refused-write
     /// metric and decides `403` over `401`.
     pub fn refusal_reason(&self) -> Option<&'static str> {
         match self {
             WriteAuthError::OutOfScope(_) => Some("scope"),
             WriteAuthError::KeyExpired => Some("expiry"),
+            WriteAuthError::SpendingLimit(_) => Some("spending-limit"),
             _ => None,
         }
     }
@@ -148,6 +152,7 @@ impl std::fmt::Display for WriteAuthError {
                 "scope: this key's scope does not include '{write}' (ADR 0078)"
             ),
             WriteAuthError::KeyExpired => write!(f, "expiry: this key has expired (ADR 0078)"),
+            WriteAuthError::SpendingLimit(refusal) => write!(f, "{refusal}"),
         }
     }
 }
