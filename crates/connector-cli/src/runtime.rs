@@ -100,6 +100,11 @@ pub enum RuntimeError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// Another process already holds `state_dir`'s lock (issue #1318): two
+    /// processes over one directory each replay the journals once and keep
+    /// the watermarks in memory, so they diverge silently. Refused by name
+    /// rather than served.
+    StateDirHeld { path: PathBuf },
     /// A journal under `state_dir` exists but could not be replayed --
     /// unreadable, or carrying a line this build cannot decode. Refusing
     /// to start is the whole point: the only other option is to start with
@@ -245,6 +250,13 @@ impl fmt::Display for RuntimeError {
                 "state_dir {} is not usable for this node's claim journals: {source} -- \
                  the connector refuses to start rather than keep claim watermarks only in \
                  memory, where a restart would make every already-spent claim replayable",
+                path.display()
+            ),
+            RuntimeError::StateDirHeld { path } => write!(
+                f,
+                "state_dir {} is held by another connector process -- the connector refuses \
+                 to start over a directory a live node is serving from, because two processes \
+                 would each keep their own claim watermarks and settlement nonces",
                 path.display()
             ),
             RuntimeError::JournalUnreplayable { path, source } => write!(
@@ -578,6 +590,34 @@ const OUTBOUND_CHANNEL_JOURNAL: &str = "outbound-channels.log";
 /// not an append-only journal line format like the two above (see
 /// `connector_runtime::PeerRouteStore`'s own docs for why).
 const RUNTIME_PEER_ROUTE_TABLE: &str = "runtime-peers.json";
+/// The file whose advisory lock says one process owns `state_dir` (issue
+/// #1318). Empty and never written: the journals themselves are not locked,
+/// so `FileJournal` and the table's write-then-rename work unchanged.
+const STATE_DIR_LOCK: &str = ".state-dir.lock";
+
+/// Take an exclusive OS advisory lock on `state_dir`, creating the directory
+/// if it is not there yet. The operating system releases it when the process
+/// exits for any reason, so a crash leaves nothing to clean up.
+fn lock_state_dir(state_dir: &Path) -> Result<std::fs::File, RuntimeError> {
+    let unusable = |source| RuntimeError::StateDirUnusable {
+        path: state_dir.to_path_buf(),
+        source,
+    };
+    std::fs::create_dir_all(state_dir).map_err(unusable)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state_dir.join(STATE_DIR_LOCK))
+        .map_err(unusable)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(RuntimeError::StateDirHeld {
+            path: state_dir.to_path_buf(),
+        }),
+        Err(std::fs::TryLockError::Error(source)) => Err(unusable(source)),
+    }
+}
 
 /// Open `name` under this node's configured `state_dir`, creating the
 /// directory if it is not there yet.
@@ -689,6 +729,10 @@ pub struct Runtime {
     /// surface can fund, withdraw from and sign on it from the first
     /// request.
     pub outbound_channels: Option<Arc<OutboundChannels>>,
+    /// The lock on `state_dir` (issue #1318), `Some` exactly when the node
+    /// names one. `run` moves it into the `RunningNode` it hands back, because
+    /// the runtime is dropped before the process stops serving.
+    pub state_dir_lock: Option<std::fs::File>,
 }
 
 /// Construct the live [`Connector`] and [`Signer`] a validated [`Config`]
@@ -714,6 +758,9 @@ pub struct Runtime {
 /// process exactly as the client edge's do. That ledger sits *above* the
 /// peer transport port and was untouched by #679's deletion.
 pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
+    // Issue #1318: the first thing done with `state_dir`, before any journal
+    // is read or any chain dialed.
+    let state_dir_lock = config.state_dir().map(lock_state_dir).transpose()?;
     let signer = build_signer(config.signer_key())?;
     // ADR 0075 decision 8, issue #1385: a node whose journals still hold
     // claims on TOON's own channels is refused by name before any chain is
@@ -1047,6 +1094,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         batch_settlement_evm,
         batch_settlement_solana,
         outbound_channels,
+        state_dir_lock,
     })
 }
 

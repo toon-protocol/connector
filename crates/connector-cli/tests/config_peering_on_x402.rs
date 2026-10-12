@@ -379,6 +379,9 @@ client_edge_url = "http://{other_addr}/ilp"
     /// the same `state_dir`, on the same socket.
     async fn restart_with(&mut self, config_text: &str) {
         let config = support::load_config(config_text);
+        // A restart ends the old process first, and with it its hold on
+        // `state_dir` (issue #1318).
+        self.runtime = None;
         let runtime = connector_cli::build(&config)
             .await
             .expect("rebuild the node from its peering config");

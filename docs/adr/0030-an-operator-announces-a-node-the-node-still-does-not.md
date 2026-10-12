@@ -186,3 +186,15 @@ for free, which is neither the URL the announce was published _through_ nor anyt
 network. A node that fronts no relay omits the field. An `http(s)://` value is refused at config
 load: that spelling is the write ingress, and announcing it publishes an unauthenticated write door
 to the network.
+
+## Update (issue #1318) — 2026-10-12: a `state_dir` lock replaces the deleted guard
+
+The `--via-own-routing` guard above went with the verb
+([0046](0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md)) and nothing replaced
+it for a while. Its successor is a lock, not a refusal: a serving node takes an exclusive OS advisory
+lock on a file inside `state_dir` before it opens anything there, the operating system releases it
+when the process exits for any reason, and a second process over the same directory exits at startup
+naming it. It is scoped to the directory, not to a subcommand. The hazard also has three directions,
+not one: outbound (the nonce fork described above), inbound (a nonce one process accepted is accepted
+again by the other, which is free service) and settlement (both send transactions from one settlement
+key and collide on its nonce).

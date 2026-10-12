@@ -387,6 +387,9 @@ key_file = "{settlement_key}"
     /// Restart from the same config file and `state_dir`, through the
     /// production boot path, on the same socket.
     async fn restart(&mut self) {
+        // A restart ends the old process first, and with it its hold on
+        // `state_dir` (issue #1318).
+        self.runtime.state_dir_lock.take();
         self.runtime = connector_cli::build(&self.config)
             .await
             .expect("rebuild the node");
