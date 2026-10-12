@@ -662,6 +662,18 @@ impl Config {
         // on any request carrying a claim header whose envelope target is
         // not already refused, priced route or not, so a free route on a
         // node with settlement still advances a watermark.
+        if state_dir.is_none() {
+            if let Some(controller) = operator.as_ref().and_then(|operator| {
+                operator
+                    .controller_keys()
+                    .iter()
+                    .find(|key| key.spending_limit().is_some())
+            }) {
+                return Err(ConfigError::SpendingLimitWithoutStateDir {
+                    entry: controller.name().to_string(),
+                });
+            }
+        }
         if let Some(path) = &state_dir {
             if path.exists() && !path.is_dir() {
                 return Err(ConfigError::StateDirNotADirectory { path: path.clone() });

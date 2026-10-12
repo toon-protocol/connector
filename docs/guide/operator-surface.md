@@ -39,7 +39,7 @@ calling and never on the node. `connector send --operator-key <file>
 --print-keyid` prints the value that goes in the allowlist, derived by the binary
 that will do the signing.
 
-## A controller's key: a scope and an expiry
+## A controller's key: a scope, an expiry and a spending limit
 
 `write_keys` holds an operator's keys, and each may make **every** write. Automation
 you point at a node — a controller — should hold less. Declare its key in a file of
@@ -58,6 +58,11 @@ controller_keys_file = "/app/data/operator-controller-keys"
 key     = "<64 hex ed25519 public key>"
 scope   = ["channels-land", "routes-peers"]
 expires = "2026-12-31T00:00:00Z"   # optional, RFC 3339
+
+[agent]
+key            = "<64 hex ed25519 public key>"
+scope          = ["packets"]
+spending_limit = { per_write = 1000, per_day = 50000 }   # required with `packets`; both figures
 ```
 
 A scope is a non-empty list of named writes: `packets`, `peers` (`POST /peers`,
@@ -68,11 +73,38 @@ A scope is a non-empty list of named writes: `packets`, `peers` (`POST /peers`,
 restart.
 
 A write from a restricted key outside its scope, or after its `expires`, is answered
-**`403`** with a body naming the reason (`scope` or `expiry`), before anything is
+**`403`** with a body naming the reason (`scope`, `expiry` or `spending limit`), before anything is
 signed, journaled or sent. It is not in `GET /audit-log`; it is a log line and a count
 on `toon_writes_refused_total{reason}`. `401` stays the answer to a missing, bad,
 replayed or unlisted signature. `GET /write-keys` lists every write key — its key
-id, whether it is restricted, its scope and its expiry.
+id, whether it is restricted, its scope, its expiry and — for a key with a spending limit — the
+limit and what the key has counted today.
+
+### The spending limit
+
+A key whose scope includes `packets` states a `spending_limit`: `per_write`, the most one
+packet may carry, and `per_day`, the most the key may send in a UTC day. Both are required
+together. A `POST /packets` from that key is answered `403` naming the spending limit when
+the packet's amount is above `per_write`, or would take the key's total for the current UTC
+day above `per_day`. Nothing is signed or sent and no audit record is kept.
+
+- **A packet counts at its full `Prepare` amount once accepted, whatever happens to it** —
+  fulfilled, rejected with any code, or never answered. Nothing is ever given back. A
+  controller that retries rejected packets uses up its day having spent nothing, and
+  `GET /write-keys` is how that is seen. The limit bounds what the key exposed, not what the
+  node lost.
+- **The figure is bare.** The amount is added as a number, in the base units of whatever
+  channel the packet is paid over, with no asset and no conversion. On a node holding tokens
+  of different decimals it adds unlike units.
+- The count is journaled under `state_dir` (`controller-day-totals.journal`), by key, and
+  appended before the packet is handed to the connector; a packet whose count cannot be
+  appended is refused. A restart does not reset the day, and neither does removing an entry
+  and adding it back. The total starts again at the next UTC day.
+- A node that states a `spending_limit` needs a `state_dir`, and refuses to start without one.
+  It also refuses to start when the journal exists but cannot be replayed.
+- A key on `write_keys` is never counted or limited. Only packets a write key originates
+  count — not packets arriving at the client edge or from a peering.
+- The refused-write counter `toon_writes_refused_total` gains the reason `spending-limit`.
 
 The node refuses to start, naming the entry, when a scope is empty or names an
 unknown write; a key is not 64 hex characters or appears twice, or is also on
@@ -80,10 +112,9 @@ unknown write; a key is not 64 hex characters or appears twice, or is also on
 states only one of its `per_write` and `per_day`; or the file is missing or
 unreadable. An entry whose `expires` has already passed is not a refusal to start.
 
-**Limits are not enforced yet.** An entry that states a `spending_limit` or a
-`deposit_limit` is refused at boot, so no release accepts a limit it does not hold.
-Scopes that require one — `packets` (a spending limit), `peers`, `channels-open` and
-`channels-fund` (a deposit limit) — therefore cannot be declared until they are.
+**The deposit limit is not enforced yet.** An entry that states a `deposit_limit` is refused
+at boot, so no release accepts a limit it does not hold. The scopes that require one —
+`peers`, `channels-open` and `channels-fund` — therefore cannot be declared until it is.
 
 ## Reads
 
@@ -97,7 +128,7 @@ Scopes that require one — `packets` (a spending limit), `peers`, `channels-ope
 | `GET /claims`        | The claim journal — what you have been paid, and by whom. |
 | `GET /identity`      | This node's operator-facing identity.                     |
 | `GET /audit-log`     | Every accepted write, with the key that made it.          |
-| `GET /write-keys`    | Every write key: restricted or not, its scope and expiry. |
+| `GET /write-keys`    | Every write key: restricted or not, scope, expiry, limit. |
 | `GET /metrics`       | Prometheus text.                                          |
 | `GET /packets`       | Recent packets, newest first; in memory (ADR 0077).       |
 

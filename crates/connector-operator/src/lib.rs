@@ -51,6 +51,7 @@
 //! be shipped by it -- mounted with the surface, absent without it, and
 //! granting no authority the reads and writes do not already grant.
 
+mod day_totals;
 mod rfc9421;
 mod write_auth;
 
@@ -97,6 +98,7 @@ use connector_runtime::{
 };
 use connector_settlement::batch::BatchSettlementError;
 use connector_signer::{derive_evm_address, to_hex, Signer, SignerError};
+pub use day_totals::{DayTotals, DayTotalsError, DAY_TOTALS_JOURNAL};
 use url::Url;
 use write_auth::{authenticate_write, AuditRecord, WriteAuth, WriteKeyView};
 
@@ -193,6 +195,7 @@ pub fn router_with_batch_channels(
         bearer_token,
         write_keys,
         Vec::new(),
+        None,
         declared_rates,
         batch_channels,
     )
@@ -201,7 +204,9 @@ pub fn router_with_batch_channels(
 /// [`router_with_batch_channels`] plus the restricted write keys of
 /// controllers (ADR 0078): each may make only the writes its scope names,
 /// until its expiry, and a write outside them is answered `403`. A key in
-/// `write_keys` keeps every write.
+/// `write_keys` keeps every write. `day_totals` is where a spending limit
+/// counts: a restricted key with a limit and no `day_totals` is refused every
+/// packet, because a count that cannot be journaled refuses the packet.
 #[allow(clippy::too_many_arguments)]
 pub fn router_with_controller_keys(
     connector: Arc<Connector>,
@@ -210,6 +215,7 @@ pub fn router_with_controller_keys(
     bearer_token: impl Into<String>,
     write_keys: Vec<[u8; 32]>,
     controller_keys: Vec<ControllerKey>,
+    day_totals: Option<DayTotals>,
     declared_rates: Option<DeclaredRates>,
     batch_channels: Option<Arc<BatchChannels>>,
 ) -> Router {
@@ -218,7 +224,11 @@ pub fn router_with_controller_keys(
         claim_gate,
         signer,
         bearer_token: Arc::from(bearer_token.into()),
-        write_auth: Arc::new(WriteAuth::with_controller_keys(write_keys, controller_keys)),
+        write_auth: Arc::new(WriteAuth::with_controller_keys(
+            write_keys,
+            controller_keys,
+            day_totals,
+        )),
         rates: declared_rates,
         batch: batch_channels,
     };
@@ -3205,6 +3215,7 @@ mod tests {
                 controllers,
                 None,
                 None,
+                None,
             )
         }
 
@@ -3413,6 +3424,308 @@ mod tests {
                 serde_json::json!(["routes-peers", "channels-land"])
             );
             assert_eq!(listed[1]["expires"], "2030-01-01T00:00:00Z");
+        }
+    }
+
+    /// A controller's spending limit (ADR 0078): a packet is refused `403`
+    /// above the per-packet figure or past the day's, counts in full once
+    /// accepted whatever becomes of it, and the day's total outlives a restart.
+    mod spending_limit_writes {
+        use super::*;
+        use crate::rfc9421::sign_request;
+        use connector_config::SpendingLimit;
+        use ed25519_dalek::Keypair;
+        use rand::rngs::OsRng;
+        use std::path::Path;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tower::ServiceExt;
+
+        static CREATED: AtomicU64 = AtomicU64::new(1_000);
+
+        fn day(day: u32) -> chrono::DateTime<chrono::Utc> {
+            use chrono::TimeZone;
+            chrono::Utc
+                .with_ymd_and_hms(2030, 1, day, 12, 0, 0)
+                .unwrap()
+        }
+
+        fn limit(per_write: u64, per_day: u64) -> SpendingLimit {
+            SpendingLimit { per_write, per_day }
+        }
+
+        fn controller(keypair: &Keypair, limit: SpendingLimit) -> ControllerKey {
+            ControllerKey::new(
+                "agent",
+                keypair.public.to_bytes(),
+                vec![WriteScope::Packets],
+                None,
+            )
+            .with_spending_limit(limit)
+        }
+
+        /// A router over the controllers, counting into `journal` on `clock`
+        /// (or nowhere, for `None`).
+        fn app(
+            write_keys: Vec<[u8; 32]>,
+            controllers: Vec<ControllerKey>,
+            journal: Option<(&Path, Arc<TestClock>)>,
+        ) -> Router {
+            let connector = Arc::new(Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            ));
+            let day_totals =
+                journal.map(|(path, clock)| DayTotals::open(path, clock).expect("journal opens"));
+            router_with_controller_keys(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                write_keys,
+                controllers,
+                day_totals,
+                None,
+                None,
+            )
+        }
+
+        /// Send a packet of `amount`. No route exists, so the connector
+        /// rejects it: what is under test is the count, not the outcome.
+        async fn send(
+            app: impl std::borrow::Borrow<Router>,
+            keypair: &Keypair,
+            amount: u64,
+        ) -> (StatusCode, String) {
+            let body = Prepare {
+                amount,
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(1),
+                greeting: false,
+                destination: "g.example.nowhere".to_string(),
+                data: vec![],
+            }
+            .encode();
+            let created = CREATED.fetch_add(1, Ordering::SeqCst);
+            let (sig_input, sig, digest) = sign_request(
+                keypair,
+                "POST",
+                "/packets",
+                &body,
+                created,
+                Some(9_999_999_999),
+            );
+            let request = Request::builder()
+                .method("POST")
+                .uri("/packets")
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.borrow().clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        async fn read(app: &Router, path: &str) -> String {
+            let response = get(app.clone(), path, Some("correct-token")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        async fn counted_today(app: &Router) -> u64 {
+            let listed: serde_json::Value =
+                serde_json::from_str(&read(app, "/write-keys").await).unwrap();
+            listed[0]["spending_limit"]["counted_today"]
+                .as_u64()
+                .unwrap()
+        }
+
+        fn admitted(status: StatusCode) -> bool {
+            status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED
+        }
+
+        #[tokio::test]
+        async fn a_packet_above_the_per_packet_figure_is_refused_and_counts_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![],
+                vec![controller(&key, limit(10, 100))],
+                Some((&dir.path().join("totals"), clock)),
+            );
+
+            let (status, body) = send(&app, &key, 11).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("spending limit"), "{body}");
+            assert_eq!(counted_today(&app).await, 0);
+            assert_eq!(read(&app, "/audit-log").await, "[]");
+
+            let (status, _) = send(&app, &key, 10).await;
+            assert!(admitted(status), "{status}");
+            assert_eq!(counted_today(&app).await, 10);
+        }
+
+        #[tokio::test]
+        async fn the_packet_that_would_pass_the_day_is_refused_and_the_next_day_is_fresh() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![],
+                vec![controller(&key, limit(10, 25))],
+                Some((&dir.path().join("totals"), clock.clone())),
+            );
+
+            assert!(admitted(send(&app, &key, 10).await.0));
+            assert!(admitted(send(&app, &key, 10).await.0));
+            let (status, body) = send(&app, &key, 6).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("per-day"), "{body}");
+            assert_eq!(counted_today(&app).await, 20);
+            // What fits still goes through.
+            assert!(admitted(send(&app, &key, 5).await.0));
+            assert_eq!(send(&app, &key, 1).await.0, StatusCode::FORBIDDEN);
+
+            clock.set(day(2));
+            assert_eq!(counted_today(&app).await, 0);
+            assert!(admitted(send(&app, &key, 10).await.0));
+        }
+
+        #[tokio::test]
+        async fn a_rejected_packet_counts_in_full() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![],
+                vec![controller(&key, limit(10, 30))],
+                Some((&dir.path().join("totals"), clock)),
+            );
+            // Every one of these is rejected: no route reaches the destination.
+            for _ in 0..3 {
+                let (status, _) = send(&app, &key, 10).await;
+                assert!(admitted(status), "{status}");
+            }
+            assert_eq!(counted_today(&app).await, 30);
+            assert_eq!(send(&app, &key, 1).await.0, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn concurrent_packets_never_take_the_total_above_the_day() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Arc::new(Keypair::generate(&mut OsRng));
+            let app = app(
+                vec![],
+                vec![controller(&key, limit(1, 5))],
+                Some((&dir.path().join("totals"), clock)),
+            );
+            let mut tasks = Vec::new();
+            for _ in 0..20 {
+                let (app, key) = (app.clone(), key.clone());
+                tasks.push(tokio::spawn(async move { send(app, &key, 1).await.0 }));
+            }
+            let mut passed = 0;
+            for task in tasks {
+                if admitted(task.await.unwrap()) {
+                    passed += 1;
+                }
+            }
+            assert_eq!(passed, 5);
+            assert_eq!(counted_today(&app).await, 5);
+        }
+
+        #[tokio::test]
+        async fn the_total_survives_a_restart_and_removing_the_entry() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("totals");
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            {
+                let app = app(
+                    vec![],
+                    vec![controller(&key, limit(10, 15))],
+                    Some((&path, clock.clone())),
+                );
+                assert!(admitted(send(&app, &key, 10).await.0));
+            }
+            // A restart: the same journal, a fresh process.
+            let app = app(
+                vec![],
+                vec![controller(&key, limit(10, 15))],
+                Some((&path, clock.clone())),
+            );
+            assert_eq!(counted_today(&app).await, 10);
+            assert_eq!(send(&app, &key, 6).await.0, StatusCode::FORBIDDEN);
+
+            // The entry is removed for a restart, and added back the same day.
+            drop(app);
+            let without = self::app(vec![], vec![], Some((&path, clock.clone())));
+            drop(without);
+            let app = self::app(
+                vec![],
+                vec![controller(&key, limit(10, 15))],
+                Some((&path, clock)),
+            );
+            assert_eq!(counted_today(&app).await, 10);
+            assert_eq!(send(&app, &key, 6).await.0, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn a_count_that_cannot_be_journaled_refuses_the_packet() {
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(vec![], vec![controller(&key, limit(10, 100))], None);
+            let (status, body) = send(&app, &key, 1).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("journaled"), "{body}");
+            assert_eq!(read(&app, "/audit-log").await, "[]");
+        }
+
+        #[tokio::test]
+        async fn a_write_key_is_never_counted_or_limited() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("totals");
+            let clock = Arc::new(TestClock::new(day(1)));
+            let operator = Keypair::generate(&mut OsRng);
+            let other = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![operator.public.to_bytes()],
+                vec![controller(&other, limit(1, 1))],
+                Some((&path, clock)),
+            );
+            for _ in 0..3 {
+                assert!(admitted(send(&app, &operator, 1_000_000).await.0));
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        }
+
+        #[tokio::test]
+        async fn write_keys_reports_the_limit_and_the_count_and_the_counter_moves() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![],
+                vec![controller(&key, limit(10, 25))],
+                Some((&dir.path().join("totals"), clock)),
+            );
+            assert!(admitted(send(&app, &key, 7).await.0));
+            let listed: serde_json::Value =
+                serde_json::from_str(&read(&app, "/write-keys").await).unwrap();
+            assert_eq!(
+                listed[0]["spending_limit"],
+                serde_json::json!({"per_write": 10, "per_day": 25, "counted_today": 7})
+            );
+            assert_eq!(send(&app, &key, 11).await.0, StatusCode::FORBIDDEN);
+            assert!(read(&app, "/metrics")
+                .await
+                .contains(r#"toon_writes_refused_total{reason="spending-limit"} 1"#));
         }
     }
 

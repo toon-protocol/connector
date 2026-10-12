@@ -411,10 +411,21 @@ controller_keys_file` ([ADR 0078](../adr/0078-a-controllers-write-key-carries-a-
 carries a **scope** — a list of the named writes `packets`, `peers`, `routes-peers`, `routes-leased`,
 `channels-open`, `channels-fund`, `channels-withdraw` and `channels-land` (a `DELETE` belongs to the
 name of its `POST`) — and an optional expiry. A verified signature from such a key outside its scope or
-after its expiry is answered `403` naming the reason (`scope` or `expiry`), before anything is signed,
+after its expiry is answered `403` naming the reason (`scope`, `expiry` or `spending-limit`), before anything is signed,
 journaled or sent; it is not retained in the audit log, and counts on `toon_writes_refused_total`. `401`
-remains the answer to a signature that is missing, bad, replayed or unlisted. This build refuses at boot
-an entry that states a spending or deposit limit, since neither is enforced yet.
+remains the answer to a signature that is missing, bad, replayed or unlisted.
+
+A key whose scope includes `packets` carries a **spending limit**, `per_write` and `per_day`, both
+required. A `POST /packets` from it is refused `403` when the packet's amount is above `per_write`, or
+would take the key's total for the current UTC day above `per_day`. A packet counts at its full `Prepare`
+amount once accepted — fulfilled, rejected with any code, or never answered — and nothing is given
+back. The figure is bare: the amount is added as a number with no asset and no conversion, so on a node
+holding tokens of different decimals it adds unlike units. The count is journaled under `state_dir`,
+by key, before the packet is handed on; a packet whose count cannot be journaled is refused; a restart,
+or removing and re-adding the entry, does not reset the day. A key on `write_keys` is never counted,
+and only packets a write key originates count. `GET /write-keys` shows each restricted key's limit and
+`counted_today`. This build refuses at boot an entry that states a deposit limit, since it is not
+enforced yet.
 
 Two mechanisms sit behind the write half that [ADR 0008](../adr/0008-operator-surface-splits-read-from-write.md)'s
 Decision does not name — **replay rejection**, and the **audit log** the retained signatures are

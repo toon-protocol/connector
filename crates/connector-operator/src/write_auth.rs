@@ -19,6 +19,7 @@ use base64::Engine;
 use connector_config::{ControllerKey, WriteScope};
 use serde::Serialize;
 
+use crate::day_totals::{DayTotals, SpendRefusal};
 use crate::rfc9421::{verify_write_signature, VerifiedWrite, WriteAuthError};
 
 /// A retained record of one authenticated write: the signature itself,
@@ -45,6 +46,18 @@ pub struct WriteKeyView {
     pub name: Option<String>,
     pub scope: Vec<&'static str>,
     pub expires: Option<String>,
+    /// The spending limit and what the key has counted against it today
+    /// (ADR 0078 decision 11); `None` for a key with no limit.
+    pub spending_limit: Option<SpendingLimitView>,
+}
+
+/// A restricted key's spending limit, as `GET /write-keys` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SpendingLimitView {
+    pub per_write: u64,
+    pub per_day: u64,
+    /// Counted against `per_day` so far in the current UTC day.
+    pub counted_today: u64,
 }
 
 fn to_hex(bytes: &[u8; 32]) -> String {
@@ -74,6 +87,8 @@ pub struct WriteAuth {
     full: Vec<[u8; 32]>,
     /// The restricted keys (ADR 0078), by key.
     restricted: HashMap<[u8; 32], ControllerKey>,
+    /// Where spending limits count (ADR 0078 decision 8).
+    day_totals: Option<DayTotals>,
     seen_signatures: Mutex<HashMap<Vec<u8>, u64>>,
     audit_log: Mutex<Vec<AuditRecord>>,
 }
@@ -88,6 +103,7 @@ impl WriteAuth {
     pub fn with_controller_keys(
         write_keys: Vec<[u8; 32]>,
         controller_keys: Vec<ControllerKey>,
+        day_totals: Option<DayTotals>,
     ) -> WriteAuth {
         let allowlist = write_keys
             .iter()
@@ -101,6 +117,7 @@ impl WriteAuth {
                 .into_iter()
                 .map(|controller| (*controller.key(), controller))
                 .collect(),
+            day_totals,
             seen_signatures: Mutex::new(HashMap::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -158,11 +175,37 @@ impl WriteAuth {
             if let Some(controller) =
                 verified_key(&verified.keyid).and_then(|key| self.restricted.get(&key))
             {
+                let key_hex = to_hex(controller.key());
                 if controller.expires().is_some_and(|expires| now >= expires) {
                     return Err(WriteAuthError::KeyExpired);
                 }
                 if !controller.scope().contains(&write) {
                     return Err(WriteAuthError::OutOfScope(write));
+                }
+                // A packet counts at its full amount once accepted, whatever
+                // becomes of it (ADR 0078 decision 3), and the count is
+                // journaled before the packet is handed on. The replay lock
+                // is held across the check and the append, so two packets
+                // arriving together cannot both pass a check one of them
+                // would fail. A body that is not a `Prepare` is not a
+                // packet: the handler answers it `400` and nothing is sent.
+                if write == WriteScope::Packets {
+                    if let (Some(limit), Ok(prepare)) = (
+                        controller.spending_limit(),
+                        connector_domain::Prepare::decode(body),
+                    ) {
+                        let refusal = match &self.day_totals {
+                            Some(totals) => {
+                                totals.count_spending(&key_hex, prepare.amount, limit).err()
+                            }
+                            None => Some(SpendRefusal::Unrecorded(
+                                "this node keeps no day totals".to_string(),
+                            )),
+                        };
+                        if let Some(refusal) = refusal {
+                            return Err(WriteAuthError::SpendingLimit(refusal));
+                        }
+                    }
                 }
             }
             seen.insert(verified.signature.clone(), verified.expires);
@@ -195,6 +238,7 @@ impl WriteAuth {
                 name: None,
                 scope: WriteScope::ALL.iter().map(|s| s.name()).collect(),
                 expires: None,
+                spending_limit: None,
             })
             .collect();
         let mut controllers: Vec<&ControllerKey> = self.restricted.values().collect();
@@ -204,6 +248,16 @@ impl WriteAuth {
             restricted: true,
             name: Some(controller.name().to_string()),
             scope: controller.scope().iter().map(|s| s.name()).collect(),
+            spending_limit: controller.spending_limit().map(|limit| {
+                SpendingLimitView {
+                    per_write: limit.per_write,
+                    per_day: limit.per_day,
+                    counted_today: self
+                        .day_totals
+                        .as_ref()
+                        .map_or(0, |totals| totals.spent_today(&to_hex(controller.key()))),
+                }
+            }),
             expires: controller.expires().and_then(|at| {
                 chrono::DateTime::from_timestamp(i64::try_from(at).ok()?, 0)
                     .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
@@ -273,7 +327,7 @@ mod tests {
     #[test]
     fn a_valid_write_is_authenticated_and_retained_as_an_audit_record() {
         let keypair = keypair();
-        let auth = WriteAuth::with_controller_keys(vec![keypair.public.to_bytes()], vec![]);
+        let auth = WriteAuth::with_controller_keys(vec![keypair.public.to_bytes()], vec![], None);
         let body = b"{\"prefix\":\"g.example\"}";
         let (sig_input, sig, digest) = sign(&keypair, "POST", "/routes", body, 9_999_999_999);
 
@@ -298,7 +352,7 @@ mod tests {
     #[test]
     fn a_rejected_write_is_not_retained_as_an_audit_record() {
         let keypair = keypair();
-        let auth = WriteAuth::with_controller_keys(vec![], vec![]); // key not allowlisted
+        let auth = WriteAuth::with_controller_keys(vec![], vec![], None); // key not allowlisted
         let body = b"body";
         let (sig_input, sig, digest) = sign(&keypair, "POST", "/routes", body, 9_999_999_999);
 
@@ -318,7 +372,7 @@ mod tests {
     #[test]
     fn replaying_the_same_signature_is_rejected_the_second_time() {
         let keypair = keypair();
-        let auth = WriteAuth::with_controller_keys(vec![keypair.public.to_bytes()], vec![]);
+        let auth = WriteAuth::with_controller_keys(vec![keypair.public.to_bytes()], vec![], None);
         let body = b"body";
         let (sig_input, sig, digest) = sign(&keypair, "POST", "/routes", body, 9_999_999_999);
 
@@ -362,7 +416,7 @@ mod tests {
             vec![WriteScope::ChannelsLand],
             Some(now + 2),
         );
-        let auth = WriteAuth::with_controller_keys(vec![], vec![controller]);
+        let auth = WriteAuth::with_controller_keys(vec![], vec![controller], None);
         let body = b"body";
         let (sig_input, sig, digest) =
             sign(&keypair, "POST", "/channels/c/land", body, 9_999_999_999);

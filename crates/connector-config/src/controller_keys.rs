@@ -14,8 +14,10 @@
 //! expires = "2026-12-31T00:00:00Z"   # optional, RFC 3339
 //! ```
 //!
-//! The spending and deposit limits are parsed and validated here, but this
-//! build does not count them, so an entry that states one is refused by name
+//! An entry that carries `packets` states a `spending_limit` (`per_write` and
+//! `per_day`, both): the operator surface counts it (ADR 0078). The deposit
+//! limit is parsed and validated here, but this build does not count it, so
+//! an entry that states one is refused by name
 //! ([`ConfigError::ControllerLimitsNotEnforced`]): no release accepts a limit
 //! it does not hold.
 
@@ -89,6 +91,14 @@ impl fmt::Display for WriteScope {
     }
 }
 
+/// A spending limit (ADR 0078): the most a key may send in packets, per
+/// packet and per UTC day, as one bare figure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpendingLimit {
+    pub per_write: u64,
+    pub per_day: u64,
+}
+
 /// A restricted write key. Every boot refusal is checked where the file is
 /// parsed; [`ControllerKey::new`] itself validates nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +107,7 @@ pub struct ControllerKey {
     key: [u8; 32],
     scope: Vec<WriteScope>,
     expires: Option<u64>,
+    spending_limit: Option<SpendingLimit>,
 }
 
 impl ControllerKey {
@@ -113,7 +124,14 @@ impl ControllerKey {
             key,
             scope,
             expires,
+            spending_limit: None,
         }
+    }
+
+    /// The same key carrying a spending limit.
+    pub fn with_spending_limit(mut self, limit: SpendingLimit) -> ControllerKey {
+        self.spending_limit = Some(limit);
+        self
     }
 
     /// The entry's table name in the file: what a boot refusal and a log
@@ -136,6 +154,11 @@ impl ControllerKey {
     /// entry states one.
     pub fn expires(&self) -> Option<u64> {
         self.expires
+    }
+
+    /// What the key may send in packets, if the entry states a limit.
+    pub fn spending_limit(&self) -> Option<SpendingLimit> {
+        self.spending_limit
     }
 }
 
@@ -283,7 +306,7 @@ pub(crate) fn parse_controller_keys(
             }
         }
 
-        if raw.spending_limit.is_some() || raw.deposit_limit.is_some() {
+        if raw.deposit_limit.is_some() {
             return Err(ConfigError::ControllerLimitsNotEnforced {
                 path: path.to_path_buf(),
                 entry: name,
@@ -304,7 +327,15 @@ pub(crate) fn parse_controller_keys(
             }
         };
 
-        out.push(ControllerKey::new(name, key, scope, expires));
+        let mut controller = ControllerKey::new(name, key, scope, expires);
+        if let Some(RawLimit {
+            per_write: Some(per_write),
+            per_day: Some(per_day),
+        }) = raw.spending_limit
+        {
+            controller = controller.with_spending_limit(SpendingLimit { per_write, per_day });
+        }
+        out.push(controller);
     }
     Ok(out)
 }
@@ -471,12 +502,27 @@ mod tests {
     }
 
     #[test]
-    fn a_stated_limit_is_refused_because_limits_are_not_yet_enforced() {
+    fn a_stated_deposit_limit_is_refused_because_it_is_not_yet_enforced() {
         let result = parse(&format!(
-            "[a]\nkey = \"{KEY}\"\nscope = [\"packets\"]\nspending_limit = {{ per_write = 1, per_day = 5 }}\n"
+            "[a]\nkey = \"{KEY}\"\nscope = [\"channels-land\"]\ndeposit_limit = {{ per_write = 1, per_day = 5 }}\n"
         ));
         assert!(
             matches!(result, Err(ConfigError::ControllerLimitsNotEnforced { entry, .. }) if entry == "a")
+        );
+    }
+
+    #[test]
+    fn a_spending_limit_resolves_with_both_figures() {
+        let keys = parse(&format!(
+            "[a]\nkey = \"{KEY}\"\nscope = [\"packets\"]\nspending_limit = {{ per_write = 1, per_day = 5 }}\n"
+        ))
+        .expect("parses");
+        assert_eq!(
+            keys[0].spending_limit(),
+            Some(SpendingLimit {
+                per_write: 1,
+                per_day: 5
+            })
         );
     }
 
