@@ -5,7 +5,8 @@ packet carries the same `correlation_id` â€” the packet's execution condition â€
 because that value is invariant across hops, the same id appears in every
 connector that handled it. `RUST_LOG=debug` for more.
 
-**Settlement RPC down.** A node refuses to start without it and refuses vouchers while it is out; see [when the settlement RPC is unreachable](../operators/x402-batch-settlement.md#when-the-settlement-rpc-is-unreachable).
+**Settlement RPC down.** A node refuses to start without it and refuses vouchers
+while it is out; see [when the settlement RPC is unreachable](../operators/x402-batch-settlement.md#when-the-settlement-rpc-is-unreachable).
 
 **Releases.** A release is one dispatch of `release-connector.yml`: it builds the
 image, cuts a dated handle and opens a GitHub Release. It does not deploy, and

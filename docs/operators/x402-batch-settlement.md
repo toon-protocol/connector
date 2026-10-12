@@ -290,10 +290,10 @@ is refused too. Fund both keys before the first boot.
 
 The two moments differ, on purpose:
 
-| When                       | What the node does                                                                                                                                                                                                                                                      | How you see it                                                                                                                                        |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **At boot**                | Refuses to start, exits non-zero and does not retry. This holds if _any_ `[settlement.<chain>]` table cannot bind: a node with both tables and one unreachable chain does not start on the other.                                                                       | `[settlement.<chain>] could not be bound: … A node must reach the x402 contract or program its vouchers are signed for (ADR 0074, ADR 0075)`          |
-| **At runtime, node is up** | Stays up, with no grace period. Every voucher on the unreachable chain is refused, because a channel is read from the chain for every voucher and never answered from a cache. Nothing is latched: the next voucher after the RPC answers is accepted, with no restart. | The sender gets a `T00` reject. The node logs a `warn`: `refusing a voucher: could not resolve its batch-settlement channel`, with the lookup's error |
+| When                       | What the node does                                                                                                                                                                                                                                                                                          | How you see it                                                                                                                                                                                                       |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **At boot**                | Retries each read three times (about 3.5 s), then refuses to start and exits non-zero; it does not restart itself. This holds if _any_ `[settlement.<chain>]` table cannot bind: a node with both tables and one unreachable chain does not start on the other.                                             | `[settlement.<chain>] could not be bound: … A node must reach the x402 contract or program its vouchers are signed for (ADR 0074, ADR 0075)`                                                                         |
+| **At runtime, node is up** | Stays up, with no grace period. Every voucher on the unreachable chain is refused, because a channel is read from the chain for every voucher and never answered from a cache. Nothing is latched: once the RPC answers, the next voucher on a channel the node already holds is accepted, with no restart. | The client gets a `T00` reject: "this connector could not look up the channel's counterparty". The node logs a `warn`: `refusing a voucher: could not resolve its batch-settlement channel`, with the lookup's error |
 
 Why they differ: configuration is validated once at boot (ADR 0009), and a node must reach the
 contract or program its vouchers are signed for (ADR 0074, ADR 0075), so a table it cannot bind is
@@ -305,13 +305,15 @@ A chain that _answers_ but has no x402 contract or program is a different refusa
 
 With two tables at runtime, only vouchers for the chain whose RPC is down are refused; each
 chain's vouchers are resolved through that chain's own backend. A request that carries no voucher
-because its route is free (`price = 0`) never reads a channel, so it is not affected.
+because its route is free (`price = 0`) never reads a channel, so it is not affected. A peer's
+voucher is not refused but left unacknowledged, so it stays pending and its resend is judged
+afresh. A failed lookup of a channel the node has not seen yet also spends the unresolvable-lookup
+budget, so first vouchers on new channels can get `T05` instead of `T00`, during the outage and for
+the rest of that budget's window after it.
 
 The boot refusal clears itself once the chain answers, so **run the node under a supervisor with a
 restart policy** (Docker `restart: unless-stopped`, systemd `Restart=on-failure`). It then
-loops until the RPC is reachable and serves from the first boot that binds. Under systemd, set
-`RestartSec=5` or more: with the default start limit of five starts in ten seconds, a unit that
-restarts instantly gives up for good, where one that waits five seconds never reaches the limit.
+loops until the RPC is reachable and serves from the first boot that binds.
 
 The old `channel_liveness_ttl_secs` and `channel_serve_stale_secs` keys are gone and refused by name
 at boot; there is no window to tune.
