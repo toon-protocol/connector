@@ -197,6 +197,25 @@ in your head and in the same review:
 | `state_dir`        | the connector's | every channel's replay watermark                            | a restarted node accepts a nonce it already spent — free service, silently |
 | `HiddenServiceDir` | the daemon's    | the node's address, and with it every counterparty's config | every peer dials an address that is gone — silently, on their side         |
 
+A persisted `HiddenServiceDir` keeps the address across container and host restarts. It does **not**
+keep it across an `anon` upgrade that crosses a TLD era (#1320). A v3 address is
+`base32(PUBKEY ‖ CHECKSUM ‖ VERSION)` with `CHECKSUM = SHA3_256(prefix ‖ PUBKEY ‖ VERSION)[:2]`, and
+the prefix is inside the hash, so the same `hs_ed25519_secret_key` yields a different address in
+each era:
+
+| `anon` tag | TLD       | checksum prefix    |
+| ---------- | --------- | ------------------ |
+| v0.4.9.7   | `.onion`  | `.onion checksum`  |
+| v0.4.9.13  | `.anon`   | `.anon checksum`   |
+| v0.4.10.2  | `.anyone` | `.anyone checksum` |
+
+(v0.4.9.13's `.anon` is not a host the connector accepts; it is listed because a daemon may pass
+through it.) The new daemon silently rewrites `hostname` and leaves the key file untouched. The
+address changes in the TLD and in characters 52–55 only — the first 51 are the public key alone, and
+the 56th encodes the version — so the old and new addresses look almost the same. Treat such an
+upgrade as an **address rotation**, not a routine version bump: every counterparty holding the old
+address dials a dead endpoint, so coordinate it with all of them beforehand.
+
 Use a **named volume**, not a path in the writable layer and not a host bind mount you have to
 `chown` — the same argument that puts `/app/state` on one. Back it up if losing the address would
 cost more than telling every counterparty a new one.
@@ -314,8 +333,9 @@ the cheapest way to ask "has a rendezvous happened yet" while circuits are still
   `HiddenServiceDir/hostname` holds a 56-character v3 address. A container that is `Up` is not a
   container that has a circuit.
 - **(b) The address survives a restart.** Restart the daemon container and read `hostname` again: it
-  must be **the same address**. If it is not, `HiddenServiceDir` is not persisted — stop here, fix
-  step 3, and tell no counterparty the address you read before now.
+  must be **the same address**. If it is not, either `HiddenServiceDir` is not persisted or the
+  daemon was upgraded across a TLD era since you last read the address (step 3, #1320) — stop here,
+  fix step 3 or coordinate the rotation, and tell no counterparty the address you read before now.
 - **(c) The peering establishes, and it charges.** Every gate in
   [`btp-peer-transport-bringup.md`](btp-peer-transport-bringup.md) applies unchanged, and gate (c)
   there — a paid write end to end with **no free-write path** — is the one that matters most here
@@ -414,4 +434,5 @@ through costs nothing.
 
 Neither rollback touches the daemon, the volume or the address. Leaving the sidecar running with its
 `HiddenServiceDir` intact is what makes the next attempt cheap — the address is the expensive thing
-to lose, and it is the one thing here nothing can regenerate for you.
+to lose, and it is the one thing here nothing can regenerate for you (short of an `anon` upgrade
+across a TLD era, which replaces it — step 3).

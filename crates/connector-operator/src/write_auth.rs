@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::http::HeaderMap;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use connector_config::{ControllerKey, WriteScope};
 use serde::Serialize;
 
 use crate::rfc9421::{verify_write_signature, VerifiedWrite, WriteAuthError};
@@ -34,23 +35,72 @@ pub struct AuditRecord {
     pub expires: u64,
 }
 
+/// One row of `GET /write-keys`: a key allowed to sign a write. An
+/// unrestricted key (`write_keys`) lists every write as its scope; a
+/// restricted one (`controller_keys_file`) lists its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WriteKeyView {
+    pub keyid: String,
+    pub restricted: bool,
+    pub name: Option<String>,
+    pub scope: Vec<&'static str>,
+    pub expires: Option<String>,
+}
+
+fn to_hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The 32 bytes a verified `keyid` names.
+fn verified_key(keyid: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    if keyid.len() != 64 {
+        return None;
+    }
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(keyid.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// The operator write surface's authentication state: which keys may
 /// write, which signatures have already been spent, and the audit trail
 /// of every write accepted so far.
 pub struct WriteAuth {
+    /// Every key that may sign a write: `write_keys` and the controllers'.
     allowlist: HashSet<[u8; 32]>,
+    /// The operator's keys, which keep every write (ADR 0008), in the order
+    /// configured.
+    full: Vec<[u8; 32]>,
+    /// The restricted keys (ADR 0078), by key.
+    restricted: HashMap<[u8; 32], ControllerKey>,
     seen_signatures: Mutex<HashMap<Vec<u8>, u64>>,
     audit_log: Mutex<Vec<AuditRecord>>,
 }
 
 impl WriteAuth {
-    /// Construct write authentication over `allowlist` -- the ed25519
-    /// public keys permitted to sign a write. Revoking a key is a
-    /// deploy-time change to this list (ADR 0009: config is immutable for
+    /// Construct write authentication over `write_keys` -- the ed25519
+    /// public keys permitted to sign any write -- and `controller_keys`, the
+    /// restricted keys of controllers (ADR 0078), each permitted only the
+    /// writes its scope names, until its expiry. Revoking a key is a
+    /// deploy-time change to these lists (ADR 0009: config is immutable for
     /// the process lifetime), not a runtime operation.
-    pub fn new(allowlist: Vec<[u8; 32]>) -> WriteAuth {
+    pub fn with_controller_keys(
+        write_keys: Vec<[u8; 32]>,
+        controller_keys: Vec<ControllerKey>,
+    ) -> WriteAuth {
+        let allowlist = write_keys
+            .iter()
+            .copied()
+            .chain(controller_keys.iter().map(|controller| *controller.key()))
+            .collect();
         WriteAuth {
-            allowlist: allowlist.into_iter().collect(),
+            allowlist,
+            full: write_keys,
+            restricted: controller_keys
+                .into_iter()
+                .map(|controller| (*controller.key(), controller))
+                .collect(),
             seen_signatures: Mutex::new(HashMap::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -59,8 +109,14 @@ impl WriteAuth {
     /// Verify a presented write signature against THIS request, reject a
     /// replay of a signature already accepted, and -- on success --
     /// retain the signature as this write's audit record.
+    ///
+    /// A restricted key's scope and expiry are checked once the signature
+    /// has verified and **before** it is remembered or retained: a refused
+    /// write leaves no audit record and does not spend the signature.
+    #[allow(clippy::too_many_arguments)]
     pub fn authenticate(
         &self,
+        write: WriteScope,
         method: &str,
         path: &str,
         signature_input: Option<&str>,
@@ -93,8 +149,21 @@ impl WriteAuth {
             // remembered: once it can no longer verify as unexpired, it
             // can never be replayed successfully, so it is safe to forget.
             seen.retain(|_, expires_at| *expires_at >= now);
+            // A replay is a `401` whatever the key's authority now is: a
+            // signature accepted before its key expired and presented again
+            // after is a replay first.
             if seen.contains_key(&verified.signature) {
                 return Err(WriteAuthError::Replayed);
+            }
+            if let Some(controller) =
+                verified_key(&verified.keyid).and_then(|key| self.restricted.get(&key))
+            {
+                if controller.expires().is_some_and(|expires| now >= expires) {
+                    return Err(WriteAuthError::KeyExpired);
+                }
+                if !controller.scope().contains(&write) {
+                    return Err(WriteAuthError::OutOfScope(write));
+                }
             }
             seen.insert(verified.signature.clone(), verified.expires);
         }
@@ -112,6 +181,35 @@ impl WriteAuth {
             });
 
         Ok(verified)
+    }
+
+    /// Every write key, for `GET /write-keys`: the operator's first, then
+    /// the controllers' in name order.
+    pub fn keys(&self) -> Vec<WriteKeyView> {
+        let mut views: Vec<WriteKeyView> = self
+            .full
+            .iter()
+            .map(|key| WriteKeyView {
+                keyid: to_hex(key),
+                restricted: false,
+                name: None,
+                scope: WriteScope::ALL.iter().map(|s| s.name()).collect(),
+                expires: None,
+            })
+            .collect();
+        let mut controllers: Vec<&ControllerKey> = self.restricted.values().collect();
+        controllers.sort_by(|a, b| a.name().cmp(b.name()));
+        views.extend(controllers.into_iter().map(|controller| WriteKeyView {
+            keyid: to_hex(controller.key()),
+            restricted: true,
+            name: Some(controller.name().to_string()),
+            scope: controller.scope().iter().map(|s| s.name()).collect(),
+            expires: controller.expires().and_then(|at| {
+                chrono::DateTime::from_timestamp(i64::try_from(at).ok()?, 0)
+                    .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            }),
+        }));
+        views
     }
 
     /// Every write authenticated so far, in the order it was accepted.
@@ -133,6 +231,7 @@ impl WriteAuth {
 /// response type in every call site's `Result`.
 pub(crate) fn authenticate_write(
     write_auth: &WriteAuth,
+    write: WriteScope,
     method: &str,
     path: &str,
     headers: &HeaderMap,
@@ -140,6 +239,7 @@ pub(crate) fn authenticate_write(
 ) -> Result<VerifiedWrite, WriteAuthError> {
     let header_str = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     write_auth.authenticate(
+        write,
         method,
         path,
         header_str("signature-input"),
@@ -173,11 +273,12 @@ mod tests {
     #[test]
     fn a_valid_write_is_authenticated_and_retained_as_an_audit_record() {
         let keypair = keypair();
-        let auth = WriteAuth::new(vec![keypair.public.to_bytes()]);
+        let auth = WriteAuth::with_controller_keys(vec![keypair.public.to_bytes()], vec![]);
         let body = b"{\"prefix\":\"g.example\"}";
         let (sig_input, sig, digest) = sign(&keypair, "POST", "/routes", body, 9_999_999_999);
 
         let result = auth.authenticate(
+            WriteScope::Packets,
             "POST",
             "/routes",
             Some(&sig_input),
@@ -197,11 +298,12 @@ mod tests {
     #[test]
     fn a_rejected_write_is_not_retained_as_an_audit_record() {
         let keypair = keypair();
-        let auth = WriteAuth::new(vec![]); // key not allowlisted
+        let auth = WriteAuth::with_controller_keys(vec![], vec![]); // key not allowlisted
         let body = b"body";
         let (sig_input, sig, digest) = sign(&keypair, "POST", "/routes", body, 9_999_999_999);
 
         let result = auth.authenticate(
+            WriteScope::Packets,
             "POST",
             "/routes",
             Some(&sig_input),
@@ -216,11 +318,12 @@ mod tests {
     #[test]
     fn replaying_the_same_signature_is_rejected_the_second_time() {
         let keypair = keypair();
-        let auth = WriteAuth::new(vec![keypair.public.to_bytes()]);
+        let auth = WriteAuth::with_controller_keys(vec![keypair.public.to_bytes()], vec![]);
         let body = b"body";
         let (sig_input, sig, digest) = sign(&keypair, "POST", "/routes", body, 9_999_999_999);
 
         let first = auth.authenticate(
+            WriteScope::Packets,
             "POST",
             "/routes",
             Some(&sig_input),
@@ -231,6 +334,7 @@ mod tests {
         assert!(first.is_ok());
 
         let second = auth.authenticate(
+            WriteScope::Packets,
             "POST",
             "/routes",
             Some(&sig_input),
@@ -242,6 +346,42 @@ mod tests {
 
         // Exactly one write was recorded -- the replay never reached the
         // audit log.
+        assert_eq!(auth.audit_log().len(), 1);
+    }
+
+    #[test]
+    fn a_signature_replayed_after_its_key_expires_is_a_replay_not_an_expiry() {
+        let keypair = keypair();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let controller = ControllerKey::new(
+            "agent",
+            keypair.public.to_bytes(),
+            vec![WriteScope::ChannelsLand],
+            Some(now + 2),
+        );
+        let auth = WriteAuth::with_controller_keys(vec![], vec![controller]);
+        let body = b"body";
+        let (sig_input, sig, digest) =
+            sign(&keypair, "POST", "/channels/c/land", body, 9_999_999_999);
+        let attempt = || {
+            auth.authenticate(
+                WriteScope::ChannelsLand,
+                "POST",
+                "/channels/c/land",
+                Some(&sig_input),
+                Some(&sig),
+                Some(&digest),
+                body,
+            )
+        };
+
+        assert!(attempt().is_ok());
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        // `401` stays the answer to a replayed signature (#1487).
+        assert_eq!(attempt(), Err(WriteAuthError::Replayed));
         assert_eq!(auth.audit_log().len(), 1);
     }
 }

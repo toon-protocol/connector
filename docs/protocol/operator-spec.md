@@ -341,6 +341,9 @@ voucher, which has none; a `toon-channel` row an older journal still holds repor
 journal recorded on the peer book and `0` on the client book, whose replay keeps only amounts since
 issue #1384.
 
+`GET /write-keys` lists every write key: its key id, whether it is restricted, its scope and its
+expiry.
+
 The audit log is the one worth knowing about: **every accepted write is retained as its own
 signature**, not as a log line asserting that something happened.
 
@@ -392,7 +395,7 @@ response to anything arriving over the network.
 **Non-normative.** How _this_ connector spells §3.
 
 **Reads** — bearer token: `GET /peers` · `/routes` · `/routes/leased` · `/routes/peers` · `/channels` ·
-`/claims` · `/rates` · `/identity` · `/audit-log` · `/metrics`
+`/claims` · `/rates` · `/identity` · `/audit-log` · `/write-keys` · `/metrics`
 
 **Writes** — RFC 9421 HTTP Message Signature from a key on an operator allowlist, with RFC 9530
 Content-Digest binding the signature to the body: `POST /packets` · `POST|DELETE /peers` ·
@@ -402,6 +405,16 @@ Content-Digest binding the signature to the body: `POST /packets` · `POST|DELET
 **Page** — no authentication: `GET /dashboard`, the operator dashboard, which reads and writes
 through exactly the lines above from the operator's browser
 ([ADR 0066](../adr/0066-the-operator-dashboard-is-a-page-the-surface-serves-and-signs-in-the-browser.md)).
+
+A key on `write_keys` may make every write. A **controller's** key, declared in `[operator]
+controller_keys_file` ([ADR 0078](../adr/0078-a-controllers-write-key-carries-a-scope-and-two-limits.md)),
+carries a **scope** — a list of the named writes `packets`, `peers`, `routes-peers`, `routes-leased`,
+`channels-open`, `channels-fund`, `channels-withdraw` and `channels-land` (a `DELETE` belongs to the
+name of its `POST`) — and an optional expiry. A verified signature from such a key outside its scope or
+after its expiry is answered `403` naming the reason (`scope` or `expiry`), before anything is signed,
+journaled or sent; it is not retained in the audit log, and counts on `toon_writes_refused_total`. `401`
+remains the answer to a signature that is missing, bad, replayed or unlisted. This build refuses at boot
+an entry that states a spending or deposit limit, since neither is enforced yet.
 
 Two mechanisms sit behind the write half that [ADR 0008](../adr/0008-operator-surface-splits-read-from-write.md)'s
 Decision does not name — **replay rejection**, and the **audit log** the retained signatures are

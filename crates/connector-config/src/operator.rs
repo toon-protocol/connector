@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::controller_keys::{resolve_controller_keys, ControllerKey};
 use crate::error::ConfigError;
 
 /// The `[operator]` section as written in the config file. Its presence
@@ -54,6 +55,10 @@ pub(crate) struct RawOperatorConfig {
     write_keys: Option<Vec<String>>,
     #[serde(default)]
     write_keys_file: Option<PathBuf>,
+    /// The restricted keys of a controller (ADR 0078): a file of its own,
+    /// one table per key. Beside `write_keys`, never instead of it.
+    #[serde(default)]
+    controller_keys_file: Option<PathBuf>,
     /// How many recent packets to keep in memory for `GET /packets`
     /// (ADR 0077). Absent or `0` keeps none; not a required key.
     #[serde(default)]
@@ -78,6 +83,7 @@ impl fmt::Debug for RawOperatorConfig {
             .field("bearer_token_file", &self.bearer_token_file)
             .field("write_keys", &self.write_keys)
             .field("write_keys_file", &self.write_keys_file)
+            .field("controller_keys_file", &self.controller_keys_file)
             .field("packet_history", &self.packet_history)
             .finish()
     }
@@ -92,6 +98,7 @@ impl fmt::Debug for RawOperatorConfig {
 pub struct OperatorConfig {
     bearer_token: String,
     write_keys: Vec<[u8; 32]>,
+    controller_keys: Vec<ControllerKey>,
     packet_history: usize,
 }
 
@@ -105,6 +112,10 @@ impl fmt::Debug for OperatorConfig {
             .field(
                 "write_keys",
                 &format_args!("{} key(s)", self.write_keys.len()),
+            )
+            .field(
+                "controller_keys",
+                &format_args!("{} key(s)", self.controller_keys.len()),
             )
             .field("packet_history", &self.packet_history)
             .finish()
@@ -125,6 +136,13 @@ impl OperatorConfig {
         &self.write_keys
     }
 
+    /// The restricted keys of controllers (ADR 0078): each may make only the
+    /// writes its scope names, until its expiry. Disjoint from
+    /// [`write_keys`](Self::write_keys).
+    pub fn controller_keys(&self) -> &[ControllerKey] {
+        &self.controller_keys
+    }
+
     /// How many recent packets the node keeps in memory for the operator to
     /// watch (ADR 0077); `0` keeps none.
     pub fn packet_history(&self) -> usize {
@@ -138,7 +156,7 @@ fn parse_write_key(value: &str) -> Result<[u8; 32], ConfigError> {
     })
 }
 
-fn hex_decode_32(value: &str) -> Option<[u8; 32]> {
+pub(crate) fn hex_decode_32(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -162,7 +180,10 @@ fn hex_decode_32(value: &str) -> Option<[u8; 32]> {
 /// for `[signer] key_file`. The path is resolved the same way those are (by
 /// the OS, against the process's working directory), which is why the
 /// committed fleet configs write absolute container paths.
-fn read_operator_file(setting: &'static str, path: &Path) -> Result<String, ConfigError> {
+pub(crate) fn read_operator_file(
+    setting: &'static str,
+    path: &Path,
+) -> Result<String, ConfigError> {
     if !path.is_file() {
         return Err(ConfigError::OperatorFileNotFound {
             setting,
@@ -311,10 +332,13 @@ pub(crate) fn resolve_operator(
 
     let bearer_token = resolve_bearer_token(raw.bearer_token, raw.bearer_token_file)?;
     let write_keys = resolve_write_keys(raw.write_keys, raw.write_keys_file)?;
+    let controller_keys =
+        resolve_controller_keys(raw.controller_keys_file.as_deref(), &write_keys)?;
 
     Ok(Some(OperatorConfig {
         bearer_token,
         write_keys,
+        controller_keys,
         packet_history: raw.packet_history.unwrap_or(0),
     }))
 }
@@ -334,6 +358,7 @@ mod tests {
             bearer_token_file: None,
             write_keys: Some(write_keys.iter().map(|k| k.to_string()).collect()),
             write_keys_file: None,
+            controller_keys_file: None,
             packet_history: None,
         }
     }
@@ -359,6 +384,90 @@ mod tests {
         file.write_all(contents.as_bytes()).expect("write");
         file.flush().expect("flush");
         file
+    }
+
+    fn with_controllers(path: PathBuf) -> RawOperatorConfig {
+        let mut config = raw("token", &[OTHER_KEY]);
+        config.controller_keys_file = Some(path);
+        config
+    }
+
+    #[test]
+    fn a_controller_keys_file_resolves_beside_the_write_keys() {
+        let file = file_holding(&format!(
+            "[agent]\nkey = \"{KEY}\"\nscope = [\"channels-land\"]\n"
+        ));
+        let resolved = resolve_operator(Some(with_controllers(file.path().to_path_buf())))
+            .expect("resolve")
+            .expect("some");
+        assert_eq!(resolved.write_keys().len(), 1);
+        assert_eq!(resolved.controller_keys().len(), 1);
+        assert_eq!(resolved.controller_keys()[0].name(), "agent");
+    }
+
+    #[test]
+    fn no_controller_keys_file_means_no_restricted_keys() {
+        let resolved = resolve_operator(Some(raw("token", &[KEY])))
+            .expect("resolve")
+            .expect("some");
+        assert!(resolved.controller_keys().is_empty());
+    }
+
+    #[test]
+    fn a_named_controller_keys_file_that_is_missing_is_refused() {
+        let result = resolve_operator(Some(with_controllers(PathBuf::from(
+            "/nonexistent/controllers.toml",
+        ))));
+        assert!(matches!(
+            result,
+            Err(ConfigError::OperatorFileNotFound {
+                setting: "controller_keys_file",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_named_controller_keys_file_that_is_unreadable_is_refused() {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&[0xff, 0xfe, 0xfd]).expect("write");
+        file.flush().expect("flush");
+        let result = resolve_operator(Some(with_controllers(file.path().to_path_buf())));
+        assert!(matches!(
+            result,
+            Err(ConfigError::OperatorFileUnreadable {
+                setting: "controller_keys_file",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_controller_key_that_is_also_on_write_keys_file_is_refused() {
+        let keys = file_holding(&format!("{OTHER_KEY}\n"));
+        let controllers = file_holding(&format!(
+            "[agent]\nkey = \"{OTHER_KEY}\"\nscope = [\"channels-land\"]\n"
+        ));
+        let mut config = with_controllers(controllers.path().to_path_buf());
+        config.write_keys = None;
+        config.write_keys_file = Some(keys.path().to_path_buf());
+        let result = resolve_operator(Some(config));
+        assert!(matches!(
+            result,
+            Err(ConfigError::ControllerKeyAlsoWriteKey { .. })
+        ));
+    }
+
+    #[test]
+    fn a_controller_key_that_is_also_a_write_key_is_refused() {
+        let file = file_holding(&format!(
+            "[agent]\nkey = \"{OTHER_KEY}\"\nscope = [\"channels-land\"]\n"
+        ));
+        let result = resolve_operator(Some(with_controllers(file.path().to_path_buf())));
+        assert!(matches!(
+            result,
+            Err(ConfigError::ControllerKeyAlsoWriteKey { .. })
+        ));
     }
 
     #[test]
@@ -442,6 +551,7 @@ mod tests {
             bearer_token_file: Some(token.path().to_path_buf()),
             write_keys: None,
             write_keys_file: Some(keys.path().to_path_buf()),
+            controller_keys_file: None,
             packet_history: None,
         }))
         .expect("resolve")
@@ -464,6 +574,7 @@ mod tests {
             bearer_token_file: Some(token.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            controller_keys_file: None,
             packet_history: None,
         }))
         .expect("resolve")
@@ -485,6 +596,7 @@ mod tests {
             bearer_token_file: Some(token.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            controller_keys_file: None,
             packet_history: None,
         }))
         .expect("resolve")
@@ -520,6 +632,7 @@ mod tests {
             bearer_token_file: None,
             write_keys: None,
             write_keys_file: Some(keys.path().to_path_buf()),
+            controller_keys_file: None,
             packet_history: None,
         }))
         .expect("resolve")
@@ -542,6 +655,7 @@ mod tests {
             bearer_token_file: Some(token.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            controller_keys_file: None,
             packet_history: None,
         }));
 
@@ -559,6 +673,7 @@ mod tests {
             bearer_token_file: None,
             write_keys: Some(vec![OTHER_KEY.to_string()]),
             write_keys_file: Some(keys.path().to_path_buf()),
+            controller_keys_file: None,
             packet_history: None,
         }));
 
@@ -576,6 +691,7 @@ mod tests {
             bearer_token_file: Some(PathBuf::from("/nonexistent/operator-bearer-token")),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            controller_keys_file: None,
             packet_history: None,
         }));
 
@@ -594,6 +710,7 @@ mod tests {
             bearer_token_file: None,
             write_keys: None,
             write_keys_file: Some(PathBuf::from("/nonexistent/operator-write-keys")),
+            controller_keys_file: None,
             packet_history: None,
         }));
 
@@ -617,6 +734,7 @@ mod tests {
             bearer_token_file: Some(dir.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            controller_keys_file: None,
             packet_history: None,
         }));
 
@@ -635,6 +753,7 @@ mod tests {
             bearer_token_file: Some(file.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            controller_keys_file: None,
             packet_history: None,
         }));
 
@@ -652,6 +771,7 @@ mod tests {
                 bearer_token_file: Some(token.path().to_path_buf()),
                 write_keys: Some(vec![KEY.to_string()]),
                 write_keys_file: None,
+                controller_keys_file: None,
                 packet_history: None,
             }));
 
@@ -674,6 +794,7 @@ mod tests {
                 bearer_token_file: None,
                 write_keys: None,
                 write_keys_file: Some(keys.path().to_path_buf()),
+                controller_keys_file: None,
                 packet_history: None,
             }));
 
@@ -693,6 +814,7 @@ mod tests {
             bearer_token_file: None,
             write_keys: None,
             write_keys_file: Some(keys.path().to_path_buf()),
+            controller_keys_file: None,
             packet_history: None,
         }));
 
