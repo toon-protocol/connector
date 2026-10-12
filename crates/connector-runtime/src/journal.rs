@@ -273,6 +273,8 @@ impl FileJournal {
 }
 
 impl Journal for FileJournal {
+    /// A batch of one, so the entry and its newline go out in a single
+    /// `write_all` -- see `append_batch` (#1319).
     fn append(&self, entry: &JournalEntry) -> Result<(), JournalError> {
         self.append_batch(std::slice::from_ref(entry))
     }
@@ -315,6 +317,7 @@ impl Journal for FileJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn sample_entries() -> Vec<JournalEntry> {
         vec![
@@ -506,14 +509,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.log");
         let handles: Vec<_> = (0..2)
-            .map(|_| std::sync::Arc::new(FileJournal::open(&path).unwrap()))
+            .map(|_| Arc::new(FileJournal::open(&path).unwrap()))
             .collect();
 
         let writers: Vec<_> = handles
             .iter()
             .enumerate()
             .map(|(h, journal)| {
-                let journal = journal.clone();
+                let journal = Arc::clone(journal);
                 std::thread::spawn(move || {
                     for i in 0..PER_HANDLE {
                         journal
