@@ -39,6 +39,52 @@ calling and never on the node. `connector send --operator-key <file>
 --print-keyid` prints the value that goes in the allowlist, derived by the binary
 that will do the signing.
 
+## A controller's key: a scope and an expiry
+
+`write_keys` holds an operator's keys, and each may make **every** write. Automation
+you point at a node — a controller — should hold less. Declare its key in a file of
+its own ([ADR 0078](../adr/0078-a-controllers-write-key-carries-a-scope-and-two-limits.md)):
+
+```toml
+[operator]
+bearer_token_file    = "/app/data/operator-bearer-token"
+write_keys_file      = "/app/data/operator-write-keys"
+controller_keys_file = "/app/data/operator-controller-keys"
+```
+
+```toml
+# /app/data/operator-controller-keys — one table per restricted key
+[lander]
+key     = "<64 hex ed25519 public key>"
+scope   = ["channels-land", "routes-peers"]
+expires = "2026-12-31T00:00:00Z"   # optional, RFC 3339
+```
+
+A scope is a non-empty list of named writes: `packets`, `peers` (`POST /peers`,
+`DELETE /peers/:id`), `routes-peers` (`POST /routes/peers`,
+`DELETE /routes/peers/:prefix`), `routes-leased`, `channels-open`, `channels-fund`,
+`channels-withdraw` and `channels-land`. A `DELETE` belongs to the name of its
+`POST`. The file is read once at boot: changing or revoking a key is an edit and a
+restart.
+
+A write from a restricted key outside its scope, or after its `expires`, is answered
+**`403`** with a body naming the reason (`scope` or `expiry`), before anything is
+signed, journaled or sent. It is not in `GET /audit-log`; it is a log line and a count
+on `toon_writes_refused_total{reason}`. `401` stays the answer to a missing, bad,
+replayed or unlisted signature. `GET /write-keys` lists every write key — its key
+id, whether it is restricted, its scope and its expiry.
+
+The node refuses to start, naming the entry, when a scope is empty or names an
+unknown write; a key is not 64 hex characters or appears twice, or is also on
+`write_keys` or in `write_keys_file`; a scope lacks the limit it requires, or a limit
+states only one of its `per_write` and `per_day`; or the file is missing or
+unreadable. An entry whose `expires` has already passed is not a refusal to start.
+
+**Limits are not enforced yet.** An entry that states a `spending_limit` or a
+`deposit_limit` is refused at boot, so no release accepts a limit it does not hold.
+Scopes that require one — `packets` (a spending limit), `peers`, `channels-open` and
+`channels-fund` (a deposit limit) — therefore cannot be declared until they are.
+
 ## Reads
 
 | Endpoint             | Answers                                                   |
@@ -51,6 +97,7 @@ that will do the signing.
 | `GET /claims`        | The claim journal — what you have been paid, and by whom. |
 | `GET /identity`      | This node's operator-facing identity.                     |
 | `GET /audit-log`     | Every accepted write, with the key that made it.          |
+| `GET /write-keys`    | Every write key: restricted or not, its scope and expiry. |
 | `GET /metrics`       | Prometheus text.                                          |
 | `GET /packets`       | Recent packets, newest first; in memory (ADR 0077).       |
 

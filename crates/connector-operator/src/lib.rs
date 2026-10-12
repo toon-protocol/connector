@@ -86,6 +86,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use connector_client_edge::ClientClaimGate;
+use connector_config::{ControllerKey, WriteScope};
 use connector_domain::x402::X402BatchSettlementTerms;
 use connector_domain::{Prepare, Price};
 use connector_runtime::{
@@ -97,7 +98,7 @@ use connector_runtime::{
 use connector_settlement::batch::BatchSettlementError;
 use connector_signer::{derive_evm_address, to_hex, Signer, SignerError};
 use url::Url;
-use write_auth::{authenticate_write, AuditRecord, WriteAuth};
+use write_auth::{authenticate_write, AuditRecord, WriteAuth, WriteKeyView};
 
 /// This node's own identity: the active signing key and the address
 /// derived from it (ADR 0012's signer, read rather than exercised).
@@ -185,12 +186,39 @@ pub fn router_with_batch_channels(
     declared_rates: Option<DeclaredRates>,
     batch_channels: Option<Arc<BatchChannels>>,
 ) -> Router {
+    router_with_controller_keys(
+        connector,
+        claim_gate,
+        signer,
+        bearer_token,
+        write_keys,
+        Vec::new(),
+        declared_rates,
+        batch_channels,
+    )
+}
+
+/// [`router_with_batch_channels`] plus the restricted write keys of
+/// controllers (ADR 0078): each may make only the writes its scope names,
+/// until its expiry, and a write outside them is answered `403`. A key in
+/// `write_keys` keeps every write.
+#[allow(clippy::too_many_arguments)]
+pub fn router_with_controller_keys(
+    connector: Arc<Connector>,
+    claim_gate: Arc<ClientClaimGate>,
+    signer: Arc<dyn Signer>,
+    bearer_token: impl Into<String>,
+    write_keys: Vec<[u8; 32]>,
+    controller_keys: Vec<ControllerKey>,
+    declared_rates: Option<DeclaredRates>,
+    batch_channels: Option<Arc<BatchChannels>>,
+) -> Router {
     let state = OperatorState {
         connector,
         claim_gate,
         signer,
         bearer_token: Arc::from(bearer_token.into()),
-        write_auth: Arc::new(WriteAuth::new(write_keys)),
+        write_auth: Arc::new(WriteAuth::with_controller_keys(write_keys, controller_keys)),
         rates: declared_rates,
         batch: batch_channels,
     };
@@ -209,6 +237,7 @@ pub fn router_with_batch_channels(
         .route("/rates", get(rates))
         .route("/identity", get(identity))
         .route("/audit-log", get(audit_log))
+        .route("/write-keys", get(write_key_list))
         .route("/metrics", get(metrics))
         .route("/packets", get(packet_history))
         .route_layer(middleware::from_fn_with_state(
@@ -280,6 +309,7 @@ async fn dashboard() -> Response {
 /// module docs.
 fn require_write_auth(
     state: &OperatorState,
+    write: WriteScope,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -287,13 +317,29 @@ fn require_write_auth(
 ) -> Result<(), (StatusCode, String)> {
     authenticate_write(
         &state.write_auth,
+        write,
         method.as_str(),
         uri.path(),
         headers,
         body,
     )
     .map(|_| ())
-    .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))
+    .map_err(|error| match error.refusal_reason() {
+        // The signature verified: the caller is known, and what it asked is
+        // outside its authority (ADR 0078). Nothing was signed, journaled or
+        // sent, and nothing is in the audit log.
+        Some(reason) => {
+            state.connector.metrics().record_write_refused(reason);
+            tracing::warn!(
+                method = method.as_str(),
+                path = uri.path(),
+                reason,
+                "operator write refused: {error}"
+            );
+            (StatusCode::FORBIDDEN, error.to_string())
+        }
+        None => (StatusCode::UNAUTHORIZED, error.to_string()),
+    })
 }
 
 async fn require_bearer_token<B>(
@@ -399,6 +445,13 @@ async fn rates(State(state): State<OperatorState>) -> Json<Vec<RateView>> {
     })
 }
 
+/// `GET /write-keys`: every key that may sign a write -- its key id, whether
+/// it is restricted, its scope and its expiry (ADR 0078 decision 11). A
+/// read like any other: gated by the bearer token.
+async fn write_key_list(State(state): State<OperatorState>) -> Json<Vec<WriteKeyView>> {
+    Json(state.write_auth.keys())
+}
+
 async fn audit_log(State(state): State<OperatorState>) -> Json<Vec<AuditRecord>> {
     Json(state.write_auth.audit_log())
 }
@@ -444,7 +497,9 @@ async fn originate_packet(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) =
+        require_write_auth(&state, WriteScope::Packets, &method, &uri, &headers, &body)
+    {
         return error.into_response();
     }
 
@@ -498,7 +553,14 @@ async fn create_leased_route(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) = require_write_auth(
+        &state,
+        WriteScope::RoutesLeased,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
         return error.into_response();
     }
 
@@ -701,7 +763,9 @@ async fn upsert_peer(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) =
+        require_write_auth(&state, WriteScope::Peers, &method, &uri, &headers, &body)
+    {
         return error.into_response();
     }
 
@@ -754,7 +818,9 @@ async fn remove_peer(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) =
+        require_write_auth(&state, WriteScope::Peers, &method, &uri, &headers, &body)
+    {
         return error.into_response();
     }
 
@@ -805,7 +871,14 @@ async fn upsert_peer_route(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) = require_write_auth(
+        &state,
+        WriteScope::RoutesPeers,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
         return error.into_response();
     }
 
@@ -836,7 +909,14 @@ async fn remove_peer_route(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) = require_write_auth(
+        &state,
+        WriteScope::RoutesPeers,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
         return error.into_response();
     }
 
@@ -956,7 +1036,14 @@ async fn open_channel(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) = require_write_auth(
+        &state,
+        WriteScope::ChannelsOpen,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
         return error.into_response();
     }
 
@@ -1021,7 +1108,14 @@ async fn fund_channel(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) = require_write_auth(
+        &state,
+        WriteScope::ChannelsFund,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
         return error.into_response();
     }
     // `total` is named before the body is parsed: it was toon-channel funding
@@ -1086,7 +1180,14 @@ async fn withdraw_channel(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) = require_write_auth(
+        &state,
+        WriteScope::ChannelsWithdraw,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
         return error.into_response();
     }
     let Some(batch) = state.batch.as_ref() else {
@@ -1120,7 +1221,14 @@ async fn land_channel(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) = require_write_auth(
+        &state,
+        WriteScope::ChannelsLand,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
         return error.into_response();
     }
     let Some(batch) = state.batch.as_ref() else {
@@ -3045,6 +3153,266 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+    }
+
+    /// A controller's restricted write key (ADR 0078): a write outside its
+    /// scope or after its expiry is a `403` that leaves no audit record, and a
+    /// key on `write_keys` keeps every write.
+    mod controller_key_writes {
+        use super::*;
+        use crate::rfc9421::{keyid_hex, sign_request};
+        use ed25519_dalek::Keypair;
+        use rand::rngs::OsRng;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tower::ServiceExt;
+
+        /// Every write of the surface, as `(method, path, the name that
+        /// governs it)`.
+        const WRITES: [(&str, &str, WriteScope); 10] = [
+            ("POST", "/packets", WriteScope::Packets),
+            ("POST", "/peers", WriteScope::Peers),
+            ("DELETE", "/peers/hop", WriteScope::Peers),
+            ("POST", "/routes/peers", WriteScope::RoutesPeers),
+            ("DELETE", "/routes/peers/g.hop", WriteScope::RoutesPeers),
+            ("POST", "/routes/leased", WriteScope::RoutesLeased),
+            ("POST", "/channels", WriteScope::ChannelsOpen),
+            ("POST", "/channels/c1/fund", WriteScope::ChannelsFund),
+            (
+                "POST",
+                "/channels/c1/withdraw",
+                WriteScope::ChannelsWithdraw,
+            ),
+            ("POST", "/channels/c1/land", WriteScope::ChannelsLand),
+        ];
+
+        static CREATED: AtomicU64 = AtomicU64::new(1_000);
+
+        fn app(write_keys: Vec<[u8; 32]>, controllers: Vec<ControllerKey>) -> Router {
+            let connector = Arc::new(Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            ));
+            router_with_controller_keys(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                write_keys,
+                controllers,
+                None,
+                None,
+            )
+        }
+
+        fn controller(
+            keypair: &Keypair,
+            scope: &[WriteScope],
+            expires: Option<u64>,
+        ) -> ControllerKey {
+            ControllerKey::new("agent", keypair.public.to_bytes(), scope.to_vec(), expires)
+        }
+
+        async fn write(
+            app: &Router,
+            keypair: &Keypair,
+            method: &str,
+            path: &str,
+        ) -> (StatusCode, String) {
+            let created = CREATED.fetch_add(1, Ordering::SeqCst);
+            let (sig_input, sig, digest) =
+                sign_request(keypair, method, path, &[], created, Some(9_999_999_999));
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        async fn read(app: &Router, path: &str) -> String {
+            let response = get(app.clone(), path, Some("correct-token")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        #[tokio::test]
+        async fn a_key_scoped_to_land_is_refused_a_withdrawal_and_leaves_no_audit_record() {
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![Keypair::generate(&mut OsRng).public.to_bytes()],
+                vec![controller(&key, &[WriteScope::ChannelsLand], None)],
+            );
+
+            let (status, body) = write(&app, &key, "POST", "/channels/c1/withdraw").await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("scope"), "{body}");
+            assert_eq!(read(&app, "/audit-log").await, "[]");
+
+            let (status, _) = write(&app, &key, "POST", "/channels/c1/land").await;
+            assert_ne!(status, StatusCode::FORBIDDEN);
+            assert_ne!(status, StatusCode::UNAUTHORIZED);
+            let audit = read(&app, "/audit-log").await;
+            assert!(audit.contains(&keyid_hex(&key)), "{audit}");
+            assert!(audit.contains("/channels/c1/land"), "{audit}");
+        }
+
+        #[tokio::test]
+        async fn each_named_write_admits_its_own_endpoints_and_no_other() {
+            for scope in WriteScope::ALL {
+                let key = Keypair::generate(&mut OsRng);
+                let app = app(
+                    vec![Keypair::generate(&mut OsRng).public.to_bytes()],
+                    vec![controller(&key, &[scope], None)],
+                );
+                for (method, path, governed_by) in WRITES {
+                    let (status, body) = write(&app, &key, method, path).await;
+                    if governed_by == scope {
+                        assert!(
+                            status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED,
+                            "{scope} should admit {method} {path}: {status} {body}"
+                        );
+                    } else {
+                        assert_eq!(
+                            status,
+                            StatusCode::FORBIDDEN,
+                            "{scope} must not admit {method} {path}: {body}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_key_past_its_expiry_is_refused_naming_the_expiry() {
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![Keypair::generate(&mut OsRng).public.to_bytes()],
+                vec![controller(&key, &[WriteScope::ChannelsLand], Some(1))],
+            );
+            let (status, body) = write(&app, &key, "POST", "/channels/c1/land").await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("expiry"), "{body}");
+            assert_eq!(read(&app, "/audit-log").await, "[]");
+        }
+
+        #[tokio::test]
+        async fn a_key_before_its_expiry_still_writes() {
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![Keypair::generate(&mut OsRng).public.to_bytes()],
+                vec![controller(
+                    &key,
+                    &[WriteScope::ChannelsLand],
+                    Some(9_999_999_999),
+                )],
+            );
+            let (status, _) = write(&app, &key, "POST", "/channels/c1/land").await;
+            assert_ne!(status, StatusCode::FORBIDDEN);
+            assert_ne!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn a_write_key_makes_every_write_with_and_without_controller_keys() {
+            let operator = Keypair::generate(&mut OsRng);
+            let controller_key = Keypair::generate(&mut OsRng);
+            let with = app(
+                vec![operator.public.to_bytes()],
+                vec![controller(
+                    &controller_key,
+                    &[WriteScope::ChannelsLand],
+                    None,
+                )],
+            );
+            let without = app(vec![operator.public.to_bytes()], vec![]);
+            for app in [with, without] {
+                for (method, path, _) in WRITES {
+                    let (status, body) = write(&app, &operator, method, path).await;
+                    assert!(
+                        status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED,
+                        "{method} {path}: {status} {body}"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn an_unlisted_key_is_still_a_401() {
+            let app = app(vec![], vec![]);
+            let stranger = Keypair::generate(&mut OsRng);
+            let (status, _) = write(&app, &stranger, "POST", "/channels/c1/land").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn the_refused_write_counter_moves_on_scope_and_on_expiry() {
+            let scoped = Keypair::generate(&mut OsRng);
+            let expired = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![Keypair::generate(&mut OsRng).public.to_bytes()],
+                vec![
+                    controller(&scoped, &[WriteScope::ChannelsLand], None),
+                    ControllerKey::new(
+                        "late",
+                        expired.public.to_bytes(),
+                        vec![WriteScope::ChannelsLand],
+                        Some(1),
+                    ),
+                ],
+            );
+            write(&app, &scoped, "POST", "/channels/c1/withdraw").await;
+            write(&app, &expired, "POST", "/channels/c1/land").await;
+            let metrics = read(&app, "/metrics").await;
+            assert!(
+                metrics.contains(r#"toon_writes_refused_total{reason="scope"} 1"#),
+                "{metrics}"
+            );
+            assert!(
+                metrics.contains(r#"toon_writes_refused_total{reason="expiry"} 1"#),
+                "{metrics}"
+            );
+        }
+
+        #[tokio::test]
+        async fn write_keys_lists_both_kinds_behind_the_bearer_token() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![operator.public.to_bytes()],
+                vec![controller(
+                    &agent,
+                    &[WriteScope::ChannelsLand, WriteScope::RoutesPeers],
+                    Some(1_893_456_000),
+                )],
+            );
+            assert_eq!(
+                get(app.clone(), "/write-keys", None).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let listed: serde_json::Value =
+                serde_json::from_str(&read(&app, "/write-keys").await).unwrap();
+            let listed = listed.as_array().unwrap();
+            assert_eq!(listed.len(), 2);
+            assert_eq!(listed[0]["keyid"], keyid_hex(&operator));
+            assert_eq!(listed[0]["restricted"], false);
+            assert_eq!(listed[0]["scope"].as_array().unwrap().len(), 8);
+            assert_eq!(listed[1]["keyid"], keyid_hex(&agent));
+            assert_eq!(listed[1]["restricted"], true);
+            assert_eq!(
+                listed[1]["scope"],
+                serde_json::json!(["routes-peers", "channels-land"])
+            );
+            assert_eq!(listed[1]["expires"], "2030-01-01T00:00:00Z");
         }
     }
 

@@ -149,6 +149,17 @@ price = 0
 #   bearer_token_file = "/app/data/operator-bearer-token"
 #   write_keys_file   = "/app/data/operator-write-keys"
 #
+# A controller's restricted key (ADR 0078) is declared in a file of its own,
+# beside the operator's, never instead of it:
+#
+#   controller_keys_file = "/app/data/operator-controller-keys"
+#
+# one TOML table per key -- `key` (64 hex), `scope` (the named writes it may
+# make), an optional `expires` (RFC 3339). Read once at boot. A key there may
+# not also be on `write_keys`. This build refuses an entry that states a
+# spending or deposit limit, so the scopes `packets`, `peers`, `channels-open`
+# and `channels-fund` (which require one) cannot be written yet.
+#
 # UNANSWERED FOR THIS TIER: who holds the write key, and what the audit trail
 # of a production write is answerable to.
 [operator]

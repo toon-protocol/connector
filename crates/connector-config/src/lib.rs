@@ -18,6 +18,7 @@
 mod batch_settlement;
 mod client_channel_asset;
 mod config;
+mod controller_keys;
 mod denomination;
 mod encoding;
 mod error;
@@ -39,6 +40,7 @@ pub use batch_settlement::{
 };
 pub use client_channel_asset::ClientChannelAssets;
 pub use config::{parse_socks_proxy, Config};
+pub use controller_keys::{ControllerKey, WriteScope};
 pub use denomination::{DeclaredToken, DenominationConfig, QuoteLeg, QuotePath, RateRow};
 pub use error::ConfigError;
 pub use identity::ClientIdentityConfig;

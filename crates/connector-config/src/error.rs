@@ -154,6 +154,65 @@ pub enum ConfigError {
     },
 
     #[error(
+        "the [operator] controller_keys_file {path} is not a valid controller-key file: \
+         {message}. One TOML table per restricted key (ADR 0078); unknown fields are refused"
+    )]
+    ControllerKeysFileInvalid { path: PathBuf, message: String },
+
+    #[error("controller key '{entry}' in {path} is refused: {reason}")]
+    ControllerKeyInvalid {
+        path: PathBuf,
+        entry: String,
+        reason: String,
+    },
+
+    #[error(
+        "controller key '{entry}' in {path} is also on [operator] write_keys / write_keys_file, \
+         where a key may make every write: a key is restricted or it is not, so keep it in \
+         exactly one place (ADR 0078)"
+    )]
+    ControllerKeyAlsoWriteKey { path: PathBuf, entry: String },
+
+    #[error(
+        "controller key '{entry}' in {path} repeats the key of entry '{first}': one key, one \
+         entry (ADR 0078)"
+    )]
+    ControllerKeyDuplicated {
+        path: PathBuf,
+        entry: String,
+        first: String,
+    },
+
+    #[error(
+        "controller key '{entry}' in {path} has '{write}' in its scope but states no {limit}: \
+         a scope that commits value must state its limit (ADR 0078 decision 6). A key that \
+         needs no limit belongs on write_keys"
+    )]
+    ControllerLimitRequired {
+        path: PathBuf,
+        entry: String,
+        write: crate::WriteScope,
+        limit: &'static str,
+    },
+
+    #[error(
+        "controller key '{entry}' in {path} states a {limit} with only one of 'per_write' and \
+         'per_day': a limit has both figures (ADR 0078 decision 2)"
+    )]
+    ControllerLimitIncomplete {
+        path: PathBuf,
+        entry: String,
+        limit: &'static str,
+    },
+
+    #[error(
+        "controller key '{entry}' in {path} states a spending or deposit limit, and limits are \
+         not yet enforced by this build: refusing to start rather than accept a limit the node \
+         does not hold (ADR 0078)"
+    )]
+    ControllerLimitsNotEnforced { path: PathBuf, entry: String },
+
+    #[error(
         "route '{prefix}' must set exactly one of 'handler_url' or 'peer_id', but neither is set"
     )]
     RouteMissingTarget { prefix: String },
