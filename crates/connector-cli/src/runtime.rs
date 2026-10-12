@@ -1718,7 +1718,12 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
                 signer,
                 operator.bearer_token().to_string(),
                 operator.write_keys().to_vec(),
-                operator.controller_keys().to_vec(),
+                // The file itself, not the list it held at boot: the operator
+                // surface reads it again on every signed request (ADR 0079).
+                operator.controller_keys_file().cloned().map_or_else(
+                    || connector_operator::ControllerKeySource::Fixed(Vec::new()),
+                    connector_operator::ControllerKeySource::File,
+                ),
                 day_totals,
                 declared_rates(runtime, config),
                 batch_channels,
@@ -2632,6 +2637,67 @@ write_keys = ["{key}"]
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The node reads `controller_keys_file` itself, not the list it held
+    /// at boot (ADR 0079): a key removed from the file is refused its next
+    /// request by the same running router.
+    #[tokio::test]
+    async fn a_controller_key_removed_from_its_file_is_refused_with_no_restart() {
+        use connector_operator::signing::{keyid_hex, sign_request};
+
+        let secret = ed25519_dalek::SecretKey::from_bytes(&[7u8; 32]).expect("secret");
+        let agent = ed25519_dalek::Keypair {
+            public: (&secret).into(),
+            secret,
+        };
+        let controllers = tempfile::NamedTempFile::new().expect("controller keys file");
+        std::fs::write(
+            controllers.path(),
+            format!(
+                "[agent]\nkey = \"{}\"\nscope = [\"channels-land\"]\n",
+                keyid_hex(&agent)
+            ),
+        )
+        .expect("write controller keys");
+        let (config, _key_path) = config_with_raw_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:0"
+
+[signer]
+key_file = "{}"
+
+[operator]
+bearer_token = "operator-secret"
+write_keys = ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+controller_keys_file = "{}"
+"#,
+                key_path.display(),
+                controllers.path().display()
+            )
+        });
+        let runtime = build(&config).await.expect("build");
+        let app = router(&runtime, &config).expect("router");
+        let signed_read = |created: u64| {
+            let (sig_input, sig, digest) =
+                sign_request(&agent, "GET", "/peers", &[], created, Some(9_999_999_999));
+            let request = Request::builder()
+                .uri("/peers")
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::empty())
+                .unwrap();
+            app.clone().oneshot(request)
+        };
+
+        assert_eq!(signed_read(1_000).await.unwrap().status(), StatusCode::OK);
+        std::fs::write(controllers.path(), "").expect("revoke");
+        assert_eq!(
+            signed_read(1_001).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     /// The dashboard is part of the operator surface (ADR 0066): mounted

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::controller_keys::{resolve_controller_keys, ControllerKey};
+use crate::controller_keys::{ControllerKey, ControllerKeysFile};
 use crate::error::ConfigError;
 
 /// The `[operator]` section as written in the config file. Its presence
@@ -99,6 +99,7 @@ pub struct OperatorConfig {
     bearer_token: String,
     write_keys: Vec<[u8; 32]>,
     controller_keys: Vec<ControllerKey>,
+    controller_keys_file: Option<ControllerKeysFile>,
     packet_history: usize,
 }
 
@@ -123,7 +124,8 @@ impl fmt::Debug for OperatorConfig {
 }
 
 impl OperatorConfig {
-    /// The bearer token every read on the operator surface must present.
+    /// The bearer token a read on the operator surface presents, unless it
+    /// is signed by a write key instead (ADR 0079).
     pub fn bearer_token(&self) -> &str {
         &self.bearer_token
     }
@@ -138,9 +140,18 @@ impl OperatorConfig {
 
     /// The restricted keys of controllers (ADR 0078): each may make only the
     /// writes its scope names, until its expiry. Disjoint from
-    /// [`write_keys`](Self::write_keys).
+    /// [`write_keys`](Self::write_keys). This is the file as it stood at
+    /// boot; the operator surface reads it again through
+    /// [`controller_keys_file`](Self::controller_keys_file).
     pub fn controller_keys(&self) -> &[ControllerKey] {
         &self.controller_keys
+    }
+
+    /// The file the restricted keys are read from, if the config names one.
+    /// Its contents are the one part of the operator surface's
+    /// authentication that changes without a restart (ADR 0079).
+    pub fn controller_keys_file(&self) -> Option<&ControllerKeysFile> {
+        self.controller_keys_file.as_ref()
     }
 
     /// How many recent packets the node keeps in memory for the operator to
@@ -332,13 +343,19 @@ pub(crate) fn resolve_operator(
 
     let bearer_token = resolve_bearer_token(raw.bearer_token, raw.bearer_token_file)?;
     let write_keys = resolve_write_keys(raw.write_keys, raw.write_keys_file)?;
-    let controller_keys =
-        resolve_controller_keys(raw.controller_keys_file.as_deref(), &write_keys)?;
+    let controller_keys_file = raw
+        .controller_keys_file
+        .map(|path| ControllerKeysFile::new(path, write_keys.clone()));
+    let controller_keys = match &controller_keys_file {
+        Some(file) => file.parse(&file.read()?)?,
+        None => Vec::new(),
+    };
 
     Ok(Some(OperatorConfig {
         bearer_token,
         write_keys,
         controller_keys,
+        controller_keys_file,
         packet_history: raw.packet_history.unwrap_or(0),
     }))
 }
@@ -411,6 +428,34 @@ mod tests {
             .expect("resolve")
             .expect("some");
         assert!(resolved.controller_keys().is_empty());
+        assert!(resolved.controller_keys_file().is_none());
+    }
+
+    #[test]
+    fn the_controller_keys_file_reads_again_under_the_rules_it_booted_under() {
+        let file = file_holding(&format!(
+            "[agent]\nkey = \"{KEY}\"\nscope = [\"channels-land\"]\n"
+        ));
+        let resolved = resolve_operator(Some(with_controllers(file.path().to_path_buf())))
+            .expect("resolve")
+            .expect("some");
+        let live = resolved.controller_keys_file().expect("names a file");
+        let read = |live: &ControllerKeysFile| live.read().and_then(|text| live.parse(&text));
+
+        std::fs::write(file.path(), "").expect("revoke");
+        assert!(read(live).expect("an empty file parses").is_empty());
+
+        // A restricted key that is also on `write_keys` is refused on a
+        // re-read exactly as it is at boot.
+        std::fs::write(
+            file.path(),
+            format!("[agent]\nkey = \"{OTHER_KEY}\"\nscope = [\"channels-land\"]\n"),
+        )
+        .expect("rewrite");
+        assert!(matches!(
+            read(live),
+            Err(ConfigError::ControllerKeyAlsoWriteKey { .. })
+        ));
     }
 
     #[test]

@@ -40,7 +40,9 @@ pub use batch_settlement::{
 };
 pub use client_channel_asset::ClientChannelAssets;
 pub use config::{parse_socks_proxy, Config};
-pub use controller_keys::{ControllerKey, DepositLimit, SpendingLimit, WriteScope};
+pub use controller_keys::{
+    ControllerKey, ControllerKeysFile, DepositLimit, SpendingLimit, WriteScope,
+};
 pub use denomination::{DeclaredToken, DenominationConfig, QuoteLeg, QuotePath, RateRow};
 pub use error::ConfigError;
 pub use identity::ClientIdentityConfig;

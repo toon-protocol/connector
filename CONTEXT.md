@@ -227,7 +227,8 @@ _Avoid_: admin panel, control panel, console
 **Write key**:
 A key allowed to make a write on the operator surface. An **operator's** write key may make every
 write. A **controller's** write key is restricted: it carries a **scope**, and may carry a
-**spending limit** and a **deposit limit**.
+**spending limit** and a **deposit limit**. It is revoked by removing its entry, with no restart.
+Any write key may also sign a read, in place of the bearer token.
 _Avoid_: admin key, API key, operator token
 
 **Scope**:

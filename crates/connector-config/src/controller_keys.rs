@@ -18,10 +18,13 @@
 //! carries `peers`, `channels-open` or `channels-fund` a `deposit_limit`
 //! (each `per_write` and `per_day`, both): the operator surface counts them
 //! (ADR 0078).
+//!
+//! The file is checked at boot and read again by the operator surface on
+//! every signed request ([`ControllerKeysFile`], ADR 0079).
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -359,16 +362,38 @@ pub(crate) fn parse_controller_keys(
     Ok(out)
 }
 
-/// Read and parse the file named by `controller_keys_file`.
-pub(crate) fn resolve_controller_keys(
-    file: Option<&Path>,
-    write_keys: &[[u8; 32]],
-) -> Result<Vec<ControllerKey>, ConfigError> {
-    let Some(path) = file else {
-        return Ok(Vec::new());
-    };
-    let contents = crate::operator::read_operator_file("controller_keys_file", path)?;
-    parse_controller_keys(&contents, path, write_keys)
+/// The file `[operator] controller_keys_file` names, and what a restricted
+/// key in it is checked against. The setting itself is config, read once at
+/// boot (ADR 0009); the file's **contents** are read again by the operator
+/// surface on every signed request (ADR 0079), so removing an entry revokes
+/// its key at that key's next request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerKeysFile {
+    path: PathBuf,
+    write_keys: Vec<[u8; 32]>,
+}
+
+impl ControllerKeysFile {
+    /// The file at `path`, on a node whose `write_keys` are `write_keys`: a
+    /// restricted key that is also one of those is refused.
+    pub fn new(path: PathBuf, write_keys: Vec<[u8; 32]>) -> ControllerKeysFile {
+        ControllerKeysFile { path, write_keys }
+    }
+
+    /// Where the file is.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The file's contents as they are now.
+    pub fn read(&self) -> Result<String, ConfigError> {
+        crate::operator::read_operator_file("controller_keys_file", &self.path)
+    }
+
+    /// Parse `contents` under every rule the file is held to at boot.
+    pub fn parse(&self, contents: &str) -> Result<Vec<ControllerKey>, ConfigError> {
+        parse_controller_keys(contents, &self.path, &self.write_keys)
+    }
 }
 
 #[cfg(test)]

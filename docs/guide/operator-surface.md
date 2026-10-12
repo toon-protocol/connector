@@ -22,7 +22,8 @@ The rules are numbered in
 [`operator-spec.md`](../protocol/operator-spec.md) and follow from
 [ADR 0008](../adr/0008-operator-surface-splits-read-from-write.md):
 
-- **Reads** take `Authorization: Bearer <token>` and nothing more.
+- **Reads** take `Authorization: Bearer <token>` and nothing more — or, with no
+  `Authorization` header, the signature a write takes ([below](#a-signed-read)).
 - **Writes** take an RFC 9421 HTTP Message Signature from an ed25519 key on
   `write_keys`, with the body bound by an RFC 9530 `Content-Digest`.
 - **A bearer token is never sufficient to move value** (OP-03). Read authority
@@ -74,8 +75,40 @@ A scope is a non-empty list of named writes: `packets`, `peers` (`POST /peers`,
 `DELETE /peers/:id`), `routes-peers` (`POST /routes/peers`,
 `DELETE /routes/peers/:prefix`), `routes-leased`, `channels-open`, `channels-fund`,
 `channels-withdraw` and `channels-land`. A `DELETE` belongs to the name of its
-`POST`. The file is read once at boot: changing or revoking a key is an edit and a
-restart.
+`POST`.
+
+**Revoking a key is an edit, with no restart**
+([ADR 0079](../adr/0079-a-controllers-key-is-revoked-by-an-edit-and-may-sign-a-read.md)).
+The file's contents are read again on every signed request, so an entry you remove is
+an unlisted key — `401` — at that key's next request, and an entry you add or change
+binds the same way. Only the contents are live: which file `controller_keys_file`
+names, and `write_keys` itself, are still read once at boot.
+
+- Replace the file by writing the new list beside it and renaming it into place. A
+  file caught half-written, unreadable, or breaking any rule it is held to at boot
+  yields **no** restricted keys: each is refused `401` until the file is repaired, and
+  the log names the file. The last list that parsed is not served, because that would
+  keep honouring a key you may have just tried to revoke. An operator's key is not
+  affected.
+- The day's totals are kept by key, not by entry. Removing an entry and adding it back
+  does not reset its day.
+- Whoever can write the file can grant a key at once. Give it the permissions of the
+  config that names it.
+
+### A signed read
+
+A controller is handed a key and never the bearer token: the token is shared by every
+reader and cannot be revoked for one of them. So a read with **no** `Authorization`
+header may carry the signature a write carries — `@method`, `@path` and the
+`content-digest` of an empty body — from any key that may sign a write.
+
+- A scope names writes and says nothing about reads: any listed key reads everything
+  the bearer token reads.
+- A key removed from the file is refused `401`, and one past its `expires` `403`, on
+  reads as on writes.
+- A signed read is not spent and is not in `GET /audit-log`. It is good until its own
+  `expires`, so sign reads with a short one.
+- A request that does present an `Authorization` header is judged by the token alone.
 
 A write from a restricted key outside its scope, or after its `expires`, is answered
 **`403`** with a body naming the reason (`scope`, `expiry`, `spending-limit` or `deposit-limit`), before anything is

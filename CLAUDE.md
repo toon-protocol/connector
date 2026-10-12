@@ -185,7 +185,8 @@ refused by name at boot along with every other announce-only key.
 
 `[operator] write_keys` is different: it holds the **public** halves (64 hex each) of
 the keys allowed to make an authenticated write. The private half lives with whoever
-is calling, never on the node. `[operator] bearer_token` gates reads only — no shared
+is calling, never on the node. `[operator] bearer_token` gates reads only — a write key's signature also reads, in its
+place (ADR 0079) — and no shared
 secret is ever sufficient to move value (ADR 0008).
 
 Generate one with `openssl rand -hex 32 > signer.key`, or let `local/keys.sh

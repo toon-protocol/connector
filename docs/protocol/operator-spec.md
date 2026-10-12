@@ -248,13 +248,14 @@ outside it in fact.
 
 ### 2.1 What changes without a restart, and what does not
 
-| change                                          | how                                                               |
-| ----------------------------------------------- | ----------------------------------------------------------------- |
-| a route's price, a peering's fee, a handler URL | **edit the file and restart** — reload is a restart               |
-| a leased route                                  | pushed by a **controller**, expires unless renewed, never durable |
-| a runtime peer or peer route                    | written through the operator surface, **durable** across restarts |
-| a channel: open, fund, withdraw, land           | the operator surface, against a settlement backend (§2.2)         |
-| originating a packet outward                    | the operator surface                                              |
+| change                                          | how                                                                       |
+| ----------------------------------------------- | ------------------------------------------------------------------------- |
+| a route's price, a peering's fee, a handler URL | **edit the file and restart** — reload is a restart                       |
+| a leased route                                  | pushed by a **controller**, expires unless renewed, never durable         |
+| a runtime peer or peer route                    | written through the operator surface, **durable** across restarts         |
+| a channel: open, fund, withdraw, land           | the operator surface, against a settlement backend (§2.2)                 |
+| originating a packet outward                    | the operator surface                                                      |
+| a controller's write key: grant, change, revoke | **edit `controller_keys_file`** — read again on every signed request (§4) |
 
 **A runtime row can never take a key the configuration file owns.** A colliding write is refused
 outright, and on the next boot a runtime row whose key the file has since claimed is **deleted**, not
@@ -327,7 +328,8 @@ opens and funds its own x402 channel through `POST /peers`.
 
 ### 2.3 What an operator can see
 
-Reads are gated by a bearer token and nothing else: peers, routes (config, leased and runtime, each
+Reads are gated by a bearer token — or, in this implementation, a write key's signature in its place
+(§4) — and nothing else: peers, routes (config, leased and runtime, each
 labelled by source), channels, claims, node identity, the write audit log, and metrics.
 
 `GET /channels` lists every x402 channel, inbound and outbound, each with its `direction`,
@@ -394,7 +396,7 @@ response to anything arriving over the network.
 
 **Non-normative.** How _this_ connector spells §3.
 
-**Reads** — bearer token: `GET /peers` · `/routes` · `/routes/leased` · `/routes/peers` · `/channels` ·
+**Reads** — bearer token, or a write key's signature in its place: `GET /peers` · `/routes` · `/routes/leased` · `/routes/peers` · `/channels` ·
 `/claims` · `/rates` · `/identity` · `/audit-log` · `/write-keys` · `/metrics`
 
 **Writes** — RFC 9421 HTTP Message Signature from a key on an operator allowlist, with RFC 9530
@@ -414,6 +416,18 @@ name of its `POST`) — and an optional expiry. A verified signature from such a
 after its expiry is answered `403` naming the reason (`scope`, `expiry`, `spending-limit` or `deposit-limit`), before anything is signed,
 journaled or sent; it is not retained in the audit log, and counts on `toon_writes_refused_total`. `401`
 remains the answer to a signature that is missing, bad, replayed or unlisted.
+
+The **contents** of `controller_keys_file` are read again on every signed request
+([ADR 0079](../adr/0079-a-controllers-key-is-revoked-by-an-edit-and-may-sign-a-read.md)): an entry
+removed is an unlisted key at that key's next request, with no restart, and OP-02's "individually
+revocable" is met for a controller by an edit alone. A file that cannot be read or no longer parses
+yields no restricted keys until it is repaired. `write_keys`, `write_keys_file` and the setting naming
+the controllers' file are read once at boot.
+
+A read that presents no `Authorization` header MAY carry the signature a write carries, over an empty
+body, from any key that may sign a write; a scope does not narrow reads. Such a read is not spent, not
+retained in the audit log, and good until its own `expires`. This is write authority conferring read
+authority, which OP-03 does not forbid; a bearer token still confers no write.
 
 A key whose scope includes `packets` carries a **spending limit**, `per_write` and `per_day`, both
 required. A `POST /packets` from it is refused `403` when the packet's amount is above `per_write`, or
