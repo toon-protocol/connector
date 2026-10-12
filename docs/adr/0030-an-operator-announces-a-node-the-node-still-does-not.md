@@ -1,6 +1,6 @@
 # An operator announces a node; the node still does not
 
-**Status:** **Retired by [0046](0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md)** — an announce assumes a relay, and a network of pure connectors has none. Kept for its reasoning about _who_ may announce, which is right about the question it asks and is what stops a sidecar being rebuilt. **One part survives:** issue #807's amendment, under which the packet path reads `[announce]`'s `addresses` and `btp_endpoint` to _answer_ with in the x402 greeting. That is answering, not announcing; those two fields are re-homed by 0046 rather than removed.
+**Status:** **Retired by [0046](0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md)** — an announce assumes a relay, and a network of pure connectors has none. Kept for its reasoning about _who_ may announce, which is right about the question it asks and is what stops a sidecar being rebuilt. **One part survives:** issue #807's amendment, under which the packet path reads `[announce]`'s `addresses` and `btp_endpoint` to _answer_ with in the x402 greeting. That is answering, not announcing; those two fields are re-homed by 0046 rather than removed. Its `--via-own-routing` guard went with the verb; the hazard it guarded is now held off by a lock on `state_dir` itself (issue #1318's update, below).
 
 **Scope:** fleet and operations — not connector-internal, not wire law. See the [ADR index](README.md).
 
@@ -187,11 +187,11 @@ network. A node that fronts no relay omits the field. An `http(s)://` value is r
 load: that spelling is the write ingress, and announcing it publishes an unauthenticated write door
 to the network.
 
-## Update (issue #1318) — 2026-10-12: a `state_dir` lock replaces the deleted guard
+## Update (issue #1318) — a `state_dir` lock replaces the deleted guard (2026-10-12)
 
-The `--via-own-routing` guard above went with the verb
-([0046](0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md)) and nothing replaced
-it for a while. Its successor is a lock, not a refusal: a serving node takes an exclusive OS advisory
+The `--via-own-routing` guard under "A second process must not share a serving node's `state_dir`"
+above went with the verb ([0046](0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md))
+and nothing replaced it for a while. Its successor is a lock, not a refusal: a serving node takes an exclusive OS advisory
 lock on a file inside `state_dir` before it opens anything there, the operating system releases it
 when the process exits for any reason, and a second process over the same directory exits at startup
 naming it. It is scoped to the directory, not to a subcommand. The hazard also has three directions,

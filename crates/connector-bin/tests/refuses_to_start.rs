@@ -1566,17 +1566,23 @@ btp_endpoint = "wss://node.example/ilp/btp"
 
 fn state_dir_config(key_file: &std::path::Path, state_dir: Option<&std::path::Path>) -> String {
     let state_dir = state_dir.map_or_else(String::new, |dir| {
-        format!("state_dir = \"{}\"\n", dir.display())
+        format!("state_dir = \"{}\"", dir.display())
     });
     format!(
-        "client_edge_addr = \"127.0.0.1:0\"\n{state_dir}\n[signer]\nkey_file = \"{}\"\n",
-        key_file.display()
+        r#"
+client_edge_addr = "127.0.0.1:0"
+{state_dir}
+
+[signer]
+key_file = "{key_file}"
+"#,
+        key_file = key_file.display(),
     )
 }
 
 /// Every file under `dir` with its bytes, so a test can say a second
 /// process left the first one's files exactly as they were.
-fn snapshot(dir: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+fn files_with_contents(dir: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .expect("read state_dir")
         .map(|entry| {
@@ -1593,14 +1599,23 @@ fn snapshot(dir: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
 
 /// Issue #1318: a second process over a live node's `state_dir` refuses to
 /// start, naming the directory, and leaves the first one's files alone.
-#[test]
-fn a_second_process_over_a_held_state_dir_refuses_to_start() {
+#[tokio::test]
+async fn a_second_process_over_a_held_state_dir_refuses_to_start() {
     let key_file = write_raw_key_file();
     let state_dir = tempfile::tempdir().expect("temp state dir");
+    // A journal with a line in it, so a truncation or rewrite would show.
+    write_journal(
+        state_dir.path(),
+        "client-edge-claims.log",
+        &[connector_domain::JournalEntry::OutboundVoucherSigned {
+            channel_id: format!("evm:0x{}", "cd".repeat(32)),
+            cumulative_amount: 10,
+        }],
+    );
     let first_config = write_config(&state_dir_config(key_file.path(), Some(state_dir.path())));
     let mut first = spawn(first_config.path());
-    wait_for_listen_addr(&mut first);
-    let before = snapshot(state_dir.path());
+    let first_addr = wait_for_listen_addr(&mut first);
+    let before = files_with_contents(state_dir.path());
 
     // A different ephemeral port is what the config's `:0` already gives:
     // only the lock can be what stops this one.
@@ -1614,8 +1629,11 @@ fn a_second_process_over_a_held_state_dir_refuses_to_start() {
             && stderr.contains("held by another connector process"),
         "expected the error to name the held state_dir, got: {stderr}"
     );
-    assert!(first.try_wait().expect("poll first").is_none());
-    assert_eq!(snapshot(state_dir.path()), before);
+    assert_eq!(files_with_contents(state_dir.path()), before);
+    let response = reqwest::get(format!("http://{first_addr}/ilp"))
+        .await
+        .expect("the first node is still serving");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     let _ = first.kill();
     let _ = first.wait();
 }
