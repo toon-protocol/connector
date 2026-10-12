@@ -115,7 +115,7 @@ not change what anything else must do.
 | [0063](0063-the-ilp-packet-is-toons-dialect-not-rfc-0027s.md)                                | The ILP packet is TOON's dialect, not RFC 0027's                             | Accepted — ratifies the shipped encoding (#1174)                                                                                                               |
 | [0066](0066-the-operator-dashboard-is-a-page-the-surface-serves-and-signs-in-the-browser.md) | The operator dashboard is a page the surface serves; it signs in the browser | Accepted — **built**; extends 0008; amended by 0077 (the node keeps a bounded packet history)                                                                  |
 | [0077](0077-the-node-keeps-a-bounded-packet-history-for-watching.md)                         | The node keeps a bounded packet history, for watching and for nothing else   | Accepted — **built** (#1477); amends 0066 and 0014                                                                                                             |
-| [0078](0078-a-controllers-write-key-carries-a-scope-and-two-limits.md)                       | A controller's write key carries a scope and two limits                      | Accepted (2026-10-11, #1485) — **not yet built**; extends 0008                                                                                                 |
+| [0078](0078-a-controllers-write-key-carries-a-scope-and-two-limits.md)                       | A controller's write key carries a scope and two limits                      | Accepted (2026-10-11, #1485) — **partly built** (#1487: scope, expiry, `403`, `GET /write-keys`; limits not yet counted); extends 0008                         |
 
 ---
 

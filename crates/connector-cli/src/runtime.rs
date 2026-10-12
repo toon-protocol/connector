@@ -1646,12 +1646,13 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     Ok(match config.operator() {
         Some(operator) => {
             let batch_channels = batch_channels_for_operator(runtime, &claim_gate);
-            app.merge(connector_operator::router_with_batch_channels(
+            app.merge(connector_operator::router_with_controller_keys(
                 connector,
                 claim_gate,
                 signer,
                 operator.bearer_token().to_string(),
                 operator.write_keys().to_vec(),
+                operator.controller_keys().to_vec(),
                 declared_rates(runtime, config),
                 batch_channels,
             ))
