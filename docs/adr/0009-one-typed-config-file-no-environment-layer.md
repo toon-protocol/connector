@@ -1,6 +1,6 @@
 # Configuration is one typed file with no environment-variable layer
 
-**Status:** Accepted. Extended by [0034](0034-a-runtime-peer-route-table-never-shadows-the-config-file.md), which adds a runtime table that can never shadow the file.
+**Status:** Accepted. Extended by [0034](0034-a-runtime-peer-route-table-never-shadows-the-config-file.md), which adds a runtime table that can never shadow the file. Amended by [0079](0079-a-controllers-key-is-revoked-by-an-edit-and-may-sign-a-read.md) for one thing: the **contents** of `[operator] controller_keys_file` are read again on every signed request, so a controller's key is revoked without a restart. The setting naming that file, and everything else, is still read once.
 
 **Scope:** connector architecture — internal to this codebase. See the [ADR index](README.md).
 
@@ -85,3 +85,11 @@ fields (ADR 0046, issue #1074) are both shaped by it.
 config key is never silently dropped — the `peer_wire_addr` / `ceiling` / `[peer_sale]` precedent. An
 operator whose committed TOML still sets `apex` or `[[children]]` stops at boot, by name, rather than
 loading with the key ignored.
+
+## Update (issue #1485) — the contents of `controller_keys_file` are read again
+
+[0079](0079-a-controllers-key-is-revoked-by-an-edit-and-may-sign-a-read.md) makes one exception to "immutable for the process lifetime": the **contents** of the file
+`[operator] controller_keys_file` names are read again on every signed request, so that a
+controller's key is revoked by an edit with no restart. The setting that names the file is still
+read once, as is everything else, `write_keys` and `write_keys_file` included. A file that stops
+parsing after boot is not a crash and not a stale list: it yields no restricted keys until repaired.

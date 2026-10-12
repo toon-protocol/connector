@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::http::HeaderMap;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use connector_config::{ControllerKey, WriteScope};
+use connector_config::{ControllerKey, ControllerKeysFile, WriteScope};
 use serde::Serialize;
 
 use crate::day_totals::{CountKind, CountRefusal, DayTotals, Figures};
@@ -106,17 +106,104 @@ fn verified_key(keyid: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// The restricted keys (ADR 0078), by key.
+type Restricted = HashMap<[u8; 32], ControllerKey>;
+
+fn by_key(controller_keys: Vec<ControllerKey>) -> Arc<Restricted> {
+    Arc::new(
+        controller_keys
+            .into_iter()
+            .map(|controller| (*controller.key(), controller))
+            .collect(),
+    )
+}
+
+/// Where the operator surface's restricted keys come from.
+pub enum ControllerKeySource {
+    /// A list fixed for the process lifetime: a node whose config names no
+    /// `controller_keys_file` has the empty one.
+    Fixed(Vec<ControllerKey>),
+    /// `[operator] controller_keys_file`, read again on every signed request
+    /// (ADR 0079), so that an entry removed from it is refused at its key's
+    /// next request with no restart.
+    File(ControllerKeysFile),
+}
+
+impl From<Vec<ControllerKey>> for ControllerKeySource {
+    fn from(controller_keys: Vec<ControllerKey>) -> ControllerKeySource {
+        ControllerKeySource::Fixed(controller_keys)
+    }
+}
+
+impl From<ControllerKeysFile> for ControllerKeySource {
+    fn from(file: ControllerKeysFile) -> ControllerKeySource {
+        ControllerKeySource::File(file)
+    }
+}
+
+/// [`ControllerKeySource`] as [`WriteAuth`] holds it.
+enum RestrictedKeys {
+    Fixed(Arc<Restricted>),
+    File {
+        file: ControllerKeysFile,
+        last: Mutex<LastReading>,
+    },
+}
+
+/// What the last reading of `controller_keys_file` found.
+enum LastReading {
+    Unread,
+    /// The contents and what they parsed to, so an unchanged file is read
+    /// and compared but not parsed again.
+    Parsed(String, Arc<Restricted>),
+    /// Why the file was unusable, so one breakage is one line in the log
+    /// however many requests arrive while it lasts.
+    Unusable(String),
+}
+
+impl RestrictedKeys {
+    /// The restricted keys as they stand now. A file that cannot be read or
+    /// no longer parses yields **none**: every restricted key is then an
+    /// unlisted key until the file is repaired, because the alternative --
+    /// serving the last list that parsed -- would keep honouring a key its
+    /// operator may have just tried to revoke.
+    fn now(&self) -> Arc<Restricted> {
+        let (file, last) = match self {
+            RestrictedKeys::Fixed(keys) => return Arc::clone(keys),
+            RestrictedKeys::File { file, last } => (file, last),
+        };
+        let mut last = last.lock().expect("controller keys lock poisoned");
+        let parsed = file.read().and_then(|contents| match &*last {
+            LastReading::Parsed(seen, keys) if *seen == contents => Ok(Arc::clone(keys)),
+            _ => {
+                let keys = by_key(file.parse(&contents)?);
+                *last = LastReading::Parsed(contents, Arc::clone(&keys));
+                Ok(keys)
+            }
+        });
+        parsed.unwrap_or_else(|error| {
+            let error = error.to_string();
+            if !matches!(&*last, LastReading::Unusable(logged) if *logged == error) {
+                tracing::error!(
+                    path = %file.path().display(),
+                    "controller_keys_file is unusable, so every restricted key is refused: {error}"
+                );
+                *last = LastReading::Unusable(error);
+            }
+            Arc::new(Restricted::new())
+        })
+    }
+}
+
 /// The operator write surface's authentication state: which keys may
 /// write, which signatures have already been spent, and the audit trail
 /// of every write accepted so far.
 pub struct WriteAuth {
-    /// Every key that may sign a write: `write_keys` and the controllers'.
-    allowlist: HashSet<[u8; 32]>,
     /// The operator's keys, which keep every write (ADR 0008), in the order
     /// configured.
     full: Vec<[u8; 32]>,
-    /// The restricted keys (ADR 0078), by key.
-    restricted: HashMap<[u8; 32], ControllerKey>,
+    /// The restricted keys (ADR 0078).
+    restricted: RestrictedKeys,
     /// Where spending limits count (ADR 0078 decision 8).
     day_totals: Option<Arc<DayTotals>>,
     seen_signatures: Mutex<HashMap<Vec<u8>, u64>>,
@@ -127,30 +214,81 @@ impl WriteAuth {
     /// Construct write authentication over `write_keys` -- the ed25519
     /// public keys permitted to sign any write -- and `controller_keys`, the
     /// restricted keys of controllers (ADR 0078), each permitted only the
-    /// writes its scope names, until its expiry. Revoking a key is a
-    /// deploy-time change to these lists (ADR 0009: config is immutable for
-    /// the process lifetime), not a runtime operation.
+    /// writes its scope names, until its expiry. Revoking a key on
+    /// `write_keys` is a deploy-time change (ADR 0009: config is immutable
+    /// for the process lifetime). Revoking a restricted key is an edit to
+    /// `controller_keys_file`, which binds at the key's next request when
+    /// `controller_keys` is [`ControllerKeySource::File`] (ADR 0079).
     pub fn with_controller_keys(
         write_keys: Vec<[u8; 32]>,
-        controller_keys: Vec<ControllerKey>,
+        controller_keys: impl Into<ControllerKeySource>,
         day_totals: Option<Arc<DayTotals>>,
     ) -> WriteAuth {
-        let allowlist = write_keys
-            .iter()
-            .copied()
-            .chain(controller_keys.iter().map(|controller| *controller.key()))
-            .collect();
         WriteAuth {
-            allowlist,
             full: write_keys,
-            restricted: controller_keys
-                .into_iter()
-                .map(|controller| (*controller.key(), controller))
-                .collect(),
+            restricted: match controller_keys.into() {
+                ControllerKeySource::Fixed(keys) => RestrictedKeys::Fixed(by_key(keys)),
+                ControllerKeySource::File(file) => RestrictedKeys::File {
+                    file,
+                    last: Mutex::new(LastReading::Unread),
+                },
+            },
             day_totals,
             seen_signatures: Mutex::new(HashMap::new()),
             audit_log: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Every key that may sign a request: `write_keys` and `restricted`.
+    fn allowlist(&self, restricted: &Restricted) -> HashSet<[u8; 32]> {
+        self.full.iter().chain(restricted.keys()).copied().collect()
+    }
+
+    /// Verify a signature presented on a **read**, in place of the bearer
+    /// token (ADR 0079): any key that may sign a write, restricted or not,
+    /// may read, and a scope says nothing about reads. A restricted key
+    /// past its expiry or gone from `controller_keys_file` is refused here
+    /// as it is on a write.
+    ///
+    /// A read's signature is neither spent nor retained: it is good until
+    /// its own `expires`, and the audit log records accepted writes. A
+    /// replayed read tells its replayer what the bearer token would.
+    pub fn authenticate_read(
+        &self,
+        method: &str,
+        path: &str,
+        signature_input: Option<&str>,
+        signature: Option<&str>,
+        content_digest: Option<&str>,
+    ) -> Result<(), WriteAuthError> {
+        // A request that presents no signature is refused before the file is
+        // read: only a signed request reaches it.
+        if signature_input.is_none() || signature.is_none() {
+            return Err(WriteAuthError::MissingSignature);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is before the Unix epoch")
+            .as_secs();
+        let restricted = self.restricted.now();
+        let verified = verify_write_signature(
+            method,
+            path,
+            signature_input,
+            signature,
+            content_digest,
+            b"",
+            now,
+            &self.allowlist(&restricted),
+        )?;
+        let expired = verified_key(&verified.keyid)
+            .and_then(|key| restricted.get(&key))
+            .and_then(ControllerKey::expires)
+            .is_some_and(|expires| now >= expires);
+        if expired {
+            return Err(WriteAuthError::KeyExpired);
+        }
+        Ok(())
     }
 
     /// Verify a presented write signature against THIS request, reject a
@@ -176,6 +314,12 @@ impl WriteAuth {
             .expect("system clock is before the Unix epoch")
             .as_secs();
 
+        if signature_input.is_none() || signature.is_none() {
+            return Err(WriteAuthError::MissingSignature);
+        }
+        // One reading of the list serves this whole check: the key that
+        // verified is judged by the entry it verified under.
+        let restricted = self.restricted.now();
         let verified = verify_write_signature(
             method,
             path,
@@ -184,7 +328,7 @@ impl WriteAuth {
             content_digest,
             body,
             now,
-            &self.allowlist,
+            &self.allowlist(&restricted),
         )?;
 
         {
@@ -203,7 +347,7 @@ impl WriteAuth {
                 return Err(WriteAuthError::Replayed);
             }
             if let Some(controller) =
-                verified_key(&verified.keyid).and_then(|key| self.restricted.get(&key))
+                verified_key(&verified.keyid).and_then(|key| restricted.get(&key))
             {
                 let key_hex = to_hex(controller.key());
                 if controller.expires().is_some_and(|expires| now >= expires) {
@@ -281,12 +425,21 @@ impl WriteAuth {
     /// counted (ADR 0078 decision 4): `None` for a key on `write_keys`, which
     /// is never counted or limited. A restricted key that states no deposit
     /// limit gets a gate that refuses -- config makes that unreachable for any
-    /// scope that deposits, and a deposit nothing bounds is not made.
+    /// scope that deposits, and a deposit nothing bounds is not made. So does
+    /// a key that left `controller_keys_file` after its write authenticated
+    /// (ADR 0079): only a key on `write_keys` is ever unlimited.
     pub fn deposit_gate(&self, keyid: &str) -> Option<KeyDeposits> {
-        let controller = verified_key(keyid).and_then(|key| self.restricted.get(&key))?;
+        let key = verified_key(keyid)?;
+        if self.full.contains(&key) {
+            return None;
+        }
         Some(KeyDeposits {
-            key: to_hex(controller.key()),
-            limit: controller.deposit_limit(),
+            key: to_hex(&key),
+            limit: self
+                .restricted
+                .now()
+                .get(&key)
+                .and_then(ControllerKey::deposit_limit),
             totals: self.day_totals.clone(),
         })
     }
@@ -307,7 +460,8 @@ impl WriteAuth {
                 deposit_limit: None,
             })
             .collect();
-        let mut controllers: Vec<&ControllerKey> = self.restricted.values().collect();
+        let restricted = self.restricted.now();
+        let mut controllers: Vec<&ControllerKey> = restricted.values().collect();
         controllers.sort_by(|a, b| a.name().cmp(b.name()));
         views.extend(controllers.into_iter().map(|controller| {
             WriteKeyView {
@@ -501,5 +655,78 @@ mod tests {
         // `401` stays the answer to a replayed signature (#1487).
         assert_eq!(attempt(), Err(WriteAuthError::Replayed));
         assert_eq!(auth.audit_log().len(), 1);
+    }
+
+    /// `[name]` holding `keypair`, scoped to `packets` with a spending limit
+    /// and to `channels-fund` with a deposit limit.
+    fn limited_entry(keypair: &Keypair, per_day: u64) -> String {
+        format!(
+            "[agent]\nkey = \"{}\"\nscope = [\"packets\", \"channels-fund\"]\n\
+             spending_limit = {{ per_write = 100, per_day = {per_day} }}\n\
+             deposit_limit = {{ per_write = 100, per_day = {per_day} }}\n",
+            keyid_hex(keypair)
+        )
+    }
+
+    fn day_totals(dir: &tempfile::TempDir) -> Arc<DayTotals> {
+        Arc::new(
+            DayTotals::open(
+                &dir.path().join(crate::DAY_TOTALS_JOURNAL),
+                Arc::new(connector_runtime::SystemClock),
+            )
+            .expect("open day totals"),
+        )
+    }
+
+    #[test]
+    fn removing_an_entry_and_adding_it_back_does_not_reset_its_day() {
+        use connector_runtime::DepositGate;
+
+        let keypair = keypair();
+        let dir = tempfile::tempdir().expect("state dir");
+        let file = dir.path().join("controllers");
+        std::fs::write(&file, limited_entry(&keypair, 150)).expect("write");
+        let auth = WriteAuth::with_controller_keys(
+            vec![],
+            ControllerKeysFile::new(file.clone(), vec![]),
+            Some(day_totals(&dir)),
+        );
+        let keyid = keyid_hex(&keypair);
+        let deposit = |amount| auth.deposit_gate(&keyid).expect("restricted").count(amount);
+        assert!(deposit(100).is_ok());
+
+        std::fs::write(&file, "").expect("revoke");
+        // Gone from the file after its write authenticated: refused, never
+        // treated as an operator's unlimited key.
+        assert!(deposit(1).is_err());
+
+        std::fs::write(&file, limited_entry(&keypair, 150)).expect("restore");
+        assert!(deposit(100).is_err(), "the day's 100 is still counted");
+        assert!(deposit(50).is_ok());
+
+        // A limit raised in the file applies against what is already counted.
+        std::fs::write(&file, limited_entry(&keypair, 250)).expect("raise");
+        assert!(deposit(100).is_ok());
+        assert!(deposit(1).is_err());
+    }
+
+    #[test]
+    fn an_unsigned_request_is_refused_without_reading_the_file() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let auth = WriteAuth::with_controller_keys(
+            vec![],
+            // A directory is not a readable file: reading it would mark the
+            // list unusable.
+            ControllerKeysFile::new(dir.path().to_path_buf(), vec![]),
+            None,
+        );
+        assert_eq!(
+            auth.authenticate_read("GET", "/peers", None, None, None),
+            Err(WriteAuthError::MissingSignature)
+        );
+        let RestrictedKeys::File { last, .. } = &auth.restricted else {
+            panic!("file source");
+        };
+        assert!(matches!(*last.lock().unwrap(), LastReading::Unread));
     }
 }

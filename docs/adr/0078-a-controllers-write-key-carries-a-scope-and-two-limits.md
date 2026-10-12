@@ -1,6 +1,6 @@
 # A controller's write key carries a scope and two limits
 
-**Status:** Accepted (owner decision, 2026-10-11, #1485) — **built**. Built (#1487): decisions 1, 7 and 10 and the scope, expiry and `403` halves of 9 and 11 — `[operator] controller_keys_file`, the eight named writes, the optional expiry, `403` naming `scope` or `expiry` before anything is signed or journaled, `toon_writes_refused_total{reason}`, and `GET /write-keys` listing each key's id, whether it is restricted, its scope and its expiry. Built (#1488): **the spending limit** — decisions 2, 3 and 5 for packets, decision 8 for the spending count (`DayTotals`, journaled under `state_dir` as `controller-day-totals.journal`), the `spending-limit` reason on the refused-write counter, and the spending half of decision 11 on `GET /write-keys`. Built (#1489): **the deposit limit** — decision 4 and the deposit halves of 2, 5, 8, 9 and 11: `POST /peers` and `POST /channels` count their `deposit` where a new channel is journaled (a found or resumed one counts nothing), `POST /channels/:id/fund` counts its `amount` every time, into the same journal as a second `CountKind`, with the `deposit-limit` reason and the deposit limit on `GET /write-keys`. No entry is refused for stating a limit any more. It **extends** [0008](0008-operator-surface-splits-read-from-write.md): every write stays signed, attributable and individually revocable, and a key on `write_keys` keeps the authority that record gave it. It leaves [0009](0009-one-typed-config-file-no-environment-layer.md) untouched: a restricted key's entry is config, read once at boot, and changing or revoking it is an edit and a restart.
+**Status:** Accepted (owner decision, 2026-10-11, #1485) — **built**. Built (#1487): decisions 1, 7 and 10 and the scope, expiry and `403` halves of 9 and 11 — `[operator] controller_keys_file`, the eight named writes, the optional expiry, `403` naming `scope` or `expiry` before anything is signed or journaled, `toon_writes_refused_total{reason}`, and `GET /write-keys` listing each key's id, whether it is restricted, its scope and its expiry. Built (#1488): **the spending limit** — decisions 2, 3 and 5 for packets, decision 8 for the spending count (`DayTotals`, journaled under `state_dir` as `controller-day-totals.journal`), the `spending-limit` reason on the refused-write counter, and the spending half of decision 11 on `GET /write-keys`. Built (#1489): **the deposit limit** — decision 4 and the deposit halves of 2, 5, 8, 9 and 11: `POST /peers` and `POST /channels` count their `deposit` where a new channel is journaled (a found or resumed one counts nothing), `POST /channels/:id/fund` counts its `amount` every time, into the same journal as a second `CountKind`, with the `deposit-limit` reason and the deposit limit on `GET /write-keys`. No entry is refused for stating a limit any more. It **extends** [0008](0008-operator-surface-splits-read-from-write.md): every write stays signed, attributable and individually revocable, and a key on `write_keys` keeps the authority that record gave it. As written it left [0009](0009-one-typed-config-file-no-environment-layer.md) untouched, with a restricted key revoked by an edit and a restart; **[0079](0079-a-controllers-key-is-revoked-by-an-edit-and-may-sign-a-read.md) amends that** — see the Update below.
 
 **Scope:** connector architecture — internal to this codebase. See the [ADR index](README.md).
 
@@ -90,3 +90,15 @@ controller_keys_file`: one table per key holding the key, its scope, its limits 
 - The setting is added beside the existing ones, so no existing config changes and this is not a
   breaking deploy.
 - The spending limit is not a **cap**. A cap is the largest packet a peering carries.
+
+## Update (issue #1485) — a revoke is an edit alone, and a read may be signed
+
+[0079](0079-a-controllers-key-is-revoked-by-an-edit-and-may-sign-a-read.md) reverses one option this record refused and adds to one decision:
+
+- **"Reread the key file on every write" is now what happens.** The contents of
+  `controller_keys_file` are read again on every signed request, so removing an entry revokes its
+  key at that key's next request. The Status line's "an edit and a restart" described this record
+  as first built. Decision 8 is unchanged: the day's totals are kept by key and do not follow the
+  file.
+- **Decision 11 gains a second way in.** `GET /write-keys`, like every read, also accepts a write
+  key's signature in place of the bearer token.

@@ -87,7 +87,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use connector_client_edge::ClientClaimGate;
-use connector_config::{ControllerKey, WriteScope};
+use connector_config::WriteScope;
 use connector_domain::x402::X402BatchSettlementTerms;
 use connector_domain::{Prepare, Price};
 use connector_runtime::DepositGate;
@@ -101,6 +101,7 @@ use connector_settlement::batch::BatchSettlementError;
 use connector_signer::{derive_evm_address, to_hex, Signer, SignerError};
 pub use day_totals::{DayTotals, DayTotalsError, DAY_TOTALS_JOURNAL};
 use url::Url;
+pub use write_auth::ControllerKeySource;
 use write_auth::{authenticate_write, AuditRecord, WriteAuth, WriteKeyView};
 
 /// This node's own identity: the active signing key and the address
@@ -208,6 +209,8 @@ pub fn router_with_batch_channels(
 /// `write_keys` keeps every write. `day_totals` is where a spending limit
 /// counts: a restricted key with a limit and no `day_totals` is refused every
 /// packet, because a count that cannot be journaled refuses the packet.
+/// `controller_keys` is a fixed list or `[operator] controller_keys_file`
+/// itself, which is then read again on every signed request (ADR 0079).
 #[allow(clippy::too_many_arguments)]
 pub fn router_with_controller_keys(
     connector: Arc<Connector>,
@@ -215,7 +218,7 @@ pub fn router_with_controller_keys(
     signer: Arc<dyn Signer>,
     bearer_token: impl Into<String>,
     write_keys: Vec<[u8; 32]>,
-    controller_keys: Vec<ControllerKey>,
+    controller_keys: impl Into<ControllerKeySource>,
     day_totals: Option<DayTotals>,
     declared_rates: Option<DeclaredRates>,
     batch_channels: Option<Arc<BatchChannels>>,
@@ -234,7 +237,8 @@ pub fn router_with_controller_keys(
         batch: batch_channels,
     };
 
-    // Reads: gated by the bearer token and nothing else. Writes: gated by
+    // Reads: gated by the bearer token, or a write key's signature in its
+    // place (ADR 0079), and nothing else. Writes: gated by
     // an RFC 9421 signature and nothing else (ADR 0008) -- `route_layer`
     // only wraps the routes already added to `reads` when it is called,
     // so `writes`, merged in afterward, is never behind the bearer token.
@@ -253,7 +257,7 @@ pub fn router_with_controller_keys(
         .route("/packets", get(packet_history))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            require_bearer_token,
+            require_read_auth,
         ));
 
     let writes = Router::new()
@@ -353,20 +357,43 @@ fn require_write_auth(
     })
 }
 
-async fn require_bearer_token<B>(
+/// The gate on every read: the bearer token, or -- with no `Authorization`
+/// header at all -- an RFC 9421 signature by a key that may sign a write
+/// (ADR 0079). A controller is handed a key and never the token, which is
+/// shared by every reader and cannot be revoked for one of them. A request
+/// that presents a token is judged by the token alone.
+async fn require_read_auth<B>(
     State(state): State<OperatorState>,
     request: Request<B>,
     next: Next<B>,
 ) -> Response {
-    let presented = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
+    let headers = request.headers();
+    if let Some(authorization) = headers.get(header::AUTHORIZATION) {
+        let presented = authorization
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix("Bearer "));
+        return match presented {
+            Some(token) if token == state.bearer_token.as_ref() => next.run(request).await,
+            _ => StatusCode::UNAUTHORIZED.into_response(),
+        };
+    }
 
-    match presented {
-        Some(token) if token == state.bearer_token.as_ref() => next.run(request).await,
-        _ => StatusCode::UNAUTHORIZED.into_response(),
+    let header_str = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let signed = state.write_auth.authenticate_read(
+        request.method().as_str(),
+        request.uri().path(),
+        header_str("signature-input"),
+        header_str("signature"),
+        header_str("content-digest"),
+    );
+    match signed {
+        Ok(()) => next.run(request).await,
+        // The caller is known and its key has expired (ADR 0078 decision 10).
+        Err(error) if error.refusal_reason().is_some() => {
+            (StatusCode::FORBIDDEN, error.to_string()).into_response()
+        }
+        Err(_) => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
 
@@ -1331,7 +1358,7 @@ fn node_identity(signer: &dyn Signer) -> Result<NodeIdentity, SignerError> {
 mod tests {
     use super::*;
     use axum::body::Body;
-    use connector_config::StaticRoute;
+    use connector_config::{ControllerKey, StaticRoute};
     use connector_runtime::{
         FakeAppClient, InMemoryJournal, InProcessPeerTransport, RouteSource, TestClock,
     };
@@ -4810,6 +4837,291 @@ mod tests {
                 let response = app.clone().oneshot(request).await.unwrap();
                 assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
             }
+        }
+    }
+
+    /// `controller_keys_file` is read again on every signed request, and a
+    /// read signed by a write key needs no bearer token (ADR 0079).
+    mod live_controller_keys_and_signed_reads {
+        use super::*;
+        use crate::rfc9421::{keyid_hex, sign_request};
+        use connector_config::ControllerKeysFile;
+        use ed25519_dalek::Keypair;
+        use rand::rngs::OsRng;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static CREATED: AtomicU64 = AtomicU64::new(1_000);
+
+        /// One entry of the file, as an operator writes it.
+        fn entry(name: &str, keypair: &Keypair, scope: &str, expires: Option<&str>) -> String {
+            let expires = expires.map_or(String::new(), |at| format!("expires = \"{at}\"\n"));
+            format!(
+                "[{name}]\nkey = \"{}\"\nscope = [\"{scope}\"]\n{expires}",
+                keyid_hex(keypair)
+            )
+        }
+
+        /// A node whose restricted keys are whatever `file` holds, and whose
+        /// one operator key is `operator`.
+        fn app(file: &tempfile::NamedTempFile, operator: &Keypair) -> Router {
+            let connector = Arc::new(Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            ));
+            let write_keys = vec![operator.public.to_bytes()];
+            router_with_controller_keys(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                write_keys.clone(),
+                ControllerKeysFile::new(file.path().to_path_buf(), write_keys),
+                None,
+                None,
+                None,
+            )
+        }
+
+        fn file_holding(contents: &str) -> tempfile::NamedTempFile {
+            let file = tempfile::NamedTempFile::new().expect("temp controller keys file");
+            std::fs::write(file.path(), contents).expect("write controller keys");
+            file
+        }
+
+        async fn signed(
+            app: &Router,
+            keypair: &Keypair,
+            method: &str,
+            path: &str,
+        ) -> (StatusCode, String) {
+            let created = CREATED.fetch_add(1, Ordering::SeqCst);
+            let (sig_input, sig, digest) =
+                sign_request(keypair, method, path, &[], created, Some(9_999_999_999));
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        const LAND: &str = "/channels/c1/land";
+
+        fn admitted(status: StatusCode) -> bool {
+            status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED
+        }
+
+        #[tokio::test]
+        async fn a_key_removed_from_the_file_is_refused_its_next_write_and_read() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let file = file_holding(&entry("agent", &agent, "channels-land", None));
+            let app = app(&file, &operator);
+            assert!(admitted(signed(&app, &agent, "POST", LAND).await.0));
+            assert_eq!(
+                signed(&app, &agent, "GET", "/write-keys").await.0,
+                StatusCode::OK
+            );
+
+            std::fs::write(file.path(), "").expect("revoke");
+
+            assert_eq!(
+                signed(&app, &agent, "POST", LAND).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                signed(&app, &agent, "GET", "/write-keys").await.0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        #[tokio::test]
+        async fn a_key_added_to_the_file_writes_with_no_restart() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let file = file_holding("");
+            let app = app(&file, &operator);
+            assert_eq!(
+                signed(&app, &agent, "POST", LAND).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+
+            std::fs::write(file.path(), entry("agent", &agent, "channels-land", None))
+                .expect("grant");
+
+            assert!(admitted(signed(&app, &agent, "POST", LAND).await.0));
+            let (_, listed) = signed(&app, &operator, "GET", "/write-keys").await;
+            assert!(listed.contains(&keyid_hex(&agent)), "{listed}");
+        }
+
+        #[tokio::test]
+        async fn a_scope_changed_in_the_file_binds_the_next_write() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let file = file_holding(&entry("agent", &agent, "channels-land", None));
+            let app = app(&file, &operator);
+            assert!(admitted(signed(&app, &agent, "POST", LAND).await.0));
+
+            std::fs::write(
+                file.path(),
+                entry("agent", &agent, "channels-withdraw", None),
+            )
+            .expect("narrow");
+
+            let (status, body) = signed(&app, &agent, "POST", LAND).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("scope"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_file_that_stops_parsing_refuses_every_restricted_key_and_no_operator_key() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let good = entry("agent", &agent, "channels-land", None);
+            let file = file_holding(&good);
+            let app = app(&file, &operator);
+            assert!(admitted(signed(&app, &agent, "POST", LAND).await.0));
+
+            for broken in [
+                "[agent\n".to_string(),
+                entry("agent", &agent, "not-a-write", None),
+                // A restricted key that is also the operator's.
+                entry("agent", &operator, "channels-land", None),
+            ] {
+                std::fs::write(file.path(), &broken).expect("break");
+                assert_eq!(
+                    signed(&app, &agent, "POST", LAND).await.0,
+                    StatusCode::UNAUTHORIZED,
+                    "{broken}"
+                );
+                assert!(
+                    admitted(signed(&app, &operator, "POST", LAND).await.0),
+                    "{broken}"
+                );
+            }
+
+            std::fs::remove_file(file.path()).expect("delete");
+            assert_eq!(
+                signed(&app, &agent, "POST", LAND).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+
+            std::fs::write(file.path(), &good).expect("repair");
+            assert!(admitted(signed(&app, &agent, "POST", LAND).await.0));
+        }
+
+        #[tokio::test]
+        async fn a_read_signed_by_any_write_key_needs_no_bearer_token() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let file = file_holding(&entry("agent", &agent, "channels-land", None));
+            let app = app(&file, &operator);
+
+            for path in ["/write-keys", "/peers", "/claims", "/metrics"] {
+                for key in [&operator, &agent] {
+                    let (status, body) = signed(&app, key, "GET", path).await;
+                    assert_eq!(status, StatusCode::OK, "{path}: {body}");
+                }
+            }
+            let stranger = Keypair::generate(&mut OsRng);
+            assert_eq!(
+                signed(&app, &stranger, "GET", "/peers").await.0,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                get(app.clone(), "/peers", None).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        #[tokio::test]
+        async fn a_read_signed_for_one_path_does_not_read_another() {
+            let operator = Keypair::generate(&mut OsRng);
+            let file = file_holding("");
+            let app = app(&file, &operator);
+            let (sig_input, sig, digest) =
+                sign_request(&operator, "GET", "/peers", &[], 1_000, Some(9_999_999_999));
+            let request = Request::builder()
+                .uri("/claims")
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn a_wrong_bearer_token_is_not_rescued_by_a_good_signature() {
+            let operator = Keypair::generate(&mut OsRng);
+            let file = file_holding("");
+            let app = app(&file, &operator);
+            let (sig_input, sig, digest) =
+                sign_request(&operator, "GET", "/peers", &[], 1_000, Some(9_999_999_999));
+            let request = Request::builder()
+                .uri("/peers")
+                .header(header::AUTHORIZATION, "Bearer wrong-token")
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn a_signed_read_may_be_repeated_and_leaves_no_audit_record() {
+            let operator = Keypair::generate(&mut OsRng);
+            let file = file_holding("");
+            let app = app(&file, &operator);
+            let (sig_input, sig, digest) =
+                sign_request(&operator, "GET", "/peers", &[], 1_000, Some(9_999_999_999));
+            for _ in 0..2 {
+                let request = Request::builder()
+                    .uri("/peers")
+                    .header("signature-input", &sig_input)
+                    .header("signature", &sig)
+                    .header("content-digest", &digest)
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            let (_, audit) = signed(&app, &operator, "GET", "/audit-log").await;
+            assert_eq!(audit, "[]");
+        }
+
+        #[tokio::test]
+        async fn an_expired_key_is_refused_a_read_naming_the_expiry() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let file = file_holding(&entry(
+                "agent",
+                &agent,
+                "channels-land",
+                Some("2020-01-01T00:00:00Z"),
+            ));
+            let app = app(&file, &operator);
+            let (status, body) = signed(&app, &agent, "GET", "/peers").await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("expir"), "{body}");
+            // The refused-write counter counts writes.
+            let (_, metrics) = signed(&app, &operator, "GET", "/metrics").await;
+            assert!(
+                !metrics.contains(r#"toon_writes_refused_total{reason="expiry"} 1"#),
+                "{metrics}"
+            );
         }
     }
 }
