@@ -224,6 +224,30 @@ the surface that the node happens to ship, with no authority of its own — the 
 the operator key it is fed are the operator's, and the key never leaves the browser.
 _Avoid_: admin panel, control panel, console
 
+**Write key**:
+A key allowed to make a write on the operator surface. An **operator's** write key may make every
+write. A **controller's** write key is restricted: it carries a **scope**, and may carry a
+**spending limit** and a **deposit limit**.
+_Avoid_: admin key, API key, operator token
+
+**Scope**:
+The named writes a controller's write key may make. A write outside it is refused before anything
+is signed or sent.
+_Avoid_: role, permission, capability
+
+**Spending limit**:
+The most a controller's write key may send in packets, per packet and per UTC day. It counts every
+packet the key originates at its full amount, rejected or not, because originating a packet sends
+a claim: it bounds what the key exposed, not what the node lost. One bare figure, counted in the
+base units of whatever channel each packet is paid over.
+_Avoid_: cap (that is the largest packet a peering carries), budget, allowance, quota
+
+**Deposit limit**:
+The most a controller's write key may put into channels, per write and per UTC day, by peering,
+opening or funding. Separate from the **spending limit**, because a deposit stays the node's own
+money and a packet does not.
+_Avoid_: cap, funding limit
+
 ### Protocol surfaces
 
 **Peering**:
