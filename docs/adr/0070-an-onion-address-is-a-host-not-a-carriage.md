@@ -213,6 +213,12 @@ was an interoperability break in which neither side was wrong on its own: a node
 `local/onion` published an address that client refused, and the client dialed a TLD that daemon
 could not resolve.
 
+**The rename is an identity change as well as a routing one (#1320).** The checksum prefix is inside
+the hash of a v3 address (`.onion checksum` at v0.4.9.7, `.anon checksum` at v0.4.9.13,
+`.anyone checksum` at v0.4.10.2), so an unchanged `hs_ed25519_secret_key` yields a different address
+in each era: the TLD and characters 52–55 differ, the first 51 do not. Upgrading a daemon across the
+rename rotates the node's address. The runbook says so at the persisted-volume step.
+
 **Both suffixes are accepted.** `is_onion_endpoint` — still the one implementation of the host rule,
 per decision 2 — matches a host ending in `.onion` **or** `.anyone`. Nothing else about this record
 changes: not the decisions, not `PeerCarriage`'s two values, not `peer_allow_plaintext_endpoints`'s
