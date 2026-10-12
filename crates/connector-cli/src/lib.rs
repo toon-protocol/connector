@@ -232,6 +232,9 @@ pub struct RunningNode {
     pub router: Router,
     /// The socket address the client edge binds.
     pub client_edge_addr: SocketAddr,
+    /// The lock on `state_dir` (issue #1318), held for as long as the node
+    /// is. Never read: dropping it is what would release it.
+    _state_dir_lock: Option<std::fs::File>,
 }
 
 /// What [`run`] left for the binary to do.
@@ -258,13 +261,14 @@ pub async fn run<S: AsRef<str>>(args: &[S]) -> Result<Command, CliError> {
     match parse_args(args)? {
         Invocation::Serve { config_path } => {
             let config = Config::load(Path::new(&config_path))?;
-            let runtime = build(&config).await?;
+            let mut runtime = build(&config).await?;
             let client_edge_addr = config.client_edge_addr();
             let router = router(&runtime, &config)?;
 
             Ok(Command::Serve(RunningNode {
                 router,
                 client_edge_addr,
+                _state_dir_lock: runtime.state_dir_lock.take(),
             }))
         }
         Invocation::Send { options } => {

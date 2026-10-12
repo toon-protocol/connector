@@ -169,3 +169,8 @@ config's own self-description has no endpoints and nothing to dial.
 > **`state_dir` is where this node records which claims it has already been
 > paid.** In a container it must be a mounted volume; a watermark that dies with
 > the container hands every payer their spent claims back as free service.
+>
+> One directory belongs to one process. A node locks `state_dir` before it opens
+> anything there, and a second connector started over the same directory refuses
+> to start, naming it. The lock is the operating system's, so a node that crashed
+> leaves nothing to clean up.
