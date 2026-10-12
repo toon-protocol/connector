@@ -206,13 +206,6 @@ pub enum ConfigError {
     },
 
     #[error(
-        "controller key '{entry}' in {path} states a deposit limit, and the deposit limit is \
-         not yet enforced by this build: refusing to start rather than accept a limit the node \
-         does not hold (ADR 0078)"
-    )]
-    ControllerLimitsNotEnforced { path: PathBuf, entry: String },
-
-    #[error(
         "route '{prefix}' must set exactly one of 'handler_url' or 'peer_id', but neither is set"
     )]
     RouteMissingTarget { prefix: String },
@@ -950,14 +943,14 @@ pub enum ConfigError {
     )]
     SettlementWithoutStateDir,
 
-    /// A spending limit is counted in a journal under `state_dir` (ADR 0078
+    /// A spending or deposit limit is counted in a journal under `state_dir` (ADR 0078
     /// decision 8); without one the count would not survive a restart.
     #[error(
-        "controller key '{entry}' states a spending limit but 'state_dir' is not set: the day's \
+        "controller key '{entry}' states a {limit} but 'state_dir' is not set: the day's \
          count is journaled under state_dir, and a count held only in memory would reset the \
          day at every restart. Set a top-level state_dir to a directory this node can write"
     )]
-    SpendingLimitWithoutStateDir { entry: String },
+    LimitWithoutStateDir { entry: String, limit: &'static str },
 
     #[error("state_dir '{path}' exists but is not a directory")]
     StateDirNotADirectory { path: PathBuf },

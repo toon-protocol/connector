@@ -164,6 +164,20 @@ pub enum BatchChannelError {
     /// open was not sent, a voucher was not handed out.
     #[error("the outbound channel journal could not be written: {0}")]
     Journal(String),
+    /// A controller's deposit limit refused the deposit (ADR 0078), before
+    /// anything was journaled or sent. Carries the reason, which names it.
+    #[error("{0}")]
+    DepositRefused(String),
+}
+
+/// Where a deposit is counted against a controller's deposit limit (ADR 0078
+/// decision 4). Asked once per deposit that commits value: when an open is
+/// about to be journaled as a new channel -- never for a repeat that finds or
+/// resumes one -- and before every top-up, which is an increment each time.
+/// An `Err` is the reason the deposit is refused; the channel write then
+/// journals and sends nothing.
+pub trait DepositGate: Send + Sync {
+    fn count(&self, amount: u128) -> Result<(), String>;
 }
 
 impl From<JournalError> for BatchChannelError {
@@ -451,6 +465,17 @@ impl OutboundChannels {
         terms: ReceiverTerms,
         deposit: u128,
     ) -> Result<(OutboundChannelState, bool), BatchChannelError> {
+        self.open_with(terms, deposit, None).await
+    }
+
+    /// [`OutboundChannels::open`], counting a deposit that journals a new
+    /// channel with `gate` first. A resumed open counts nothing.
+    pub async fn open_with(
+        &self,
+        terms: ReceiverTerms,
+        deposit: u128,
+        gate: Option<&dyn DepositGate>,
+    ) -> Result<(OutboundChannelState, bool), BatchChannelError> {
         let chain = chain_of(terms.chain());
         let payer = Arc::clone(self.payer(chain)?);
         let _opening = self.opening.lock().await;
@@ -475,7 +500,8 @@ impl OutboundChannels {
         let (mut record, mut resumed) = match pending {
             Some(record) => (record, true),
             None => (
-                self.prepare(&payer, chain, terms.clone(), deposit).await?,
+                self.prepare(&payer, chain, terms.clone(), deposit, gate)
+                    .await?,
                 false,
             ),
         };
@@ -492,7 +518,9 @@ impl OutboundChannels {
                     if !resumed {
                         return Err(BatchSettlementError::OpenLapsed(channel).into());
                     }
-                    record = self.prepare(&payer, chain, terms.clone(), deposit).await?;
+                    record = self
+                        .prepare(&payer, chain, terms.clone(), deposit, gate)
+                        .await?;
                     resumed = false;
                 }
                 Err(error) => return Err(error.into()),
@@ -510,8 +538,15 @@ impl OutboundChannels {
         chain: SettlementChain,
         terms: ReceiverTerms,
         deposit: u128,
+        gate: Option<&dyn DepositGate>,
     ) -> Result<OutboundChannelRecord, BatchChannelError> {
         let record = payer.prepare_open(terms, deposit).await?;
+        // Counted as the channel is journaled and before the open is sent: a
+        // deposit whose transaction then fails is not given back.
+        if let Some(gate) = gate {
+            gate.count(deposit)
+                .map_err(BatchChannelError::DepositRefused)?;
+        }
         self.append(JournalEntry::OutboundChannelOpening {
             channel_id: journal_key(chain, record.channel()),
             record: record.encode(),
@@ -536,7 +571,22 @@ impl OutboundChannels {
         id: &str,
         increment: u128,
     ) -> Result<OutboundChannelState, BatchChannelError> {
+        self.top_up_with(id, increment, None).await
+    }
+
+    /// [`OutboundChannels::top_up`], counting `increment` with `gate` before
+    /// it is sent -- every time, because it is an increment.
+    pub async fn top_up_with(
+        &self,
+        id: &str,
+        increment: u128,
+        gate: Option<&dyn DepositGate>,
+    ) -> Result<OutboundChannelState, BatchChannelError> {
         let (channel, payer) = self.ready(id).await?;
+        if let Some(gate) = gate {
+            gate.count(increment)
+                .map_err(BatchChannelError::DepositRefused)?;
+        }
         Ok(payer.top_up(&channel, increment).await?)
     }
 
@@ -858,6 +908,18 @@ impl BatchChannels {
         counterparty_url: Option<&Url>,
         deposit: u128,
     ) -> Result<(BatchChannelView, bool), BatchChannelError> {
+        self.open_with(terms, counterparty_url, deposit, None).await
+    }
+
+    /// [`BatchChannels::open`], counting a deposit that journals a new
+    /// channel with `gate`.
+    pub async fn open_with(
+        &self,
+        terms: &X402BatchSettlementTerms,
+        counterparty_url: Option<&Url>,
+        deposit: u128,
+        gate: Option<&dyn DepositGate>,
+    ) -> Result<(BatchChannelView, bool), BatchChannelError> {
         let (chain, network) = match terms {
             X402BatchSettlementTerms::Evm(evm) => (SettlementChain::Evm, &evm.network),
             X402BatchSettlementTerms::Solana(solana) => (SettlementChain::Solana, &solana.network),
@@ -872,7 +934,7 @@ impl BatchChannels {
         }
         let terms =
             receiver_terms(terms, counterparty_url).map_err(BatchChannelError::InvalidTerms)?;
-        let (state, resumed) = self.outbound.open(terms, deposit).await?;
+        let (state, resumed) = self.outbound.open_with(terms, deposit, gate).await?;
         Ok((self.outbound.view_of(&state), resumed))
     }
 
