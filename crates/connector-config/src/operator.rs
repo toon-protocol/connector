@@ -428,6 +428,37 @@ mod tests {
     }
 
     #[test]
+    fn a_named_controller_keys_file_that_is_unreadable_is_refused() {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&[0xff, 0xfe, 0xfd]).expect("write");
+        file.flush().expect("flush");
+        let result = resolve_operator(Some(with_controllers(file.path().to_path_buf())));
+        assert!(matches!(
+            result,
+            Err(ConfigError::OperatorFileUnreadable {
+                setting: "controller_keys_file",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_controller_key_that_is_also_on_write_keys_file_is_refused() {
+        let keys = file_holding(&format!("{OTHER_KEY}\n"));
+        let controllers = file_holding(&format!(
+            "[agent]\nkey = \"{OTHER_KEY}\"\nscope = [\"channels-land\"]\n"
+        ));
+        let mut config = with_controllers(controllers.path().to_path_buf());
+        config.write_keys = None;
+        config.write_keys_file = Some(keys.path().to_path_buf());
+        let result = resolve_operator(Some(config));
+        assert!(matches!(
+            result,
+            Err(ConfigError::ControllerKeyAlsoWriteKey { .. })
+        ));
+    }
+
+    #[test]
     fn a_controller_key_that_is_also_a_write_key_is_refused() {
         let file = file_holding(&format!(
             "[agent]\nkey = \"{OTHER_KEY}\"\nscope = [\"channels-land\"]\n"

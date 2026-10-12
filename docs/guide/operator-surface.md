@@ -76,7 +76,9 @@ id, whether it is restricted, its scope and its expiry.
 
 The node refuses to start, naming the entry, when a scope is empty or names an
 unknown write; a key is not 64 hex characters or appears twice, or is also on
-`write_keys`; or the file is missing.
+`write_keys` or in `write_keys_file`; a scope lacks the limit it requires, or a limit
+states only one of its `per_write` and `per_day`; or the file is missing or
+unreadable. An entry whose `expires` has already passed is not a refusal to start.
 
 **Limits are not enforced yet.** An entry that states a `spending_limit` or a
 `deposit_limit` is refused at boot, so no release accepts a limit it does not hold.

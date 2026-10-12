@@ -140,17 +140,6 @@ impl WriteAuth {
             &self.allowlist,
         )?;
 
-        if let Some(controller) =
-            verified_key(&verified.keyid).and_then(|key| self.restricted.get(&key))
-        {
-            if controller.expires().is_some_and(|expires| now >= expires) {
-                return Err(WriteAuthError::KeyExpired);
-            }
-            if !controller.scope().contains(&write) {
-                return Err(WriteAuthError::OutOfScope(write));
-            }
-        }
-
         {
             let mut seen = self
                 .seen_signatures
@@ -160,8 +149,21 @@ impl WriteAuth {
             // remembered: once it can no longer verify as unexpired, it
             // can never be replayed successfully, so it is safe to forget.
             seen.retain(|_, expires_at| *expires_at >= now);
+            // A replay is a `401` whatever the key's authority now is: a
+            // signature accepted before its key expired and presented again
+            // after is a replay first.
             if seen.contains_key(&verified.signature) {
                 return Err(WriteAuthError::Replayed);
+            }
+            if let Some(controller) =
+                verified_key(&verified.keyid).and_then(|key| self.restricted.get(&key))
+            {
+                if controller.expires().is_some_and(|expires| now >= expires) {
+                    return Err(WriteAuthError::KeyExpired);
+                }
+                if !controller.scope().contains(&write) {
+                    return Err(WriteAuthError::OutOfScope(write));
+                }
             }
             seen.insert(verified.signature.clone(), verified.expires);
         }
@@ -344,6 +346,42 @@ mod tests {
 
         // Exactly one write was recorded -- the replay never reached the
         // audit log.
+        assert_eq!(auth.audit_log().len(), 1);
+    }
+
+    #[test]
+    fn a_signature_replayed_after_its_key_expires_is_a_replay_not_an_expiry() {
+        let keypair = keypair();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let controller = ControllerKey::new(
+            "agent",
+            keypair.public.to_bytes(),
+            vec![WriteScope::ChannelsLand],
+            Some(now + 2),
+        );
+        let auth = WriteAuth::with_controller_keys(vec![], vec![controller]);
+        let body = b"body";
+        let (sig_input, sig, digest) =
+            sign(&keypair, "POST", "/channels/c/land", body, 9_999_999_999);
+        let attempt = || {
+            auth.authenticate(
+                WriteScope::ChannelsLand,
+                "POST",
+                "/channels/c/land",
+                Some(&sig_input),
+                Some(&sig),
+                Some(&digest),
+                body,
+            )
+        };
+
+        assert!(attempt().is_ok());
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        // `401` stays the answer to a replayed signature (#1487).
+        assert_eq!(attempt(), Err(WriteAuthError::Replayed));
         assert_eq!(auth.audit_log().len(), 1);
     }
 }

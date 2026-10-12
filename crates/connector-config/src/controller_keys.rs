@@ -89,7 +89,8 @@ impl fmt::Display for WriteScope {
     }
 }
 
-/// A restricted write key, fully validated.
+/// A restricted write key. Every boot refusal is checked where the file is
+/// parsed; [`ControllerKey::new`] itself validates nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControllerKey {
     name: String,
