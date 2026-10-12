@@ -540,13 +540,14 @@ impl OutboundChannels {
         deposit: u128,
         gate: Option<&dyn DepositGate>,
     ) -> Result<OutboundChannelRecord, BatchChannelError> {
-        let record = payer.prepare_open(terms, deposit).await?;
-        // Counted as the channel is journaled and before the open is sent: a
-        // deposit whose transaction then fails is not given back.
+        // Counted as the channel is journaled and before the open is built,
+        // so a refused deposit is neither signed nor sent; a deposit whose
+        // transaction then fails is not given back.
         if let Some(gate) = gate {
             gate.count(deposit)
                 .map_err(BatchChannelError::DepositRefused)?;
         }
+        let record = payer.prepare_open(terms, deposit).await?;
         self.append(JournalEntry::OutboundChannelOpening {
             channel_id: journal_key(chain, record.channel()),
             record: record.encode(),
@@ -1401,6 +1402,53 @@ mod tests {
             assert_ne!(second.on_chain.id, state.on_chain.id);
             assert_eq!(outbound.views().await.len(), 2);
         }
+    }
+
+    /// A gate that adds up what it is asked to count.
+    #[derive(Default)]
+    struct Counted(std::sync::Mutex<u128>);
+
+    impl DepositGate for Counted {
+        fn count(&self, amount: u128) -> Result<(), String> {
+            *self.0.lock().unwrap() += amount;
+            Ok(())
+        }
+    }
+
+    /// ADR 0078 decision 4: a retried open that resumes its journaled
+    /// channel counts nothing against a deposit limit; the next open, a
+    /// channel of its own, counts its deposit.
+    #[tokio::test]
+    async fn a_resumed_open_counts_nothing_and_a_new_one_counts_its_deposit() {
+        let world = World::new(PayerExit::Withdrawal);
+        let journal = Arc::new(InMemoryJournal::new());
+        let record = world
+            .payer()
+            .prepare_open(world.receiver.published_terms(), 1_000)
+            .await
+            .expect("prepare");
+        journal
+            .append(&JournalEntry::OutboundChannelOpening {
+                channel_id: journal_key(chain_name(PayerExit::Withdrawal), record.channel()),
+                record: record.encode(),
+            })
+            .unwrap();
+        let outbound = world.boot(Arc::clone(&journal) as Arc<dyn Journal>).await;
+        let gate = Counted::default();
+
+        let (_, resumed) = outbound
+            .open_with(world.receiver.published_terms(), 1_000, Some(&gate))
+            .await
+            .expect("the retried open");
+        assert!(resumed);
+        assert_eq!(*gate.0.lock().unwrap(), 0, "a resumed open counts nothing");
+
+        let (_, resumed) = outbound
+            .open_with(world.receiver.published_terms(), 1_000, Some(&gate))
+            .await
+            .expect("a second open");
+        assert!(!resumed);
+        assert_eq!(*gate.0.lock().unwrap(), 1_000);
     }
 
     /// A pending open resumes only for the same open: a request with another

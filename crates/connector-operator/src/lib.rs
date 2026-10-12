@@ -2746,7 +2746,7 @@ mod tests {
         /// it dials, which settlement address it derives a channel from --
         /// is the behaviour under test. A fake handing back a value would
         /// skip the fetch, which is the half that is new.
-        fn serve_self_description(settlement_address: &str) -> SocketAddr {
+        pub(super) fn serve_self_description(settlement_address: &str) -> SocketAddr {
             // The fake chain's settled token: what the counterparty's x402
             // terms must name for this node's paying half to open on them.
             let ReceiverTerms::Evm(fake) =
@@ -2812,7 +2812,8 @@ mod tests {
         /// publishes it. Deliberately not this node's own and deliberately
         /// not an edge identity: the channel derives from the settlement
         /// address of the chain in question.
-        const COUNTERPARTY_SETTLEMENT: &str = "0x00000000000000000000000000000000000000aa";
+        pub(super) const COUNTERPARTY_SETTLEMENT: &str =
+            "0x00000000000000000000000000000000000000aa";
 
         /// The CAIP-2 network both nodes' x402 terms name.
         const NETWORK: &str = "eip155:31337";
@@ -3874,17 +3875,19 @@ mod tests {
                 86_400,
             ));
             this.fund(10_000);
-            let outbound = OutboundChannels::restore(
-                Arc::new(InMemoryJournal::new()),
-                vec![(
-                    SettlementChain::Evm,
-                    Arc::clone(&this) as Arc<dyn BatchSettlementPayer>,
-                )],
-            )
-            .await
-            .expect("an empty journal replays");
+            let outbound = Arc::new(
+                OutboundChannels::restore(
+                    Arc::new(InMemoryJournal::new()),
+                    vec![(
+                        SettlementChain::Evm,
+                        Arc::clone(&this) as Arc<dyn BatchSettlementPayer>,
+                    )],
+                )
+                .await
+                .expect("an empty journal replays"),
+            );
             let batch = Arc::new(BatchChannels::new(
-                Arc::new(outbound),
+                Arc::clone(&outbound),
                 vec![(
                     SettlementChain::Evm,
                     Arc::clone(&this) as Arc<dyn BatchSettlementBackend>,
@@ -3893,13 +3896,25 @@ mod tests {
                     as Arc<dyn connector_settlement::batch::HeldVouchers>,
                 Vec::new(),
             ));
-            let connector = Arc::new(Connector::new(
-                vec![],
-                vec![],
-                Arc::new(FakeAppClient::new()),
-                Arc::new(InProcessPeerTransport::new()),
-                Arc::new(TestClock::new(chrono::Utc::now())),
-            ));
+            // A peering opens on the same outbound channels a `POST
+            // /channels` does, so the two count into one day.
+            let connector = Arc::new(
+                Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(TestClock::new(chrono::Utc::now())),
+                )
+                .with_outbound_channels(
+                    outbound,
+                    vec![(SettlementChain::Evm, "eip155:31337".to_string())],
+                )
+                .with_self_description_source(Arc::new(
+                    connector_runtime::BoundedHttpSelfDescription::new(true, None),
+                ))
+                .with_peer_allow_plaintext_endpoints(true),
+            );
             let app = router_with_controller_keys(
                 connector,
                 empty_claim_gate(),
@@ -4056,6 +4071,74 @@ mod tests {
             assert_eq!(write_keys(&app).await["deposit_limit"]["counted_today"], 0);
             let (status, body) = fund(&app, &key, &id, 300).await;
             assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        async fn peer(app: &Router, key: &Keypair, deposit: u64) -> (StatusCode, String) {
+            let addr = super::runtime_peer_route_writes::serve_self_description(
+                super::runtime_peer_route_writes::COUNTERPARTY_SETTLEMENT,
+            );
+            send(
+                app,
+                key,
+                "/peers",
+                serde_json::json!({
+                    "id": "node-b",
+                    "url": format!("http://{addr}/ilp"),
+                    "fee": 0,
+                    "deposit": deposit,
+                }),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_peering_deposit_and_a_fund_share_the_day_and_a_repeat_peering_counts_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let (app, chain) = node(
+                vec![controller(&key, 500, 800)],
+                (&dir.path().join("totals"), clock),
+            )
+            .await;
+
+            let (status, body) = peer(&app, &key, 501).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.starts_with("deposit-limit:"), "{body}");
+            assert_eq!(chain.balance(), 10_000, "nothing was sent");
+            assert_eq!(read(&app, "/channels").await, "[]", "nothing was journaled");
+
+            let (status, body) = peer(&app, &key, 500).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let established: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(established["channel"]["status"], "created");
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                500
+            );
+
+            // Found: counted, this would pass the per-day figure.
+            let (status, body) = peer(&app, &key, 500).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let found: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(found["channel"]["status"], "found");
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                500
+            );
+
+            let channels: serde_json::Value =
+                serde_json::from_str(&read(&app, "/channels").await).unwrap();
+            let id = channels[0]["id"].as_str().expect("an id").to_string();
+            let (status, body) = fund(&app, &key, &id, 301).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.contains("per-day"), "{body}");
+            let (status, body) = fund(&app, &key, &id, 300).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                800
+            );
         }
 
         #[tokio::test]

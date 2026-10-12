@@ -3143,6 +3143,44 @@ controller_keys_file = "{}"
         );
     }
 
+    #[test]
+    fn rejects_a_deposit_limit_with_no_state_dir() {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut controllers = tempfile::NamedTempFile::new().expect("temp controllers file");
+        std::io::Write::write_all(
+            &mut controllers,
+            format!(
+                "[agent]\nkey = \"{key}\"\nscope = [\"channels-fund\"]\n\
+                 deposit_limit = {{ per_write = 1, per_day = 5 }}\n"
+            )
+            .as_bytes(),
+        )
+        .expect("write controllers");
+        let result = with_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[operator]
+bearer_token = "secret-token"
+write_keys = ["{}"]
+controller_keys_file = "{}"
+"#,
+                key_path.display(),
+                "f".repeat(64),
+                controllers.path().display(),
+            )
+        });
+
+        expect_error(
+            result,
+            |error| matches!(error, ConfigError::LimitWithoutStateDir { entry, limit } if entry == "agent" && *limit == "deposit limit"),
+        );
+    }
+
     /// A peer claim's watermark is no less a replay defence than a client
     /// claim's (issue #605).
     #[test]
