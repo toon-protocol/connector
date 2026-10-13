@@ -9,12 +9,17 @@ and creates `/app/state` owned by that uid, so a fresh named volume inherits the
 ownership.
 
 Pin a **release handle** — `rust-<handle>`, a UTC date and that day's ordinal.
-Handles are immutable and never moved:
+Handles are immutable and never moved. The image reads every key file you mount
+as uid `10001`, so hand the key to that uid when you make it: a key you own
+with mode `600` is unreadable to the container, which restarts forever with
+`failed to read signer key_file … Permission denied`. The same applies to every
+settlement key in step 3.
 
 ```bash
 docker pull ghcr.io/toon-protocol/connector:rust-2026.09.29.1
 mkdir -p node/config node/data && cd node
-openssl rand -hex 32 > data/signer.key && chmod 600 data/signer.key
+openssl rand -hex 32 > data/signer.key
+chmod 600 data/signer.key && sudo chown 10001 data/signer.key
 ```
 
 `rust-sha-<short-sha>` pins an exact commit and is equally immutable. `rust-main`
@@ -155,6 +160,20 @@ addresses, endpoints, identity key and settlement facts. A connector answers; it
 never announces. It is also the whole of what another operator needs to peer with
 you, once [`[node]` and `peer_expose`](peering.md#being-peerable) are set — this minimal
 config's own self-description has no endpoints and nothing to dial.
+
+Three things this minimal node cannot do yet, and where each is fixed:
+
+- **It cannot be paid, or even described by the client.** With no `[settlement]`
+  table, `toon-client describe` and `price` refuse it with "publishes no
+  settlement chains at all". [Step 3](get-paid.md) is eight lines on devnet.
+- **A caller must name a route.** With no destination, the client addresses the
+  node's own ILP address from `GET /ilp`, which works only when that address is
+  also the prefix of a priced route (the devnet store's `g.toon.store` is). Set
+  `[node] addresses` to your route's prefix, or expect callers to pass it.
+- **You cannot see that you were paid.** At the default log level the node
+  writes one line when a channel is admitted and nothing per voucher. The
+  [operator surface](operator-surface.md) — `GET /claims` and the dashboard —
+  is how an operator watches the money.
 
 > [!IMPORTANT]
 > **One TOML file, read once, immutable for the process lifetime.** There is no

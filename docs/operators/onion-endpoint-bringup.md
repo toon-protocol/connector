@@ -248,11 +248,24 @@ holds unmodified — `btp_endpoint` is required exactly when `peer_expose` opens
 edge for claim-state over HTTP whichever carriage a packet rides.
 
 ```toml
+peer_expose = "http"              # root level, above every table; "both" to open BTP too
+
 [node]
 addresses     = ["g.example.onionnode"]
 http_endpoint = "http://<56-char-address>.anyone/ilp"
 btp_endpoint  = "ws://<56-char-address>.anyone/ilp/btp"
 ```
+
+`peer_expose` is the key this runbook used to leave to [the peering
+guide](../guide/peering.md#being-peerable): without it the node publishes the
+endpoint and still answers `"peerCarriages": []`, so nothing can dial it. An
+operator following only this page set everything else and sat on an undialable
+node until they found that one key (website first-run test, 2026-10-13).
+
+The daemon does not say when it has published the descriptor. For the first
+minute or two after `Bootstrapped 100%` a dial from outside usually times out;
+in the same test the address answered `GET /ilp` in 2.3 s about two and a half
+minutes after bootstrap. Wait, then try; there is nothing to watch for.
 
 **On the dialing node**, into the peer's `endpoint` — and into the `[[pay_channels]]` row's
 `client_edge_url`, if this side pays. Step 6.
