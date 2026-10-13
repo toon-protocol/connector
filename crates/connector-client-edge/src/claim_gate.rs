@@ -1085,6 +1085,7 @@ impl ClientClaimGate {
         // failed batch emptied the watermark -- records the channel with it,
         // so it can still be landed on after a restart.
         let channel_record = (!watermarks.contains_key(&key)).then(|| verified.channel.to_entry());
+        let admitted = channel_record.is_some();
         let ticket = self.advance_and_enqueue(
             &mut watermarks,
             &key,
@@ -1092,6 +1093,19 @@ impl ClientClaimGate {
             signature_bytes,
             channel_record,
         )?;
+        // Once per channel, at `info`: the one line an operator reading the
+        // default log gets to learn that somebody is paying this node. Every
+        // later voucher on the channel stays off the hot path's log (see
+        // `connector_runtime`'s own rule); `GET /claims` is the ledger.
+        if admitted {
+            tracing::info!(
+                channel = %key,
+                cumulative = amount,
+                "admitted a batch-settlement channel on its first voucher"
+            );
+        } else {
+            tracing::debug!(channel = %key, cumulative = amount, "accepted a voucher");
+        }
         self.voucher_signers
             .write()
             .expect("voucher signers lock poisoned")
