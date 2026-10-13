@@ -54,11 +54,12 @@ app.get('/api/info', async (req, res) => {
     res.json({
       // ── Per-chain capability map ──
       //
-      // USDC only (toon-meta#310 §4.6, connector#898): this faucet dispenses no
-      // native gas/token of any chain — the local-anvil EVM leg (`/api/request`)
-      // and the native-SOL leg are gone, not just unconfigured. The Mina leg
-      // went with Mina itself (ADR 0065). Each surviving leg advertises only
-      // its USDC-drip route.
+      // USDC first (toon-meta#310 §4.6, connector#898): the local-anvil EVM leg
+      // (`/api/request`) and the native-SOL leg are gone, not just unconfigured,
+      // and the Mina leg went with Mina itself (ADR 0065). Each surviving leg
+      // advertises its USDC-drip route. The Base Sepolia leg may ALSO drip a
+      // little ETH, best-effort and only above its reserve, so a devnet payer
+      // can leave a channel it opened gaslessly (infra/linode-faucet, 2026-10-13).
       chains: {
         solana: solanaFaucet
           ? {
