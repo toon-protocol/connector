@@ -4,10 +4,8 @@
 
 # Connector
 
-**Put a price on an ordinary HTTP app. Get paid per request, in tokens.**
-
-_It terminates payments the way nginx terminates SSL._ One static binary reads one TOML
-file, sits in front of your app, and settles on EVM and Solana.
+**Put a price on any HTTP app and get paid per request, in USDC, with no protocol fee and no
+change to your app.**
 
 [![Release](https://img.shields.io/github/v/release/toon-protocol/connector?style=flat-square&color=c9a24a&label=release)](https://github.com/toon-protocol/connector/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/toon-protocol/connector/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/toon-protocol/connector/actions/workflows/ci.yml)
@@ -25,26 +23,58 @@ docker pull ghcr.io/toon-protocol/connector:rust-2026.09.29.1
 
 ---
 
-**A paid reverse proxy.** You put it in front of an ordinary HTTP app, you set a
-price, and it collects that price from whoever calls — in tokens, per request,
-without your app knowing payment exists.
+**1. Pull the image.** A release handle, never moved.
 
 ```sh
-docker pull ghcr.io/toon-protocol/connector:rust-2026.09.29.1   # a release handle, never moved
-openssl rand -hex 32 > data/signer.key                          # the node's identity key
-docker compose up -d                                            # one binary, one config file
-curl http://localhost:3000/ilp                                  # ask the node what it is
+docker pull ghcr.io/toon-protocol/connector:rust-2026.09.29.1
+mkdir -p node/config node/data && cd node
 ```
 
-[Run a node](docs/guide/run-a-node.md) has the `compose.yml` and the config those commands
-need.
+**2. Write `config/connector.toml`.** One route per thing you serve, priced.
+
+```toml
+client_edge_addr = "0.0.0.0:3000"
+state_dir        = "/app/state"
+
+[signer]
+key_file = "/app/data/signer.key"
+
+[[routes]]
+prefix      = "g.example.quotes"
+handler_url = "http://quotes:8080/"
+price       = 1000                   # 0.001 USDC per request
+```
+
+**3. Make a key, start it, ask it what it is.**
+
+```sh
+openssl rand -hex 32 > data/signer.key                          # the node's identity key
+chmod 600 data/signer.key && sudo chown 10001 data/signer.key   # the image reads it as uid 10001
+docker compose up -d                                            # compose.yml is in Run a node
+curl http://localhost:3000/ilp                                  # free and unauthenticated
+```
+
+What holds it up:
+
+- **You set the price; there is no protocol fee.** Per route, in the token's smallest unit:
+  `price = 1000` is 0.001 USDC.
+- **A signed voucher per request, no gas per request.** Every ten minutes your node lands many
+  channels' vouchers in one transaction, on x402's audited contract on Base or the
+  `payment-channels` program on Solana.
+- **Your app sees a plain HTTP request** and three optional `X-TOON-*` headers: who paid, how
+  much, on what chain. It never sees a payment.
+- **One static binary, one TOML file, MIT.**
+
+[Run a node](docs/guide/run-a-node.md) has the `compose.yml` and the full config.
+[Get paid](docs/guide/get-paid.md) adds the `[settlement]` table that lets anyone pay it. The rest
+of this page is why it is built this way.
 
 ## Why it exists
 
-It does that by being an [Interledger](https://interledger.org) connector: value
-arrives wrapped in a protocol your app never speaks, and at the last hop this
-binary unwraps it, verifies it was paid for, and hands the app a plain HTTP
-request. **It terminates payments the way nginx terminates SSL.**
+It is an [Interledger](https://interledger.org) connector: value arrives wrapped
+in a protocol your app never speaks, and at the last hop this binary unwraps it,
+verifies it was paid for, and hands the app a plain HTTP request. **It terminates
+payments the way nginx terminates SSL.**
 
 You do not need to know anything about Interledger to run one.
 
