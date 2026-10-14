@@ -49,6 +49,9 @@ chrono = "0.4"
 # `connector send` signs its RFC 9421 operator write with an ed25519 key --
 # the same curve and the same crate `connector-operator` verifies with.
 ed25519-dalek = "1"
+# `connector init` draws its three fresh secrets from the OS (issue: the
+# 2026-10-13 first-run test); the same crate `connector-signer` generates with.
+rand = "0.7"
 ethers = { version = "2", default-features = false, features = ["rustls"] }
 # `socks` because ADR 0070 decision 5 gives `connector send` a
 # `--socks-proxy` flag, and an onion URL -- the operator surface it signs a

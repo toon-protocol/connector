@@ -24,6 +24,7 @@
 //! bound socket or that the work is already done.
 
 mod batch_settlement;
+mod init;
 mod peer_transport;
 mod probe;
 mod runtime;
@@ -71,6 +72,8 @@ pub enum CliError {
     Send(send::SendError),
     /// The `probe` subcommand ran and learned no cost.
     Probe(probe::ProbeError),
+    /// The `init` subcommand could not write the node.
+    Init(init::InitError),
 }
 
 impl fmt::Display for CliError {
@@ -78,6 +81,7 @@ impl fmt::Display for CliError {
         match self {
             CliError::Usage(message) => write!(f, "{message}"),
             CliError::Config(source) => write!(f, "{source}"),
+            CliError::Init(source) => write!(f, "{source}"),
             CliError::Runtime(source) => write!(f, "{source}"),
             CliError::Send(source) => write!(f, "{source}"),
             CliError::Probe(source) => write!(f, "{source}"),
@@ -111,6 +115,12 @@ impl From<send::SendError> for CliError {
     }
 }
 
+impl From<init::InitError> for CliError {
+    fn from(source: init::InitError) -> Self {
+        CliError::Init(source)
+    }
+}
+
 /// The verb that used to select the removed `announce` subcommand (ADR 0046,
 /// issue #1074), kept only so that a script or a systemd unit still invoking
 /// it is told what happened instead of being handed the file-not-found error
@@ -124,9 +134,11 @@ impl From<send::SendError> for CliError {
 const ANNOUNCE_VERB: &str = "announce";
 const SEND_VERB: &str = "send";
 const PROBE_VERB: &str = "probe";
+const INIT_VERB: &str = "init";
 
 const USAGE: &str = "usage:\n  \
      connector <config-file>\n  \
+     connector init --devnet [--dir <path>] [--address <g.ilp.address>] [--image <ref>]\n  \
      connector send --operator <url> --operator-key <file> --to <ilp-address> \
      --seal-to <url> [--amount <n>] [--target <path>] [--method <verb>] \
      [--body <file|-> ] [--expires-in <seconds>] [--socks-proxy <socks5h-url>] \
@@ -160,6 +172,11 @@ enum Invocation {
     PrintKeyid {
         key_file: String,
     },
+    /// `connector init --devnet`: write a runnable devnet node into a
+    /// directory, touching no chain and no network.
+    Init {
+        options: Box<init::InitOptions>,
+    },
 }
 
 /// Split process arguments into an [`Invocation`].
@@ -181,6 +198,11 @@ fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Invocation, CliError> {
     if first == PROBE_VERB {
         let rest: Vec<&str> = args[2..].iter().map(AsRef::as_ref).collect();
         return parse_send_args(&rest, PROBE_VERB);
+    }
+
+    if first == INIT_VERB {
+        let rest: Vec<&str> = args[2..].iter().map(AsRef::as_ref).collect();
+        return parse_init_args(&rest);
     }
 
     if first == ANNOUNCE_VERB {
@@ -214,6 +236,11 @@ pub fn load_config<S: AsRef<str>>(args: &[S]) -> Result<Config, CliError> {
             return Err(CliError::Usage(format!(
                 "'{SEND_VERB}' and '{PROBE_VERB}' load no configuration: each is a client of another node's \
                  operator surface, not a node.\n\n{USAGE}"
+            )))
+        }
+        Invocation::Init { .. } => {
+            return Err(CliError::Usage(format!(
+                "'{INIT_VERB}' loads no configuration: it writes one.\n\n{USAGE}"
             )))
         }
     };
@@ -296,7 +323,58 @@ pub async fn run<S: AsRef<str>>(args: &[S]) -> Result<Command, CliError> {
         Invocation::PrintKeyid { key_file } => Ok(Command::Finished {
             summary: send::print_keyid(&key_file)?,
         }),
+        Invocation::Init { options } => {
+            let report = init::init(&options)?;
+            Ok(Command::Finished {
+                summary: init::describe(&report),
+            })
+        }
     }
+}
+
+/// `connector init`'s arguments. `--devnet` is required, because it is the
+/// only network this verb knows how to write and an `init` that silently
+/// produced a devnet node when the operator meant mainnet would be worse
+/// than a usage error.
+fn parse_init_args(rest: &[&str]) -> Result<Invocation, CliError> {
+    let mut devnet = false;
+    let mut dir: Option<String> = None;
+    let mut address: Option<String> = None;
+    let mut image: Option<String> = None;
+    let mut iter = rest.iter();
+    while let Some(arg) = iter.next() {
+        let mut value = |flag: &str| -> Result<String, CliError> {
+            iter.next()
+                .map(|v| (*v).to_string())
+                .ok_or_else(|| CliError::Usage(format!("{flag} needs a value\n\n{USAGE}")))
+        };
+        match *arg {
+            "--devnet" => devnet = true,
+            "--dir" => dir = Some(value("--dir")?),
+            "--address" => address = Some(value("--address")?),
+            "--image" => image = Some(value("--image")?),
+            other => {
+                return Err(CliError::Usage(format!(
+                    "unknown argument to '{INIT_VERB}': {other}\n\n{USAGE}"
+                )))
+            }
+        }
+    }
+    if !devnet {
+        return Err(CliError::Usage(format!(
+            "'{INIT_VERB}' writes a devnet node and must be told so: `connector init --devnet`. \
+             A mainnet node settles real money in a token you choose, and every value in its \
+             settlement block is yours to read off the chain (docs/guide/get-paid.md); nothing \
+             here guesses it for you.\n\n{USAGE}"
+        )));
+    }
+    Ok(Invocation::Init {
+        options: Box::new(init::InitOptions {
+            dir: std::path::PathBuf::from(dir.unwrap_or_else(|| ".".to_string())),
+            address,
+            image: image.unwrap_or_else(|| init::DEFAULT_IMAGE.to_string()),
+        }),
+    })
 }
 
 /// The one line an operator reads after a send. The keyid is on it because it
