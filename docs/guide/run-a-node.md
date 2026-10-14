@@ -1,6 +1,36 @@
 # 1. Run a node
 
-The connector is one static binary that reads one TOML file. Two ways to get it.
+The connector is one static binary that reads one TOML file. Three ways to get it running:
+`init` writes a devnet node for you, Docker runs the one you write, and source is for
+changing the connector rather than running it.
+
+## The fastest start: `connector init --devnet`
+
+One command writes a runnable devnet node into a directory: a config with one priced route,
+the Base Sepolia settlement block, an operator surface so you can see what you were paid,
+fresh keys owned by you, and a `compose.yml` that runs the connector and a payment-oblivious
+echo app as your own uid. It touches no chain and overwrites nothing.
+
+```bash
+IMG=ghcr.io/toon-protocol/connector:rust-main   # or a dated release handle that carries `init`
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/w" -w /w "$IMG" init --devnet --dir node --image "$IMG"
+cd node && docker compose up -d
+curl -s http://127.0.0.1:3000/ilp | jq .routes
+```
+
+`init` prints what it wrote, the node's settlement address, and the three `toon-client`
+commands that pay it. The first-run test of 2026-10-13 took a careful operator twenty minutes
+and four traps to reach this point by hand; the traps were a key the image could not read, a
+config the client could not describe, a route that needed a destination, and a node that was
+silent when paid. `init` writes around all four, and the rest of this page explains each file
+it wrote so you can change it.
+
+Only `--devnet` exists. A mainnet node settles real money in a token you choose, and every
+value in that block is yours to read off the chain ([step 3](get-paid.md)). Flags:
+`--dir <path>` (default `.`), `--address <g.ilp.address>` (default `g.devnet.<six hex digits>`,
+also the one route's prefix), `--image <ref>` (what `compose.yml` runs; pin a release handle
+for a node you keep). A directory that already holds a `config/connector.toml` is refused by
+name, because rotating the signer key would change the node's identity under every peer.
 
 ## With Docker
 
