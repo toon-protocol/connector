@@ -474,15 +474,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().to_path_buf();
         init(&options(&dir)).expect("init");
-        for secret in [
+        for key_file in [
             "data/signer.key",
             "data/settlement.key",
             "data/operator-write.key",
         ] {
-            let mode = fs::metadata(dir.join(secret)).expect("meta").mode() & 0o777;
-            assert_eq!(mode, 0o600, "{secret} mode {mode:o}");
-            let text = fs::read_to_string(dir.join(secret)).expect("read");
-            assert_eq!(text.len(), 64, "{secret} is 64 hex characters");
+            let mode = fs::metadata(dir.join(key_file)).expect("meta").mode() & 0o777;
+            assert_eq!(mode, 0o600, "{key_file} mode {mode:o}");
+            let text = fs::read_to_string(dir.join(key_file)).expect("read");
+            assert_eq!(text.len(), 64, "{key_file} is 64 hex characters");
             assert!(text.bytes().all(|b| b.is_ascii_hexdigit()));
         }
         let me = fs::metadata(&dir).expect("meta").uid();
