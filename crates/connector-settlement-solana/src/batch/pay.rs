@@ -109,35 +109,38 @@ const NO_SOCKS_PROXY: &str = "the sponsor endpoint is an onion host, and this no
 /// node cannot peer with an onion counterparty it could not open toward.
 pub(super) struct SponsorClients {
     direct: reqwest::Client,
-    /// Built once from the proxy, or why there is none -- reported at the
-    /// post that needed it rather than at boot, since a node with no onion
-    /// counterparty never does.
-    onion: Result<reqwest::Client, String>,
+    /// The client through the proxy, or none when the node configures no
+    /// proxy -- reported at the post that needed it rather than at boot,
+    /// since a node with no onion counterparty never does. Built again when
+    /// the proxy cannot be reached.
+    onion: Option<connector_proxied_client::ProxiedClient>,
 }
 
 impl SponsorClients {
     /// A direct client, and one through `socks_proxy` when one is
     /// configured.
     pub(super) fn new(socks_proxy: Option<&url::Url>) -> Result<Self, BatchSettlementError> {
-        let bounded = || reqwest::Client::builder().timeout(SPONSOR_POST_TIMEOUT);
-        let direct = bounded().build().map_err(backend_error)?;
-        let onion = match socks_proxy {
-            None => Err(NO_SOCKS_PROXY.to_string()),
-            Some(proxy) => reqwest::Proxy::all(proxy.as_str())
-                .and_then(|socks| bounded().proxy(socks).build())
-                .map_err(|error| format!("socks_proxy '{proxy}' could not be used: {error}")),
-        };
+        let direct = reqwest::Client::builder()
+            .timeout(SPONSOR_POST_TIMEOUT)
+            .build()
+            .map_err(backend_error)?;
+        let onion = socks_proxy.map(|proxy| {
+            connector_proxied_client::ProxiedClient::new(proxy, |builder| {
+                builder.timeout(SPONSOR_POST_TIMEOUT)
+            })
+        });
         Ok(SponsorClients { direct, onion })
     }
 
     /// The client a post to `endpoint` leaves on, or why there is none.
-    fn client_for(&self, endpoint: &str) -> Result<&reqwest::Client, String> {
-        let onion = url::Url::parse(endpoint)
-            .is_ok_and(|endpoint| connector_config::is_onion_endpoint(&endpoint));
-        if onion {
-            self.onion.as_ref().map_err(Clone::clone)
+    fn client_for(&self, endpoint: &str) -> Result<reqwest::Client, String> {
+        if is_onion(endpoint) {
+            match &self.onion {
+                Some(onion) => onion.client(),
+                None => Err(NO_SOCKS_PROXY.to_string()),
+            }
         } else {
-            Ok(&self.direct)
+            Ok(self.direct.clone())
         }
     }
 
@@ -155,6 +158,9 @@ impl SponsorClients {
             .send()
             .await
             .map_err(|error| {
+                if let Some(onion) = self.onion.as_ref().filter(|_| is_onion(endpoint)) {
+                    onion.observe(&error);
+                }
                 SponsorFailure::Unreachable(format!(
                     "the sponsor endpoint {endpoint} could not be reached: {error}"
                 ))
@@ -185,6 +191,10 @@ impl SponsorClients {
                 ))
             })
     }
+}
+
+fn is_onion(endpoint: &str) -> bool {
+    url::Url::parse(endpoint).is_ok_and(|endpoint| connector_config::is_onion_endpoint(&endpoint))
 }
 
 /// What the paying half remembers about one channel it opened.

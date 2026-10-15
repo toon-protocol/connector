@@ -120,7 +120,16 @@ impl Socks5TestServer {
     /// asserting *that a dial arrived here* does not need the dial to have
     /// succeeded.
     pub async fn spawn(routes: HashMap<String, SocketAddr>) -> Socks5TestServer {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
+        Socks5TestServer::spawn_on(SocketAddr::from(([127, 0, 0, 1], 0)), routes).await
+    }
+
+    /// As [`spawn`](Self::spawn), on `addr` -- for a test that brings a proxy
+    /// back up where one stood, to watch a client find it again.
+    pub async fn spawn_on(
+        addr: SocketAddr,
+        routes: HashMap<String, SocketAddr>,
+    ) -> Socks5TestServer {
+        let listener = TcpListener::bind(addr)
             .await
             .expect("a loopback port for the SOCKS5 test server");
         let addr = listener.local_addr().expect("the bound address");

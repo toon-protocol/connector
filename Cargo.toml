@@ -13,6 +13,7 @@ members = [
     "crates/connector-domain",
     "crates/connector-runtime",
     "crates/connector-chain-rpc",
+    "crates/connector-proxied-client",
     "crates/connector-settlement",
     "crates/connector-settlement-evm",
     "crates/connector-settlement-solana",

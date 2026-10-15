@@ -59,14 +59,25 @@ pub fn is_min_context_slot_not_reached(error: &ClientError) -> bool {
 /// The SDK's `HttpSender` over the transport's client, retrying a refusal
 /// (403 or 429) with backoff.
 pub struct RefusalRetrying {
-    inner: HttpSender,
+    transport: RpcTransport,
 }
 
 impl RefusalRetrying {
     pub fn new(transport: &RpcTransport) -> RefusalRetrying {
         RefusalRetrying {
-            inner: HttpSender::new_with_client(transport.url().as_str(), transport.http().clone()),
+            transport: transport.clone(),
         }
+    }
+
+    /// A sender over the transport's *current* client: a circuit's is
+    /// rebuilt when its proxy cannot be reached, so it is taken afresh for
+    /// each attempt rather than held.
+    fn sender(&self) -> Result<HttpSender, String> {
+        let client = self.transport.http()?;
+        Ok(HttpSender::new_with_client(
+            self.transport.url().as_str(),
+            client,
+        ))
     }
 }
 
@@ -79,13 +90,21 @@ impl RpcSender for RefusalRetrying {
     ) -> ClientResult<serde_json::Value> {
         let mut retry = 0;
         loop {
-            let error = match self.inner.send(request, params.clone()).await {
+            let error = match self
+                .sender()
+                .map_err(|reason| ClientError::from(ErrorKind::Custom(reason)))?
+                .send(request, params.clone())
+                .await
+            {
                 Ok(value) => return Ok(value),
                 // reqwest prints the full URL, and a keyed endpoint's path is
                 // its API key, so it is dropped from every error this
                 // sender returns.
                 Err(error) => match error.kind {
-                    ErrorKind::Reqwest(source) => ClientError::from(source.without_url()),
+                    ErrorKind::Reqwest(source) => {
+                        self.transport.observe(&source);
+                        ClientError::from(source.without_url())
+                    }
                     kind => ClientError::from(kind),
                 },
             };
@@ -107,10 +126,10 @@ impl RpcSender for RefusalRetrying {
     }
 
     fn get_transport_stats(&self) -> RpcTransportStats {
-        self.inner.get_transport_stats()
+        RpcTransportStats::default()
     }
 
     fn url(&self) -> String {
-        self.inner.url()
+        self.transport.url().to_string()
     }
 }

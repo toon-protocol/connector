@@ -38,8 +38,10 @@
 //! knows nothing about channels; it is the part of a dial that is the same on
 //! both chains.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use connector_proxied_client::ProxiedClient;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use url::Url;
 
@@ -134,8 +136,16 @@ pub enum Route {
 #[derive(Debug, Clone)]
 pub struct RpcTransport {
     url: Url,
-    http: reqwest::Client,
+    http: Http,
     route: Route,
+}
+
+/// The shared client: a plain one, or one that rebuilds itself when its
+/// proxy cannot be reached.
+#[derive(Debug, Clone)]
+enum Http {
+    Direct(reqwest::Client),
+    Circuit(Arc<ProxiedClient>),
 }
 
 /// Why a transport could not be built. Each is a configuration fact, and
@@ -157,6 +167,10 @@ pub enum TransportError {
     ProxyNotSocks5h { value: String },
     #[error("could not build the settlement HTTP client: {0}")]
     Client(#[source] reqwest::Error),
+    /// The proxy's host did not resolve, or `reqwest` refused it. Boot
+    /// refuses a table that opts into the proxy when this happens.
+    #[error("could not build the settlement HTTP client: {0}")]
+    ProxyUnusable(String),
 }
 
 impl RpcTransport {
@@ -200,17 +214,23 @@ impl RpcTransport {
                 value: rpc_url.to_string(),
             });
         }
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(timeouts.connect)
-            .timeout(timeouts.request)
-            .pool_idle_timeout(timeouts.pool_idle);
-        match &route {
+        let tune = move |builder: reqwest::ClientBuilder| {
+            builder
+                .connect_timeout(timeouts.connect)
+                .timeout(timeouts.request)
+                .pool_idle_timeout(timeouts.pool_idle)
+        };
+        let http = match &route {
             Route::Direct => {
                 // Never inherit HTTP(S)_PROXY from the environment: which
                 // way a settlement dial goes is the config file's to say
                 // (ADR 0009), and a direct route that quietly went through
                 // someone's proxy would be neither.
-                builder = builder.no_proxy();
+                let client = tune(reqwest::Client::builder())
+                    .no_proxy()
+                    .build()
+                    .map_err(TransportError::Client)?;
+                Http::Direct(client)
             }
             Route::Circuit { proxy, circuit } => {
                 if proxy.scheme() != "socks5h" {
@@ -218,17 +238,25 @@ impl RpcTransport {
                         value: proxy.to_string(),
                     });
                 }
-                // `Proxy::all` means every request this client makes goes
-                // to the proxy: there is no host this client dials direct,
-                // so a proxy that is down fails the request rather than
-                // routing around it (ADR 0073 decision 2).
-                let proxy = reqwest::Proxy::all(proxy.as_str())
-                    .map_err(TransportError::Client)?
-                    .basic_auth(circuit.socks_username(), circuit.socks_password());
-                builder = builder.proxy(proxy);
+                // Every request this client makes goes to the proxy: there
+                // is no host it dials direct, so a proxy that is down fails
+                // the request rather than routing around it (ADR 0073
+                // decision 2). It is rebuilt when the proxy cannot be
+                // reached, so one that moves is found again, and carries the
+                // circuit's SOCKS credentials each time.
+                let proxied = ProxiedClient::with_credentials(
+                    proxy,
+                    Some((
+                        circuit.socks_username().to_string(),
+                        circuit.socks_password().to_string(),
+                    )),
+                    tune,
+                );
+                // An unresolvable proxy refuses boot, as it always has.
+                proxied.client().map_err(TransportError::ProxyUnusable)?;
+                Http::Circuit(Arc::new(proxied))
             }
-        }
-        let http = builder.build().map_err(TransportError::Client)?;
+        };
         Ok(RpcTransport { url, http, route })
     }
 
@@ -237,9 +265,25 @@ impl RpcTransport {
         &self.url
     }
 
-    /// The shared HTTP client.
-    pub fn http(&self) -> &reqwest::Client {
-        &self.http
+    /// The shared HTTP client: a handle on the table's pool. On a circuit it
+    /// is the current one, so take it afresh for each request rather than
+    /// holding it, and report a failed request to [`observe`](Self::observe).
+    pub fn http(&self) -> Result<reqwest::Client, String> {
+        match &self.http {
+            Http::Direct(client) => Ok(client.clone()),
+            // Only fails while the proxy's host does not resolve; the
+            // request then fails closed with the reason.
+            Http::Circuit(proxied) => proxied.client(),
+        }
+    }
+
+    /// Report a failed request made on [`http`](Self::http). A circuit whose
+    /// proxy could not be connected to is rebuilt, re-resolving the proxy's
+    /// host; a failure beyond the proxy is not a reason to.
+    pub fn observe(&self, error: &reqwest::Error) {
+        if let Http::Circuit(proxied) = &self.http {
+            proxied.observe(error);
+        }
     }
 
     /// Which way requests go.

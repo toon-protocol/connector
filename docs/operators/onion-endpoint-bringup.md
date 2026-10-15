@@ -181,6 +181,15 @@ Belongs beside `AgreeToTerms 1` in your head: both are configuration faults that
 before it can say anything useful about itself, leaving a connector beside it that looks healthy and
 is unreachable.
 
+The other direction no longer bites. The connector re-resolves its own `socks_proxy` host whenever
+the proxy cannot be reached (and builds again at the next onion dial if the host never resolved), so
+the start order of the connector and the daemon does not matter, and a recreated daemon with a new
+address is found again without a connector restart. Before this build it did matter: the clients
+were built once at boot, and the `depends_on: anon: {condition: service_started, restart: true}`
+workaround in toon-protocol/relay's devnet bundle is why that bundle worked. Only a failure to
+reach the **proxy** triggers this; a hidden service that is down, or a CONNECT the proxy refuses,
+does not.
+
 ### 3. `HiddenServiceDir` must be on a persisted volume — the same rule as `state_dir`
 
 **This is the failure that costs the most and announces itself the least.** The daemon generates the

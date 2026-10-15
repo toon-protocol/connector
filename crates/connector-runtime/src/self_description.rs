@@ -45,6 +45,7 @@ use url::Url;
 
 use connector_config::{is_onion_endpoint, plaintext_permitted};
 use connector_domain::NodeSelfDescription;
+use connector_proxied_client::ProxiedClient;
 
 /// Why an onion URL cannot be read on a node that configured no
 /// `socks_proxy` (ADR 0070 decision 3).
@@ -133,7 +134,11 @@ pub struct BoundedHttpSelfDescription {
     /// bootstrap, not settlement RPC and not a `handler_url`, so decision
     /// 4 leaves it in scope rather than out. (Settlement RPC reaches the
     /// proxy only by its table's own opt-in, ADR 0073.)
-    onion: Result<reqwest::Client, String>,
+    ///
+    /// Rebuilt when the proxy cannot be reached rather than frozen at
+    /// construction, so a daemon that comes up after the connector, or moves,
+    /// is dialled without a restart.
+    onion: Option<ProxiedClient>,
     allow_plaintext: bool,
 }
 
@@ -158,12 +163,13 @@ impl BoundedHttpSelfDescription {
         let client = bounded()
             .build()
             .expect("a reqwest client with a timeout and no redirect policy always builds");
-        let onion = match socks_proxy {
-            None => Err(NO_SOCKS_PROXY.to_string()),
-            Some(proxy) => reqwest::Proxy::all(proxy.as_str())
-                .and_then(|socks| bounded().proxy(socks).build())
-                .map_err(|error| format!("socks_proxy '{proxy}' could not be used: {error}")),
-        };
+        let onion = socks_proxy.map(|proxy| {
+            ProxiedClient::new(proxy, |builder| {
+                builder
+                    .timeout(FETCH_TIMEOUT)
+                    .redirect(reqwest::redirect::Policy::none())
+            })
+        });
         BoundedHttpSelfDescription {
             client,
             onion,
@@ -179,11 +185,14 @@ impl BoundedHttpSelfDescription {
     /// carriage's own proxy are one implementation, so the URL a runtime
     /// peering is established from is read over the same path the peering
     /// will then be dialed over.
-    fn client_for(&self, url: &Url) -> Result<&reqwest::Client, String> {
+    fn client_for(&self, url: &Url) -> Result<reqwest::Client, String> {
         if is_onion_endpoint(url) {
-            self.onion.as_ref().map_err(Clone::clone)
+            match &self.onion {
+                Some(onion) => onion.client(),
+                None => Err(NO_SOCKS_PROXY.to_string()),
+            }
         } else {
-            Ok(&self.client)
+            Ok(self.client.clone())
         }
     }
 }
@@ -213,6 +222,9 @@ impl SelfDescriptionSource for BoundedHttpSelfDescription {
             })?;
 
         let response = client.get(url.clone()).send().await.map_err(|source| {
+            if let Some(onion) = self.onion.as_ref().filter(|_| is_onion_endpoint(url)) {
+                onion.observe(&source);
+            }
             SelfDescriptionError::Unreachable {
                 url: url.to_string(),
                 reason: source.to_string(),

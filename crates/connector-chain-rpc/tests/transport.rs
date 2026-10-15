@@ -297,3 +297,64 @@ async fn a_failed_request_never_prints_the_endpoint_path_where_an_api_key_lives(
         "{solana}"
     );
 }
+
+#[tokio::test]
+async fn a_circuit_whose_proxy_went_away_recovers_when_one_listens_again() {
+    let rpc = FakeRpc::spawn(|_| block_number("0x2a")).await;
+    let host = "evmsettlementrpcevmsettlementrpcevmsettlementrpcevmsett.onion";
+    let routes = || HashMap::from([(format!("{host}:80"), rpc.addr())]);
+
+    let first = Socks5TestServer::spawn(routes()).await;
+    let addr = first.addr();
+    let provider = EvmRpc::provider(
+        RpcTransport::new(
+            &format!("http://{host}/"),
+            Route::Circuit {
+                proxy: first.proxy_url(),
+                circuit: Circuit::EvmSettlement,
+            },
+            SHORT,
+        )
+        .expect("transport"),
+    );
+    assert_eq!(provider.get_block_number().await.unwrap().as_u64(), 42);
+
+    drop(first);
+    // Let the pooled connection through the old proxy expire, so the next
+    // request has to dial the proxy again.
+    tokio::time::sleep(SHORT.pool_idle + Duration::from_millis(300)).await;
+    // The accept loop ends on its own task; wait for the port to be free of it.
+    let mut failed = false;
+    for _ in 0..50 {
+        if provider.get_block_number().await.is_err() {
+            failed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(failed, "a proxy that is gone cannot carry the request");
+
+    let second = loop {
+        match tokio::spawn(Socks5TestServer::spawn_on(addr, routes())).await {
+            Ok(server) => break server,
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    };
+    assert_eq!(
+        provider
+            .get_block_number()
+            .await
+            .expect("recovered without a restart")
+            .as_u64(),
+        42
+    );
+    let connects = second.connects();
+    assert!(
+        connects
+            .iter()
+            .all(|connect| connect.username.as_deref()
+                == Some(Circuit::EvmSettlement.socks_username())),
+        "the rebuilt client keeps the circuit's username: {connects:?}"
+    );
+    assert!(!connects.is_empty());
+}
