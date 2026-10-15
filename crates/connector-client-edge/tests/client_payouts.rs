@@ -630,7 +630,8 @@ async fn a_client_is_paid_a_voucher_it_lands_itself(payout: PayoutChain, voucher
     let landed = client
         .land(presentation.channel(), second)
         .await
-        .expect("the client lands its payout voucher");
+        .expect("the client lands its payout voucher")
+        .state;
     assert_eq!(landed.landed, 500);
 
     // A restart: the payout channel and its watermark come back from the
@@ -649,7 +650,8 @@ async fn a_client_is_paid_a_voucher_it_lands_itself(payout: PayoutChain, voucher
     let landed = client
         .land(presentation.channel(), third)
         .await
-        .expect("the post-restart voucher lands above the last");
+        .expect("the post-restart voucher lands above the last")
+        .state;
     assert_eq!(landed.landed, 600);
 }
 

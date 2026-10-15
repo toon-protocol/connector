@@ -46,7 +46,7 @@ use connector_chain_rpc::solana::{is_min_context_slot_not_reached, rpc_client};
 use connector_chain_rpc::{retry_read, RpcTransport};
 use connector_settlement::batch::{
     AdmissionRefusal, BatchChannelState, BatchChannelStatus, BatchSettlementBackend,
-    BatchSettlementError, ChannelPresentation, Voucher, VoucherSigner,
+    BatchSettlementError, ChannelPresentation, Landed, Voucher, VoucherSigner,
 };
 use connector_settlement::ChannelId;
 use solana_account_decoder_client_types::UiAccountEncoding;
@@ -820,7 +820,7 @@ impl BatchSettlementBackend for SolanaBatchSettlement {
         &self,
         channel: &ChannelId,
         voucher: Voucher,
-    ) -> Result<BatchChannelState, BatchSettlementError> {
+    ) -> Result<Landed, BatchSettlementError> {
         let address = self.require_admitted(channel)?;
         let account = self.read_existing(channel, &address).await?;
         let landed = u128::from(account.settled);
@@ -891,7 +891,10 @@ impl BatchSettlementBackend for SolanaBatchSettlement {
         let landed = self.submit_confirmed(&instructions).await?;
 
         let account = self.read_existing_after(channel, &address, &landed).await?;
-        Ok(state_of(channel, &account))
+        Ok(Landed {
+            state: state_of(channel, &account),
+            transaction: landed.signature.to_string(),
+        })
     }
 }
 

@@ -369,7 +369,7 @@ async fn solana_only_rules_hold_against_the_deployed_program() {
     );
     // ...but the voucher already held still lands, with `settle_and_seal`,
     // and that seals the channel: nothing lands after it.
-    let state = backend
+    let landed = backend
         .land(
             &id,
             Voucher {
@@ -379,6 +379,22 @@ async fn solana_only_rules_hold_against_the_deployed_program() {
         )
         .await
         .expect("settle_and_seal while closing");
+    // The answer names the one transaction that did it, and the validator
+    // reports that signature confirmed and successful.
+    let signature: solana_sdk::signature::Signature =
+        landed.transaction.parse().expect("a base58 signature");
+    let status = world
+        .rpc
+        .get_signature_statuses(&[signature])
+        .await
+        .expect("statuses")
+        .value
+        .remove(0)
+        .expect("the validator knows the landing transaction");
+    assert!(status.err.is_none(), "{status:?}");
+    assert!(status.satisfies_commitment(CommitmentConfig::confirmed()));
+    let state = landed.state;
+
     assert_eq!(state.status, BatchChannelStatus::Sealed);
     assert_eq!((state.landed, state.collateral), (250, 0));
     assert_eq!(
