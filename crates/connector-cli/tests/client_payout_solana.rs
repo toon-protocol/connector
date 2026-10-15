@@ -194,7 +194,7 @@ async fn a_client_is_paid_a_solana_voucher_it_lands_on_chain_itself() {
         .land(presentation.channel(), second)
         .await
         .expect("the client lands the payout voucher");
-    assert_eq!(landed.landed, 500);
+    assert_eq!(landed.state.landed, 500);
 
     // -- 5. A restarts; the payout watermark comes back from its journal --
     drop(session);
@@ -218,5 +218,5 @@ async fn a_client_is_paid_a_solana_voucher_it_lands_on_chain_itself() {
         .land(presentation.channel(), third)
         .await
         .expect("the post-restart voucher lands above the last");
-    assert_eq!(landed.landed, 600);
+    assert_eq!(landed.state.landed, 600);
 }

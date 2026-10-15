@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 use connector_settlement::batch::{
     AdmissionRefusal, BatchChannelState, BatchChannelStatus, BatchSettlementBackend,
-    BatchSettlementError, ChannelPresentation, EvmChannelConfig, Voucher, VoucherSigner,
+    BatchSettlementError, ChannelPresentation, EvmChannelConfig, Landed, Voucher, VoucherSigner,
 };
 use connector_settlement::ChannelId;
 use connector_signer::{
@@ -495,7 +495,7 @@ impl BatchSettlementBackend for EvmBatchSettlementBackend {
         &self,
         channel: &ChannelId,
         voucher: Voucher,
-    ) -> Result<BatchChannelState, BatchSettlementError> {
+    ) -> Result<Landed, BatchSettlementError> {
         let config = self.require_admitted(channel)?;
         let id = admitted_id(channel)?;
         let amount = voucher.cumulative_amount;
@@ -549,7 +549,10 @@ impl BatchSettlementBackend for EvmBatchSettlementBackend {
             .snapshot_after(id, &receipt)
             .await
             .map_err(|error| unread_after_write("the claim", error))?;
-        Ok(self.state(channel, &config, &after))
+        Ok(Landed {
+            state: self.state(channel, &config, &after),
+            transaction: format!("{:#x}", receipt.transaction_hash),
+        })
     }
 }
 

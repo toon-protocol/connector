@@ -66,6 +66,17 @@ pub enum VoucherSigner {
     Solana([u8; 32]),
 }
 
+/// What a successful [`BatchSettlementBackend::land`] answers: the channel
+/// after the landing, and the one confirmed transaction that landed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landed {
+    /// The channel as read after the landing.
+    pub state: BatchChannelState,
+    /// The confirmed transaction, in the chain's own spelling: `0x` and 64
+    /// lowercase hex characters on EVM, a base58 signature on Solana.
+    pub transaction: String,
+}
+
 /// A snapshot of a batch-settlement channel, read from its chain.
 ///
 /// `landed` and `collateral` are both cumulative-amount figures in the
@@ -774,7 +785,8 @@ pub trait BatchSettlementBackend: Send + Sync {
     /// Land `voucher` on the admitted or restored `channel`, so its amount
     /// is recorded
     /// on chain in this node's favour: EVM `claim`; Solana `settle` while
-    /// Open and `settle_and_seal` while Closing. Returns the state after.
+    /// Open and `settle_and_seal` while Closing. Returns the state after and
+    /// the one transaction that landed it.
     ///
     /// Works on every status but `Sealed`, and that is the point: landing is
     /// what protects value already accepted once a payer begins to exit.
@@ -790,7 +802,7 @@ pub trait BatchSettlementBackend: Send + Sync {
         &self,
         channel: &ChannelId,
         voucher: Voucher,
-    ) -> Result<BatchChannelState, BatchSettlementError>;
+    ) -> Result<Landed, BatchSettlementError>;
 }
 
 /// The paying half of the settlement port (ADR 0075 decision 2): this node

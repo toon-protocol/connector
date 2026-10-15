@@ -285,7 +285,8 @@ async fn a_channel_must_name_a_payer_authorizer() {
         .backend
         .land(&channel, chain.voucher(&chain.payer, &channel, 250))
         .await
-        .expect("a held voucher lands on a restored channel");
+        .expect("a held voucher lands on a restored channel")
+        .state;
     assert_eq!(state.landed, 250);
 
     // A payer with code -- an EIP-7702 delegation designator, then an
@@ -550,4 +551,50 @@ async fn a_decimals_the_token_disagrees_with_is_refused() {
 
 async fn nonce(chain: &Chain) -> u64 {
     chain.x402.nonce(chain.backend.own_address()).await
+}
+
+/// A landing answers with the hash of its one `claim` transaction, spelled
+/// `0x` and 64 lowercase hex digits, and the chain confirms it, sent to
+/// `x402BatchSettlement`.
+#[tokio::test]
+async fn a_landing_names_its_confirmed_claim_transaction() {
+    if !require_anvil() {
+        return;
+    }
+    use ethers::providers::{Http, Middleware, Provider};
+    use ethers::types::H256;
+
+    let chain = Chain::spawn().await;
+    let presentation = chain.open(chain.config(), 1_000).await;
+    let channel = presentation.channel().clone();
+    chain.backend.admit(presentation).await.expect("admit");
+    let landed = chain
+        .backend
+        .land(&channel, chain.voucher(&chain.session, &channel, 300))
+        .await
+        .expect("land");
+
+    let spelled = &landed.transaction;
+    assert_eq!(spelled.len(), 66, "{spelled}");
+    assert!(
+        spelled.starts_with("0x")
+            && spelled[2..]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{spelled}"
+    );
+    let provider = Provider::<Http>::try_from(chain._anvil.rpc_url.as_str()).expect("provider");
+    let hash: H256 = spelled.parse().expect("a transaction hash");
+    let receipt = provider
+        .get_transaction_receipt(hash)
+        .await
+        .expect("receipt lookup")
+        .expect("the landing's transaction is mined");
+    assert_eq!(receipt.status, Some(1.into()));
+    assert_eq!(
+        receipt.to,
+        Some(Address::from(
+            connector_signer::X402_BATCH_SETTLEMENT_ADDRESS
+        ))
+    );
 }

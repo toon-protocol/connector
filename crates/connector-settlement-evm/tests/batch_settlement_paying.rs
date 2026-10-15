@@ -391,7 +391,7 @@ async fn a_signed_voucher_is_the_contracts_digest_signed_by_the_settlement_key()
         .land(&channel, voucher)
         .await
         .expect("the receiving half lands what the paying half signed");
-    assert_eq!(landed.landed, 250);
+    assert_eq!(landed.state.landed, 250);
 }
 
 /// A token with EIP-3009 is deposited through `ERC3009DepositCollector`

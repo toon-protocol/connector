@@ -204,7 +204,7 @@ async fn a_client_is_paid_an_evm_voucher_it_lands_on_chain_itself() {
         .land(presentation.channel(), second)
         .await
         .expect("the client lands the payout voucher");
-    assert_eq!(landed.landed, 500);
+    assert_eq!(landed.state.landed, 500);
     assert_eq!(
         x402.channel(&payout_channel).await,
         (5_000, 500),
@@ -233,6 +233,6 @@ async fn a_client_is_paid_an_evm_voucher_it_lands_on_chain_itself() {
         .land(presentation.channel(), third)
         .await
         .expect("the post-restart voucher lands above the last");
-    assert_eq!(landed.landed, 600);
+    assert_eq!(landed.state.landed, 600);
     assert_eq!(x402.channel(&payout_channel).await, (5_000, 600));
 }

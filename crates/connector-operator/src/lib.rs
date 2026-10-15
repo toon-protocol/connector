@@ -4752,13 +4752,34 @@ mod tests {
             assert_eq!(row["direction"], "inbound");
             assert_eq!(row["watermark"], 300);
             assert_eq!(row["landed"], 0);
+            assert!(row.get("transaction").is_none(), "{row}");
 
             let path = format!("/channels/{}/land", channel.0);
             let (status, landed) = node.write(&path, serde_json::Value::Null).await;
             assert_eq!(status, StatusCode::OK, "{landed}");
             assert_eq!(landed["landed"], 300);
-            let (status, _) = node.write(&path, serde_json::Value::Null).await;
+            assert_eq!(landed["id"], channel.0.as_str());
+            assert!(
+                landed["transaction"]
+                    .as_str()
+                    .is_some_and(|transaction| !transaction.is_empty()),
+                "{landed}"
+            );
+            let listed = node.read("/channels").await;
+            assert!(
+                listed
+                    .as_array()
+                    .expect("a list")
+                    .iter()
+                    .all(|row| row.get("transaction").is_none()),
+                "{listed}"
+            );
+            let (status, refused) = node.write(&path, serde_json::Value::Null).await;
             assert_eq!(status, StatusCode::CONFLICT);
+            assert!(
+                !refused.to_string().contains("transaction"),
+                "a refused land names no transaction: {refused}"
+            );
             let (status, _) = node
                 .write(
                     &format!("/channels/0x{}/land", "cd".repeat(32)),

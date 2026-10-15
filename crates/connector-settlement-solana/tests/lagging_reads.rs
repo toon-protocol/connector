@@ -459,8 +459,27 @@ async fn a_land_read_answered_from_before_it_is_repeated() {
     let before = snapshot(&w.validator, &address).await;
     let voucher = w.payer.sign_voucher(&channel, 400).await.expect("voucher");
     w.receiver_lag.arm(&address, vec![before], None);
-    let state = w.receiver.land(&channel, voucher).await.expect("land");
-    assert_eq!(state.landed, 400);
+    let landed = w.receiver.land(&channel, voucher).await.expect("land");
+    assert_eq!(landed.state.landed, 400);
+    // The answer names the `settle` transaction, and the validator has it
+    // confirmed.
+    let signature = landed
+        .transaction
+        .parse::<solana_sdk::signature::Signature>()
+        .expect("a base58 signature");
+    let statuses = w
+        .rpc
+        .get_signature_statuses(&[signature])
+        .await
+        .expect("signature status");
+    let status = statuses.value[0]
+        .as_ref()
+        .expect("the validator knows the settle transaction");
+    assert!(status.err.is_none(), "{status:?}");
+    assert!(
+        status.satisfies_commitment(CommitmentConfig::confirmed()),
+        "{status:?}"
+    );
 }
 
 #[tokio::test]

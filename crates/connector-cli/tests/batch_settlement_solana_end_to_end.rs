@@ -221,6 +221,6 @@ price = {PRICE}
         )
         .await
         .expect("the journaled voucher lands");
-    assert_eq!(landed.landed, u128::from(PRICE));
-    assert_eq!(landed.status, BatchChannelStatus::Open);
+    assert_eq!(landed.state.landed, u128::from(PRICE));
+    assert_eq!(landed.state.status, BatchChannelStatus::Open);
 }

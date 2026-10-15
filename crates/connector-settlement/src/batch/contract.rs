@@ -196,7 +196,8 @@ where
     let state = backend
         .land(&held_on, voucher(&sign, &held_on, 100))
         .await
-        .expect("a voucher held on a restored channel lands");
+        .expect("a voucher held on a restored channel lands")
+        .state;
     assert_eq!(state.landed, 100);
     assert_eq!(
         backend.channel_state(&held_on).await.expect("state").landed,
@@ -260,10 +261,15 @@ where
 
     // -- Landing --
 
-    let state = backend
+    let landing = backend
         .land(&channel, voucher(&sign, &channel, 300))
         .await
         .expect("land");
+    assert!(
+        !landing.transaction.is_empty(),
+        "a landing names its transaction"
+    );
+    let state = landing.state;
     assert_eq!(state.landed, 300);
     assert_eq!(
         state.collateral, 700,
@@ -315,10 +321,15 @@ where
     deposit(&channel, 500).await;
     let state = backend.channel_state(&channel).await.expect("state");
     assert_eq!(state.collateral, 1_200);
-    let state = backend
+    let second = backend
         .land(&channel, voucher(&sign, &channel, 1_001))
         .await
         .expect("the refused voucher lands once the deposit covers it");
+    assert_ne!(
+        second.transaction, landing.transaction,
+        "two landings are two transactions"
+    );
+    let state = second.state;
     assert_eq!(state.landed, 1_001);
     assert_eq!(state.collateral, 499);
 
@@ -356,7 +367,8 @@ where
     let state = backend
         .land(&other, voucher(&sign, &other, 400))
         .await
-        .expect("a held voucher lands while the payer is leaving");
+        .expect("a held voucher lands while the payer is leaving")
+        .state;
     assert_eq!(state.landed, 400);
     assert_eq!(state.collateral, 0);
     assert_eq!(
@@ -568,7 +580,8 @@ where
     let landed = receiver
         .land(&channel, first.clone())
         .await
-        .expect("a voucher the payer signed lands on the receiver's side");
+        .expect("a voucher the payer signed lands on the receiver's side")
+        .state;
     assert_eq!(landed.landed, 300);
     assert_eq!(landed.collateral, 1_200);
     let state = payer.outbound_state(&channel).await.expect("state");
@@ -676,7 +689,8 @@ where
     let landed = receiver
         .land(&channel, held)
         .await
-        .expect("the held voucher lands while the payer withdraws");
+        .expect("the held voucher lands while the payer withdraws")
+        .state;
     assert_eq!(landed.landed, 400);
 
     let_delay_pass().await;
@@ -874,6 +888,7 @@ where
             .land(&journaled, voucher)
             .await
             .expect("and what it signs lands")
+            .state
             .landed,
         400
     );
