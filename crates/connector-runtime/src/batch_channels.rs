@@ -139,7 +139,7 @@ pub struct BatchChannelView {
 /// What `POST /channels/:id/land` answers: the channel as
 /// [`BatchChannelView`] reports it, plus the transaction that landed the
 /// voucher. A separate type so that `GET /channels` keeps its shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LandedChannel {
     #[serde(flatten)]
     pub view: BatchChannelView,

@@ -1308,6 +1308,8 @@ async fn withdraw_channel(
 /// watchers and sweeps land vouchers on their own; this is the manual lever
 /// for planned maintenance. No request body: the voucher landed is the one
 /// the client edge accepted and journaled, never one the caller supplies.
+/// The answer is the channel's `GET /channels` row plus `transaction`, the
+/// one transaction that landed the voucher.
 ///
 /// Replaces the `toon-channel` `redeem`, `redeem-latest` and
 /// `cooperative-close` writes, deleted here. Landing the same voucher twice

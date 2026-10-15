@@ -40,7 +40,7 @@ const SOMEONE_ELSE: [u8; 20] = [0xbb; 20];
 /// who opens channels on it.
 struct Chain {
     /// Held so the chain outlives every closure the suite runs.
-    _anvil: Anvil,
+    anvil: Anvil,
     x402: Arc<X402Chain>,
     backend: Arc<EvmBatchSettlementBackend>,
     /// The token this node settles in.
@@ -81,7 +81,7 @@ impl Chain {
             x402.mint(token, payer.address(), 1_000_000_000).await;
         }
         Chain {
-            _anvil: anvil,
+            anvil,
             x402: Arc::new(x402),
             backend: Arc::new(backend),
             token,
@@ -475,7 +475,7 @@ async fn a_land_reports_the_transaction_that_landed_it() {
                 .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
         "{hash}"
     );
-    let provider = Provider::<Http>::try_from(chain._anvil.rpc_url.as_str()).expect("provider");
+    let provider = Provider::<Http>::try_from(chain.anvil.rpc_url.as_str()).expect("provider");
     let receipt = provider
         .get_transaction_receipt(hash.parse::<ethers::types::H256>().expect("a hash"))
         .await
