@@ -1334,7 +1334,7 @@ async fn land_channel(
         return no_batch_backend();
     };
     match batch.land(&channel_id).await {
-        Ok(view) => Json(view).into_response(),
+        Ok(landed) => Json(landed).into_response(),
         Err(error) => batch_channel_error_response(error),
     }
 }
@@ -4757,6 +4757,37 @@ mod tests {
             let (status, landed) = node.write(&path, serde_json::Value::Null).await;
             assert_eq!(status, StatusCode::OK, "{landed}");
             assert_eq!(landed["landed"], 300);
+            // The answer is the channel's row plus the one transaction that
+            // landed it; the listing keeps its shape, with no `transaction`.
+            let answer = landed.as_object().expect("an object");
+            for key in [
+                "id",
+                "scheme",
+                "chain",
+                "direction",
+                "status",
+                "counterparty",
+                "collateral",
+                "landed",
+                "watermark",
+            ] {
+                assert!(answer.contains_key(key), "{key} in {landed}");
+            }
+            assert!(
+                landed["transaction"]
+                    .as_str()
+                    .is_some_and(|transaction| !transaction.is_empty()),
+                "{landed}"
+            );
+            let listed = node.read("/channels").await;
+            assert!(
+                listed
+                    .as_array()
+                    .expect("a list")
+                    .iter()
+                    .all(|row| row.get("transaction").is_none()),
+                "{listed}"
+            );
             let (status, _) = node.write(&path, serde_json::Value::Null).await;
             assert_eq!(status, StatusCode::CONFLICT);
             let (status, _) = node

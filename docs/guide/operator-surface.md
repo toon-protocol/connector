@@ -225,16 +225,16 @@ reach `/metrics` on that box: on the fleet, an SSH tunnel to `client_edge_addr`.
 
 ## Writes
 
-| Endpoint                      | Does                                                                             |
-| ----------------------------- | -------------------------------------------------------------------------------- |
-| `POST /packets`               | Originate a packet from this node.                                               |
-| `POST /peers`                 | Establish a peering from a URL. `DELETE /peers/:id` removes it.                  |
-| `POST /routes/peers`          | Write a durable runtime route. `DELETE /routes/peers/:prefix` removes it.        |
-| `POST /routes/leased`         | Push a TTL-bound route that lapses on its own.                                   |
-| `POST /channels`              | Open an **outbound** x402 channel toward a counterparty, on its published terms. |
-| `POST /channels/:id/fund`     | **Top up** an outbound channel by an increment.                                  |
-| `POST /channels/:id/withdraw` | Start a withdrawal (EVM) or close (Solana); call again once due to finish.       |
-| `POST /channels/:id/land`     | Land the latest voucher held on an **inbound** channel now.                      |
+| Endpoint                      | Does                                                                                                       |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `POST /packets`               | Originate a packet from this node.                                                                         |
+| `POST /peers`                 | Establish a peering from a URL. `DELETE /peers/:id` removes it.                                            |
+| `POST /routes/peers`          | Write a durable runtime route. `DELETE /routes/peers/:prefix` removes it.                                  |
+| `POST /routes/leased`         | Push a TTL-bound route that lapses on its own.                                                             |
+| `POST /channels`              | Open an **outbound** x402 channel toward a counterparty, on its published terms.                           |
+| `POST /channels/:id/fund`     | **Top up** an outbound channel by an increment.                                                            |
+| `POST /channels/:id/withdraw` | Start a withdrawal (EVM) or close (Solana); call again once due to finish.                                 |
+| `POST /channels/:id/land`     | Land the latest voucher held on an **inbound** channel now; the answer includes the landing `transaction`. |
 
 The watchers land your inbound vouchers on their own; `land` is the lever for
 planned maintenance. `POST /channels` journals the channel before it spends, so a

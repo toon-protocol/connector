@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use super::port::{
     AdmissionRefusal, BatchChannelState, BatchChannelStatus, BatchSettlementBackend,
     BatchSettlementError, BatchSettlementPayer, ChannelPresentation, EvmChannelConfig,
-    EvmReceiverTerms, OpenedChannel, OutboundChannelRecord, OutboundChannelState, ReceiverTerms,
-    SolanaReceiverTerms, Voucher, VoucherSigner,
+    EvmReceiverTerms, Landed, OpenedChannel, OutboundChannelRecord, OutboundChannelState,
+    ReceiverTerms, SolanaReceiverTerms, Voucher, VoucherSigner,
 };
 use crate::ChannelId;
 
@@ -656,7 +656,7 @@ impl BatchSettlementBackend for InMemoryBatchSettlement {
         &self,
         channel: &ChannelId,
         voucher: Voucher,
-    ) -> Result<BatchChannelState, BatchSettlementError> {
+    ) -> Result<Landed, BatchSettlementError> {
         self.require_admitted(channel)?;
         let mut ledger = self.chain.ledger();
         let stored = ledger
@@ -684,8 +684,12 @@ impl BatchSettlementBackend for InMemoryBatchSettlement {
             // channel, and terminal.
             stored.status = BatchChannelStatus::Sealed;
         }
+        let transaction = format!("in-memory-land-{channel}-{}", voucher.cumulative_amount);
         let stored = &*stored;
-        Ok(self.state(channel, stored))
+        Ok(Landed {
+            state: self.state(channel, stored),
+            transaction,
+        })
     }
 }
 
@@ -1029,7 +1033,7 @@ mod tests {
         assert_eq!(state.status, BatchChannelStatus::Closing);
         assert!(!state.status.accepts_vouchers());
 
-        let state = fake.land(&channel, voucher(400)).await.expect("seal");
+        let state = fake.land(&channel, voucher(400)).await.expect("seal").state;
         assert_eq!(state.status, BatchChannelStatus::Sealed);
         assert_eq!(state.landed, 400);
         assert_eq!(state.collateral, 0);
@@ -1066,7 +1070,11 @@ mod tests {
         fake.admit(opened.presentation).await.expect("admit");
 
         fake.client_begin_exit(&channel);
-        let state = fake.land(&channel, voucher(400)).await.expect("claim");
+        let state = fake
+            .land(&channel, voucher(400))
+            .await
+            .expect("claim")
+            .state;
         assert_eq!(state.status, BatchChannelStatus::Withdrawing);
         assert!(state.status.accepts_vouchers());
         assert_eq!(state.landed, 400);

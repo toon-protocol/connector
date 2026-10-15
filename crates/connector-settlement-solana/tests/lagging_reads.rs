@@ -459,7 +459,12 @@ async fn a_land_read_answered_from_before_it_is_repeated() {
     let before = snapshot(&w.validator, &address).await;
     let voucher = w.payer.sign_voucher(&channel, 400).await.expect("voucher");
     w.receiver_lag.arm(&address, vec![before], None);
-    let state = w.receiver.land(&channel, voucher).await.expect("land");
+    let state = w
+        .receiver
+        .land(&channel, voucher)
+        .await
+        .expect("land")
+        .state;
     assert_eq!(state.landed, 400);
 }
 

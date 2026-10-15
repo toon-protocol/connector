@@ -285,7 +285,8 @@ async fn a_channel_must_name_a_payer_authorizer() {
         .backend
         .land(&channel, chain.voucher(&chain.payer, &channel, 250))
         .await
-        .expect("a held voucher lands on a restored channel");
+        .expect("a held voucher lands on a restored channel")
+        .state;
     assert_eq!(state.landed, 250);
 
     // A payer with code -- an EIP-7702 delegation designator, then an
@@ -442,6 +443,46 @@ async fn a_voucher_the_contract_would_refuse_is_never_submitted() {
     }
     assert_eq!(chain.x402.channel(&channel).await, (1_000, 0));
     assert_eq!(nonce(&chain).await, nonce_before, "nothing was sent");
+}
+
+/// A land answers with the hash of the one transaction that landed it: on
+/// chain it is a successful call to `x402BatchSettlement`, spelled `0x` and
+/// 64 lowercase hex.
+#[tokio::test]
+async fn a_land_reports_the_transaction_that_landed_it() {
+    use connector_settlement_evm::test_support::x402::batch_settlement_address;
+    use ethers::providers::{Http, Middleware, Provider};
+
+    if !require_anvil() {
+        return;
+    }
+    let chain = Chain::spawn().await;
+    let presentation = chain.open(chain.config(), 1_000).await;
+    let channel = presentation.channel().clone();
+    chain.backend.admit(presentation).await.expect("admit");
+    let landed = chain
+        .backend
+        .land(&channel, chain.voucher(&chain.session, &channel, 300))
+        .await
+        .expect("land");
+
+    let hash = &landed.transaction;
+    assert!(
+        hash.len() == 66
+            && hash.starts_with("0x")
+            && hash[2..]
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{hash}"
+    );
+    let provider = Provider::<Http>::try_from(chain._anvil.rpc_url.as_str()).expect("provider");
+    let receipt = provider
+        .get_transaction_receipt(hash.parse::<ethers::types::H256>().expect("a hash"))
+        .await
+        .expect("receipt query")
+        .expect("the chain has the landing transaction");
+    assert_eq!(receipt.status, Some(1.into()));
+    assert_eq!(receipt.to, Some(batch_settlement_address()));
 }
 
 /// EVM has no terminal state (the port's `BatchChannelStatus` table): a

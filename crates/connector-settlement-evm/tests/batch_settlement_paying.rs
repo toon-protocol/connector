@@ -390,7 +390,8 @@ async fn a_signed_voucher_is_the_contracts_digest_signed_by_the_settlement_key()
         .receiver
         .land(&channel, voucher)
         .await
-        .expect("the receiving half lands what the paying half signed");
+        .expect("the receiving half lands what the paying half signed")
+        .state;
     assert_eq!(landed.landed, 250);
 }
 
