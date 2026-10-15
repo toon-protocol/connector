@@ -52,7 +52,7 @@ use connector_domain::x402::X402BatchSettlementTerms;
 use connector_domain::JournalEntry;
 use connector_settlement::batch::{
     BatchChannelState, BatchChannelStatus, BatchSettlementBackend, BatchSettlementError,
-    BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, HeldVouchers,
+    BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, HeldVouchers, Landed,
     OutboundChannelRecord, OutboundChannelState, ReceiverTerms, SolanaReceiverTerms, Voucher,
     VoucherSigner,
 };
@@ -988,8 +988,9 @@ impl BatchChannels {
 
     /// Land the latest voucher held on the inbound channel `id` now (ADR
     /// 0075 decision 11): the manual lever beside the watchers and sweeps,
-    /// for planned maintenance.
-    pub async fn land(&self, id: &str) -> Result<BatchChannelView, BatchChannelError> {
+    /// for planned maintenance. Answers with the channel after the land and
+    /// the transaction that landed it (issue #1504).
+    pub async fn land(&self, id: &str) -> Result<(BatchChannelView, String), BatchChannelError> {
         let id = canonical_id(id);
         let held = self
             .held
@@ -1000,10 +1001,10 @@ impl BatchChannels {
         let chain = chain_of(held.presentation.chain());
         let backend = self.receiver(chain)?;
         read_inbound(backend.as_ref(), &held.presentation).await?;
-        let state = backend
-            .land(held.presentation.channel(), held.voucher.clone())
+        let Landed { state, transaction } = backend
+            .land_with_transaction(held.presentation.channel(), held.voucher.clone())
             .await?;
-        Ok(BatchChannelView {
+        let view = BatchChannelView {
             id,
             scheme: BATCH_SETTLEMENT.to_string(),
             chain: chain.name().to_string(),
@@ -1014,7 +1015,8 @@ impl BatchChannels {
             landed: Some(state.landed),
             watermark: held.voucher.cumulative_amount,
             detail: None,
-        })
+        };
+        Ok((view, transaction))
     }
 }
 
@@ -1621,8 +1623,9 @@ mod tests {
             assert_eq!(view.watermark, 300);
             assert_eq!(view.landed, Some(0));
 
-            let landed = channels.land(&channel.0).await.expect("land");
+            let (landed, transaction) = channels.land(&channel.0).await.expect("land");
             assert_eq!(landed.landed, Some(300));
+            assert!(!transaction.is_empty(), "the land names its transaction");
             assert_eq!(
                 channels.land(&channel.0).await.unwrap_err(),
                 BatchChannelError::Settlement(BatchSettlementError::StaleVoucher {

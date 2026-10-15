@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use super::port::{
     AdmissionRefusal, BatchChannelStatus, BatchSettlementBackend, BatchSettlementError,
-    BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, OutboundChannelRecord,
+    BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, Landed, OutboundChannelRecord,
     ReceiverTerms, SolanaReceiverTerms, Voucher, VoucherSigner,
 };
 use crate::ChannelId;
@@ -260,10 +260,14 @@ where
 
     // -- Landing --
 
-    let state = backend
-        .land(&channel, voucher(&sign, &channel, 300))
+    let Landed { state, transaction } = backend
+        .land_with_transaction(&channel, voucher(&sign, &channel, 300))
         .await
         .expect("land");
+    assert!(
+        !transaction.is_empty(),
+        "a land names the transaction that landed it"
+    );
     assert_eq!(state.landed, 300);
     assert_eq!(
         state.collateral, 700,

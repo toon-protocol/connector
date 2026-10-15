@@ -292,7 +292,9 @@ performs none of them.
   `claim`, Solana `settle`, or `settle_and_seal` on a channel its payer is closing. The watchers and
   sweeps land vouchers on their own; this is the lever for planned maintenance. The voucher landed is
   the one the client edge accepted and journaled, never one the caller supplies, and landing it twice
-  is a `409`.
+  is a `409`. It answers with the channel as `GET /channels` shows it, plus `transaction`: the
+  transaction that landed the voucher, the EVM transaction hash (`0x` and 64 hex) or the Solana
+  transaction signature (base58).
 
 **An open is journaled before it spends, and that is what makes it safe to retry**
 ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 8). The

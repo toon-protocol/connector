@@ -1302,6 +1302,16 @@ async fn withdraw_channel(
     }
 }
 
+/// The answer to `POST /channels/:id/land`: the channel after the land, and
+/// the transaction that landed it -- the EVM transaction hash or the Solana
+/// transaction signature (issue #1504).
+#[derive(Debug, Serialize)]
+struct LandedChannel {
+    #[serde(flatten)]
+    channel: BatchChannelView,
+    transaction: String,
+}
+
 /// `POST /channels/:id/land`: land the latest voucher this node holds on an
 /// inbound x402 channel now (ADR 0075 decision 11) -- EVM `claim`, Solana
 /// `settle`, or `settle_and_seal` on a channel its payer is closing. The
@@ -1334,7 +1344,11 @@ async fn land_channel(
         return no_batch_backend();
     };
     match batch.land(&channel_id).await {
-        Ok(view) => Json(view).into_response(),
+        Ok((channel, transaction)) => Json(LandedChannel {
+            channel,
+            transaction,
+        })
+        .into_response(),
         Err(error) => batch_channel_error_response(error),
     }
 }
@@ -4721,8 +4735,9 @@ mod tests {
             );
         }
 
-        /// Land the held latest voucher on an inbound channel; landing it
-        /// again is a `409` by name, and a channel with none held a `404`.
+        /// Land the held latest voucher on an inbound channel, answered with the
+        /// transaction that landed it; landing it again is a `409` by name, and
+        /// a channel with none held a `404`.
         #[tokio::test]
         async fn the_held_voucher_on_an_inbound_channel_lands_over_the_surface() {
             let node = Node::new().await;
@@ -4757,6 +4772,12 @@ mod tests {
             let (status, landed) = node.write(&path, serde_json::Value::Null).await;
             assert_eq!(status, StatusCode::OK, "{landed}");
             assert_eq!(landed["landed"], 300);
+            let transaction = landed["transaction"].as_str().unwrap_or_default();
+            assert!(
+                !transaction.is_empty(),
+                "the land answers with the transaction that landed it: {landed}"
+            );
+            assert_eq!(landed["id"], channel.0.as_str(), "the view's fields stay");
             let (status, _) = node.write(&path, serde_json::Value::Null).await;
             assert_eq!(status, StatusCode::CONFLICT);
             let (status, _) = node

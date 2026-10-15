@@ -192,7 +192,7 @@ A channel's first accepted voucher journals the channel itself (`BatchChannelAdm
 | Solana | Every **10 s**, rediscover every channel you sponsored with `getProgramAccounts` (filtered on `rent_payer`), so the journal is not the index. Open: `settle` the latest voucher every **10 min**. Closing: `settle_and_seal` inside the grace period. Sealed: `distribute`. Distributed: `reclaim` the channel's rent.                   |
 
 `POST /channels/:id/land` lands an inbound channel's latest voucher now. It is the manual lever for
-planned maintenance. `GET /channels` and `GET /claims` show each channel with its direction,
+planned maintenance, and it answers with the `transaction` that landed it. `GET /channels` and `GET /claims` show each channel with its direction,
 collateral and watermark. See the guide to the [operator surface](../guide/operator-surface.md).
 
 The one-day default minimum for `withdrawDelay` and `grace_period` is the window a delayed or

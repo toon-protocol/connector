@@ -786,11 +786,37 @@ pub trait BatchSettlementBackend: Send + Sync {
     ///
     /// On Solana, landing on a `Closing` channel seals it: `settle_and_seal`
     /// is the only instruction that can land there, and it is terminal.
+    ///
+    /// [`land_with_transaction`](Self::land_with_transaction) is the same
+    /// land, keeping the transaction that landed it.
     async fn land(
         &self,
         channel: &ChannelId,
         voucher: Voucher,
-    ) -> Result<BatchChannelState, BatchSettlementError>;
+    ) -> Result<BatchChannelState, BatchSettlementError> {
+        Ok(self.land_with_transaction(channel, voucher).await?.state)
+    }
+
+    /// [`land`](Self::land), answering with the transaction that landed the
+    /// voucher beside the state after it: what `POST /channels/:id/land`
+    /// reports as proof of the land (issue #1504).
+    async fn land_with_transaction(
+        &self,
+        channel: &ChannelId,
+        voucher: Voucher,
+    ) -> Result<Landed, BatchSettlementError>;
+}
+
+/// A voucher landed by [`BatchSettlementBackend::land_with_transaction`]:
+/// the channel's state after the land and the one transaction that landed
+/// it. EVM sends one `claim`; Solana one transaction carrying `settle` or
+/// `settle_and_seal` and the voucher's Ed25519 instruction before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landed {
+    pub state: BatchChannelState,
+    /// EVM: the transaction hash, `0x` and 64 lowercase hex. Solana: the
+    /// transaction signature, base58.
+    pub transaction: String,
 }
 
 /// The paying half of the settlement port (ADR 0075 decision 2): this node

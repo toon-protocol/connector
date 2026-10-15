@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use super::port::{
     AdmissionRefusal, BatchChannelState, BatchChannelStatus, BatchSettlementBackend,
     BatchSettlementError, BatchSettlementPayer, ChannelPresentation, EvmChannelConfig,
-    EvmReceiverTerms, OpenedChannel, OutboundChannelRecord, OutboundChannelState, ReceiverTerms,
-    SolanaReceiverTerms, Voucher, VoucherSigner,
+    EvmReceiverTerms, Landed, OpenedChannel, OutboundChannelRecord, OutboundChannelState,
+    ReceiverTerms, SolanaReceiverTerms, Voucher, VoucherSigner,
 };
 use crate::ChannelId;
 
@@ -652,11 +652,11 @@ impl BatchSettlementBackend for InMemoryBatchSettlement {
         Ok(self.state(channel, stored))
     }
 
-    async fn land(
+    async fn land_with_transaction(
         &self,
         channel: &ChannelId,
         voucher: Voucher,
-    ) -> Result<BatchChannelState, BatchSettlementError> {
+    ) -> Result<Landed, BatchSettlementError> {
         self.require_admitted(channel)?;
         let mut ledger = self.chain.ledger();
         let stored = ledger
@@ -685,7 +685,12 @@ impl BatchSettlementBackend for InMemoryBatchSettlement {
             stored.status = BatchChannelStatus::Sealed;
         }
         let stored = &*stored;
-        Ok(self.state(channel, stored))
+        Ok(Landed {
+            state: self.state(channel, stored),
+            // The fake has no transactions: a land is named by its channel and
+            // amount, which a later land on the same channel always exceeds.
+            transaction: format!("in-memory-land-{}-{}", channel.0, voucher.cumulative_amount),
+        })
     }
 }
 
