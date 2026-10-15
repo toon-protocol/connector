@@ -30,6 +30,7 @@ rand = "0.8"
 # endpoint (ADR 0074 decision 9, ADR 0075 decision 3) and reads the JSON it
 # answers with -- through `socks_proxy` when that sponsor is an onion host
 # (ADR 0070). The same line and TLS stack the rest of the workspace uses.
+connector-proxied-client = { path = "../connector-proxied-client" }
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json", "socks"] }
 # The one host rule, `is_onion_endpoint` (ADR 0070): which sponsor posts
 # leave on the proxy. Read from the one implementation, never re-derived.

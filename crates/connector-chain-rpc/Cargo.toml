@@ -22,6 +22,7 @@ test-support = ["tokio/net", "tokio/io-util"]
 # pulls in (ADR 0070), so the lockfile gains nothing. 0.11 because both
 # chain SDKs build their clients on 0.11 and a client handed across that
 # seam has to be the same type.
+connector-proxied-client = { path = "../connector-proxied-client" }
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "socks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

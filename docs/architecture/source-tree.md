@@ -84,6 +84,11 @@ connector-chain-rpc              the HTTP transport every settlement table's RPC
                                   the optional pinned circuit through `socks_proxy`. Holds
                                   no key and knows no channel
 
+connector-proxied-client         the one cached `reqwest` client through `socks_proxy`
+                                  (ADR 0070): rebuilt, re-resolving the proxy's host, when
+                                  the proxy cannot be reached. The only place a SOCKS
+                                  `reqwest::Proxy` is built for a long-lived client
+
 connector-settlement             the chain-agnostic settlement port + its contract suite
   ├─ port.rs, contract.rs        the port, and the one suite every backend is run against
   ├─ in_memory.rs                the fake — the first implementation to pass that suite
