@@ -10,7 +10,7 @@
 //!
 //!   * its own PUBLIC ILP-over-HTTP and BTP endpoints -- the container sees
 //!     `0.0.0.0:4000` and a private docker network, never
-//!     `https://proxy.ario.devnet.toonprotocol.dev/ilp`;
+//!     `https://toonprotocol.dev/ilp`;
 //!   * which ILP addresses it answers to.
 //!
 //! Everything else a node says about itself is **derived**: the prices come
