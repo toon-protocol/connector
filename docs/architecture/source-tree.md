@@ -202,6 +202,12 @@ connector-cli                    config → runtime → merged routers → bound
 connector-bin                    bin/connector, bin/stub-app — and the workspace's
                                   cross-cutting integration tests (see below)
 connector-vectors                bin/generate-vectors → vectors/wire-vectors.json
+connector-zk-note                zk-note primitives (ADR 0080): kimchi Poseidon, the domain
+                                  tags and generator seeds (wire law), hashToGroup, the
+                                  balance commitment, the state message and its Mina Schnorr
+                                  signature — byte-identical to o1js, pinned by
+                                  fixtures/parity.json. Pure: no I/O, no clock, no connector
+                                  crate. Nothing calls it yet
 ```
 
 ### Test layout
