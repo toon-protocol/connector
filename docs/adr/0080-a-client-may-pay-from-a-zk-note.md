@@ -1,6 +1,6 @@
 # A client may pay from a zk note
 
-**Status:** Accepted (owner decision, 2026-10-16, #1511), **conditional on spike #1512**. Nothing is built. If #1512 finds that the connector can't verify an o1js `ZkProgram` proof in Rust, this record is **withdrawn**, not amended, because the route back to o1js is closed (below). It **amends** [0040](0040-a-verified-payment-is-stated-to-the-app.md): the payer is stated only when it is known. It **adds a note to** [0033](0033-the-exposure-machinery-is-retired-not-restated.md): the risk that record retired comes back at a zk edge, under a cap, as the **open budget**. It leaves [0002](0002-drop-mina-from-the-rust-connector.md) and [0065-mina](0065-mina-leaves-the-repository.md) standing, and the sections below explain why. It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): the allowance claim, the allowance request and answer, and the signed successor state all become vectors.
+**Status:** Accepted (owner decision, 2026-10-16, #1511). **Spike #1512 answered yes** (2026-10-16, [research note](../research/zk-note-verifier-spike.md)), so the condition is met and the record stands. Nothing is built. It **amends** [0040](0040-a-verified-payment-is-stated-to-the-app.md): the payer is stated only when it is known. It **adds a note to** [0033](0033-the-exposure-machinery-is-retired-not-restated.md): the risk that record retired comes back at a zk edge, under a cap, as the **open budget**. It leaves [0002](0002-drop-mina-from-the-rust-connector.md) and [0065-mina](0065-mina-leaves-the-repository.md) standing, and the sections below explain why. It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): the allowance claim, the allowance request and answer, and the signed successor state all become vectors.
 
 **Scope:** protocol law. It adds a claim scheme, a greeting entry and two client-edge endpoints that every implementation of a zk edge must speak. Where the proof is verified and how the journal records it are connector architecture. See the [ADR index](README.md).
 
@@ -139,5 +139,5 @@ challenger all live outside this repository. The rule "do not reintroduce an o1j
   an escape. The anonymity set is the active notes in one vault, so a young vault hides little.
 - A connector without the zk-note table refuses `scheme: "zk-note"` like any unknown scheme, and
   behaves exactly as before.
-- Built in two issues, both blocked on #1512: the primitives, gate, journal, config, greeting and
+- Built in two issues, unblocked by #1512 (answered yes): the primitives, gate, journal, config, greeting and
   vectors over an in-memory vault, then the Mina adapter run against committed fixtures.
