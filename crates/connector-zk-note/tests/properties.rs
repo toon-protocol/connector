@@ -6,7 +6,7 @@ use connector_zk_note::commitment::{charge, commit, value_generator};
 use connector_zk_note::derive::{binding, context, nullifier, successor_anchor};
 use connector_zk_note::state::{sign_state, verify_state, StateMessage};
 use connector_zk_note::tiers::{Tiers, TiersError};
-use connector_zk_note::{Field, Scalar};
+use connector_zk_note::{Field, Point, Scalar};
 use mina_signer::{Keypair, SecKey};
 use proptest::prelude::*;
 
@@ -23,10 +23,10 @@ proptest! {
 
     #[test]
     fn charging_delta_is_committing_to_the_balance_less_delta(
-        balance in any::<u64>(), delta_frac in any::<u64>(), r in any::<u64>(),
+        balance in any::<u64>(), delta_frac in any::<u64>(), r in any::<[u8; 32]>(),
     ) {
         let delta = if balance == 0 { 0 } else { delta_frac % (balance + 1) };
-        let r = Scalar::from(r) * Scalar::from(0xDEAD_BEEF_u64);
+        let r = Scalar::from_le_bytes_mod_order(&r);
         prop_assert_eq!(charge(commit(balance, r), delta), commit(balance - delta, r));
     }
 
@@ -39,7 +39,7 @@ proptest! {
 
     #[test]
     fn a_state_signature_verifies_and_fails_under_any_changed_field(
-        seed in 1u64.., vault in any::<u64>(), balance in any::<u64>(), r in any::<u64>(), anchor in any::<u64>(),
+        seed in 1u64..u64::MAX, vault in any::<u64>(), balance in any::<u64>(), r in any::<u64>(), anchor in any::<u64>(),
     ) {
         let kp = keypair(seed);
         let state = StateMessage {
@@ -59,12 +59,16 @@ proptest! {
         let mut other = state.clone();
         other.commitment = charge(other.commitment, 1);
         prop_assert!(!verify_state(&sig, &kp.public, &other));
-        // x and y separately: a commitment with the same x and the other y.
+        // y alone: a commitment with the same x and the other y.
         let mut other = state.clone();
         other.commitment = (-other.commitment.into_group()).into();
         prop_assert!(!verify_state(&sig, &kp.public, &other));
+        // x alone: the signed fields, not the curve, are what is checked.
+        let mut other = state.clone();
+        other.commitment = Point::new_unchecked(other.commitment.x + Field::from(1u64), other.commitment.y);
+        prop_assert!(!verify_state(&sig, &kp.public, &other));
         // another key
-        prop_assert!(!verify_state(&sig, &keypair(seed.wrapping_add(1).max(1)).public, &state) || seed.wrapping_add(1).max(1) == seed);
+        prop_assert!(!verify_state(&sig, &keypair(seed + 1).public, &state));
     }
 
     #[test]
