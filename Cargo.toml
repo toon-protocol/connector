@@ -29,6 +29,7 @@ members = [
     "crates/connector-cli",
     "crates/connector-bin",
     "crates/connector-vectors",
+    "crates/connector-zk-note",
 ]
 
 [workspace.package]
