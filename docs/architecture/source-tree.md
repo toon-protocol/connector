@@ -202,6 +202,12 @@ connector-cli                    config → runtime → merged routers → bound
 connector-bin                    bin/connector, bin/stub-app — and the workspace's
                                   cross-cutting integration tests (see below)
 connector-vectors                bin/generate-vectors → vectors/wire-vectors.json
+connector-zk-note                zk-note primitives (ADR 0080): kimchi Poseidon, the domain
+                                  tags and generator seeds (wire law), hashToGroup, the
+                                  balance commitment, the state message and its Mina Schnorr
+                                  signature — byte-identical to o1js, pinned by
+                                  fixtures/parity.json. Pure: no I/O, no clock, no connector
+                                  crate. Nothing calls it yet
 ```
 
 ### Test layout
@@ -248,14 +254,16 @@ settlement path since [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-
 outright in #1386. The contracts and program stay on chain; their deployment records moved to
 [`docs/deployments/`](../deployments/).
 
-**Mina is not in this repository at all.**
+**Mina is not a settlement chain here, and nothing here proves.**
 [ADR 0002](../adr/0002-drop-mina-from-the-rust-connector.md) dropped it as a settlement chain —
 the zkApp's methods need proof generation through o1js, which exists only in JavaScript, and a
 Node sidecar beside the binary was refused — and
 [ADR 0065](../adr/0065-mina-leaves-the-repository.md) then deleted the zkApp, the browser faucet
-dApp and the Mina tooling that record had left standing. The Cargo workspace has no Mina crate
-and the npm workspaces have no Mina package. What remains is the connector refusing a `mina`
-claim by name, which is wire behaviour, not Mina support.
+dApp and the Mina tooling that record had left standing. The npm workspaces have no Mina
+package. What remains of the old Mina support is the connector refusing a `mina` claim by name,
+which is wire behaviour. The one Mina-derived crate, `connector-zk-note`, is
+[ADR 0080](../adr/0080-a-client-may-pay-from-a-zk-note.md)'s verifier-side primitives over o1-labs
+`proof-systems` — no o1js, no proving, no settlement — and leaves both records standing.
 
 ### `tools/`
 

@@ -28,3 +28,4 @@ docs/rfcs
 # (local/anyone/.gitignore), but prettier walks the working tree rather than
 # the index and exits non-zero on a file it cannot read.
 local/*/.store
+crates/connector-zk-note/fixtures/
