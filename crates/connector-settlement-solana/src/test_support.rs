@@ -299,8 +299,9 @@ impl BatchPayer {
 /// a build of the pinned source (`3ffa4d67`) because the chain's binary is
 /// what a node settles against, and the record could not establish that the
 /// two are equal. The devnet deployment's dump differs (SHA-256
-/// `acdb3abf…cf8b`): its `TREASURY_OWNER` is the placeholder a devnet build
-/// ships with.
+/// `acdb3abf…cf8b`): its `TREASURY_OWNER` is
+/// [`TREASURY_OWNER_DEVNET`](crate::batch::wire::TREASURY_OWNER_DEVNET), not
+/// the placeholder a devnet build of the source ships with (#1520).
 ///
 /// Committed rather than dumped at test time so the gate needs no network;
 /// no key material is involved, only the program's public bytes.
