@@ -1,16 +1,39 @@
 #!/usr/bin/env python3
-"""Does the devnet fleet still agree with itself about a FORWARDED route?
+"""Does the devnet's ONE connector still serve what its committed config says?
 
 Called by `.github/workflows/fleet-health.yml`. See that file's header for
-why it exists; the short version is that fleet-health probed container state
-and `GET /ilp/identity` only, and both stayed green through two multi-hour
-outages on 2026-08-28 that a forwarded route would have shown in minutes.
+why it exists.
 
-This is the half of that gap which costs nothing. It reads each node's
-PUBLIC `GET /ilp` self-description (ADR 0050) and holds the documents to
-each other: no credential, no ssh, no packet, no money. What it therefore
-CANNOT do is prove a packet crosses a peering -- only a paid probe does
-that, and `fleet-health.yml`'s `paid-probe` job is the other half.
+The devnet has run one connector since 2026-10-16 (relay#270, infra#57): the
+relay's, at `https://toonprotocol.dev/ilp`, terminating every devnet app's
+prefix itself. Before that each node ran its own connector and this script
+held their `GET /ilp` documents to each other -- does every forwarded prefix
+land on a node that routes it, at a price that covers it, over a peering
+whose two sides settle in the same token. With one connector there is no
+forwarded leg in the fleet left to hold, and reading the old per-node names
+(`proxy.{relay,ario,gas}.devnet`) would read the same document three times
+-- and stop resolving once infra#58 removes them. The file keeps its name
+because the workflow, CI and `fleet_release_gate.rs` call it by that name.
+
+What it holds now, free and with no credential, reading only public URLs:
+
+  * the committed config -- `deploy/connector.toml` on the relay repo's
+    `main`, the one file holding every devnet route and price -- against the
+    connector's own `GET /ilp` (ADR 0050): every committed route is listed
+    at the committed price and transport, the committed addresses are the
+    ones it claims, it says it is at the committed endpoints, and it settles
+    in the committed tokens. A missing route is a prefix a payer is refused;
+    a price that differs is a merge that did not reach the host, or a host
+    edit no merge made.
+  * the relay's NIP-11 document at `relay.toonprotocol.dev` against the same
+    `GET /ilp`: the relay tells every client which connector to pay, which
+    key to seal to, at what price and in which tokens. If those disagree with
+    the connector, every client is charged and refused -- the 2026-08-28
+    01:27Z mint-cutover outage, in its one-connector shape.
+
+What it CANNOT do is prove a packet reaches an app. The host probe asks
+whether the connector shares a network with each app it routes to and gets
+an answer from it; `paid-probe` sends a packet. This is the free half.
 
 Output is the same `<OK|FAIL>\\t<subject>\\t<check>\\t<detail>` TSV the rest
 of that workflow speaks, so the report table needs no second renderer.
@@ -22,471 +45,455 @@ of that workflow speaks, so the report table needs no second renderer.
 
 import json
 import sys
+import time
+import tomllib
 import urllib.request
+from datetime import datetime
 
-# The ONE hardcoded fact: which URLs make up the fleet. Every prefix, price
-# and settlement figure below is read off the documents those URLs serve. A
-# hardcoded expectation would go stale the way fleet-ops.yml's dead scp path
-# did -- and would then report success against a fleet it had stopped
-# describing.
-NODES = {
-    "relay": "https://proxy.relay.devnet.toonprotocol.dev/ilp",
-    "store": "https://proxy.ario.devnet.toonprotocol.dev/ilp",
-    "gas": "https://proxy.gas.devnet.toonprotocol.dev/ilp",
-}
+# The hardcoded facts: where the one connector, the relay's NIP-11 document
+# and the committed config live. Every route, price, address and token below
+# is read off what those URLs serve -- a hardcoded expectation would go stale
+# the way fleet-ops.yml's dead scp path did, and would then report success
+# against a devnet it had stopped describing. None of them is a transitional
+# name infra#58 removes; `--self-test` asserts that.
+CONNECTOR_URL = "https://toonprotocol.dev/ilp"
+RELAY_INFO_URL = "https://relay.toonprotocol.dev"
+COMMITTED_CONFIG_URL = (
+    "https://raw.githubusercontent.com/toon-protocol/relay/main/deploy/connector.toml"
+)
+# When `main` last changed that file. Read only when a route disagrees, so a
+# merge still inside its apply window is reported as pending, not as an
+# outage. Unauthenticated: it is asked at most once a run, and only then.
+COMMITTED_CONFIG_HISTORY_URL = (
+    "https://api.github.com/repos/toon-protocol/relay/commits"
+    "?sha=main&path=deploy/connector.toml&per_page=1"
+)
+# Same grace as the host probe's staleness rule: one 5-minute timer tick to
+# fetch, three more to apply or retry.
+APPLY_GRACE_SECONDS = 20 * 60
 
-# Settlement facts that MUST match across a peering, per chain, read off
-# each document's `batchSettlements` (ADR 0075: every channel is an x402
-# channel, and the self-description's `settlements` -- the retired
-# `toon-channel` terms -- is gone, issue #1384). The settlement ADDRESS
-# (`payTo`) is deliberately absent: it is meant to differ, being each node's
-# own. What must agree is the token: a peering's two one-way channels each
-# settle in one asset, and a mint cutover on one box and not the other --
-# the 2026-08-28 01:27Z outage exactly -- leaves one side opening channels
-# the other will not admit.
-SHARED_SETTLEMENT_FACTS = ("asset",)
+TRANSITIONAL_NAMES = (
+    "proxy.relay.devnet",
+    "proxy.ario.devnet",
+    "proxy.gas.devnet",
+    "proxy.gateway.devnet",
+    "proxy.echo.devnet",
+    "relay-ws.devnet",
+)
 
 
-def fetch_over_https(url):
-    with urllib.request.urlopen(url, timeout=20) as answer:
+def fetch_json(url, accept="application/json"):
+    request = urllib.request.Request(url, headers={"Accept": accept})
+    with urllib.request.urlopen(request, timeout=20) as answer:
         return json.load(answer)
 
 
-def segments(address):
-    return address.split(".")
+def fetch_text(url):
+    with urllib.request.urlopen(url, timeout=20) as answer:
+        return answer.read().decode("utf-8")
 
 
-def covers(candidate, prefix):
-    """Does `candidate` route `prefix` under longest-prefix matching?
-
-    On ILP SEGMENT boundaries, never on characters: `g.toon.relays` is not
-    covered by `g.toon.relay`, and treating it as covered would report a
-    dangling forward as healthy.
-    """
-    c, p = segments(candidate), segments(prefix)
-    return len(c) <= len(p) and p[: len(c)] == c
+def committed_config_age(fetch=fetch_json, now=time.time):
+    """Seconds since `main` last changed the committed config, or None."""
+    commits = fetch(COMMITTED_CONFIG_HISTORY_URL)
+    stamp = commits[0]["commit"]["committer"]["date"]
+    when = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    return now() - when
 
 
-def price_of(route):
-    """A route row's price as (flat, per_kib). `GET /ilp` spells both as
-    decimal STRINGS and omits `pricePerKib` entirely on a flat route."""
+def committed_price(route):
+    """A committed route's price as (flat, per_kib). The TOML spells it as a
+    bare integer or as `{ base, per_kib }`."""
+    price = route.get("price", 0)
+    if isinstance(price, dict):
+        return int(price.get("base", 0)), int(price.get("per_kib", 0))
+    return int(price), 0
+
+
+def served_price(route):
+    """A `GET /ilp` route row's price as (flat, per_kib). The document spells
+    both as decimal STRINGS and omits `pricePerKib` on a flat route."""
     return int(route.get("price", 0)), int(route.get("pricePerKib") or 0)
 
 
-def roles_of(docs):
-    """Which prefixes each node FORWARDS, which it is the END of, and which
-    no public document can settle. Returns `{(node, prefix): role}`, one of
-    `"terminates"`, `"forwards"` or `"ambiguous"`, for every route row.
-
-    `GET /ilp` says what a node ROUTES (`routes`) and what it CLAIMS as its
-    own names (`ilpAddresses`). It does not say which routes end at this
-    node and which it passes on. So "routed but not claimed" is not proof of
-    a forward, and treating it as one reported a forward that does not exist
-    (connector#1248): the store routes `g.toon.relay.store` because the
-    relay forwards packets to it under that name, but it deliberately does
-    not claim the name, because the name is the relay's (store#121, "routed
-    is not advertised"). The check read that as a store -> relay forward
-    and flagged it as underpriced against the relay's own 1001 row.
-
-    The rule, per prefix P routed by node N:
-
-      1. P is in N's `ilpAddresses`: N terminates P (the gas shape).
-      2. Some OTHER node lists P in its `ilpAddresses`: that node ends the
-         route, so N forwards P (unchanged from before this rule).
-      3. Nobody lists P. Let S be every node routing exactly P. If S is
-         just N, N forwards (a forward to a shorter covering prefix, or a
-         DANGLING one). If S is exactly two nodes and exactly one of them
-         has an own address covering P (the relay's `g.toon.relay` covers
-         `g.toon.relay.store`), that node owns the name and forwards it,
-         and the other ends the route (the store shape).
-      4. Anything else is AMBIGUOUS, and that is a FAILURE, not a guess.
-         Neither covers, both cover, or three or more nodes route P while
-         nobody claims it: the documents cannot say who ends the route.
-         Guessing "forwards" reproduces the false alarm this rule fixes.
-         Guessing "terminates" could hide a real loop or an underpriced
-         forward. The fix on the fleet side is for the node that ends the
-         route to list P in `[node].addresses` (the gas shape), or for the
-         owner to stop routing an exact name nobody claims.
-
-    The sound fix is a fact rather than a heuristic: a `terminated` or
-    `forwarded` field on each `GET /ilp` route row, as an amendment to
-    ADR 0050. The connector knows which one each row is, since a
-    RouteTermination and a peer route are different config. Until that
-    exists, this is the most this script can infer.
-    """
-    claimed = {n: set(d.get("ilpAddresses", [])) for n, d in docs.items()}
-    routed = {n: {r["prefix"] for r in d.get("routes", [])} for n, d in docs.items()}
-    roles = {}
-    for node in docs:
-        for prefix in routed[node]:
-            if prefix in claimed[node]:
-                roles[(node, prefix)] = "terminates"
-                continue
-            if any(prefix in claimed[other] for other in docs if other != node):
-                roles[(node, prefix)] = "forwards"
-                continue
-            sharing = sorted(n for n in docs if prefix in routed[n])
-            if sharing == [node]:
-                roles[(node, prefix)] = "forwards"
-                continue
-            owners = [
-                n for n in sharing if any(covers(a, prefix) for a in claimed[n])
-            ]
-            if len(sharing) == 2 and len(owners) == 1:
-                roles[(node, prefix)] = "forwards" if owners == [node] else "terminates"
-            else:
-                roles[(node, prefix)] = "ambiguous"
-    return roles
+def chain_of(network):
+    """`eip155:84532` -> `evm`, `solana:Et...` -> `solana`."""
+    return "evm" if network.startswith("eip155:") else network.split(":")[0]
 
 
-def crosscheck(nodes, fetch):
-    """Hold every node's self-description to every other's.
+def same_asset(chain, a, b):
+    # An EVM address is the same address in any case; a Solana mint is not.
+    if chain == "evm":
+        return str(a).lower() == str(b).lower()
+    return a == b
 
-    `fetch` takes a URL and returns the parsed document, or raises. Injected
-    so `--self-test` can drive the failure branches without a fleet.
+
+def crosscheck(fetch_doc, fetch_config, fetch_info, config_age):
+    """Hold the one connector to its committed config and to the relay.
+
+    Every input is injected so `--self-test` can drive the failure branches
+    without a devnet. `config_age()` returns seconds since the committed
+    config last changed, or raises when that cannot be read.
     """
     rows = []
 
     def row(ok, subject, check, detail):
         rows.append(("OK" if ok else "FAIL", subject, check, detail))
 
-    docs = {}
-    for name, url in sorted(nodes.items()):
+    def read(subject, url, fetch, what):
         try:
-            docs[name] = fetch(url)
-            row(True, name, f"GET {url}", "200, self-description parsed")
+            value = fetch()
+            row(True, subject, f"GET {url}", f"200, {what} parsed")
+            return value
         except Exception as error:  # noqa: BLE001 -- every failure is one verdict
             row(
                 False,
-                name,
+                subject,
                 f"GET {url}",
-                f"unreadable ({error}) -- every check about this node is "
-                "blind, which is a failure and not a pass",
+                f"unreadable ({error}) -- every check that needs it is blind, "
+                "which is a failure and not a pass",
             )
+            return None
 
-    # A node whose document did not parse simply cannot be a far side; the
-    # FAIL above is what is reported, and the cross-checks skip it.
-    terminated = {n: set(d.get("ilpAddresses", [])) for n, d in docs.items()}
-    advertised = {
-        n: {r["prefix"]: r for r in d.get("routes", [])} for n, d in docs.items()
-    }
+    doc = read("one connector", CONNECTOR_URL, fetch_doc, "self-description")
+    config = read("relay connector.toml", COMMITTED_CONFIG_URL, fetch_config, "committed config")
+    info = read("relay", RELAY_INFO_URL, fetch_info, "NIP-11 document")
 
-    def settlements_of(name):
-        return {s["network"]: s for s in docs[name].get("batchSettlements", [])}
+    served = {}
+    if doc is not None:
+        for route in doc.get("routes", []):
+            served.setdefault(route["prefix"], []).append(route)
 
-    def check_peering(near, far, prefix):
-        """The two checks that are about the PEERING rather than the route:
-        do the two sides still settle in the same token on a chain they
-        share, and can either of them still dial the other."""
-        a, b = settlements_of(near), settlements_of(far)
-        subject = f"{near} -> {far}"
-        shared = sorted(set(a) & set(b))
-        if not shared:
-            row(
-                False,
-                subject,
-                "a settlement chain in common",
-                f"{near} settles on {sorted(a) or 'nothing'} and {far} on "
-                f"{sorted(b) or 'nothing'}: no chain in common, so nothing "
-                f"can pay for `{prefix}`",
-            )
-        for chain in shared:
-            differing = [
-                f"{fact}: {near}={a[chain].get(fact)!r} {far}={b[chain].get(fact)!r}"
-                for fact in SHARED_SETTLEMENT_FACTS
-                if (fact in a[chain] or fact in b[chain])
-                and a[chain].get(fact) != b[chain].get(fact)
-            ]
-            agreed = [
-                fact
-                for fact in SHARED_SETTLEMENT_FACTS
-                if fact in a[chain] and fact in b[chain]
-            ]
-            if differing:
-                row(
-                    False,
-                    subject,
-                    f"settlement facts agree on `{chain}`",
-                    "the two sides settle in DIFFERENT tokens, so a channel "
-                    "one side opens is one the other will not admit -- "
-                    + "; ".join(differing),
-                )
-            elif not agreed:
-                row(
-                    False,
-                    subject,
-                    f"settlement facts agree on `{chain}`",
-                    "neither document states any of "
-                    f"{list(SHARED_SETTLEMENT_FACTS)} for `{chain}`, so this "
-                    "check is blind rather than passing",
-                )
+    # ── The committed config against the connector ────────────────────────
+    if doc is not None and config is not None:
+        node = config.get("node", {})
+
+        # A merge to the relay's `main` reaches the host within one timer
+        # tick plus an apply. Inside that window a disagreement is the merge
+        # still landing, and reporting it as an outage opens an alert that
+        # closes itself on the next run. Asked once, only on a disagreement.
+        age = []
+
+        def pending():
+            if not age:
+                try:
+                    age.append(config_age())
+                except Exception:  # noqa: BLE001 -- unknown age means no grace
+                    age.append(None)
+            seconds = age[0]
+            if seconds is not None and 0 <= seconds <= APPLY_GRACE_SECONDS:
+                return f"main changed connector.toml {int(seconds // 60)}m ago, within the {APPLY_GRACE_SECONDS // 60}m apply grace"
+            return None
+
+        def judge(subject, check, ok, ok_detail, fail_detail):
+            if ok:
+                row(True, subject, check, ok_detail)
+                return
+            why = pending()
+            if why:
+                row(True, subject, check, f"pending: {why} -- {fail_detail}")
             else:
-                row(
-                    True,
+                row(False, subject, check, fail_detail)
+
+        want_http = node.get("http_endpoint")
+        judge(
+            "one connector",
+            "is where the committed config says",
+            doc.get("httpEndpoint") == want_http == CONNECTOR_URL
+            and doc.get("btpEndpoint") == node.get("btp_endpoint"),
+            f"httpEndpoint {doc.get('httpEndpoint')}, btpEndpoint {doc.get('btpEndpoint')}",
+            f"the connector says it is at {doc.get('httpEndpoint')!r} / "
+            f"{doc.get('btpEndpoint')!r}, the committed config says "
+            f"{want_http!r} / {node.get('btp_endpoint')!r}, and this check "
+            f"reads {CONNECTOR_URL!r}. A client that follows the self-description "
+            "lands somewhere else.",
+        )
+
+        want_addresses = list(node.get("addresses", []))
+        have_addresses = list(doc.get("ilpAddresses", []))
+        missing = sorted(set(want_addresses) - set(have_addresses))
+        extra = sorted(set(have_addresses) - set(want_addresses))
+        primary_ok = bool(want_addresses) and have_addresses[:1] == want_addresses[:1]
+        judge(
+            "one connector",
+            "claims the committed addresses",
+            not missing and not extra and primary_ok,
+            f"{len(have_addresses)} addresses, primary {have_addresses[:1]}",
+            f"missing {missing}, not committed {extra}, primary "
+            f"{have_addresses[:1]} vs committed {want_addresses[:1]}",
+        )
+
+        committed = {}
+        for route in config.get("routes", []):
+            committed[route["prefix"]] = route
+
+        for prefix in sorted(committed):
+            route = committed[prefix]
+            subject = f"`{prefix}`"
+            check = "listed at the committed price"
+            rows_for = served.get(prefix, [])
+            want_flat, want_kib = committed_price(route)
+            want_transport = route.get("transport")
+            if not rows_for:
+                judge(
                     subject,
-                    f"settlement facts agree on `{chain}`",
-                    "agree on " + ", ".join(agreed)
-                    + " -- each side admits the other's channels",
-                )
-
-        # Exactly one side of a peering dials; the other only accepts, and
-        # advertises no carriage. So an empty `peerCarriages` on one side is
-        # normal and says nothing. BOTH empty is not: once that session
-        # drops, neither side can re-establish it and every packet is T01
-        # until a human intervenes.
-        near_carriage = docs[near].get("peerCarriages") or []
-        far_carriage = docs[far].get("peerCarriages") or []
-        if not near_carriage and not far_carriage:
-            row(
-                False,
-                subject,
-                "someone can dial",
-                "NEITHER side advertises a peerCarriage. The peering may be "
-                "up now, but nothing can re-establish it after a restart, "
-                "and every packet is then T01 until a human re-peers it.",
-            )
-        else:
-            row(
-                True,
-                subject,
-                "someone can dial",
-                f"{near} advertises {near_carriage or 'no carriage'}, "
-                f"{far} advertises {far_carriage or 'no carriage'} -- only "
-                "one side ever dials, so one of these being empty is normal",
-            )
-
-    # For every prefix a node FORWARDS (see `roles_of` for how that is told
-    # apart from a route it ends without claiming the name), somebody else
-    # has to route that name, at a price this node's own advertised price
-    # can cover, over a peering the two of them still agree about.
-    roles = roles_of(docs)
-    for near in sorted(docs):
-        for prefix in sorted(advertised[near]):
-            role = roles[(near, prefix)]
-            if role == "terminates" and prefix not in terminated[near]:
-                owner = next(
-                    n for n in sorted(docs)
-                    if n != near and roles.get((n, prefix)) == "forwards"
-                )
-                row(
-                    True,
-                    near,
-                    f"`{prefix}` ends here",
-                    f"routed but not advertised: {owner} owns the name and "
-                    f"forwards it here, so this is not a {near} -> {owner} "
-                    "forward (store#121)",
-                )
-            elif role == "ambiguous":
-                sharing = sorted(n for n in docs if prefix in advertised[n])
-                row(
+                    check,
                     False,
-                    near,
-                    f"`{prefix}` has a known end",
-                    f"AMBIGUOUS ROUTE: {', '.join(sharing)} all route "
-                    f"`{prefix}`, none lists it in `ilpAddresses`, and the "
-                    "documents cannot say which one ends the route -- the "
-                    "node that terminates it should list it in "
-                    "`[node].addresses`",
-                )
-
-        forwards = [
-            p for p in sorted(advertised[near]) if roles[(near, p)] == "forwards"
-        ]
-        if not forwards:
-            row(
-                True,
-                near,
-                "forwarded prefixes",
-                "none advertised -- this node terminates everything it sells",
-            )
-            continue
-
-        for prefix in forwards:
-            near_flat, near_kib = price_of(advertised[near][prefix])
-
-            # The far side is whoever routes this name under longest-prefix
-            # matching. Never this node itself: `near` FORWARDS this prefix,
-            # so its own longest match for it is the very row being checked.
-            candidates = [
-                (len(segments(q)), far, q)
-                for far in sorted(docs)
-                if far != near
-                for q in sorted(advertised[far])
-                if covers(q, prefix)
-            ]
-            if not candidates:
-                row(
-                    False,
-                    f"{near} -> ?",
-                    f"`{prefix}` lands somewhere",
-                    "DANGLING FORWARD: this node advertises and forwards "
-                    f"`{prefix}`, and no node in the fleet routes that name. "
-                    "A payer is charged and then refused -- F02 at the far "
-                    "side, or T01 here if the peering it points at cannot "
-                    "even be dialled.",
+                    "",
+                    f"MISSING ROUTE: committed at {want_flat}+{want_kib}/KiB to "
+                    f"{route.get('handler_url')}, and the connector does not list it. "
+                    "A payer for this prefix is refused.",
                 )
                 continue
-
-            _, far, far_prefix = max(candidates)
-            row(
-                True,
-                f"{near} -> {far}",
-                f"`{prefix}` lands somewhere",
-                f"{far} "
-                f"{'terminates' if roles[(far, far_prefix)] == 'terminates' else 'forwards on'}"
-                f" `{far_prefix}`",
-            )
-
-            far_flat, far_kib = price_of(advertised[far][far_prefix])
-            check = f"`{prefix}` is priced to cover the far side"
-            if near_flat < far_flat or near_kib < far_kib:
+            if len(rows_for) > 1:
                 row(
                     False,
-                    f"{near} -> {far}",
+                    subject,
                     check,
-                    f"UNDERPRICED FORWARD: {near} sells it at {near_flat}"
-                    f"+{near_kib}/KiB but {far} charges {far_flat}"
-                    f"+{far_kib}/KiB for `{far_prefix}`. The packet arrives "
-                    "short and is refused after the payer has been charged.",
+                    f"SHADOWED ROUTE: listed {len(rows_for)} times "
+                    f"({[served_price(r) for r in rows_for]}): a runtime route "
+                    "(POST /routes/peers) carries the same prefix as a committed "
+                    "one, and only one of them can win",
                 )
-            elif (near_flat, near_kib) == (far_flat, far_kib):
-                row(
-                    True,
-                    f"{near} -> {far}",
-                    check,
-                    f"{near_flat}+{near_kib}/KiB, exactly the far side's "
-                    "price -- covered, but this hop's own per-packet fee "
-                    "comes out of the delivered amount rather than on top",
-                )
-            else:
-                row(
-                    True,
-                    f"{near} -> {far}",
-                    check,
-                    f"{near_flat}+{near_kib}/KiB covers {far}'s {far_flat}"
-                    f"+{far_kib}/KiB",
-                )
+                continue
+            have = rows_for[0]
+            have_flat, have_kib = served_price(have)
+            have_transport = have.get("requiredTransport")
+            judge(
+                subject,
+                check,
+                (have_flat, have_kib) == (want_flat, want_kib)
+                and have_transport == want_transport,
+                f"{have_flat}+{have_kib}/KiB"
+                + (f", {have_transport} only" if have_transport else ""),
+                f"PRICE DIFFERS: committed {want_flat}+{want_kib}/KiB"
+                f"{f' ({want_transport} only)' if want_transport else ''}, "
+                f"served {have_flat}+{have_kib}/KiB"
+                f"{f' ({have_transport} only)' if have_transport else ''}. "
+                "The host is not running what relay's main says.",
+            )
 
-            check_peering(near, far, prefix)
+        # A route the connector lists that the config does not hold is a
+        # runtime route -- `POST /routes/peers`, a forward to a peer outside
+        # the fleet (a node that joined the relay, relay#268). Nothing free
+        # can see where it lands, so it is named rather than judged.
+        for prefix in sorted(set(served) - set(committed)):
+            row(
+                True,
+                f"`{prefix}`",
+                "a runtime route, not in the committed config",
+                f"listed at {'+'.join(map(str, served_price(served[prefix][0])))}/KiB "
+                "by a POST /routes/peers this check cannot follow; the devnet's "
+                "own apps are all committed routes",
+            )
 
-    # De-duplicated, order preserved: two forwarded prefixes over one
-    # peering assert the same settlement agreement, and printing it twice
-    # pads the table without saying anything twice.
-    seen, unique = set(), []
-    for entry in rows:
-        if entry not in seen:
-            seen.add(entry)
-            unique.append(entry)
-    return unique
+        settlement = config.get("settlement", {})
+        offered = {}
+        for entry in doc.get("batchSettlements", []):
+            offered.setdefault(chain_of(entry.get("network", "")), []).append(entry)
+        for chain in sorted(settlement):
+            want = settlement[chain].get("token_address")
+            have = [e.get("asset") for e in offered.get(chain, [])]
+            judge(
+                "one connector",
+                f"settles in the committed `{chain}` token",
+                any(same_asset(chain, want, a) for a in have),
+                f"{want}",
+                f"committed {want!r}, offered {have or 'nothing'}: a client "
+                "deposits into a token the committed config does not name",
+            )
+
+    # ── The relay's NIP-11 document against the connector ─────────────────
+    if doc is not None and info is not None:
+        toon = info.get("toon") or {}
+        subject = "relay -> one connector"
+        if not toon:
+            row(
+                False,
+                subject,
+                "the relay names a connector",
+                "the NIP-11 document carries no `toon` block: no client can "
+                "find out where to pay",
+            )
+        else:
+            url = toon.get("connector_url")
+            row(
+                url == doc.get("httpEndpoint") == CONNECTOR_URL,
+                subject,
+                "the relay names the one connector",
+                f"connector_url {url!r}"
+                + ("" if url == CONNECTOR_URL else f", the one connector is {CONNECTOR_URL!r}"),
+            )
+            key = toon.get("connector_seal_key")
+            have_key = (doc.get("edgeIdentity") or {}).get("publicKey")
+            row(
+                bool(key) and str(key).lower() == str(have_key).lower(),
+                subject,
+                "the relay names the connector's seal key",
+                "the same key"
+                if key and str(key).lower() == str(have_key).lower()
+                else f"relay says {key!r}, the connector publishes {have_key!r}: "
+                "every sealed payload is one the connector cannot open",
+            )
+            address = toon.get("ilp_address")
+            row(
+                address in doc.get("ilpAddresses", []),
+                subject,
+                "the relay's address is the connector's",
+                f"{address!r}"
+                + ("" if address in doc.get("ilpAddresses", []) else " is not claimed by the connector"),
+            )
+            relay_route = (served.get(address) or [{}])[0]
+            want_price = toon.get("price")
+            row(
+                want_price is not None
+                and relay_route
+                and int(want_price) == served_price(relay_route)[0],
+                subject,
+                "the relay's price is the connector's",
+                f"relay says {want_price}, the connector lists "
+                f"{served_price(relay_route)[0] if relay_route else 'no route'} for `{address}`",
+            )
+            offered = {e.get("network"): e.get("asset") for e in doc.get("batchSettlements", [])}
+            told = {s.get("network"): s.get("asset") for s in toon.get("settlement", [])}
+            differing = [
+                f"{net}: relay={asset!r} connector={offered.get(net)!r}"
+                for net, asset in sorted(told.items())
+                if not same_asset(chain_of(net or ""), asset, offered.get(net))
+            ]
+            row(
+                bool(told) and not differing,
+                subject,
+                "the relay and the connector settle in the same tokens",
+                "agree on " + ", ".join(sorted(told))
+                if told and not differing
+                else ("; ".join(differing) or "the relay names no settlement")
+                + " -- a client pays in a token the connector will not admit",
+            )
+
+    return rows
 
 
-def legs(nodes, fetch):
-    """Every forwarded prefix in the fleet, as the paid probe needs it.
+def legs(fetch_doc, fetch_config):
+    """Every committed route the connector lists, as the paid probe needs it.
 
     `fleet-health.yml`'s `paid-probe` job drives `connector send` against
     these. It reads them from here rather than keeping a table of its own
-    so there is ONE list of what the fleet forwards, derived from live
-    documents -- a second copy is a copy that goes stale, and a paid probe
-    aimed at a prefix nobody routes any more would report a real-looking
-    failure about nothing.
+    so there is ONE list of what the devnet routes -- a second copy is a copy
+    that goes stale, and a probe aimed at a prefix nobody routes any more
+    would report a real-looking failure about nothing.
 
-    Yields `near`, `prefix`, `far`, `far url`, `amount`, tab-separated.
-    `amount` is the near side's OWN advertised price for the prefix, one
-    KiB's worth of slope included -- so it covers the far side's price plus
-    every fee on the way, and tracks a repricing without an edit here.
+    Yields `prefix`, `amount`, `handler_url`, tab-separated. `amount` is the
+    committed flat price plus one KiB's worth of slope, so it covers the
+    route and tracks a repricing without an edit here.
     """
-    docs = {name: fetch(url) for name, url in sorted(nodes.items())}
-    roles = roles_of(docs)
+    doc, config = fetch_doc(), fetch_config()
+    listed = {r["prefix"] for r in doc.get("routes", [])}
     out = []
-    for near, doc in docs.items():
-        for route in doc.get("routes", []):
-            prefix = route["prefix"]
-            # The same classification `crosscheck` uses. An ambiguous route
-            # is left out: the cross-check already FAILs it, and a probe
-            # sealed to a guessed far side would fail for this script's
-            # reason rather than the fleet's.
-            if roles[(near, prefix)] != "forwards":
-                continue
-            flat, kib = price_of(route)
-            # Longest-prefix matching, exactly as `crosscheck` resolves a
-            # far side -- picking the FIRST node that merely covers the
-            # prefix would seal a `g.toon.relay.store` probe to whichever
-            # node happens to advertise the shorter `g.toon.relay`, and the
-            # packet would then be refused for a reason that is this
-            # script's fault rather than the fleet's.
-            candidates = [
-                (len(segments(q["prefix"])), far)
-                for far, far_doc in docs.items()
-                if far != near
-                for q in far_doc.get("routes", [])
-                if covers(q["prefix"], prefix)
-            ]
-            if candidates:
-                _, far = max(candidates)
-                out.append((near, prefix, far, nodes[far], str(flat + kib)))
+    for route in sorted(config.get("routes", []), key=lambda r: r["prefix"]):
+        if route["prefix"] not in listed:
+            continue
+        flat, kib = committed_price(route)
+        out.append((route["prefix"], str(flat + kib), route.get("handler_url", "")))
     return out
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # Self-test. A monitor whose FAIL branches have never run is a green tick
 # over nothing, and this file's failure paths are unreachable from a healthy
-# fleet by construction -- so they are driven here, against synthetic
+# devnet by construction -- so they are driven here, against synthetic
 # documents, and CI runs this before the workflow ever trusts the script.
 # ─────────────────────────────────────────────────────────────────────────
 
-def _doc(addresses, routes, settlements, carriages):
+_CONFIG = """
+[node]
+addresses = ["g.toon.relay", "g.toon.store", "g.toon.echo"]
+http_endpoint = "https://toonprotocol.dev/ilp"
+btp_endpoint = "wss://toonprotocol.dev/ilp/btp"
+
+[[routes]]
+prefix = "g.toon.relay"
+handler_url = "http://relay:3100/write"
+price = 1
+transport = "btp"
+
+[[routes]]
+prefix = "g.toon.store"
+handler_url = "http://store-dvm:3300/store"
+price = { base = 1000, per_kib = 10 }
+
+[[routes]]
+prefix = "g.toon.echo"
+handler_url = "http://echo-app:3000"
+price = { base = 1, per_kib = 1 }
+
+[settlement.evm]
+token_address = "0x0C996d7c934c79a6255254875607Fe69df25C0E1"
+
+[settlement.solana]
+token_address = "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU"
+"""
+
+_EVM = "0x0c996d7c934c79a6255254875607fe69df25c0e1"
+_SOL = "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU"
+_KEY = "0x04915d29"
+
+
+def _doc():
     return {
-        "ilpAddresses": addresses,
+        "ilpAddresses": ["g.toon.relay", "g.toon.store", "g.toon.echo"],
+        "httpEndpoint": "https://toonprotocol.dev/ilp",
+        "btpEndpoint": "wss://toonprotocol.dev/ilp/btp",
+        "edgeIdentity": {"publicKey": _KEY},
         "routes": [
-            dict({"prefix": p, "price": str(f)}, **({"pricePerKib": str(k)} if k else {}))
-            for p, f, k in routes
+            {"prefix": "g.toon.echo", "price": "1", "pricePerKib": "1"},
+            {"prefix": "g.toon.relay", "price": "1", "requiredTransport": "btp"},
+            {"prefix": "g.toon.store", "price": "1000", "pricePerKib": "10"},
         ],
-        "batchSettlements": settlements,
-        "peerCarriages": carriages,
+        "batchSettlements": [
+            {"network": "eip155:84532", "asset": _EVM},
+            {"network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1", "asset": _SOL},
+        ],
     }
 
 
-_EVM = {
-    "network": "eip155:84532",
-    "asset": "0xusdc",
-    "payTo": "0xnode",
-}
-_SOL = {
-    "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
-    "asset": "mintA",
-    "payTo": "node",
-}
-
-
-def _fleet(**overrides):
-    fleet = {
-        "relay": _doc(
-            ["g.toon.relay"],
-            [("g.toon.relay", 1, 0), ("g.toon.relay.store", 1001, 10)],
-            [dict(_EVM), dict(_SOL)],
-            [],
-        ),
-        # The store's live shape since store#121: it ROUTES the relay's
-        # name for it but does not CLAIM it -- "routed is not advertised".
-        "store": _doc(
-            ["g.toon.store"],
-            [("g.toon.store", 1000, 10), ("g.toon.relay.store", 1000, 10)],
-            [dict(_EVM), dict(_SOL)],
-            ["btp"],
-        ),
+def _info():
+    return {
+        "toon": {
+            "ilp_address": "g.toon.relay",
+            "connector_url": "https://toonprotocol.dev/ilp",
+            "connector_seal_key": _KEY,
+            "price": 1,
+            "settlement": [
+                {"network": "eip155:84532", "asset": _EVM},
+                {"network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1", "asset": _SOL},
+            ],
+        }
     }
-    fleet.update(overrides)
-    return fleet
 
 
-def _run(fleet):
-    def fetch(url):
-        doc = fleet[url]
-        if isinstance(doc, Exception):
-            raise doc
-        return doc
+def _old_config():
+    raise OSError("no commit history")
 
-    return crosscheck({name: name for name in fleet}, fetch)
+
+def _run(doc=None, config=_CONFIG, info=None, age=_old_config):
+    doc = _doc() if doc is None else doc
+    info = _info() if info is None else info
+
+    def give(value):
+        def fetch():
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return fetch
+
+    def parse():
+        if isinstance(config, Exception):
+            raise config
+        return tomllib.loads(config)
+
+    return crosscheck(give(doc), parse, give(info), age)
 
 
 def _fails(rows):
@@ -501,214 +508,149 @@ def _self_test():
         ok = bool(failures) == want_fail and (
             not want_in or any(want_in in f[3] for f in failures)
         )
-        cases.append((ok, name, failures))
+        cases.append((ok, name, failures if want_fail or failures else rows))
 
-    case("a healthy fleet passes", _run(_fleet()), False)
-
-    # The 2026-08-28 01:27Z outage: an SPL mint cutover on one box only.
-    cut = _fleet()
-    cut["store"]["batchSettlements"][1] = dict(_SOL, asset="mintB")
-    case("an SPL mint cutover on one side fails", _run(cut), True, "asset")
-
-    # A prefix forwarded to nobody -- the shape found live on the store box.
-    dangling = _fleet()
-    dangling["store"]["routes"].append({"prefix": "g.toon.store.relay", "price": "2"})
-    case("a dangling forward fails", _run(dangling), True, "DANGLING FORWARD")
-
-    # A far-side price rise the near side did not follow.
-    under = _fleet()
-    under["store"]["routes"][1]["price"] = "2000"
-    case("an underpriced forward fails", _run(under), True, "UNDERPRICED FORWARD")
-
-    # A per-KiB slope the near side did not follow, at an equal flat price.
-    slope = _fleet()
-    slope["store"]["routes"][1]["pricePerKib"] = "99"
-    case("an unfollowed per-KiB slope fails", _run(slope), True, "UNDERPRICED FORWARD")
-
-    # Nobody left who can dial: the peering cannot survive a restart.
-    deaf = _fleet()
-    deaf["store"]["peerCarriages"] = []
-    case("neither side able to dial fails", _run(deaf), True, "NEITHER side")
-
-    # No chain in common: nothing can pay.
-    apart = _fleet()
-    apart["store"]["batchSettlements"] = [dict(_SOL)]
-    apart["relay"]["batchSettlements"] = [dict(_EVM)]
-    case("no settlement chain in common fails", _run(apart), True, "no chain in common")
-
-    # An unreachable node is a failure, never a skip.
-    down = _fleet()
-    down["store"] = OSError("connection refused")
-    case("an unreadable self-description fails", _run(down), True, "blind")
-
-    # `--legs` must name the same forwards the checks above cross-check,
-    # priced at the near side's own advertised figure. A leg list that
-    # drifted from the route list would aim the paid probe at the wrong
-    # prefix, or pay the wrong amount, and report the miss as an outage.
-    healthy = _fleet()
-    found = legs({n: n for n in healthy}, lambda url: healthy[url])
+    healthy = _run()
+    case("a healthy one-connector devnet passes", healthy, False)
     cases.append(
         (
-            found == [("relay", "g.toon.relay.store", "store", "store", "1011")],
-            "--legs names each forward once, at the near side's own price",
-            found,
+            sum(1 for r in healthy if r[2] == "listed at the committed price") == 3,
+            "every committed route gets its own row",
+            healthy,
         )
     )
 
-    # A third node advertising a SHORTER covering prefix must not win the
-    # leg. `gas` routes `g.toon.relay`, which covers `g.toon.relay.store`;
-    # sealing the probe to gas would have it refused for this script's
-    # reason rather than the fleet's. Live shape, and the bug this case
-    # was written against.
-    three = _fleet(
-        gas=_doc(
-            ["g.toon.gas"],
-            [("g.toon.gas", 1000, 0), ("g.toon.relay", 2, 0)],
-            [dict(_EVM), dict(_SOL)],
-            ["btp"],
-        )
-    )
-    found = legs({n: n for n in three}, lambda url: three[url])
-    sealed = dict((prefix, far) for _, prefix, far, _, _ in found)
-    cases.append(
-        (
-            sealed.get("g.toon.relay.store") == "store",
-            "--legs seals to the LONGEST match, not the first that covers",
-            found,
-        )
-    )
+    gone = _doc()
+    gone["routes"] = [r for r in gone["routes"] if r["prefix"] != "g.toon.echo"]
+    case("a committed route the connector does not list fails", _run(gone), True, "MISSING ROUTE")
 
-    # ── routed is not advertised (connector#1248, store#121) ────────────
-    def has(rows, subject, check_part, status="OK"):
-        return any(
-            r[0] == status and r[1] == subject and check_part in r[2] for r in rows
-        )
+    cheap = _doc()
+    cheap["routes"][2]["price"] = "999"
+    case("a flat price that differs fails", _run(cheap), True, "PRICE DIFFERS")
 
-    # The store shape: routed, not claimed. The relay -> store forward is
-    # still checked, and no store -> relay forward is invented.
-    rows = _run(_fleet())
+    slope = _doc()
+    slope["routes"][2]["pricePerKib"] = "99"
+    case("a per-KiB slope that differs fails", _run(slope), True, "PRICE DIFFERS")
+
+    either = _doc()
+    del either["routes"][1]["requiredTransport"]
+    case("a transport pin the host dropped fails", _run(either), True, "PRICE DIFFERS")
+
+    # A merge still inside its apply window is pending, not an outage, and
+    # one past it is an outage.
+    case("a disagreement inside the apply grace is pending", _run(cheap, age=lambda: 300), False)
+    case("a disagreement past the apply grace fails", _run(cheap, age=lambda: 3600), True, "PRICE DIFFERS")
+
+    moved = _doc()
+    moved["httpEndpoint"] = "https://proxy.relay.devnet.toonprotocol.dev/ilp"
+    case("a connector advertising another endpoint fails", _run(moved), True, "says it is at")
+
+    lost = _doc()
+    lost["ilpAddresses"].remove("g.toon.store")
+    case("an address the connector stopped claiming fails", _run(lost), True, "missing ['g.toon.store']")
+
+    swapped = _doc()
+    swapped["ilpAddresses"] = list(reversed(swapped["ilpAddresses"]))
+    case("a different primary address fails", _run(swapped), True, "primary")
+
+    # The 2026-08-28 01:27Z shape: a mint cutover on one side only.
+    cut = _doc()
+    cut["batchSettlements"][1]["asset"] = "mintB"
+    case("a token the committed config does not name fails", _run(cut), True, "committed")
+
+    runtime = _doc()
+    runtime["routes"].append({"prefix": "g.toon.b4ad2718.echo", "price": "3"})
+    rows = _run(runtime)
     cases.append(
         (
             not _fails(rows)
-            and has(rows, "relay -> store", "is priced to cover")
-            and not any(r[1] == "store -> relay" for r in rows)
-            and has(rows, "store", "`g.toon.relay.store` ends here"),
-            "the store shape (routed, not advertised) passes, and only relay -> store is checked",
+            and any(r[1] == "`g.toon.b4ad2718.echo`" and "runtime route" in r[2] for r in rows),
+            "a runtime route to a joined node is named, not failed",
             rows,
         )
     )
 
-    # The gas shape: the far side DOES list the relay's name for it.
-    def gas_fleet(relay_price=1001):
-        fleet = _fleet()
-        fleet["relay"]["routes"].append(
-            {"prefix": "g.toon.relay.gas", "price": str(relay_price)}
-        )
-        fleet["gas"] = _doc(
-            ["g.toon.gas", "g.toon.relay.gas"],
-            [("g.toon.gas", 1000, 0), ("g.toon.relay", 2, 0), ("g.toon.relay.gas", 1000, 0)],
-            [dict(_EVM), dict(_SOL)],
-            ["btp"],
-        )
-        return fleet
+    shadow = _doc()
+    shadow["routes"].append({"prefix": "g.toon.echo", "price": "2", "pricePerKib": "1"})
+    case("a runtime route shadowing a committed one fails", _run(shadow), True, "SHADOWED ROUTE")
 
-    rows = _run(gas_fleet())
+    elsewhere = _info()
+    elsewhere["toon"]["connector_url"] = "https://proxy.relay.devnet.toonprotocol.dev/ilp"
+    case("a relay naming another connector fails", _run(info=elsewhere), True, "connector_url")
+
+    rekeyed = _info()
+    rekeyed["toon"]["connector_seal_key"] = "0x04deadbeef"
+    case("a relay naming another seal key fails", _run(info=rekeyed), True, "cannot open")
+
+    mint = _info()
+    mint["toon"]["settlement"][1]["asset"] = "mintB"
+    case("a relay settling in another token fails", _run(info=mint), True, "will not admit")
+
+    priced = _info()
+    priced["toon"]["price"] = 2
+    case("a relay advertising another price fails", _run(info=priced), True, "relay says 2")
+
+    case("a relay with no toon block fails", _run(info={"name": "x"}), True, "no `toon` block")
+
+    case("an unreadable self-description fails", _run(doc=OSError("refused")), True, "blind")
+    case("an unreadable committed config fails", _run(config=OSError("404")), True, "blind")
+    case("an unreadable NIP-11 document fails", _run(info=OSError("refused")), True, "blind")
+
+    # `--legs` names each committed route the connector lists, once, at the
+    # committed flat price plus one KiB.
+    found = legs(lambda: _doc(), lambda: tomllib.loads(_CONFIG))
     cases.append(
         (
-            not _fails(rows)
-            and has(rows, "relay -> gas", "is priced to cover")
-            and has(rows, "relay -> store", "is priced to cover")
-            and not any(r[1] in ("gas -> relay", "store -> relay") and "g.toon.relay." in r[2] for r in rows),
-            "the gas shape (name in addresses) passes beside the store shape",
-            rows,
-        )
-    )
-
-    # The relay itself underpricing a REAL forward still fails, in both shapes.
-    cheap = _fleet()
-    cheap["relay"]["routes"][1]["price"] = "999"
-    case("an underpriced relay -> store forward fails", _run(cheap), True, "UNDERPRICED FORWARD: relay")
-    case(
-        "an underpriced relay -> gas forward fails",
-        _run(gas_fleet(relay_price=999)),
-        True,
-        "UNDERPRICED FORWARD: relay",
-    )
-
-    # AMBIGUOUS, defined as a FAILURE. Two nodes route the same exact
-    # name, neither claims it, and neither owns a covering address: nothing
-    # public says which one ends the route, and a guess either way is
-    # wrong somewhere (a false forward, or a hidden loop).
-    stray = _fleet()
-    for node in ("relay", "store"):
-        stray[node]["routes"].append({"prefix": "g.toon.other.x", "price": "5"})
-    case("two nodes routing an unowned, unclaimed name fails as ambiguous", _run(stray), True, "AMBIGUOUS ROUTE")
-
-    # Both own a covering address: still no way to tell.
-    both = _fleet()
-    both["store"]["ilpAddresses"].append("g.toon.relay")
-    case("two owners of one unclaimed name fails as ambiguous", _run(both), True, "AMBIGUOUS ROUTE")
-
-    # Three hops under one unclaimed name: the owner forwards, but the
-    # middle hop and the end cannot be told apart.
-    hop = _fleet(
-        mid=_doc(["g.toon.mid"], [("g.toon.mid", 1, 0), ("g.toon.relay.store", 1000, 10)], [dict(_EVM), dict(_SOL)], ["btp"])
-    )
-    case("a three-hop chain under an unclaimed name fails as ambiguous", _run(hop), True, "AMBIGUOUS ROUTE")
-
-    # Three hops where the end CLAIMS the name: every other router of it
-    # is a forwarder, so nothing is ambiguous and the middle hop's price
-    # is held to the end's.
-    claimed = _fleet(
-        mid=_doc(["g.toon.mid"], [("g.toon.mid", 1, 0), ("g.toon.relay.store", 1000, 10)], [dict(_EVM), dict(_SOL)], ["btp"])
-    )
-    claimed["store"]["ilpAddresses"].append("g.toon.relay.store")
-    rows = _run(claimed)
-    cases.append(
-        (
-            not _fails(rows) and has(rows, "mid -> store", "is priced to cover"),
-            "a three-hop chain whose end claims the name resolves every hop",
-            rows,
-        )
-    )
-
-    # The live gas + store fleet's legs: one per real forward, none from
-    # the store, none ambiguous.
-    found = legs({n: n for n in gas_fleet()}, lambda url: gas_fleet()[url])
-    cases.append(
-        (
-            sorted((n, p, f) for n, p, f, _, _ in found)
-            == [("gas", "g.toon.relay", "relay"), ("relay", "g.toon.relay.gas", "gas"), ("relay", "g.toon.relay.store", "store")],
-            "--legs lists exactly the real forwards of the live shape",
+            found
+            == [
+                ("g.toon.echo", "2", "http://echo-app:3000"),
+                ("g.toon.relay", "1", "http://relay:3100/write"),
+                ("g.toon.store", "1010", "http://store-dvm:3300/store"),
+            ],
+            "--legs names every committed route once, at base plus one KiB",
             found,
         )
     )
 
-    # Segment-boundary matching: `g.toon.relays` must NOT satisfy a forward
-    # of `g.toon.relay.store`, or a dangling forward reads as healthy.
-    assert covers("g.toon.relay", "g.toon.relay.store")
-    assert not covers("g.toon.relays", "g.toon.relay.store")
-    assert not covers("g.toon.relay.store", "g.toon.relay")
+    # infra#58 removes the transitional names; nothing here may depend on one.
+    urls = (CONNECTOR_URL, RELAY_INFO_URL, COMMITTED_CONFIG_URL, COMMITTED_CONFIG_HISTORY_URL)
+    cases.append(
+        (
+            not any(name in url for name in TRANSITIONAL_NAMES for url in urls),
+            "no URL here is a transitional name infra#58 removes",
+            urls,
+        )
+    )
 
-    for ok, name, failures in cases:
+    for ok, name, detail in cases:
         print(f"{'ok  ' if ok else 'FAIL'}  {name}")
         if not ok:
-            for failure in failures:
-                print(f"        {failure}")
+            for entry in detail if isinstance(detail, (list, tuple)) else [detail]:
+                print(f"        {entry}")
     if not all(ok for ok, _, _ in cases):
         raise SystemExit("self-test failed")
     print(f"\n{len(cases)} cases passed.")
+
+
+def _live():
+    return (
+        lambda: fetch_json(CONNECTOR_URL),
+        lambda: tomllib.loads(fetch_text(COMMITTED_CONFIG_URL)),
+        lambda: fetch_json(RELAY_INFO_URL, accept="application/nostr+json"),
+        committed_config_age,
+    )
 
 
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
         _self_test()
     elif len(sys.argv) == 2 and sys.argv[1] == "--legs":
-        for leg in legs(NODES, fetch_over_https):
+        doc, config, _, _ = _live()
+        for leg in legs(doc, config):
             print("\t".join(leg))
     elif len(sys.argv) == 2:
         with open(sys.argv[1], "w", encoding="utf-8") as out:
-            for entry in crosscheck(NODES, fetch_over_https):
+            for entry in crosscheck(*_live()):
                 out.write("\t".join(str(field) for field in entry) + "\n")
     else:
         raise SystemExit(__doc__)
