@@ -46,10 +46,25 @@ pub const OPEN_SLOT_WINDOW: u64 = 1_500;
 /// so a caller must name the one its deployment was built with.
 pub const TREASURY_OWNER_MAINNET: &str = "Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP";
 
+/// The owner of the treasury token account the devnet deployment's
+/// `distribute` checks for. Upstream's source still gives devnet the
+/// placeholder below (PC `constants.rs`, `TODO: real devnet owner`); the
+/// deployment was built with this one instead, as upstream's
+/// `feat/solex-channels` branch names it (`Solex.toml`,
+/// `channels.nightly.vars.treasury_owner`, `f23711f3`). Evidence, 2026-10-16
+/// (#1520): `solana program dump -u d CHNLx…` gives the binary SHA-256
+/// `acdb3abf…cf8b` that [`crate::test_support::payment_channels_fixture`]'s
+/// note records, and its bytes hold this key -- not the placeholder, not
+/// [`TREASURY_OWNER_MAINNET`] -- beside the ATA program's id, where the
+/// mainnet dump holds the mainnet owner; and a simulated `distribute` of
+/// devnet channel `EVcXWJPa…jpJ` fails `TreasuryAccountMismatch` (2401) with
+/// the other two owners and succeeds with this one.
+pub const TREASURY_OWNER_DEVNET: &str = "4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap";
+
 /// The placeholder `TREASURY_OWNER` a build without `mainnet-beta` ships
 /// with, `0xBE 0xEF` sixteen times (PC `constants.rs`,
-/// `TREASURY_OWNER_SENTINEL`) -- which the devnet deployment carries (see
-/// `test_support::payment_channels_fixture`).
+/// `TREASURY_OWNER_SENTINEL`). No public deployment carries it -- devnet's
+/// is [`TREASURY_OWNER_DEVNET`] -- but a localnet build of the source does.
 pub const TREASURY_OWNER_PLACEHOLDER: [u8; 32] = [
     0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF,
     0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF,
@@ -59,9 +74,12 @@ pub const TREASURY_OWNER_PLACEHOLDER: [u8; 32] = [
 /// built with, in the order a caller should try them: the program id is the
 /// same on every cluster, so which one a deployment holds is not derivable
 /// from anything a caller has.
-pub fn treasury_owner_candidates() -> [Pubkey; 2] {
+pub fn treasury_owner_candidates() -> [Pubkey; 3] {
     [
         TREASURY_OWNER_MAINNET
+            .parse()
+            .expect("a literal base58 address"),
+        TREASURY_OWNER_DEVNET
             .parse()
             .expect("a literal base58 address"),
         Pubkey::new_from_array(TREASURY_OWNER_PLACEHOLDER),
@@ -903,9 +921,31 @@ mod tests {
 
     #[test]
     fn the_treasury_owners_are_the_builds_own() {
-        let [mainnet, placeholder] = treasury_owner_candidates();
+        let [mainnet, devnet, placeholder] = treasury_owner_candidates();
         assert_eq!(mainnet.to_string(), TREASURY_OWNER_MAINNET);
+        assert_eq!(devnet.to_string(), TREASURY_OWNER_DEVNET);
         assert_eq!(&placeholder.to_bytes()[..4], &[0xBE, 0xEF, 0xBE, 0xEF]);
+    }
+
+    /// The treasury account devnet's `distribute` accepted in simulation for
+    /// channel `EVcXWJPa…jpJ`, whose mint is an SPL Token mint (#1520): the
+    /// devnet owner's canonical ATA of that mint, which is what
+    /// [`distribute_instruction`] passes.
+    #[test]
+    fn the_devnet_owner_names_the_treasury_account_devnet_accepted() {
+        let mint: Pubkey = "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU"
+            .parse()
+            .unwrap();
+        let [_, devnet, _] = treasury_owner_candidates();
+        assert_eq!(
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &devnet,
+                &mint,
+                &spl_token::id(),
+            )
+            .to_string(),
+            "Fcax2uKeDYKAFiDufeeMPj5EP9wxBZJgNRhfQV3b5bye"
+        );
     }
 
     #[test]
