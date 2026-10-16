@@ -355,15 +355,54 @@ derived: a pair may hold several. A peering is two, one each way (ADR 0075).
 _Avoid_: channel (when ambiguous with a route or a stream)
 
 **Claim**:
-A signed statement of a payment channel's cumulative state, handed from payer to payee.
-Each claim supersedes the last, so a lost claim costs nothing and a replayed claim gains
-nothing. Every claim is a **voucher** ([ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)).
+A signed statement of a cumulative amount, handed from payer to payee, against something that
+holds value for the payee: a payment channel or an **allowance**. Each claim supersedes the last,
+so a lost claim costs nothing and a replayed claim gains nothing. A claim on a channel is a
+**voucher** ([ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md));
+a claim on an allowance is an **allowance claim** (#1511).
 Since #1384 a `toon-channel` claim — one with no `scheme`, or `scheme: "toon-channel"`, the scheme
 ADR 0075 retires — is refused by name at the client edge and on both peer carriages.
 _Avoid_: receipt, payment, balance proof; `toon-channel` (retired, ADR 0075)
 
 **Voucher**:
-A claim under x402's `batch-settlement` scheme (ADR 0074, ADR 0075) — the only kind.
+A claim under x402's `batch-settlement` scheme (ADR 0074, ADR 0075) — the only kind of claim on a
+payment channel, and the only kind a peer ever sends.
+_Avoid_: voucher for an **allowance claim**
+
+**Zk note**:
+A deposit in a vault that its owner spends by proving that some unspent note in the vault covers an
+amount, without saying which. Bound to one **zk edge**. What proves the spend is the vault's
+**proof program**, checked against its verification key.
+_Avoid_: shielded balance, private channel; circuit (for the proof program — a circuit is the overlay's)
+
+**Zk edge**:
+A connector whose client edge accepts payment from a **zk note**. It learns that a payment was made
+and how much, never by whom; it pays every hop beyond it with its own vouchers, as any connector does.
+
+**Allowance**:
+A budget a **zk edge** grants against one proof that a zk note covers it: an amount from a published
+set of tiers, a session key and an expiry. Opened by one proof, paid down by allowance claims, closed
+once, and charged once. Packets within one allowance can be linked to each other; packets across
+allowances cannot.
+_Avoid_: session (overloaded with the BTP session), credit, tab
+
+**Allowance claim**:
+A claim on an **allowance**, signed by its session key. It obeys a voucher's rules — a cumulative
+amount strictly above the watermark, an increase that covers the packet's charge — and never exceeds
+the allowance's budget.
+_Avoid_: session voucher, zk voucher
+
+**Open budget**:
+The sum of the budgets of a **zk edge**'s open allowances: what it may have paid downstream on the
+strength of proofs before any state advance is charged. Bounded by a cap the operator sets; an
+allowance that would exceed it is refused. The one place the risk **exposure** named returns, and
+only at a zk edge.
+_Avoid_: exposure (retired, ADR 0033), credit line, float
+
+**State advance**:
+The zk edge's signature over a zk note's next state once an allowance closes: the note's old balance
+less exactly the allowance's charge. It is what lets the payer spend the remainder.
+_Avoid_: receipt, refund
 
 **Sponsor**:
 A connector's Solana settlement key, in the seats it takes on a client's x402 `batch-settlement`
