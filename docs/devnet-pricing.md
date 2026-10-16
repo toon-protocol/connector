@@ -29,10 +29,11 @@ Three tiers, and only the first is committed anywhere.
 | A **forwarded** leg's price and fee                      | runtime peer-route state on the box, in its state volume — committed nowhere, **by design** | nothing; a runtime row is not a committed fact |
 | What any box is charging **right now**                   | the box                                                                                     | the free self-description, below               |
 
-The second tier is the one that surprises people, so it is worth saying plainly: the relay's
-`g.toon.relay.store` and `g.toon.relay.gas` legs, and the gas box's route back to `g.toon.relay`,
-appear in **no** committed file in any repository. They are established over the operator surface
-(`POST /peers`, then `POST /routes/peers` —
+The second tier is the one that surprises people, so it is worth saying plainly: a forwarded leg
+appears in **no** committed file in any repository. (The devnet has none since 2026-10-16 — its one
+connector terminates every prefix itself, below — but until then the relay's `g.toon.relay.store`
+and `g.toon.relay.gas` legs, and the gas box's route back to `g.toon.relay`, were exactly that.)
+They are established over the operator surface (`POST /peers`, then `POST /routes/peers` —
 [ADR 0058](adr/0058-a-peering-is-established-from-a-url.md),
 [ADR 0034](adr/0034-a-runtime-peer-route-table-never-shadows-the-config-file.md)) and live in
 `runtime-peers.json` beside the box's state. Each bundle says so in its own comments and explains
@@ -43,22 +44,30 @@ back with `GET /peers`; a `"source"` of `"runtime"` is that arrangement working.
 
 One host and no apex — the apex (`toon`) was destroyed 2026-08-14 (#872, toon-meta#313). `g.toon`
 remains the namespace root in the wire protocol, and nothing answers at it. The host is the Linode
-labelled `relay` (infra ADR 0001: the devnet is one host, and every node keeps its own connector):
-every hostname below is served by the one Caddy edge that host runs, not by a separate box per row.
+labelled `relay` (infra ADR 0001), behind one Caddy edge.
 
-| Node           | Public hostname                         | Terminates                                | Authority                                                                                                    |
-| -------------- | --------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| relay          | `proxy.relay.devnet.toonprotocol.dev`   | `g.toon.relay`, `g.toon.relay.ephemeral`  | [`toon-protocol/relay`](https://github.com/toon-protocol/relay) `deploy/connector.toml`                      |
-| store (`ario`) | `proxy.ario.devnet.toonprotocol.dev`    | `g.toon.store`, `g.toon.relay.store`      | [`toon-protocol/store`](https://github.com/toon-protocol/store) `deploy/connector.toml.template`             |
-| gas-station    | `proxy.gas.devnet.toonprotocol.dev`     | `g.toon.gas`, `g.toon.relay.gas`          | [`toon-protocol/gas-station`](https://github.com/toon-protocol/gas-station) `deploy/connector.toml.template` |
-| gateway        | `proxy.gateway.devnet.toonprotocol.dev` | no priced route — a free Gateway Handover | [`toon-protocol/gateway`](https://github.com/toon-protocol/gateway) `deploy/`                                |
-| faucet         | `faucet.devnet.toonprotocol.dev`        | — no connector at all                     | `infra/linode-faucet/` in **this** repository                                                                |
+Since 2026-10-16 that host runs **one connector**, the relay's, at `https://toonprotocol.dev/ilp`
+(relay#270, infra#57). It terminates every devnet app's prefix itself, so every devnet price is
+committed in one file: [`toon-protocol/relay`](https://github.com/toon-protocol/relay)
+`deploy/connector.toml`. The store, gas-station, gateway and Echo Merchant repositories still deploy
+their apps from their own `deploy/` bundles, but run no connector on the devnet.
 
-`ario` is a **node label and a DNS name**, and since store#109 (2026-08-27) it is nothing else:
-the store node terminates `g.toon.store`, and a probe for `g.toon.ario` is a `404`. The two are
-easy to conflate precisely because the hostname still carries the older name — the node's own
-`[node].http_endpoint` is `https://proxy.ario.devnet.toonprotocol.dev/ilp` while its
-`[node].addresses` are `g.toon.store` and `g.toon.relay.store`. See "Retired names" below.
+| App           | Terminated by the one connector as                      | App's repository                                                                |
+| ------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| relay         | `g.toon.relay`, `g.toon.relay.ephemeral`                | [`toon-protocol/relay`](https://github.com/toon-protocol/relay)                 |
+| store         | `g.toon.store`, `g.toon.relay.store`                    | [`toon-protocol/store`](https://github.com/toon-protocol/store)                 |
+| gas-station   | `g.toon.gas`, `g.toon.gas.quote`, `g.toon.relay.gas`    | [`toon-protocol/gas-station`](https://github.com/toon-protocol/gas-station)     |
+| gateway       | `g.toon.workload-gateway.handover` — a free handover    | [`toon-protocol/gateway`](https://github.com/toon-protocol/gateway)             |
+| Echo Merchant | `g.toon.echo`                                           | [`toon-protocol/echo-merchant`](https://github.com/toon-protocol/echo-merchant) |
+| faucet        | — no connector at all, `faucet.devnet.toonprotocol.dev` | `infra/linode-faucet/` in **this** repository                                   |
+
+The old per-node names (`proxy.relay.devnet`, `proxy.ario.devnet`, `proxy.gas.devnet`,
+`proxy.gateway.devnet`, `proxy.echo.devnet`) still reach the same one connector, as transitional
+aliases on the edge; use `toonprotocol.dev`.
+
+`ario` was a **node label and a DNS name**, and since store#109 (2026-08-27) nothing else: the
+store terminates `g.toon.store`, and a probe for `g.toon.ario` is a `404`. See "Retired names"
+below.
 
 The faucet is the one node whose deploy this repository still owns, and
 [ADR 0068](adr/0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md)
@@ -94,7 +103,8 @@ hop's `price − fee` is at least the next hop's price
 hold **at every length**: the bases must clear the fee **and** each hop's slope must be at least the
 next hop's, or a large enough packet erodes to a shortfall the small ones never revealed.
 
-The live relay→store leg is the worked example, and it satisfies both halves:
+The relay→store leg, live until the devnet moved to one connector on 2026-10-16, is the worked
+example, and it satisfied both halves:
 
 ```
 relay  g.toon.relay.store   base 1001, per_kib 10   forwards over the peering
@@ -110,8 +120,8 @@ the figures above are worth writing down even though this file does not own them
 
 ### `g.toon` answers nothing
 
-It is the namespace root, not an address. Every box terminates its own prefixes directly for its
-own clients; there is no hop in front of any of them.
+It is the namespace root, not an address. The devnet's one connector terminates every prefix
+directly for its own clients; there is no hop in front of it.
 
 ## Ask the box, do not read a table
 
@@ -225,14 +235,14 @@ hand-maintained buffer like `2000`.
 ## Retired names
 
 - **`g.toon.ario`** — retired by store#109 (2026-08-27), which renamed the store box's terminating
-  prefix and its `[node].addresses` to `g.toon.store`. It is now a **box label and a DNS name only**:
-  the edge is still `proxy.ario.devnet.toonprotocol.dev`, and a price probe for `g.toon.ario` there
-  is a `404`. Note the direction of travel — this file's predecessor recorded `g.toon.store` as the
-  retired alias and `g.toon.ario` as the survivor, which is what it was between 2026-08-05 and
-  store#109. A shipped client compiled against `g.toon.ario`
-  (`desktop/src/shared/api/toonTransportConfig.ts`, buzz's `storeDestination`) reaches nothing; the
-  name to compile in is `g.toon.store`, or `g.toon.relay.store` for a client that only ever learned
-  the relay box.
+  prefix and its `[node].addresses` to `g.toon.store`. It survived as a box label and a DNS name
+  only — `proxy.ario.devnet.toonprotocol.dev`, now an alias of the one connector at
+  `toonprotocol.dev` — and a price probe for `g.toon.ario` is a `404`. Note the direction of
+  travel — this file's predecessor recorded `g.toon.store` as the retired alias and `g.toon.ario`
+  as the survivor, which is what it was between 2026-08-05 and store#109. A shipped client
+  compiled against `g.toon.ario` (`desktop/src/shared/api/toonTransportConfig.ts`, buzz's
+  `storeDestination`) reaches nothing; the name to compile in is `g.toon.store`, or
+  `g.toon.relay.store` for a client that only ever learned the relay box.
 
 - **`g.toon.relay.ario`** — retired by #820 alongside the apex-era alias. It was never actually
   reachable: the apex's Rust route table only ever declared `g.toon.relay` and `g.toon.ario`, so

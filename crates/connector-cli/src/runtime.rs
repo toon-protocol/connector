@@ -1590,7 +1590,7 @@ fn client_claim_gate(
 ///
 ///   * the three `[node]` fields are **configured**, because no process can
 ///     introspect them: a container sees `0.0.0.0:4000`, never
-///     `https://proxy.ario.devnet.toonprotocol.dev/ilp`;
+///     `https://toonprotocol.dev/ilp`;
 ///   * `peer_carriages` is `peer_expose`, i.e. which listeners this node
 ///     opens. **Which** carriages exist, never **who** rides them -- peer
 ///     identities and per-peering terms are operator-private (ND-09);
