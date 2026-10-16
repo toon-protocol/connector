@@ -46,10 +46,18 @@ pub const OPEN_SLOT_WINDOW: u64 = 1_500;
 /// so a caller must name the one its deployment was built with.
 pub const TREASURY_OWNER_MAINNET: &str = "Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP";
 
+/// The `TREASURY_OWNER` the devnet deployment of `CHNLx…` carries: its dump
+/// (SHA-256 `acdb3abfc818a7350e876db42253d465fe31f5d52da0259c7ef3806191b3cf8b`)
+/// holds these 32 bytes in its constants block, and holds neither the mainnet
+/// owner nor the placeholder. Upstream agrees: solana-foundation/payment-channels,
+/// branch `feat/solex-channels`, commit `f23711f3`, `Solex.toml`,
+/// `[channels.nightly]` (`cluster = "devnet"`) sets this `treasury_owner`.
+pub const TREASURY_OWNER_DEVNET: &str = "4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap";
+
 /// The placeholder `TREASURY_OWNER` a build without `mainnet-beta` ships
 /// with, `0xBE 0xEF` sixteen times (PC `constants.rs`,
-/// `TREASURY_OWNER_SENTINEL`) -- which the devnet deployment carries (see
-/// `test_support::payment_channels_fixture`).
+/// `TREASURY_OWNER_SENTINEL`) -- which a local or default-features build
+/// carries. The devnet deployment does not (see [`TREASURY_OWNER_DEVNET`]).
 pub const TREASURY_OWNER_PLACEHOLDER: [u8; 32] = [
     0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF,
     0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF, 0xBE, 0xEF,
@@ -59,9 +67,12 @@ pub const TREASURY_OWNER_PLACEHOLDER: [u8; 32] = [
 /// built with, in the order a caller should try them: the program id is the
 /// same on every cluster, so which one a deployment holds is not derivable
 /// from anything a caller has.
-pub fn treasury_owner_candidates() -> [Pubkey; 2] {
+pub fn treasury_owner_candidates() -> [Pubkey; 3] {
     [
         TREASURY_OWNER_MAINNET
+            .parse()
+            .expect("a literal base58 address"),
+        TREASURY_OWNER_DEVNET
             .parse()
             .expect("a literal base58 address"),
         Pubkey::new_from_array(TREASURY_OWNER_PLACEHOLDER),
@@ -903,8 +914,9 @@ mod tests {
 
     #[test]
     fn the_treasury_owners_are_the_builds_own() {
-        let [mainnet, placeholder] = treasury_owner_candidates();
+        let [mainnet, devnet, placeholder] = treasury_owner_candidates();
         assert_eq!(mainnet.to_string(), TREASURY_OWNER_MAINNET);
+        assert_eq!(devnet.to_string(), TREASURY_OWNER_DEVNET);
         assert_eq!(&placeholder.to_bytes()[..4], &[0xBE, 0xEF, 0xBE, 0xEF]);
     }
 
