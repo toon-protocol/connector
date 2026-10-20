@@ -600,6 +600,11 @@ says devnet's binary carries — gives `dbfdc5f1…92db`, not devnet's hash, and
 of that commit is refused by its own build-time assert on the placeholder. No later commit touches
 `program/`. So devnet runs a build of unknown provenance, under a single key.
 
+> **Correction (2026-10, #1520).** Devnet's binary does not carry the placeholder `TREASURY_OWNER`;
+> its constants block holds `4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap`, and the fixture note
+> that this passage cites was wrong. Upstream `feat/solex-channels` @ `f23711f3` (`Solex.toml`,
+> `[channels.nightly]`, `cluster = "devnet"`) sets that owner and is the likely origin of devnet's build.
+
 **What this means for this record.** Mainnet — where a third party's value sits — runs the audited
 source under a 3-of-5 multisig with no time lock: an upgrade needs three of five keys and takes
 effect at once, with no window in which a node could withdraw first. Devnet is weaker on both
