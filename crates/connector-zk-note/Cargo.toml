@@ -1,0 +1,26 @@
+[package]
+name = "connector-zk-note"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Zk-note primitives (ADR 0080): Poseidon, tags, derivations, the balance commitment and the Mina Schnorr state signature, byte-identical to the reference implementation."
+
+# Pure: no I/O, no clock, no dependency on any connector crate, so the wallet and the
+# challenger outside this repository can depend on it too. Every proof-systems crate is
+# pinned by git `rev` to ab84160f, the commit the live Mina daemon 4.0.0-mainnet-mesa
+# pins (tag 0.7.0 less two commits). It is not a tag. One build serves one Mina era; a
+# repin comes with a regenerated fixtures/parity.json. No JavaScript prover dependency may appear here (ADR 0080's
+# falsifiers).
+[dependencies]
+ark-ec = { version = "0.5", default-features = false }
+ark-ff = { version = "0.5", default-features = false }
+mina-curves = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386" }
+mina-hasher = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386" }
+mina-poseidon = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386" }
+mina-signer = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386" }
+o1-utils = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386" }
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"
+sha2 = "0.10"
