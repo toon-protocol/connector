@@ -18,12 +18,14 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{TimeZone, Utc};
+use connector_config::StaticRoute;
 use connector_domain::{Prepare, Reject};
 use connector_runtime::{Connector, FakeAppClient, InProcessPeerTransport, PeerRoute, TestClock};
 use connector_signer::{LocalSigner, Signer};
 use tower::ServiceExt;
 
 const ACCUMULATED_COST_HEADER: &str = "toon-accumulated-cost";
+const REJECT_REASON_HEADER: &str = "toon-reject-reason";
 
 fn test_clock() -> Arc<TestClock> {
     Arc::new(TestClock::new(
@@ -150,6 +152,55 @@ async fn a_reject_relayed_through_a_paying_hop_reports_that_hops_fee() {
     // this hop's own fee -- one figure, no breakdown (ADR 0011).
     assert_eq!(reject.code.as_str(), "F02");
     assert_eq!(reported, Some(7));
+}
+
+/// Issue #1532: a reject reason is attached only by the connector that
+/// raised the reject. An `F03` a peer raised -- here a priced termination
+/// the peer arrival did not cover -- reaches the client with its cost and
+/// no `toon-reject-reason`, because this connector never invents one.
+#[tokio::test]
+async fn an_f03_relayed_from_a_peer_reports_its_cost_and_no_reason() {
+    let second_hop = Arc::new(Connector::new(
+        vec![StaticRoute::new_priced("g.example.app", "http://localhost:4000", 1_000).unwrap()],
+        vec![],
+        Arc::new(FakeAppClient::new()),
+        Arc::new(InProcessPeerTransport::new()),
+        test_clock(),
+    ));
+    let mut peer_transport = InProcessPeerTransport::new();
+    peer_transport.add_peer("second-hop", second_hop);
+    let connector = Arc::new(covering(
+        Connector::new(
+            vec![],
+            vec![PeerRoute::new("g.example", "second-hop")],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(peer_transport),
+            test_clock(),
+        ),
+        "second-hop",
+    ));
+
+    let response = connector_client_edge::router(connector, test_signer())
+        .oneshot(ilp_request(&prepare("g.example.app")))
+        .await
+        .expect("the router answers");
+
+    assert_eq!(
+        response
+            .headers()
+            .get(ACCUMULATED_COST_HEADER)
+            .map(|value| value.to_str().unwrap().to_string())
+            .as_deref(),
+        Some("1000")
+    );
+    assert_eq!(response.headers().get(REJECT_REASON_HEADER), None);
+    let body = hyper::body::to_bytes(response.into_body())
+        .await
+        .expect("a response body");
+    assert_eq!(
+        Reject::decode(&body).expect("an OER REJECT").code.as_str(),
+        "F03"
+    );
 }
 
 /// ADR 0065 (issue #984) over the surface a client actually reads: two unpaid

@@ -6,7 +6,8 @@ four cases, one per client-edge **reject reason** — `underpayment`, `undercoll
 `amount_over_charge`, `probe_terminates_here` — each pinning the code (`F03`), the cost, the reason,
 the exact `toon-accumulated-cost` / `toon-reject-reason` HTTP header pair and the exact BTP
 protocolData entries. The English message is not pinned. A replayer asserts that a client-edge
-`F03` carries exactly that pair and that any other code carries no `toon-reject-reason`. Before
+`F03` raised for one of those four situations carries exactly that pair and that any other code
+carries no `toon-reject-reason`. Before
 that, **`schema_version` 8** (issue #1429, ADR 0074 decision 3 amended 2026-09-30): an EVM voucher's
 `maxClaimableAmount` widens from `u64` to `u128`, and every `max_claimable_amount` field becomes a
 decimal string rather than a JSON number — invariant 7's own paragraph has the detail. Before that,

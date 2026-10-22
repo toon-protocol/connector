@@ -4916,6 +4916,73 @@ mod tests {
             assert_eq!(reason_header(&response), None);
         }
 
+        /// Issue #1532 over HTTP: a voucher above what the channel can pay
+        /// is `F03` with cost `0` and the reason `undercollateralized` --
+        /// the voucher covers the price, so the move is to top up and resend
+        /// it, which the cost alone could not say.
+        #[tokio::test]
+        async fn an_over_deposit_voucher_carries_the_undercollateralized_reason() {
+            let route =
+                StaticRoute::new_priced("g.example.app", "http://localhost:4000", PRICE).unwrap();
+            let app_client = Arc::new(FakeAppClient::new());
+            let connector = Arc::new(Connector::new(
+                vec![route],
+                vec![],
+                app_client.clone(),
+                Arc::new(InProcessPeerTransport::new()),
+                test_clock(),
+            ));
+            let channels = Arc::new(crate::test_support::FakeBatchSettlement::new(u128::from(
+                PRICE - 1,
+            )));
+            let app = router_with_gate(connector, test_signer(), None, test_gate(channels));
+
+            let request = request_with_claim_header(
+                &sample_prepare("g.example.app"),
+                CLAIM_HEADER,
+                &evm_claim_json(PRICE),
+            );
+            let response = app.oneshot(request).await.unwrap();
+
+            assert_eq!(cost_header(&response), Some(0));
+            assert_eq!(
+                reason_header(&response).as_deref(),
+                Some("undercollateralized")
+            );
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            assert_eq!(Reject::decode(&bytes).unwrap().code.as_str(), "F03");
+            assert!(app_client.deliveries().is_empty());
+        }
+
+        /// Issue #1532 over HTTP: a PREPARE to a priced forwarded
+        /// destination declaring an `amount` above the forwarding charge is
+        /// `F03` with the charge as its cost and the reason
+        /// `amount_over_charge`.
+        #[tokio::test]
+        async fn an_amount_over_the_forwarding_charge_carries_its_reason() {
+            let connector = Arc::new(Connector::new(
+                vec![],
+                vec![PeerRoute::new_priced("g.example.far", "second-hop", PRICE)],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                test_clock(),
+            ));
+            let app = router_with_gate(connector, test_signer(), None, test_gate(test_channels()));
+            let mut prepare = sample_prepare("g.example.far");
+            prepare.amount = PRICE + 1;
+
+            let request = request_with_claim_header(&prepare, CLAIM_HEADER, &evm_claim_json(PRICE));
+            let response = app.oneshot(request).await.unwrap();
+
+            assert_eq!(cost_header(&response), Some(PRICE));
+            assert_eq!(
+                reason_header(&response).as_deref(),
+                Some("amount_over_charge")
+            );
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            assert_eq!(Reject::decode(&bytes).unwrap().code.as_str(), "F03");
+        }
+
         /// ADR 0011: probing traverses the network for free, so it is
         /// accepted only from a sender holding a channel this connector
         /// recognizes. A probe presenting nothing is not authorized, and
