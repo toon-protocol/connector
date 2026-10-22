@@ -283,6 +283,12 @@ key_file = "/app/data/signer.key"
 # to this node without naming a destination; the endpoint is what lets a
 # client pick a carriage. Not dialable by peers until `peer_expose` is set
 # (docs/guide/peering.md).
+#
+# `http_endpoint` is published as written and a payer dials it as written, so
+# 127.0.0.1 only works for a payer on this same host. When the node is exposed,
+# change it to the absolute URL a payer outside this host dials: a public
+# https:// URL behind a TLS proxy, or a .anyone address. The node warns at boot
+# while it names a loopback or container host.
 [node]
 addresses     = ["{address}"]
 http_endpoint = "http://127.0.0.1:3000/ilp"

@@ -36,6 +36,13 @@ and simply leaves `btp_endpoint` out; a BTP node writes both; and with `"neither
 (the default) a `[node]` naming only `addresses` is legal and still answers
 `GET /ilp`, it is just not dialable.
 
+Published endpoints are **absolute** URLs, and a payer dials them exactly as written,
+so each must be reachable from wherever the payers are. A loopback address
+(`127.0.0.1`, `localhost`), `0.0.0.0`, or a bare container name like `node-a` works
+only for payers on the same host or docker network; the node logs a warning at boot
+for each such endpoint, and still starts. For payers elsewhere, publish the public
+`https://` (or `wss://`) URL in front of the node.
+
 For a local or pre-TLS trial only, add `peer_allow_plaintext_endpoints = true` at
 the top level so `http://`/`ws://` endpoints are accepted too — every deployed
 config should stay on `https://`/`wss://`.
