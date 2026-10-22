@@ -692,6 +692,15 @@ pub enum BatchSettlementError {
     #[error("{0} is not deployed on this chain")]
     NotDeployed(String),
 
+    /// The chain's RPC endpoint refused a read (HTTP 403 or 429) after the
+    /// transport had retried it with backoff (ADR 0073 decision 5). Kept
+    /// apart from [`Backend`](BatchSettlementError::Backend) so a watch loop
+    /// can say so once while an endpoint keeps refusing, instead of once per
+    /// cycle. `endpoint` is `scheme://host[:port]`, never the URL, which may
+    /// carry an API key.
+    #[error("batch-settlement RPC endpoint {endpoint} refused the request with HTTP {status}")]
+    Refused { endpoint: String, status: u16 },
+
     #[error("batch-settlement backend error: {0}")]
     Backend(String),
 }

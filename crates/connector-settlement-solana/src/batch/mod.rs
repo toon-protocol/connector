@@ -212,7 +212,7 @@ impl SolanaBatchSettlement {
         let sponsor_pubkey = sponsor.pubkey();
         let lamports = retry_read(|| rpc.get_balance(&sponsor_pubkey))
             .await
-            .map_err(backend_error)?;
+            .map_err(rpc_error)?;
         if lamports == 0 {
             return Err(BatchSettlementError::Backend(format!(
                 "[settlement.solana] key {sponsor_pubkey} holds no lamports, so it cannot pay for \
@@ -257,7 +257,7 @@ impl SolanaBatchSettlement {
                 .get_account_with_commitment(&receiving, CommitmentConfig::confirmed())
         })
         .await
-        .map_err(backend_error)?;
+        .map_err(rpc_error)?;
         if existing.value.is_some() {
             return Ok(());
         }
@@ -366,7 +366,7 @@ impl SolanaBatchSettlement {
                 .get_account_with_commitment(address, CommitmentConfig::confirmed())
         })
         .await
-        .map_err(backend_error)?;
+        .map_err(rpc_error)?;
         Ok(self.channel_in(response.value))
     }
 
@@ -541,7 +541,7 @@ impl SolanaBatchSettlement {
                 .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
         })
         .await
-        .map_err(|error| SubmitFailure::Other(backend_error(error)))?;
+        .map_err(|error| SubmitFailure::Other(rpc_error(error)))?;
         let transaction = Transaction::new_signed_with_payer(
             instructions,
             Some(&self.sponsor.pubkey()),
@@ -751,6 +751,21 @@ fn address_of(channel: &ChannelId) -> Result<Pubkey, BatchSettlementError> {
 
 fn backend_error(error: impl std::fmt::Display) -> BatchSettlementError {
     BatchSettlementError::Backend(error.to_string())
+}
+
+/// Like [`backend_error`], for an error an RPC read returned: a refusal the
+/// transport reported (HTTP 403 or 429) keeps its endpoint and status, so a
+/// watch loop can recognise it.
+fn rpc_error<E: std::fmt::Display + connector_chain_rpc::AsRefused>(
+    error: E,
+) -> BatchSettlementError {
+    match error.refusal() {
+        Some(refused) => BatchSettlementError::Refused {
+            endpoint: refused.endpoint,
+            status: refused.status,
+        },
+        None => backend_error(error),
+    }
 }
 
 #[async_trait]

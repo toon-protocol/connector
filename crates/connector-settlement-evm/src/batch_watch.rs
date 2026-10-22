@@ -49,7 +49,7 @@ use ethers::middleware::Middleware;
 use ethers::types::Bytes;
 
 use crate::batch_settlement::{
-    backend_error, chain_config, parse_id, signer_config, EvmBatchSettlementBackend,
+    backend_error, chain_config, parse_id, rpc_error, signer_config, EvmBatchSettlementBackend,
 };
 use crate::bindings::x402_batch_settlement::{
     ChannelsCall, ChannelsReturn, Voucher as X402Voucher, VoucherClaim, WithdrawInitiatedFilter,
@@ -58,6 +58,7 @@ use crate::bindings::x402_batch_settlement::{
 use crate::channel_id::format_channel_id;
 use crate::log_query::scoped_event;
 use crate::send::confirm;
+use connector_chain_rpc::{RefusalLog, Refused};
 
 /// How often the watcher reads new `WithdrawInitiated` logs. A
 /// withdrawal's delay is at least this
@@ -143,7 +144,7 @@ impl EvmBatchSettlementBackend {
             .get_block_number()
             .await
             .map(|block| block.as_u64())
-            .map_err(backend_error)
+            .map_err(rpc_error)
     }
 
     /// Every channel a `WithdrawInitiated` in blocks `from..=to` names,
@@ -160,7 +161,7 @@ impl EvmBatchSettlementBackend {
             let logs = withdrawals_initiated_query(&self.contract, start, end)
                 .query()
                 .await
-                .map_err(backend_error)?;
+                .map_err(rpc_error)?;
             for log in logs {
                 let channel = format_channel_id(log.channel_id);
                 if !channels.contains(&channel) {
@@ -190,7 +191,7 @@ impl EvmBatchSettlementBackend {
             let ChannelPresentation::Evm { channel, .. } = &entry.presentation else {
                 continue;
             };
-            let Some(config) = self.config_for(entry).await else {
+            let Some(config) = self.config_for(entry).await? else {
                 continue;
             };
             let Some(id) = parse_id(channel) else {
@@ -280,7 +281,7 @@ impl EvmBatchSettlementBackend {
             .receivers(self.own_address, self.token)
             .call()
             .await
-            .map_err(backend_error)?;
+            .map_err(rpc_error)?;
         let Some(due) = settle_due(total_claimed, total_settled) else {
             return Ok(0);
         };
@@ -297,18 +298,24 @@ impl EvmBatchSettlementBackend {
 
     /// The config `entry`'s channel was presented under, **restoring** it
     /// now if this process has neither admitted nor restored it. `None`,
-    /// logged, when it cannot be.
+    /// logged, when it cannot be; an error only when the endpoint refused.
     ///
     /// Restored, never admitted: the voucher is already accepted, so the
     /// admission rules -- which may have tightened since it was -- have no
     /// say in whether it is claimed (ADR 0074 decision 5).
-    async fn config_for(&self, entry: &HeldVoucher) -> Option<EvmChannelConfig> {
+    async fn config_for(
+        &self,
+        entry: &HeldVoucher,
+    ) -> Result<Option<EvmChannelConfig>, BatchSettlementError> {
         let channel = entry.presentation.channel();
         if let Some(config) = self.admitted_config(channel) {
-            return Some(config);
+            return Ok(Some(config));
         }
         match self.restore(entry.presentation.clone()).await {
-            Ok(state) => self.admitted_config(&state.id),
+            Ok(state) => Ok(self.admitted_config(&state.id)),
+            // A refusal is the endpoint's, not this channel's: it ends the
+            // pass, where the loop reports it once.
+            Err(error @ BatchSettlementError::Refused { .. }) => Err(error),
             Err(error) => {
                 tracing::warn!(
                     %channel,
@@ -316,7 +323,7 @@ impl EvmBatchSettlementBackend {
                     "could not restore a batch-settlement channel this node holds a voucher on; \
                      not claiming it this time"
                 );
-                None
+                Ok(None)
             }
         }
     }
@@ -340,7 +347,7 @@ impl EvmBatchSettlementBackend {
                 .multicall(calls)
                 .call()
                 .await
-                .map_err(backend_error)?;
+                .map_err(rpc_error)?;
             if answers.len() != chunk.len() {
                 return Err(BatchSettlementError::Backend(format!(
                     "x402BatchSettlement's multicall answered {} results for {} calls",
@@ -367,6 +374,8 @@ pub struct EvmBatchWatcher {
     /// The last block whose logs have been read; `None` until the first
     /// watch, which starts from the chain's head.
     cursor: Option<u64>,
+    /// Whether the endpoint is refusing, so [`run`](Self::run) says so once.
+    refusals: RefusalLog,
 }
 
 impl EvmBatchWatcher {
@@ -375,6 +384,7 @@ impl EvmBatchWatcher {
             backend,
             held,
             cursor: None,
+            refusals: RefusalLog::new(),
         }
     }
 
@@ -428,11 +438,16 @@ impl EvmBatchWatcher {
                     "a batch-settlement payer began a withdrawal; claimed its latest voucher and \
                      re-read what the channel still backs"
                 ),
-                Err(error) => tracing::warn!(
-                    %channel,
-                    %error,
-                    "a batch-settlement payer began a withdrawal; could not re-read the channel"
-                ),
+                Err(error) => {
+                    if self.logged_in_full(&error) {
+                        tracing::warn!(
+                            %channel,
+                            %error,
+                            "a batch-settlement payer began a withdrawal; could not re-read the \
+                             channel"
+                        );
+                    }
+                }
             }
         }
         Ok(claimed)
@@ -440,6 +455,21 @@ impl EvmBatchWatcher {
 
     /// Claim every held voucher the chain has not recorded, then settle what
     /// is claimed to this node's address.
+    /// Whether `error` is to be logged as it always was. A refusal is
+    /// reported to [`RefusalLog`] instead, which says so once.
+    fn logged_in_full(&self, error: &BatchSettlementError) -> bool {
+        match error {
+            BatchSettlementError::Refused { endpoint, status } => {
+                self.refusals.refused(&Refused {
+                    endpoint: endpoint.clone(),
+                    status: *status,
+                });
+                false
+            }
+            _ => true,
+        }
+    }
+
     pub async fn sweep_once(&self) -> Result<SweepReport, BatchSettlementError> {
         let claimed = self.backend.claim_held(&self.held.held_vouchers()).await?;
         let settled = self.backend.settle_claimed().await?;
@@ -457,12 +487,26 @@ impl EvmBatchWatcher {
         loop {
             tokio::select! {
                 _ = watch.tick() => {
-                    if let Err(error) = self.watch_once().await {
-                        tracing::warn!(%error, "batch-settlement withdrawal watch failed; retrying");
+                    self.refusals.begin_pass();
+                    match self.watch_once().await {
+                        Ok(_) => self.refusals.end_pass(),
+                        Err(error) => {
+                            if self.logged_in_full(&error) {
+                                tracing::warn!(
+                                    %error,
+                                    "batch-settlement withdrawal watch failed; retrying"
+                                );
+                            }
+                        }
                     }
                 }
                 _ = sweep.tick() => {
-                    match self.sweep_once().await {
+                    self.refusals.begin_pass();
+                    let swept = self.sweep_once().await;
+                    if swept.is_ok() {
+                        self.refusals.end_pass();
+                    }
+                    match swept {
                         Ok(report) if !report.claimed.is_empty() || report.settled > 0 => {
                             tracing::info!(
                                 channels = report.claimed.len(),
@@ -472,7 +516,9 @@ impl EvmBatchWatcher {
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            tracing::warn!(%error, "batch-settlement sweep failed; retrying");
+                            if self.logged_in_full(&error) {
+                                tracing::warn!(%error, "batch-settlement sweep failed; retrying");
+                            }
                         }
                     }
                 }

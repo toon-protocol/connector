@@ -86,7 +86,7 @@ use ethers::types::{Address, BlockNumber, Bytes, TransactionReceipt, U256};
 use ethers::utils::keccak256;
 
 use crate::batch_settlement::{
-    admitted_id, backend_error, chain_config, signer_config, unread_after_write,
+    admitted_id, backend_error, chain_config, rpc_error, signer_config, unread_after_write,
     EvmBatchSettlementBackend, Snapshot,
 };
 use crate::bindings::deposit::DepositToken;
@@ -542,7 +542,7 @@ impl EvmBatchSettlementBackend {
         let separator =
             connector_chain_rpc::retry_read(|| async { token.domain_separator().call().await })
                 .await
-                .map_err(backend_error)?;
+                .map_err(rpc_error)?;
         let nonce = keccak256(encode(&[
             Token::FixedBytes(channel_id.to_vec()),
             Token::Uint(salt),
@@ -587,7 +587,7 @@ impl EvmBatchSettlementBackend {
             token.allowance(self.own_address, permit2).call().await
         })
         .await
-        .map_err(backend_error)?;
+        .map_err(rpc_error)?;
         if allowance < U256::from(amount) {
             self.transact(token.approve(permit2, U256::MAX).tx).await?;
         }
@@ -596,7 +596,7 @@ impl EvmBatchSettlementBackend {
             permit2_domain.domain_separator().call().await
         })
         .await
-        .map_err(backend_error)?;
+        .map_err(rpc_error)?;
 
         let deadline = U256::MAX;
         let permitted = keccak256(encode(&[
@@ -649,7 +649,7 @@ impl EvmBatchSettlementBackend {
     async fn chain_now(&self) -> Result<u64, BatchSettlementError> {
         let block = connector_chain_rpc::retry_read(|| self.client.get_block(BlockNumber::Latest))
             .await
-            .map_err(backend_error)?
+            .map_err(rpc_error)?
             .ok_or_else(|| {
                 BatchSettlementError::Backend("the chain has no latest block".to_string())
             })?;

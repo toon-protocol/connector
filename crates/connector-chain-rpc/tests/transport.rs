@@ -7,8 +7,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use connector_chain_rpc::evm::{answered, EvmRpc};
-use connector_chain_rpc::solana::rpc_client;
-use connector_chain_rpc::{Circuit, FakeRpc, Route, RpcReply, RpcTransport, Timeouts};
+use connector_chain_rpc::solana::{answered as solana_answered, rpc_client};
+use connector_chain_rpc::{
+    retry_read, AsRefused, Circuit, FakeRpc, Refused, Route, RpcReply, RpcTransport, Timeouts,
+    READ_RETRIES, REFUSAL_RETRIES,
+};
 use connector_runtime::{Socks5TestServer, SocksConnect};
 use ethers::providers::Middleware;
 use serde_json::json;
@@ -92,6 +95,95 @@ async fn an_evm_refusal_that_outlasts_its_retries_is_reported_as_one() {
         error.to_string().contains("HTTP 403"),
         "the refusal is named: {error}"
     );
+}
+
+#[tokio::test]
+async fn an_evm_read_that_is_always_refused_costs_one_transports_retries_and_names_the_refusal() {
+    for status in [403, 429] {
+        let rpc = FakeRpc::spawn(move |_| RpcReply::Status(status)).await;
+        let transport = RpcTransport::direct(&rpc.url()).expect("transport");
+        let provider = EvmRpc::provider(transport.clone());
+
+        let error = retry_read(|| provider.get_block_number())
+            .await
+            .expect_err("a permanent refusal");
+        assert_eq!(
+            rpc.calls().len() as u32,
+            1 + REFUSAL_RETRIES,
+            "HTTP {status}: retry_read must not multiply the transport's retries"
+        );
+        assert_eq!(
+            error.refusal(),
+            Some(Refused {
+                endpoint: transport.endpoint(),
+                status
+            })
+        );
+        assert!(!error.to_string().contains("/v2"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn a_solana_read_that_is_always_refused_costs_one_layers_retries_and_names_the_refusal() {
+    // The SDK retries a 429 five times itself; the 403 is the crate's.
+    for (status, requests) in [(429, 6), (403, 1 + REFUSAL_RETRIES as usize)] {
+        let rpc = FakeRpc::spawn(move |_| RpcReply::Status(status)).await;
+        let transport = RpcTransport::direct(&rpc.url()).expect("transport");
+        let client = rpc_client(
+            &transport,
+            RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+        );
+
+        let error = retry_read(|| client.get_slot())
+            .await
+            .expect_err("a permanent refusal");
+        assert_eq!(
+            rpc.calls().len(),
+            requests,
+            "HTTP {status}: one layer's retries and no more"
+        );
+        assert_eq!(
+            error.refusal(),
+            Some(Refused {
+                endpoint: transport.endpoint(),
+                status
+            })
+        );
+        // A refusal is never the node's answer, so a confirmation poll that
+        // meets one keeps polling.
+        assert!(!solana_answered(&error));
+    }
+}
+
+#[tokio::test]
+async fn a_solana_429_that_clears_inside_the_sdks_retries_is_served() {
+    let rpc = FakeRpc::spawn(|call| {
+        if call.nth < 2 {
+            RpcReply::Status(429)
+        } else {
+            RpcReply::Result(json!(7))
+        }
+    })
+    .await;
+    let transport = RpcTransport::direct(&rpc.url()).expect("transport");
+    let client = rpc_client(
+        &transport,
+        RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+    );
+
+    assert_eq!(client.get_slot().await.expect("served after two 429s"), 7);
+}
+
+#[tokio::test]
+async fn a_read_whose_connection_is_dropped_is_still_retried_every_time() {
+    let rpc = FakeRpc::spawn(|_| RpcReply::Drop).await;
+    let provider = EvmRpc::provider(RpcTransport::direct(&rpc.url()).expect("transport"));
+
+    let error = retry_read(|| provider.get_block_number())
+        .await
+        .expect_err("a connection that never answers");
+    assert_eq!(error.refusal(), None);
+    assert_eq!(rpc.calls().len() as u32, 1 + READ_RETRIES);
 }
 
 #[tokio::test]

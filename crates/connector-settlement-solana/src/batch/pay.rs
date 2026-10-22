@@ -81,7 +81,7 @@ use solana_sdk::signature::{Signature, Signer};
 use solana_sdk::transaction::VersionedTransaction;
 
 use super::sweep::SponsoredChannel;
-use super::{backend_error, sponsor, state_of, wire, SolanaBatchSettlement, CHAIN};
+use super::{backend_error, rpc_error, sponsor, state_of, wire, SolanaBatchSettlement, CHAIN};
 use crate::submit::Confirmed;
 
 /// How long a post to a counterparty's sponsor endpoint may take. The
@@ -326,7 +326,7 @@ impl SolanaBatchSettlement {
                 .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
         })
         .await
-        .map_err(backend_error)?;
+        .map_err(rpc_error)?;
         let message = VersionedMessage::V0(
             v0::Message::try_compile(
                 sponsor,
@@ -504,7 +504,7 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
                 .get_slot_with_commitment(CommitmentConfig::confirmed())
         })
         .await
-        .map_err(backend_error)?;
+        .map_err(rpc_error)?;
         let payer = self.settlement_key();
         let open = wire::OpenChannel {
             payer,
@@ -599,7 +599,7 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
                 .get_block_height_with_commitment(CommitmentConfig::confirmed())
         })
         .await
-        .map_err(backend_error)?;
+        .map_err(rpc_error)?;
         if let Some(account) = self.read(&channel).await? {
             if !self.built_as_recorded(&channel, &account, &receiver, deposit_units) {
                 return Err(not_as_built(&account));

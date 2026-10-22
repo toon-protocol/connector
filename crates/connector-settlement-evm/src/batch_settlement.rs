@@ -162,7 +162,7 @@ impl EvmBatchSettlementBackend {
         let contract_address = Address::from(X402_BATCH_SETTLEMENT_ADDRESS);
         let code = connector_chain_rpc::retry_read(|| client.get_code(contract_address, None))
             .await
-            .map_err(backend_error)?;
+            .map_err(rpc_error)?;
         if code.as_ref().is_empty() {
             return Err(BatchSettlementError::NotDeployed(format!(
                 "x402BatchSettlement ({contract_address:?})"
@@ -175,7 +175,7 @@ impl EvmBatchSettlementBackend {
                 .await
         })
         .await
-        .map_err(backend_error)?;
+        .map_err(rpc_error)?;
         if on_chain_decimals != expected_decimals {
             return Err(BatchSettlementError::Backend(format!(
                 "[settlement.evm] decimals is {expected_decimals}, but token {token:?} \
@@ -337,7 +337,7 @@ impl EvmBatchSettlementBackend {
         if let Some(block) = block {
             call = call.block(BlockId::Number(BlockNumber::Number(block.into())));
         }
-        let answers = call.call().await.map_err(backend_error)?;
+        let answers = call.call().await.map_err(rpc_error)?;
         let [channel, pending] = answers.as_slice() else {
             return Err(BatchSettlementError::Backend(format!(
                 "x402BatchSettlement's multicall answered {} results for 2 calls",
@@ -626,6 +626,21 @@ fn hex(bytes: &[u8]) -> String {
 
 pub(crate) fn backend_error<E: std::fmt::Display>(error: E) -> BatchSettlementError {
     BatchSettlementError::Backend(error.to_string())
+}
+
+/// Like [`backend_error`], for an error an RPC read returned: a refusal the
+/// transport reported (HTTP 403 or 429) keeps its endpoint and status, so a
+/// watch loop can recognise it.
+pub(crate) fn rpc_error<E: std::fmt::Display + connector_chain_rpc::AsRefused>(
+    error: E,
+) -> BatchSettlementError {
+    match error.refusal() {
+        Some(refused) => BatchSettlementError::Refused {
+            endpoint: refused.endpoint,
+            status: refused.status,
+        },
+        None => backend_error(error),
+    }
 }
 
 #[cfg(test)]
