@@ -318,7 +318,9 @@ price = {PRICE}
     let app = connector_cli::router(&runtime, &config).expect("router");
     let receiver = runtime.signer.public_key().expect("the node's wrap key");
 
-    // The voucher the node already held is claimed all the same.
+    // The voucher the node already held is claimed all the same -- on the
+    // watch's first pass, which fires at boot: the two-day minimum puts the
+    // watch at fifteen minutes, far past this loop.
     let mut claimed = false;
     for _ in 0..200 {
         if x402.channel(&channel).await == (DEPOSIT, u128::from(2 * PRICE)) {

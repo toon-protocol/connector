@@ -149,8 +149,11 @@ chain. On EVM, the node claims every held voucher in one `claim` and then
 `WithdrawInitiated`, and the moment a payer starts a withdrawal it claims that
 channel's latest voucher. That matters because only the amount already
 claimed on chain survives the withdrawal. On Solana, the node `settle`s open
-channels every ten minutes. It rediscovers its sponsored channels from the
-chain every ten seconds. On a closing channel it lands the latest voucher with
+channels every ten minutes, or on the next watch pass after that. It
+rediscovers its sponsored channels from the chain ninety times inside the
+node's minimum grace period, at least every ten seconds and at most every
+fifteen minutes: fifteen at the one-day default. The EVM withdrawal watch
+runs at the same rate off `min_withdraw_delay_secs`. On a closing channel it lands the latest voucher with
 `settle_and_seal` inside the grace period, then `distribute`s, then
 `reclaim`s the rent. The one-day minimum delay is how long a delayed or
 censored transaction still has to land. `POST /channels/:id/land` is the

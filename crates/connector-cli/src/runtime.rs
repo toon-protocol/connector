@@ -1491,13 +1491,14 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
 /// on neither chain starts nothing.
 ///
 /// - EVM: [`EvmBatchWatcher`] reads `WithdrawInitiated` every
-///   [`watch_interval`] of the node's `min_withdraw_delay_secs` and claims the latest voucher on a
-///   withdrawing channel at once, and every [`BATCH_SWEEP_INTERVAL`] claims
-///   every held voucher in one `claim` and then `settle`s.
+///   [`watch_interval`] of the node's `min_withdraw_delay_secs` and claims
+///   the latest voucher on a withdrawing channel at once, and every
+///   [`BATCH_SWEEP_INTERVAL`] claims every held voucher in one `claim` and
+///   then `settle`s.
 /// - Solana: [`SolanaBatchWatcher`] rediscovers every sponsored channel every
-///   [`watch_interval`] of the node's `min_grace_period_secs` -- sealing a Closing one with its latest
-///   voucher, distributing a Sealed one, reclaiming a Distributed one's rent
-///   -- and settles Open ones every [`OPEN_SETTLE_INTERVAL`]. The Open settle
+///   [`watch_interval`] of the node's `min_grace_period_secs` -- sealing a
+///   Closing one with its latest voucher, distributing a Sealed one,
+///   reclaiming a Distributed one's rent -- and settles Open ones every [`OPEN_SETTLE_INTERVAL`]. The Open settle
 ///   check runs only on a watch pass, so a longer watch rounds it up to the
 ///   next pass.
 ///

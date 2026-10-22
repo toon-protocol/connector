@@ -6,6 +6,7 @@
 //! contract suite (ADR 0007) and the in-memory fake every higher-level test
 //! runs over. `connector-settlement-evm` and `connector-settlement-solana`
 //! hold their chain-backed implementations to the same suite, unmodified.
+//! [`watch_interval`] is the one rule both chains' watchers pass at.
 //!
 //! No chain SDK, RPC client or transaction appears in this crate; they
 //! belong to the two settlement crates above.

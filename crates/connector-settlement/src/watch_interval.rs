@@ -37,6 +37,8 @@ mod tests {
     use proptest::prelude::*;
 
     const ONE_DAY: u64 = 86_400;
+    /// The shortest delay config admits on either chain.
+    const X402_MINIMUM_DELAY: u64 = 900;
 
     #[test]
     fn the_floor_delay_watches_every_ten_seconds() {
@@ -48,18 +50,37 @@ mod tests {
         assert_eq!(watch_interval(ONE_DAY), MAX_WATCH_INTERVAL);
     }
 
+    #[test]
+    fn the_floor_is_the_x402_minimum_delay_over_the_passes() {
+        assert_eq!(
+            MIN_WATCH_INTERVAL.as_secs() * WATCH_PASSES_PER_MINIMUM_DELAY,
+            X402_MINIMUM_DELAY
+        );
+    }
+
+    // Uniform over all of `u64` almost every draw lands far above the
+    // ceiling's 81 000 seconds, so each property also samples the region
+    // where the division, not a clamp, decides the interval.
+    fn delay() -> impl Strategy<Value = u64> {
+        prop_oneof![0u64..=200_000, any::<u64>()]
+    }
+
+    fn admitted_delay() -> impl Strategy<Value = u64> {
+        prop_oneof![X402_MINIMUM_DELAY..=200_000, X402_MINIMUM_DELAY..=u64::MAX]
+    }
+
     proptest! {
         #[test]
-        fn always_within_the_bounds(min in any::<u64>()) {
-            let i = watch_interval(min);
-            prop_assert!(i >= MIN_WATCH_INTERVAL && i <= MAX_WATCH_INTERVAL);
+        fn always_within_the_bounds(min in delay()) {
+            let interval = watch_interval(min);
+            prop_assert!(interval >= MIN_WATCH_INTERVAL && interval <= MAX_WATCH_INTERVAL);
         }
 
         #[test]
-        fn ninety_passes_fit_unless_clamped_at_the_ceiling(min in 900u64..=u64::MAX) {
-            let i = watch_interval(min);
-            if i < MAX_WATCH_INTERVAL {
-                prop_assert!(min / i.as_secs() >= WATCH_PASSES_PER_MINIMUM_DELAY);
+        fn ninety_passes_fit_unless_clamped_at_the_ceiling(min in admitted_delay()) {
+            let interval = watch_interval(min);
+            if interval < MAX_WATCH_INTERVAL {
+                prop_assert!(min / interval.as_secs() >= WATCH_PASSES_PER_MINIMUM_DELAY);
             }
         }
     }
