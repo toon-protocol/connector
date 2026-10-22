@@ -46,7 +46,7 @@ pub use controller_keys::{
 pub use denomination::{DeclaredToken, DenominationConfig, QuoteLeg, QuotePath, RateRow};
 pub use error::ConfigError;
 pub use identity::ClientIdentityConfig;
-pub use node::{is_host_local_endpoint, NodeConfig};
+pub use node::NodeConfig;
 pub use operator::OperatorConfig;
 pub use pay_channel::PayChannelConfig;
 pub use peer::{

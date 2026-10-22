@@ -169,7 +169,7 @@ impl NodeConfig {
 /// name with no dot, which is usually a container name. Onion endpoints are
 /// never host-local; that rule is [`is_onion_endpoint`], not a second copy.
 #[must_use]
-pub fn is_host_local_endpoint(url: &Url) -> bool {
+fn is_host_local_endpoint(url: &Url) -> bool {
     if is_onion_endpoint(url) {
         return false;
     }
@@ -634,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn the_boot_warning_names_the_field_and_value() {
+    fn host_local_endpoints_names_each_flagged_field() {
         let mut written = raw();
         written.http_endpoint = Some("http://127.0.0.1:3000/ilp".into());
         written.btp_endpoint = Some("ws://connector:3001/btp".into());
