@@ -15,6 +15,7 @@
 //! #1385): every channel is an x402 channel.
 
 pub mod batch;
+pub mod watch_interval;
 
 /// A payment channel's identifier, opaque to everything above this port:
 /// the canonical `evm:0x…` or `solana:…` key of an x402 channel.
