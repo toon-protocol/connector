@@ -833,6 +833,7 @@ mod tests {
                         message: "the operator surface answered this dial".to_string(),
                         data: Vec::new(),
                         accumulated_cost: 0,
+                        reason: None,
                     }
                     .encode(),
                 )

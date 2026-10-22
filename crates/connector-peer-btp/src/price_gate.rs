@@ -313,6 +313,7 @@ pub fn payment_required(
                 ClientRouteKind::Terminated => required,
                 ClientRouteKind::Forwarded => 0,
             },
+            reason: None,
         },
         // A peering has no bootstrap identity to advertise and no client
         // session to lease: the peer already knows this node, and what it

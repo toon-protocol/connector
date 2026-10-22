@@ -222,6 +222,7 @@ impl PeerHttpState {
                     message: "no peer route for this interaction".to_string(),
                     data: Vec::new(),
                     accumulated_cost: 0,
+                    reason: None,
                 })),
                 ClaimAckOutcome::NotSent,
             );

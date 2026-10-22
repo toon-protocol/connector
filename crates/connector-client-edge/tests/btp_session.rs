@@ -476,6 +476,7 @@ async fn a_claimless_prepare_to_a_priced_route_is_refused_with_the_terms() {
         pd(&answer, "toon-accumulated-cost"),
         Some(PRICE.to_string().as_bytes())
     );
+    assert_eq!(pd(&answer, "toon-reject-reason"), None);
     let terms: serde_json::Value =
         serde_json::from_slice(pd(&answer, "payment-required").expect("the terms ride along"))
             .expect("the terms are the §1.4 JSON");
@@ -696,6 +697,37 @@ async fn a_replayed_claim_is_refused_with_the_http_taxonomy() {
     let reject = Reject::decode(&second.ilp_packet).expect("an OER REJECT");
     assert_eq!(reject.code.as_str(), "F01");
     assert_eq!(pd(&second, "toon-accumulated-cost"), Some(b"0".as_slice()));
+    // An `F01` is not one of the `F03` situations: no reason (#1532).
+    assert_eq!(pd(&second, "toon-reject-reason"), None);
+}
+
+/// Issue #1532, BTP-shaped: an underpaying voucher is `F03` with the charge
+/// as its cost and the reason `underpayment`, as it is over HTTP.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_underpaying_voucher_carries_the_underpayment_reason_over_btp() {
+    let (addr, signer) = serve_edge().await;
+    let mut session = connect(addr).await;
+    let claim = evm_claim_json(PRICE - 1);
+    send(
+        &mut session,
+        btp_message(
+            1,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &sealed_prepare("g.test.app", &signer.public_key().unwrap()).encode(),
+        ),
+    )
+    .await;
+    let answer = next_answer(&mut session).await;
+    let reject = Reject::decode(&answer.ilp_packet).expect("an OER REJECT");
+    assert_eq!(reject.code.as_str(), "F03");
+    assert_eq!(
+        pd(&answer, "toon-accumulated-cost"),
+        Some(PRICE.to_string().as_bytes())
+    );
+    assert_eq!(
+        pd(&answer, "toon-reject-reason"),
+        Some(b"underpayment".as_slice())
+    );
 }
 
 /// Issue #869, BTP-shaped: a packet refused for its envelope's own target

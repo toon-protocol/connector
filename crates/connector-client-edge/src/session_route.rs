@@ -343,6 +343,7 @@ fn reject_overlapping_termination(destination: &str) -> PacketResponse {
             .to_string(),
         data: Vec::new(),
         accumulated_cost: 0,
+        reason: None,
     })
 }
 
@@ -354,6 +355,7 @@ fn undecodable_session_answer() -> Reject {
             .to_string(),
         data: Vec::new(),
         accumulated_cost: 0,
+        reason: None,
     }
 }
 

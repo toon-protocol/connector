@@ -437,6 +437,7 @@ fn unreachable_at(peer_id: &str, endpoint: &Url) -> PeerForward {
             message: format!("peer '{peer_id}' unreachable at {endpoint}"),
             data: Vec::new(),
             accumulated_cost: 0,
+            reason: None,
         }),
         ..PeerForward::unreachable(peer_id)
     }
@@ -649,6 +650,7 @@ mod tests {
             message: "No payment channel claim attached".to_string(),
             data: Vec::new(),
             accumulated_cost: 0,
+            reason: None,
         }
     }
 
