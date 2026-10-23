@@ -50,8 +50,9 @@ request pays for itself.**
   A dedicated peer listener is permitted as defence in depth, but role is still
   decided by the channel binding and the claim, never by which listener the bytes
   arrived on (`peer-carriage-spec.md` §1.10).
-- **The body limit is 2 MiB and is deliberately not a config knob**
-  (`client-edge-spec.md` §1.1). `POST /ilp/probe` is a second ingress with the
+- **A body is read up to the node's request limit, which is deliberately not a config knob**
+  ([ADR 0082](../../adr/0082-a-route-may-raise-the-request-limit-to-carry-its-payload-limit.md);
+  `client-edge-spec.md` §1.1): 2 MiB unless a route's `max_bytes` raises it. `POST /ilp/probe` is a second ingress with the
   same framing, gated by channel recognition and a per-channel rate limit
   answering `403`
   ([ADR 0011](../../adr/0011-rejects-accumulate-fees-and-probes-discover-cost.md)).

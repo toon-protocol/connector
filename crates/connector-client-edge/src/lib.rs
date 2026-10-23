@@ -63,7 +63,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -397,6 +397,7 @@ pub fn router_with_node_facts(
     peers: Option<Arc<PeerCarriages>>,
     identities: Arc<[ConfiguredIdentity]>,
 ) -> Router {
+    let request_limit = connector.request_limit().bytes();
     let state = Arc::new(ClientEdgeState {
         connector,
         signer,
@@ -414,9 +415,22 @@ pub fn router_with_node_facts(
         // endpoint. One address, two methods, and **never a `POST` for the
         // document** (ND-03) -- a self-description endpoint that grows a
         // write is purchasable peering through a side door (ADR 0043).
-        .route("/ilp", post(handle_ilp).get(self_description))
+        //
+        // ADR 0082: the two routes that read a PREPARE read up to the
+        // node's request limit -- 2 MiB, axum's own default, unless a
+        // route's `max_bytes` raises it. The BTP upgrade reads the same
+        // figure off the connector for its messages.
+        .route(
+            "/ilp",
+            post(handle_ilp)
+                .get(self_description)
+                .layer(DefaultBodyLimit::max(request_limit)),
+        )
         .route("/ilp/btp", get(btp::handle_btp_upgrade))
-        .route("/ilp/probe", post(handle_probe))
+        .route(
+            "/ilp/probe",
+            post(handle_probe).layer(DefaultBodyLimit::max(request_limit)),
+        )
         .route("/ilp/identity", get(identity))
         .route("/ilp/routes/price", get(route_price))
         .route("/ilp/claim-state", post(claim_state::claim_state))
@@ -4483,6 +4497,108 @@ mod tests {
                 "an at-limit packet fulfils"
             );
             assert_eq!(app_client.deliveries().len(), 1);
+        }
+
+        /// A node with one route at `max_bytes` (or none), whose app answers
+        /// `ok`, behind a gate that accepts the test channels' claims.
+        fn router_over_one_route(
+            max_bytes: Option<u64>,
+        ) -> (Router, Arc<FakeAppClient>, PublicKeyBytes) {
+            let signer = test_signer();
+            let receiver = signer.public_key().unwrap();
+            let route = StaticRoute::new_priced("g.example.app", "http://localhost:4000", 100)
+                .unwrap()
+                .with_max_bytes(max_bytes.and_then(connector_domain::PayloadLimit::new));
+            let app_client = Arc::new(FakeAppClient::new());
+            app_client.respond(route.handler_url(), answered(b"ok"));
+            let connector = Arc::new(
+                Connector::new(
+                    vec![route],
+                    vec![],
+                    app_client.clone(),
+                    Arc::new(InProcessPeerTransport::new()),
+                    test_clock(),
+                )
+                .with_identity_signer(signer.clone()),
+            );
+            let gate = crate::test_support::gate_over(
+                Arc::new(InMemoryJournal::new()) as Arc<dyn connector_runtime::Journal>,
+                &test_channels(),
+            );
+            (
+                router_with_gate(connector, signer, None, gate),
+                app_client,
+                receiver,
+            )
+        }
+
+        const MIB: usize = 1024 * 1024;
+
+        /// ADR 0082 (issue #1529): a route whose `max_bytes` is above 2 MiB
+        /// raises the node's request limit, so a `POST /ilp` larger than
+        /// axum's default reaches the app whole.
+        #[tokio::test]
+        async fn a_route_above_2_mib_takes_a_request_larger_than_2_mib() {
+            let (app, app_client, receiver) = router_over_one_route(Some(4 * MIB as u64));
+            let body = vec![b'x'; 3 * MIB];
+            let (prepare, _) = sealed_sample_prepare_with_body("g.example.app", &body, &receiver);
+
+            let response = app
+                .oneshot(request_with_claim_header(
+                    &prepare,
+                    CLAIM_HEADER,
+                    &evm_claim_json(100),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            assert!(
+                Fulfill::decode(&bytes).is_ok(),
+                "a 3 MiB packet fulfils, got {:?}",
+                Reject::decode(&bytes)
+            );
+            let deliveries = app_client.deliveries();
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(deliveries[0].request.body, body, "the app gets every byte");
+        }
+
+        /// ADR 0082: the raised limit is still a limit -- a body past what the
+        /// largest route admits is refused `413` before it is decoded.
+        #[tokio::test]
+        async fn a_request_past_the_raised_limit_is_refused_413() {
+            let (app, app_client, _) = router_over_one_route(Some(4 * MIB as u64));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/ilp")
+                .body(Body::from(vec![0u8; 5 * MIB]))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert!(app_client.deliveries().is_empty());
+        }
+
+        /// ADR 0082: a node whose routes raise nothing reads exactly what it
+        /// read before the record -- 2 MiB on `POST /ilp` and on
+        /// `POST /ilp/probe` alike.
+        #[tokio::test]
+        async fn a_node_whose_routes_raise_nothing_still_refuses_past_2_mib() {
+            for max_bytes in [None, Some(4096)] {
+                for path in ["/ilp", "/ilp/probe"] {
+                    let (app, _, _) = router_over_one_route(max_bytes);
+                    let request = Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::from(vec![0u8; 2 * MIB + 1]))
+                        .unwrap();
+                    let response = app.oneshot(request).await.unwrap();
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "{path} with max_bytes = {max_bytes:?}"
+                    );
+                }
+            }
         }
 
         /// ADR 0065 (issue #984) at the seam that actually takes the money:

@@ -29,7 +29,9 @@ Two things decide what you can charge for:
   packet, which is longer than the body your app receives: set it to your app's
   own limit and a body just under that limit is refused; set it higher and a body
   just over it still reaches your app's `413`. Clients read it as `maxBytes`
-  beside the route's price.
+  beside the route's price. It is also how a route sells a request larger than
+  the 2 MiB a node reads by default: a `max_bytes` up to 64 MiB raises the node's
+  limit far enough to carry it, and the app must accept a body that large too.
 - **The trailing slash on `handler_url` is load-bearing**, and a request's target
   is resolved _beneath_ the handler's path — an absolute path, a `..` segment, a
   scheme or an authority is refused before your app is touched.

@@ -1291,12 +1291,12 @@ price = 1000
         assert_eq!(config.routes()[1].max_bytes(), None);
     }
 
-    /// ADR 0081: a zero limit refuses every payload, and a limit above the
-    /// client edge's own body limit can never be reached -- both are refused
-    /// by name rather than loaded.
+    /// ADR 0081: a zero limit refuses every payload. ADR 0082: a limit above
+    /// 64 MiB would raise the node's request limit further than a route may
+    /// -- both are refused by name rather than loaded.
     #[test]
-    fn refuses_a_payload_limit_of_zero_or_above_the_carriage() {
-        for (value, expected) in [("0", "max_bytes = 0"), ("2097153", "2097152")] {
+    fn refuses_a_payload_limit_of_zero_or_above_64_mib() {
+        for (value, expected) in [("0", "max_bytes = 0"), ("67108865", "67108864")] {
             let error = with_key_file(|key_path| {
                 format!(
                     r#"
@@ -1321,6 +1321,46 @@ max_bytes = {value}
                 "max_bytes = {value}: got {error}"
             );
         }
+    }
+
+    /// ADR 0082: a route may declare `max_bytes` up to 64 MiB, beside a
+    /// route that declares a small one.
+    #[test]
+    fn loads_a_payload_limit_up_to_64_mib() {
+        let load = |max_bytes: &str| {
+            with_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[[routes]]
+prefix = "g.example.upload"
+handler_url = "http://localhost:5000"
+price = 1000
+{max_bytes}
+
+[[routes]]
+prefix = "g.example.quotes"
+handler_url = "http://localhost:5001"
+price = 1000
+max_bytes = 4096
+"#,
+                    key_path.display()
+                )
+            })
+            .expect("load")
+        };
+
+        assert_eq!(load("").routes()[0].max_bytes(), None);
+        let raised = load("max_bytes = 67108864");
+        assert_eq!(
+            raised.routes()[0].max_bytes(),
+            PayloadLimit::new(64 * 1024 * 1024)
+        );
+        assert_eq!(raised.routes()[1].max_bytes(), PayloadLimit::new(4096));
     }
 
     /// A price table exists only to carry a slope, so omitting `per_kib` is

@@ -90,20 +90,22 @@ connector's own app, not an unaffiliated payer — and is out of scope for this 
 application/octet-stream`. An ILP-level outcome — fulfilled or rejected — is always HTTP 200;
   a non-2xx status is reserved for a transport-level failure and never carries an OER body:
 
-  | Status | Meaning                                                                          |
-  | ------ | -------------------------------------------------------------------------------- |
-  | `400`  | Malformed request: not a PREPARE, undecodable OER, oversized body.               |
-  | `401`  | An `ILP-Peer-Id` was presented but authentication failed. Answered before        |
-  |        | the route is looked up, so it never arrives as a `402` instead. See §1.2.        |
-  | `402`  | Unpaid request to a route this connector terminates and prices: x402 v2          |
-  |        | payment-required terms, JSON body (not OER). See §1.4.                           |
-  | `403`  | A probe (`POST /ilp/probe`) from a sender not authorized to probe: no            |
-  |        | payment channel this connector recognizes, or over its rate limit. See §1.6.     |
-  | `413`  | Request body too large. There is no config field for this: the limit is          |
-  |        | axum's own `DefaultBodyLimit` (2 MiB), which this router does not override. A    |
-  |        | route's own, lower `max_bytes` is not this: it is a `200` + `F00` REJECT (§1.3). |
-  | `500`  | Reserved by this spec for transport failure only; an unexpected                  |
-  |        | internal error during routing is surfaced as a `200` + `T00` REJECT, not a 500.  |
+  | Status | Meaning                                                                         |
+  | ------ | ------------------------------------------------------------------------------- |
+  | `400`  | Malformed request: not a PREPARE, or undecodable OER.                           |
+  | `401`  | An `ILP-Peer-Id` was presented but authentication failed. Answered before       |
+  |        | the route is looked up, so it never arrives as a `402` instead. See §1.2.       |
+  | `402`  | Unpaid request to a route this connector terminates and prices: x402 v2         |
+  |        | payment-required terms, JSON body (not OER). See §1.4.                          |
+  | `403`  | A probe (`POST /ilp/probe`) from a sender not authorized to probe: no           |
+  |        | payment channel this connector recognizes, or over its rate limit. See §1.6.    |
+  | `413`  | Request body over the node's request limit (ADR 0082): 2 MiB, or the largest    |
+  |        | route `max_bytes` plus 64 KiB of framing, whichever is larger. It is derived    |
+  |        | from the routes, not set by a key of its own, and `POST /ilp/probe` reads at    |
+  |        | the same figure. A route's `max_bytes` is checked after this, on the decoded    |
+  |        | PREPARE: a packet within this limit but over it is a `200` + `F00` (§1.3).      |
+  | `500`  | Reserved by this spec for transport failure only; an unexpected                 |
+  |        | internal error during routing is surfaced as a `200` + `T00` REJECT, not a 500. |
 
 ### 1.2 Identity
 
@@ -998,6 +1000,10 @@ retired with the field, [ADR 0057](../adr/0057-minimum-delivery-is-retired-a-cla
 - **Method/path:** `GET /ilp/btp`, websocket upgrade. The `btp` subprotocol is selected when
   offered; an upgrade offering no subprotocol is accepted identically.
 - **Frames:** binary websocket messages, one BTP frame per message. Text frames are ignored.
+- **Message limit:** one message, and one websocket frame, may be up to 64 MiB plus 64 KiB — the
+  largest request limit any node can have (ADR 0082), never a library default. It is fixed rather
+  than the node's own request limit because responses ride the same socket. A larger message ends
+  the session, with every request in flight on it.
 
 **BTP frame layout** (all integers big-endian; this is the `@toon-protocol/client`
 `btp/protocol.ts` dialect, which is the deployed client wire, extended additively with RFC-23's
