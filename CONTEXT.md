@@ -533,9 +533,17 @@ packet cost.
 The largest sealed payload a route accepts — its `max_bytes`, measured on the same length its
 **price** is charged on ([ADR 0081](docs/adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md)).
 A packet over it is refused `F00` before any claim for it is taken, so it costs its sender nothing,
-and the limit is published wherever the price is. It can lower the carriage's own body limit, never
-raise it. Not to be confused with the **cap**, which bounds a packet's _amount_ at a peering.
+and the limit is published wherever the price is. One above 2 MiB raises the node's **request
+limit** to carry it. Not to be confused with the **cap**, which bounds a packet's _amount_ at a peering.
 _Avoid_: ceiling (a retired term, above), size cap
+
+**Request limit**:
+The largest request body a node reads before it can see which route a packet is for — a
+`POST /ilp` body — derived from its routes: 2 MiB, or the largest **payload limit** plus 64 KiB of
+framing ([ADR 0082](docs/adr/0082-a-route-may-raise-the-request-limit-to-carry-its-payload-limit.md)).
+Over it, a body is refused `413`. There is no key for it. A BTP socket reads at a fixed figure
+instead, the largest request limit any node can have, since responses share the socket.
+_Avoid_: max request size
 
 **Cost**:
 What a caller must send for a packet to be delivered: the fees of every hop that carries it, plus

@@ -9,6 +9,10 @@
 //! is a property of carriage, so every gate that charges a price can refuse
 //! on the same figure, before it opens anything -- and the sender, which
 //! sealed the wrap, knows it before it sends.
+//!
+//! [`RequestLimit`] is the other half (ADR 0082, issue #1529): the largest
+//! request either client carriage *reads* before it can see which route a
+//! packet is for, derived from those same limits.
 
 use std::num::NonZeroU64;
 
@@ -44,6 +48,77 @@ impl PayloadLimit {
         u64::try_from(payload_len).is_ok_and(|len| len <= self.max_bytes())
     }
 }
+
+/// The largest `max_bytes` a route may declare (ADR 0082): 64 MiB. A route
+/// above the 2 MiB a node accepts by default raises the node's
+/// [`RequestLimit`] to carry it, and this bounds how far one route can raise
+/// it.
+pub const MAX_PAYLOAD_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// The largest request body a node reads -- a `POST /ilp` or
+/// `POST /ilp/probe` body, from a client or a peer (ADR 0082).
+///
+/// It is read before the packet is decoded, so before the route is known,
+/// and is therefore one figure for the node: the default 2 MiB, or enough to
+/// carry the largest packet any of the node's routes admits, whichever is
+/// larger. A node whose routes declare no `max_bytes` above 2 MiB reads
+/// exactly what it read before the record.
+///
+/// A BTP socket does not read at this figure: requests and responses share
+/// it, so it reads at [`BTP_MESSAGE_LIMIT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestLimit(usize);
+
+impl RequestLimit {
+    /// 2 MiB: axum's own `DefaultBodyLimit`, the `POST /ilp` limit of every
+    /// node before ADR 0082.
+    pub const DEFAULT: RequestLimit = RequestLimit(2 * 1024 * 1024);
+
+    /// What a request carries beyond its packet's payload. On HTTP that is
+    /// the PREPARE's own OER framing -- at most about 1.1 KiB, most of it a
+    /// 1023-byte destination. On BTP it is that plus the frame's header and
+    /// its other protocol-data entries, a claim among them, which run to a
+    /// few KiB. 64 KiB covers both with room to spare.
+    pub const FRAMING_ALLOWANCE: usize = 64 * 1024;
+
+    /// The request limit a node whose routes declare `limits` reads at.
+    pub fn covering(limits: impl IntoIterator<Item = PayloadLimit>) -> RequestLimit {
+        let largest = limits
+            .into_iter()
+            .map(|limit| usize::try_from(limit.max_bytes()).unwrap_or(usize::MAX))
+            .max()
+            .map_or(0, |max_bytes| {
+                max_bytes.saturating_add(Self::FRAMING_ALLOWANCE)
+            });
+        RequestLimit(largest.max(Self::DEFAULT.0))
+    }
+
+    /// The limit, in bytes.
+    pub const fn bytes(&self) -> usize {
+        self.0
+    }
+}
+
+impl Default for RequestLimit {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The largest websocket message, and frame, any BTP socket reads, accepted
+/// or dialed (ADR 0082): the largest [`RequestLimit`] any node can have.
+///
+/// A fixed figure rather than the node's own request limit, because a socket
+/// cannot tell a request from a response until it has read it, and a
+/// FULFILL carries the app's whole response, which no `max_bytes` bounds.
+/// It equals tungstenite's 64 MiB message default plus the framing
+/// allowance, so no session that read a message before the record refuses
+/// it now; what changes is that the figure is chosen here.
+pub const BTP_MESSAGE_LIMIT: usize = MAX_PAYLOAD_LIMIT as usize + RequestLimit::FRAMING_ALLOWANCE;
+
+// Never below tungstenite's own 64 MiB message default, which every BTP
+// socket read at before the record.
+const _: () = assert!(BTP_MESSAGE_LIMIT >= 64 * 1024 * 1024);
 
 /// The refusal for a packet to `destination` whose payload is `payload_len`
 /// bytes, under a route whose limit is `limit` -- `None` when the route sets
@@ -103,23 +178,91 @@ mod tests {
         assert_eq!(refuse_oversize(None, "g.any", usize::MAX), None);
     }
 
+    /// A PREPARE carrying exactly `max_bytes` of payload to the longest
+    /// destination RFC 0015 allows -- the largest packet a route with that
+    /// limit admits.
+    fn largest_admitted_prepare(max_bytes: u64) -> Vec<u8> {
+        crate::Prepare {
+            amount: u64::MAX,
+            expires_at: chrono::Utc::now(),
+            greeting: false,
+            destination: "g".repeat(1023),
+            data: vec![0; usize::try_from(max_bytes).unwrap()],
+        }
+        .encode()
+    }
+
+    #[test]
+    fn a_node_whose_routes_raise_nothing_keeps_the_two_mib_body_limit() {
+        assert_eq!(RequestLimit::covering([]).bytes(), 2 * 1024 * 1024);
+        let small = PayloadLimit::new(4096).unwrap();
+        assert_eq!(RequestLimit::covering([small]).bytes(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_largest_route_limit_sets_the_request_limit() {
+        let small = PayloadLimit::new(4096).unwrap();
+        let large = PayloadLimit::new(8 * 1024 * 1024).unwrap();
+        let limit = RequestLimit::covering([small, large]);
+        assert!(limit.bytes() > 8 * 1024 * 1024);
+        assert_eq!(limit, RequestLimit::covering([large, small]));
+    }
+
+    #[test]
+    fn the_largest_packet_a_route_admits_fits_its_request_limit() {
+        for max_bytes in [1, 2 * 1024 * 1024, 5 * 1024 * 1024 + 7, MAX_PAYLOAD_LIMIT] {
+            let limit = RequestLimit::covering([PayloadLimit::new(max_bytes).unwrap()]);
+            let packet = largest_admitted_prepare(max_bytes);
+            assert!(
+                packet.len() <= limit.bytes(),
+                "a {}-byte PREPARE for max_bytes = {max_bytes} exceeds {}",
+                packet.len(),
+                limit.bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn a_btp_socket_reads_the_largest_request_any_node_can_take() {
+        let largest = RequestLimit::covering([PayloadLimit::new(MAX_PAYLOAD_LIMIT).unwrap()]);
+        assert_eq!(BTP_MESSAGE_LIMIT, largest.bytes());
+    }
+
     proptest! {
         #[test]
-        fn a_payload_at_the_limit_is_admitted(max_bytes in 1u64..=(64 * 1024 * 1024)) {
+        fn a_request_limit_never_falls_below_two_mib(
+            limits in proptest::collection::vec(1u64..=MAX_PAYLOAD_LIMIT, 0..8),
+        ) {
+            let limits = limits.into_iter().filter_map(PayloadLimit::new);
+            prop_assert!(RequestLimit::covering(limits).bytes() >= 2 * 1024 * 1024);
+        }
+
+        #[test]
+        fn a_request_limit_covers_every_route_limit(
+            limits in proptest::collection::vec(1u64..=MAX_PAYLOAD_LIMIT, 1..8),
+        ) {
+            let request = RequestLimit::covering(limits.iter().copied().filter_map(PayloadLimit::new));
+            for max_bytes in limits {
+                prop_assert!(request.bytes() as u64 > max_bytes);
+            }
+        }
+
+        #[test]
+        fn a_payload_at_the_limit_is_admitted(max_bytes in 1u64..=MAX_PAYLOAD_LIMIT) {
             let limit = PayloadLimit::new(max_bytes);
             let at = usize::try_from(max_bytes).unwrap();
             prop_assert_eq!(refuse_oversize(limit, "g.a", at), None);
         }
 
         #[test]
-        fn a_payload_one_under_the_limit_is_admitted(max_bytes in 1u64..=(64 * 1024 * 1024)) {
+        fn a_payload_one_under_the_limit_is_admitted(max_bytes in 1u64..=MAX_PAYLOAD_LIMIT) {
             let limit = PayloadLimit::new(max_bytes);
             let under = usize::try_from(max_bytes - 1).unwrap();
             prop_assert_eq!(refuse_oversize(limit, "g.a", under), None);
         }
 
         #[test]
-        fn a_payload_one_over_the_limit_is_refused_f00(max_bytes in 1u64..=(64 * 1024 * 1024)) {
+        fn a_payload_one_over_the_limit_is_refused_f00(max_bytes in 1u64..=MAX_PAYLOAD_LIMIT) {
             let limit = PayloadLimit::new(max_bytes);
             let over = usize::try_from(max_bytes + 1).unwrap();
             let reject = refuse_oversize(limit, "g.a", over);

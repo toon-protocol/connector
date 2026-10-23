@@ -797,6 +797,74 @@ async fn a_claim_covering_a_packet_over_the_payload_limit_is_never_spent_over_bt
     Fulfill::decode(&second.ilp_packet).expect("the unspent claim still pays");
 }
 
+const MIB: usize = 1024 * 1024;
+
+/// ADR 0082 (issue #1529), BTP-shaped: a route whose `max_bytes` is above
+/// 2 MiB is carried over BTP too, past tungstenite's own 16 MiB frame
+/// default, which a session no longer reads at.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_above_2_mib_takes_a_message_larger_than_the_library_default_over_btp() {
+    let route = StaticRoute::new_priced("g.test.app", "http://localhost:4000", PRICE)
+        .unwrap()
+        .with_max_bytes(connector_domain::PayloadLimit::new(20 * MIB as u64));
+    let app_client = Arc::new(FakeAppClient::new());
+    let (addr, signer) = serve_edge_with_route(route, app_client.clone()).await;
+    let mut session = connect(addr).await;
+
+    let body = vec![b'x'; 17 * MIB];
+    let envelope = EnvelopeRequest {
+        method: "POST".to_string(),
+        target: "/".to_string(),
+        headers: vec![],
+        body: body.clone(),
+    }
+    .encode();
+    let (data, _) =
+        connector_signer::giftwrap::seal_request(&envelope, &signer.public_key().unwrap())
+            .expect("seal");
+    let prepare = Prepare {
+        data,
+        ..sealed_prepare("g.test.app", &signer.public_key().unwrap())
+    };
+
+    send(
+        &mut session,
+        btp_message(
+            1,
+            &[("payment-channel-claim", evm_claim_json(PRICE).as_bytes())],
+            &prepare.encode(),
+        ),
+    )
+    .await;
+    let answer = next_answer(&mut session).await;
+    Fulfill::decode(&answer.ilp_packet).expect("a 17 MiB packet fulfils");
+    let deliveries = app_client.deliveries();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].request.body, body, "the app gets every byte");
+}
+
+/// ADR 0082: a BTP socket reads at `BTP_MESSAGE_LIMIT`, a figure the node
+/// chose, and a message past it ends the session rather than being read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_past_the_btp_message_limit_ends_the_session() {
+    let (addr, _signer) = serve_edge().await;
+    let mut session = connect(addr).await;
+    let oversize = btp_message(1, &[], &vec![0u8; connector_domain::BTP_MESSAGE_LIMIT]);
+    // The far side may close before the whole frame is written; whether the
+    // send itself errors is a race, so only the outcome is asserted.
+    let _ = session.send(WsMessage::Binary(oversize)).await;
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match session.next().await {
+                None | Some(Err(_)) | Some(Ok(WsMessage::Close(_))) => return,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "an oversize message must end the session");
+}
+
 /// Issue #1446, BTP-shaped: a voucher presented with a packet to a
 /// destination nothing will carry is rejected `F02` without being ingested,
 /// on this carriage exactly as on HTTP (§9's no-drift invariant). The

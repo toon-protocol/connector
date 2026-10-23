@@ -264,14 +264,14 @@ pub enum ConfigError {
     )]
     RouteMaxBytesZero { prefix: String },
 
-    /// ADR 0081: a route may lower the carriage's limit, never raise it --
-    /// raising it is issue #1529's decision, not this key's.
+    /// ADR 0082: a route's `max_bytes` raises the node's request limit to
+    /// carry it, and no further than 64 MiB.
     #[error(
-        "route '{prefix}' sets max_bytes = {value}, above the client edge's own {limit}-byte \
-         body limit, so no packet could ever reach it (ADR 0081: max_bytes lowers the \
-         carriage's limit and cannot raise it). Set it to {limit} or less, or omit it"
+        "route '{prefix}' sets max_bytes = {value}, above the {limit}-byte limit a route may \
+         declare (ADR 0082: a route raises the node's request limit to carry its largest \
+         packet, up to this bound). Set it to {limit} or less, or omit it"
     )]
-    RouteMaxBytesAboveCarriage {
+    RouteMaxBytesAboveLimit {
         prefix: String,
         value: u64,
         limit: u64,
