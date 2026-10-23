@@ -16,7 +16,7 @@ use connector_domain::{
     amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_fee, delivery_budget,
     forward_wait_budget, forwarded_expiry, is_expired, is_valid_ilp_address, select_route, AssetId,
     EnvelopeRequest, Fulfill, PacketResponse, Prepare, Price, RateLookup, Reject, RejectCode,
-    FORWARDING_MESSAGE_WINDOW,
+    RejectReason, FORWARDING_MESSAGE_WINDOW,
 };
 use connector_settlement::ChannelId;
 use connector_signer::giftwrap::{derive_fulfillment, open_request, seal_response};
@@ -64,6 +64,7 @@ fn unsealed_termination_reject(message: &str) -> Reject {
         message: message.to_string(),
         data: Vec::new(),
         accumulated_cost: 0,
+        reason: None,
     }
 }
 
@@ -1981,6 +1982,7 @@ impl Connector {
                 message: "prepare has expired".to_string(),
                 data: Vec::new(),
                 accumulated_cost: 0,
+                reason: None,
             });
         }
         None
@@ -2146,6 +2148,7 @@ impl Connector {
                     // hop's, so it states the charge its upstream hops add
                     // their fees to (as `handle_probe` does at the edge).
                     accumulated_cost: charge,
+                    reason: None,
                 });
                 let mut trace = self.trace(&prepare, arrived_from.map(Arrival::Peer));
                 if let Some(trace) = trace.as_mut() {
@@ -2274,6 +2277,10 @@ impl Connector {
                     ),
                     data: Vec::new(),
                     accumulated_cost: price,
+                    // Only a *terminated* route: a priced forward answered
+                    // here is an F03 too, but not this reason's situation.
+                    reason: (route.kind == ClientRouteKind::Terminated)
+                        .then_some(RejectReason::ProbeTerminatesHere),
                 }));
             }
         }
@@ -2341,6 +2348,7 @@ impl Connector {
                     message: format!("no route to destination '{}'", prepare.destination),
                     data: Vec::new(),
                     accumulated_cost: 0,
+                    reason: None,
                 }),
                 trace,
                 None,
@@ -2545,6 +2553,7 @@ impl Connector {
             ),
             data: Vec::new(),
             accumulated_cost: 0,
+            reason: None,
         };
 
         // A node with no table at all is a node that declared no rate for
@@ -2570,6 +2579,7 @@ impl Connector {
                     ),
                     data: Vec::new(),
                     accumulated_cost: 0,
+                    reason: None,
                 });
             }
             RateLookup::NotDeclared => return Err(undeclared()),
@@ -2605,6 +2615,7 @@ impl Connector {
                     ),
                     data: Vec::new(),
                     accumulated_cost: threshold,
+                    reason: None,
                 })
             }
             None => Err(Reject {
@@ -2618,6 +2629,7 @@ impl Connector {
                 ),
                 data: Vec::new(),
                 accumulated_cost: 0,
+                reason: None,
             }),
         }
     }
@@ -2842,6 +2854,7 @@ impl Connector {
                         // way back, so the sender reads the least amount that
                         // gets past this hop. `R01` marks a partial sum.
                         accumulated_cost: fee,
+                        reason: None,
                     });
                 };
                 forwarded_amount
@@ -2880,6 +2893,7 @@ impl Connector {
                 ),
                 data: Vec::new(),
                 accumulated_cost: 0,
+                reason: None,
             });
         }
 
@@ -2923,6 +2937,7 @@ impl Connector {
                 ),
                 data: Vec::new(),
                 accumulated_cost: 0,
+                reason: None,
             });
         };
 
@@ -2971,6 +2986,7 @@ impl Connector {
                     message: format!("cannot cover a peer PREPARE to '{peer_id}': {reason}"),
                     data: Vec::new(),
                     accumulated_cost: 0,
+                    reason: None,
                 });
             }
         };
@@ -3337,6 +3353,7 @@ impl Connector {
             ),
             data: Vec::new(),
             accumulated_cost: 0,
+            reason: None,
         }
     }
 
@@ -3642,6 +3659,7 @@ impl Connector {
                     message: format!("envelope did not decode: {error}"),
                     data: Vec::new(),
                     accumulated_cost: termination.charge,
+                    reason: None,
                 });
             }
         };
@@ -3674,6 +3692,7 @@ impl Connector {
                 ),
                 data: Vec::new(),
                 accumulated_cost: 0,
+                reason: None,
             });
         };
 
@@ -3720,6 +3739,7 @@ impl Connector {
                 ),
                 data: Vec::new(),
                 accumulated_cost: termination.charge,
+                reason: None,
             });
         };
 
@@ -3746,6 +3766,7 @@ impl Connector {
                 message,
                 data: Vec::new(),
                 accumulated_cost: 0,
+                reason: None,
             }),
             // Issue #596: distinguishable from both an undecodable envelope
             // (F01, above) and an app's own answer -- including a 404,
@@ -3759,6 +3780,7 @@ impl Connector {
                 message,
                 data: Vec::new(),
                 accumulated_cost: 0,
+                reason: None,
             }),
         }
     }
@@ -6107,6 +6129,7 @@ mod tests {
                     message: "carried, and the far end had nowhere to put it".to_string(),
                     data: Vec::new(),
                     accumulated_cost: 0,
+                    reason: None,
                 }),
                 ClaimAckOutcome::NotSent,
             )
@@ -7178,6 +7201,7 @@ mod tests {
                     message: "carried, and the far end had nowhere to put it".to_string(),
                     data: Vec::new(),
                     accumulated_cost: self.quotes,
+                    reason: None,
                 }),
                 ClaimAckOutcome::NotSent,
             )
@@ -9452,6 +9476,7 @@ mod tests {
                                 message: "refused".to_string(),
                                 data: Vec::new(),
                                 accumulated_cost: 0,
+                                reason: None,
                             }),
                             ack,
                         )
@@ -10291,6 +10316,7 @@ mod tests {
                             message: "pay".to_string(),
                             data: Vec::new(),
                             accumulated_cost: self.states,
+                            reason: None,
                         }),
                         ClaimAckOutcome::NotSent,
                         // What the forwarded packet itself carries: a retry

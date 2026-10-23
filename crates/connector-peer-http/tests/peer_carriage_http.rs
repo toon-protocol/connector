@@ -1153,6 +1153,7 @@ async fn a_response_carrying_no_ack_header_leaves_the_voucher_not_acknowledged()
                     message: String::new(),
                     data: Vec::new(),
                     accumulated_cost: 0,
+                    reason: None,
                 }
                 .encode(),
             );
@@ -1191,6 +1192,7 @@ async fn a_malformed_ack_header_leaves_the_voucher_not_acknowledged() {
                     message: String::new(),
                     data: Vec::new(),
                     accumulated_cost: 0,
+                    reason: None,
                 }
                 .encode(),
             );

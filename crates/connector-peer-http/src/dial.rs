@@ -354,6 +354,7 @@ fn peer_not_dialable(peer_id: &str) -> PacketResponse {
         ),
         data: Vec::new(),
         accumulated_cost: 0,
+        reason: None,
     })
 }
 
@@ -375,6 +376,7 @@ fn dial_failed(peer_id: &str, endpoint: &Url) -> PacketResponse {
         message: format!("peer '{peer_id}' unreachable at {endpoint}"),
         data: Vec::new(),
         accumulated_cost: 0,
+        reason: None,
     })
 }
 
@@ -496,6 +498,7 @@ impl HttpPeerTransport {
                 message: "No payment channel claim attached".to_string(),
                 data: Vec::new(),
                 accumulated_cost: terms.price().unwrap_or_default(),
+                reason: None,
             };
             return PeerForward::quoted(
                 PacketResponse::Reject(reject),

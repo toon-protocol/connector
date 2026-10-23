@@ -77,7 +77,8 @@ use connector_domain::client_claim::ClientClaim;
 use connector_domain::identity::{anonymous_identity, resolve_identity, ConfiguredIdentity};
 use connector_domain::{
     agreed_required_transport, published_required_transport, EdgeIdentity, NodeFacts,
-    NodeSelfDescription, PacketResponse, Prepare, Price, Reject, RejectCode, RoutePrice,
+    NodeSelfDescription, PacketResponse, Prepare, Price, Reject, RejectCode, RejectReason,
+    RoutePrice,
 };
 use connector_runtime::{ClientRouteFacts, ClientRouteKind, Connector, ProbeDenied};
 use connector_signer::nip59::{unwrap_claim, WrappedClaim};
@@ -141,6 +142,7 @@ const PAYMENT_REQUIRED_HEADER: &str = connector_btp::PAYMENT_REQUIRED_HEADER;
 /// payload. Decimal `uint64`, present on every REJECT this edge answers
 /// with (issue #548).
 const ACCUMULATED_COST_HEADER: &str = connector_btp::ACCUMULATED_COST_HEADER;
+const REJECT_REASON_HEADER: &str = connector_btp::REJECT_REASON_HEADER;
 /// client-edge-spec.md §1.2: a configured peer names itself with this
 /// header. Its absence is what makes a request anonymous -- a first-class
 /// path, not a fallback.
@@ -1024,18 +1026,29 @@ pub fn packet_response(response: PacketResponse) -> Response {
             fulfill.encode(),
         )
             .into_response(),
-        PacketResponse::Reject(reject) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, OCTET_STREAM),
-                (
-                    header::HeaderName::from_static(ACCUMULATED_COST_HEADER),
-                    reject.accumulated_cost.to_string().as_str(),
-                ),
-            ],
-            reject.encode(),
-        )
-            .into_response(),
+        PacketResponse::Reject(reject) => {
+            let mut response = (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, OCTET_STREAM),
+                    (
+                        header::HeaderName::from_static(ACCUMULATED_COST_HEADER),
+                        reject.accumulated_cost.to_string().as_str(),
+                    ),
+                ],
+                reject.encode(),
+            )
+                .into_response();
+            // `Toon-Reject-Reason` (§1.6, issue #1532): only on a reject this
+            // connector raised itself, beside the cost.
+            if let Some(reason) = reject.reason {
+                response.headers_mut().insert(
+                    header::HeaderName::from_static(REJECT_REASON_HEADER),
+                    header::HeaderValue::from_static(reason.as_str()),
+                );
+            }
+            response
+        }
     }
 }
 
@@ -1140,17 +1153,28 @@ fn over_carried_reject(
         ),
         data: Vec::new(),
         accumulated_cost: charge,
+        reason: Some(RejectReason::AmountOverCharge),
     })
 }
 
 fn claim_rejection_reject(rejection: ClaimIngestRejection, charge: u64) -> Reject {
-    let (code, accumulated_cost) = match rejection {
-        ClaimIngestRejection::Underpayment { .. } => (RejectCode::f03_invalid_amount(), charge),
-        ClaimIngestRejection::Undercollateralized { .. } => (RejectCode::f03_invalid_amount(), 0),
-        ClaimIngestRejection::NotDurable => (RejectCode::t00_internal_error(), 0),
-        ClaimIngestRejection::ChannelLookupFailed(_) => (RejectCode::t00_internal_error(), 0),
-        ClaimIngestRejection::LookupBudgetExhausted { .. } => (RejectCode::t05_rate_limited(), 0),
-        _ => (RejectCode::f01_invalid_packet(), 0),
+    let (code, accumulated_cost, reason) = match rejection {
+        ClaimIngestRejection::Underpayment { .. } => (
+            RejectCode::f03_invalid_amount(),
+            charge,
+            Some(RejectReason::Underpayment),
+        ),
+        ClaimIngestRejection::Undercollateralized { .. } => (
+            RejectCode::f03_invalid_amount(),
+            0,
+            Some(RejectReason::Undercollateralized),
+        ),
+        ClaimIngestRejection::NotDurable => (RejectCode::t00_internal_error(), 0, None),
+        ClaimIngestRejection::ChannelLookupFailed(_) => (RejectCode::t00_internal_error(), 0, None),
+        ClaimIngestRejection::LookupBudgetExhausted { .. } => {
+            (RejectCode::t05_rate_limited(), 0, None)
+        }
+        _ => (RejectCode::f01_invalid_packet(), 0, None),
     };
     Reject {
         code,
@@ -1158,6 +1182,7 @@ fn claim_rejection_reject(rejection: ClaimIngestRejection, charge: u64) -> Rejec
         message: rejection.message(),
         data: Vec::new(),
         accumulated_cost,
+        reason,
     }
 }
 
@@ -4744,6 +4769,69 @@ mod tests {
                 .map(|value| value.to_str().unwrap().parse::<u64>().unwrap())
         }
 
+        fn reason_header(response: &Response) -> Option<String> {
+            response
+                .headers()
+                .get(REJECT_REASON_HEADER)
+                .map(|value| value.to_str().unwrap().to_string())
+        }
+
+        /// Issue #1532: the reason is single-sourced in
+        /// `claim_rejection_reject`, so both carriages agree; only the two
+        /// `F03` claim refusals carry one.
+        #[test]
+        fn only_the_f03_claim_refusals_carry_a_reject_reason() {
+            let reason = |rejection| claim_rejection_reject(rejection, 7).reason;
+            assert_eq!(
+                reason(ClaimIngestRejection::Underpayment {
+                    advanced: 1,
+                    price: 7
+                }),
+                Some(RejectReason::Underpayment)
+            );
+            assert_eq!(
+                reason(ClaimIngestRejection::Undercollateralized {
+                    claimed: 2,
+                    deposited: 1
+                }),
+                Some(RejectReason::Undercollateralized)
+            );
+            assert_eq!(reason(ClaimIngestRejection::NotDurable), None);
+            assert_eq!(reason(ClaimIngestRejection::SignatureInvalid), None);
+            assert_eq!(reason(ClaimIngestRejection::UnknownChannel), None);
+        }
+
+        #[test]
+        fn an_over_carried_forward_carries_amount_over_charge() {
+            let reject = over_carried_reject("g.peer", ClientRouteKind::Forwarded, 11, 10)
+                .expect("above the charge");
+            assert_eq!(reject.code.as_str(), "F03");
+            assert_eq!(reject.accumulated_cost, 10);
+            assert_eq!(reject.reason, Some(RejectReason::AmountOverCharge));
+        }
+
+        /// A reject carrying no reason (a relayed one, any other code) gets
+        /// no header; one carrying a reason gets exactly its token.
+        #[test]
+        fn the_reason_header_rides_only_a_reject_that_has_one() {
+            let mut reject = claim_rejection_reject(
+                ClaimIngestRejection::Undercollateralized {
+                    claimed: 2,
+                    deposited: 1,
+                },
+                7,
+            );
+            let response = packet_response(PacketResponse::Reject(reject.clone()));
+            assert_eq!(
+                reason_header(&response).as_deref(),
+                Some("undercollateralized")
+            );
+            assert_eq!(cost_header(&response), Some(0));
+            reject.reason = None;
+            let relayed = packet_response(PacketResponse::Reject(reject));
+            assert_eq!(reason_header(&relayed), None);
+        }
+
         fn probe_request(prepare: &Prepare, claim_json: Option<&str>) -> Request<Body> {
             let builder = Request::builder().method("POST").uri("/ilp/probe");
             let builder = match claim_json {
@@ -4807,6 +4895,7 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(cost_header(&response), Some(PRICE));
+            assert_eq!(reason_header(&response).as_deref(), Some("underpayment"));
             let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
             assert_eq!(Reject::decode(&bytes).unwrap().code.as_str(), "F03");
             assert!(app_client.deliveries().is_empty());
@@ -4824,6 +4913,74 @@ mod tests {
             let response = app.oneshot(request).await.unwrap();
 
             assert_eq!(cost_header(&response), Some(0));
+            assert_eq!(reason_header(&response), None);
+        }
+
+        /// Issue #1532 over HTTP: a voucher above what the channel can pay
+        /// is `F03` with cost `0` and the reason `undercollateralized` --
+        /// the voucher covers the price, so the move is to top up and resend
+        /// it, which the cost alone could not say.
+        #[tokio::test]
+        async fn an_over_deposit_voucher_carries_the_undercollateralized_reason() {
+            let route =
+                StaticRoute::new_priced("g.example.app", "http://localhost:4000", PRICE).unwrap();
+            let app_client = Arc::new(FakeAppClient::new());
+            let connector = Arc::new(Connector::new(
+                vec![route],
+                vec![],
+                app_client.clone(),
+                Arc::new(InProcessPeerTransport::new()),
+                test_clock(),
+            ));
+            let channels = Arc::new(crate::test_support::FakeBatchSettlement::new(u128::from(
+                PRICE - 1,
+            )));
+            let app = router_with_gate(connector, test_signer(), None, test_gate(channels));
+
+            let request = request_with_claim_header(
+                &sample_prepare("g.example.app"),
+                CLAIM_HEADER,
+                &evm_claim_json(PRICE),
+            );
+            let response = app.oneshot(request).await.unwrap();
+
+            assert_eq!(cost_header(&response), Some(0));
+            assert_eq!(
+                reason_header(&response).as_deref(),
+                Some("undercollateralized")
+            );
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            assert_eq!(Reject::decode(&bytes).unwrap().code.as_str(), "F03");
+            assert!(app_client.deliveries().is_empty());
+        }
+
+        /// Issue #1532 over HTTP: a PREPARE to a priced forwarded
+        /// destination declaring an `amount` above the forwarding charge is
+        /// `F03` with the charge as its cost and the reason
+        /// `amount_over_charge`.
+        #[tokio::test]
+        async fn an_amount_over_the_forwarding_charge_carries_its_reason() {
+            let connector = Arc::new(Connector::new(
+                vec![],
+                vec![PeerRoute::new_priced("g.example.far", "second-hop", PRICE)],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                test_clock(),
+            ));
+            let app = router_with_gate(connector, test_signer(), None, test_gate(test_channels()));
+            let mut prepare = sample_prepare("g.example.far");
+            prepare.amount = PRICE + 1;
+
+            let request = request_with_claim_header(&prepare, CLAIM_HEADER, &evm_claim_json(PRICE));
+            let response = app.oneshot(request).await.unwrap();
+
+            assert_eq!(cost_header(&response), Some(PRICE));
+            assert_eq!(
+                reason_header(&response).as_deref(),
+                Some("amount_over_charge")
+            );
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            assert_eq!(Reject::decode(&bytes).unwrap().code.as_str(), "F03");
         }
 
         /// ADR 0011: probing traverses the network for free, so it is
@@ -4904,6 +5061,10 @@ mod tests {
 
             assert_eq!(probe_response.status(), StatusCode::OK);
             assert_eq!(cost_header(&probe_response), Some(PRICE));
+            assert_eq!(
+                reason_header(&probe_response).as_deref(),
+                Some("probe_terminates_here")
+            );
             let bytes = hyper::body::to_bytes(probe_response.into_body())
                 .await
                 .unwrap();

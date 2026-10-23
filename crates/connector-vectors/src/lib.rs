@@ -18,16 +18,16 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use connector_btp::{
     decode_frame, encode_error, encode_message, encode_response, encode_transfer, ProtocolData,
-    ACCUMULATED_COST_HEADER, AUTH_PROTOCOL, BTP_MESSAGE, CLAIM_ACK_HEADER, CLAIM_ACK_PROTOCOL,
-    CLAIM_HEADER, CONTENT_TYPE_TEXT, PAYOUT_CLAIM_PROTOCOL, PEER_CHALLENGE_HEADER,
-    PEER_CHALLENGE_PROTOCOL,
+    ACCUMULATED_COST_HEADER, ACCUMULATED_COST_PROTOCOL, AUTH_PROTOCOL, BTP_MESSAGE,
+    CLAIM_ACK_HEADER, CLAIM_ACK_PROTOCOL, CLAIM_HEADER, CONTENT_TYPE_TEXT, PAYOUT_CLAIM_PROTOCOL,
+    PEER_CHALLENGE_HEADER, PEER_CHALLENGE_PROTOCOL, REJECT_REASON_HEADER, REJECT_REASON_PROTOCOL,
 };
 use connector_domain::client_claim::{
     self, ClientClaim, ClientClaimError, SCHEME_BATCH_SETTLEMENT,
 };
 use connector_domain::{
     validate_voucher, ClaimError, EnvelopeError, EnvelopeRequest, EnvelopeResponse, Fulfill,
-    Prepare, Price, Reject, RejectCode, VoucherAdmission, VoucherWatermark,
+    Prepare, Price, Reject, RejectCode, RejectReason, VoucherAdmission, VoucherWatermark,
 };
 use connector_peer_btp::role_gate::{self, RefusedEvidence};
 use connector_peer_btp::{ack, challenge_json, claim_json, fields, ClaimDecodeError};
@@ -178,7 +178,13 @@ use serde::Serialize;
 /// number, or still refusing an EVM voucher above `u64::MAX`, is reading
 /// and refusing what this schema version exists to announce is no longer
 /// true.
-pub const SCHEMA_VERSION: u32 = 8;
+/// **9** (issue #1532): a new top-level `client_edge` section, whose
+/// `f03_rejects` pins the closed set of reject reasons a client-edge `F03`
+/// carries -- `underpayment`, `undercollateralized`, `amount_over_charge`,
+/// `probe_terminates_here` -- with each case's code, cost, reason and the
+/// exact `toon-reject-reason` HTTP header and BTP protocolData entry. Nothing
+/// existing changes; a replaying SDK that ignores the section is unaffected.
+pub const SCHEMA_VERSION: u32 = 9;
 
 fn seq_bytes<const N: usize>(start: u8) -> [u8; N] {
     let mut out = [0u8; N];
@@ -217,6 +223,88 @@ pub struct WireVectors {
     pub payout_voucher: PayoutVoucherVectors,
     pub client_auth_channel_challenge: ClientAuthChannelChallengeVectors,
     pub claim_state_toon_channel_refused: ClaimStateToonChannelRefusedVectors,
+    pub client_edge: ClientEdgeVectors,
+}
+
+/// Schema 9 (issue #1532): the client edge's own responses, as opposed to
+/// the peer carriage's.
+#[derive(Debug, Serialize)]
+pub struct ClientEdgeVectors {
+    pub f03_rejects: Vec<F03RejectCase>,
+}
+
+/// One `F03` the client edge raises, with the reason that tells it apart
+/// (`client-edge-spec.md` §1.6). The English `message` is deliberately not
+/// pinned: it is non-normative.
+#[derive(Debug, Serialize)]
+pub struct F03RejectCase {
+    pub name: &'static str,
+    pub code: &'static str,
+    pub accumulated_cost: u64,
+    pub reason: &'static str,
+    /// The header pair as `[name, value]`, cost then reason, on the `200`
+    /// that carries the REJECT body.
+    pub http_headers: Vec<(String, String)>,
+    /// The protocolData entries on the BTP RESPONSE, cost then reason.
+    pub btp_protocol_data: Vec<F03ProtocolEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct F03ProtocolEntry {
+    pub name: &'static str,
+    pub content_type: u16,
+    pub data_hex: String,
+}
+
+fn generate_client_edge_vectors() -> ClientEdgeVectors {
+    // (case, reason, cost): the charge is a fixed 250; undercollateralized
+    // reports `0` because the route's price was covered.
+    let cases = [
+        ("f03_underpayment", RejectReason::Underpayment, 250u64),
+        (
+            "f03_undercollateralized",
+            RejectReason::Undercollateralized,
+            0,
+        ),
+        (
+            "f03_amount_over_charge",
+            RejectReason::AmountOverCharge,
+            250,
+        ),
+        (
+            "f03_probe_terminates_here",
+            RejectReason::ProbeTerminatesHere,
+            250,
+        ),
+    ];
+    let f03_rejects = cases
+        .into_iter()
+        .map(|(name, reason, cost)| {
+            let entry = |entry_name: &'static str, value: String| F03ProtocolEntry {
+                name: entry_name,
+                content_type: CONTENT_TYPE_TEXT,
+                data_hex: hex_of(value.as_bytes()),
+            };
+            F03RejectCase {
+                name,
+                code: "F03",
+                accumulated_cost: cost,
+                reason: reason.as_str(),
+                http_headers: vec![
+                    (ACCUMULATED_COST_HEADER.to_string(), cost.to_string()),
+                    (
+                        REJECT_REASON_HEADER.to_string(),
+                        reason.as_str().to_string(),
+                    ),
+                ],
+                btp_protocol_data: vec![
+                    entry(ACCUMULATED_COST_PROTOCOL, cost.to_string()),
+                    entry(REJECT_REASON_PROTOCOL, reason.as_str().to_string()),
+                ],
+            }
+        })
+        .collect();
+    ClientEdgeVectors { f03_rejects }
 }
 
 #[derive(Debug, Serialize)]
@@ -1186,6 +1274,7 @@ fn fixture_reject() -> Reject {
         // real value this vector pins travels as the carriage's own
         // `accumulated-cost` entry/header, built separately below.
         accumulated_cost: 0,
+        reason: None,
     }
 }
 
@@ -3112,6 +3201,7 @@ pub fn generate() -> WireVectors {
     let payout_voucher = generate_payout_voucher_vectors();
     let client_auth_channel_challenge = generate_client_auth_channel_challenge_vectors();
     let claim_state_toon_channel_refused = generate_claim_state_toon_channel_refused_vectors();
+    let client_edge = generate_client_edge_vectors();
 
     WireVectors {
         schema_version: SCHEMA_VERSION,
@@ -3126,6 +3216,7 @@ pub fn generate() -> WireVectors {
         payout_voucher,
         client_auth_channel_challenge,
         claim_state_toon_channel_refused,
+        client_edge,
     }
 }
 

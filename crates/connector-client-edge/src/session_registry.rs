@@ -292,6 +292,7 @@ fn no_live_session_reject(address: &str) -> Reject {
         message: format!("no live client session for '{address}'"),
         data: Vec::new(),
         accumulated_cost: 0,
+        reason: None,
     }
 }
 

@@ -46,7 +46,7 @@ use connector_btp::{
     decode_frame, encode_error, encode_response, reply, BtpDecodeError, BtpSessionHandle,
     OutboundRequests, ProtocolData, SessionGone, ACCUMULATED_COST_PROTOCOL, AUTH_PROTOCOL,
     BTP_ERROR, BTP_MESSAGE, BTP_RESPONSE, BTP_TRANSFER, CLAIM_PROTOCOL, CONTENT_TYPE_TEXT,
-    PAYMENT_REQUIRED_PROTOCOL, PAYOUT_CLAIM_PROTOCOL,
+    PAYMENT_REQUIRED_PROTOCOL, PAYOUT_CLAIM_PROTOCOL, REJECT_REASON_PROTOCOL,
 };
 use connector_domain::client_claim::ClientClaim;
 use connector_domain::{PacketResponse, Prepare, Price, Reject, RejectCode};
@@ -460,6 +460,13 @@ fn reject_response(request_id: u32, reject: Reject, extra: Vec<ProtocolData>) ->
         content_type: CONTENT_TYPE_TEXT,
         data: reject.accumulated_cost.to_string().into_bytes(),
     }];
+    if let Some(reason) = reject.reason {
+        protocol_data.push(ProtocolData {
+            name: REJECT_REASON_PROTOCOL.to_string(),
+            content_type: CONTENT_TYPE_TEXT,
+            data: reason.as_str().as_bytes().to_vec(),
+        });
+    }
     protocol_data.extend(extra);
     encode_response(request_id, &protocol_data, &reject.encode())
 }
@@ -774,6 +781,7 @@ async fn handle_frame(
                 ),
                 data: Vec::new(),
                 accumulated_cost: 0,
+                reason: None,
             };
             return reply(
                 replies,
@@ -813,6 +821,7 @@ async fn handle_frame(
             // The charge the terms above quote for this packet (0 for a
             // `greeting` declared on an unpriced destination).
             accumulated_cost: charge,
+            reason: None,
         };
         return reply(
             replies,

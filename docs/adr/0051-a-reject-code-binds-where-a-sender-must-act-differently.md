@@ -151,3 +151,30 @@ opposite action on the wrong one.
 
 Restoring it costs this record's other rule nothing: `R01` is still one situation, still one move,
 and no second implementation may put anything else behind it.
+
+## Update (issue #1532)
+
+**The `F03` row now covers four situations, told apart by a binding reject reason.** The client edge
+raises `F03` for an **underpayment**, an **undercollateralized** claim (#646), a forwarded packet
+whose `amount` is above the forwarding charge, and a **probe** to a route this connector terminates.
+The code alone left a sender parsing English to learn its move, so each reject this connector raises
+for one of them carries a `reason` from a closed set, beside its code and cost (the `Toon-Reject-Reason`
+header, the `toon-reject-reason` protocolData entry; `docs/protocol/client-edge-spec.md` §1.6):
+
+| reason                  | sender's move                                        |
+| ----------------------- | ---------------------------------------------------- |
+| `underpayment`          | sign a voucher that pays the stated cost             |
+| `undercollateralized`   | top the channel up, then resend **the same** voucher |
+| `amount_over_charge`    | send `amount` equal to the stated cost               |
+| `probe_terminates_here` | pay the stated cost; a probe is never delivered      |
+
+Undercollateralized's move is **not** "pay the stated amount": its cost is `0`, the voucher already
+covers the price, and nothing was consumed. A `T`-class code was considered for it and declined:
+changing the code breaks every client that already reads `F03`, and the reason carries the
+distinction without touching the code.
+
+A reason is attached only to a reject this connector raised itself. A reject relayed back from a
+peer reaches the client with no reason, and a connector never invents one; every other code carries
+none. An absent reason means "not raised here", never "unknown", and a client that sees an absent or
+unknown reason acts on the code and the cost alone. The reason is not a claim-ack (that is the peer
+carriage's verdict on a claim) and never rides the REJECT's `data`.

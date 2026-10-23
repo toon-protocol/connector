@@ -87,6 +87,15 @@ pub const PEER_CHALLENGE_HEADER: &str = "toon-peer-role-challenge";
 /// The HTTP twin of [`ACCUMULATED_COST_PROTOCOL`] (§3, §5.2) -- already
 /// implemented on the client edge and reused verbatim.
 pub const ACCUMULATED_COST_HEADER: &str = "toon-accumulated-cost";
+
+/// The client edge's reject reason (client-edge-spec.md §1.6, issue #1532),
+/// placed exactly like `toon-accumulated-cost`: a protocolData entry on a
+/// BTP reject response ...
+pub const REJECT_REASON_PROTOCOL: &str = "toon-reject-reason";
+
+/// ... and the HTTP header (`Toon-Reject-Reason`) on the same responses that
+/// carry the cost. Client carriages only; a peer never sends or reads one.
+pub const REJECT_REASON_HEADER: &str = "toon-reject-reason";
 /// The HTTP twin of [`PAYMENT_REQUIRED_PROTOCOL`] (§3.1, `client-edge-spec.md`
 /// §1.4) -- the client edge's own `402` header spelling, reused verbatim by
 /// the peer carriage that answers an uncovered peer PREPARE with the same

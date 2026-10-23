@@ -63,7 +63,7 @@ pub use node::{
     NodeSelfDescription, RoutePrice, VoucherSignerFact, CLIENT_EDGE_DEFAULT_VERSION,
     CLIENT_EDGE_SUPPORTED_VERSIONS,
 };
-pub use packet::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
+pub use packet::{Fulfill, PacketResponse, Prepare, Reject, RejectCode, RejectReason};
 pub use price::Price;
 pub use rate::{Rate, RateError};
 pub use rate_table::{

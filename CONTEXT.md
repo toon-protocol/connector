@@ -542,6 +542,10 @@ size; what answers every size is
 the terminating node's published **price**, on its greeting and its self-description.
 _Avoid_: total fee, quote
 
+**Reject reason**:
+The name of the situation a client-edge reject answers, carried beside its code where one code covers situations that need different moves from the sender: an `F03` may be an **underpayment**, an **undercollateralized** claim, an amount over the **charge** for forwarding, or a **probe** to a route that terminates here. A closed set. Only the connector that raised a reject attaches one; a relayed reject has none, so an absent reason means "not raised here", never "unknown", and the code and **cost** alone still tell the sender what to do (ADR 0051, issue #1532).
+_Avoid_: error subtype, claim-ack reason (that is the peer carriage's verdict on a claim, not a reject's)
+
 **Rate**:
 The declared terms on which one connector crosses one denomination boundary: a rational over
 **base units** — so many of the outgoing channel's for so many of the incoming one's — with the
