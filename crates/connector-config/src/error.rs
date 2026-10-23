@@ -255,6 +255,28 @@ pub enum ConfigError {
     )]
     PeerRouteHasTransport { prefix: String, value: String },
 
+    /// ADR 0081: a limit of zero refuses every packet with a payload, which
+    /// is a route nobody can use rather than a limit.
+    #[error(
+        "route '{prefix}' sets max_bytes = 0, which refuses every packet with a payload \
+         (ADR 0081). Omit 'max_bytes' for no limit, or set the largest sealed payload, in \
+         bytes, this route accepts"
+    )]
+    RouteMaxBytesZero { prefix: String },
+
+    /// ADR 0081: a route may lower the carriage's limit, never raise it --
+    /// raising it is issue #1529's decision, not this key's.
+    #[error(
+        "route '{prefix}' sets max_bytes = {value}, above the client edge's own {limit}-byte \
+         body limit, so no packet could ever reach it (ADR 0081: max_bytes lowers the \
+         carriage's limit and cannot raise it). Set it to {limit} or less, or omit it"
+    )]
+    RouteMaxBytesAboveCarriage {
+        prefix: String,
+        value: u64,
+        limit: u64,
+    },
+
     #[error(
         "route '{prefix}' sets transport = '{value}', which this connector does not recognize \
          -- only 'http', 'btp' or 'both' are valid (issue #701). Omit the field for the \

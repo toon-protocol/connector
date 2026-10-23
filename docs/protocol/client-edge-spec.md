@@ -90,19 +90,20 @@ connector's own app, not an unaffiliated payer — and is out of scope for this 
 application/octet-stream`. An ILP-level outcome — fulfilled or rejected — is always HTTP 200;
   a non-2xx status is reserved for a transport-level failure and never carries an OER body:
 
-  | Status | Meaning                                                                         |
-  | ------ | ------------------------------------------------------------------------------- |
-  | `400`  | Malformed request: not a PREPARE, undecodable OER, oversized body.              |
-  | `401`  | An `ILP-Peer-Id` was presented but authentication failed. Answered before       |
-  |        | the route is looked up, so it never arrives as a `402` instead. See §1.2.       |
-  | `402`  | Unpaid request to a route this connector terminates and prices: x402 v2         |
-  |        | payment-required terms, JSON body (not OER). See §1.4.                          |
-  | `403`  | A probe (`POST /ilp/probe`) from a sender not authorized to probe: no           |
-  |        | payment channel this connector recognizes, or over its rate limit. See §1.6.    |
-  | `413`  | Request body too large. There is no config field for this: the limit is         |
-  |        | axum's own `DefaultBodyLimit` (2 MiB), which this router does not override.     |
-  | `500`  | Reserved by this spec for transport failure only; an unexpected                 |
-  |        | internal error during routing is surfaced as a `200` + `T00` REJECT, not a 500. |
+  | Status | Meaning                                                                          |
+  | ------ | -------------------------------------------------------------------------------- |
+  | `400`  | Malformed request: not a PREPARE, undecodable OER, oversized body.               |
+  | `401`  | An `ILP-Peer-Id` was presented but authentication failed. Answered before        |
+  |        | the route is looked up, so it never arrives as a `402` instead. See §1.2.        |
+  | `402`  | Unpaid request to a route this connector terminates and prices: x402 v2          |
+  |        | payment-required terms, JSON body (not OER). See §1.4.                           |
+  | `403`  | A probe (`POST /ilp/probe`) from a sender not authorized to probe: no            |
+  |        | payment channel this connector recognizes, or over its rate limit. See §1.6.     |
+  | `413`  | Request body too large. There is no config field for this: the limit is          |
+  |        | axum's own `DefaultBodyLimit` (2 MiB), which this router does not override. A    |
+  |        | route's own, lower `max_bytes` is not this: it is a `200` + `F00` REJECT (§1.3). |
+  | `500`  | Reserved by this spec for transport failure only; an unexpected                  |
+  |        | internal error during routing is surfaced as a `200` + `T00` REJECT, not a 500.  |
 
 ### 1.2 Identity
 
@@ -131,6 +132,15 @@ A request identifies its sender in one of two ways:
   required to pay for a terminated route.
 
 ### 1.3 Payment claim
+
+**A packet over its route's payload limit is never paid for.** A route MAY declare `max_bytes`
+([ADR 0081](../adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md)); a
+PREPARE whose `data` — the sealed wrap, the length a price is charged on — is longer is answered
+`200` with an `F00` REJECT reading `'<destination>' accepts at most <max_bytes> payload bytes; this
+packet carries <len>`, with `accumulated_cost` `0`. It is checked after the route's transport policy
+and **before** the §1.4 greeting and every step below, on both carriages, so a claim header on such
+a request is never read, its claim never reaches the journal and its watermark does not move. A
+packet exactly `max_bytes` long is charged and delivered as it would be without a limit.
 
 A request pays with a claim header. **Every claim is an x402 `batch-settlement` voucher**
 ([ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md),
@@ -527,6 +537,7 @@ deleted with that claim scheme.
 **`extensions.toon`** carries what that entry also carried that is not a payment option, unchanged
 in name and meaning: `info` holds `ilpAddress`, `amount`, `endpoint` (`/ilp`), `price` and
 `sessionLeaseTtlMs` on every greeting, plus `pricePerKib` where the addressed route prices by size,
+plus `maxBytes` where it declares a payload limit (§1.3),
 plus whichever of `ilpAddresses`/`btpEndpoint`/`requiredTransport` applies (below), and nothing
 else; `schema` is a JSON Schema describing `info`, as x402 v2 asks of an extension, and is
 informational. It is on **every** greeting, including one with no `accepts[]` entry, so the amount
@@ -653,6 +664,13 @@ carries a slope the two answer different questions and must not be conflated:
   cacheability true: one greeting answers every size, rather than one greeting per size.
 
 `toon.pricePerKib` is **absent**, not `"0"`, on a flat route.
+
+**`toon.maxBytes`** is the addressed route's payload limit
+([ADR 0081](../adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md)): a JSON
+number of bytes, the longest sealed payload the route accepts. A client checks its own packet against
+it before paying; a packet over it is refused `F00` whatever it carries (§1.3). It is **absent** on a
+route with no limit, so such a route's greeting is byte-identical to what it was before the field
+existed. `GET /ilp/routes/price` answers `maxBytes` the same way.
 
 **Transport policy** (issue #701, `toon-meta#262` decision 11): which transport(s) a terminated
 route accepts is per-connector config, not a protocol constant — `both` by default, so no deployed

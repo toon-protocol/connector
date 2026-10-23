@@ -1051,7 +1051,7 @@ mod tests {
     use crate::peer::{PeerCarriage, DEFAULT_MAX_PACKET_AMOUNT};
     use crate::route::TransportPolicy;
     use crate::settlement::SettlementChain;
-    use connector_domain::{AssetId, Price};
+    use connector_domain::{AssetId, PayloadLimit, Price};
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -1255,6 +1255,72 @@ price = 1000
         // The flat spelling is untouched and still means what it meant.
         assert_eq!(config.routes()[1].price(), Price::flat(1000));
         assert!(config.routes()[1].price().is_flat());
+    }
+
+    /// ADR 0081: `max_bytes` is optional, and a route that writes none has
+    /// no limit at all. The forwarded branch is `route.rs`'s
+    /// `resolve_routes` tests' to cover, since a forwarded route needs a
+    /// whole peering to load here.
+    #[test]
+    fn loads_a_routes_payload_limit() {
+        let config = with_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[[routes]]
+prefix = "g.example.upload"
+handler_url = "http://localhost:5000"
+price = 1000
+max_bytes = 65536
+
+[[routes]]
+prefix = "g.example.quotes"
+handler_url = "http://localhost:5001"
+price = 1000
+"#,
+                key_path.display()
+            )
+        })
+        .expect("load");
+
+        assert_eq!(config.routes()[0].max_bytes(), PayloadLimit::new(65_536));
+        assert_eq!(config.routes()[1].max_bytes(), None);
+    }
+
+    /// ADR 0081: a zero limit refuses every payload, and a limit above the
+    /// client edge's own body limit can never be reached -- both are refused
+    /// by name rather than loaded.
+    #[test]
+    fn refuses_a_payload_limit_of_zero_or_above_the_carriage() {
+        for (value, expected) in [("0", "max_bytes = 0"), ("2097153", "2097152")] {
+            let error = with_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[[routes]]
+prefix = "g.example.upload"
+handler_url = "http://localhost:5000"
+price = 1000
+max_bytes = {value}
+"#,
+                    key_path.display()
+                )
+            })
+            .expect_err("refused");
+            assert!(
+                error.to_string().contains(expected)
+                    && error.to_string().contains("g.example.upload"),
+                "max_bytes = {value}: got {error}"
+            );
+        }
     }
 
     /// A price table exists only to carry a slope, so omitting `per_kib` is

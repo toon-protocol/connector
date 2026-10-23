@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::node::NodeFacts;
-use crate::Price;
+use crate::{PayloadLimit, Price};
 
 /// The x402 version this connector emits and reads.
 pub const X402_VERSION: u32 = 2;
@@ -181,6 +181,14 @@ pub struct X402ToonTerms {
         default
     )]
     pub price_per_kib: Option<String>,
+    /// The largest sealed payload, in bytes, the addressed route accepts
+    /// (ADR 0081, issue #1530): a packet longer than this is refused `F00`
+    /// whatever it pays. A JSON number, since it is a length rather than an
+    /// amount and never exceeds the 2 MiB a route may declare. Absent on a
+    /// route with no limit, so such a route greets byte-identically to
+    /// before ADR 0081.
+    #[serde(rename = "maxBytes", skip_serializing_if = "Option::is_none", default)]
+    pub max_bytes: Option<u64>,
     /// The emitting node's own ILP address(es) (issue #807) -- never an echo
     /// of the probed destination the way `ilpAddress` is. Absent when the
     /// emitter configured no `[node] addresses`.
@@ -218,6 +226,11 @@ pub struct X402ToonTerms {
 /// what [`X402ToonTerms`] serializes to. Informational -- this connector
 /// never validates against it -- and constant, so every greeting carries the
 /// same object.
+///
+/// It does not list `maxBytes` (ADR 0081), deliberately: the schema rides
+/// every greeting, so naming a new field here would change the bytes a
+/// route without a limit greets with, which ADR 0081 promises it does not.
+/// The schema permits properties it does not list, so it stays true.
 pub fn toon_extension_schema() -> serde_json::Value {
     let string = serde_json::json!({ "type": "string" });
     serde_json::json!({
@@ -614,6 +627,7 @@ pub fn terms_body(terms: &GreetingTerms<'_>) -> Vec<u8> {
         required_transport,
         session_lease_ttl_ms,
         request,
+        max_bytes,
     } = *terms;
     // ND-11: every node fact here is read off the SAME value the node
     // self-description is projected from -- never a second assembly.
@@ -646,6 +660,7 @@ pub fn terms_body(terms: &GreetingTerms<'_>) -> Vec<u8> {
                     endpoint: "/ilp".to_string(),
                     price: price.base().to_string(),
                     price_per_kib: (!price.is_flat()).then(|| price.per_kib().to_string()),
+                    max_bytes: max_bytes.map(|limit| limit.max_bytes()),
                     ilp_addresses: ilp_addresses.to_vec(),
                     btp_endpoint: btp_endpoint.map(str::to_string),
                     required_transport: required_transport.map(str::to_string),
@@ -690,6 +705,9 @@ pub struct GreetingTerms<'a> {
     pub session_lease_ttl_ms: u64,
     /// What a client should send to use the addressed route (issue #1210).
     pub request: Option<&'a serde_json::Value>,
+    /// The addressed route's payload limit (ADR 0081), quoted as the `toon`
+    /// extension's `maxBytes`; `None` when the route sets none.
+    pub max_bytes: Option<PayloadLimit>,
 }
 
 /// Read a `payment-required` greeting's terms.
@@ -742,6 +760,37 @@ mod tests {
         assert_eq!(terms.ilp_address(), Some("g.toon.relay"));
         assert_eq!(terms.required_transport(), None);
         assert_eq!(terms.toon().unwrap().session_lease_ttl_ms, 300_000);
+    }
+
+    /// ADR 0081: a route's payload limit rides the greeting as `maxBytes`, so
+    /// a client can check its size before it pays -- and a route without one
+    /// greets with no such key at all.
+    #[test]
+    fn a_routes_payload_limit_rides_the_greeting_and_is_absent_when_unset() {
+        let limited = terms_body(&GreetingTerms {
+            destination: "g.toon.blossom.upload",
+            price: Price::scheduled(100, 10),
+            max_bytes: PayloadLimit::new(65_536),
+            ..Default::default()
+        });
+        let value: serde_json::Value = serde_json::from_slice(&limited).unwrap();
+        assert_eq!(value["extensions"]["toon"]["info"]["maxBytes"], 65_536);
+        let terms = parse_greeting(&limited).expect("well-formed");
+        assert_eq!(terms.toon().unwrap().max_bytes, Some(65_536));
+
+        let open = terms_body(&GreetingTerms {
+            destination: "g.toon.relay",
+            price: Price::flat(1000),
+            ..Default::default()
+        });
+        // Nowhere in the bytes -- not in `info`, and not in the schema that
+        // rides every greeting -- so a route without a limit greets exactly
+        // as it did before ADR 0081.
+        let text = String::from_utf8(open).unwrap();
+        assert!(
+            !text.contains("maxBytes"),
+            "a route without a limit must not mention maxBytes, got: {text}"
+        );
     }
 
     /// ADR 0065: a flat route's greeting carries no slope at all.
