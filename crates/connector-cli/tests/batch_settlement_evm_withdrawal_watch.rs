@@ -78,6 +78,9 @@ token_address = "{token:?}"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
+# The shortest delay x402 admits, so the watch runs at its fastest: the
+# default day would watch every fifteen minutes.
+min_withdraw_delay_secs = 900
 
 [settlement.evm.key]
 key_file = "{settlement_key}"
@@ -130,9 +133,10 @@ price = {PRICE}
         .await;
 
     // The node answers on its own, well inside the day's delay: the chain's
-    // clock never moves while this waits.
+    // clock never moves while this waits. The watch runs every ten seconds
+    // at this minimum.
     let mut claimed = false;
-    for _ in 0..200 {
+    for _ in 0..400 {
         if x402.channel(&channel).await == (DEPOSIT, u128::from(2 * PRICE)) {
             claimed = true;
             break;
@@ -314,7 +318,9 @@ price = {PRICE}
     let app = connector_cli::router(&runtime, &config).expect("router");
     let receiver = runtime.signer.public_key().expect("the node's wrap key");
 
-    // The voucher the node already held is claimed all the same.
+    // The voucher the node already held is claimed all the same -- on the
+    // watch's first pass, which fires at boot: the two-day minimum puts the
+    // watch at fifteen minutes, far past this loop.
     let mut claimed = false;
     for _ in 0..200 {
         if x402.channel(&channel).await == (DEPOSIT, u128::from(2 * PRICE)) {

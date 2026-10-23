@@ -6,6 +6,7 @@
 //! contract suite (ADR 0007) and the in-memory fake every higher-level test
 //! runs over. `connector-settlement-evm` and `connector-settlement-solana`
 //! hold their chain-backed implementations to the same suite, unmodified.
+//! [`watch_interval`] is the one rule both chains' watchers pass at.
 //!
 //! No chain SDK, RPC client or transaction appears in this crate; they
 //! belong to the two settlement crates above.
@@ -15,6 +16,7 @@
 //! #1385): every channel is an x402 channel.
 
 pub mod batch;
+pub mod watch_interval;
 
 /// A payment channel's identifier, opaque to everything above this port:
 /// the canonical `evm:0x…` or `solana:…` key of an x402 channel.

@@ -92,6 +92,9 @@ connector-proxied-client         the one cached `reqwest` client through `socks_
 connector-settlement             the chain-agnostic settlement port + its contract suite
   ├─ port.rs, contract.rs        the port, and the one suite every backend is run against
   ├─ in_memory.rs                the fake — the first implementation to pass that suite
+  ├─ watch_interval.rs           how often both chains' batch watchers pass: the node's
+                                  published minimum delay over 90, clamped to
+                                  10 s..=15 min (#1531)
   └─ batch/                      a second port for x402 batch-settlement channels, in
                                   two halves (ADR 0074 decision 9, ADR 0075 decision 2).
                                   Receiving: admit, read collateral and lifecycle, land a

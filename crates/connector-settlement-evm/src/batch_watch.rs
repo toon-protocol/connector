@@ -59,12 +59,6 @@ use crate::channel_id::format_channel_id;
 use crate::log_query::scoped_event;
 use crate::send::confirm;
 
-/// How often the watcher reads new `WithdrawInitiated` logs. A
-/// withdrawal's delay is at least this
-/// node's published minimum, a day by default (ADR 0074 decision 5), so what
-/// the interval buys is margin, not correctness.
-pub const WITHDRAWAL_WATCH_INTERVAL: Duration = Duration::from_secs(5);
-
 /// How often the sweep claims every held voucher and settles. Ten minutes
 /// keeps what a withdrawal could race to at most ten minutes of vouchers
 /// even with the watcher down, while "claims are constant, settlement is

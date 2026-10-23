@@ -31,10 +31,7 @@ pub mod sponsor;
 mod sweep;
 pub mod wire;
 
-pub use sweep::{
-    next_step, SolanaBatchWatcher, SponsoredChannel, Step, CLOSING_WATCH_INTERVAL,
-    OPEN_SETTLE_INTERVAL,
-};
+pub use sweep::{next_step, SolanaBatchWatcher, SponsoredChannel, Step, OPEN_SETTLE_INTERVAL};
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;

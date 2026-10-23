@@ -48,16 +48,11 @@ use solana_sdk::signature::Signer;
 use super::{backend_error, wire, SolanaBatchSettlement, SubmitFailure};
 use crate::submit::Confirmed;
 
-/// How often the watcher reads every sponsored channel. The grace period is
-/// at least this node's published minimum -- a day by default, never below
-/// x402's 900 seconds (ADR 0074 decision 5) -- so ten seconds leaves the
-/// Closing watch ninety chances inside even the shortest one, for one
-/// filtered `getProgramAccounts` per tick.
-pub const CLOSING_WATCH_INTERVAL: Duration = Duration::from_secs(10);
-
 /// How often an Open channel's latest voucher is settled. The EVM sweep's
 /// cadence, for the same reason: a transaction per busy channel every ten
-/// minutes, not per voucher.
+/// minutes, not per voucher. It is checked only on a watch pass, so when the
+/// node's watch interval is longer (up to fifteen minutes at the one-day
+/// default) settling rounds up to the next pass.
 pub const OPEN_SETTLE_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Most `reclaim`s one transaction carries: two accounts each, no signer.
@@ -498,7 +493,8 @@ impl SolanaBatchWatcher {
 
     /// Pass every `watch_every`, settling Open channels on the passes at
     /// least `settle_every` apart, the first included, for the life of the
-    /// process. A pass that fails is logged and retried; nothing here ever
+    /// process; a `watch_every` longer than `settle_every` rounds settling
+    /// up to the next pass. A pass that fails is logged and retried; nothing here ever
     /// returns.
     pub async fn run(self, watch_every: Duration, settle_every: Duration) {
         let mut watch = tokio::time::interval(watch_every);

@@ -30,6 +30,7 @@ use connector_runtime::{
 use connector_settlement::batch::{
     BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer, HeldVouchers,
 };
+use connector_settlement::watch_interval::watch_interval;
 use connector_settlement_evm::{DepositRoute, EvmBatchSettlementBackend, EvmBatchWatcher};
 use connector_settlement_solana::batch::{SolanaBatchSettlement, SolanaBatchWatcher};
 use connector_signer::{LocalSigner, Signer, SignerError};
@@ -1508,34 +1509,41 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
 /// on neither chain starts nothing.
 ///
 /// - EVM: [`EvmBatchWatcher`] reads `WithdrawInitiated` every
-///   [`WITHDRAWAL_WATCH_INTERVAL`] and claims the latest voucher on a
-///   withdrawing channel at once, and every [`BATCH_SWEEP_INTERVAL`] claims
-///   every held voucher in one `claim` and then `settle`s.
+///   [`watch_interval`] of the node's `min_withdraw_delay_secs` and claims
+///   the latest voucher on a withdrawing channel at once, and every
+///   [`BATCH_SWEEP_INTERVAL`] claims every held voucher in one `claim` and
+///   then `settle`s.
 /// - Solana: [`SolanaBatchWatcher`] rediscovers every sponsored channel every
-///   [`CLOSING_WATCH_INTERVAL`] -- sealing a Closing one with its latest
-///   voucher, distributing a Sealed one, reclaiming a Distributed one's rent
-///   -- and settles Open ones every [`OPEN_SETTLE_INTERVAL`].
+///   [`watch_interval`] of the node's `min_grace_period_secs` -- sealing a
+///   Closing one with its latest voucher, distributing a Sealed one,
+///   reclaiming a Distributed one's rent -- and settles Open ones every [`OPEN_SETTLE_INTERVAL`]. The Open settle
+///   check runs only on a watch pass, so a longer watch rounds it up to the
+///   next pass.
+///
+/// Neither watch interval is configurable: [`watch_interval`] is the node's
+/// published minimum delay over ninety, clamped to ten seconds..fifteen
+/// minutes, so ninety passes fit inside the shortest delay any admitted
+/// channel can carry and an idle node spends no more RPC than that needs.
 ///
 /// Both backends read and write through the settlement table's one transport
 /// (ADR 0073): the watchers are built from the backends, never from a URL.
 ///
-/// [`WITHDRAWAL_WATCH_INTERVAL`]: connector_settlement_evm::WITHDRAWAL_WATCH_INTERVAL
+/// [`watch_interval`]: connector_settlement::watch_interval::watch_interval
 /// [`BATCH_SWEEP_INTERVAL`]: connector_settlement_evm::BATCH_SWEEP_INTERVAL
-/// [`CLOSING_WATCH_INTERVAL`]: connector_settlement_solana::batch::CLOSING_WATCH_INTERVAL
 /// [`OPEN_SETTLE_INTERVAL`]: connector_settlement_solana::batch::OPEN_SETTLE_INTERVAL
 fn spawn_batch_settlement_watchers(runtime: &Runtime, gate: &Arc<ClientClaimGate>) {
     let held: Arc<dyn HeldVouchers> = Arc::new(ClaimGateVouchers(Arc::clone(gate)));
     if let Some(backend) = &runtime.batch_settlement_evm {
         let watcher = EvmBatchWatcher::new(Arc::clone(backend), Arc::clone(&held));
         tokio::spawn(watcher.run(
-            connector_settlement_evm::WITHDRAWAL_WATCH_INTERVAL,
+            watch_interval(backend.min_withdraw_delay_secs()),
             connector_settlement_evm::BATCH_SWEEP_INTERVAL,
         ));
     }
     if let Some(backend) = &runtime.batch_settlement_solana {
         let watcher = SolanaBatchWatcher::new(Arc::clone(backend), held);
         tokio::spawn(watcher.run(
-            connector_settlement_solana::batch::CLOSING_WATCH_INTERVAL,
+            watch_interval(backend.min_grace_period_secs()),
             connector_settlement_solana::batch::OPEN_SETTLE_INTERVAL,
         ));
     }
