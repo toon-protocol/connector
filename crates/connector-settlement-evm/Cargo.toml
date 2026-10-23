@@ -42,3 +42,5 @@ libsecp256k1 = "0.6"
 serde_json = "1"
 tempfile = "3"
 proptest = "1"
+# `batch_watch_refusals`: what the watcher logs while an endpoint refuses.
+tracing-subscriber = "0.3"

@@ -453,8 +453,6 @@ impl EvmBatchWatcher {
         Ok(claimed)
     }
 
-    /// Claim every held voucher the chain has not recorded, then settle what
-    /// is claimed to this node's address.
     /// Whether `error` is to be logged as it always was. A refusal is
     /// reported to [`RefusalLog`] instead, which says so once.
     fn logged_in_full(&self, error: &BatchSettlementError) -> bool {
@@ -470,6 +468,8 @@ impl EvmBatchWatcher {
         }
     }
 
+    /// Claim every held voucher the chain has not recorded, then settle what
+    /// is claimed to this node's address.
     pub async fn sweep_once(&self) -> Result<SweepReport, BatchSettlementError> {
         let claimed = self.backend.claim_held(&self.held.held_vouchers()).await?;
         let settled = self.backend.settle_claimed().await?;

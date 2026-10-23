@@ -570,8 +570,9 @@ impl std::fmt::Display for AdmissionRefusal {
 }
 
 /// Errors a [`BatchSettlementBackend`] reports. Every variant but
-/// [`Backend`](BatchSettlementError::Backend) is a rule of the port; that
-/// one is an I/O failure specific to how an implementation reaches its
+/// [`Refused`](BatchSettlementError::Refused) and
+/// [`Backend`](BatchSettlementError::Backend) is a rule of the port; those
+/// two are I/O failures specific to how an implementation reaches its
 /// chain.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BatchSettlementError {
