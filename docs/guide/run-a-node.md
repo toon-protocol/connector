@@ -32,6 +32,12 @@ also the one route's prefix), `--image <ref>` (what `compose.yml` runs; pin a re
 for a node you keep). A directory that already holds a `config/connector.toml` is refused by
 name, because rotating the signer key would change the node's identity under every peer.
 
+The node it writes publishes `http_endpoint = "http://127.0.0.1:3000/ilp"`. Published
+endpoints are **absolute** URLs that a payer dials exactly as written, so that one works only
+for a payer on this same host, and the node warns about it at boot. Before exposing the node,
+change it to the URL a payer elsewhere dials, such as the public `https://` URL of a TLS
+proxy in front of it ([being peerable](peering.md#being-peerable)).
+
 ## With Docker
 
 The published image is how this is meant to be deployed. It runs as uid `10001`

@@ -670,6 +670,23 @@ fn warn_about_plaintext_peerings(config: &Config) {
     }
 }
 
+/// Name every published `[node]` endpoint that only a payer on this host or
+/// docker network can dial (issue #1533). A warning, never a refusal: the same
+/// values are right in tests, `local/` topologies and a same-host trial.
+fn warn_about_host_local_endpoints(config: &Config) {
+    let Some(node) = config.node() else { return };
+    for (field, value) in node.host_local_endpoints() {
+        tracing::warn!(
+            field,
+            value,
+            "[node] {field} names a host no payer outside this machine can reach, and it is \
+             published as written in this node's self-description. Unless every payer is on \
+             this host or docker network, publish the URL a payer outside this host dials: \
+             the public https:// (or wss://) URL in front of the node"
+        );
+    }
+}
+
 /// Everything [`build`] produced from a validated [`Config`], and
 /// everything [`router`] needs from it. A struct rather than a tuple
 /// because the third member is the kind of thing that only ever grows: as
@@ -778,6 +795,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // and the whole point of a loopback-and-test opt-in is that a node that
     // took it says so where an operator will see it.
     warn_about_plaintext_peerings(config);
+    warn_about_host_local_endpoints(config);
     // Issue #678 gap 2: the dial side, built from `[[peers]]`. A node with
     // no dialable peering still holds an empty `InProcessPeerTransport`, so
     // a packet routed to a peer is answered `T01 peer unreachable` rather
