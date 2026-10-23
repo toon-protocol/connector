@@ -16,7 +16,7 @@ use connector_domain::{
     amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_fee, delivery_budget,
     forward_wait_budget, forwarded_expiry, is_expired, is_valid_ilp_address, refuse_oversize,
     select_route, AssetId, EnvelopeRequest, Fulfill, PacketResponse, PayloadLimit, Prepare, Price,
-    RateLookup, Reject, RejectCode, RejectReason, FORWARDING_MESSAGE_WINDOW,
+    RateLookup, Reject, RejectCode, RejectReason, RequestLimit, FORWARDING_MESSAGE_WINDOW,
 };
 use connector_settlement::ChannelId;
 use connector_signer::giftwrap::{derive_fulfillment, open_request, seal_response};
@@ -3937,6 +3937,20 @@ impl Connector {
                     max_bytes: route.max_bytes(),
                 },
             })
+    }
+
+    /// The largest request body this node reads before it knows a packet's
+    /// route (ADR 0082) -- derived from the configured routes' `max_bytes`,
+    /// terminating and forwarded alike, since a forwarding hop reads the
+    /// whole packet too. A runtime route and a lease carry no limit, so
+    /// neither raises it.
+    pub fn request_limit(&self) -> RequestLimit {
+        RequestLimit::covering(
+            self.routes
+                .iter()
+                .filter_map(StaticRoute::max_bytes)
+                .chain(self.peer_routes.iter().filter_map(PeerRoute::max_bytes)),
+        )
     }
 
     /// [`Self::client_route`]'s price alone, for a caller with no use for

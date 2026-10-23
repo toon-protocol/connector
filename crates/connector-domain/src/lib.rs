@@ -67,7 +67,9 @@ pub use node::{
     CLIENT_EDGE_SUPPORTED_VERSIONS,
 };
 pub use packet::{Fulfill, PacketResponse, Prepare, Reject, RejectCode, RejectReason};
-pub use payload_limit::{refuse_oversize, PayloadLimit};
+pub use payload_limit::{
+    refuse_oversize, PayloadLimit, RequestLimit, BTP_MESSAGE_LIMIT, MAX_PAYLOAD_LIMIT,
+};
 pub use price::Price;
 pub use rate::{Rate, RateError};
 pub use rate_table::{
