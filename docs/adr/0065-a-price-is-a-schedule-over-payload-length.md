@@ -4,7 +4,7 @@
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 
-**Falsifier:** `crates/connector-config/src/route.rs` matching `\bmax_bytes\b` — this record defers a per-route payload ceiling to its own decision and says no such field exists. The field cannot be spelled anything else in a route's schema, so its appearance here means the deferral was quietly resolved and this record's "Not decided here" section is stale.
+**Falsifier:** none — this record's one absence claim, that no per-route payload limit exists, was resolved on the record rather than quietly: [0081](0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md) decides `max_bytes`, and the "Not decided here" paragraph below says so. Its former falsifier (`route.rs` matching `\bmax_bytes\b`) was retired with that record.
 
 A terminated route's price is **`base + per_kib × ceil(payload_len / 1024)`**, where
 `payload_len` is the length of the packet's own `data` — the sealed gift wrap, whose
@@ -140,7 +140,10 @@ did not already have in its own request body.
 of its motive: with a slope there is no longer a cheap tier for a large packet to abuse,
 because a large packet simply costs more. What remains — an operator wanting to refuse work
 above a size at any price — is a different decision about refusal rather than about pricing,
-and it gets its own record. Today the only ceiling is the HTTP body limit.
+and it gets its own record. Today the only ceiling is the HTTP body limit. **Decided by
+[0081](0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md)** (#1530): a route
+may declare `max_bytes`, measured on the same sealed length this record prices on, and a packet
+over it is refused `F00` before it is paid for.
 
 **App-quoted pricing.** For an upstream whose price moves under the operator's feet — an
 Arweave or ArNS buy priced in AR at the moment of purchase — a schedule an operator commits

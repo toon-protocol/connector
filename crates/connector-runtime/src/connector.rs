@@ -14,9 +14,9 @@ use connector_config::{
 use connector_domain::x402::X402PaymentRequired;
 use connector_domain::{
     amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_fee, delivery_budget,
-    forward_wait_budget, forwarded_expiry, is_expired, is_valid_ilp_address, select_route, AssetId,
-    EnvelopeRequest, Fulfill, PacketResponse, Prepare, Price, RateLookup, Reject, RejectCode,
-    FORWARDING_MESSAGE_WINDOW,
+    forward_wait_budget, forwarded_expiry, is_expired, is_valid_ilp_address, refuse_oversize,
+    select_route, AssetId, EnvelopeRequest, Fulfill, PacketResponse, PayloadLimit, Prepare, Price,
+    RateLookup, Reject, RejectCode, FORWARDING_MESSAGE_WINDOW,
 };
 use connector_settlement::ChannelId;
 use connector_signer::giftwrap::{derive_fulfillment, open_request, seal_response};
@@ -376,6 +376,10 @@ pub struct ClientRouteFacts {
     /// matching route's `request` table, converted to JSON. `None` when the
     /// route configured none.
     pub request: Option<serde_json::Value>,
+    /// The largest sealed payload a packet to this route may carry (ADR
+    /// 0081) -- refused `F00` above it before any claim is taken. `None` when
+    /// the route set no `max_bytes`.
+    pub max_bytes: Option<PayloadLimit>,
 }
 
 /// One priced prefix, as [`Connector::client_route_prices`] enumerates them
@@ -401,6 +405,9 @@ pub struct ClientRoutePrice {
     /// carriage from. There is no second value for the advertisement to
     /// disagree with the enforcement about.
     pub transport_policy: TransportPolicy,
+    /// The route's payload limit (ADR 0081), read off the same lookup for
+    /// the same reason: what is published and what is refused are one value.
+    pub max_bytes: Option<PayloadLimit>,
 }
 
 /// The connector's packet plane: a fixed set of terminated routes and peer
@@ -1963,9 +1970,10 @@ impl Connector {
     }
 
     /// Reject `prepare` outright if it isn't even eligible for routing --
-    /// already past its expiry as of the injected clock -- checked before
-    /// any route is selected or any app/peer is touched, so an expired
-    /// packet never reaches either.
+    /// already past its expiry as of the injected clock, or longer than its
+    /// route's `max_bytes` (ADR 0081) -- checked before any route is
+    /// selected or any app/peer is touched, so such a packet never reaches
+    /// either.
     ///
     /// Until issue #1269 this also refused a missing/all-zero execution
     /// condition (issue #417). That arm is gone along with the field: there
@@ -1983,7 +1991,16 @@ impl Connector {
                 accumulated_cost: 0,
             });
         }
-        None
+        self.refuse_oversize(prepare)
+    }
+
+    /// `F00` for a packet whose sealed payload is longer than the matched
+    /// configured route's `max_bytes` (ADR 0081), or `None`. Read off the
+    /// same [`Self::client_route`] lookup the price is, so a packet is
+    /// refused under the limit of the route it would have been charged by.
+    fn refuse_oversize(&self, prepare: &Prepare) -> Option<Reject> {
+        let route = self.client_route(&prepare.destination)?;
+        refuse_oversize(route.max_bytes, &prepare.destination, prepare.data.len())
     }
 
     /// Reject `prepare` outright if it fails [`Self::reject_ineligible`];
@@ -2127,6 +2144,18 @@ impl Connector {
         prepare: Prepare,
     ) -> PacketResponse {
         if let Some(route) = self.client_route(&prepare.destination) {
+            // ADR 0081: over the route's limit is refused before the amount
+            // is judged -- no amount could buy this packet here, so `F03`
+            // would tell the sender to pay more for something it cannot have.
+            if let Some(reject) =
+                refuse_oversize(route.max_bytes, &prepare.destination, prepare.data.len())
+            {
+                let mut trace = self.trace(&prepare, arrived_from.map(Arrival::Peer));
+                if let Some(trace) = trace.as_mut() {
+                    trace.direction = Some(Direction::Delivered);
+                }
+                return self.finish(PacketResponse::Reject(reject), trace, None);
+            }
             // ADR 0029's per-packet coverage rule, read off the schedule at
             // this packet's own payload length (ADR 0065): the peer measures
             // the sealed wrap it was handed, which is the same figure the
@@ -2248,6 +2277,13 @@ impl Connector {
             return Err(ProbeDenied::RateLimited);
         }
         if let Some(route) = self.client_route(&prepare.destination) {
+            // ADR 0081: a packet this route would refuse for its size has no
+            // cost to report -- the refusal is the answer a real one gets.
+            if let Some(reject) =
+                refuse_oversize(route.max_bytes, &prepare.destination, prepare.data.len())
+            {
+                return Ok(PacketResponse::Reject(reject));
+            }
             // A probe learns what the path costs *for a packet like the one
             // it sent* (ADR 0011, ADR 0065): the schedule is evaluated at the
             // probe's own payload length, so a sender that probes with the
@@ -3862,18 +3898,21 @@ impl Connector {
                     transport_policy: self.routes[index].transport_policy(),
                     kind: ClientRouteKind::Terminated,
                     request: self.routes[index].request().cloned(),
+                    max_bytes: self.routes[index].max_bytes(),
                 },
                 ConfiguredTarget::Peer(index) => ClientRouteFacts {
                     price: self.peer_routes[index].price(),
                     transport_policy: TransportPolicy::Both,
                     kind: ClientRouteKind::Forwarded,
                     request: self.peer_routes[index].request().cloned(),
+                    max_bytes: self.peer_routes[index].max_bytes(),
                 },
                 ConfiguredTarget::RuntimePeer(route) => ClientRouteFacts {
                     price: route.price(),
                     transport_policy: TransportPolicy::Both,
                     kind: ClientRouteKind::Forwarded,
                     request: route.request().cloned(),
+                    max_bytes: route.max_bytes(),
                 },
             })
     }
@@ -3929,6 +3968,7 @@ impl Connector {
                     price: facts.price,
                     request: facts.request,
                     transport_policy: facts.transport_policy,
+                    max_bytes: facts.max_bytes,
                 })
             })
             .collect()
@@ -11129,6 +11169,151 @@ mod tests {
             assert!(counted.contains(&format!(
                 r#"toon_packets_total{{outcome="fulfill"}} {packets}"#
             )));
+        }
+    }
+
+    /// ADR 0081 (issue #1530): a route's `max_bytes` is refused `F00` at
+    /// every gate that would otherwise charge for the packet -- the peer
+    /// arrival, the probe and routing itself -- measured on the same sealed
+    /// length the price is charged on.
+    mod payload_limit {
+        use super::*;
+        use connector_domain::PayloadLimit;
+
+        const CHANNEL: &str = "evm:0xchannel";
+
+        /// A terminated route at `g.example.app`, priced `price`, refusing a
+        /// sealed payload longer than `limit` bytes.
+        fn limited_connector(price: u64, limit: usize) -> (Connector, Arc<FakeAppClient>) {
+            let route = StaticRoute::new_priced("g.example.app", "http://localhost:4000", price)
+                .unwrap()
+                .with_max_bytes(PayloadLimit::new(limit as u64));
+            let app_client = Arc::new(FakeAppClient::new());
+            app_client.respond(route.handler_url(), answered(b"done"));
+            (
+                connector_with(vec![route], app_client.clone(), test_clock()),
+                app_client,
+            )
+        }
+
+        fn assert_refused_oversize(response: PacketResponse, limit: usize) {
+            match response {
+                PacketResponse::Reject(reject) => {
+                    assert_eq!(reject.code.as_str(), "F00");
+                    assert!(
+                        reject
+                            .message
+                            .contains(&format!("at most {limit} payload bytes")),
+                        "the refusal must name the limit, got: {}",
+                        reject.message
+                    );
+                    assert_eq!(reject.accumulated_cost, 0);
+                }
+                other => panic!("expected F00, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_peer_arrival_over_the_limit_is_refused_f00_before_its_amount_is_judged() {
+            let (over, _) = sealed_prepare(b"hello");
+            // One byte under this packet's own sealed length.
+            let limit = over.data.len() - 1;
+            let (connector, app_client) = limited_connector(1000, limit);
+
+            // Underpaid as well as oversize: the size is the answer, since no
+            // amount could ever buy this packet here.
+            let response = connector
+                .handle_peer_prepare(Some("upstream"), Prepare { amount: 1, ..over })
+                .await;
+
+            assert_refused_oversize(response, limit);
+            assert_eq!(app_client.deliveries().len(), 0);
+        }
+
+        #[tokio::test]
+        async fn a_peer_arrival_at_the_limit_is_delivered() {
+            let (fits, _) = sealed_prepare(b"hello");
+            let (connector, app_client) = limited_connector(1000, fits.data.len());
+
+            let response = connector
+                .handle_peer_prepare(
+                    Some("upstream"),
+                    Prepare {
+                        amount: 1000,
+                        ..fits
+                    },
+                )
+                .await;
+
+            assert!(
+                matches!(response, PacketResponse::Fulfill(_)),
+                "got {response:?}"
+            );
+            assert_eq!(app_client.deliveries().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_probe_over_the_limit_is_refused_f00_rather_than_quoted() {
+            let (over, _) = sealed_prepare(b"hello");
+            let limit = over.data.len() - 1;
+            let (connector, _) = limited_connector(25, limit);
+            connector.recognize_channel(CHANNEL);
+
+            let response = connector
+                .handle_probe(CHANNEL, over)
+                .await
+                .expect("not denied");
+
+            assert_refused_oversize(response, limit);
+        }
+
+        /// A forwarding hop refuses on its own route's limit too: the sealed
+        /// length is carriage, so it needs nothing of the packet a forward
+        /// does not already have.
+        #[tokio::test]
+        async fn a_packet_over_a_forwarded_routes_limit_is_refused_f00_and_not_forwarded() {
+            let route = PeerRoute::new_priced("g.example.remote", "downstream", 10)
+                .with_max_bytes(PayloadLimit::new(4));
+            let connector = Connector::new(
+                vec![],
+                vec![route],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                test_clock(),
+            );
+
+            let response = connector
+                .handle_prepare(Prepare {
+                    data: b"12345".to_vec(),
+                    ..prepare("g.example.remote", b"unused")
+                })
+                .await;
+
+            assert_refused_oversize(response, 4);
+        }
+
+        #[test]
+        fn the_limit_is_reported_with_the_routes_price_and_absent_when_unset() {
+            let limited = StaticRoute::new_priced("g.example.app", "http://localhost:4000", 1)
+                .unwrap()
+                .with_max_bytes(PayloadLimit::new(65_536));
+            let open =
+                StaticRoute::new_priced("g.example.open", "http://localhost:4001", 1).unwrap();
+            let connector = connector_with(
+                vec![limited, open],
+                Arc::new(FakeAppClient::new()),
+                test_clock(),
+            );
+
+            let prices = connector.client_route_prices();
+
+            assert_eq!(prices[0].prefix, "g.example.app");
+            assert_eq!(prices[0].max_bytes, PayloadLimit::new(65_536));
+            assert_eq!(prices[1].max_bytes, None);
+            assert_eq!(
+                connector.client_route("g.example.app").unwrap().max_bytes,
+                PayloadLimit::new(65_536)
+            );
         }
     }
 }

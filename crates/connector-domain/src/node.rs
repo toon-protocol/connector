@@ -172,6 +172,13 @@ pub struct RoutePrice {
     /// before this issue.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub request: Option<serde_json::Value>,
+    /// The largest sealed payload, in bytes, this route accepts (ADR 0081,
+    /// issue #1530) -- the `[[routes]] max_bytes` a packet over is refused
+    /// `F00` under, before it is paid for. A JSON number, as on the greeting.
+    /// Absent on a route with no limit, so a node that sets none publishes
+    /// exactly the document it published before ADR 0081.
+    #[serde(rename = "maxBytes", skip_serializing_if = "Option::is_none", default)]
+    pub max_bytes: Option<u64>,
     /// The client transport **this** route requires (ND-05a, TOON_Network
     /// issue #111) -- `"http"` or `"btp"`, the two spellings
     /// `TransportPolicy::name` already gives the greeting's
@@ -447,6 +454,7 @@ mod tests {
                 price: "1000".to_string(),
                 price_per_kib: None,
                 request: None,
+                max_bytes: None,
                 required_transport: None,
             }],
             Some("btp".to_string()),
@@ -477,6 +485,7 @@ mod tests {
                 price: u64::MAX.to_string(),
                 price_per_kib: None,
                 request: None,
+                max_bytes: None,
                 required_transport: None,
             }],
             None,
@@ -503,6 +512,7 @@ mod tests {
                     price: "1000".to_string(),
                     price_per_kib: None,
                     request: Some(serde_json::json!({"protocol": "nip90", "kinds": [5096, 5098]})),
+                    max_bytes: None,
                     required_transport: None,
                 },
                 RoutePrice {
@@ -510,6 +520,7 @@ mod tests {
                     price: "1000".to_string(),
                     price_per_kib: None,
                     request: None,
+                    max_bytes: None,
                     required_transport: None,
                 },
             ],
@@ -542,6 +553,7 @@ mod tests {
                     price: "1".to_string(),
                     price_per_kib: None,
                     request: None,
+                    max_bytes: None,
                     required_transport: published_required_transport("btp"),
                 },
                 RoutePrice {
@@ -549,6 +561,7 @@ mod tests {
                     price: "0".to_string(),
                     price_per_kib: None,
                     request: None,
+                    max_bytes: None,
                     required_transport: published_required_transport("both"),
                 },
             ],
@@ -613,6 +626,7 @@ mod tests {
                 price: "1000".to_string(),
                 price_per_kib: None,
                 request: None,
+                max_bytes: None,
                 required_transport: None,
             }],
             Some("btp".to_string()),

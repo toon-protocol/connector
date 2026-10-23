@@ -797,6 +797,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         .map(|route| {
             PeerRoute::new_scheduled(route.prefix(), route.peer_id(), route.price())
                 .with_request(route.request().cloned())
+                .with_max_bytes(route.max_bytes())
         })
         .collect();
     let mut connector = Connector::new(

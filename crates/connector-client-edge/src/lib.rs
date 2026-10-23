@@ -76,8 +76,8 @@ use connector_config::TransportPolicy;
 use connector_domain::client_claim::ClientClaim;
 use connector_domain::identity::{anonymous_identity, resolve_identity, ConfiguredIdentity};
 use connector_domain::{
-    agreed_required_transport, published_required_transport, EdgeIdentity, NodeFacts,
-    NodeSelfDescription, PacketResponse, Prepare, Price, Reject, RejectCode, RoutePrice,
+    agreed_required_transport, published_required_transport, refuse_oversize, EdgeIdentity,
+    NodeFacts, NodeSelfDescription, PacketResponse, Prepare, Price, Reject, RejectCode, RoutePrice,
 };
 use connector_runtime::{ClientRouteFacts, ClientRouteKind, Connector, ProbeDenied};
 use connector_signer::nip59::{unwrap_claim, WrappedClaim};
@@ -577,6 +577,9 @@ async fn self_description(State(state): State<Arc<ClientEdgeState>>) -> Response
             price: route.price.base().to_string(),
             price_per_kib: (!route.price.is_flat()).then(|| route.price.per_kib().to_string()),
             request: route.request,
+            // ADR 0081: the limit both carriages refuse over, off the same
+            // lookup -- what is published and what is refused are one value.
+            max_bytes: route.max_bytes.map(|limit| limit.max_bytes()),
             // The carriage this route pins, off the same `client_route`
             // lookup the price came from -- and that lookup is the one
             // `handle_ilp` and `btp.rs` refuse a wrong carriage from
@@ -671,6 +674,13 @@ struct RoutePriceView {
     /// answer is byte-identical to what it was before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     charge: Option<u64>,
+    /// The largest sealed payload this destination's route accepts (ADR
+    /// 0081). Absent on a route with no limit, so this answer stays
+    /// byte-identical to what it was before the field existed. `charge` is
+    /// still answered for a `size` above it: it is what the schedule says,
+    /// and this field is what says such a packet is refused regardless.
+    #[serde(rename = "maxBytes", default, skip_serializing_if = "Option::is_none")]
+    max_bytes: Option<u64>,
     /// Which client carriage a request to this destination must arrive on
     /// (TOON_Network#111), in the same two spellings and from the same
     /// `client_route` lookup the self-description's per-route field and both
@@ -717,6 +727,7 @@ async fn route_price(
                 price: price.base(),
                 price_per_kib: price.per_kib(),
                 charge,
+                max_bytes: facts.max_bytes.map(|limit| limit.max_bytes()),
                 required_transport: published_required_transport(facts.transport_policy.name()),
             })
             .into_response()
@@ -769,9 +780,9 @@ fn payment_required(
     price: Price,
     payload_len: usize,
     node: &NodeFacts,
-    request: Option<&serde_json::Value>,
+    route: Option<&ClientRouteFacts>,
 ) -> Response {
-    x402_response(destination, price, payload_len, node, None, request)
+    x402_response(destination, price, payload_len, node, None, route)
 }
 
 /// Answer a request to `destination` that arrived over a transport its
@@ -790,7 +801,7 @@ fn wrong_transport_required(
     payload_len: usize,
     required: TransportPolicy,
     node: &NodeFacts,
-    request: Option<&serde_json::Value>,
+    route: Option<&ClientRouteFacts>,
 ) -> Response {
     x402_response(
         destination,
@@ -798,7 +809,7 @@ fn wrong_transport_required(
         payload_len,
         node,
         Some(required.name()),
-        request,
+        route,
     )
 }
 
@@ -808,7 +819,7 @@ fn x402_response(
     payload_len: usize,
     node: &NodeFacts,
     required_transport: Option<&str>,
-    request: Option<&serde_json::Value>,
+    route: Option<&ClientRouteFacts>,
 ) -> Response {
     let body = x402_terms_body(
         destination,
@@ -816,7 +827,7 @@ fn x402_response(
         payload_len,
         node,
         required_transport,
-        request,
+        route,
     );
     let header_value = BASE64.encode(&body);
     Response::builder()
@@ -846,7 +857,7 @@ fn x402_terms_body(
     payload_len: usize,
     node: &NodeFacts,
     required_transport: Option<&str>,
-    request: Option<&serde_json::Value>,
+    route: Option<&ClientRouteFacts>,
 ) -> Vec<u8> {
     connector_domain::x402::terms_body(&connector_domain::x402::GreetingTerms {
         destination,
@@ -856,7 +867,8 @@ fn x402_terms_body(
         required_transport,
         session_lease_ttl_ms: crate::session_registry::SESSION_LEASE_BACKSTOP_TTL.as_millis()
             as u64,
-        request,
+        request: route.and_then(|route| route.request.as_ref()),
+        max_bytes: route.and_then(|route| route.max_bytes),
     })
 }
 
@@ -1274,12 +1286,10 @@ async fn handle_ilp(
         .as_ref()
         .map_or(Price::FREE, |route| route.price);
     let charge = schedule.charge(prepare.data.len());
-    // Issue #1210: what a client should send to use this route, greeted
-    // alongside its price -- read off the same lookup, so the two cannot
-    // name different routes.
-    let request = client_route
-        .as_ref()
-        .and_then(|route| route.request.as_ref());
+    // Issue #1210 and ADR 0081: what a client should send to use this route,
+    // and the largest payload it accepts, are greeted alongside its price off
+    // the same lookup -- the greeting helpers read both from `client_route`
+    // itself, so the three cannot name different routes.
 
     // Transport policy (issue #701, toon-meta#262 decision 11) is checked
     // before payment is considered at all: a route restricted to BTP is
@@ -1296,9 +1306,19 @@ async fn handle_ilp(
                 prepare.data.len(),
                 policy,
                 &state.node,
-                request,
+                client_route.as_ref(),
             );
         }
+    }
+
+    // ADR 0081: a packet over the route's `max_bytes` is refused before it is
+    // greeted or its claim is looked at, so it never spends the client's
+    // watermark -- no amount could buy it here, and a greeting would only
+    // invite a payment that cannot succeed.
+    if let Some(reject) = client_route.as_ref().and_then(|route| {
+        refuse_oversize(route.max_bytes, &prepare.destination, prepare.data.len())
+    }) {
+        return packet_response(PacketResponse::Reject(reject));
     }
 
     if !has_claim_header && (charge > 0 || prepare.greeting) {
@@ -1307,7 +1327,7 @@ async fn handle_ilp(
             schedule,
             prepare.data.len(),
             &state.node,
-            request,
+            client_route.as_ref(),
         );
     }
 
@@ -3318,6 +3338,73 @@ mod tests {
         );
     }
 
+    /// ADR 0081 (issue #1530): a route's `max_bytes` is published wherever
+    /// its price is -- the self-description, `GET /ilp/routes/price` and the
+    /// x402 greeting -- so a client can check its size before it pays, and a
+    /// route without one publishes no such key anywhere.
+    #[tokio::test]
+    async fn a_routes_payload_limit_is_published_wherever_its_price_is() {
+        let limited = StaticRoute::new_priced("g.toon.blossom", "http://localhost:4000", 100)
+            .unwrap()
+            .with_max_bytes(connector_domain::PayloadLimit::new(65_536));
+        let open = StaticRoute::new_priced("g.example.app", "http://localhost:4001", 100).unwrap();
+        let connector = Arc::new(Connector::new(
+            vec![limited, open],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let app = router(connector, test_signer());
+
+        let document = self_description_of(app.clone()).await;
+        let routes = document["routes"].as_array().unwrap();
+        let route = |prefix: &str| {
+            routes
+                .iter()
+                .find(|route| route["prefix"] == prefix)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(route("g.toon.blossom")["maxBytes"], 65_536);
+        assert!(
+            route("g.example.app").get("maxBytes").is_none(),
+            "a route with no limit must publish no maxBytes key"
+        );
+
+        let ask = |destination: &'static str| {
+            let app = app.clone();
+            async move {
+                let request = Request::builder()
+                    .method("GET")
+                    .uri(format!("/ilp/routes/price?destination={destination}"))
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app.oneshot(request).await.unwrap();
+                let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        assert_eq!(ask("g.toon.blossom").await["maxBytes"], 65_536);
+        assert!(ask("g.example.app").await.get("maxBytes").is_none());
+
+        // The 402 greeting an unpaid request within the limit gets.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ilp")
+                    .body(Body::from(sample_prepare("g.toon.blossom").encode()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let terms = connector_domain::x402::parse_greeting(&bytes).expect("well-formed terms");
+        assert_eq!(terms.toon().unwrap().max_bytes, Some(65_536));
+    }
+
     /// ND-06: the edge identity -- the key a packet's payload is sealed to
     /// (ADR 0018) -- must be published, because a route whose terminating
     /// identity is unpublished cannot be delivered to at all. It is the same
@@ -4289,6 +4376,88 @@ mod tests {
             assert_eq!(reject.code.as_str(), "F03");
             assert_ne!(reject.code.as_str(), "F01");
             assert!(app_client.deliveries().is_empty());
+        }
+
+        /// ADR 0081 (issue #1530) at the seam that takes the money: a packet
+        /// over its route's `max_bytes` is refused `F00` before its covering
+        /// claim is validated, so the claim journals nothing and the same
+        /// claim then still buys a packet within the limit.
+        #[tokio::test]
+        async fn a_packet_over_its_routes_payload_limit_is_refused_before_its_claim_is_taken() {
+            use connector_runtime::Journal;
+
+            let signer = test_signer();
+            let receiver = signer.public_key().unwrap();
+            let (fits, _) = sealed_sample_prepare_with_body("g.example.app", b"hi", &receiver);
+            let (over, _) =
+                sealed_sample_prepare_with_body("g.example.app", &vec![b'x'; 3000], &receiver);
+            let limit = fits.data.len();
+            assert!(over.data.len() > limit);
+
+            let route = StaticRoute::new_priced("g.example.app", "http://localhost:4000", 100)
+                .unwrap()
+                .with_max_bytes(connector_domain::PayloadLimit::new(limit as u64));
+            let app_client = Arc::new(FakeAppClient::new());
+            app_client.respond(route.handler_url(), answered(b"ok"));
+            let connector = Arc::new(
+                Connector::new(
+                    vec![route],
+                    vec![],
+                    app_client.clone(),
+                    Arc::new(InProcessPeerTransport::new()),
+                    test_clock(),
+                )
+                .with_identity_signer(signer.clone()),
+            );
+            let journal = Arc::new(InMemoryJournal::new());
+            let gate = crate::test_support::gate_over(
+                Arc::clone(&journal) as Arc<dyn Journal>,
+                &test_channels(),
+            );
+            let app = router_with_gate(connector, signer, None, gate);
+
+            let response = app
+                .clone()
+                .oneshot(request_with_claim_header(
+                    &over,
+                    CLAIM_HEADER,
+                    &evm_claim_json(100),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            let reject = Reject::decode(&bytes).expect("decode reject");
+            assert_eq!(reject.code.as_str(), "F00");
+            assert!(
+                reject
+                    .message
+                    .contains(&format!("at most {limit} payload bytes")),
+                "the refusal names the limit, got: {}",
+                reject.message
+            );
+            assert!(
+                journal.read_all().unwrap().is_empty(),
+                "an oversize packet's claim must never reach the journal"
+            );
+            assert!(app_client.deliveries().is_empty());
+
+            // A packet exactly at the limit is priced and delivered as
+            // before -- by the very claim the oversize one carried.
+            let response = app
+                .oneshot(request_with_claim_header(
+                    &fits,
+                    CLAIM_HEADER,
+                    &evm_claim_json(100),
+                ))
+                .await
+                .unwrap();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            assert!(
+                Fulfill::decode(&bytes).is_ok(),
+                "an at-limit packet fulfils"
+            );
+            assert_eq!(app_client.deliveries().len(), 1);
         }
 
         /// ADR 0065 (issue #984) at the seam that actually takes the money:
@@ -5405,6 +5574,7 @@ mod tests {
                     price: FORWARD_PRICE,
                     price_per_kib: 0,
                     charge: None,
+                    max_bytes: None,
                     // A forwarded route accepts either carriage -- writing
                     // `transport` on one is refused at load -- so this answer
                     // names no pin (TOON_Network#111).

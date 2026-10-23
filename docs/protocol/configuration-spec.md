@@ -134,6 +134,16 @@ the operator wrote none. A connector MUST NOT fetch this fact from the app or an
 operator declares it, or it is absent.
 ([ADR 0067](../adr/0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md))
 
+**CF-13e** `[operator]` — A route MAY carry `max_bytes`, the largest sealed payload, in bytes, a
+packet to it may carry, on either branch. A connector MUST refuse a packet whose `data` is longer
+with `F00`, at every gate that charges the route's price (CF-13b), and at the client edge MUST do so
+before any claim for that packet is read, so an oversize packet costs its sender nothing. A packet
+exactly `max_bytes` long MUST be priced and delivered as one without a limit is. A connector MUST
+publish the limit as `maxBytes` wherever it publishes the route's price, omitted where the route
+sets none, and MUST refuse at load, by name, a `max_bytes` of `0` or one above the client edge's own
+2 MiB body limit: the key lowers the carriage's limit and never raises it.
+([ADR 0081](../adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md))
+
 **CF-14** `[connector]` — Two routes naming the same handler MUST agree on its price, comparing whole
 schedules: same base and same slope.
 
@@ -325,7 +335,7 @@ spell it however it likes.
 | ------------------------------------------ | ------------------------------------- | -------- | ---------------------------------------------------- |
 | `client_edge_addr`                         | socket address                        | yes      | where the client edge binds — **not** its public URL |
 | `[signer]`                                 | table                                 | yes      | CF-06, the one identity key                          |
-| `[[routes]]`                               | array of tables                       | —        | CF-10 – CF-15                                        |
+| `[[routes]]`                               | array of tables                       | —        | CF-10 – CF-15 (CF-13e: `max_bytes`)                  |
 | `[[peers]]`                                | array of tables                       | —        | CF-16 – CF-20                                        |
 | `[[peer_channels]]`                        | array of tables                       | —        | CF-21, the peer book                                 |
 | `[[pay_channels]]`                         | array of tables                       | —        | CF-21, channels this node pays from                  |
@@ -364,7 +374,9 @@ CF-10, CF-11). Write `price = 0` where free is deliberate. A price is either a w
 `handler_url` (CF-15). `request` (CF-13d) is an optional arbitrary table, published unread wherever
 the route's price is published; unlike every other row in `[[routes]]`, its contents are not
 `deny_unknown_fields` — that guarantee stops at the row, not inside a blob whose keys are the app's
-business.
+business. `max_bytes` (CF-13e) is optional on either branch: a whole number of bytes from `1` to
+2 MiB, measured on the sealed payload a price is charged on, above which a packet is refused `F00`
+before it is paid for. A `[[children]]` entry carries neither `request` nor `max_bytes`.
 
 **Peerings.** A peer row carries an `id`, an optional `endpoint` whose scheme selects the carriage, a
 `max_packet_amount` (CF-19's cap — `0` is refused by name, and there is no disabling spelling) and a

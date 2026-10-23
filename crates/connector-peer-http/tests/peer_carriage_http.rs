@@ -1757,6 +1757,28 @@ async fn a_voucher_that_does_not_cover_the_routes_price_is_refused_with_the_gree
     assert!(app_client.deliveries().is_empty());
 }
 
+/// ADR 0081 (issue #1530) at the peer gate: a packet over the route's
+/// `max_bytes` is refused `F00` rather than greeted `F06` -- no voucher could
+/// buy it, so quoting terms for it would only invite a payment that cannot
+/// succeed -- and the app never sees it.
+#[tokio::test]
+async fn a_peer_arrival_over_the_routes_payload_limit_is_refused_f00_not_greeted() {
+    let book = VoucherBook::new();
+    let route = priced_route().with_max_bytes(connector_domain::PayloadLimit::new(16));
+    let app_client = serving_app(&route, b"never");
+    let peer = accepting(payee_with_route(route, Arc::clone(&app_client)), &book);
+    let mut oversize = prepare("g.example.app");
+    oversize.data = vec![0xab; 17];
+
+    let response = peer
+        .handle(request(Some(&peer_voucher(10)), oversize.encode()))
+        .await;
+
+    assert_eq!(reject_code(&response), "F00");
+    assert!(response.headers.get(PAYMENT_REQUIRED_HEADER).is_none());
+    assert!(app_client.deliveries().is_empty());
+}
+
 /// ADR 0065 (issue #984) at the peer gate: what a peer arrival must cover is
 /// the schedule at THAT packet's payload length, and the greeting it gets
 /// back publishes the schedule so the peer can price its next packet.

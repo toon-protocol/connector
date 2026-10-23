@@ -529,6 +529,14 @@ the termination itself, all computing it from the same bytes so they cannot disa
 _Avoid_: using **price** for this — a price is what the route charges, a charge is what this
 packet cost.
 
+**Payload limit**:
+The largest sealed payload a route accepts — its `max_bytes`, measured on the same length its
+**price** is charged on ([ADR 0081](docs/adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md)).
+A packet over it is refused `F00` before any claim for it is taken, so it costs its sender nothing,
+and the limit is published wherever the price is. It can lower the carriage's own body limit, never
+raise it. Not to be confused with the **cap**, which bounds a packet's _amount_ at a peering.
+_Avoid_: ceiling (a retired term, above), size cap
+
 **Cost**:
 What a caller must send for a packet to be delivered: the fees of every hop that carries it, plus
 the **charge** of the route that terminates it. A reject states the cost of the path _that
