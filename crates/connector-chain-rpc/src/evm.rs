@@ -21,12 +21,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use ethers::providers::{JsonRpcClient, JsonRpcError, Provider, ProviderError, RpcError};
+use ethers::contract::ContractError;
+use ethers::providers::{
+    JsonRpcClient, JsonRpcError, Middleware, Provider, ProviderError, RpcError,
+};
 use serde::de::DeserializeOwned;
 use serde::de::Error as _;
 use serde::Serialize;
 
-use crate::{is_refusal, refusal_backoff, RpcTransport};
+use crate::{is_refusal, refusal_backoff, AsRefused, Refused, RpcTransport};
 
 /// A JSON-RPC client over one settlement table's [`RpcTransport`].
 #[derive(Debug)]
@@ -109,6 +112,52 @@ impl RpcError for EvmRpcError {
     fn as_serde_error(&self) -> Option<&serde_json::Error> {
         match self {
             EvmRpcError::Unreadable { reason, .. } => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+impl AsRefused for EvmRpcError {
+    fn refusal(&self) -> Option<Refused> {
+        match self {
+            EvmRpcError::Refused {
+                endpoint, status, ..
+            } => Some(Refused {
+                endpoint: endpoint.clone(),
+                status: *status,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl AsRefused for ProviderError {
+    fn refusal(&self) -> Option<Refused> {
+        // `ProviderError` boxes the client's error as a bare `RpcError`, so
+        // the refusal is found by asking whether that box is the one this
+        // client returns.
+        match self {
+            ProviderError::JsonRpcClientError(source) => {
+                let source: &(dyn std::error::Error + 'static) = source.as_ref();
+                source.downcast_ref::<EvmRpcError>()?.refusal()
+            }
+            _ => None,
+        }
+    }
+}
+
+impl<M> AsRefused for ContractError<M>
+where
+    M: Middleware,
+    M::Error: 'static,
+{
+    fn refusal(&self) -> Option<Refused> {
+        match self {
+            ContractError::ProviderError { e } => e.refusal(),
+            ContractError::MiddlewareError { e } => {
+                let e: &(dyn std::error::Error + 'static) = e;
+                e.downcast_ref::<ProviderError>()?.refusal()
+            }
             _ => None,
         }
     }

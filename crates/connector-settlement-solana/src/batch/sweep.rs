@@ -33,7 +33,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use connector_chain_rpc::retry_read;
+use connector_chain_rpc::{retry_read, RefusalLog, Refused};
 use connector_settlement::batch::{BatchSettlementError, ChannelPresentation, HeldVouchers};
 use connector_settlement::ChannelId;
 use solana_account_decoder_client_types::UiAccountEncoding;
@@ -45,7 +45,7 @@ use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
 
-use super::{backend_error, wire, SolanaBatchSettlement, SubmitFailure};
+use super::{rpc_error, wire, SolanaBatchSettlement, SubmitFailure};
 use crate::submit::Confirmed;
 
 /// How often an Open channel's latest voucher is settled. The EVM sweep's
@@ -171,7 +171,7 @@ impl SolanaBatchSettlement {
                 .get_program_accounts_with_config(&self.program_id, config.clone())
         })
         .await
-        .map_err(backend_error)?;
+        .map_err(rpc_error)?;
         Ok(accounts
             .into_iter()
             .filter_map(|(address, account)| {
@@ -188,7 +188,7 @@ impl SolanaBatchSettlement {
         let clock = solana_sdk::sysvar::clock::id();
         let account = retry_read(|| self.rpc.get_account(&clock))
             .await
-            .map_err(backend_error)?;
+            .map_err(rpc_error)?;
         solana_sdk::account::from_account::<Clock, _>(&account).ok_or_else(|| {
             BatchSettlementError::Backend("the clock sysvar did not decode".to_string())
         })
@@ -287,7 +287,7 @@ impl SolanaBatchSettlement {
         let account = &channel.account;
         let mint = retry_read(|| self.rpc.get_account(&account.mint))
             .await
-            .map_err(|error| SubmitFailure::Other(backend_error(error)))?;
+            .map_err(|error| SubmitFailure::Other(rpc_error(error)))?;
         let token_program = mint.owner;
         let sponsor = self.sponsor.pubkey();
         let recipients = wire::sole_recipient(receiver);
@@ -375,6 +375,8 @@ pub struct SolanaBatchWatcher {
     /// The treasury owner this deployment's `distribute` accepted, once one
     /// has.
     treasury: Mutex<Option<Pubkey>>,
+    /// Whether the endpoint is refusing, so [`run`](Self::run) says so once.
+    refusals: RefusalLog,
 }
 
 impl SolanaBatchWatcher {
@@ -383,6 +385,7 @@ impl SolanaBatchWatcher {
             backend,
             held,
             treasury: Mutex::new(None),
+            refusals: RefusalLog::new(),
         }
     }
 
@@ -466,12 +469,16 @@ impl SolanaBatchWatcher {
                 .await
             {
                 Ok(()) => taken.push((ChannelId(channel.address.to_string()), step)),
-                Err(error) => tracing::warn!(
-                    channel = %channel.address,
-                    ?step,
-                    %error,
-                    "a batch-settlement step failed; retrying next pass"
-                ),
+                Err(error) => {
+                    if self.logged_in_full(&error) {
+                        tracing::warn!(
+                            channel = %channel.address,
+                            ?step,
+                            %error,
+                            "a batch-settlement step failed; retrying next pass"
+                        );
+                    }
+                }
             }
         }
         if !reclaimable.is_empty() {
@@ -481,14 +488,33 @@ impl SolanaBatchWatcher {
                         .iter()
                         .map(|channel| (ChannelId(channel.address.to_string()), Step::Reclaim)),
                 ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    channels = reclaimable.len(),
-                    "reclaiming batch-settlement channel rent failed; retrying next pass"
-                ),
+                Err(error) => {
+                    if self.logged_in_full(&error) {
+                        tracing::warn!(
+                            %error,
+                            channels = reclaimable.len(),
+                            "reclaiming batch-settlement channel rent failed; retrying next pass"
+                        );
+                    }
+                }
             }
         }
         Ok(taken)
+    }
+
+    /// Whether `error` is to be logged as it always was. A refusal is
+    /// reported to [`RefusalLog`] instead, which says so once.
+    fn logged_in_full(&self, error: &BatchSettlementError) -> bool {
+        match error {
+            BatchSettlementError::Refused { endpoint, status } => {
+                self.refusals.refused(&Refused {
+                    endpoint: endpoint.clone(),
+                    status: *status,
+                });
+                false
+            }
+            _ => true,
+        }
     }
 
     /// Pass every `watch_every`, settling Open channels on the passes at
@@ -503,8 +529,10 @@ impl SolanaBatchWatcher {
         loop {
             let now = watch.tick().await;
             let settle_open = last_settle.is_none_or(|last| now - last >= settle_every);
+            self.refusals.begin_pass();
             match self.tick(settle_open).await {
                 Ok(taken) => {
+                    self.refusals.end_pass();
                     if settle_open {
                         last_settle = Some(now);
                     }
@@ -513,7 +541,9 @@ impl SolanaBatchWatcher {
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "batch-settlement channel watch failed; retrying");
+                    if self.logged_in_full(&error) {
+                        tracing::warn!(%error, "batch-settlement channel watch failed; retrying");
+                    }
                 }
             }
         }

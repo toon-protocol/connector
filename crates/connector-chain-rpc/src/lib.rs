@@ -29,7 +29,12 @@
 //! - **the refusal rule** ([`refusal_backoff`]): an HTTP 403 or 429 is an
 //!   exit relay's shared IP being rate-limited or blocked, not an answer, so
 //!   both chains' adapters retry it with backoff inside a fixed budget
-//!   (decision 5).
+//!   (decision 5). That budget is spent **once**, in the transport: a
+//!   refusal that outlasts it is reported as [`Refused`], and
+//!   [`retry_read`] does not retry it again. A persistent refusal therefore
+//!   costs 5 requests and 7.5s on EVM (the first plus [`REFUSAL_RETRIES`]),
+//!   and on Solana 6 requests for a 429 (the SDK's own retries are that
+//!   chain's 429 backoff) and 5 for a 403.
 //!
 //! The chain adapters are behind features so a crate takes only its own
 //! chain's SDK: [`evm::EvmRpc`] is the ethers `JsonRpcClient`, and
@@ -310,8 +315,100 @@ impl RpcTransport {
     }
 }
 
+/// A refusal the transport has already retried and now reports: which
+/// endpoint refused and with what status.
+///
+/// The endpoint is [`RpcTransport::endpoint`]'s form, never the URL, since a
+/// keyed URL carries the API key.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{endpoint} refused the request with HTTP {status}")]
+pub struct Refused {
+    pub endpoint: String,
+    pub status: u16,
+}
+
+/// Whether an error is a [`Refused`] the transport has reported, so a caller
+/// can tell a refusal from every other failure on either chain.
+pub trait AsRefused {
+    fn refusal(&self) -> Option<Refused>;
+}
+
+/// What a watch loop remembers about an endpoint that is refusing, so it
+/// logs the start of a run of refusals once and its end once, not once per
+/// cycle.
+///
+/// A pass calls [`begin_pass`](RefusalLog::begin_pass), reports each
+/// [`Refused`] it meets through [`refused`](RefusalLog::refused), and ends
+/// with [`end_pass`](RefusalLog::end_pass). Any other failure is the
+/// caller's to log as it always was.
+#[derive(Debug, Default)]
+pub struct RefusalLog {
+    state: std::sync::Mutex<RefusalState>,
+}
+
+#[derive(Debug, Default)]
+struct RefusalState {
+    /// The refusal the last `warn` announced, until a pass runs clean.
+    announced: Option<Refused>,
+    refused_this_pass: bool,
+}
+
+impl RefusalLog {
+    pub fn new() -> RefusalLog {
+        RefusalLog::default()
+    }
+
+    pub fn begin_pass(&self) {
+        self.state().refused_this_pass = false;
+    }
+
+    /// Record a refusal: a `warn` naming the endpoint and status when it
+    /// starts, `debug` while it continues.
+    pub fn refused(&self, refusal: &Refused) {
+        let mut state = self.state();
+        state.refused_this_pass = true;
+        if state.announced.as_ref() == Some(refusal) {
+            tracing::debug!(
+                endpoint = %refusal.endpoint,
+                status = refusal.status,
+                "the settlement RPC endpoint is still refusing"
+            );
+        } else {
+            tracing::warn!(
+                endpoint = %refusal.endpoint,
+                status = refusal.status,
+                "the settlement RPC endpoint is refusing requests; reads are retried by the \
+                 transport and the next pass tries again (further refusals are logged at \
+                 debug until it answers)"
+            );
+            state.announced = Some(refusal.clone());
+        }
+    }
+
+    /// End a pass. One that met no refusal after a run of them logs that the
+    /// endpoint answers again.
+    pub fn end_pass(&self) {
+        let mut state = self.state();
+        if !state.refused_this_pass {
+            if let Some(refusal) = state.announced.take() {
+                tracing::info!(
+                    endpoint = %refusal.endpoint,
+                    "the settlement RPC endpoint answers again"
+                );
+            }
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, RefusalState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// How many times a refused request is retried before the refusal is
-/// reported (ADR 0073 decision 5).
+/// reported (ADR 0073 decision 5). On EVM, which has one transport layer,
+/// that is 4 retries and 5 requests.
 pub const REFUSAL_RETRIES: u32 = 4;
 
 /// The first wait after a refusal. Each later one doubles it.
@@ -337,7 +434,9 @@ pub fn is_refusal(status: reqwest::StatusCode) -> bool {
 /// How long to wait before retry number `retry` (0-based) of a refused
 /// request, or `None` when the retry budget is spent.
 ///
-/// 0.5s, 1s, 2s, 4s: 7.5s in all, well inside one request's 30s. A
+/// 0.5s, 1s, 2s, 4s: 7.5s in all, well inside one request's 30s. This is
+/// the whole price of a refusal: nothing above the transport retries it
+/// again ([`retry_read`]). A
 /// `Retry-After` in seconds replaces the computed wait when it is shorter
 /// than [`RETRY_AFTER_CAP`]; one longer than that ends the retries.
 pub fn refusal_backoff(retry: u32, headers: &HeaderMap) -> Option<Duration> {
@@ -368,29 +467,31 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 
 /// How many times a read that has nothing riding on it yet is retried
 /// before its failure is reported: three, as ADR 0073 decision 5 sets for
-/// boot.
+/// boot. A refusal is not one of the failures it retries.
 pub const READ_RETRIES: u32 = 3;
 
 /// The first wait between attempts. Each later one doubles it, so a read
 /// that never succeeds costs 0.5s + 1s + 2s before it is reported.
 const FIRST_READ_BACKOFF: Duration = Duration::from_millis(500);
 
-/// Run a read, retrying any failure [`READ_RETRIES`] times with backoff
-/// before returning the last one.
+/// Run a read, retrying a failure [`READ_RETRIES`] times with backoff
+/// before returning the last one. A [`Refused`] is returned at once.
 ///
 /// For the reads a node makes before anything depends on them: every one
 /// boot makes (boot is where a circuit is youngest, and one lost round trip
 /// used to fail the whole node), and the blockhash or nonce a write reads
 /// before it signs. Every failure is retried, the node's own answers
-/// included, because retrying a read that was definitively refused only
-/// costs 3.5s before the same refusal is reported, and telling the two
-/// apart would need a per-call judgement that is easy to get wrong.
+/// included, except a refusal (HTTP 403 or 429): the transport has already
+/// retried that [`REFUSAL_RETRIES`] times with backoff, so retrying it here
+/// would multiply the requests a refused endpoint is sent (and its quota
+/// spent) by `1 + READ_RETRIES` for the same answer.
 ///
 /// **Never a send.** A transaction is not passed through this: a send whose
 /// answer was lost is resolved by looking up what it did, never by sending
 /// it again blind.
 pub async fn retry_read<T, E, F, Fut>(mut call: F) -> Result<T, E>
 where
+    E: AsRefused,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
@@ -398,7 +499,9 @@ where
     loop {
         match call().await {
             Ok(value) => return Ok(value),
-            Err(error) if attempt >= READ_RETRIES => return Err(error),
+            Err(error) if attempt >= READ_RETRIES || error.refusal().is_some() => {
+                return Err(error)
+            }
             Err(_) => {
                 tokio::time::sleep(FIRST_READ_BACKOFF * 2u32.pow(attempt)).await;
                 attempt += 1;
@@ -471,25 +574,112 @@ mod tests {
         assert!(built.is_proxied());
     }
 
+    #[derive(Debug, PartialEq)]
+    enum Failure {
+        Other(&'static str),
+        Refusal,
+    }
+
+    impl AsRefused for Failure {
+        fn refusal(&self) -> Option<Refused> {
+            matches!(self, Failure::Refusal).then(|| Refused {
+                endpoint: "http://rpc.example".to_string(),
+                status: 429,
+            })
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_read_is_retried_three_times_and_then_its_failure_is_reported() {
         let mut attempts = 0;
-        let failed: Result<(), &str> = retry_read(|| {
+        let failed: Result<(), Failure> = retry_read(|| {
             attempts += 1;
-            async { Err("unreachable") }
+            async { Err(Failure::Other("unreachable")) }
         })
         .await;
-        assert_eq!(failed, Err("unreachable"));
+        assert_eq!(failed, Err(Failure::Other("unreachable")));
         assert_eq!(attempts, 1 + READ_RETRIES);
 
         let mut attempts = 0;
-        let served: Result<u8, &str> = retry_read(|| {
+        let served: Result<u8, Failure> = retry_read(|| {
             attempts += 1;
-            let result = if attempts < 3 { Err("not yet") } else { Ok(7) };
+            let result = if attempts < 3 {
+                Err(Failure::Other("not yet"))
+            } else {
+                Ok(7)
+            };
             async move { result }
         })
         .await;
         assert_eq!(served, Ok(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_the_transport_reported_is_not_retried_again() {
+        let mut attempts = 0;
+        let failed: Result<(), Failure> = retry_read(|| {
+            attempts += 1;
+            async { Err(Failure::Refusal) }
+        })
+        .await;
+        assert_eq!(failed, Err(Failure::Refusal));
+        assert_eq!(attempts, 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn a_run_of_refusals_is_warned_about_once_and_its_end_logged_once() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        let refusal = Refused {
+            endpoint: "https://rpc.example".to_string(),
+            status: 429,
+        };
+        let log = RefusalLog::new();
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..5 {
+                log.begin_pass();
+                log.refused(&refusal);
+                log.end_pass();
+            }
+            log.begin_pass();
+            log.end_pass();
+            log.begin_pass();
+            log.end_pass();
+            log.begin_pass();
+            log.refused(&refusal);
+            log.end_pass();
+        });
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let count = |level: &str| text.lines().filter(|l| l.contains(level)).count();
+        assert_eq!(count(" WARN "), 2, "one per run of refusals:\n{text}");
+        assert_eq!(count(" DEBUG "), 4, "{text}");
+        assert_eq!(count(" INFO "), 1, "one when calls succeed again:\n{text}");
+        assert!(text.contains("https://rpc.example"), "{text}");
+        assert!(text.contains("429"), "{text}");
     }
 
     #[test]
