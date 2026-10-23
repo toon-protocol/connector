@@ -6,12 +6,10 @@ use url::Url;
 
 use crate::error::ConfigError;
 
-/// The largest `max_bytes` a route may declare (ADR 0081): the client
-/// edge's HTTP body limit, axum's own `DefaultBodyLimit` of 2 MiB, which
-/// `POST /ilp` does not override. A limit above it could never be reached on
-/// that carriage, and ADR 0081 lets a route lower the carriage's limit, never
-/// raise it -- raising it is issue #1529's, a separate decision.
-pub const MAX_PAYLOAD_LIMIT: u64 = 2 * 1024 * 1024;
+/// The largest `max_bytes` a route may declare (ADR 0082, raised from ADR
+/// 0081's 2 MiB): one definition, the domain's, since it also bounds how far
+/// a route can raise the node's [`connector_domain::RequestLimit`].
+pub use connector_domain::MAX_PAYLOAD_LIMIT;
 
 /// Maximum length of an ILP address, per RFC 0015.
 const MAX_ILP_ADDRESS_LEN: usize = 1023;
@@ -545,14 +543,14 @@ fn build_peer_route(
 
 /// Parse a `[[routes]]` entry's `max_bytes` (ADR 0081), refusing by name a
 /// value that is not a limit at all -- zero refuses every payload -- or one
-/// above [`MAX_PAYLOAD_LIMIT`], which no packet on the client edge's HTTP
-/// carriage could ever reach.
+/// above [`MAX_PAYLOAD_LIMIT`], further than ADR 0082 lets a route raise
+/// the node's request limit.
 fn parse_max_bytes(prefix: &str, value: Option<u64>) -> Result<Option<PayloadLimit>, ConfigError> {
     let Some(value) = value else {
         return Ok(None);
     };
     if value > MAX_PAYLOAD_LIMIT {
-        return Err(ConfigError::RouteMaxBytesAboveCarriage {
+        return Err(ConfigError::RouteMaxBytesAboveLimit {
             prefix: prefix.to_string(),
             value,
             limit: MAX_PAYLOAD_LIMIT,
@@ -754,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_limit_at_the_carriage_limit_loads_and_one_over_is_refused() {
+    fn a_payload_limit_at_the_maximum_loads_and_one_over_is_refused() {
         let mut at = priced_route("g.example.at", "http://localhost:4000", 1);
         at.max_bytes = Some(MAX_PAYLOAD_LIMIT);
         let (routes, _) = resolve_routes(None, vec![at], vec![]).expect("at the limit loads");
@@ -764,7 +762,7 @@ mod tests {
         over.max_bytes = Some(MAX_PAYLOAD_LIMIT + 1);
         assert!(matches!(
             resolve_routes(None, vec![over], vec![]),
-            Err(ConfigError::RouteMaxBytesAboveCarriage { prefix, .. }) if prefix == "g.peer-b"
+            Err(ConfigError::RouteMaxBytesAboveLimit { prefix, .. }) if prefix == "g.peer-b"
         ));
     }
 

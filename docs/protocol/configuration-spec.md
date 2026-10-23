@@ -140,9 +140,17 @@ with `F00`, at every gate that charges the route's price (CF-13b), and at the cl
 before any claim for that packet is read, so an oversize packet costs its sender nothing. A packet
 exactly `max_bytes` long MUST be priced and delivered as one without a limit is. A connector MUST
 publish the limit as `maxBytes` wherever it publishes the route's price, omitted where the route
-sets none, and MUST refuse at load, by name, a `max_bytes` of `0` or one above the client edge's own
-2 MiB body limit: the key lowers the carriage's limit and never raises it.
-([ADR 0081](../adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md))
+sets none, and MUST refuse at load, by name, a `max_bytes` of `0` or one above 64 MiB.
+([ADR 0081](../adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md),
+[ADR 0082](../adr/0082-a-route-may-raise-the-request-limit-to-carry-its-payload-limit.md))
+
+**CF-13f** `[connector]` — A connector MUST read every HTTP body that carries a packet — a
+`POST /ilp` or `POST /ilp/probe` body, and an operator's `POST /packets` — up to one **request
+limit**, and no further: 2 MiB, or the largest `max_bytes` of any configured route, terminating or
+forwarded, plus 64 KiB, whichever is larger. There is no key for it, and a body over it is answered
+`413`. Every BTP socket it accepts or dials MUST read a message, and a frame, up to 64 MiB plus
+64 KiB, the largest request limit any node can have, and a message over that ends the session.
+([ADR 0082](../adr/0082-a-route-may-raise-the-request-limit-to-carry-its-payload-limit.md))
 
 **CF-14** `[connector]` — Two routes naming the same handler MUST agree on its price, comparing whole
 schedules: same base and same slope.
@@ -375,8 +383,9 @@ CF-10, CF-11). Write `price = 0` where free is deliberate. A price is either a w
 the route's price is published; unlike every other row in `[[routes]]`, its contents are not
 `deny_unknown_fields` — that guarantee stops at the row, not inside a blob whose keys are the app's
 business. `max_bytes` (CF-13e) is optional on either branch: a whole number of bytes from `1` to
-2 MiB, measured on the sealed payload a price is charged on, above which a packet is refused `F00`
-before it is paid for. A `[[children]]` entry carries neither `request` nor `max_bytes`.
+64 MiB, measured on the sealed payload a price is charged on, above which a packet is refused `F00`
+before it is paid for; one above 2 MiB raises the node's request limit to carry it (CF-13f). A
+`[[children]]` entry carries neither `request` nor `max_bytes`.
 
 **Peerings.** A peer row carries an `id`, an optional `endpoint` whose scheme selects the carriage, a
 `max_packet_amount` (CF-19's cap — `0` is refused by name, and there is no disabling spelling) and a
