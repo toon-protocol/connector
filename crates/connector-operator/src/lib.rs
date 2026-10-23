@@ -78,7 +78,7 @@ pub mod test_support {
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -260,8 +260,15 @@ pub fn router_with_controller_keys(
             require_read_auth,
         ));
 
+    // ADR 0082: an originated packet is read up to the same request limit
+    // the client edge reads one at, so an operator can send what a route
+    // on this node admits.
+    let request_limit = state.connector.request_limit().bytes();
     let writes = Router::new()
-        .route("/packets", post(originate_packet))
+        .route(
+            "/packets",
+            post(originate_packet).layer(DefaultBodyLimit::max(request_limit)),
+        )
         .route("/routes/leased", post(create_leased_route))
         .route("/peers", post(upsert_peer))
         .route("/peers/:id", delete(remove_peer))

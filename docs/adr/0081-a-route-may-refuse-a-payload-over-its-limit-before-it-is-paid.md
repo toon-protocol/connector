@@ -1,10 +1,10 @@
 # A route may refuse a payload over its limit before it is paid
 
-**Status:** Accepted (owner decision, 2026-10-22, #1530) — **built**. Decides what [0065-price](0065-a-price-is-a-schedule-over-payload-length.md) deferred under _Not decided here_: a per-route **payload limit**, `max_bytes` (that record called it a ceiling, a word `CONTEXT.md` retires). **Narrows** [0020](0020-a-price-is-flat-and-attaches-to-a-handler.md)'s "a price buys an answer": an answer the operator has said it will not give at this size is not sold. Leaves [#1529](https://github.com/toon-protocol/connector/issues/1529) — raising the 2 MiB body limit — to a record of its own.
+**Status:** Accepted (owner decision, 2026-10-22, #1530) — **built**. Decides what [0065-price](0065-a-price-is-a-schedule-over-payload-length.md) deferred under _Not decided here_: a per-route **payload limit**, `max_bytes` (that record called it a ceiling, a word `CONTEXT.md` retires). **Narrows** [0020](0020-a-price-is-flat-and-attaches-to-a-handler.md)'s "a price buys an answer": an answer the operator has said it will not give at this size is not sold. Left [#1529](https://github.com/toon-protocol/connector/issues/1529) — raising the 2 MiB body limit — to a record of its own; **amended by [0082](0082-a-route-may-raise-the-request-limit-to-carry-its-payload-limit.md)**, which took it: decision 4's upper bound is now 64 MiB.
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 
-**Falsifier:** none — the record claims nothing absent that a pattern over the tree could find: what it leaves undecided (a route that _raises_ the carriage's limit) is an absence of behaviour, which no symbol names.
+**Falsifier:** none — the record claims nothing absent that a pattern over the tree could find: what it left undecided (a route that _raises_ the carriage's limit) was an absence of behaviour, which no symbol names, and [0082](0082-a-route-may-raise-the-request-limit-to-carry-its-payload-limit.md) has since decided it.
 
 **A route may declare `max_bytes`. A packet whose sealed payload is longer is refused `F00` before
 any claim for it is looked at, so its sender is charged nothing, and the limit is published wherever
@@ -143,3 +143,12 @@ only; a child that needs a limit is written as a route.
 overhead to every body; an operator who sets `max_bytes` to the app's own body limit refuses a few
 bodies the app would have taken, and one who sets it above lets a few through that the app will
 `413`.
+
+## Update (issue #1529)
+
+[ADR 0082](0082-a-route-may-raise-the-request-limit-to-carry-its-payload-limit.md) decides what
+decision 4 left open. A route's `max_bytes` may now be up to **64 MiB**, not 2 MiB, and one above
+2 MiB raises the node's request limit, the figure a request body is read at, far enough to carry
+it; every BTP socket reads at a fixed 64 MiB plus 64 KiB. Decision 3's `maxBytes` is therefore
+never above 64 MiB. Everything else here stands: `max_bytes` is still checked on the decoded
+PREPARE, before any claim, and refused `F00`.

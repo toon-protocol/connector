@@ -68,12 +68,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use connector_btp::{decode_frame, BtpSessionHandle, OutboundRequests};
 use connector_config::is_onion_endpoint;
+use connector_domain::BTP_MESSAGE_LIMIT;
 use connector_runtime::NO_SOCKS_PROXY;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_socks::tcp::Socks5Stream;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use url::Url;
@@ -144,6 +146,18 @@ impl TungsteniteDialer {
     pub fn through_socks_proxy(mut self, proxy: Option<&Url>) -> Self {
         self.socks_proxy = proxy.cloned();
         self
+    }
+
+    /// The websocket configuration every dialed session reads under (ADR
+    /// 0082): [`BTP_MESSAGE_LIMIT`] for a message and for a frame -- the
+    /// figure the accept side reads at too -- and tungstenite's defaults for
+    /// the rest.
+    fn websocket_config() -> WebSocketConfig {
+        WebSocketConfig {
+            max_message_size: Some(BTP_MESSAGE_LIMIT),
+            max_frame_size: Some(BTP_MESSAGE_LIMIT),
+            ..WebSocketConfig::default()
+        }
     }
 
     /// A SOCKS5 stream to `endpoint`, established through this node's
@@ -305,7 +319,7 @@ impl PeerDialer for TungsteniteDialer {
             let (socket, _) = tokio_tungstenite::client_async_tls_with_config(
                 endpoint.as_str(),
                 stream,
-                None,
+                Some(Self::websocket_config()),
                 None,
             )
             .await
@@ -313,9 +327,13 @@ impl PeerDialer for TungsteniteDialer {
             return Ok(self.start_session(socket));
         }
 
-        let (socket, _) = tokio_tungstenite::connect_async(endpoint.as_str())
-            .await
-            .map_err(|error| failed(error.to_string()))?;
+        let (socket, _) = tokio_tungstenite::connect_async_with_config(
+            endpoint.as_str(),
+            Some(Self::websocket_config()),
+            false,
+        )
+        .await
+        .map_err(|error| failed(error.to_string()))?;
         Ok(self.start_session(socket))
     }
 }

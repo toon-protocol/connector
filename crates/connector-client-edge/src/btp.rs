@@ -49,6 +49,7 @@ use connector_btp::{
     PAYMENT_REQUIRED_PROTOCOL, PAYOUT_CLAIM_PROTOCOL, REJECT_REASON_PROTOCOL,
 };
 use connector_domain::client_claim::ClientClaim;
+use connector_domain::BTP_MESSAGE_LIMIT;
 use connector_domain::{refuse_oversize, PacketResponse, Prepare, Price, Reject, RejectCode};
 use connector_peer_btp::challenge_json::{self, PeerRoleChallenge};
 use connector_peer_btp::role_gate::{challenge_in_window, VoucherCheck, VoucherEvidence};
@@ -68,7 +69,13 @@ pub(crate) async fn handle_btp_upgrade(
     State(state): State<Arc<ClientEdgeState>>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // ADR 0082: one message, and one frame, may be as large as the largest
+    // request any node can take -- a figure chosen here, never tungstenite's
+    // defaults. A frame gets the whole figure because a BTP client sends
+    // each message as one frame.
     ws.protocols(["btp"])
+        .max_message_size(BTP_MESSAGE_LIMIT)
+        .max_frame_size(BTP_MESSAGE_LIMIT)
         .on_upgrade(move |socket| btp_session(socket, state))
 }
 
