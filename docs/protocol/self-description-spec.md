@@ -205,6 +205,12 @@ greeted request costs — that is the field's job — so the schedule is what ma
 every size. The slope is **omitted** where it is zero, so a flat route's document and greeting are
 byte-identical to what they were before schedules existed.
 
+**ND-12b** `[connector]` — Where a route declares a payload limit
+([ADR 0081](../adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md)), both
+surfaces MUST publish it as `maxBytes`, a JSON number of bytes: this document on that prefix's entry,
+and the greeting in `extensions.toon.info`. It is **omitted** where the route sets none, so a node
+that sets no limit publishes exactly what it published before the field existed.
+
 ---
 
 ## 2. Forwarded routes: whose identity?

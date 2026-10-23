@@ -208,6 +208,16 @@ pub fn payment_required(
     // A destination that resolves to no configured route -- unmatched, or
     // leased -- is not this gate's business and never has been.
     let route = connector.client_route(destination)?;
+    // ADR 0081: a packet over the route's `max_bytes` is not this gate's to
+    // greet -- no claim could buy it, so quoting terms would invite a payment
+    // that cannot succeed. It passes on to `Connector::handle_peer_prepare`,
+    // which refuses it `F00` before anything is delivered.
+    if route
+        .max_bytes
+        .is_some_and(|limit| !limit.admits(prepare.data.len()))
+    {
+        return None;
+    }
     // `greeted` is the schedule quoted back on the F06 below; `required` is
     // that schedule evaluated at THIS packet, and is what the claim must
     // cover. They are the same number for a flat route, which is every route

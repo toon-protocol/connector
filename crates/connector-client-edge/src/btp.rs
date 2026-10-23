@@ -49,7 +49,7 @@ use connector_btp::{
     PAYMENT_REQUIRED_PROTOCOL, PAYOUT_CLAIM_PROTOCOL, REJECT_REASON_PROTOCOL,
 };
 use connector_domain::client_claim::ClientClaim;
-use connector_domain::{PacketResponse, Prepare, Price, Reject, RejectCode};
+use connector_domain::{refuse_oversize, PacketResponse, Prepare, Price, Reject, RejectCode};
 use connector_peer_btp::challenge_json::{self, PeerRoleChallenge};
 use connector_peer_btp::role_gate::{challenge_in_window, VoucherCheck, VoucherEvidence};
 use connector_settlement::batch::ChannelPresentation;
@@ -740,12 +740,10 @@ async fn handle_frame(
         .as_ref()
         .map_or(Price::FREE, |route| route.price);
     let charge = schedule.charge(prepare.data.len());
-    // Issue #1210: see `handle_ilp`'s mirror of this on the HTTP carriage --
-    // what a client should send to use this route, read off the same lookup
-    // its price and transport policy come from.
-    let request = client_route
-        .as_ref()
-        .and_then(|route| route.request.as_ref());
+    // Issue #1210 and ADR 0081: see `handle_ilp`'s mirror of this on the
+    // HTTP carriage -- the greeting reads the route's `request` and
+    // `max_bytes` off `client_route` itself, the lookup its price and
+    // transport policy come from.
     // Issue #807 / #1269: see `handle_ilp`'s mirror of this on the HTTP
     // carriage -- a PREPARE that declares `greeting` is structurally a
     // bootstrap probe, never a real payment attempt, regardless of
@@ -769,7 +767,7 @@ async fn handle_frame(
                 prepare.data.len(),
                 &state.node,
                 Some(policy.name()),
-                request,
+                client_route.as_ref(),
             );
             let reject = Reject {
                 code: RejectCode::f02_unreachable(),
@@ -799,6 +797,19 @@ async fn handle_frame(
         }
     }
 
+    // ADR 0081: see `handle_ilp`'s mirror of this on the HTTP carriage -- a
+    // packet over the route's `max_bytes` is refused before it is greeted or
+    // its claim is ingested, so it never spends the client's watermark.
+    if let Some(reject) = client_route.as_ref().and_then(|route| {
+        refuse_oversize(route.max_bytes, &prepare.destination, prepare.data.len())
+    }) {
+        return reply(
+            replies,
+            reject_response(frame.request_id, reject, Vec::new()),
+        )
+        .await;
+    }
+
     // The §1.4 greeting, BTP-shaped (§1.9 step 3): BTP cannot answer HTTP
     // 402, so the same terms JSON rides as protocolData on an F06 REJECT.
     // A claimless PREPARE to an unpriced route falls through unchanged,
@@ -811,7 +822,7 @@ async fn handle_frame(
             prepare.data.len(),
             &state.node,
             None,
-            request,
+            client_route.as_ref(),
         );
         let reject = Reject {
             code: RejectCode::f06_unexpected_payment(),

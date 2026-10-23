@@ -872,6 +872,62 @@ async fn a_claim_covering_a_packet_refused_for_envelope_shape_is_never_spent_ove
     Fulfill::decode(&second.ilp_packet).expect("the unspent claim is still accepted");
 }
 
+/// ADR 0081 (issue #1530), BTP-shaped: a packet over its route's
+/// `max_bytes` is refused `F00` before its claim is ingested, on this
+/// carriage exactly as on HTTP. The identical claim then pays for a packet
+/// within the limit, which it could not had the refusal advanced the
+/// watermark.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_covering_a_packet_over_the_payload_limit_is_never_spent_over_btp() {
+    const LIMIT: usize = 8192;
+    let route = StaticRoute::new_priced("g.test.app", "http://localhost:4000", PRICE)
+        .unwrap()
+        .with_max_bytes(connector_domain::PayloadLimit::new(LIMIT as u64));
+    let (addr, signer) = serve_edge_with_route(route, Arc::new(FakeAppClient::new())).await;
+    let mut session = connect(addr).await;
+    let receiver = signer.public_key().unwrap();
+    let claim = evm_claim_json(PRICE);
+
+    let fits = sealed_prepare("g.test.app", &receiver);
+    assert!(fits.data.len() <= LIMIT, "the in-limit packet must fit");
+    let mut over = fits.clone();
+    over.data.resize(LIMIT + 1, 0);
+
+    send(
+        &mut session,
+        btp_message(
+            1,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &over.encode(),
+        ),
+    )
+    .await;
+    let first = next_answer(&mut session).await;
+    let reject = Reject::decode(&first.ilp_packet).expect("an OER REJECT");
+    assert_eq!(reject.code.as_str(), "F00");
+    assert!(
+        reject.message.contains("at most 8192 payload bytes"),
+        "the refusal names the limit, got: {}",
+        reject.message
+    );
+    assert!(
+        pd(&first, "payment-required").is_none(),
+        "an oversize packet is not greeted"
+    );
+
+    send(
+        &mut session,
+        btp_message(
+            2,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &fits.encode(),
+        ),
+    )
+    .await;
+    let second = next_answer(&mut session).await;
+    Fulfill::decode(&second.ilp_packet).expect("the unspent claim still pays");
+}
+
 /// Issue #1446, BTP-shaped: a voucher presented with a packet to a
 /// destination nothing will carry is rejected `F02` without being ingested,
 /// on this carriage exactly as on HTTP (§9's no-drift invariant). The

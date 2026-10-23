@@ -22,7 +22,14 @@ Two things decide what you can charge for:
 
 - **You are paid for an answer, not the answer the caller wanted.** A `404` from
   your app is a real answer: it rides home on a `FULFILL` and costs the same as a
-  `200`. Only unreachability or a refused target produces a reject.
+  `200`. Only unreachability or a refused target produces a reject — and one
+  exception you opt into: a request larger than the route's `max_bytes` is refused
+  `F00` before it is paid for and never reaches your app, so a body your app would
+  only answer `413` costs the caller nothing. `max_bytes` measures the sealed
+  packet, which is longer than the body your app receives: set it to your app's
+  own limit and a body just under that limit is refused; set it higher and a body
+  just over it still reaches your app's `413`. Clients read it as `maxBytes`
+  beside the route's price.
 - **The trailing slash on `handler_url` is load-bearing**, and a request's target
   is resolved _beneath_ the handler's path — an absolute path, a `..` segment, a
   scheme or an authority is refused before your app is touched.

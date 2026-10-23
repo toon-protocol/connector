@@ -11,6 +11,8 @@
 //! guards a pair with (ADR 0071, [`rate`], [`asset`], [`rate_table`]),
 //! what a terminated route charges for one packet -- a schedule over the
 //! packet's payload length, flat when its slope is zero (ADR 0065, [`price`]) --
+//! and the largest payload a route accepts before it is paid (ADR 0081,
+//! [`payload_limit`]) --
 //! fulfilment / expiry rules (RFC-0022; the execution condition itself left
 //! the wire under issue #1269 / ADR 0069),
 //! the voucher watermark rule (ADR 0074, ADR 0075), and the
@@ -35,6 +37,7 @@ mod journal_entry;
 pub mod node;
 mod oer;
 mod packet;
+pub mod payload_limit;
 pub mod price;
 pub mod rate;
 pub mod rate_table;
@@ -64,6 +67,7 @@ pub use node::{
     CLIENT_EDGE_SUPPORTED_VERSIONS,
 };
 pub use packet::{Fulfill, PacketResponse, Prepare, Reject, RejectCode, RejectReason};
+pub use payload_limit::{refuse_oversize, PayloadLimit};
 pub use price::Price;
 pub use rate::{Rate, RateError};
 pub use rate_table::{

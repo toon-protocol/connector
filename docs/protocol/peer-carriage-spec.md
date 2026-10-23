@@ -1011,7 +1011,11 @@ additively extensible) and MUST NOT be emitted.
   (`connector_domain::x402::terms_body`), never a second wire shape. Where the route prices by
   size that greeting quotes this packet's own figure as `amount` and publishes the schedule beside
   it (`price` + `pricePerKib`), so a peer refused once can price its next packet without being
-  refused again. Since issue #1384 those figures ride the greeting's `extensions.toon.info`
+  refused again. A packet longer than the route's `max_bytes` is not greeted at all: it is refused
+  `F00` by `Connector::handle_peer_prepare` before its amount is judged and is never delivered
+  ([ADR 0081](../adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md)); its
+  voucher, judged inline before the packet is decoded (§7.1), keeps its own verdict as on every
+  other reject. Since issue #1384 those figures ride the greeting's `extensions.toon.info`
   (`client-edge-spec.md` §1.4), and a peer carriage's greeting — which describes no node — carries
   **no `accepts[]` entry**: it quotes the amount and the schedule there and nothing else, and the
   dialing side covers it with a voucher on its own outbound channel to this node (ADR 0075
