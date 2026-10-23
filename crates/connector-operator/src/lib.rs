@@ -2067,6 +2067,68 @@ mod tests {
             assert_eq!(reject.code, RejectCode::f02_unreachable());
         }
 
+        /// As [`router_with_write_keys`], over one route whose `max_bytes`
+        /// is `max_bytes` (or none).
+        fn router_over_a_route_limit(write_keys: Vec<[u8; 32]>, max_bytes: Option<u64>) -> Router {
+            let route = connector_config::StaticRoute::new_priced(
+                "g.example.upload",
+                "http://localhost:4000",
+                0,
+            )
+            .unwrap()
+            .with_max_bytes(max_bytes.and_then(connector_domain::PayloadLimit::new));
+            let connector = Arc::new(Connector::new(
+                vec![route],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            ));
+            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
+            router(
+                connector,
+                empty_claim_gate(),
+                signer,
+                "correct-token".to_string(),
+                write_keys,
+                None,
+            )
+        }
+
+        /// ADR 0082 (issue #1529): `POST /packets` reads a body up to the
+        /// node's request limit -- 2 MiB until a route raises it, and then
+        /// enough to originate the largest packet that route admits.
+        #[tokio::test]
+        async fn an_originated_packet_is_read_up_to_the_request_limit() {
+            const MIB: usize = 1024 * 1024;
+            let keypair = keypair();
+            let body = Prepare {
+                destination: "g.example.upload".to_string(),
+                data: vec![0; 3 * MIB],
+                ..sample_prepare()
+            }
+            .encode();
+            let (sig_input, sig, digest) = sign(&keypair, &body, 9_999_999_999);
+
+            for (max_bytes, expected) in [
+                (None, StatusCode::PAYLOAD_TOO_LARGE),
+                (Some(4 * MIB as u64), StatusCode::OK),
+            ] {
+                let app = router_over_a_route_limit(vec![keypair.public.to_bytes()], max_bytes);
+                let response = app
+                    .oneshot(packets_request(
+                        body.clone(),
+                        Some(&sig_input),
+                        Some(&sig),
+                        Some(&digest),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "max_bytes = {max_bytes:?}");
+            }
+        }
+
         #[tokio::test]
         async fn a_signature_from_a_key_not_on_the_allowlist_is_rejected() {
             let signer = keypair();
