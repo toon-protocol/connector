@@ -65,11 +65,31 @@ use std::time::{Duration, Instant};
 
 use connector_chain_rpc::evm::{answered, EvmRpc};
 use connector_chain_rpc::{retry_read, RpcTransport};
-use ethers::providers::{Middleware, Provider, ProviderError};
+use ethers::providers::{Middleware, Provider, ProviderError, RpcError};
 use ethers::signers::{LocalWallet, Signer as EvmSigner};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::types::{Address, BlockNumber, TransactionReceipt, TxHash, U256, U64};
 use ethers::utils::keccak256;
+
+/// A floor, so a quiet stretch of empty blocks never bids a zero tip: 0.001
+/// gwei.
+const MIN_TIP: u64 = 1_000_000;
+
+/// What to bid, from the market and not ethers' fixed 3 gwei tip. `rewards`
+/// is `eth_feeHistory`'s per-block tip samples (ethers asks for the 5th
+/// percentile of each of the last 10 blocks). The tip is their median,
+/// never under [`MIN_TIP`]; the cap is twice the base fee plus the tip, so
+/// the write still lands if the base fee doubles.
+pub(crate) fn market_fees(base_fee: U256, rewards: Vec<Vec<U256>>) -> (U256, U256) {
+    let mut tips: Vec<U256> = rewards.iter().filter_map(|r| r.first().copied()).collect();
+    tips.sort();
+    let tip = tips
+        .get(tips.len() / 2)
+        .copied()
+        .unwrap_or_default()
+        .max(U256::from(MIN_TIP));
+    (base_fee * 2 + tip, tip)
+}
 
 /// Why a write could not be sent, or was not confirmed: the one failure
 /// this module reports, carried as its message so a caller's
@@ -194,12 +214,13 @@ impl Sender {
             transaction.set_from(own);
             transaction.set_nonce(nonce);
             transaction.set_chain_id(self.wallet.chain_id());
-            // Gas and fees are estimated here. A failure sends nothing, so
-            // it is returned as it is, reverts included.
-            self.provider
-                .fill_transaction(&mut transaction, None)
-                .await
-                .map_err(|error| SendError(error.to_string()))?;
+            self.fill_market_fees(&mut transaction).await?;
+            // Gas is estimated here. A failure sends nothing, so it is
+            // returned as it is, reverts included -- bar the hint a revert
+            // with no data gets, see `explain_dataless_revert`.
+            if let Err(error) = self.provider.fill_transaction(&mut transaction, None).await {
+                return Err(self.explain_dataless_revert(error).await);
+            }
             let signature = self
                 .wallet
                 .sign_transaction(&transaction)
@@ -260,6 +281,55 @@ impl Sender {
                     return Ok(hash);
                 }
             }
+        }
+    }
+
+    /// Fill an EIP-1559 transaction's fees from the market ([`market_fees`])
+    /// unless the caller set both. With both set, ethers' own estimator
+    /// (a fixed 3 gwei tip under a 100 gwei base fee) never runs.
+    async fn fill_market_fees(&self, transaction: &mut TypedTransaction) -> Result<(), SendError> {
+        let TypedTransaction::Eip1559(inner) = transaction else {
+            return Ok(());
+        };
+        if inner.max_fee_per_gas.is_some() && inner.max_priority_fee_per_gas.is_some() {
+            return Ok(());
+        }
+        let (max_fee, tip) = self
+            .provider
+            .estimate_eip1559_fees(Some(market_fees))
+            .await
+            .map_err(|error| SendError(error.to_string()))?;
+        inner.max_fee_per_gas.get_or_insert(max_fee);
+        inner.max_priority_fee_per_gas.get_or_insert(tip);
+        Ok(())
+    }
+
+    /// A node reports a sender that cannot pay for gas as `execution
+    /// reverted` with no data, which points an operator at the contract. When
+    /// estimation fails that way, say what the key holds. A revert carrying
+    /// data is a contract's own and is reported as it came; so is the error
+    /// when the balance cannot be read.
+    async fn explain_dataless_revert(&self, error: ProviderError) -> SendError {
+        let message = error.to_string();
+        let dataless = error
+            .as_error_response()
+            .and_then(|response| response.as_revert_data())
+            .is_some_and(|data| data.is_empty());
+        if !dataless {
+            return SendError(message);
+        }
+        let own = self.wallet.address();
+        match self.provider.get_balance(own, None).await {
+            Ok(balance) => {
+                let eth = ethers::utils::format_units(balance, "ether")
+                    .map(|text| text.trim_end_matches('0').trim_end_matches('.').to_string())
+                    .unwrap_or_else(|_| format!("{balance} wei"));
+                SendError(format!(
+                    "{message} (settlement key {own:#x} holds {eth} ETH; a revert with no data \
+                     during estimation can mean the key cannot pay for gas)"
+                ))
+            }
+            Err(_) => SendError(message),
         }
     }
 
@@ -440,7 +510,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use connector_chain_rpc::{FakeRpc, RpcReply};
-    use ethers::types::TransactionRequest;
+    use ethers::types::{Eip1559TransactionRequest, TransactionRequest};
 
     use super::*;
     use crate::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
@@ -763,5 +833,148 @@ mod tests {
             U256::from(4),
             "sent once, at the free nonce"
         );
+    }
+
+    fn eip1559_self_transfer(sender: &Sender) -> TypedTransaction {
+        Eip1559TransactionRequest::new()
+            .to(sender.address())
+            .value(1u64)
+            .into()
+    }
+
+    const GWEI: u64 = 1_000_000_000;
+
+    #[test]
+    fn base_like_fees_bid_the_median_tip_and_twice_the_base_fee_plus_it() {
+        let base = U256::from(5_000_000u64);
+        let samples = [900_000u64, 1_000_000, 1_100_000, 1_000_000, 5_000_000];
+        let rewards = samples.iter().map(|t| vec![U256::from(*t)]).collect();
+        let (max_fee, tip) = market_fees(base, rewards);
+        assert_eq!(tip, U256::from(1_000_000u64));
+        assert_eq!(max_fee, base * 2 + tip);
+        assert!(max_fee < U256::from(3 * GWEI));
+    }
+
+    #[test]
+    fn empty_or_zero_rewards_bid_the_floor_tip() {
+        let base = U256::from(5_000_000u64);
+        let floor = U256::from(MIN_TIP);
+        assert_eq!(market_fees(base, vec![]), (base * 2 + floor, floor));
+        assert_eq!(market_fees(base, vec![vec![]]), (base * 2 + floor, floor));
+        let zeros = vec![vec![U256::zero()]; 10];
+        assert_eq!(market_fees(base, zeros), (base * 2 + floor, floor));
+    }
+
+    #[test]
+    fn a_market_tip_above_three_gwei_is_used_as_is() {
+        let base = U256::from(30 * GWEI);
+        let tip = U256::from(5 * GWEI);
+        let (max_fee, got) = market_fees(base, vec![vec![tip]; 10]);
+        assert_eq!(got, tip);
+        assert_eq!(max_fee, base * 2 + tip);
+    }
+
+    /// The write mines with the tip the estimator derives from the chain's
+    /// fee history, not ethers' 3 gwei.
+    #[tokio::test]
+    async fn a_write_bids_the_markets_tip_not_ethers_three_gwei() {
+        if !require_anvil() {
+            return;
+        }
+        let anvil = Anvil::spawn(19_750).await;
+        let (provider, sender) = sender(&anvil.rpc_url);
+        let history = provider
+            .fee_history(10u64, BlockNumber::Latest, &[5.0])
+            .await
+            .expect("fee history");
+        let base = *history.base_fee_per_gas.last().expect("base fee");
+        let (_, expected_tip) = market_fees(base, history.reward);
+        assert_ne!(expected_tip, U256::from(3 * GWEI));
+
+        let hash = sender
+            .send(eip1559_self_transfer(&sender))
+            .await
+            .expect("send");
+        confirm(&provider, hash, FAST).await.expect("confirm");
+        let mined = provider
+            .get_transaction(hash)
+            .await
+            .expect("lookup")
+            .expect("mined");
+        assert_eq!(mined.max_priority_fee_per_gas, Some(expected_tip));
+    }
+
+    /// Fees a caller already set are kept.
+    #[tokio::test]
+    async fn fees_the_caller_set_are_kept() {
+        if !require_anvil() {
+            return;
+        }
+        let anvil = Anvil::spawn(19_760).await;
+        let (provider, sender) = sender(&anvil.rpc_url);
+        let transaction: TypedTransaction = Eip1559TransactionRequest::new()
+            .to(sender.address())
+            .value(1u64)
+            .max_fee_per_gas(50 * GWEI)
+            .max_priority_fee_per_gas(2 * GWEI)
+            .into();
+        let hash = sender.send(transaction).await.expect("send");
+        confirm(&provider, hash, FAST).await.expect("confirm");
+        let mined = provider.get_transaction(hash).await.unwrap().unwrap();
+        assert_eq!(mined.max_priority_fee_per_gas, Some(U256::from(2 * GWEI)));
+    }
+
+    /// Places `runtime` as the code at a fresh address on `anvil`.
+    async fn place_code(provider: &Provider<EvmRpc>, runtime: &str) -> Address {
+        let at: Address = "0x00000000000000000000000000000000000c0de1"
+            .parse()
+            .expect("address");
+        let _: serde_json::Value = provider
+            .request("anvil_setCode", (at, runtime))
+            .await
+            .expect("setCode");
+        at
+    }
+
+    /// A key too poor to pay for its write's gas, sending to a contract that
+    /// reverts with no data: the error says what the key holds.
+    #[tokio::test]
+    async fn a_dataless_revert_names_the_key_and_its_balance() {
+        if !require_anvil() {
+            return;
+        }
+        let anvil = Anvil::spawn(19_770).await;
+        let (provider, sender) = sender(&anvil.rpc_url);
+        // PUSH1 0 PUSH1 0 REVERT
+        let contract = place_code(&provider, "0x60006000fd").await;
+        let poor = U256::from(360_000_000_000_000u64);
+        let _: serde_json::Value = provider
+            .request("anvil_setBalance", (sender.address(), poor))
+            .await
+            .expect("setBalance");
+        let transaction: TypedTransaction = Eip1559TransactionRequest::new().to(contract).into();
+        let SendError(message) = sender.send(transaction).await.expect_err("reverts");
+        assert!(
+            message.contains(&format!("{:#x}", sender.address())),
+            "{message}"
+        );
+        assert!(message.contains("0.00036 ETH"), "{message}");
+        assert!(message.contains("gas"), "{message}");
+        assert!(message.contains("execution reverted"), "{message}");
+    }
+
+    /// A contract's own revert, carrying data, is reported as it came.
+    #[tokio::test]
+    async fn a_revert_with_data_is_reported_unchanged() {
+        if !require_anvil() {
+            return;
+        }
+        let anvil = Anvil::spawn(19_780).await;
+        let (provider, sender) = sender(&anvil.rpc_url);
+        // PUSH4 deadbeef PUSH1 0 MSTORE PUSH1 4 PUSH1 0x1c REVERT
+        let contract = place_code(&provider, "0x63deadbeef6000526004601cfd").await;
+        let transaction: TypedTransaction = Eip1559TransactionRequest::new().to(contract).into();
+        let SendError(message) = sender.send(transaction).await.expect_err("reverts");
+        assert!(!message.contains("settlement key"), "{message}");
     }
 }
