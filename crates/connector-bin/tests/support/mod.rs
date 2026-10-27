@@ -75,6 +75,23 @@ pub fn sealed_prepare_data(body: &[u8], receiver_public: &PublicKeyBytes) -> (Ve
     seal_request(&plaintext, receiver_public).expect("seal")
 }
 
+/// [`sealed_prepare_data`] with `headers` written into the envelope -- what a
+/// caller who wants to forge an attribution header seals.
+pub fn sealed_prepare_data_with_headers(
+    body: &[u8],
+    headers: Vec<(String, String)>,
+    receiver_public: &PublicKeyBytes,
+) -> (Vec<u8>, [u8; 32]) {
+    let plaintext = EnvelopeRequest {
+        method: "POST".to_string(),
+        target: "/".to_string(),
+        headers,
+        body: body.to_vec(),
+    }
+    .encode();
+    seal_request(&plaintext, receiver_public).expect("seal")
+}
+
 /// A `Prepare` carrying `data` -- typically already sealed with a secret the
 /// termination will derive its fulfilment from (ADR 0019, issue #525) via
 /// [`sealed_prepare_data`].

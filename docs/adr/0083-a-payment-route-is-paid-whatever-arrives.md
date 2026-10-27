@@ -1,10 +1,10 @@
 # A payment route is paid whatever arrives
 
-**Status:** Accepted (owner decision, 2026-10-26, #1543), **not yet built**. No `payment` key exists in `connector-config`'s route schema. **Amends** [0029](0029-a-peer-wire-arrival-to-a-priced-termination-must-cover-its-price.md) (at a payment route, a peer arrival's claim must cover the packet's `amount`, not just the charge), [0040](0040-a-verified-payment-is-stated-to-the-app.md) (a peer arrival at a payment route is a second case where something was verified, so the headers are stated) and [0050](0050-a-connectors-url-resolves-to-its-self-description.md) (the self-description marks a payment route).
+**Status:** Accepted (owner decision, 2026-10-26, #1543), **built** (#1543): `payment` is a `[[routes]]` key in `connector-config`, refused by name with a `peer_id` (`PaymentRouteForwards`); the peer price gate in `connector-peer-btp/src/price_gate.rs` judges coverage, `connector-runtime/src/attribution.rs` states the headers, and `GET /ilp` marks the route. **Amends** [0029](0029-a-peer-wire-arrival-to-a-priced-termination-must-cover-its-price.md) (at a payment route, a peer arrival's claim must cover the packet's `amount`, not just the charge), [0040](0040-a-verified-payment-is-stated-to-the-app.md) (a peer arrival at a payment route is a second case where something was verified, so the headers are stated) and [0050](0050-a-connectors-url-resolves-to-its-self-description.md) (the self-description marks a payment route).
 
 **Scope:** protocol law — binds every implementation, not just this one. See the [ADR index](README.md).
 
-**Falsifier:** `crates/connector-config/src/route.rs` matching `\bpayment\b` — this record's Status line says no `payment` key exists in the route schema. The key cannot be added under another name without amending this record, so a match means the record is built and its Status line is stale.
+**Falsifier:** none — the record no longer claims anything absent: every decision in it is built (#1543), so there is no unbuilt half left to check the tree against.
 
 **A `[[routes]]` entry may set `payment = true`. A payment route still ends at an app, the
 operator's own, but its job is to be paid: the payer chooses the amount, at or above the route's

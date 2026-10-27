@@ -385,7 +385,10 @@ the route's price is published; unlike every other row in `[[routes]]`, its cont
 business. `max_bytes` (CF-13e) is optional on either branch: a whole number of bytes from `1` to
 64 MiB, measured on the sealed payload a price is charged on, above which a packet is refused `F00`
 before it is paid for; one above 2 MiB raises the node's request limit to carry it (CF-13f). A
-`[[children]]` entry carries neither `request` nor `max_bytes`.
+`payment` is an optional boolean, false when absent, valid only with `handler_url` and refused by
+name with a `peer_id`: it marks a payment route, whose peer arrivals must be covered by their claim for
+the packet's whole `amount` ([ADR 0083](../adr/0083-a-payment-route-is-paid-whatever-arrives.md)).
+A `[[children]]` entry carries none of `request`, `max_bytes` or `payment`.
 
 **Peerings.** A peer row carries an `id`, an optional `endpoint` whose scheme selects the carriage, a
 `max_packet_amount` (CF-19's cap — `0` is refused by name, and there is no disabling spelling) and a

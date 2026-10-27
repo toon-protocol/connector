@@ -100,6 +100,11 @@ pub(crate) struct RawRoute {
     /// no limit beyond the carriage's own. Validated by [`parse_max_bytes`].
     #[serde(default)]
     max_bytes: Option<u64>,
+    /// Marks the route a payment route (ADR 0083, issue #1543). False when
+    /// absent; valid only with `handler_url`, and refused by name with a
+    /// `peer_id` ([`ConfigError::PaymentRouteForwards`]).
+    #[serde(default)]
+    payment: bool,
 }
 
 /// A `[[children]]` entry: a convenience form that desugars into a
@@ -208,6 +213,7 @@ pub struct StaticRoute {
     transport_policy: TransportPolicy,
     request: Option<serde_json::Value>,
     max_bytes: Option<PayloadLimit>,
+    payment: bool,
 }
 
 impl StaticRoute {
@@ -354,6 +360,21 @@ impl StaticRoute {
         self.max_bytes = max_bytes;
         self
     }
+
+    /// Whether this is a payment route (ADR 0083, issue #1543): the payer
+    /// chooses the amount, and a peer arrival's claim must cover all of it.
+    /// False for every route before ADR 0083.
+    pub fn payment(&self) -> bool {
+        self.payment
+    }
+
+    /// Mark a route built directly rather than from a config file a payment
+    /// route (ADR 0083) -- a fixture's shorthand for `[[routes]] payment =
+    /// true`.
+    pub fn with_payment(mut self, payment: bool) -> StaticRoute {
+        self.payment = payment;
+        self
+    }
 }
 
 /// A route whose traffic this connector forwards to a peer rather than
@@ -452,6 +473,7 @@ fn build_route(
         transport_policy,
         request: request.map(request_to_json),
         max_bytes: None,
+        payment: false,
     })
 }
 
@@ -588,6 +610,11 @@ pub(crate) fn resolve_routes(
     let mut peer_routes = Vec::new();
 
     for raw in raw_routes {
+        // ADR 0083: a forward is never the end of a payment. Refused by name
+        // ahead of the target match so it is not read as anything else.
+        if raw.payment && raw.peer_id.is_some() {
+            return Err(ConfigError::PaymentRouteForwards { prefix: raw.prefix });
+        }
         // ADR 0061: a fee attaches to a peering, not to a route. Refused on
         // BOTH branches and before either is examined -- a terminated route
         // never had one to charge (issue #556's rule, unchanged), and a
@@ -610,6 +637,7 @@ pub(crate) fn resolve_routes(
                     raw.request,
                 )?;
                 route.max_bytes = max_bytes;
+                route.payment = raw.payment;
                 insert_unique_prefix(&mut seen, route.prefix())?;
                 insert_consistent_handler_price(&mut handler_prices, &route)?;
                 routes.push(route);
@@ -695,6 +723,7 @@ mod tests {
             transport: None,
             request: None,
             max_bytes: None,
+            payment: false,
         }
     }
 
@@ -712,6 +741,7 @@ mod tests {
             transport: None,
             request: None,
             max_bytes: None,
+            payment: false,
         }
     }
 
@@ -766,6 +796,25 @@ mod tests {
         ));
     }
 
+    /// ADR 0083: `payment = true` marks a route that ends at an app, and a
+    /// route that does not say so is not one.
+    #[test]
+    fn a_payment_route_loads_with_a_handler_and_is_refused_by_name_with_a_peer() {
+        let mut paid = priced_route("g.example.tip", "http://localhost:4000", 0);
+        paid.payment = true;
+        let plain = priced_route("g.example.app", "http://localhost:4001", 0);
+        let (routes, _) = resolve_routes(None, vec![paid, plain], vec![]).expect("resolve");
+        assert!(routes[0].payment());
+        assert!(!routes[1].payment());
+
+        let mut forward = priced_peer_route("g.peer-b", "peer-b", 1);
+        forward.payment = true;
+        assert!(matches!(
+            resolve_routes(None, vec![forward], vec![]),
+            Err(ConfigError::PaymentRouteForwards { prefix }) if prefix == "g.peer-b"
+        ));
+    }
+
     #[test]
     fn resolves_explicit_routes() {
         let (routes, peer_routes) = resolve_routes(
@@ -795,6 +844,7 @@ mod tests {
                 transport: None,
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -818,6 +868,7 @@ mod tests {
                 transport: None,
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -843,6 +894,7 @@ mod tests {
                 transport: None,
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -867,6 +919,7 @@ mod tests {
                 transport: None,
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -942,6 +995,7 @@ mod tests {
                 transport: None,
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -1035,6 +1089,7 @@ mod tests {
             transport: None,
             request: None,
             max_bytes: None,
+            payment: false,
         }
     }
 
@@ -1072,6 +1127,7 @@ mod tests {
                 transport: None,
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         )
@@ -1233,6 +1289,7 @@ mod tests {
                 transport: None,
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -1255,6 +1312,7 @@ mod tests {
                 transport: None,
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -1395,6 +1453,7 @@ mod tests {
                 transport: Some("btp".to_string()),
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         )
@@ -1415,6 +1474,7 @@ mod tests {
                 transport: Some("http".to_string()),
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         )
@@ -1435,6 +1495,7 @@ mod tests {
                 transport: Some("both".to_string()),
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         )
@@ -1459,6 +1520,7 @@ mod tests {
                 transport: Some("carrier-pigeon".to_string()),
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -1486,6 +1548,7 @@ mod tests {
                 transport: Some("btp".to_string()),
                 request: None,
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -1583,6 +1646,7 @@ mod tests {
                 transport: None,
                 request: Some(request),
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         )
@@ -1630,6 +1694,7 @@ mod tests {
                     toml::Value::String("nip90".to_string()),
                 )])),
                 max_bytes: None,
+                payment: false,
             }],
             vec![],
         )
