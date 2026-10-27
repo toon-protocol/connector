@@ -719,8 +719,11 @@ jobs:
                 # 500. Port 3001 is the paid write port and is not touched.
                 bip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$n" 2>/dev/null | awk '{print $1}')
                 bpath=/$(printf '0%.0s' $(seq 64))
-                got=$(curl -s -o /dev/null -D /tmp/blossom-headers -w '%{http_code}' --max-time 10 "http://${bip:-0.0.0.0}:3000$bpath" 2>/dev/null)
-                bwhy=$(tr -d '\r' < /tmp/blossom-headers 2>/dev/null | awk -F': *' 'tolower($1)=="x-reason" {print $2}' | tail -1)
+                # The headers come back on stdout, not in a file: this script
+                # writes nothing on the host. The status is the last line.
+                bhead=$(curl -s -o /dev/null -D - -w '%{http_code}' --max-time 10 "http://${bip:-0.0.0.0}:3000$bpath" 2>/dev/null | tr -d '\r')
+                got=$(printf '%s\n' "$bhead" | tail -1)
+                bwhy=$(printf '%s\n' "$bhead" | awk -F': *' 'tolower($1)=="x-reason" {print $2}' | tail -1)
                 if [ "$got" = "404" ] && [ "$bwhy" = "blob not found" ]; then
                   row OK "$who" 'GET /<64 zeros>' "404 blob not found on its own address"
                 else

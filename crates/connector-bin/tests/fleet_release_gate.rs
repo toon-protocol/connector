@@ -480,6 +480,11 @@ fn fleet_health_probes_blossom_on_both_layers() {
         );
     }
     assert!(
+        !arm.contains("/tmp"),
+        "fleet-health.yml's `blossom` arm writes a file on the host, which the \
+         workflow promises never to do:\n{arm}"
+    );
+    assert!(
         FLEET_HEALTH_WORKFLOW.contains(&format!(
             "https://blossom.$D/{} 404 x-reason:blob not found",
             "0".repeat(64)
