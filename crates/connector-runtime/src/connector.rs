@@ -381,6 +381,10 @@ pub struct ClientRouteFacts {
     /// 0081) -- refused `F00` above it before any claim is taken. `None` when
     /// the route set no `max_bytes`.
     pub max_bytes: Option<PayloadLimit>,
+    /// Whether the route is a payment route (ADR 0083): a peer arrival's
+    /// claim must cover the packet's own `amount`. Only a configured
+    /// termination can be one.
+    pub payment: bool,
 }
 
 /// One priced prefix, as [`Connector::client_route_prices`] enumerates them
@@ -409,6 +413,8 @@ pub struct ClientRoutePrice {
     /// The route's payload limit (ADR 0081), read off the same lookup for
     /// the same reason: what is published and what is refused are one value.
     pub max_bytes: Option<PayloadLimit>,
+    /// Whether the route is a payment route (ADR 0083), off the same lookup.
+    pub payment: bool,
 }
 
 /// The connector's packet plane: a fixed set of terminated routes and peer
@@ -2061,6 +2067,7 @@ impl Connector {
         self.handle_prepare_spanned(
             prepare,
             client_channel_id,
+            None,
             client_channel_id.map(Arrival::ClientChannel),
         )
         .await
@@ -2075,7 +2082,7 @@ impl Connector {
     /// `accumulated_cost` does not gain this node's fee. The per-packet cap
     /// still applies, and no denomination is crossed.
     pub async fn originate_prepare(&self, prepare: Prepare) -> PacketResponse {
-        self.handle_prepare_spanned(prepare, None, Some(Arrival::Operator))
+        self.handle_prepare_spanned(prepare, None, None, Some(Arrival::Operator))
             .await
     }
 
@@ -2092,6 +2099,7 @@ impl Connector {
         &self,
         prepare: Prepare,
         client_channel_id: Option<&str>,
+        peer_channel: Option<&str>,
         arrived: Option<Arrival<'_>>,
     ) -> PacketResponse {
         let span = tracing::info_span!(
@@ -2103,7 +2111,7 @@ impl Connector {
         if let Some(channel_id) = client_channel_id {
             span.record("client_channel_id", channel_id);
         }
-        self.handle_prepare_traced(prepare, client_channel_id, arrived)
+        self.handle_prepare_traced(prepare, client_channel_id, peer_channel, arrived)
             .instrument(span)
             .await
     }
@@ -2144,6 +2152,24 @@ impl Connector {
         &self,
         arrived_from: Option<&str>,
         prepare: Prepare,
+    ) -> PacketResponse {
+        self.handle_peer_prepare_over(arrived_from, prepare, None)
+            .await
+    }
+
+    /// [`Self::handle_peer_prepare`] for a carriage that also knows the
+    /// chain-namespaced key of the peering channel whose voucher covered this
+    /// PREPARE and was **accepted** (ADR 0083, issue #1543). It is what a
+    /// payment route states to its app as `X-TOON-Payer` / `X-TOON-Chain`,
+    /// alongside the packet's `amount` as `X-TOON-Amount` -- the carriage's
+    /// price gate having already refused the arrival unless that voucher's
+    /// advance covered the whole `amount`. `None` states nothing, exactly as
+    /// before.
+    pub async fn handle_peer_prepare_over(
+        &self,
+        arrived_from: Option<&str>,
+        prepare: Prepare,
+        inbound_channel: Option<&str>,
     ) -> PacketResponse {
         if let Some(route) = self.client_route(&prepare.destination) {
             // ADR 0081: over the route's limit is refused before the amount
@@ -2187,8 +2213,13 @@ impl Connector {
             }
         }
 
-        self.handle_prepare_spanned(prepare, None, arrived_from.map(Arrival::Peer))
-            .await
+        self.handle_prepare_spanned(
+            prepare,
+            None,
+            inbound_channel,
+            arrived_from.map(Arrival::Peer),
+        )
+        .await
     }
 
     /// Record that `channel_id` names a payment channel this connector
@@ -2327,6 +2358,7 @@ impl Connector {
         &self,
         prepare: Prepare,
         client_channel_id: Option<&str>,
+        peer_channel: Option<&str>,
         arrived: Option<Arrival<'_>>,
     ) -> PacketResponse {
         // Per-packet lines are debug, not info (issue #690): at huddle rates
@@ -2405,7 +2437,12 @@ impl Connector {
                     trace.direction.get_or_insert(Direction::Delivered);
                 }
                 let response = self
-                    .deliver_to_app(&self.routes[index], prepare, client_channel_id)
+                    .deliver_to_app(
+                        &self.routes[index],
+                        prepare,
+                        client_channel_id,
+                        peer_channel,
+                    )
                     .await;
                 return self.finish(response, trace, None);
             }
@@ -3562,9 +3599,11 @@ impl Connector {
     /// `client_channel_id` is the client channel whose covering claim
     /// admitted this packet at this connector's own edge, or `None` when
     /// nothing did (a peer-role arrival, an unpriced or unclaimed
-    /// request). It is the sole source of the attribution headers the
-    /// delivery carries (ADR 0040, `crate::attribution`) -- which is why a
-    /// packet that reached here across another hop states no payer at all
+    /// request). With `peer_channel` -- the accepted voucher's peering
+    /// channel, which only a payment route (ADR 0083) reads -- it is the
+    /// whole source of the attribution headers the delivery carries (ADR
+    /// 0040, `crate::attribution`) -- which is why a packet that reached
+    /// here across another hop to any other route states no payer at all
     /// rather than naming the hop it arrived from, the failure ADR 0017
     /// found in the TypeScript prototype's own header.
     ///
@@ -3580,6 +3619,7 @@ impl Connector {
         route: &StaticRoute,
         prepare: Prepare,
         client_channel_id: Option<&str>,
+        peer_channel: Option<&str>,
     ) -> PacketResponse {
         let expires_at = prepare.expires_at;
         // What this packet costs, read off the schedule at its own payload
@@ -3589,6 +3629,22 @@ impl Connector {
         // anything recovered from inside the wrap. The client edge and the
         // peer gate computed the same figure from the same bytes.
         let charge = route.price().charge(prepare.data.len());
+        // ADR 0040 / ADR 0083: what the app is told was verified. A client
+        // claim states the charge it covered. A peer arrival at a payment
+        // route states the packet's whole `amount`, which the carriage's gate
+        // has already made the voucher's own advance; at any other route a
+        // peer arrival states nothing.
+        let attribution = match (client_channel_id, peer_channel) {
+            (Some(channel_key), _) => Some(PaymentAttribution {
+                channel_key,
+                charge,
+            }),
+            (None, Some(channel_key)) if route.payment() => Some(PaymentAttribution {
+                channel_key,
+                charge: prepare.amount,
+            }),
+            _ => None,
+        };
 
         let (envelope_bytes, shared_secret) = match self.open_termination_request(&prepare.data) {
             Ok(opened) => opened,
@@ -3604,7 +3660,7 @@ impl Connector {
                 expires_at,
                 &shared_secret,
                 &envelope_bytes,
-                client_channel_id,
+                attribution,
             )
             .await;
         Self::seal_termination_response(inner, &shared_secret)
@@ -3684,7 +3740,7 @@ impl Connector {
         expires_at: chrono::DateTime<Utc>,
         shared_secret: &[u8; 32],
         envelope_bytes: &[u8],
-        client_channel_id: Option<&str>,
+        attribution: Option<PaymentAttribution<'_>>,
     ) -> PacketResponse {
         let mut request = match EnvelopeRequest::decode(envelope_bytes) {
             Ok(request) => request,
@@ -3704,13 +3760,7 @@ impl Connector {
         // payment -- and, whether or not there is anything to state, remove
         // whatever the sender wrote under those same names first, so an app
         // reading them is reading this connector or reading nothing.
-        apply_payment_attribution(
-            &mut request,
-            client_channel_id.map(|channel_key| PaymentAttribution {
-                channel_key,
-                charge: termination.charge,
-            }),
-        );
+        apply_payment_attribution(&mut request, attribution);
 
         // PF-25's first half: a packet with nothing left is not delivered at
         // all. `accumulated_cost` is zero because the app was never asked --
@@ -3921,6 +3971,7 @@ impl Connector {
                     kind: ClientRouteKind::Terminated,
                     request: self.routes[index].request().cloned(),
                     max_bytes: self.routes[index].max_bytes(),
+                    payment: self.routes[index].payment(),
                 },
                 ConfiguredTarget::Peer(index) => ClientRouteFacts {
                     price: self.peer_routes[index].price(),
@@ -3928,6 +3979,7 @@ impl Connector {
                     kind: ClientRouteKind::Forwarded,
                     request: self.peer_routes[index].request().cloned(),
                     max_bytes: self.peer_routes[index].max_bytes(),
+                    payment: false,
                 },
                 ConfiguredTarget::RuntimePeer(route) => ClientRouteFacts {
                     price: route.price(),
@@ -3935,6 +3987,7 @@ impl Connector {
                     kind: ClientRouteKind::Forwarded,
                     request: route.request().cloned(),
                     max_bytes: route.max_bytes(),
+                    payment: false,
                 },
             })
     }
@@ -4005,6 +4058,7 @@ impl Connector {
                     request: facts.request,
                     transport_policy: facts.transport_policy,
                     max_bytes: facts.max_bytes,
+                    payment: facts.payment,
                 })
             })
             .collect()

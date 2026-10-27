@@ -215,6 +215,12 @@ pub enum ConfigError {
     )]
     RouteTargetAmbiguous { prefix: String },
 
+    #[error(
+        "route '{prefix}' sets 'payment = true' with a 'peer_id': a payment route ends at an \
+         app, so it needs a 'handler_url' (ADR 0083) -- a forward is never the end of a payment"
+    )]
+    PaymentRouteForwards { prefix: String },
+
     #[error("route '{prefix}' has an empty 'peer_id'")]
     RoutePeerIdEmpty { prefix: String },
 

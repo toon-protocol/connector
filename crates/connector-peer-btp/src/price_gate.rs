@@ -67,8 +67,11 @@
 use std::collections::BTreeMap;
 
 use connector_config::{ForwardedClaimEnforcement, PeerConfig};
+use connector_domain::client_claim::ClientClaim;
 use connector_domain::x402::GreetingTerms;
-use connector_domain::{validate_price, Prepare, Price, Reject, RejectCode, Watermark};
+use connector_domain::{
+    payment_route_covers, validate_price, Prepare, Price, Reject, RejectCode, Watermark,
+};
 use connector_runtime::{ClaimAckOutcome, ClientRouteKind, Connector};
 
 /// Each peering's [`ForwardedClaimEnforcement`], the rest reading as
@@ -222,6 +225,22 @@ pub fn payment_required(
     // that schedule evaluated at THIS packet, and is what the claim must
     // cover. They are the same number for a flat route, which is every route
     // that existed before ADR 0065.
+    // ADR 0083: at a payment route the claim must cover the packet's own
+    // `amount`, not the charge, and whatever the peering's
+    // `forwarded_claim_enforcement` says -- there is no observe mode here. It
+    // is `F03` rather than `F06`'s "pay the route's price": the sender chose
+    // an amount this claim does not back, and the greeting quotes that
+    // amount. A zero amount asks for nothing to be covered.
+    if route.kind == ClientRouteKind::Terminated && route.payment {
+        return payment_route_refusal(
+            peer_id,
+            prepare,
+            ack,
+            claimed,
+            prior_watermark,
+            route.price.charge(prepare.data.len()),
+        );
+    }
     let (greeted, required, enforcing) = match route.kind {
         // ADR 0029's rule has no escape hatch: since issue #1077 deleted
         // `claim_enforcement`, an uncovered arrival to a priced termination
@@ -332,6 +351,80 @@ pub fn payment_required(
         terms: connector_domain::x402::terms_body(&GreetingTerms {
             destination,
             price: greeted,
+            payload_len: prepare.data.len(),
+            ..Default::default()
+        }),
+    })
+}
+
+/// The key of the peering channel whose voucher covered this PREPARE, for the
+/// delivery to state (ADR 0083, `Connector::handle_peer_prepare_over`): the
+/// voucher's own channel, and only when the receiving half **accepted** it.
+/// A voucher that decoded but was refused names a channel nobody verified, and
+/// ADR 0040 states nothing this connector did not verify for itself.
+#[must_use]
+pub fn accepted_channel(ack: ClaimAckOutcome, voucher: Option<&ClientClaim>) -> Option<String> {
+    (ack == ClaimAckOutcome::Accepted)
+        .then_some(voucher)
+        .flatten()
+        .map(ClientClaim::channel_key)
+}
+
+/// [`payment_required`]'s verdict for a payment route (ADR 0083): the covering
+/// claim must advance the channel's watermark by at least the packet's own
+/// `amount`, measured through [`validate_price`] as ADR 0042 item 3 measures a
+/// forwarded arrival. `charge` is the route's price at this payload; an
+/// `amount` under it is `handle_peer_prepare`'s ADR 0029 `F03`, and is
+/// refused here too so a claim is never taken for a packet that fails it.
+fn payment_route_refusal(
+    peer_id: &str,
+    prepare: &Prepare,
+    ack: ClaimAckOutcome,
+    claimed: Option<u128>,
+    prior_watermark: Option<Watermark>,
+    charge: u64,
+) -> Option<PaymentRequired> {
+    let required = prepare.amount;
+    if required == 0 && charge == 0 {
+        return None;
+    }
+    let covers = ack == ClaimAckOutcome::Accepted
+        && claimed.is_some_and(|claimed| {
+            payment_route_covers(prior_watermark, claimed, required, charge)
+        });
+    if covers {
+        return None;
+    }
+    let advanced = match claimed {
+        Some(claimed) if ack == ClaimAckOutcome::Accepted => claimed
+            .saturating_sub(prior_watermark.map_or(0, |watermark| watermark.cumulative_amount)),
+        _ => 0,
+    };
+    let destination = prepare.destination.as_str();
+    tracing::warn!(
+        peer_id,
+        destination,
+        amount = required,
+        charge,
+        advanced,
+        claim_ack = ?ack,
+        "peer PREPARE refused F03: no claim covers this payment route's packet amount (ADR 0083)"
+    );
+    Some(PaymentRequired {
+        reject: Reject {
+            code: RejectCode::f03_invalid_amount(),
+            triggered_by: String::new(),
+            message: format!(
+                "'{destination}' is a payment route: the claim must cover the packet's amount \
+                 {required} (at least {charge}), but advanced {advanced}"
+            ),
+            data: Vec::new(),
+            accumulated_cost: charge,
+            reason: None,
+        },
+        terms: connector_domain::x402::terms_body(&GreetingTerms {
+            destination,
+            price: Price::flat(required.max(charge)),
             payload_len: prepare.data.len(),
             ..Default::default()
         }),

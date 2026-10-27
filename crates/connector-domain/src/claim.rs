@@ -71,6 +71,22 @@ pub fn validate_price(
     Ok(())
 }
 
+/// Whether a peer arrival at a **payment route** (ADR 0083) is covered: its
+/// claim advances the channel's watermark by at least the packet's own
+/// `amount` ([`validate_price`] with the amount as the figure, as ADR 0042
+/// item 3 measures a forwarded arrival) and the amount is at least the route's
+/// `charge` at this payload. An `amount` under the charge is ADR 0029's `F03`
+/// whatever the claim covers, so the claim never buys a packet the route would
+/// refuse.
+pub fn payment_route_covers(
+    watermark: Option<Watermark>,
+    cumulative_amount: u128,
+    amount: u64,
+    charge: u64,
+) -> bool {
+    amount >= charge && validate_price(watermark, cumulative_amount, amount).is_ok()
+}
+
 /// The `nonce` every voucher's [`crate::JournalEntry::InboundClaimAccepted`]
 /// carries (ADR 0074 decision 3).
 ///
@@ -474,6 +490,47 @@ mod tests {
             let advanced = cumulative_amount.saturating_sub(prior);
             let result = validate_price(watermark, cumulative_amount, price);
             prop_assert_eq!(result.is_ok(), advanced >= u128::from(price));
+        }
+
+        /// ADR 0083: at a payment route an arrival is admitted exactly when
+        /// the claim's advance covers the packet's own amount AND the amount
+        /// covers the charge -- a claim that covers only the charge buys
+        /// nothing above it, and an amount under the charge is never admitted.
+        #[test]
+        fn a_payment_route_admits_iff_the_advance_covers_the_amount_and_the_amount_the_charge(
+            watermark in proptest::option::of(any::<u128>().prop_map(|cumulative_amount| Watermark { cumulative_amount })),
+            cumulative_amount in any::<u128>(),
+            amount in any::<u64>(),
+            charge in any::<u64>(),
+        ) {
+            let prior = watermark.map_or(0, |w| w.cumulative_amount);
+            let advanced = cumulative_amount.saturating_sub(prior);
+            prop_assert_eq!(
+                payment_route_covers(watermark, cumulative_amount, amount, charge),
+                advanced >= u128::from(amount) && amount >= charge,
+            );
+        }
+
+        #[test]
+        fn a_claim_covering_only_the_charge_is_refused_above_it(
+            prior in 0u128..u128::from(u64::MAX),
+            charge in 0u64..1_000_000,
+            extra in 1u64..1_000_000,
+        ) {
+            let watermark = Some(Watermark { cumulative_amount: prior });
+            let amount = charge + extra;
+            prop_assert!(!payment_route_covers(
+                watermark,
+                prior + u128::from(charge),
+                amount,
+                charge,
+            ));
+            prop_assert!(payment_route_covers(
+                watermark,
+                prior + u128::from(amount),
+                amount,
+                charge,
+            ));
         }
     }
 }

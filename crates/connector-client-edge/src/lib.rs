@@ -602,6 +602,8 @@ async fn self_description(State(state): State<Arc<ClientEdgeState>>) -> Response
             // (TOON_Network#111, ND-05a). Advertisement and enforcement read
             // one value, so there is nothing for them to disagree about.
             required_transport: published_required_transport(route.transport_policy.name()),
+            // ADR 0083: absent, never `false`, off the same lookup.
+            payment: route.payment.then_some(true),
         })
         .collect();
 
