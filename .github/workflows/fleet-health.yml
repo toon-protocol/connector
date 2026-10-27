@@ -94,11 +94,11 @@
 # on 2026-10-15: infra#56 brought the Echo Merchant's stack onto the host,
 # and relay#268 the relay's `anon` sidecar, and neither had an arm here.)
 #
-# Today that discovers ten containers: the one `connector` and the `relay`
+# Today that discovers eleven containers: the one `connector` and the `relay`
 # and `anon` beside it in the relay's project, `store`, `gas-station`,
-# `gateway` and `echo-merchant` (each the only container in its project), the
-# edge's `caddy`, the Onboarder (the x402 facilitator, `onboarder`), and the
-# faucet.
+# `gateway`, `echo-merchant` and `blossom` (each the only container in its
+# project), the edge's `caddy`, the Onboarder (the x402 facilitator,
+# `onboarder`), and the faucet.
 #
 # Two probe layers, because each catches what the other cannot:
 #
@@ -134,6 +134,10 @@
 #        - `gw.devnet…/` and a fresh random `<label>.gw.devnet…/` → **503**
 #          with `toon-gateway-reason: no_grant`: the gateway answered and
 #          dialled nobody, which is its healthy, empty state.
+#        - `blossom.devnet…/<64 zeros>` → **404** with
+#          `x-reason: blob not found`: the app consulted its holdings for a
+#          blob that never exists. Caddy's own fallback 404 carries no
+#          `x-reason`, so a bare 404 would prove nothing.
 #      The transitional `proxy.{relay,ario,gas,gateway,echo}.devnet…` and
 #      `relay-ws.devnet…` names are NOT probed: they are aliases of the one
 #      connector that infra#58 removes, and nothing here may go red when it
@@ -705,6 +709,24 @@ jobs:
                 # probe is blind, and that is a failure, not a pass.
                 [ "$health" != "none" ] || row FAIL "$who" 'docker healthcheck' 'defines no healthcheck, and this arm relies on one: the probe is blind'
                 ;;
+              blossom)
+                # Blossom (toon-protocol/blossom) defines no healthcheck and
+                # its image has no curl or wget, so the probe is from here:
+                # a read-only GET of a blob that never exists (the all-zero
+                # hash) on the free read port, 3000, of its own address. A
+                # healthy app consults its holdings and answers 404 with
+                # `x-reason: blob not found`; a broken holdings store answers
+                # 500. Port 3001 is the paid write port and is not touched.
+                bip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$n" 2>/dev/null | awk '{print $1}')
+                bpath=/$(printf '0%.0s' $(seq 64))
+                got=$(curl -s -o /dev/null -D /tmp/blossom-headers -w '%{http_code}' --max-time 10 "http://${bip:-0.0.0.0}:3000$bpath" 2>/dev/null)
+                bwhy=$(tr -d '\r' < /tmp/blossom-headers 2>/dev/null | awk -F': *' 'tolower($1)=="x-reason" {print $2}' | tail -1)
+                if [ "$got" = "404" ] && [ "$bwhy" = "blob not found" ]; then
+                  row OK "$who" 'GET /<64 zeros>' "404 blob not found on its own address"
+                else
+                  row FAIL "$who" 'GET /<64 zeros>' "${got:-000}${bwhy:+ $bwhy} on ${bip:-no address}:3000: expected 404 blob not found"
+                fi
+                ;;
               echo-merchant)
                 # The Echo Merchant (infra#56) defines no healthcheck, and
                 # answers any request with a Mirror of it — so a GET of `/` on
@@ -844,7 +866,10 @@ jobs:
           # transitional proxy.*.devnet and relay-ws.devnet aliases are not
           # here on purpose: infra#58 removes them.
           #
-          # <url> <expected status> [<required toon-gateway-reason>]
+          # <url> <expected status> [[<header>:]<required reason>]
+          # The reason is read from `toon-gateway-reason` unless the entry
+          # names another header (`x-reason:blob not found`); it runs to the
+          # end of the line, so it may contain spaces.
           # The random label is fresh every run so no cache can answer for
           # the gateway; the CHECK column names it `<random>` so the alert's
           # change signature does not move with it.
@@ -852,13 +877,17 @@ jobs:
           D=devnet.toonprotocol.dev
           while read -r url want reason; do
             [ -n "$url" ] || continue
+            rhdr=toon-gateway-reason
+            case "${reason:-}" in
+              *:*) rhdr=${reason%%:*}; reason=${reason#*:} ;;
+            esac
             shown="${url/$LABEL/<random>}"
             # Up to three tries, so a single dropped connection is not an
             # outage — and a real one still fails all three.
             for try in 1 2 3; do
               got=$(curl -s -o /dev/null -D /tmp/public-headers -w '%{http_code}' --max-time 20 "$url" 2>/dev/null || true)
               got=${got:-000}
-              seen=$(tr -d '\r' < /tmp/public-headers 2>/dev/null | awk -F': *' 'tolower($1)=="toon-gateway-reason" {print $2}' | tail -1)
+              seen=$(tr -d '\r' < /tmp/public-headers 2>/dev/null | awk -F': *' -v h="$rhdr" 'tolower($1)==h {print $2}' | tail -1)
               if [ "$got" = "$want" ] && { [ -z "${reason:-}" ] || [ "$seen" = "$reason" ]; }; then
                 break
               fi
@@ -878,6 +907,7 @@ jobs:
           https://$LABEL.gw.$D/ 503 no_grant
           https://faucet.$D/health 200
           https://onboard.$D/health 200
+          https://blossom.$D/0000000000000000000000000000000000000000000000000000000000000000 404 x-reason:blob not found
           EOF
           cat /tmp/public.tsv
 

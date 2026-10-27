@@ -448,6 +448,51 @@ fn fleet_health_probes_the_onboarder_on_both_layers() {
     );
 }
 
+/// Blossom is discovered by its auto-apply timer like the Onboarder, but its
+/// image has no curl and its compose service no healthcheck, so it is probed by
+/// a read-only GET of the all-zero hash: on the host against port 3000 of its own
+/// address, and across the edge. Both insist on `x-reason: blob not found`,
+/// because Caddy's own fallback 404 carries no such header.
+#[test]
+fn fleet_health_probes_blossom_on_both_layers() {
+    let lines: Vec<&str> = FLEET_HEALTH_WORKFLOW.lines().collect();
+    let Some(start) = lines.iter().position(|line| line.trim() == "blossom)") else {
+        panic!(
+            "fleet-health.yml has no on-host probe arm for the `blossom` service; \
+             it would report `NO PROBE DEFINED` on every run."
+        );
+    };
+    let arm = lines[start..]
+        .iter()
+        .take_while(|line| line.trim() != ";;")
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        ":3000",
+        "x-reason",
+        "blob not found",
+        r#"[ "$got" = "404" ]"#,
+    ] {
+        assert!(
+            arm.contains(needle),
+            "fleet-health.yml's `blossom` arm no longer contains `{needle}`:\n{arm}"
+        );
+    }
+    assert!(
+        FLEET_HEALTH_WORKFLOW.contains(&format!(
+            "https://blossom.$D/{} 404 x-reason:blob not found",
+            "0".repeat(64)
+        )),
+        "fleet-health.yml no longer requests blossom's all-zero hash across the \
+         edge and expects 404 with `x-reason: blob not found`."
+    );
+    assert!(
+        FLEET_HEALTH_WORKFLOW.contains("https://gw.$D/ 503 no_grant"),
+        "the gateway edge entries must still match `toon-gateway-reason: no_grant`."
+    );
+}
+
 /// The health workflow is only worth having if a human hears it. toon-meta#403
 /// asked for "an ... external check should alert" and the alert is the half
 /// that was never specified; a red tick on a 15-minute cron is not one.
