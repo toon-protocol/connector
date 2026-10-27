@@ -167,6 +167,13 @@ The property of a route that ends at this connector, where a packet becomes a de
 an app. The point at which a payload stops being opaque: the terminating connector reads the
 packet's envelope to know what request to make.
 
+**Payment route**:
+A terminated route whose job is to be paid, not to sell work: the payer chooses the amount, at or
+above the route's **price**, and everything that arrives is the operator's. It still ends at an
+app, the operator's own, which is what learns that the payment arrived. A peer arrival below the
+price is refused, and one above it is not.
+_Avoid_: tip route (relay's word for the event that names one), raw route, transfer
+
 **Client destination**:
 An address that resolves to a live client session rather than to a handler. The connector delivers
 to that client and never terminates: it does not open the payload, does not derive a fulfilment,
