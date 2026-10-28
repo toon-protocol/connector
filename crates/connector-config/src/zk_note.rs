@@ -497,6 +497,14 @@ max_move = {{ numerator = 1, denominator = 10 }}
             .denomination()
             .rate(&AssetId::mina_native(), &AssetId::evm(USDC))
             .is_some());
+        // ADR 0071 at a zk edge: an allowance-paid packet is denominated in
+        // the vault's asset, so a forward out of it converts at that rate.
+        assert_eq!(
+            config
+                .client_channel_assets()
+                .asset("zk-note:00112233445566778899aabbccddeeff"),
+            Some(&AssetId::mina_native())
+        );
     }
 
     #[test]

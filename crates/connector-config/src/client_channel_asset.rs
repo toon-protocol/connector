@@ -1,3 +1,4 @@
+use connector_domain::client_claim::ZK_NOTE_NAMESPACE;
 use connector_domain::AssetId;
 
 use crate::denomination::DenominationConfig;
@@ -55,9 +56,24 @@ pub struct ClientChannelAssets {
     /// One entry per `[settlement.<chain>]` table, and there are two chains
     /// -- so a linear scan is not a compromise here, it is the whole table.
     chains: Vec<(SettlementChain, AssetId)>,
+    /// What an allowance claim's packet is denominated in on a zk edge
+    /// (ADR 0080 decision 7, as amended): the vault's asset,
+    /// [`AssetId::mina_native`]. `None` on a node that is no zk edge, or
+    /// that deals nothing.
+    zk_note: Option<AssetId>,
 }
 
 impl ClientChannelAssets {
+    /// This table, on a zk edge: an allowance's key, `zk-note:<allowance
+    /// id>`, resolves to `mina:native`, so a forward out of an
+    /// allowance-paid packet crosses into the outgoing peering's token at
+    /// the operator's declared rate.
+    #[must_use]
+    pub fn with_zk_edge(mut self) -> ClientChannelAssets {
+        self.zk_note = Some(AssetId::mina_native());
+        self
+    }
+
     /// Whether this node resolved no client channel at all -- `true` for
     /// every node that declares no `[[tokens]]`, which is every config this
     /// repository ships. The question a caller asks before any other, since
@@ -77,6 +93,10 @@ impl ClientChannelAssets {
     /// and reading the id would be the difference between a declared
     /// channel and a chain-discovered one that must not exist.
     ///
+    /// On a zk edge, an allowance's key (`zk-note:<allowance id>`) resolves
+    /// to `mina:native`, the vault's asset (ADR 0080 decision 7, as
+    /// amended), whatever the allowance id.
+    ///
     /// `None` has two causes and neither is "this channel holds an
     /// undeclared token" -- that is a boot refusal
     /// ([`ConfigError::ClientChannelTokenNotDeclared`]), so it never
@@ -86,6 +106,9 @@ impl ClientChannelAssets {
     /// admitted.
     pub fn asset(&self, channel_key: &str) -> Option<&AssetId> {
         let (namespace, _) = channel_key.split_once(':')?;
+        if namespace == ZK_NOTE_NAMESPACE {
+            return self.zk_note.as_ref();
+        }
         let chain = namespace.parse::<SettlementChain>().ok()?;
         self.chains
             .iter()
@@ -109,6 +132,7 @@ impl FromIterator<(SettlementChain, AssetId)> for ClientChannelAssets {
     ) -> ClientChannelAssets {
         ClientChannelAssets {
             chains: chains.into_iter().collect(),
+            zk_note: None,
         }
     }
 }
@@ -130,9 +154,13 @@ impl FromIterator<(SettlementChain, AssetId)> for ClientChannelAssets {
 /// deals nothing resolves nothing, is held to nothing, and reaches the
 /// forwarding path with the empty table it had before this function
 /// existed.
+///
+/// On a zk edge (`zk_edge`), an allowance's key resolves to `mina:native`
+/// as well ([`ClientChannelAssets::with_zk_edge`]).
 pub(crate) fn resolve_client_channel_assets(
     settlements: &[SettlementConfig],
     denomination: &DenominationConfig,
+    zk_edge: bool,
 ) -> Result<ClientChannelAssets, ConfigError> {
     if !denomination.declares_tokens() {
         return Ok(ClientChannelAssets::default());
@@ -152,7 +180,11 @@ pub(crate) fn resolve_client_channel_assets(
         chains.push((chain, asset));
     }
 
-    Ok(ClientChannelAssets { chains })
+    let assets = ClientChannelAssets {
+        chains,
+        zk_note: None,
+    };
+    Ok(if zk_edge { assets.with_zk_edge() } else { assets })
 }
 
 #[cfg(test)]
