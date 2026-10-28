@@ -34,6 +34,7 @@ mod error;
 mod fee;
 pub mod identity;
 mod journal_entry;
+pub mod network;
 pub mod node;
 mod oer;
 mod packet;
@@ -61,6 +62,7 @@ pub use identity::{
     anonymous_identity, resolve_identity, ConfiguredIdentity, SenderIdentity, UnauthorizedIdentity,
 };
 pub use journal_entry::JournalEntry;
+pub use network::{Network, NetworkError, SolanaGenesisPrefix};
 pub use node::{
     agreed_required_transport, published_required_transport, EdgeIdentity, NodeFacts,
     NodeSelfDescription, RoutePrice, VoucherSignerFact, CLIENT_EDGE_DEFAULT_VERSION,
