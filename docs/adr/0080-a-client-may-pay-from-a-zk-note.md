@@ -1,6 +1,6 @@
 # A client may pay from a zk note
 
-**Status:** Accepted (owner decision, 2026-10-16, #1511). **Spike #1512 answered yes** (2026-10-16, [research note](../research/zk-note-verifier-spike.md)), so the condition is met and the record stands. Nothing is built. It **amends** [0040](0040-a-verified-payment-is-stated-to-the-app.md): the payer is stated only when it is known. It **adds a note to** [0033](0033-the-exposure-machinery-is-retired-not-restated.md): the risk that record retired comes back at a zk edge, under a cap, as the **open budget**. It leaves [0002](0002-drop-mina-from-the-rust-connector.md) and [0065-mina](0065-mina-leaves-the-repository.md) standing, and the sections below explain why. It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): the allowance claim, the allowance request and answer, and the signed successor state all become vectors.
+**Status:** Accepted (owner decision, 2026-10-16, #1511). **Spike #1512 answered yes** (2026-10-16, [research note](../research/zk-note-verifier-spike.md)), so the condition is met and the record stands. **Amended 2026-10-28** (owner decision, #1513): decision 7 names the asset and its rate, and the vault holds one asset with no merge or top-up of notes. Nothing is built. It **amends** [0040](0040-a-verified-payment-is-stated-to-the-app.md): the payer is stated only when it is known. It **adds a note to** [0033](0033-the-exposure-machinery-is-retired-not-restated.md): the risk that record retired comes back at a zk edge, under a cap, as the **open budget**. It leaves [0002](0002-drop-mina-from-the-rust-connector.md) and [0065-mina](0065-mina-leaves-the-repository.md) standing, and the sections below explain why. It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): the allowance claim, the allowance request and answer, and the signed successor state all become vectors.
 
 **Scope:** protocol law. It adds a claim scheme, a greeting entry and two client-edge endpoints that every implementation of a zk edge must speak. Where the proof is verified and how the journal records it are connector architecture. See the [ADR index](README.md).
 
@@ -66,7 +66,20 @@ closes, which zkAPI cannot say.
    that asset. Its forward to the next hop crosses a denomination at a declared rate
    ([0071](0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). The Mina asset is accepted
    only as the zk-note table's own; a `mina:` asset in `[[tokens]]` or a settlement table is still
-   refused by name.
+   refused by name. _Amended 2026-10-28 (owner decision, #1513):_ the vault's asset is native MINA,
+   9 decimals. The table declares it, and has two spellings for it:
+   - **In the greeting**, the zk-note entry follows the x402 entries' shape: `network` is the
+     CAIP-2 network (`mina:mainnet` or `mina:devnet`), and `asset` is `slip44:12586`, MINA's
+     SLIP-44 coin type. Together they read as the CAIP-19 `mina:mainnet/slip44:12586`. That
+     string is TOON's own composition: the `mina` namespace has no CAIP-19 profile
+     ([research](../research/mina-tokens-and-stablecoins.md)).
+   - **Inside the connector**, it is the `AssetId` `mina:native`. A `[[rates]]` row may name it;
+     `[[tokens]]` still may not.
+
+   No pool a TWAP source can read quotes MINA, so the rate out of it is a declared `[[rates]]`
+   row, static for the process lifetime. The operator covers MINA's movement between restarts
+   with a spread, and the open-budget cap bounds what rides on that rate.
+
 8. **Allowances are opened over HTTP only.** `POST /ilp/zk-note/allowances` opens one, or closes
    one when signed by its session key. `GET /ilp/zk-note/allowances/:id/successor` returns the
    signed successor and is idempotent. There is no BTP frame for either. Allowance claims ride both
@@ -119,6 +132,18 @@ challenger all live outside this repository. The rule "do not reintroduce an o1j
   the damage.
 - **Proof evidence in the journal.** Rejected: proofs are tens of KB and are evidence, not money
   state. The journal keeps a hash of each one.
+- **Merging notes.** Rejected (2026-10-28): one proof spending two states needs somewhere to record
+  the result. On chain, the vault cannot see the nullifiers a zk edge journaled off chain, so a
+  merged leaf would have to wait out a challenge window like an escape. At the zk edge, the merge
+  would be a second proof type in the connector and would tell the zk edge that two states share
+  an owner. A payer whose notes are each too small for a tier withdraws and deposits again.
+- **Topping up a note.** Rejected (2026-10-28) for the reason in Consequences: it links a public
+  deposit to a private state.
+- **The CAIP-19 string as the `AssetId`.** Rejected (2026-10-28): every `AssetId` is
+  `<chain>:<token>` with no network in it, and the zk-note table already fixes the network.
+- **An operator-writable MINA rate first.** Rejected for now (2026-10-28): ADR 0071 names it as
+  the natural next step, but it is a change of its own and need not precede the zk edge. A
+  static rate with a spread, under the open-budget cap, is enough to start.
 
 ## Consequences
 
@@ -137,6 +162,17 @@ challenger all live outside this repository. The rule "do not reintroduce an o1j
 - **What still leaks:** the timing and volume of allowances, the tier chosen, each packet's
   destination address, the linkage of packets within one allowance, and the last allowance before
   an escape. The anonymity set is the active notes in one vault, so a young vault hides little.
+- **A vault holds one asset, and an allowance spends one note** (owner decision, 2026-10-28). The
+  note commitment carries no token ID, so a vault holds exactly one asset, native MINA here; a
+  vault for any other asset is a different zkApp, under a different verification key and asset
+  string. A payer who deposits again makes a **new note**, never a larger old one: a deposit is
+  public, and adding it to an existing note would link the payer's address to a state it has been
+  spending privately. Budgets stay a published set of tiers, and deposits come in the vault's
+  fixed sizes ([toon-protocol/zk_toon#6](https://github.com/toon-protocol/zk_toon/issues/6)); a
+  wallet splits any other amount into several notes.
+- **The asset stays out of the vectors.** ADR 0071 keeps `vectors/wire-vectors.json` unit-silent,
+  and its falsifier refuses any `asset` or `token` key there. The zk-note vectors pin the claim,
+  the allowance exchange and the successor; the asset is stated in the greeting.
 - A connector without the zk-note table refuses `scheme: "zk-note"` like any unknown scheme, and
   behaves exactly as before.
 - Built in two issues, unblocked by #1512 (answered yes): the primitives, gate, journal, config, greeting and
