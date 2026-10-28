@@ -92,6 +92,11 @@ pub enum RuntimeError {
     /// skipped: a skipped entry is a claim somebody could still redeem that
     /// this node has forgotten it accepted.
     ToonChannelJournal { path: PathBuf, channel: String },
+    /// `[zk_note]` is set, and this build has no Mina vault adapter to read
+    /// the vault or verify a request proof with (ADR 0080; the adapter is
+    /// #1514). Refused by name rather than served: a zk edge that cannot
+    /// verify a proof can grant no allowance.
+    ZkNoteVaultNotBuilt,
     /// `state_dir` names a directory this node cannot create or write a
     /// journal file in (issue #605) -- typically a read-only mount, or a
     /// directory owned by another uid than the one the container runs as.
@@ -237,6 +242,12 @@ impl fmt::Display for RuntimeError {
                  channel is an x402 channel on the contract or program the binary fixes (ADR \
                  0075 decision 1), so a chain without it cannot be settled on -- point rpc_url at \
                  a chain x402 is deployed to, or remove the table"
+            ),
+            RuntimeError::ZkNoteVaultNotBuilt => write!(
+                f,
+                "[zk_note] is set, but this build has no Mina vault adapter to read the vault \
+                 and verify request proofs with (ADR 0080; connector#1514), so it cannot be a \
+                 zk edge yet -- remove the [zk_note] table to run this build"
             ),
             RuntimeError::ToonChannelJournal { path, channel } => write!(
                 f,
@@ -1583,6 +1594,12 @@ fn client_claim_gate(
     // sender, and what a node can afford to spend discovering channels that
     // turn out not to exist depends on the settlement endpoint it pays for.
     let budget = UnresolvableLookupBudgetPolicy::default();
+    // The gate's zk edge (`ClientClaimGate::with_zk_edge`) needs a
+    // `ZkNoteVault`, and the only one is the in-memory fake. #1514's Mina
+    // adapter is what this refusal becomes the construction of.
+    if config.zk_note().is_some() {
+        return Err(RuntimeError::ZkNoteVaultNotBuilt);
+    }
     let gate = ClientClaimGate::restore(journal)
         .map_err(|source| RuntimeError::JournalUnreplayable { path, source })?
         .with_lookup_budget(UnresolvableLookupBudgetPolicy {
@@ -2557,6 +2574,51 @@ key_file = "{key_path}"
             message.contains(&state_dir.display().to_string()),
             "the failure must name the path an operator has to fix: {message}"
         );
+    }
+
+    /// ADR 0080: a `[zk_note]` table on a build with no Mina vault adapter
+    /// is refused by name at boot, never served as a zk edge that grants
+    /// nothing.
+    #[test]
+    fn a_zk_note_table_without_a_vault_adapter_refuses_to_build_a_gate() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let state_key = state_dir.path().join("zk-state.key");
+        std::fs::write(&state_key, b"not a real key").expect("write");
+        let vault = connector_zk_note::Keypair::try_from(connector_zk_note::SecKey::new(
+            connector_zk_note::Scalar::from(7u64),
+        ))
+        .expect("a keypair")
+        .public
+        .into_address();
+        let (config, _key_path) = config_with_raw_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_path}"
+
+[zk_note]
+vault = "{vault}"
+network = "mina:devnet"
+graphql_url = "https://api.minascan.io/node/devnet/v1/graphql"
+state_key_file = "{state_key}"
+verification_key_hash = "1"
+tiers = [100000000]
+allowance_lifetime_secs = 3600
+open_budget_cap = 1000000000
+"#,
+                key_path = key_path.display(),
+                state_dir = state_dir.path().display(),
+                state_key = state_key.display(),
+            )
+        });
+        let Err(error) = client_claim_gate(&config, None) else {
+            panic!("a zk-note table must not produce a gate this build cannot back");
+        };
+        assert!(matches!(error, RuntimeError::ZkNoteVaultNotBuilt));
+        assert!(error.to_string().contains("[zk_note]"), "{error}");
     }
 
     /// A journal carrying a line this build cannot decode stops the node

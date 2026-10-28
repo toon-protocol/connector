@@ -1134,6 +1134,7 @@ dependencies = [
  "connector-settlement-evm",
  "connector-settlement-solana",
  "connector-signer",
+ "connector-zk-note",
  "ed25519-dalek",
  "ethers",
  "futures-util",
