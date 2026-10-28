@@ -532,3 +532,170 @@ fn the_committed_payout_vouchers_replay() {
         &signer
     ));
 }
+
+/// ADR 0080 decision 12 (#1523): the committed `zk_note` vectors replay
+/// against the real implementation -- the claim through the decoder and the
+/// session-key check, the close through its check, the request proof's
+/// public input against the binding tag, and the successor re-derived
+/// through zk_toon's crate to the same `(r, s)` and verified under the
+/// state key -- at the zk_toon commit this repository pins.
+#[test]
+fn the_committed_zk_note_vectors_replay_against_the_real_implementation() {
+    use connector_domain::client_claim::{parse_client_edge_claim, ClientEdgeClaim};
+    use connector_zk_note::note::field_to_string;
+    use connector_zk_note::note::state::verify_state;
+    use connector_zk_note::request::{expected_tag, RequestProof};
+    use connector_zk_note::session::{
+        allowance_claim_fields, signature_from_be_bytes, verify_allowance_claim,
+        verify_allowance_close,
+    };
+    use connector_zk_note::successor::successor;
+    use connector_zk_note::{
+        commitment_from_le_bytes, field_to_le_bytes, scalar_to_string, CompressedPubKey, Field,
+        Keypair, Scalar, SecKey,
+    };
+    use std::str::FromStr;
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/wire-vectors.json");
+    let committed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the committed vectors"))
+            .expect("the committed vectors are valid JSON");
+    let zk = &committed["zk_note"];
+    let text = |value: &serde_json::Value| value.as_str().expect("a string").to_string();
+    let field = |value: &serde_json::Value| Field::from_str(&text(value)).expect("a field");
+    let signature_bytes = |hex: &serde_json::Value| -> [u8; 64] {
+        hex::decode(text(hex))
+            .expect("hex")
+            .try_into()
+            .expect("64 bytes")
+    };
+
+    // Generated at the commit the crate pins.
+    let manifest = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../connector-zk-note/Cargo.toml"),
+    )
+    .expect("the boundary crate's manifest");
+    assert!(
+        manifest.contains(&format!("rev = \"{}\"", text(&zk["zk_toon_commit"]))),
+        "the zk_note vectors name a zk_toon commit the boundary crate does not pin"
+    );
+    assert_eq!(zk["signing"]["network_id"], "devnet");
+    assert_eq!(zk["signing"]["nonce"], "chunked");
+
+    let session_key =
+        CompressedPubKey::from_address(&text(&zk["keys"]["session_key"])).expect("a B62 key");
+    let state_secret = SecKey::new(Scalar::from(
+        text(&zk["keys"]["state_secret"]).parse::<u64>().unwrap(),
+    ));
+    let state = Keypair::try_from(state_secret).expect("a keypair");
+    assert_eq!(
+        state.public.into_compressed().into_address(),
+        text(&zk["keys"]["state_key"])
+    );
+
+    // The claim decodes at a zk edge, and its signature is the session key's.
+    let claim_json = zk["allowance_claim"]["claim"].to_string();
+    let Ok(ClientEdgeClaim::Allowance(claim)) = parse_client_edge_claim(&claim_json, true) else {
+        panic!("the vector's claim decodes as an allowance claim");
+    };
+    let signature = signature_from_be_bytes(&claim.signature).expect("canonical");
+    assert!(verify_allowance_claim(
+        &signature,
+        &session_key,
+        claim.allowance_id.as_bytes(),
+        claim.cumulative_amount
+    ));
+    let fields: Vec<String> =
+        allowance_claim_fields(claim.allowance_id.as_bytes(), claim.cumulative_amount)
+            .into_iter()
+            .map(field_to_string)
+            .collect();
+    assert_eq!(
+        serde_json::to_value(fields).unwrap(),
+        zk["allowance_claim"]["signed_fields"]
+    );
+
+    // The close is the session key's, and only the close's.
+    let close = signature_from_be_bytes(&signature_bytes(
+        &zk["allowance_close"]["body"]["signature"],
+    ))
+    .expect("canonical");
+    assert!(verify_allowance_close(
+        &close,
+        &session_key,
+        claim.allowance_id.as_bytes()
+    ));
+    assert!(!verify_allowance_close(
+        &signature,
+        &session_key,
+        claim.allowance_id.as_bytes()
+    ));
+
+    // The request's public input binds this edge, the session key, the tier
+    // and the expiry.
+    let body = &zk["allowance_request"]["body"];
+    let proof = RequestProof::parse(body["proof"].to_string().as_bytes()).expect("a JsonProof");
+    let public = proof.public();
+    assert_eq!(public.vault, state.public.into_compressed());
+    assert_eq!(
+        CompressedPubKey::from_address(&text(&body["sessionKey"])).unwrap(),
+        session_key
+    );
+    let expires_at = text(&body["expiresAt"]).parse::<u64>().unwrap();
+    assert_eq!(
+        public.tag,
+        expected_tag(
+            public.nullifier,
+            &public.vault,
+            &session_key,
+            public.tier,
+            expires_at
+        )
+    );
+    assert_eq!(
+        zk["allowance_answer"]["body"]["tier"],
+        public.tier.to_string()
+    );
+
+    // The successor: re-derived through zk_toon to the same (r, s), and
+    // verifying under the state key over the five pinned fields.
+    let next = &zk["successor"];
+    let before = &next["commitment_before"];
+    let commitment = commitment_from_le_bytes(
+        &field_to_le_bytes(field(&before["x"])),
+        &field_to_le_bytes(field(&before["y"])),
+    )
+    .expect("a point");
+    assert_eq!(field(&next["nullifier"]), public.nullifier);
+    assert_eq!(commitment, public.commitment);
+    let charge = text(&next["charge"]).parse::<u64>().unwrap();
+    assert_eq!(
+        charge, claim.cumulative_amount,
+        "the charge is the final watermark"
+    );
+    let derived = successor(&state, commitment, public.nullifier, charge).expect("signable");
+    assert_eq!(
+        text(&next["signature"]["r"]),
+        field_to_string(derived.signature.rx)
+    );
+    assert_eq!(
+        text(&next["signature"]["s"]),
+        scalar_to_string(derived.signature.s)
+    );
+    let fields: Vec<String> = derived
+        .message
+        .to_fields()
+        .into_iter()
+        .map(field_to_string)
+        .collect();
+    assert_eq!(serde_json::to_value(fields).unwrap(), next["signed_fields"]);
+    assert!(verify_state(
+        &derived.signature,
+        &state.public,
+        &derived.message
+    ));
+    let answer = &next["answer"]["body"];
+    assert_eq!(answer["charge"], next["charge"]);
+    assert_eq!(answer["signature"]["r"], next["signature"]["r"]);
+    assert_eq!(answer["anchor"], next["signed_fields"][4]);
+}

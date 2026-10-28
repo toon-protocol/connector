@@ -184,7 +184,19 @@ use serde::Serialize;
 /// `probe_terminates_here` -- with each case's code, cost, reason and the
 /// exact `toon-reject-reason` HTTP header and BTP protocolData entry. Nothing
 /// existing changes; a replaying SDK that ignores the section is unaffected.
-pub const SCHEMA_VERSION: u32 = 9;
+/// **10** (issue #1523, ADR 0080 decision 12): a new top-level `zk_note`
+/// section -- a zk edge's own wire: the allowance request and answer, the
+/// allowance claim with its three signed fields and `(r, s)`, the close
+/// request with its two, and the signed successor with zk_toon's five state
+/// fields, `(r, s)` and the endpoint's answer, every value computed through
+/// zk_toon's `zk-note` crate at the commit the section's `zk_toon_commit`
+/// names, signed under the devnet domain with the chunked nonce. zk_toon's
+/// own derived values stay in its `test-vectors/zk-note.json`, and no asset
+/// or decimals key appears (ADR 0071). Nothing existing changes; a replaying
+/// SDK that ignores the section is unaffected.
+pub const SCHEMA_VERSION: u32 = 10;
+
+pub mod zk_note;
 
 fn seq_bytes<const N: usize>(start: u8) -> [u8; N] {
     let mut out = [0u8; N];
@@ -224,6 +236,7 @@ pub struct WireVectors {
     pub client_auth_channel_challenge: ClientAuthChannelChallengeVectors,
     pub claim_state_toon_channel_refused: ClaimStateToonChannelRefusedVectors,
     pub client_edge: ClientEdgeVectors,
+    pub zk_note: zk_note::ZkNoteVectors,
 }
 
 /// Schema 9 (issue #1532): the client edge's own responses, as opposed to
@@ -3202,6 +3215,7 @@ pub fn generate() -> WireVectors {
     let client_auth_channel_challenge = generate_client_auth_channel_challenge_vectors();
     let claim_state_toon_channel_refused = generate_claim_state_toon_channel_refused_vectors();
     let client_edge = generate_client_edge_vectors();
+    let zk_note = zk_note::generate_zk_note_vectors();
 
     WireVectors {
         schema_version: SCHEMA_VERSION,
@@ -3217,6 +3231,7 @@ pub fn generate() -> WireVectors {
         client_auth_channel_challenge,
         claim_state_toon_channel_refused,
         client_edge,
+        zk_note,
     }
 }
 
