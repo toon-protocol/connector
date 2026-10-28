@@ -773,14 +773,16 @@ impl ClientClaimGate {
             .get(&id)
             .ok_or(AllowanceCloseRefusal::UnknownAllowance)?;
         Ok(match &allowance.state {
-            AllowanceState::Signed(journaled) => SuccessorStatus::Signed(SignedSuccessor {
-                allowance_id: id,
-                charge: journaled.charge,
-                state_key: edge.state_key(),
-                commitment: journaled.commitment,
-                anchor: journaled.anchor,
-                signature: journaled.signature.clone(),
-            }),
+            AllowanceState::Signed(journaled) => {
+                SuccessorStatus::Signed(Box::new(SignedSuccessor {
+                    allowance_id: id,
+                    charge: journaled.charge,
+                    state_key: edge.state_key(),
+                    commitment: journaled.commitment,
+                    anchor: journaled.anchor,
+                    signature: journaled.signature.clone(),
+                }))
+            }
             _ => SuccessorStatus::Pending,
         })
     }
@@ -868,7 +870,7 @@ pub enum SuccessorStatus {
     /// its forwards in flight.
     Pending,
     /// Charged, and its successor signed.
-    Signed(SignedSuccessor),
+    Signed(Box<SignedSuccessor>),
 }
 
 /// A closed allowance's successor state (ADR 0080 decisions 2 and 4): the

@@ -808,7 +808,7 @@ fn close_signed_by(key: &Keypair, id: AllowanceId) -> AllowanceClose {
 
 fn signed(status: SuccessorStatus) -> SignedSuccessor {
     match status {
-        SuccessorStatus::Signed(successor) => successor,
+        SuccessorStatus::Signed(successor) => *successor,
         SuccessorStatus::Pending => panic!("expected a signed successor, got pending"),
     }
 }
@@ -909,17 +909,20 @@ async fn the_charge_is_written_once_and_the_successor_is_idempotent() {
         // Asking again -- to close, or for the successor -- changes nothing.
         assert_eq!(
             gate.close_allowance(payer.close(id)),
-            Ok(SuccessorStatus::Signed(first.clone()))
+            Ok(SuccessorStatus::Signed(Box::new(first.clone())))
         );
         assert_eq!(
             gate.successor(id),
-            Ok(SuccessorStatus::Signed(first.clone()))
+            Ok(SuccessorStatus::Signed(Box::new(first.clone())))
         );
         (id, first)
     };
     // Nor does a restart: the same successor, from the journal.
     let restarted = edge.gate();
-    assert_eq!(restarted.successor(id), Ok(SuccessorStatus::Signed(first)));
+    assert_eq!(
+        restarted.successor(id),
+        Ok(SuccessorStatus::Signed(Box::new(first)))
+    );
     assert_eq!(edge.charges(), vec![(id.to_string(), 400)]);
     assert_eq!(edge.successors(), 1);
 
