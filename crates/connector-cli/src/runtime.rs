@@ -1420,7 +1420,7 @@ pub fn spawn_rate_pollers(
 /// precisely because that is the one chain a peering already guarantees
 /// this node RPC for, and `Config::load` refuses a quote on a chain with no
 /// `[settlement.<chain>]` table by name
-/// (`ConfigError::TokenQuoteWithoutSettlement`). So the endpoint is that
+/// (`ConfigError::TokenWithoutSettlement`). So the endpoint is that
 /// table's `rpc_url`, read here, and a second key could only ever disagree
 /// with the one the node already dials.
 ///
@@ -1479,7 +1479,7 @@ fn spawn_quote_path_pollers(
 /// precisely because that is the one chain a peering already guarantees
 /// this node RPC for, and `Config::load` refuses a quote on a chain with no
 /// `[settlement.<chain>]` table by name
-/// (`ConfigError::TokenQuoteWithoutSettlement`). So the endpoint is that
+/// (`ConfigError::TokenWithoutSettlement`). So the endpoint is that
 /// table's `rpc_url`, read here, and a second key could only ever disagree
 /// with the one the node already dials.
 ///
@@ -3114,6 +3114,63 @@ key_file = "{signer_key}"
             );
         }
 
+        /// A node dealing two tokens on one network at a hand-tended rate
+        /// carries its rate table on the runtime. No `quote` anywhere, so no
+        /// poller is started and the table is a pure product of the file --
+        /// but every token names its network (ADR 0086 decision 2), so the
+        /// node holds that network's settlement table and boots against it.
+        #[tokio::test]
+        async fn a_dealing_node_carries_its_rate_table_on_the_runtime() {
+            if !require_anvil() {
+                return;
+            }
+            let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+            let mut x402 = X402Chain::place(&anvil.rpc_url).await;
+            let token = x402.deploy_fiat_token().await;
+            let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let key = key_path.display().to_string();
+            let usdc = format!("eip155:31337/erc20:{token:#x}");
+            let anyone = "eip155:31337/erc20:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+            let config = node_config(
+                &key,
+                &format!(
+                    r#"{table}
+[[tokens]]
+asset = "{usdc}"
+numeraire = true
+
+[[tokens]]
+asset = "{anyone}"
+
+[[rates]]
+from = "{anyone}"
+to = "{usdc}"
+rate = {{ numerator = 1, denominator = 4000000000000 }}
+
+[rate_guards]
+spread = {{ numerator = 30, denominator = 10000 }}
+ttl_secs = 300
+max_move = {{ numerator = 5, denominator = 100 }}
+"#,
+                    table = evm_table(&anvil.rpc_url, token, 6, &key),
+                ),
+            );
+
+            let runtime = build(&config).await.expect("build");
+
+            let table = runtime
+                .rate_table
+                .expect("a node that declares tokens deals");
+            let held = table.read();
+            let usdc: connector_domain::AssetId = usdc.parse().expect("an asset");
+            let anyone: connector_domain::AssetId = anyone.parse().expect("an asset");
+            assert_eq!(held.numeraire(), &usdc);
+            assert!(
+                held.lookup(&anyone, &usdc, chrono::Utc::now()).is_live(),
+                "a declared row is in force from boot and never ages"
+            );
+        }
+
         /// Issue #564: a `decimals` the token disagrees with refuses to
         /// build rather than being a line with no effect.
         #[tokio::test]
@@ -3516,59 +3573,6 @@ key_file = "{signer_key}"
             text.parse::<AssetId>().expect("a declared asset")
         }
 
-        /// A node dealing the same asset across two chains at a hand-tended
-        /// rate. No `quote` anywhere, so it needs no settlement table and
-        /// [`build`] dials no chain -- the table is a pure product of the
-        /// file.
-        #[tokio::test]
-        async fn a_dealing_node_carries_its_rate_table_on_the_runtime() {
-            let (config, _key_path) = config_with_raw_key_file(|key_path| {
-                format!(
-                    r#"
-client_edge_addr = "127.0.0.1:0"
-
-[signer]
-key_file = "{key_file}"
-
-[[tokens]]
-asset = "evm:{USDC}"
-numeraire = true
-
-[[tokens]]
-asset = "solana:{USDC_SOLANA}"
-
-[[rates]]
-from = "solana:{USDC_SOLANA}"
-to = "evm:{USDC}"
-rate = {{ numerator = 1, denominator = 1 }}
-
-[rate_guards]
-spread = {{ numerator = 30, denominator = 10000 }}
-ttl_secs = 300
-max_move = {{ numerator = 5, denominator = 100 }}
-"#,
-                    key_file = key_path.display()
-                )
-            });
-
-            let runtime = build(&config).await.expect("build");
-
-            let table = runtime
-                .rate_table
-                .expect("a node that declares tokens deals");
-            let held = table.read();
-            assert_eq!(held.numeraire(), &asset(&format!("evm:{USDC}")));
-            assert!(
-                held.lookup(
-                    &asset(&format!("solana:{USDC_SOLANA}")),
-                    &asset(&format!("evm:{USDC}")),
-                    chrono::Utc::now(),
-                )
-                .is_live(),
-                "a declared row is in force from boot and never ages"
-            );
-        }
-
         /// The easy path, and every node that predates ADR 0071: no token,
         /// no numeraire, no table, nothing started.
         #[tokio::test]
@@ -3619,13 +3623,13 @@ asset_eip712_version = "2"
 key_file = "{key_file}"
 
 [[tokens]]
-asset = "evm:{USDC}"
+asset = "eip155:31337/erc20:{USDC}"
 numeraire = true
 
 [[tokens]]
-asset = "evm:{ANYONE}"
+asset = "eip155:31337/erc20:{ANYONE}"
 quote = [
-  {{ pool = "{POOL_ANYONE_USDC}", quote_token = "evm:{USDC}", twap_window_secs = 1800 }},
+  {{ pool = "{POOL_ANYONE_USDC}", quote_token = "eip155:31337/erc20:{USDC}", twap_window_secs = 1800 }},
 ]
 
 [rate_guards]
@@ -3645,8 +3649,8 @@ max_move = {{ numerator = 5, denominator = 100 }}
             source.insert_pool(
                 PoolId(POOL_ANYONE_USDC.to_string()),
                 PoolContents {
-                    base: asset(&format!("evm:{ANYONE}")),
-                    quote: asset(&format!("evm:{USDC}")),
+                    base: asset(&format!("eip155:31337/erc20:{ANYONE}")),
+                    quote: asset(&format!("eip155:31337/erc20:{USDC}")),
                     rate: connector_domain::Rate::new(4, 1_000_000_000_000).expect("a rate"),
                     observed_at,
                     shortest_window: chrono::Duration::seconds(60),
@@ -3666,8 +3670,8 @@ max_move = {{ numerator = 5, denominator = 100 }}
             assert!(
                 table
                     .lookup(
-                        &asset(&format!("evm:{ANYONE}")),
-                        &asset(&format!("evm:{USDC}")),
+                        &asset(&format!("eip155:31337/erc20:{ANYONE}")),
+                        &asset(&format!("eip155:31337/erc20:{USDC}")),
                         observed_at,
                     )
                     .is_live(),
@@ -3706,13 +3710,13 @@ asset_eip712_version = "2"
 key_file = "{key_file}"
 
 [[tokens]]
-asset = "evm:{USDC}"
+asset = "eip155:31337/erc20:{USDC}"
 numeraire = true
 
 [[tokens]]
-asset = "evm:{ANYONE}"
+asset = "eip155:31337/erc20:{ANYONE}"
 quote = [
-  {{ pool = "{POOL_ANYONE_USDC}", quote_token = "evm:{USDC}", twap_window_secs = 1800 }},
+  {{ pool = "{POOL_ANYONE_USDC}", quote_token = "eip155:31337/erc20:{USDC}", twap_window_secs = 1800 }},
 ]
 
 [rate_guards]
@@ -3770,13 +3774,13 @@ min_sponsored_deposit = 1
 key_file = "{key_file}"
 
 [[tokens]]
-asset = "solana:{USDC_SOLANA}"
+asset = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:{USDC_SOLANA}"
 numeraire = true
 
 [[tokens]]
-asset = "solana:{SOL_DEALT}"
+asset = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:{SOL_DEALT}"
 quote = [
-  {{ pool = "{POOL_SOL_DEALT_USDC}", quote_token = "solana:{USDC_SOLANA}", twap_window_secs = 900 }},
+  {{ pool = "{POOL_SOL_DEALT_USDC}", quote_token = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:{USDC_SOLANA}", twap_window_secs = 900 }},
 ]
 
 [rate_guards]
@@ -3806,7 +3810,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
                             token,
                             chain: AssetChain::Solana,
                         },
-                    } if token == &asset(&format!("solana:{SOL_DEALT}"))
+                    } if token == &asset(&format!("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:{SOL_DEALT}"))
                 ),
                 "the refusal names the token and the chain: {refused:?}"
             );
@@ -3820,9 +3824,8 @@ max_move = {{ numerator = 5, denominator = 100 }}
 
         /// The other half, unchanged by the wiring: a node whose every pair
         /// is a static `[[rates]]` row has nothing to poll and no endpoint
-        /// to poll it over. It starts nothing -- and, since this is the
-        /// path `build` takes for such a node, it also needs no settlement
-        /// table to boot.
+        /// to poll it over. It starts nothing. (Its tokens still need the
+        /// settlement tables their networks name, ADR 0086 decision 2.)
         #[tokio::test]
         async fn a_node_with_no_quote_path_starts_no_poller() {
             let (config, _key_path) = config_with_raw_key_file(|key_path| {
@@ -3833,16 +3836,35 @@ client_edge_addr = "127.0.0.1:0"
 [signer]
 key_file = "{key_file}"
 
+[settlement.eip155.31337]
+rpc_url = "http://127.0.0.1:8545"
+token_address = "{USDC}"
+decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+
+[settlement.eip155.31337.key]
+key_file = "{key_file}"
+
+[settlement.solana]
+rpc_url = "http://127.0.0.1:8899"
+token_address = "{USDC_SOLANA}"
+decimals = 6
+min_sponsored_deposit = 1
+
+[settlement.solana.key]
+key_file = "{key_file}"
+
 [[tokens]]
-asset = "evm:{USDC}"
+asset = "eip155:31337/erc20:{USDC}"
 numeraire = true
 
 [[tokens]]
-asset = "solana:{USDC_SOLANA}"
+asset = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:{USDC_SOLANA}"
 
 [[rates]]
-from = "solana:{USDC_SOLANA}"
-to = "evm:{USDC}"
+from = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:{USDC_SOLANA}"
+to = "eip155:31337/erc20:{USDC}"
 rate = {{ numerator = 1, denominator = 1 }}
 
 [rate_guards]
@@ -3968,10 +3990,12 @@ key_file = "{key}"
             let _ = UniswapV3RateSource::connect(evm)
                 .observe(&QuoteLeg {
                     pool: PoolId("0x00000000000000000000000000000000000000cc".to_string()),
-                    base: connector_domain::AssetId::evm(
+                    base: connector_domain::AssetId::erc20(
+                        31337,
                         "0x00000000000000000000000000000000000000bb",
                     ),
-                    quote: connector_domain::AssetId::evm(
+                    quote: connector_domain::AssetId::erc20(
+                        31337,
                         "0x00000000000000000000000000000000000000dd",
                     ),
                     window: chrono::Duration::seconds(60),

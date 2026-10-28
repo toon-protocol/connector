@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use connector_domain::{AssetChain, AssetId, Network};
+use connector_domain::{AssetChain, AssetId, AssetNamespace, Network};
 use serde::Deserialize;
 use url::Url;
 
@@ -229,6 +229,15 @@ pub(crate) fn settlement_heading(chain: impl std::fmt::Display) -> &'static str 
     }
 }
 
+/// The settlement table a value on `network` needs: `[settlement.eip155.<id>]`
+/// for an EVM network, `[settlement.solana]` for the one Solana cluster.
+pub(crate) fn network_heading(network: &Network) -> String {
+    match network {
+        Network::Eip155(chain_id) => format!("[settlement.{}]", eip155_table_name(*chain_id)),
+        Network::Solana(_) => "[settlement.solana]".to_string(),
+    }
+}
+
 /// A chain name `SettlementChain::from_str` does not recognize. It names
 /// every chain the `[settlement.<chain>]` tables -- and therefore the rest
 /// of the fleet -- recognize.
@@ -429,19 +438,46 @@ impl SettlementConfig {
         }
     }
 
-    /// The token every channel on this chain settles in, named the way
-    /// a `[[tokens]]` row names one (ADR 0071, issue #1290): this table's
-    /// own `token_address`, on this table's own chain.
+    /// Whether `asset` is the token every channel on this table settles in
+    /// (ADR 0071, issue #1290; ADR 0086, issue #1598): this table's own
+    /// `token_address`, on this table's own network.
     ///
-    /// Derived, never declared twice -- which is the point. A node that
-    /// deals has to be able to ask whether the token a channel holds is one
-    /// it declared, and the answer has to come from the table that already
+    /// A question rather than a value, because a Solana table cannot name its
+    /// own asset at load: CAIP-19 puts the cluster's genesis prefix in it,
+    /// which only the chain knows. A `solana:` asset here is held to the one
+    /// Solana table by its mint, and its genesis prefix is asserted against
+    /// the cluster at boot -- declared-and-asserted, like an EVM table's key.
+    ///
+    /// Derived, never declared twice -- which is the point. A node that deals
+    /// has to be able to ask whether the token a channel holds is one it
+    /// declared, and the answer has to come from the table that already
     /// states it rather than from a second place an operator could write a
     /// different address.
-    pub fn asset(&self) -> AssetId {
+    pub fn holds(&self, asset: &AssetId) -> bool {
         match self {
-            SettlementConfig::Evm(evm) => AssetId::evm(to_hex(&evm.token_address)),
-            SettlementConfig::Solana(solana) => AssetId::solana(&solana.token_address),
+            SettlementConfig::Evm(evm) => {
+                *asset == AssetId::erc20(evm.chain_id(), to_hex(&evm.token_address))
+            }
+            SettlementConfig::Solana(solana) => {
+                asset.chain() == AssetChain::Solana
+                    && asset.namespace() == AssetNamespace::Token
+                    && asset.token() == solana.token_address
+            }
+        }
+    }
+
+    /// How a `[[tokens]]` row spells this table's token, for a refusal that
+    /// has to tell the operator what to declare. Exact for an EVM table; a
+    /// Solana table's genesis prefix is left as `<genesis prefix>`, since
+    /// config cannot know it.
+    pub fn asset_spelling(&self) -> String {
+        match self {
+            SettlementConfig::Evm(evm) => {
+                AssetId::erc20(evm.chain_id(), to_hex(&evm.token_address)).to_string()
+            }
+            SettlementConfig::Solana(solana) => {
+                format!("solana:<genesis prefix>/token:{}", solana.token_address)
+            }
         }
     }
 
@@ -567,6 +603,55 @@ impl SettlementTables {
         match chain {
             SettlementChain::Evm => self.evm,
             SettlementChain::Solana => self.solana,
+        }
+    }
+}
+
+/// Which networks this node has a settlement table for, as an asset's
+/// network asks it (ADR 0086 decision 2, issue #1598): each EVM table's
+/// `eip155:<chainId>`, and the one Solana table.
+///
+/// The Solana table answers for any `solana:` network, because config cannot
+/// know its cluster's genesis prefix; boot asserts the prefix against the
+/// cluster, exactly as it asserts an EVM table's key against `eth_chainId`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SettledNetworks {
+    eip155: Vec<u64>,
+    solana: bool,
+}
+
+impl SettledNetworks {
+    /// Read off an already-resolved settlement list.
+    pub(crate) fn of(settlements: &[SettlementConfig]) -> Self {
+        SettledNetworks {
+            eip155: settlements
+                .iter()
+                .filter_map(|settlement| match settlement {
+                    SettlementConfig::Evm(evm) => Some(evm.chain_id()),
+                    SettlementConfig::Solana(_) => None,
+                })
+                .collect(),
+            solana: settlements
+                .iter()
+                .any(|settlement| settlement.chain() == SettlementChain::Solana),
+        }
+    }
+
+    /// The same answer, stated directly, for a unit test about the rows that
+    /// ask it rather than about how a settlement table parses.
+    #[cfg(test)]
+    pub(crate) fn for_tests(eip155: &[u64], solana: bool) -> Self {
+        SettledNetworks {
+            eip155: eip155.to_vec(),
+            solana,
+        }
+    }
+
+    /// Whether this node settles on `network`.
+    pub(crate) fn settles(&self, network: &Network) -> bool {
+        match network {
+            Network::Eip155(chain_id) => self.eip155.contains(chain_id),
+            Network::Solana(_) => self.solana,
         }
     }
 }
@@ -1253,7 +1338,7 @@ key_file = "{key}"
     }
 
     #[test]
-    fn a_settlement_table_names_the_token_its_channels_settle_in() {
+    fn a_settlement_table_holds_the_token_its_channels_settle_in() {
         let key_file = temp_key_file();
         let resolved = resolve(&format!(
             "{}{}",
@@ -1261,12 +1346,26 @@ key_file = "{key}"
             solana_table("", key_file.path())
         ))
         .expect("resolve");
+        let lower = to_hex(&parse_evm_address(TOKEN).unwrap());
 
-        assert_eq!(
-            resolved[0].asset(),
-            AssetId::evm(to_hex(&parse_evm_address(TOKEN).unwrap()))
+        let on_this_network: AssetId = format!("eip155:31337/erc20:{lower}").parse().unwrap();
+        let on_another: AssetId = format!("eip155:8453/erc20:{lower}").parse().unwrap();
+        assert!(resolved[0].holds(&on_this_network));
+        assert!(
+            !resolved[0].holds(&on_another),
+            "the network is part of the asset"
         );
-        assert_eq!(resolved[1].asset(), AssetId::solana(MINT));
+        assert_eq!(resolved[0].asset_spelling(), on_this_network.to_string());
+
+        let mint: AssetId = format!("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:{MINT}")
+            .parse()
+            .unwrap();
+        assert!(resolved[1].holds(&mint));
+        assert!(!resolved[0].holds(&mint));
+        assert_eq!(
+            resolved[1].asset_spelling(),
+            format!("solana:<genesis prefix>/token:{MINT}")
+        );
     }
 
     #[test]

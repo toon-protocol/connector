@@ -33,14 +33,15 @@ use std::process::Command;
 
 use connector_config::{Config, DenominationConfig};
 
-/// USDC on Base, the numeraire throughout.
-const USDC: &str = "evm:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-/// ANYONE on Base -- 18 decimals, and quoted in WETH rather than in a
+/// USDC's Base address, on the anvil network the EVM table is keyed by: the
+/// numeraire throughout.
+const USDC: &str = "eip155:31337/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+/// ANYONE's Base address -- 18 decimals, and quoted in WETH rather than in a
 /// stable, which is why ADR 0071 decision 3 has two-leg quote paths at all.
-const ANYONE: &str = "evm:0x9ff58f4fFB29fA2266Ab25e75e2A8b3503311656";
-/// WETH on Base: an intermediate a quote path passes through, never a token
+const ANYONE: &str = "eip155:31337/erc20:0x9ff58f4fFB29fA2266Ab25e75e2A8b3503311656";
+/// WETH's Base address: an intermediate a quote path passes through, never a token
 /// this node deals.
-const WETH: &str = "evm:0x4200000000000000000000000000000000000006";
+const WETH: &str = "eip155:31337/erc20:0x4200000000000000000000000000000000000006";
 const POOL_ANYONE_WETH: &str = "0x1111111111111111111111111111111111111111";
 const POOL_WETH_USDC: &str = "0x2222222222222222222222222222222222222222";
 
@@ -81,8 +82,9 @@ key_file = "{}"
     )
 }
 
-/// The same node with a `[settlement.evm]` table -- an EVM chain it has RPC
-/// for, and therefore a chain a quote path may name. `state_dir` comes with
+/// The same node with a `[settlement.eip155.31337]` table -- an EVM network
+/// it has RPC for, and therefore a network its tokens may be on (ADR 0086
+/// decision 2). `state_dir` comes with
 /// it: a node that can be paid by a stranger must be able to remember
 /// having been (issue #605), and `Config::load` refuses a settlement table
 /// without one.
@@ -209,8 +211,10 @@ fn a_full_declaration_loads_and_every_value_is_reachable() {
 #[test]
 fn exits_non_zero_on_a_mixed_numeraire() {
     let key_file = write_raw_key_file();
-    let config_file = write_config(&config_without_settlement(
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let config_file = write_config(&config_with_evm_settlement(
         key_file.path(),
+        state_dir.path(),
         &format!(
             r#"
 [[tokens]]
@@ -242,8 +246,10 @@ numeraire = true
 #[test]
 fn exits_non_zero_on_a_zero_denominator() {
     let key_file = write_raw_key_file();
-    let config_file = write_config(&config_without_settlement(
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let config_file = write_config(&config_with_evm_settlement(
         key_file.path(),
+        state_dir.path(),
         &format!(
             r#"
 [[tokens]]
@@ -282,8 +288,10 @@ max_move = {{ numerator = 5, denominator = 100 }}
 #[test]
 fn exits_non_zero_on_a_rate_row_naming_an_undeclared_token() {
     let key_file = write_raw_key_file();
-    let config_file = write_config(&config_without_settlement(
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let config_file = write_config(&config_with_evm_settlement(
         key_file.path(),
+        state_dir.path(),
         &format!(
             r#"
 [[tokens]]
@@ -355,12 +363,12 @@ max_move = {{ numerator = 5, denominator = 100 }}
     );
 }
 
-/// A quote on a chain the node has no `[settlement.<chain>]` table for. A
-/// quote is read over that table's own RPC endpoint (ADR 0071 decision 3
-/// puts a token's quote on its own settlement chain for exactly that
-/// reason), so this is a poller that could never take its first reading.
+/// A token on a network the node has no settlement table for (ADR 0086
+/// decision 2): no channel of this node can hold it, and a quote on it is
+/// read over that table's own RPC endpoint, so it would be a poller that
+/// could never take its first reading.
 #[test]
-fn exits_non_zero_on_a_quote_whose_chain_has_no_settlement_table() {
+fn exits_non_zero_on_a_token_whose_network_has_no_settlement_table() {
     let key_file = write_raw_key_file();
     let config_file = write_config(&config_without_settlement(
         key_file.path(),
@@ -389,8 +397,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("[settlement.eip155.<chainId>]")
-            && stderr.contains(&ANYONE.to_ascii_lowercase()),
+        stderr.contains("[settlement.eip155.31337]") && stderr.contains(&USDC.to_ascii_lowercase()),
         "expected the refusal to name the missing settlement table, got: {stderr}"
     );
 }

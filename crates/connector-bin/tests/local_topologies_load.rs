@@ -1487,9 +1487,22 @@ fn settlement_decimals(settlement: &SettlementConfig) -> u8 {
 fn dealing_boundary(b: &Config) -> (AssetId, AssetId) {
     let table = topology("dealing");
     (
-        settlement(b, table.peering("a-b").chain).asset(),
-        settlement(b, table.peering("b-c").chain).asset(),
+        held_token(b, settlement(b, table.peering("a-b").chain)),
+        held_token(b, settlement(b, table.peering("b-c").chain)),
     )
+}
+
+/// The declared CAIP-19 token `settlement` holds (ADR 0086 decision 2): the
+/// `[[tokens]]` row whose network and contract or mint are that table's.
+fn held_token(config: &Config, settlement: &SettlementConfig) -> AssetId {
+    config
+        .denomination()
+        .tokens()
+        .iter()
+        .map(|token| token.asset())
+        .find(|asset| settlement.holds(asset))
+        .cloned()
+        .unwrap_or_else(|| panic!("no [[tokens]] row declares {}", settlement.asset_spelling()))
 }
 
 /// What one crossing forwards across the boundary, computed the way the
@@ -1674,13 +1687,12 @@ fn the_dealing_solana_channel_is_funded_in_the_outgoing_leg_unit() {
 fn the_dealing_topology_owns_its_mint_and_commits_no_key_for_it() {
     let b = load("local/dealing/connector-b.toml", DEALING_B);
     let c = load("local/dealing/connector-c.toml", DEALING_C);
-    let mint = settlement(&b, SettlementChain::Solana).asset();
+    let mint = held_token(&b, settlement(&b, SettlementChain::Solana));
     assert!(!mint
         .to_string()
         .contains("H8HSreUF2s8r8hem4qMttE3bWYCpFuh71jbuos5bA77H"));
-    assert_eq!(
-        mint,
-        c.settlements()[0].asset(),
+    assert!(
+        c.settlements()[0].holds(&mint),
         "both ends of b-c hold the same mint"
     );
     assert!(code(KEYS_SCRIPT).contains("DEALING_MINT_INDEX="));

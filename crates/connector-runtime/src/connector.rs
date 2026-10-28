@@ -5394,14 +5394,14 @@ mod tests {
 
     /// USDC on Base: 6 decimals, and the numeraire throughout, as in ADR
     /// 0071's own examples.
-    const USDC: &str = "evm:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const USDC: &str = "eip155:8453/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
     /// ANYONE on Base: 18 decimals against USDC's 6, which is where the
     /// `10^12` in ADR 0071's motivating error comes from.
-    const ANYONE: &str = "evm:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+    const ANYONE: &str = "eip155:8453/erc20:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
     /// USDC on Solana: the SAME asset as [`USDC`] on another chain, which
     /// `AssetId` nevertheless distinguishes -- today's `mixed-chain`
     /// crossing, and the pair ADR 0071 decision 2 talks about.
-    const USDC_SOLANA: &str = "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const USDC_SOLANA: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
     /// One 6-decimals USDC base unit in 18-decimals ANYONE base units at
     /// four ANYONE to the USDC -- the decimals gap (`10^12`) and the market

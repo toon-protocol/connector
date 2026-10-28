@@ -124,7 +124,7 @@ pub fn poll_interval(ttl: Ttl) -> Duration {
 pub enum QuotePathUnusable {
     /// A quote path on a chain this node has no [`RateSource`] for (issue
     /// #1302). Distinct from `Config::load`'s
-    /// `TokenQuoteWithoutSettlement`, which is the same token failing an
+    /// `TokenWithoutSettlement`, which is the same token failing an
     /// earlier and different test: that one is "this node has no
     /// `[settlement.<chain>]` table, so it has no endpoint to read the
     /// pools over", while this one is "the endpoint is there and nothing
@@ -526,11 +526,11 @@ mod tests {
     use std::io::Write;
 
     /// USDC on Base: the numeraire, 6 decimals.
-    const USDC: &str = "evm:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const USDC: &str = "eip155:31337/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
     /// ANYONE on Base: the dealt token, 18 decimals, WETH-quoted.
-    const ANYONE: &str = "evm:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+    const ANYONE: &str = "eip155:31337/erc20:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
     /// WETH on Base: an intermediate, never a token this node deals.
-    const WETH: &str = "evm:0x4200000000000000000000000000000000000006";
+    const WETH: &str = "eip155:31337/erc20:0x4200000000000000000000000000000000000006";
     const POOL_ANYONE_WETH: &str = "0x1111111111111111111111111111111111111111";
     const POOL_WETH_USDC: &str = "0x2222222222222222222222222222222222222222";
 
@@ -546,9 +546,9 @@ mod tests {
 
     /// The mock SPL mint `local/dealing` already uses, here standing as a
     /// Solana-side node's own numeraire.
-    const SOL_NUMERAIRE: &str = "solana:5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX";
+    const SOL_NUMERAIRE: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX";
     /// The token that node deals, quoted through one Solana pool.
-    const SOL_DEALT: &str = "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const SOL_DEALT: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
     /// A real Raydium account address: a base58 32-byte pool name, which is
     /// all `canonical_pool` asks of a Solana pool.
     const POOL_SOL_DEALT_NUMERAIRE: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
@@ -820,28 +820,37 @@ asset_eip712_version = "2"
 [settlement.eip155.31337.key]
 key_file = "{key_file}"
 
+[settlement.solana]
+rpc_url = "http://127.0.0.1:8899"
+token_address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+decimals = 6
+min_sponsored_deposit = 1
+
+[settlement.solana.key]
+key_file = "{key_file}"
+
 [[tokens]]
-asset = "evm:{usdc}"
+asset = "eip155:31337/erc20:{usdc}"
 numeraire = true
 
 [[tokens]]
-asset = "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+asset = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 [[tokens]]
-asset = "evm:{anyone}"
+asset = "eip155:31337/erc20:{anyone}"
 quote = [
-  {{ pool = "{pool_anyone_weth}", quote_token = "evm:{weth}", twap_window_secs = 1800 }},
-  {{ pool = "{pool_weth_usdc}", quote_token = "evm:{usdc}", twap_window_secs = 900 }},
+  {{ pool = "{pool_anyone_weth}", quote_token = "eip155:31337/erc20:{weth}", twap_window_secs = 1800 }},
+  {{ pool = "{pool_weth_usdc}", quote_token = "eip155:31337/erc20:{usdc}", twap_window_secs = 900 }},
 ]
 
 [[rates]]
-from = "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-to = "evm:{anyone}"
+from = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+to = "eip155:31337/erc20:{anyone}"
 rate = {{ numerator = 4000000000000, denominator = 1 }}
 
 [[rates]]
-from = "evm:{anyone}"
-to = "evm:{usdc}"
+from = "eip155:31337/erc20:{anyone}"
+to = "eip155:31337/erc20:{usdc}"
 ttl_secs = 60
 
 [rate_guards]
@@ -851,9 +860,9 @@ max_move = {{ numerator = 5, denominator = 100 }}
 "#,
             state_dir = state_dir.display(),
             key_file = key_file.display(),
-            usdc = USDC.trim_start_matches("evm:"),
-            anyone = ANYONE.trim_start_matches("evm:"),
-            weth = WETH.trim_start_matches("evm:"),
+            usdc = USDC.trim_start_matches("eip155:31337/erc20:"),
+            anyone = ANYONE.trim_start_matches("eip155:31337/erc20:"),
+            weth = WETH.trim_start_matches("eip155:31337/erc20:"),
             pool_anyone_weth = POOL_ANYONE_WETH,
             pool_weth_usdc = POOL_WETH_USDC,
         )
@@ -923,10 +932,10 @@ quote = [
 ]
 
 [[tokens]]
-asset = "evm:{usdc}"
+asset = "eip155:31337/erc20:{usdc}"
 
 [[rates]]
-from = "evm:{usdc}"
+from = "eip155:31337/erc20:{usdc}"
 to = "{sol_numeraire_asset}"
 rate = {{ numerator = 1000, denominator = 1 }}
 
@@ -937,8 +946,9 @@ max_move = {{ numerator = 5, denominator = 100 }}
 "#,
             state_dir = state_dir.display(),
             key_file = key_file.display(),
-            usdc = USDC.trim_start_matches("evm:"),
-            sol_numeraire = SOL_NUMERAIRE.trim_start_matches("solana:"),
+            usdc = USDC.trim_start_matches("eip155:31337/erc20:"),
+            sol_numeraire =
+                SOL_NUMERAIRE.trim_start_matches("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:"),
             sol_numeraire_asset = SOL_NUMERAIRE,
             sol_dealt = SOL_DEALT,
             pool = POOL_SOL_DEALT_NUMERAIRE,
@@ -1009,7 +1019,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
         assert_eq!(held.numeraire(), &asset(USDC));
         assert_eq!(
             held.lookup(
-                &asset("solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+                &asset("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
                 &asset(ANYONE),
                 at(0)
             )
@@ -1133,7 +1143,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
     /// later.
     ///
     /// It names the token and the chain, and it is a different sentence
-    /// from `Config::load`'s `TokenQuoteWithoutSettlement`: this node has
+    /// from `Config::load`'s `TokenWithoutSettlement`: this node has
     /// the `[settlement.solana]` table, which is exactly why the config
     /// loaded.
     #[test]
@@ -1165,18 +1175,40 @@ max_move = {{ numerator = 5, denominator = 100 }}
         let dir = tempfile::tempdir().expect("temp config dir");
         let key_file = dir.path().join("signer.key");
         std::fs::write(&key_file, [11u8; 32]).expect("write a raw 32-byte key");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).expect("create a state dir");
         let config_file = dir.path().join("connector.toml");
         let mut file = std::fs::File::create(&config_file).expect("create the config file");
         write!(
             file,
             r#"
 client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
 
 [signer]
 key_file = "{key_file}"
 
+[settlement.eip155.31337]
+rpc_url = "http://127.0.0.1:8545"
+token_address = "{usdc}"
+decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+
+[settlement.eip155.31337.key]
+key_file = "{key_file}"
+
+[settlement.solana]
+rpc_url = "http://127.0.0.1:8899"
+token_address = "{sol_mint}"
+decimals = 9
+min_sponsored_deposit = 1
+
+[settlement.solana.key]
+key_file = "{key_file}"
+
 [[tokens]]
-asset = "evm:{usdc}"
+asset = "eip155:31337/erc20:{usdc}"
 numeraire = true
 
 [[tokens]]
@@ -1184,7 +1216,7 @@ asset = "{sol_numeraire}"
 
 [[rates]]
 from = "{sol_numeraire}"
-to = "evm:{usdc}"
+to = "eip155:31337/erc20:{usdc}"
 rate = {{ numerator = 1, denominator = 1000 }}
 
 [rate_guards]
@@ -1193,8 +1225,11 @@ ttl_secs = 300
 max_move = {{ numerator = 5, denominator = 100 }}
 "#,
             key_file = key_file.display(),
-            usdc = USDC.trim_start_matches("evm:"),
+            state_dir = state_dir.display(),
+            usdc = USDC.trim_start_matches("eip155:31337/erc20:"),
             sol_numeraire = SOL_NUMERAIRE,
+            sol_mint =
+                SOL_NUMERAIRE.trim_start_matches("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:"),
         )
         .expect("write the config file");
         let config = Config::load(&config_file).expect("load the config");

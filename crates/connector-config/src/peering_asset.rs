@@ -168,11 +168,20 @@ impl FromIterator<(String, AssetId)> for PeeringAssets {
 pub(crate) fn settlement_asset(
     settlements: &[SettlementConfig],
     chain: SettlementChain,
-) -> Option<AssetId> {
-    settlements
+    denomination: &DenominationConfig,
+) -> Option<Result<AssetId, String>> {
+    let settlement = settlements
         .iter()
-        .find(|settlement| settlement.chain() == chain)
-        .map(SettlementConfig::asset)
+        .find(|settlement| settlement.chain() == chain)?;
+    Some(
+        denomination
+            .tokens()
+            .iter()
+            .map(|token| token.asset())
+            .find(|asset| settlement.holds(asset))
+            .cloned()
+            .ok_or_else(|| settlement.asset_spelling()),
+    )
 }
 
 /// Resolve every peering to the one declared token its channels hold (ADR
@@ -215,11 +224,18 @@ pub(crate) fn resolve_peering_assets(
 
         let mut resolved: Option<AssetId> = None;
         for chain in chains {
-            let Some(asset) = settlement_asset(settlements, chain) else {
+            let asset = match settlement_asset(settlements, chain, denomination) {
                 // Unreachable from a file that got this far -- a channel
                 // row whose chain has no settlement table is refused by
                 // name, earlier and more precisely (issue #1138).
-                continue;
+                None => continue,
+                Some(Ok(asset)) => asset,
+                Some(Err(asset)) => {
+                    return Err(ConfigError::PeeringTokenNotDeclared {
+                        peer_id: peer.id().to_string(),
+                        asset,
+                    })
+                }
             };
             match &resolved {
                 None => resolved = Some(asset),
@@ -240,12 +256,6 @@ pub(crate) fn resolve_peering_assets(
             // way to arrive here with nothing resolved.
             continue;
         };
-        if denomination.token(&asset).is_none() {
-            return Err(ConfigError::PeeringTokenNotDeclared {
-                peer_id: peer.id().to_string(),
-                asset,
-            });
-        }
         peerings.push((peer.id().to_string(), asset));
     }
 
@@ -269,8 +279,8 @@ mod tests {
         }
     }
 
-    const USDC_BASE: &str = "evm:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
-    const ANYONE_BASE: &str = "evm:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+    const USDC_BASE: &str = "eip155:8453/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const ANYONE_BASE: &str = "eip155:8453/erc20:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
 
     /// The question issue #1295 asks on the forwarding path, both ways
     /// round: direction is the trade, so the pair comes back ordered as it

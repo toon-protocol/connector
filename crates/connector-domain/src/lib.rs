@@ -46,7 +46,7 @@ mod route;
 pub mod x402;
 
 pub use address::is_valid_ilp_address;
-pub use asset::{AssetChain, AssetId, AssetIdError};
+pub use asset::{AssetChain, AssetId, AssetIdError, AssetNamespace};
 pub use claim::{
     advance_voucher_watermark, payment_route_covers, validate_price, validate_voucher, ClaimError,
     VoucherAdmission, VoucherWatermark, Watermark, VOUCHER_WATERMARK_NONCE,

@@ -531,11 +531,22 @@ and `[rate_guards]` are how an operator says which tokens their node **deals**, 
 against one **numeraire**, and under what guards
 ([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md) decisions 3 and 5). A
 node that writes none of the three loads, serves and forwards exactly as it did before they existed.
-A `[[tokens]]` row names its token as `evm:<contract>` or `solana:<mint>`, may set `numeraire = true`
+Every asset id in the file — a `[[tokens]]` row's `asset`, a `[[rates]]` row's `from` and `to`, a
+quote leg's `quote_token` — is **CAIP-19** and so names its network
+([ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision 2):
+`eip155:<chainId>/erc20:0x<contract>` (the hex read in any case and printed lowercase),
+`solana:<genesis prefix>/token:<mint>`, or `<network>/slip44:<coin type>` for a native coin. USDC on
+Base and USDC at the same address on Arbitrum are two assets. The retired spellings `evm:<contract>`,
+`evm:<chainId>:<contract>`, `solana:<mint>` and `<chain>:native` are refused at load by name, with the
+CAIP-19 rewrite in the message, and never read as some other token. An asset on a network this node
+has no settlement table for is refused at load too: an `eip155` asset needs the
+`[settlement.eip155.<chainId>]` table its chain id names, and a `solana` asset the `[settlement.solana]`
+table, which it is matched to by mint — config cannot know a cluster's genesis prefix.
+A `[[tokens]]` row may set `numeraire = true`
 — exactly one row may, and two is refused by name — and may carry a `quote`: one or two pools on that
-token's **own settlement chain**, each with its own `twap_window_secs`, the last ending at the
-numeraire. A quote is read over its chain's `[settlement.<chain>]` RPC endpoint, so a quote on a chain
-with no such table is refused at load rather than becoming a poller that can never take a reading; and
+token's **own settlement network**, each with its own `twap_window_secs`, the last ending at the
+numeraire. A quote is read over its network's settlement table's RPC endpoint, and a leg quoting into a
+token on another network is refused; and
 a path that ends anywhere but the numeraire is refused too, because a cross rate is composed as
 `(X/numeraire) ÷ (Y/numeraire)` and a leg answering in another unit would be composed as though it had
 not. A `[[rates]]` row is keyed by an **ordered** pair — `from` and `to`, never sorted, because

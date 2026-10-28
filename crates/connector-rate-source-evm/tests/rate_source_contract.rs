@@ -52,20 +52,20 @@ async fn the_uniswap_v3_twap_reader_upholds_the_rate_source_contract() {
             // only honest venue forces.
             leg: QuoteLeg {
                 pool: venue.anyone_weth.clone(),
-                base: AssetId::evm(support::ANYONE),
-                quote: AssetId::evm(support::WETH),
+                base: AssetId::erc20(31337, support::ANYONE),
+                quote: AssetId::erc20(31337, support::WETH),
                 window,
             },
             next_leg: QuoteLeg {
                 pool: venue.usdc_weth.clone(),
-                base: AssetId::evm(support::WETH),
-                quote: AssetId::evm(support::USDC),
+                base: AssetId::erc20(31337, support::WETH),
+                quote: AssetId::erc20(31337, support::USDC),
                 window,
             },
             // An address this reader parses perfectly well and finds nothing
             // at -- not a label it would have refused before looking.
             absent_pool: PoolId(support::NO_POOL_HERE.to_string()),
-            asset_the_pool_does_not_hold: AssetId::evm(support::USDC),
+            asset_the_pool_does_not_hold: AssetId::erc20(31337, support::USDC),
             // A zero-second window is a spot read by another name, and this
             // reader has no spot read (ADR 0071 decision 3).
             window_shorter_than_the_source_can_serve: Duration::zero(),

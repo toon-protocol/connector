@@ -141,14 +141,15 @@ pub(crate) fn resolve_client_channel_assets(
     let mut chains = Vec::with_capacity(settlements.len());
     for settlement in settlements {
         let chain = settlement.chain();
-        let Some(asset) = settlement_asset(settlements, chain) else {
+        let asset = match settlement_asset(settlements, chain, denomination) {
             // Unreachable: `settlement_asset` is looking up the very table
             // it is being asked about.
-            continue;
+            None => continue,
+            Some(Ok(asset)) => asset,
+            Some(Err(asset)) => {
+                return Err(ConfigError::ClientChannelTokenNotDeclared { chain, asset })
+            }
         };
-        if denomination.token(&asset).is_none() {
-            return Err(ConfigError::ClientChannelTokenNotDeclared { chain, asset });
-        }
         chains.push((chain, asset));
     }
 
@@ -159,8 +160,8 @@ pub(crate) fn resolve_client_channel_assets(
 mod tests {
     use super::*;
 
-    const USDC_BASE: &str = "evm:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
-    const USDC_SOLANA: &str = "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const USDC_BASE: &str = "eip155:8453/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const USDC_SOLANA: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
     fn asset(text: &str) -> AssetId {
         text.parse::<AssetId>().expect("an asset")

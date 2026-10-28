@@ -23,8 +23,8 @@ use crate::peering_asset::{resolve_peering_assets, PeeringAssets};
 use crate::route::{resolve_routes, PeerRouteConfig, RawChild, RawRoute, StaticRoute};
 use crate::secret::{RawSignerConfig, SecretLocation};
 use crate::settlement::{
-    check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettlementConfig,
-    SettlementTables,
+    check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettledNetworks,
+    SettlementConfig, SettlementTables,
 };
 
 /// The config file's shape exactly as written -- convenience forms
@@ -509,15 +509,20 @@ impl Config {
         }
         // ADR 0071 decisions 3 and 5 (issue #1290): the tokens this node
         // deals, its numeraire, the rates and guards it has declared.
-        // Resolved against `settlement_tables` because a token's quote is
-        // read over its own chain's RPC endpoint, so a quote on a chain
-        // with no `[settlement.<chain>]` table is a poller that could never
-        // take its first reading -- refused here rather than logged
-        // forever. All three keys absent is the default value and checks
-        // nothing, which is what "a node that declares none of it behaves
-        // exactly as it does today" means here.
-        let denomination =
-            resolve_denomination(raw.tokens, raw.rates, raw.rate_guards, settlement_tables)?;
+        // Resolved against the networks this node settles on (ADR 0086
+        // decision 2): every asset says which network it is on, and a token
+        // on a network with no settlement table is one no channel of this
+        // node can hold -- and, quoted, a poller that could never take its
+        // first reading. Refused here rather than logged forever. All three
+        // keys absent is the default value and checks nothing, which is
+        // what "a node that declares none of it behaves exactly as it does
+        // today" means here.
+        let denomination = resolve_denomination(
+            raw.tokens,
+            raw.rates,
+            raw.rate_guards,
+            &SettledNetworks::of(&settlements),
+        )?;
         // ADR 0071 decision 1 (issue #1292): which of those declared tokens
         // each peering's channels are denominated in, so that a forward can
         // ask whether its two legs hold different ones without asking a
@@ -2375,10 +2380,13 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
     /// names one. Checksummed on purpose: a config file is where an
     /// explorer's spelling gets pasted, and an `AssetId` reads it and the
     /// lowercase one as a single token.
-    const SETTLEMENT_TOKEN: &str = "evm:0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
-    /// USDC on Base -- some other ERC-20. Declared alone, it makes a node
-    /// that deals a token none of its peerings hold.
-    const OTHER_TOKEN: &str = "evm:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    const SETTLEMENT_TOKEN: &str = "eip155:31337/erc20:0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
+    /// Some other ERC-20 on the node's own network. Declared alone, it
+    /// makes a node that deals a token none of its peerings hold.
+    const OTHER_TOKEN: &str = "eip155:31337/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    /// A Solana devnet genesis prefix: what a `solana:` asset's network
+    /// names. Config cannot check it -- boot does, against the cluster.
+    const SOLANA_GENESIS: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
     /// USDC on Solana, the mint `[settlement.solana]` names below.
     const SOLANA_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -2523,7 +2531,7 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
                 error,
                 ConfigError::PeeringTokenNotDeclared { peer_id, asset }
                     if peer_id == "store"
-                        && asset.to_string() == SETTLEMENT_TOKEN.to_ascii_lowercase()
+                        && asset == &SETTLEMENT_TOKEN.to_ascii_lowercase()
             )
         });
         assert!(
@@ -2545,7 +2553,7 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
         key_file
             .write_all(b"not a real key")
             .expect("write key file");
-        let solana_token = format!("solana:{SOLANA_MINT}");
+        let solana_token = format!("solana:{SOLANA_GENESIS}/token:{SOLANA_MINT}");
         let config = load_text(&peerings_on_two_chains(
             key_file.path(),
             state_dir.path(),
@@ -2579,7 +2587,7 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
         key_file
             .write_all(b"not a real key")
             .expect("write key file");
-        let solana_token = format!("solana:{SOLANA_MINT}");
+        let solana_token = format!("solana:{SOLANA_GENESIS}/token:{SOLANA_MINT}");
         let result = load_text(&one_peering_on_two_chains(
             key_file.path(),
             state_dir.path(),
@@ -2723,7 +2731,7 @@ key_file = "{key_file}"
                 error,
                 ConfigError::ClientChannelTokenNotDeclared { chain, asset }
                     if *chain == SettlementChain::Solana
-                        && asset.to_string() == format!("solana:{SOLANA_MINT}")
+                        && asset == &format!("solana:<genesis prefix>/token:{SOLANA_MINT}")
             )
         });
         assert!(
@@ -2744,7 +2752,7 @@ key_file = "{key_file}"
         key_file
             .write_all(b"not a real key")
             .expect("write key file");
-        let solana_token = format!("solana:{SOLANA_MINT}");
+        let solana_token = format!("solana:{SOLANA_GENESIS}/token:{SOLANA_MINT}");
         let text = peering_config(
             key_file.path(),
             state_dir.path(),
@@ -2768,6 +2776,99 @@ key_file = "{key_file}"
                 .asset(&format!("solana:{SOLANA_CHANNEL_ACCOUNT}"))
                 .map(ToString::to_string),
             Some(solana_token)
+        );
+    }
+
+    // -- every asset id is CAIP-19 (ADR 0086 decision 2, issue #1598) --
+
+    /// The retired spellings, in every position a config names an asset,
+    /// each refused at load by name with its CAIP-19 rewrite in the message
+    /// -- and never read as some other token.
+    #[test]
+    fn a_legacy_asset_spelling_is_refused_at_load_with_its_rewrite() {
+        const LEGACY_EVM: &str = "evm:0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
+        const REWRITE_EVM: &str =
+            "eip155:<chainId>/erc20:0x49bee1bca5d15fb0963117923403f9498119a9ce";
+        let legacy_solana = format!("solana:{SOLANA_MINT}");
+        let rewrite_solana = format!("solana:<genesis prefix>/token:{SOLANA_MINT}");
+        let guards = "\n[rate_guards]\nspread = { numerator = 0, denominator = 1 }\n\
+                      ttl_secs = 60\nmax_move = { numerator = 1, denominator = 10 }\n";
+        let pool = "0x1111111111111111111111111111111111111111";
+
+        let cases: Vec<(String, &str, String)> = vec![
+            (
+                declaring(&[LEGACY_EVM]),
+                LEGACY_EVM,
+                REWRITE_EVM.to_string(),
+            ),
+            (
+                declaring(&[&legacy_solana]),
+                legacy_solana.as_str(),
+                rewrite_solana.clone(),
+            ),
+            (
+                format!(
+                    "{}\n[[rates]]\nfrom = \"{LEGACY_EVM}\"\nto = \"{OTHER_TOKEN}\"\n\
+                     rate = {{ numerator = 1, denominator = 1 }}\n{guards}",
+                    declaring(&[SETTLEMENT_TOKEN, OTHER_TOKEN])
+                ),
+                LEGACY_EVM,
+                REWRITE_EVM.to_string(),
+            ),
+            (
+                format!(
+                    "\n[[tokens]]\nasset = \"{OTHER_TOKEN}\"\nnumeraire = true\n\
+                     \n[[tokens]]\nasset = \"{SETTLEMENT_TOKEN}\"\nquote = [{{ pool = \"{pool}\", \
+                     quote_token = \"evm:31337:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\", \
+                     twap_window_secs = 60 }}]\n{guards}"
+                ),
+                "evm:31337:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                "eip155:31337/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_string(),
+            ),
+            (
+                declaring(&["evm:native"]),
+                "evm:native",
+                "<caip2 network>/slip44:<coin type>".to_string(),
+            ),
+        ];
+        for (declaration, legacy, rewrite) in cases {
+            let message = expect_error(
+                load_peering(|text| format!("{text}{declaration}")),
+                |error| {
+                    matches!(
+                        error,
+                        ConfigError::TokenAssetInvalid { .. }
+                            | ConfigError::RateRowAssetInvalid { .. }
+                            | ConfigError::TokenQuoteTokenInvalid { .. }
+                    )
+                },
+            );
+            assert!(
+                message.contains(legacy) && message.contains(&rewrite),
+                "{legacy}: got: {message}"
+            );
+        }
+    }
+
+    /// An asset on a network this node has no settlement table for is
+    /// refused at load, naming the table it would need.
+    #[test]
+    fn an_asset_on_a_network_with_no_settlement_table_is_refused_at_load() {
+        let on_base = SETTLEMENT_TOKEN.replace("eip155:31337", "eip155:8453");
+        let message = expect_error(
+            load_peering(|text| format!("{text}{}", declaring(&[SETTLEMENT_TOKEN, &on_base]))),
+            |error| matches!(error, ConfigError::TokenWithoutSettlement { .. }),
+        );
+        assert!(
+            message.contains("[settlement.eip155.8453]"),
+            "got: {message}"
+        );
+
+        // No [settlement.solana] on this node at all.
+        let solana_token = format!("solana:{SOLANA_GENESIS}/token:{SOLANA_MINT}");
+        expect_error(
+            load_peering(|text| format!("{text}{}", declaring(&[SETTLEMENT_TOKEN, &solana_token]))),
+            |error| matches!(error, ConfigError::TokenWithoutSettlement { .. }),
         );
     }
 

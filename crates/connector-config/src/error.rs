@@ -1,7 +1,7 @@
 use std::net::AddrParseError;
 use std::path::PathBuf;
 
-use connector_domain::{AssetChain, AssetId, AssetIdError, GuardError, Price, RateError};
+use connector_domain::{AssetId, AssetIdError, GuardError, Price, RateError};
 
 use crate::settlement::SettlementChain;
 
@@ -1304,12 +1304,12 @@ pub enum ConfigError {
         source: AssetIdError,
     },
 
-    /// A quote leg quoting into a token on another chain. There is no
-    /// cross-chain pool: a path that leaves the token's own settlement
-    /// chain names a venue that does not exist.
+    /// A quote leg quoting into a token on another network. There is no
+    /// cross-network pool: a path that leaves the token's own settlement
+    /// network names a venue that does not exist (ADR 0086 decision 13).
     #[error(
-        "'{asset}'s quote names '{quote_token}', which is on another chain: ADR 0071 puts a \
-         token's quote on its OWN settlement chain -- the one chain the peering already \
+        "'{asset}'s quote names '{quote_token}', which is on another network: ADR 0071 puts a \
+         token's quote on its OWN settlement network -- the one network the peering already \
          guarantees this node RPC for -- and no pool spans two of them. Price this pair with \
          a [[rates]] row instead"
     )]
@@ -1338,16 +1338,18 @@ pub enum ConfigError {
     )]
     TokenQuoteZeroWindow { asset: AssetId },
 
-    /// A quote on a token whose chain this node has no `[settlement]` table
-    /// for (ADR 0071 decision 3).
+    /// A declared token on a network this node has no settlement table for
+    /// (ADR 0086 decision 2, issue #1598). Every asset says which network it
+    /// is on, and one on a network this node does not settle on is a token
+    /// no channel of this node can ever hold -- and, for a quoted one, a pool
+    /// it can never read (ADR 0071 decision 3).
     #[error(
-        "'{asset}' has a quote but this node has no {heading} table: a quote is \
-         read over that table's own RPC endpoint, so a pool on a chain this node does not \
-         settle on is one it can never take a reading from. Add the settlement table, or \
-         drop the quote and price this token's pairs with [[rates]] rows",
-        heading = crate::settlement::settlement_heading(.chain)
+        "[[tokens]] declares '{asset}', but this node has no {heading} table: a node deals \
+         only tokens on a network it settles on. Add the settlement table, or correct the \
+         asset's network",
+        heading = crate::settlement::network_heading(.asset.network())
     )]
-    TokenQuoteWithoutSettlement { asset: AssetId, chain: AssetChain },
+    TokenWithoutSettlement { asset: AssetId },
 
     /// A quote path with no numeraire to end at.
     #[error(
@@ -1475,7 +1477,7 @@ pub enum ConfigError {
          channels settle through -- declare it with a [[tokens]] row, or remove the [[tokens]] \
          table if this node deals nothing"
     )]
-    PeeringTokenNotDeclared { peer_id: String, asset: AssetId },
+    PeeringTokenNotDeclared { peer_id: String, asset: String },
 
     /// One peering whose channel rows sit on two chains, and therefore in
     /// two tokens (ADR 0071 decision 1, issue #1292). A packet's amount is
@@ -1527,6 +1529,9 @@ pub enum ConfigError {
     )]
     ClientChannelTokenNotDeclared {
         chain: SettlementChain,
-        asset: AssetId,
+        /// The table's token in CAIP-19, as a `[[tokens]]` row would
+        /// declare it -- with `<genesis prefix>` left for a Solana table,
+        /// whose cluster config cannot know.
+        asset: String,
     },
 }

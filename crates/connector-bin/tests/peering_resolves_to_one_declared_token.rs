@@ -42,10 +42,10 @@ use connector_config::Config;
 /// names one. Checksummed on purpose: a config file is where an explorer's
 /// spelling gets pasted, and an `AssetId` reads it and the lowercase one as
 /// one token.
-const SETTLEMENT_TOKEN: &str = "evm:0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
+const SETTLEMENT_TOKEN: &str = "eip155:31337/erc20:0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
 /// USDC on Base -- some other ERC-20, declared by a node whose peerings do
 /// not hold it.
-const OTHER_TOKEN: &str = "evm:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const OTHER_TOKEN: &str = "eip155:31337/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 /// USDC on Solana: the mint `[settlement.solana]` names below, and the
 /// other side of a two-chain node's boundary.
 const SOLANA_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -233,7 +233,7 @@ fn a_declaring_node_resolves_its_peering_to_one_declared_token() {
 fn two_peerings_on_two_chains_answer_with_the_ordered_pair_they_hold() {
     let key_file = write_raw_key_file();
     let state_dir = tempfile::tempdir().expect("temp state dir");
-    let solana_token = format!("solana:{SOLANA_MINT}");
+    let solana_token = format!("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:{SOLANA_MINT}");
     let config_file = write_config(&peerings_on_two_chains(
         key_file.path(),
         state_dir.path(),
@@ -336,7 +336,7 @@ fn exits_non_zero_on_a_peering_holding_an_undeclared_token() {
 fn exits_non_zero_on_a_peering_whose_channels_sit_on_two_chains() {
     let key_file = write_raw_key_file();
     let state_dir = tempfile::tempdir().expect("temp state dir");
-    let solana_token = format!("solana:{SOLANA_MINT}");
+    let solana_token = format!("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:{SOLANA_MINT}");
     let config_file = write_config(&peerings_on_two_chains(
         key_file.path(),
         state_dir.path(),

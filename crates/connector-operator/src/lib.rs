@@ -1721,9 +1721,9 @@ mod tests {
         use connector_runtime::{RateViewState, SharedRateTable};
 
         /// USDC on Base, the numeraire -- ADR 0071's own example.
-        const USDC: &str = "evm:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+        const USDC: &str = "eip155:8453/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
         /// ANYONE on Base: the dealt token, 18 decimals against USDC's 6.
-        const ANYONE: &str = "evm:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+        const ANYONE: &str = "eip155:8453/erc20:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
 
         fn asset(text: &str) -> AssetId {
             text.parse::<AssetId>().expect("a declared asset")
@@ -1838,7 +1838,7 @@ mod tests {
             table.write(|rates| rates.refresh(asset(ANYONE), asset(USDC), rate(4), now));
             // A second token, observed ten minutes ago: aged out, and the
             // outage is its own -- ANYONE above is untouched by it.
-            let weth = asset("evm:0x4200000000000000000000000000000000000006");
+            let weth = asset("eip155:8453/erc20:0x4200000000000000000000000000000000000006");
             table.write(|rates| {
                 rates.refresh(
                     weth.clone(),
@@ -1849,7 +1849,7 @@ mod tests {
             });
             // A third, declared as a quote path and never yet observed:
             // the poller that was meant to price it has landed nothing.
-            let unpriced = asset("evm:0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b");
+            let unpriced = asset("eip155:8453/erc20:0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b");
             let app = dealing_router(DeclaredRates::new(table, [(unpriced.clone(), asset(USDC))]));
 
             let views = read_rates(app).await;
@@ -1896,7 +1896,7 @@ mod tests {
             // probable manipulation, refused, previous value left ageing.
             table.write(|rates| rates.refresh(asset(ANYONE), asset(USDC), rate(40), now));
             // A second pair that merely aged out, with no refusal on it.
-            let weth = asset("evm:0x4200000000000000000000000000000000000006");
+            let weth = asset("eip155:8453/erc20:0x4200000000000000000000000000000000000006");
             table.write(|rates| {
                 rates.refresh(
                     weth.clone(),
