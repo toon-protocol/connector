@@ -72,6 +72,42 @@ pub fn verify_allowance_claim(
     )
 }
 
+/// The domain tag that opens a close request's signed fields (ADR 0080 decision 4, #1523). A
+/// different tag from [`ALLOWANCE_CLAIM_TAG`], so no claim the session key signed can be shown as
+/// a request to close, nor a close as a claim.
+pub const ALLOWANCE_CLOSE_TAG: &str = "toon-allowance-close.v1";
+
+/// What the session key signs to close its allowance, in order: the close tag and the allowance
+/// id (its 16 bytes read little-endian). It names no amount: Δ is the zk edge's final watermark,
+/// which the payer checks against the successor, not something it asks for.
+#[must_use]
+pub fn allowance_close_fields(allowance_id: &AllowanceIdBytes) -> [Field; 2] {
+    use ark_ff::PrimeField;
+    [
+        zk_note::tag_to_field(ALLOWANCE_CLOSE_TAG),
+        Field::from_le_bytes_mod_order(allowance_id),
+    ]
+}
+
+/// Sign a close request, as a payer's wallet does. Tests and vectors only.
+#[must_use]
+pub fn sign_allowance_close(session: &Keypair, allowance_id: &AllowanceIdBytes) -> Signature {
+    sign_fields(session, &allowance_close_fields(allowance_id))
+}
+
+/// Whether `signature` is the session key's request to close this allowance.
+#[must_use]
+pub fn verify_allowance_close(
+    signature: &Signature,
+    session_key: &CompressedPubKey,
+    allowance_id: &AllowanceIdBytes,
+) -> bool {
+    let Some(key) = decompress(session_key) else {
+        return false;
+    };
+    verify_fields(signature, &key, &allowance_close_fields(allowance_id))
+}
+
 /// Sign `fields` the way o1js's `Signature.create` does.
 #[must_use]
 pub fn sign_fields(keypair: &Keypair, fields: &[Field]) -> Signature {
@@ -97,6 +133,19 @@ pub fn verify_fields(signature: &Signature, key: &PubKey, fields: &[Field]) -> b
 #[must_use]
 pub fn signature_to_hex(signature: &Signature) -> String {
     signature.to_string()
+}
+
+/// A signature's 64 wire bytes: `rx ‖ s`, each 32 bytes big-endian.
+#[must_use]
+pub fn signature_to_be_bytes(signature: &Signature) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    let mut rx = crate::field_to_le_bytes(signature.rx);
+    rx.reverse();
+    let mut s = crate::scalar_to_le_bytes(signature.s);
+    s.reverse();
+    out[..32].copy_from_slice(&rx);
+    out[32..].copy_from_slice(&s);
+    out
 }
 
 /// The signature 64 wire bytes (`rx ‖ s`, big-endian) encode, or `None` when either half is not

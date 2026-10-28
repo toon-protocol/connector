@@ -105,7 +105,8 @@ pub use batch_settlement::{
 };
 pub use channels::{ChannelLookupFailed, ChannelResolutionError, ChannelTerminal};
 pub use claim_gate::{
-    AllowanceGrant, AllowanceRefusal, AllowanceRequest, ClaimIngestRejection, ClientClaimGate,
+    AllowanceClose, AllowanceCloseRefusal, AllowanceGrant, AllowanceRefusal, AllowanceRequest,
+    ClaimIngestRejection, ClientClaimGate, InFlightForward, SignedSuccessor, SuccessorStatus,
     ZkEdge, ZkEdgeRestoreError,
 };
 pub use evidence_file::{EvidenceFile, EvidenceFileError, EVIDENCE_FILE};
@@ -973,6 +974,10 @@ struct AdmittedClaim {
     /// What [`crate::claim_gate::ClientClaimGate::admit`] just advanced
     /// [`Self::channel_key`]'s watermark to (issue #1012).
     watermark: AdmittedWatermark,
+    /// Held until the packet has resolved, past any rollback: an
+    /// allowance is charged only once none of its forwards is in flight
+    /// (ADR 0080 decision 4). Inert for a voucher.
+    in_flight: InFlightForward,
 }
 
 /// The watermark one admitted claim advanced its channel to (issue
@@ -1028,7 +1033,7 @@ async fn extract_and_validate_claim(
         wrapped,
         state.wrap_receiver_secret.as_ref(),
     )?;
-    let claim = state.claim_gate.ingest(&claim_json, charge).await?;
+    let (claim, in_flight) = state.claim_gate.ingest_forward(&claim_json, charge).await?;
     let channel_key = claim.channel_key();
     // An allowance claim has no signer to declare: who pays is what the
     // proof hides (ADR 0080).
@@ -1045,6 +1050,7 @@ async fn extract_and_validate_claim(
         channel_key,
         plaintext_signer,
         watermark,
+        in_flight,
     }))
 }
 
@@ -1412,6 +1418,9 @@ async fn handle_ilp(
     // rejects can name exactly this claim to `ClientClaimGate::roll_back`
     // below. `None` on every path `client_channel_id` is also `None` on.
     let mut admitted_claim_watermark = None;
+    // ADR 0080 decision 4: the admitted claim's packet, in flight until it
+    // has resolved and any uncarried forward been rolled back below.
+    let mut in_flight = None;
     // Issue #869: the converse of the invariant stated above -- a packet
     // whose envelope will be refused for its own target shape
     // (`AppOutcome::Refused`, F00) is never going to reach the app either,
@@ -1437,6 +1446,7 @@ async fn handle_ilp(
                 state.connector.recognize_channel(&admitted.channel_key);
                 plaintext_claim_signer = admitted.plaintext_signer;
                 admitted_claim_watermark = Some(admitted.watermark);
+                in_flight = Some(admitted.in_flight);
                 client_channel_id = Some(admitted.channel_key);
             }
             Ok(None) => {}
@@ -1467,6 +1477,7 @@ async fn handle_ilp(
         &response,
     )
     .await;
+    drop(in_flight);
     packet_response(response)
 }
 

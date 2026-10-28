@@ -205,6 +205,23 @@ pub fn validate_allowance_claim(
     Ok(admission)
 }
 
+/// **Δ**, the charge an allowance's close journals (ADR 0080 decisions 2
+/// and 4): its final watermark, once every forward in flight has resolved
+/// and every uncarried one rolled back -- `0` when no claim stands. A
+/// watermark above the budget is refused rather than charged: admission
+/// never leaves one there, so one that is there was not admitted, and the
+/// successor it would sign would take more than the proof granted.
+pub fn allowance_close_charge(
+    final_watermark: Option<u128>,
+    budget: u64,
+) -> Result<u64, ClaimError> {
+    let claimed = final_watermark.unwrap_or(0);
+    u64::try_from(claimed)
+        .ok()
+        .filter(|delta| *delta <= budget)
+        .ok_or(ClaimError::OverBudget { claimed, budget })
+}
+
 /// The watermark after accepting a voucher of `cumulative_amount`: the
 /// amount. Callers MUST have already checked [`validate_voucher`]; this does
 /// not re-check.
@@ -282,6 +299,48 @@ mod tests {
                 prop_assert!(watermark.is_none_or(|w| w <= u128::from(budget)));
             }
         }
+
+        /// Tier 1 (ADR 0080 decisions 2 and 4, #1523): admit claims and have
+        /// the next hop reject some of them, rolling each rejected one back
+        /// to the watermark it advanced from, and the charge the close
+        /// journals is the final watermark -- zero if nothing stood -- and
+        /// never more than the budget.
+        #[test]
+        fn the_close_charges_the_final_watermark_and_never_more_than_the_budget(
+            budget in 1u64..10_000,
+            claims in proptest::collection::vec((0u128..12_000, 0u64..50, any::<bool>()), 1..40),
+        ) {
+            let mut watermark: Option<u128> = None;
+            for (amount, charge, rejected) in claims {
+                let prior = watermark.map(|w| VoucherWatermark {
+                    cumulative_amount: w,
+                    signature: &[],
+                });
+                if let Ok(VoucherAdmission::Advances { .. }) =
+                    validate_allowance_claim(prior, amount, b"s", charge, budget)
+                {
+                    if !rejected {
+                        watermark = Some(amount);
+                    }
+                }
+            }
+            let delta = allowance_close_charge(watermark, budget).expect("within budget");
+            prop_assert_eq!(u128::from(delta), watermark.unwrap_or(0));
+            prop_assert!(delta <= budget);
+        }
+    }
+
+    #[test]
+    fn a_close_charge_above_the_budget_is_refused_rather_than_signed() {
+        assert_eq!(allowance_close_charge(None, 10), Ok(0));
+        assert_eq!(allowance_close_charge(Some(10), 10), Ok(10));
+        assert_eq!(
+            allowance_close_charge(Some(11), 10),
+            Err(ClaimError::OverBudget {
+                claimed: 11,
+                budget: 10
+            })
+        );
     }
 
     // -- Vouchers (ADR 0074 decision 3, issue #1341) --

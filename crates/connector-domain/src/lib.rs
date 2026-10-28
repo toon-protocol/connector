@@ -47,9 +47,9 @@ pub mod x402;
 pub use address::is_valid_ilp_address;
 pub use asset::{AssetChain, AssetId, AssetIdError};
 pub use claim::{
-    advance_voucher_watermark, payment_route_covers, validate_allowance_claim, validate_price,
-    validate_voucher, ClaimError, VoucherAdmission, VoucherWatermark, Watermark,
-    VOUCHER_WATERMARK_NONCE,
+    advance_voucher_watermark, allowance_close_charge, payment_route_covers,
+    validate_allowance_claim, validate_price, validate_voucher, ClaimError, VoucherAdmission,
+    VoucherWatermark, Watermark, VOUCHER_WATERMARK_NONCE,
 };
 pub use condition::{
     delivery_budget, forward_wait_budget, forwarded_expiry, fulfillment_matches_condition,

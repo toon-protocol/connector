@@ -55,7 +55,7 @@ use connector_peer_btp::challenge_json::{self, PeerRoleChallenge};
 use connector_peer_btp::role_gate::{challenge_in_window, VoucherCheck, VoucherEvidence};
 use connector_settlement::batch::ChannelPresentation;
 
-use crate::claim_gate::DurabilityTicket;
+use crate::claim_gate::{DurabilityTicket, InFlightForward};
 use crate::outbound_ledger::PayoutVoucher;
 use crate::peer::BtpClaimVerdict;
 use crate::{claim_rejection_reject, x402_terms_body, ClaimIngestRejection, ClientEdgeState};
@@ -692,7 +692,9 @@ async fn handle_frame(
     if frame.ilp_packet.is_empty() {
         if let Some(json) = claim_json {
             match state.claim_gate.admit(&json, 0).await {
-                Ok((claim, durability)) => {
+                // A standalone claim carries no packet, so nothing is in
+                // flight on it.
+                Ok((claim, durability, _resolved)) => {
                     let permit = window_slot(window).await;
                     let state = Arc::clone(state);
                     let session = binding.clone();
@@ -955,7 +957,7 @@ struct MatchedRoute {
 /// the HTTP carriage sends, and its packet is never routed.
 async fn finish_frame(
     state: Arc<ClientEdgeState>,
-    admitted: Option<(ClientEdgeClaim, DurabilityTicket)>,
+    admitted: Option<(ClientEdgeClaim, DurabilityTicket, InFlightForward)>,
     matched: MatchedRoute,
     request_id: u32,
     replies: mpsc::Sender<Vec<u8>>,
@@ -970,16 +972,20 @@ async fn finish_frame(
     // packet on, read before `admitted` is consumed below, so it can ride
     // into the `"packet"` span the same way the HTTP carriage's `handle_ilp`
     // threads its own `admitted.channel_key` through.
-    let client_channel_id = admitted.as_ref().map(|(claim, _)| claim.channel_key());
+    let client_channel_id = admitted.as_ref().map(|(claim, _, _)| claim.channel_key());
     // Issue #1012: the watermark this claim advanced its channel to, kept
     // for the same reason `handle_ilp`'s HTTP carriage keeps it -- so a
     // forwarded route whose next hop terminally rejects can roll back
     // exactly this claim.
     let admitted_claim_watermark = admitted
         .as_ref()
-        .map(|(claim, _)| crate::AdmittedWatermark::of(claim));
+        .map(|(claim, _, _)| crate::AdmittedWatermark::of(claim));
+    // ADR 0080 decision 4: held until the packet has resolved and any
+    // uncarried forward been rolled back, as `handle_ilp` holds it.
+    let mut in_flight = None;
 
-    if let Some((claim, durability)) = admitted {
+    if let Some((claim, durability, forward)) = admitted {
+        in_flight = Some(forward);
         match durability.durable().await {
             // A claim that cleared the gate makes the sender eligible to
             // probe and notes the claim-state endpoint's liveness
@@ -1013,6 +1019,7 @@ async fn finish_frame(
         &packet_response,
     )
     .await;
+    drop(in_flight);
     let response = match packet_response {
         PacketResponse::Fulfill(fulfill) => encode_response(request_id, &[], &fulfill.encode()),
         PacketResponse::Reject(reject) => reject_response(request_id, reject, Vec::new()),
