@@ -34,6 +34,11 @@ hkdf = "0.12"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The zk edge's state key (ADR 0080): a Mina key, read, held and used only by
+# `ZkStateSigner` here, through the zk-note boundary crate's re-exports so the
+# workspace has one proof-systems pin.
+connector-zk-note = { path = "../connector-zk-note" }
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"

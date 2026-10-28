@@ -35,7 +35,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use connector_domain::client_claim::AllowanceId;
+use connector_domain::client_claim::{decode_lower_hex, is_canonical_decimal, AllowanceId};
 use connector_zk_note::note::field_to_string;
 use connector_zk_note::CompressedPubKey;
 use serde::Deserialize;
@@ -43,7 +43,7 @@ use serde_json::json;
 
 use crate::claim_gate::{
     AllowanceClose, AllowanceCloseRefusal, AllowanceRefusal, AllowanceRequest, ClientClaimGate,
-    SuccessorStatus,
+    NotAZkEdge, SuccessorStatus,
 };
 
 /// Where allowances are opened and closed; the successor is at
@@ -88,7 +88,7 @@ pub fn zk_note_router(gate: Arc<ClientClaimGate>) -> Router {
 
 async fn allowances(State(gate): State<Arc<ClientClaimGate>>, body: Bytes) -> Response {
     if !gate.is_zk_edge() {
-        return close_refused(AllowanceCloseRefusal::NotAZkEdge);
+        return not_a_zk_edge();
     }
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -109,7 +109,10 @@ async fn allowances(State(gate): State<Arc<ClientClaimGate>>, body: Bytes) -> Re
     let Ok(session_key) = CompressedPubKey::from_address(&open.session_key) else {
         return malformed("'sessionKey' is not a Mina public key".to_string());
     };
-    let Some(expires_at_ms) = decimal_u64(&open.expires_at) else {
+    let Some(expires_at_ms) = is_canonical_decimal(&open.expires_at)
+        .then(|| open.expires_at.parse::<u64>().ok())
+        .flatten()
+    else {
         return malformed("'expiresAt' must be a decimal string of milliseconds".to_string());
     };
     let request = AllowanceRequest {
@@ -154,7 +157,7 @@ fn close(gate: &ClientClaimGate, body: &[u8]) -> Response {
     let Ok(allowance_id) = request.allowance_id.parse::<AllowanceId>() else {
         return malformed("'allowanceId' must be 32 lowercase hex characters".to_string());
     };
-    let Some(signature) = lower_hex_64(&request.signature) else {
+    let Some(signature) = decode_lower_hex::<64>(&request.signature) else {
         return malformed("'signature' must be 128 lowercase hex characters".to_string());
     };
     match gate.close_allowance(AllowanceClose {
@@ -168,7 +171,7 @@ fn close(gate: &ClientClaimGate, body: &[u8]) -> Response {
 
 async fn successor(State(gate): State<Arc<ClientClaimGate>>, Path(id): Path<String>) -> Response {
     if !gate.is_zk_edge() {
-        return close_refused(AllowanceCloseRefusal::NotAZkEdge);
+        return not_a_zk_edge();
     }
     let Ok(allowance_id) = id.parse::<AllowanceId>() else {
         return malformed("the allowance id must be 32 lowercase hex characters".to_string());
@@ -216,12 +219,22 @@ pub fn successor_json(successor: &crate::SignedSuccessor) -> serde_json::Value {
     })
 }
 
+/// Both endpoints' answer on a node that is no zk edge.
+fn not_a_zk_edge() -> Response {
+    refusal_body(
+        StatusCode::NOT_FOUND,
+        NotAZkEdge::NAME,
+        NotAZkEdge.to_string(),
+    )
+}
+
 fn close_refused(refusal: AllowanceCloseRefusal) -> Response {
     let status = match refusal {
         AllowanceCloseRefusal::NotAZkEdge | AllowanceCloseRefusal::UnknownAllowance => {
             StatusCode::NOT_FOUND
         }
         AllowanceCloseRefusal::SignatureInvalid => StatusCode::UNPROCESSABLE_ENTITY,
+        AllowanceCloseRefusal::NotDurable => StatusCode::SERVICE_UNAVAILABLE,
     };
     refusal_body(status, refusal.name(), refusal.to_string())
 }
@@ -232,29 +245,4 @@ fn malformed(detail: String) -> Response {
 
 fn refusal_body(status: StatusCode, name: &str, detail: String) -> Response {
     (status, Json(json!({ "error": name, "detail": detail }))).into_response()
-}
-
-/// A canonical decimal `u64`: digits, no sign, no leading zero.
-fn decimal_u64(text: &str) -> Option<u64> {
-    let canonical = !text.is_empty()
-        && text.bytes().all(|b| b.is_ascii_digit())
-        && (text.len() == 1 || !text.starts_with('0'));
-    canonical.then(|| text.parse().ok()).flatten()
-}
-
-fn lower_hex_64(text: &str) -> Option<[u8; 64]> {
-    let digit = |b: u8| match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        _ => None,
-    };
-    let bytes = text.as_bytes();
-    if bytes.len() != 128 {
-        return None;
-    }
-    let mut out = [0u8; 64];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = (digit(bytes[2 * i])? << 4) | digit(bytes[2 * i + 1])?;
-    }
-    Some(out)
 }

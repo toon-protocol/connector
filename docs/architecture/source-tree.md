@@ -73,6 +73,8 @@ connector-signer                 the only crate that touches key material
   ├─ voucher_signature.rs        x402 batch-settlement voucher verification (ADR 0074)
   ├─ claim_state_challenge.rs    "prove you hold this channel", moving no value
   ├─ nip59.rs                    the wrapped-claim transport-privacy envelope
+  ├─ zk_state.rs                 a zk edge's Mina state key: read, held, and used only
+  │                               to sign successor states (ADR 0080)
   └─ contract.rs                 the `Signer` contract suite
 
 connector-config                 one typed TOML file and every refuse-to-start error
@@ -208,8 +210,9 @@ connector-vectors                bin/generate-vectors → vectors/wire-vectors.j
 connector-zk-note                the connector's zk-note boundary (ADR 0080 decision 12):
                                   re-exports toon-protocol/zk_toon's `zk-note`, pinned by
                                   commit, which defines every derivation; keeps the allowance
-                                  claim's and close's session-key signatures, the successor
-                                  composed from zk_toon's charge, anchor and state message,
+                                  claim's and close's session-key signatures, the unsigned
+                                  successor composed from zk_toon's charge, anchor and state
+                                  message (the state key that signs it is connector-signer's),
                                   tier validation, and stand-ins for zk_toon#29's
                                   RequestPublic and evidence-file bytes.
                                   tests/zk_toon_parity.rs replays zk_toon's vectors. Pure: no

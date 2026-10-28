@@ -108,7 +108,7 @@ mod allowance;
 use allowance::ZkLedger;
 pub use allowance::{
     AllowanceClose, AllowanceCloseRefusal, AllowanceGrant, AllowanceRefusal, AllowanceRequest,
-    InFlightForward, SignedSuccessor, SuccessorStatus, ZkEdge, ZkEdgeRestoreError,
+    InFlightForward, NotAZkEdge, SignedSuccessor, SuccessorStatus, ZkEdge, ZkEdgeRestoreError,
 };
 
 /// Why the gate refused a claim. [`ClaimIngestRejection::Mina`] and
@@ -232,7 +232,7 @@ pub enum ClaimIngestRejection {
     /// read from, so one that is not the channel's names nobody.
     VoucherChannelConfigMismatch,
     /// An allowance claim (ADR 0080) naming an allowance this zk edge never
-    /// granted, or has closed.
+    /// granted. A closed or closing one is [`Self::AllowanceClosed`].
     UnknownAllowance,
     /// An allowance claim on an allowance past its expiry.
     AllowanceExpired,
@@ -320,7 +320,7 @@ impl ClaimIngestRejection {
                  on a chain its greeting's 'accepts' lists"
                 .to_string(),
             ClaimIngestRejection::UnknownAllowance => "claim rejected: names an allowance \
-                 this zk edge has not granted, or has closed -- open one with a request proof"
+                 this zk edge has not granted -- open one with a request proof"
                 .to_string(),
             ClaimIngestRejection::AllowanceExpired => "claim rejected: its allowance has \
                  expired -- open a new one"

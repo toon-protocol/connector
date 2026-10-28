@@ -192,6 +192,13 @@ pub enum JournalEntry {
         commitment_x: [u8; 32],
         commitment_y: [u8; 32],
     },
+    /// A zk edge stopped an allowance taking claims (ADR 0080 decision 4):
+    /// on its session key's signed close, on a claim reaching its budget, or
+    /// at its expiry. Written, and fsynced, when the close starts -- before
+    /// a signed close is answered -- so a restart brings the allowance back
+    /// closing, never open, and the boot sweep finishes it. Written at most
+    /// once per allowance, before its [`JournalEntry::AllowanceClosed`].
+    AllowanceClosing { allowance_id: String },
     /// A zk edge closed an allowance and fixed its charge Δ (ADR 0080
     /// decisions 4 and 11, #1523): the allowance's final watermark, written
     /// once every forward in flight on it had resolved, and never

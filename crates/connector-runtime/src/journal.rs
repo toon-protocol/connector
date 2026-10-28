@@ -187,6 +187,9 @@ fn encode_line(entry: &JournalEntry) -> String {
             encode_hex(commitment_x),
             encode_hex(commitment_y),
         ),
+        JournalEntry::AllowanceClosing { allowance_id } => {
+            format!("allowance_closing\t{allowance_id}")
+        }
         JournalEntry::AllowanceClosed {
             allowance_id,
             charge,
@@ -302,6 +305,9 @@ fn decode_line(line: &str) -> Result<JournalEntry, JournalError> {
                 commitment_y: bytes32(commitment_y)?,
             })
         }
+        ["allowance_closing", allowance_id] => Ok(JournalEntry::AllowanceClosing {
+            allowance_id: allowance_id.to_string(),
+        }),
         ["allowance_closed", allowance_id, charge] => Ok(JournalEntry::AllowanceClosed {
             allowance_id: allowance_id.to_string(),
             charge: parse_u64(charge)?,
@@ -466,6 +472,9 @@ mod tests {
                 session_key_is_odd: true,
                 commitment_x: [0x04; 32],
                 commitment_y: [0x05; 32],
+            },
+            JournalEntry::AllowanceClosing {
+                allowance_id: "00112233445566778899aabbccddeeff".to_string(),
             },
             JournalEntry::AllowanceClosed {
                 allowance_id: "00112233445566778899aabbccddeeff".to_string(),

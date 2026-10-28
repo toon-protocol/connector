@@ -577,7 +577,12 @@ impl Config {
         // Resolved from the settlement tables alone and keyed by chain,
         // because the channel this has to cover is one no config names
         // (ADR 0052, issue #502).
-        let client_channel_assets = resolve_client_channel_assets(&settlements, &denomination)?;
+        // A zk edge's allowance claims are its client edge's too: their
+        // packets are denominated in the vault's asset (ADR 0080 decision 7,
+        // as amended), whose rate to every settlement token was required
+        // above.
+        let client_channel_assets =
+            resolve_client_channel_assets(&settlements, &denomination, zk_note.is_some())?;
         let state_dir = raw.state_dir.map(PathBuf::from);
         // The unresolvable-lookup budget (issue #613). Every one of these
         // is refused at zero: each zero either switches the

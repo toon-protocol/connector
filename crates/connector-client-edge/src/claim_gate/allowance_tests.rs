@@ -19,7 +19,10 @@ fn edge(dir: &std::path::Path, vault: Arc<InMemoryZkNoteVault>, clock: Arc<dyn C
     ZkEdge {
         vault,
         evidence: EvidenceFile::open(&dir.join("evidence.bin")).unwrap(),
-        state_keypair: keypair(500),
+        state_signer: connector_signer::ZkStateSigner::from_base58(
+            &SecKey::new(Scalar::from(500u64)).to_base58(),
+        )
+        .unwrap(),
         tiers: Tiers::new([TIERS[1]]).unwrap(),
         allowance_lifetime: Duration::from_secs(3600),
         open_budget_cap: TIERS[1],
@@ -93,7 +96,7 @@ async fn a_reject_rolls_an_allowance_claim_back_as_it_does_a_voucher() {
     let dir = tempfile::tempdir().unwrap();
     let session = keypair(9);
     let (gate, id) = edge_with_allowance(dir.path(), &session).await;
-    let key = id.channel_key();
+    let key = id.claim_key();
     gate.ingest(&claim(&session, id, 100), 100).await.unwrap();
     gate.ingest(&claim(&session, id, 200), 100).await.unwrap();
 
@@ -123,8 +126,8 @@ async fn rolling_back_an_allowances_first_claim_empties_it() {
     let session = keypair(10);
     let (gate, id) = edge_with_allowance(dir.path(), &session).await;
     gate.ingest(&claim(&session, id, 100), 100).await.unwrap();
-    gate.roll_back(&id.channel_key(), 100).await.unwrap();
-    assert_eq!(gate.watermark(&id.channel_key()), None);
+    gate.roll_back(&id.claim_key(), 100).await.unwrap();
+    assert_eq!(gate.watermark(&id.claim_key()), None);
 }
 
 #[tokio::test]
@@ -178,7 +181,7 @@ async fn a_forward_rejected_while_the_close_waits_is_not_charged() {
     );
 
     // The next hop rejects the second packet: rolled back, then resolved.
-    gate.roll_back(&id.channel_key(), 250).await.unwrap();
+    gate.roll_back(&id.claim_key(), 250).await.unwrap();
     drop(rejected);
     assert_eq!(gate.successor(id), Ok(SuccessorStatus::Pending));
     drop(carried);

@@ -3649,13 +3649,13 @@ impl Connector {
         // has already made the voucher's own advance; at any other route a
         // peer arrival states nothing.
         let attribution = match (client_channel_id, peer_channel) {
-            (Some(channel_key), _) => Some(PaymentAttribution {
-                channel_key,
+            (Some(claim_key), _) => Some(PaymentAttribution {
+                claim_key,
                 charge,
                 zk_note_network: self.zk_note_network.as_deref(),
             }),
             (None, Some(channel_key)) if route.payment() => Some(PaymentAttribution {
-                channel_key,
+                claim_key: channel_key,
                 charge: prepare.amount,
                 zk_note_network: None,
             }),
@@ -6453,6 +6453,38 @@ mod tests {
             "a buyer this operator has never heard of is denominated by the chain its channel \
              is on, exactly like one that is declared -- there is no door into the unconverted \
              arm on a dealing node"
+        );
+    }
+
+    /// ADR 0080 decision 7 (as amended) and ADR 0071, at a zk edge: a
+    /// packet paid by an allowance claim arrives in nanomina, under the key
+    /// `zk-note:<allowance id>`, and a forward out of it converts at the
+    /// operator's declared `mina:native` rate -- never leaves unconverted.
+    #[tokio::test]
+    async fn an_allowance_paid_arrival_converts_from_mina_at_the_declared_rate() {
+        let peer = Arc::new(CarriesAndRemembers::quoting(0));
+        let assets: ClientChannelAssets =
+            [(SettlementChain::Evm, asset(USDC))].into_iter().collect();
+        // Half a USDC to the MINA: 10^9 nanomina to 5 * 10^5 micro-USDC.
+        let hop = dealing_hop_over(
+            peer.clone(),
+            &[("second-hop", USDC)],
+            0,
+            u64::MAX,
+            Some(declaring("mina:native", USDC, 1, 2_000)),
+            test_clock(),
+        )
+        .with_client_channel_assets(assets.with_zk_edge());
+
+        // Two thousandths of a MINA, on an allowance.
+        arrives_over_client_channel(&hop, "zk-note:00112233445566778899aabbccddeeff", 2_000_000)
+            .await;
+
+        let carried = peer.carried();
+        assert_eq!(carried.len(), 1, "the packet should have been forwarded");
+        assert_eq!(
+            carried[0].amount, 1_000,
+            "two million nanomina is a thousand micro-USDC at the declared rate"
         );
     }
 

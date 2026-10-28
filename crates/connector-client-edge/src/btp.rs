@@ -281,7 +281,7 @@ fn record_accepted_claim(
     claim: &ClientEdgeClaim,
     session: Option<&(String, u64)>,
 ) {
-    let channel_key = claim.channel_key();
+    let channel_key = claim.claim_key();
     state.connector.recognize_channel(&channel_key);
     state
         .claim_gate
@@ -972,7 +972,7 @@ async fn finish_frame(
     // packet on, read before `admitted` is consumed below, so it can ride
     // into the `"packet"` span the same way the HTTP carriage's `handle_ilp`
     // threads its own `admitted.channel_key` through.
-    let client_channel_id = admitted.as_ref().map(|(claim, _, _)| claim.channel_key());
+    let client_channel_id = admitted.as_ref().map(|(claim, _, _)| claim.claim_key());
     // Issue #1012: the watermark this claim advanced its channel to, kept
     // for the same reason `handle_ilp`'s HTTP carriage keeps it -- so a
     // forwarded route whose next hop terminally rejects can roll back

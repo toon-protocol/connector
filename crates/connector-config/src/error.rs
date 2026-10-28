@@ -1216,6 +1216,17 @@ pub enum ConfigError {
         source: AssetIdError,
     },
 
+    /// A `[[tokens]]` row naming `mina:native` (ADR 0080 decision 7, as
+    /// amended): native MINA is a zk-note vault's asset and no settlement
+    /// table's, so no channel holds it and no TWAP quotes it. A zk edge
+    /// deals it only as a `[[rates]]` row's `from`.
+    #[error(
+        "[[tokens]] asset '{value}' is refused: native MINA is the [zk_note] vault's asset, not \
+         a token this connector settles or quotes. On a zk edge, name it as a [[rates]] row's \
+         'from' instead (ADR 0080)"
+    )]
+    TokenMinaNative { value: String },
+
     /// Two `[[tokens]]` rows for one token. Refused rather than merged: a
     /// rate table is keyed by token, so the second row is either a typo or
     /// a disagreement, and a disagreement resolved silently is the one a

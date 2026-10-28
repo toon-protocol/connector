@@ -558,10 +558,12 @@ base58, `EK…`, as Mina's tooling exports it),
 `policy::TIERS` — any other is refused naming it), `allowance_lifetime_secs` (above zero and at most a
 quarter of zk_toon's two-day challenge window) and `open_budget_cap` (nanomina, at least the smallest
 tier). The vault's asset is native MINA, 9 decimals; the table declares it by existing, as the
-`AssetId` `mina:native`, which a `[[rates]]` row may name as its `from` and which `[[tokens]]` and the
-settlement tables still refuse. A zk edge that also settles pays its next hops in a settlement asset,
-so it needs a `[[rates]]` row from `mina:native` to each `[settlement.<chain>]` table's token, and is
-refused naming the missing pair without one. It requires `state_dir`, where its spent nullifiers are
+`AssetId` `mina:native`, which a `[[rates]]` row may name as its `from` and which the settlement
+tables still refuse; `[[tokens]]` refuses it by name (`TokenMinaNative`). A zk edge that also settles
+pays its next hops in a settlement asset, so it needs a `[[rates]]` row from `mina:native` to each
+`[settlement.<chain>]` table's token, and is refused naming the missing pair without one; a packet paid
+by an allowance claim is denominated in `mina:native`, so a forward out of it converts at that rate
+(ADR 0071). It requires `state_dir`, where its spent nullifiers are
 journaled and its evidence file, `zk-note-evidence.bin`, is kept. This build parses and validates the
 table but refuses to boot with it: the Mina vault adapter that reads the vault and verifies proofs is
 connector#1514.

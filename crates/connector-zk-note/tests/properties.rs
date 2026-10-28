@@ -90,27 +90,14 @@ fn tiers_are_a_validated_subset_of_zk_toons() {
     assert!(t.get(TIERS[1]).is_none());
 }
 
-/// The state key file holds the key as Mina's own tooling exports it: base58 `EK…`, with
-/// surrounding whitespace ignored, and nothing else read as a key.
-#[test]
-fn a_state_key_file_is_a_base58_mina_secret_key() {
-    let secret = SecKey::new(Scalar::from(42u64));
-    let key = Keypair::try_from(secret.clone()).expect("a keypair");
-    let text = format!("  {}\n", secret.to_base58());
-    let read = connector_zk_note::state_keypair_from_text(&text).expect("a key");
-    assert_eq!(read.public, key.public);
-    assert!(connector_zk_note::state_keypair_from_text("not a key").is_none());
-    assert!(connector_zk_note::state_keypair_from_text("").is_none());
-}
-
 // -- Closing an allowance and its successor (ADR 0080 decision 4, #1523) --
 
 mod close_and_successor {
     use super::*;
     use connector_zk_note::note::balance::commit;
-    use connector_zk_note::note::state::verify_state;
+    use connector_zk_note::note::state::StateMessage;
     use connector_zk_note::session::{sign_allowance_close, verify_allowance_close};
-    use connector_zk_note::successor::successor;
+    use connector_zk_note::successor::successor_state;
     use connector_zk_note::Field;
 
     proptest! {
@@ -136,18 +123,19 @@ mod close_and_successor {
         }
 
         /// The successor of `commit(B, r)` charged Δ is `commit(B − Δ, r)` at `next_anchor(N)`,
-        /// signed by the state key over zk_toon's state message.
+        /// and its message is zk_toon's state message under the state key.
         #[test]
-        fn a_successor_is_the_old_balance_less_the_charge_signed_by_the_state_key(
+        fn a_successor_is_the_old_balance_less_the_charge_under_the_state_key(
             balance in 1u64..1_000_000_000_000,
             blinding in 1u64..u64::MAX,
             charge_seed in any::<u64>(),
             nullifier in any::<u64>(),
         ) {
             let charge = charge_seed % balance;
-            let state = session(9_999);
+            let state = session(9_999).public.into_compressed();
             let before = commit(Scalar::from(balance), Scalar::from(blinding));
-            let next = successor(&state, before, Field::from(nullifier), charge).expect("signable");
+            let next = successor_state(&state, before, Field::from(nullifier), charge)
+                .expect("signable");
             prop_assert_eq!(
                 next.commitment,
                 commit(Scalar::from(balance - charge), Scalar::from(blinding))
@@ -156,8 +144,10 @@ mod close_and_successor {
                 next.anchor,
                 connector_zk_note::note::next_anchor(Field::from(nullifier))
             );
-            prop_assert!(verify_state(&next.signature, &state.public, &next.message));
-            prop_assert!(!verify_state(&next.signature, &session(1).public, &next.message));
+            prop_assert_eq!(
+                next.message.to_fields(),
+                StateMessage::new(&state, next.commitment, next.anchor).to_fields()
+            );
         }
     }
 }
