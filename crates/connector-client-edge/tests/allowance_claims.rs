@@ -1091,3 +1091,149 @@ async fn a_closed_allowance_no_longer_counts_against_the_open_budget() {
         AllowanceRefusal::OpenBudgetExceeded { open, .. } if open == TIERS[1]
     ));
 }
+
+// -- The two HTTP endpoints (ADR 0080 decision 8, #1523) --
+
+mod endpoints {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use connector_client_edge::{zk_note_router, ZK_NOTE_ALLOWANCES_PATH};
+    use tower::ServiceExt;
+
+    async fn call(app: axum::Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let response = app.oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = hyper::body::to_bytes(response.into_body())
+            .await
+            .expect("body");
+        (status, serde_json::from_slice(&bytes).expect("JSON"))
+    }
+
+    fn post(body: String) -> Request<Body> {
+        Request::post(ZK_NOTE_ALLOWANCES_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("request")
+    }
+
+    fn get_successor(id: &str) -> Request<Body> {
+        Request::get(format!("{ZK_NOTE_ALLOWANCES_PATH}/{id}/successor"))
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    fn open_body(payer: &Payer) -> String {
+        let request = payer.request();
+        let proof: serde_json::Value = serde_json::from_slice(&request.proof).unwrap();
+        serde_json::json!({
+            "proof": proof,
+            "sessionKey": request.session_key.into_address(),
+            "expiresAt": request.expires_at_ms.to_string(),
+        })
+        .to_string()
+    }
+
+    fn close_body(payer: &Payer, id: &str) -> String {
+        let id: AllowanceId = id.parse().unwrap();
+        serde_json::json!({
+            "allowanceId": id.to_string(),
+            "signature": signature_to_hex(&sign_allowance_close(&payer.session, id.as_bytes())),
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_allowance_opens_and_closes_over_http_and_its_successor_is_idempotent() {
+        let edge = Edge::new();
+        let gate = Arc::new(edge.gate());
+        let app = zk_note_router(Arc::clone(&gate));
+        let payer = Payer::new(&edge, 50).provable(&edge);
+
+        let (status, opened) = call(app.clone(), post(open_body(&payer))).await;
+        assert_eq!(status, StatusCode::OK, "{opened}");
+        let id = opened["allowanceId"].as_str().expect("an id").to_string();
+        assert_eq!(opened["tier"], TIERS[1].to_string());
+        assert_eq!(opened["expiresAt"], payer.expires_at_ms.to_string());
+
+        let (status, pending) = call(app.clone(), get_successor(&id)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            pending,
+            serde_json::json!({"allowanceId": id, "status": "pending"})
+        );
+
+        let allowance: AllowanceId = id.parse().unwrap();
+        gate.ingest(&payer.claim(allowance, 300), 100)
+            .await
+            .unwrap();
+        let (status, closed) = call(app.clone(), post(close_body(&payer, &id))).await;
+        assert_eq!(status, StatusCode::OK, "{closed}");
+        assert_eq!(closed["status"], "signed");
+        assert_eq!(closed["charge"], "300");
+        let successor = signed(gate.successor(allowance).unwrap());
+        payer.check(&edge, &successor, 300);
+        assert_eq!(
+            closed["anchor"],
+            connector_zk_note::note::field_to_string(successor.anchor)
+        );
+        assert_eq!(
+            closed["commitment"]["x"],
+            connector_zk_note::note::field_to_string(successor.commitment.x)
+        );
+        assert_eq!(
+            closed["signature"]["r"],
+            connector_zk_note::note::field_to_string(successor.signature.rx)
+        );
+
+        let (status, again) = call(app.clone(), get_successor(&id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again, closed, "every fetch returns the same signed state");
+    }
+
+    #[tokio::test]
+    async fn each_refusal_is_named() {
+        let edge = Edge::new();
+        let app = zk_note_router(Arc::new(edge.gate()));
+        let payer = Payer::new(&edge, 51).provable(&edge);
+
+        let (status, body) = call(app.clone(), post("{}".to_string())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "request_malformed");
+
+        let unoffered = Payer {
+            tier: TIERS[2],
+            ..payer.clone()
+        };
+        let (status, body) = call(app.clone(), post(open_body(&unoffered))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "tier_not_offered");
+
+        let unknown = "00000000000000000000000000000000";
+        let (status, body) = call(app.clone(), get_successor(unknown)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "unknown_allowance");
+        let (status, body) = call(app.clone(), get_successor("not-an-id")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "request_malformed");
+
+        let (_, opened) = call(app.clone(), post(open_body(&payer))).await;
+        let id = opened["allowanceId"].as_str().unwrap();
+        let stranger = Payer::new(&edge, 52);
+        let (status, body) = call(app.clone(), post(close_body(&stranger, id))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "signature_invalid");
+    }
+
+    #[tokio::test]
+    async fn a_node_that_is_no_zk_edge_refuses_both_endpoints_by_name() {
+        let journal = Arc::new(connector_runtime::InMemoryJournal::new());
+        let app = zk_note_router(Arc::new(ClientClaimGate::restore(journal).unwrap()));
+        let (status, body) = call(app.clone(), post("{}".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "zk_note_not_offered");
+        let (status, body) = call(app, get_successor("00000000000000000000000000000000")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "zk_note_not_offered");
+    }
+}

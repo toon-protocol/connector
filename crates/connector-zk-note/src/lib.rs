@@ -64,6 +64,13 @@ pub fn scalar_to_le_bytes(scalar: Scalar) -> [u8; 32] {
     out
 }
 
+/// A scalar as a decimal string: `zk_note::field_to_string`'s encoding, for a signature's `s`.
+#[must_use]
+pub fn scalar_to_string(scalar: Scalar) -> String {
+    use ark_ff::PrimeField;
+    scalar.into_bigint().to_string()
+}
+
 /// The scalar 32 little-endian bytes encode, or `None` when they are not its canonical encoding.
 #[must_use]
 pub fn scalar_from_le_bytes(bytes: &[u8; 32]) -> Option<Scalar> {

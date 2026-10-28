@@ -1740,6 +1740,10 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     let app = app.merge(crate::sponsor::router(
         runtime.batch_settlement_solana.clone(),
     ));
+    // ADR 0080 decision 8, #1523: the zk edge's allowance endpoints, beside
+    // the sponsor's and on the same terms -- mounted on every node, so one
+    // that is no zk edge refuses them by name.
+    let app = app.merge(connector_client_edge::zk_note_router(claim_gate.clone()));
     Ok(match config.operator() {
         Some(operator) => {
             let batch_channels = batch_channels_for_operator(runtime, &claim_gate);

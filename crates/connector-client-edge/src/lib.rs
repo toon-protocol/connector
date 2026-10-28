@@ -99,6 +99,7 @@ mod session_route;
 pub(crate) mod test_support;
 mod voucher_evidence;
 pub mod zk_note;
+mod zk_note_http;
 pub use batch_settlement::{
     first_toon_channel_entry, journaled_batch_channels, AdmittedEvmVoucherChannel,
     AdmittedSolanaVoucherChannel, BatchSettlementChannels, JournaledBatchChannel,
@@ -119,6 +120,7 @@ pub use lookup_budget::{
 pub use outbound_ledger::{ClientPayoutLedger, PayoutVoucher};
 pub use peer::PeerCarriages;
 pub use session_registry::SESSION_LEASE_BACKSTOP_TTL;
+pub use zk_note_http::{successor_json, zk_note_router, ZK_NOTE_ALLOWANCES_PATH};
 
 /// The BTP carriage's default per-session in-flight window (issue #688):
 /// how many of one session's frames may be past claim admission at once.

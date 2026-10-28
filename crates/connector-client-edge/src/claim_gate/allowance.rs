@@ -154,6 +154,28 @@ pub enum AllowanceRefusal {
     NotDurable,
 }
 
+impl AllowanceRefusal {
+    /// The rule's name, as `POST /ilp/zk-note/allowances` answers it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            AllowanceRefusal::NotAZkEdge => "zk_note_not_offered",
+            AllowanceRefusal::Malformed(_) => "request_malformed",
+            AllowanceRefusal::TierNotOffered { .. } => "tier_not_offered",
+            AllowanceRefusal::ExpiryOutsideLifetime { .. } => "expiry_outside_lifetime",
+            AllowanceRefusal::ForeignStateKey => "foreign_state_key",
+            AllowanceRefusal::RequestTimeOutsideWindow { .. } => "request_time_outside_window",
+            AllowanceRefusal::Subsidised => "subsidised",
+            AllowanceRefusal::TagDoesNotBind => "tag_does_not_bind",
+            AllowanceRefusal::NullifierSpent => "nullifier_spent",
+            AllowanceRefusal::OpenBudgetExceeded { .. } => "open_budget_exceeded",
+            AllowanceRefusal::UnknownRoot => "unknown_root",
+            AllowanceRefusal::ProofInvalid => "proof_invalid",
+            AllowanceRefusal::VaultUnavailable(_) => "vault_unavailable",
+            AllowanceRefusal::NotDurable => "not_durable",
+        }
+    }
+}
+
 /// The evidence file is missing a grant the journal records: the
 /// challenger could never be shown it.
 #[derive(Debug, thiserror::Error)]
@@ -665,6 +687,12 @@ impl ClientClaimGate {
         Ok((ticket, in_flight))
     }
 
+    /// Whether this gate is a zk edge: what decides whether the zk-note
+    /// endpoints serve or refuse by name.
+    pub fn is_zk_edge(&self) -> bool {
+        self.zk_edge.is_some()
+    }
+
     /// The parts a close needs, shared with every [`InFlightForward`]:
     /// `None` on a gate that is no zk edge.
     fn zk_parts(&self) -> Option<ZkParts> {
@@ -820,6 +848,17 @@ pub enum AllowanceCloseRefusal {
     UnknownAllowance,
     #[error("refused: the close is not signed by the allowance's session key")]
     SignatureInvalid,
+}
+
+impl AllowanceCloseRefusal {
+    /// The rule's name, as the endpoints answer it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            AllowanceCloseRefusal::NotAZkEdge => "zk_note_not_offered",
+            AllowanceCloseRefusal::UnknownAllowance => "unknown_allowance",
+            AllowanceCloseRefusal::SignatureInvalid => "signature_invalid",
+        }
+    }
 }
 
 /// Where an allowance's successor is.
