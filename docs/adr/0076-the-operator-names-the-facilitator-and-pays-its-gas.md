@@ -131,6 +131,11 @@ nothing: nothing in the greeting requires a payer to use the facilitator it name
 - **A node's own outbound deposit involves no facilitator.** When a node pays a peer or a client
   (0075 decision 3), it sends `deposit` itself from its settlement key and pays its own gas. It holds
   ETH anyway, so a one-time `approve` costs it nothing that matters.
+  _Note, 2026-10-01 (#1443):_ this was asked again for a node set up minutes ago, holding the token
+  and no ETH, whose counterparty names a facilitator. It stands, as a requirement and not only an
+  observation: a node operator holds gas. A node sends its own `claim`, `settle` and withdrawal as
+  well, so a relayed deposit would not spare it the gas
+  (`.out-of-scope/node-deposit-through-a-facilitator.md`).
 - **Solana is unchanged.** The payer posts its `open` to the operator's sponsor endpoint, and the
   operator is the fee payer. No facilitator was found offering SVM `batch-settlement` on Solana devnet
   (`docs/research/x402-devnet-facilitators.md`, 2026-09-25), and a third-party sponsor is refused
