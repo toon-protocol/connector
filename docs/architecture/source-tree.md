@@ -205,12 +205,13 @@ connector-cli                    config → runtime → merged routers → bound
 connector-bin                    bin/connector, bin/stub-app — and the workspace's
                                   cross-cutting integration tests (see below)
 connector-vectors                bin/generate-vectors → vectors/wire-vectors.json
-connector-zk-note                zk-note primitives (ADR 0080): kimchi Poseidon, the domain
-                                  tags and generator seeds (wire law), hashToGroup, the
-                                  balance commitment, the state message and its Mina Schnorr
-                                  signature — byte-identical to o1js, pinned by
-                                  fixtures/parity.json. Pure: no I/O, no clock, no connector
-                                  crate. Nothing calls it yet
+connector-zk-note                the connector's zk-note boundary (ADR 0080 decision 12):
+                                  re-exports toon-protocol/zk_toon's `zk-note`, pinned by
+                                  commit, which defines every derivation; keeps the allowance
+                                  claim's session-key signature, tier validation, and stand-ins
+                                  for zk_toon#29's RequestPublic and evidence-file bytes.
+                                  tests/zk_toon_parity.rs replays zk_toon's vectors. Pure: no
+                                  I/O, no clock, no connector crate
 ```
 
 ### Test layout
@@ -265,8 +266,8 @@ Node sidecar beside the binary was refused — and
 dApp and the Mina tooling that record had left standing. The npm workspaces have no Mina
 package. What remains of the old Mina support is the connector refusing a `mina` claim by name,
 which is wire behaviour. The one Mina-derived crate, `connector-zk-note`, is
-[ADR 0080](../adr/0080-a-client-may-pay-from-a-zk-note.md)'s verifier-side primitives over o1-labs
-`proof-systems` — no o1js, no proving, no settlement — and leaves both records standing.
+[ADR 0080](../adr/0080-a-client-may-pay-from-a-zk-note.md)'s boundary over zk_toon's `zk-note` and
+o1-labs `proof-systems` — no o1js, no proving, no settlement — and leaves both records standing.
 
 ### `tools/`
 

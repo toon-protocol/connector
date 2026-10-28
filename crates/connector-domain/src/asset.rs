@@ -53,6 +53,12 @@ use thiserror::Error;
 
 use crate::client_claim::{EVM_NAMESPACE, SOLANA_NAMESPACE};
 
+/// The namespace of Mina's one asset (ADR 0080 decision 7, as amended).
+pub const MINA_NAMESPACE: &str = "mina";
+
+/// The token half of native MINA's [`AssetId`]: `mina:native`.
+pub const MINA_NATIVE_TOKEN: &str = "native";
+
 /// The separator between an [`AssetId`]'s chain and its token, in the one
 /// text form an asset has. The same `<chain>:<id>` shape a channel key
 /// already uses, so an operator reading a journal line and an operator
@@ -62,9 +68,10 @@ const CHAIN_SEPARATOR: char = ':';
 /// How many hex characters an EVM contract address is, unprefixed.
 const EVM_ADDRESS_HEX_LEN: usize = 40;
 
-/// The settlement chain a token lives on -- the two this connector has a
+/// The chain a token lives on -- the two this connector has a settlement
 /// backend for, named with the same two strings the rest of the workspace
-/// names them with ([`EVM_NAMESPACE`], [`SOLANA_NAMESPACE`]).
+/// names them with ([`EVM_NAMESPACE`], [`SOLANA_NAMESPACE`]) -- and Mina,
+/// whose one asset is a zk-note vault's (ADR 0080 decision 7, as amended).
 ///
 /// A closed enum rather than a free string, because ADR 0071 decision 3 puts
 /// a token's quote on **its own settlement chain** -- the one chain the
@@ -79,6 +86,12 @@ pub enum AssetChain {
     Evm,
     /// An SPL mint on the cluster `[settlement.solana]` names.
     Solana,
+    /// Native MINA, 9 decimals, held by the vault the `[zk_note]` table
+    /// names. Its one [`AssetId`] is `mina:native` ([`AssetId::mina_native`]);
+    /// there is no Mina settlement backend, so `mina:` stays refused in
+    /// `[[tokens]]` and in every settlement table, and no TWAP source quotes
+    /// it. A `[[rates]]` row may name it as its `from`.
+    Mina,
 }
 
 impl AssetChain {
@@ -87,6 +100,7 @@ impl AssetChain {
         match self {
             AssetChain::Evm => EVM_NAMESPACE,
             AssetChain::Solana => SOLANA_NAMESPACE,
+            AssetChain::Mina => MINA_NAMESPACE,
         }
     }
 }
@@ -104,6 +118,7 @@ impl FromStr for AssetChain {
         match s {
             EVM_NAMESPACE => Ok(AssetChain::Evm),
             SOLANA_NAMESPACE => Ok(AssetChain::Solana),
+            MINA_NAMESPACE => Ok(AssetChain::Mina),
             other => Err(AssetIdError::UnknownChain(other.to_string())),
         }
     }
@@ -148,12 +163,25 @@ impl AssetId {
         }
     }
 
-    /// The same two constructors, chosen at runtime -- what a config row that
+    /// Native MINA: the vault asset of a zk edge, and the only Mina asset
+    /// (ADR 0080 decision 7, as amended).
+    pub fn mina_native() -> AssetId {
+        AssetId {
+            chain: AssetChain::Mina,
+            token: MINA_NATIVE_TOKEN.to_string(),
+        }
+    }
+
+    /// The same constructors, chosen at runtime -- what a config row that
     /// names its chain in a field rather than in a table key needs.
     pub fn new(chain: AssetChain, token: impl AsRef<str>) -> AssetId {
         match chain {
             AssetChain::Evm => AssetId::evm(token),
             AssetChain::Solana => AssetId::solana(token),
+            AssetChain::Mina => AssetId {
+                chain: AssetChain::Mina,
+                token: token.as_ref().to_string(),
+            },
         }
     }
 
@@ -190,7 +218,13 @@ impl FromStr for AssetId {
         if token.is_empty() {
             return Err(AssetIdError::EmptyToken(s.to_string()));
         }
-        Ok(AssetId::new(chain.parse::<AssetChain>()?, token))
+        let chain = chain.parse::<AssetChain>()?;
+        // Mina has one asset, native MINA. Any other `mina:` token is a chain
+        // this connector has no backend for, refused exactly as before.
+        if chain == AssetChain::Mina && token != MINA_NATIVE_TOKEN {
+            return Err(AssetIdError::UnknownChain(MINA_NAMESPACE.to_string()));
+        }
+        Ok(AssetId::new(chain, token))
     }
 }
 
@@ -317,6 +351,16 @@ mod tests {
             .expect_err("a chain with no backend is not an asset");
         assert_eq!(error, AssetIdError::UnknownChain("mina".to_string()));
         assert!(error.to_string().contains("mina"), "got: {error}");
+    }
+
+    /// ADR 0080 decision 7, as amended: `mina:native` is an asset, and it is
+    /// the only Mina one.
+    #[test]
+    fn native_mina_is_the_one_mina_asset() {
+        let mina = "mina:native".parse::<AssetId>().expect("native MINA");
+        assert_eq!(mina, AssetId::mina_native());
+        assert_eq!(mina.chain(), AssetChain::Mina);
+        assert_eq!(mina.to_string(), "mina:native");
     }
 
     #[test]

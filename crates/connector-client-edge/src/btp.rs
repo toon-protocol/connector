@@ -48,7 +48,7 @@ use connector_btp::{
     BTP_ERROR, BTP_MESSAGE, BTP_RESPONSE, BTP_TRANSFER, CLAIM_PROTOCOL, CONTENT_TYPE_TEXT,
     PAYMENT_REQUIRED_PROTOCOL, PAYOUT_CLAIM_PROTOCOL, REJECT_REASON_PROTOCOL,
 };
-use connector_domain::client_claim::ClientClaim;
+use connector_domain::client_claim::ClientEdgeClaim;
 use connector_domain::BTP_MESSAGE_LIMIT;
 use connector_domain::{refuse_oversize, PacketResponse, Prepare, Price, Reject, RejectCode};
 use connector_peer_btp::challenge_json::{self, PeerRoleChallenge};
@@ -278,7 +278,7 @@ async fn window_slot(window: &Arc<Semaphore>) -> OwnedSemaphorePermit {
 /// resends it ([`spawn_stranded_claim_resend`]).
 fn record_accepted_claim(
     state: &Arc<ClientEdgeState>,
-    claim: &ClientClaim,
+    claim: &ClientEdgeClaim,
     session: Option<&(String, u64)>,
 ) {
     let channel_key = claim.channel_key();
@@ -955,7 +955,7 @@ struct MatchedRoute {
 /// the HTTP carriage sends, and its packet is never routed.
 async fn finish_frame(
     state: Arc<ClientEdgeState>,
-    admitted: Option<(ClientClaim, DurabilityTicket)>,
+    admitted: Option<(ClientEdgeClaim, DurabilityTicket)>,
     matched: MatchedRoute,
     request_id: u32,
     replies: mpsc::Sender<Vec<u8>>,

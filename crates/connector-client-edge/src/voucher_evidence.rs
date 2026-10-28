@@ -78,7 +78,10 @@ fn voucher_ack(rejection: &ClaimIngestRejection) -> ClaimAckOutcome {
         | ClaimIngestRejection::WrapUnsupported
         | ClaimIngestRejection::WrapFailed(_)
         | ClaimIngestRejection::BatchSettlementNotAccepted
-        | ClaimIngestRejection::VoucherChannelConfigMismatch => {
+        | ClaimIngestRejection::VoucherChannelConfigMismatch
+        | ClaimIngestRejection::UnknownAllowance
+        | ClaimIngestRejection::AllowanceExpired
+        | ClaimIngestRejection::OverBudget { .. } => {
             ClaimAckOutcome::Rejected(ClaimRejectReason::UnknownChannel)
         }
     }

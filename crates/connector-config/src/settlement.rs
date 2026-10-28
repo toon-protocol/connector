@@ -177,11 +177,16 @@ impl SettlementChain {
     }
 }
 
-impl From<AssetChain> for SettlementChain {
-    fn from(chain: AssetChain) -> SettlementChain {
+/// Fallible, because one chain a token can live on has no settlement
+/// backend: Mina, whose one asset is a zk-note vault's (ADR 0080).
+impl TryFrom<AssetChain> for SettlementChain {
+    type Error = AssetChain;
+
+    fn try_from(chain: AssetChain) -> Result<SettlementChain, AssetChain> {
         match chain {
-            AssetChain::Evm => SettlementChain::Evm,
-            AssetChain::Solana => SettlementChain::Solana,
+            AssetChain::Evm => Ok(SettlementChain::Evm),
+            AssetChain::Solana => Ok(SettlementChain::Solana),
+            AssetChain::Mina => Err(AssetChain::Mina),
         }
     }
 }
@@ -1157,7 +1162,7 @@ key_file = "{key}"
     #[test]
     fn the_two_chain_enums_translate_both_ways() {
         for chain in [SettlementChain::Evm, SettlementChain::Solana] {
-            assert_eq!(SettlementChain::from(chain.asset_chain()), chain);
+            assert_eq!(SettlementChain::try_from(chain.asset_chain()), Ok(chain));
             // The two spellings are the same word, which is what keeps an
             // `evm:` asset and an `[settlement.evm]` table comparable.
             assert_eq!(chain.asset_chain().as_str(), chain.name());

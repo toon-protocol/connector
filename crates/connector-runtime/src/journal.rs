@@ -168,6 +168,25 @@ fn encode_line(entry: &JournalEntry) -> String {
             channel_id,
             cumulative_amount,
         } => format!("outbound_watermark_set\t{channel_id}\t{cumulative_amount}"),
+        JournalEntry::AllowanceGranted {
+            allowance_id,
+            nullifier,
+            evidence_hash,
+            tier,
+            expires_at_ms,
+            session_key_x,
+            session_key_is_odd,
+            commitment_x,
+            commitment_y,
+        } => format!(
+            "allowance_granted\t{allowance_id}\t{}\t{}\t{tier}\t{expires_at_ms}\t{}\t{}\t{}\t{}",
+            encode_hex(nullifier),
+            encode_hex(evidence_hash),
+            encode_hex(session_key_x),
+            u8::from(*session_key_is_odd),
+            encode_hex(commitment_x),
+            encode_hex(commitment_y),
+        ),
     }
 }
 
@@ -239,6 +258,29 @@ fn decode_line(line: &str) -> Result<JournalEntry, JournalError> {
             Ok(JournalEntry::OutboundWatermarkSet {
                 channel_id: channel_id.to_string(),
                 cumulative_amount: cumulative_amount.parse::<u128>().map_err(|_| corrupt())?,
+            })
+        }
+        ["allowance_granted", allowance_id, nullifier, evidence_hash, tier, expires_at_ms, session_key_x, session_key_is_odd, commitment_x, commitment_y] =>
+        {
+            let bytes32 = |hex: &str| -> Result<[u8; 32], JournalError> {
+                decode_hex(hex)
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    .ok_or_else(corrupt)
+            };
+            Ok(JournalEntry::AllowanceGranted {
+                allowance_id: allowance_id.to_string(),
+                nullifier: bytes32(nullifier)?,
+                evidence_hash: bytes32(evidence_hash)?,
+                tier: parse_u64(tier)?,
+                expires_at_ms: parse_u64(expires_at_ms)?,
+                session_key_x: bytes32(session_key_x)?,
+                session_key_is_odd: match *session_key_is_odd {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(corrupt()),
+                },
+                commitment_x: bytes32(commitment_x)?,
+                commitment_y: bytes32(commitment_y)?,
             })
         }
         _ => Err(corrupt()),
@@ -374,6 +416,17 @@ mod tests {
             JournalEntry::OutboundWatermarkSet {
                 channel_id: "evm:0xef01".to_string(),
                 cumulative_amount: 7,
+            },
+            JournalEntry::AllowanceGranted {
+                allowance_id: "00112233445566778899aabbccddeeff".to_string(),
+                nullifier: [0x01; 32],
+                evidence_hash: [0x02; 32],
+                tier: 100_000_000,
+                expires_at_ms: u64::MAX,
+                session_key_x: [0x03; 32],
+                session_key_is_odd: true,
+                commitment_x: [0x04; 32],
+                commitment_y: [0x05; 32],
             },
         ]
     }
