@@ -476,6 +476,50 @@ pub enum ConfigError {
         chain: &'static str,
     },
 
+    /// A `[[peer_channels]]` or `[[pay_channels]]` row's `network` is not a
+    /// CAIP-2 network on the chain its value is spelled for (ADR 0086
+    /// decision 8).
+    #[error(
+        "'[[{table}]]' for peer '{peer_id}' has network '{value}', which {reason}. A row's \
+         network is the CAIP-2 network of one of this node's settlement tables, such as \
+         'eip155:8453' for [settlement.eip155.8453] (ADR 0086 decision 8)"
+    )]
+    ChannelRowNetworkInvalid {
+        table: &'static str,
+        peer_id: String,
+        value: String,
+        reason: String,
+    },
+
+    /// A channel row's `network` names no `[settlement.eip155.<chainId>]`
+    /// table this node has (ADR 0086 decision 8): a channel on a network this
+    /// node does not settle on could never be admitted or paid on.
+    #[error(
+        "'[[{table}]]' for peer '{peer_id}' has network '{network}', and this node has no \
+         settlement table for that network -- add [settlement.eip155.<chainId>] for it, or name \
+         the network of a table this node has (ADR 0086 decision 8)"
+    )]
+    ChannelRowNetworkUnsettled {
+        table: &'static str,
+        peer_id: String,
+        network: String,
+    },
+
+    /// A `0x` channel row with no `network` on a node holding more than one
+    /// EVM table (ADR 0086 decision 8): which network the channel is on is
+    /// never guessed.
+    #[error(
+        "'[[{table}]]' for peer '{peer_id}' names an EVM channel or signer but no network, and \
+         this node settles on several EVM networks ({networks}): add network = \"<one of \
+         them>\" to the row. A row is never guessed onto one of several networks (ADR 0086 \
+         decision 8)"
+    )]
+    ChannelRowNetworkAmbiguous {
+        table: &'static str,
+        peer_id: String,
+        networks: String,
+    },
+
     #[error(
         "'{value}' is named by two '[[peer_channels]]' rows: one voucher signer, or one inbound \
          channel, proves exactly one peering, and a second row would leave which one to file \

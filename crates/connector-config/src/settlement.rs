@@ -565,9 +565,10 @@ pub(crate) fn check_settlement_rpc_routes(
 /// Solana one. The connector holds a signer rather than a wallet (ADR
 /// 0012), so a node with no table for a chain has no address on it at all,
 /// and can neither admit a voucher nor sign one there.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct SettlementTables {
-    evm: bool,
+    /// Each EVM table's chain id, in table order (ascending).
+    eip155: Vec<u64>,
     solana: bool,
 }
 
@@ -577,9 +578,13 @@ impl SettlementTables {
     /// every channel table is resolved against the same answer.
     pub(crate) fn of(settlements: &[SettlementConfig]) -> Self {
         SettlementTables {
-            evm: settlements
+            eip155: settlements
                 .iter()
-                .any(|settlement| settlement.chain() == SettlementChain::Evm),
+                .filter_map(|settlement| match settlement {
+                    SettlementConfig::Evm(evm) => Some(evm.chain_id()),
+                    SettlementConfig::Solana(_) => None,
+                })
+                .collect(),
             solana: settlements
                 .iter()
                 .any(|settlement| settlement.chain() == SettlementChain::Solana),
@@ -588,10 +593,14 @@ impl SettlementTables {
 
     /// The same answer, stated directly, for a channel-table unit test
     /// that is about the channel row rather than about how a settlement
-    /// table parses. `Config::load` always uses [`Self::of`].
+    /// table parses. `evm` is one table on chain 8453. `Config::load`
+    /// always uses [`Self::of`].
     #[cfg(test)]
     pub(crate) fn for_tests(evm: bool, solana: bool) -> Self {
-        SettlementTables { evm, solana }
+        SettlementTables {
+            eip155: if evm { vec![8453] } else { Vec::new() },
+            solana,
+        }
     }
 
     /// Whether this node pays and is paid on x402 channels on `chain`: it
@@ -601,8 +610,63 @@ impl SettlementTables {
     /// nor sign one on (issue #1380).
     pub(crate) fn x402(&self, chain: SettlementChain) -> bool {
         match chain {
-            SettlementChain::Evm => self.evm,
+            SettlementChain::Evm => !self.eip155.is_empty(),
             SettlementChain::Solana => self.solana,
+        }
+    }
+
+    /// The network a channel row on `chain` is on (ADR 0086 decision 8),
+    /// from what the row wrote: a written network must be on `chain` and
+    /// name a table this node has; an unwritten one on EVM is inferred
+    /// only when there is exactly one EVM table, and refused by name when
+    /// there are several. A Solana row's network is as written -- config
+    /// cannot know the cluster's genesis prefix -- and `None` unwritten.
+    pub(crate) fn row_network(
+        &self,
+        table: &'static str,
+        peer_id: &str,
+        chain: SettlementChain,
+        written: Option<&str>,
+    ) -> Result<Option<Network>, ConfigError> {
+        let Some(written) = written else {
+            return match (chain, self.eip155.as_slice()) {
+                (SettlementChain::Solana, _) | (SettlementChain::Evm, []) => Ok(None),
+                (SettlementChain::Evm, [only]) => Ok(Some(Network::Eip155(*only))),
+                (SettlementChain::Evm, many) => Err(ConfigError::ChannelRowNetworkAmbiguous {
+                    table,
+                    peer_id: peer_id.to_string(),
+                    networks: many
+                        .iter()
+                        .map(|id| format!("eip155:{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                }),
+            };
+        };
+        let invalid = |reason: String| ConfigError::ChannelRowNetworkInvalid {
+            table,
+            peer_id: peer_id.to_string(),
+            value: written.to_string(),
+            reason,
+        };
+        let network = written
+            .parse::<Network>()
+            .map_err(|error| invalid(format!("is not a CAIP-2 network: {error}")))?;
+        if network.chain() != chain.asset_chain() {
+            return Err(invalid(format!(
+                "is not on {}, the chain the row's channel or signer is spelled for",
+                chain.name()
+            )));
+        }
+        match &network {
+            Network::Eip155(id) if !self.eip155.contains(id) => {
+                Err(ConfigError::ChannelRowNetworkUnsettled {
+                    table,
+                    peer_id: peer_id.to_string(),
+                    network: network.to_string(),
+                })
+            }
+            _ => Ok(Some(network)),
         }
     }
 }

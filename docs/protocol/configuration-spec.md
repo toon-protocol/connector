@@ -657,11 +657,12 @@ finding a tombstone, not a live mechanism.
 ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decisions 5
 and 9, [issue #1380](https://github.com/toon-protocol/connector/issues/1380)):
 
-| key               | required | expresses                                                                                                                                                                                                                              |
-| ----------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `peer_id`         | yes      | the `[[peers]]` row this binds                                                                                                                                                                                                         |
-| `voucher_signer`  | yes      | the key that signs the peer's vouchers on the channel it pays this node on: an EVM address (`0x` and 40 hex, the channel's `payerAuthorizer` — the peer's settlement address) or a Solana public key (base58, its `authorized_signer`) |
-| `inbound_channel` | no       | pins the peering to that one x402 channel: an EVM `x402BatchSettlement` channel id (`0x` and 64 hex) or a Solana `payment-channels` channel account (base58). Absent, a voucher by the signer proves the peering on any channel        |
+| key               | required  | expresses                                                                                                                                                                                                                              |
+| ----------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `peer_id`         | yes       | the `[[peers]]` row this binds                                                                                                                                                                                                         |
+| `voucher_signer`  | yes       | the key that signs the peer's vouchers on the channel it pays this node on: an EVM address (`0x` and 40 hex, the channel's `payerAuthorizer` — the peer's settlement address) or a Solana public key (base58, its `authorized_signer`) |
+| `inbound_channel` | no        | pins the peering to that one x402 channel: an EVM `x402BatchSettlement` channel id (`0x` and 64 hex) or a Solana `payment-channels` channel account (base58). Absent, a voucher by the signer proves the peering on any channel        |
+| `network`         | see below | the CAIP-2 network the peer's channel is on, such as `eip155:8453` ([ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision 8)                                                                                 |
 
 An arrival takes the peer role when it carries a voucher — or answers a zero-value claim-state
 challenge — signed by that key, on either carriage; a `toon-channel` claim never decides it. The
@@ -675,11 +676,12 @@ is an x402 channel, resolved from the chain when its voucher presents it.
 `[[pay_channels]]` names the channel this node **pays** a hop from — every PREPARE forwarded to that
 peer carries a covering voucher on it ([ADR 0042](../adr/0042-a-packet-carries-its-claim.md)):
 
-| key                | required | expresses                                                                                                                                     |
-| ------------------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `peer_id`          | yes      | the `[[peers]]` row this covers forwards to                                                                                                   |
-| `outbound_channel` | yes      | an x402 channel **this node opened** toward the peer (`POST /channels`), by channel id (EVM) or channel account (Solana)                      |
-| `client_edge_url`  | yes      | the peer's own `POST /ilp`, where this node arrives as a buyer and where `POST /ilp/claim-state` says where its vouchers on the channel stand |
+| key                | required  | expresses                                                                                                                                     |
+| ------------------ | --------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `peer_id`          | yes       | the `[[peers]]` row this covers forwards to                                                                                                   |
+| `outbound_channel` | yes       | an x402 channel **this node opened** toward the peer (`POST /channels`), by channel id (EVM) or channel account (Solana)                      |
+| `client_edge_url`  | yes       | the peer's own `POST /ilp`, where this node arrives as a buyer and where `POST /ilp/claim-state` says where its vouchers on the channel stand |
+| `network`          | see below | the CAIP-2 network the outbound channel is on, such as `eip155:8453` (ADR 0086 decision 8)                                                    |
 
 The outbound channel MUST be one this node's outbound-channel journal holds, or the node refuses to
 start: a channel it did not open is one it holds no terms for and can sign nothing on. So a
@@ -693,6 +695,12 @@ in x402 channels on that chain at all, and are refused by name without it (CF-36
 The signing key is that chain's settlement key, the EVM table's or `[settlement.solana]`'s, and
 there is no second key to configure (CF-24,
 [ADR 0030](../adr/0030-an-operator-announces-a-node-the-node-still-does-not.md)).
+
+**A row's `network`** names which settlement table its channel is on. On a `0x` row it is REQUIRED
+when the node has more than one `[settlement.eip155.<chainId>]` table, and refused by name when
+absent there; with one EVM table it may be left out, and is that table's. It MUST name a configured
+table, or the row is refused by name. A Solana row may write `solana:<genesis prefix>`. The retired
+`chain_id` key stays refused: it named a `toon-channel` domain, not a network.
 
 **A pay-from row's `client_edge_url`** is where this node asks `POST /ilp/claim-state` where its
 vouchers on the channel stand. The receiver is the authority on its own watermark: a node that lost

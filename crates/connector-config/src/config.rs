@@ -367,7 +367,7 @@ impl Config {
         let settlements = resolve_settlement(raw.settlement)?;
         check_settlement_rpc_routes(&settlements, socks_proxy.as_ref())?;
         let settlement_tables = SettlementTables::of(&settlements);
-        let peer_channels = resolve_peer_channels(raw.peer_channels, settlement_tables)?;
+        let peer_channels = resolve_peer_channels(raw.peer_channels, &settlement_tables)?;
         for peer_route in &peer_routes {
             let Some(peer) = peers.iter().find(|peer| peer.id() == peer_route.peer_id()) else {
                 return Err(ConfigError::UnknownPeerId {
@@ -452,7 +452,7 @@ impl Config {
         let pay_channels = resolve_pay_channels(
             raw.pay_channels,
             peer_allow_plaintext_endpoints,
-            settlement_tables,
+            &settlement_tables,
         )?;
         for pay_channel in &pay_channels {
             // A row for a peering that does not exist pays nobody -- the
@@ -1615,6 +1615,130 @@ client_edge_url = "https://store.example/ilp"
             .expect("write key file");
         let text = edit(peering_config(key_file.path(), state_dir.path(), ""));
         Config::from_toml_str(&text, Path::new("test.toml"))
+    }
+
+    /// [`peering_config`] with a second EVM table, `[settlement.eip155.31338]`,
+    /// naming the **same** key file as the first (ADR 0086 decision 5), and
+    /// `edit` applied to the text.
+    fn load_two_network_peering(edit: impl Fn(String) -> String) -> Result<Config, ConfigError> {
+        load_peering(|text| {
+            let key_file = text
+                .split("key_file = \"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("the fixture names a key file")
+                .to_string();
+            let second = format!(
+                "\n[settlement.eip155.31338]\nrpc_url = \"http://127.0.0.1:8546\"\n\
+                 token_address = \"0x49beE1Bca5d15Fb0963117923403F9498119a9Ce\"\ndecimals = 6\n\
+                 asset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"\n\n\
+                 [settlement.eip155.31338.key]\nkey_file = \"{key_file}\"\n\n[[peers]]"
+            );
+            edit(text.replacen("\n[[peers]]", &second, 1))
+        })
+    }
+
+    /// `network = "<caip-2>"` written onto both channel rows of the fixture.
+    fn rows_on(text: String, network: &str) -> String {
+        text.replace(
+            &format!("voucher_signer = \"{PEER_KEY}\""),
+            &format!("voucher_signer = \"{PEER_KEY}\"\nnetwork = \"{network}\""),
+        )
+        .replace(
+            "client_edge_url = \"https://store.example/ilp\"",
+            &format!("client_edge_url = \"https://store.example/ilp\"\nnetwork = \"{network}\""),
+        )
+    }
+
+    /// ADR 0086 decisions 5 and 8: two EVM tables may name one key file, and
+    /// a channel row names which of them it is on.
+    #[test]
+    fn two_evm_tables_sharing_one_key_file_load_with_each_row_on_its_network() {
+        let config =
+            load_two_network_peering(|text| rows_on(text, "eip155:31338")).expect("load");
+
+        assert_eq!(config.settlements().len(), 2);
+        let on = "eip155:31338".parse::<connector_domain::Network>().unwrap();
+        assert_eq!(config.peer_channels()[0].network(), Some(&on));
+        assert_eq!(config.pay_channels()[0].network(), Some(&on));
+    }
+
+    /// ADR 0086 decision 8: with one EVM table a `0x` row's network is that
+    /// table's, inferred -- and checked when it is written.
+    #[test]
+    fn a_0x_row_on_a_one_table_node_is_on_that_tables_network() {
+        let config = load_peering(|text| text).expect("load");
+        let on = "eip155:31337".parse::<connector_domain::Network>().unwrap();
+        assert_eq!(config.peer_channels()[0].network(), Some(&on));
+        assert_eq!(config.pay_channels()[0].network(), Some(&on));
+
+        let written = load_peering(|text| rows_on(text, "eip155:31337")).expect("load");
+        assert_eq!(written.peer_channels()[0].network(), Some(&on));
+    }
+
+    /// ADR 0086 decision 8: a `0x` row is never guessed onto one of two
+    /// networks -- on either table.
+    #[test]
+    fn a_0x_row_with_no_network_on_a_two_table_node_is_refused_by_name() {
+        let error = load_two_network_peering(|text| text).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::ChannelRowNetworkAmbiguous { table: "peer_channels", peer_id, .. }
+                    if peer_id == "store"
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("eip155:31337") && message.contains("eip155:31338"));
+        assert!(message.contains("network"), "{message}");
+
+        let error = load_two_network_peering(|text| {
+            text.replace(
+                &format!("voucher_signer = \"{PEER_KEY}\""),
+                &format!("voucher_signer = \"{PEER_KEY}\"\nnetwork = \"eip155:31337\""),
+            )
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::ChannelRowNetworkAmbiguous { table: "pay_channels", .. }
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// ADR 0086 decision 8: a row's `network` must name a configured table.
+    #[test]
+    fn a_row_whose_network_names_no_table_is_refused_by_name() {
+        let error = load_peering(|text| rows_on(text, "eip155:8453")).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::ChannelRowNetworkUnsettled { table: "peer_channels", network, .. }
+                    if network == "eip155:8453"
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("eip155:8453"));
+
+        let error = load_peering(|text| rows_on(text, "eip155:base")).unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::ChannelRowNetworkInvalid { .. }),
+            "{error:?}"
+        );
+
+        // A Solana network on an EVM signer's row names no table of that
+        // signer's chain.
+        let error = load_peering(|text| {
+            rows_on(text, "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1")
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::ChannelRowNetworkInvalid { .. }),
+            "{error:?}"
+        );
     }
 
     /// The whole surface round-trips from a real TOML file: the exposure
