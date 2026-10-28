@@ -1,6 +1,6 @@
 # Property tests over a pure core; fakes are allowed, mocks are not
 
-**Status:** Accepted. The crate it names, `connector-core`, shipped as `connector-domain`; the local-disposable-chain section is an in-place amendment, not a separate record.
+**Status:** Accepted, amended by [0084](0084-a-chain-too-heavy-to-spawn-per-test-is-spawned-once-per-test-binary.md) (a chain per test by default, and a shared tier, one chain per test binary, for a chain too heavy for that). The crate it names, `connector-core`, shipped as `connector-domain`; the local-disposable-chain section is an in-place amendment, not a separate record.
 
 **Scope:** connector architecture — internal to this codebase. See the [ADR index](README.md).
 
@@ -73,3 +73,18 @@ run `cargo test`. `crates/connector-settlement-evm/tests/support/mod.rs` is the 
 Deployments to shared testnets remain worthwhile for a different job — giving the running
 devnet nodes something to settle against (`packages/contracts/deployments/base-sepolia.md`).
 That is operating the network, not testing the code, and the two should not be conflated.
+
+## Update (issue #1568)
+
+"A throwaway chain per run" above was always read as a chain per **test**: that is what CLAUDE.md,
+CONTRIBUTING.md and `Anvil::spawn` / `SolanaValidator::spawn` do.
+[ADR 0084](0084-a-chain-too-heavy-to-spawn-per-test-is-spawned-once-per-test-binary.md) says so, and
+adds a second tier. A chain too heavy to spawn per test (more than 10 s to its first usable block, or
+more than 1 GB) may be spawned once per test binary, by the harness itself, with each test isolated
+by fresh accounts and channels.
+
+The four risks listed above are why that is acceptable rather than a retreat from this section. Each
+one is about a chain shared across runs or with other people, and a chain the test binary spawns for
+itself and discards has none of them. The two obligations above still bind the shared tier: its chain
+is pinned (a Docker image by digest), and a missing one fails CI. Deployments to shared testnets are
+still not testing the code (0084 decision 8).

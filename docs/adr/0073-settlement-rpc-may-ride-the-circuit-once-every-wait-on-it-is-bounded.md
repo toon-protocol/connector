@@ -2,6 +2,8 @@
 
 **Status:** Accepted on TOON_Network#167 (2026-09-25), and built together with every item of decision 5's hardening, as this record required. It amends [0070](0070-an-onion-address-is-a-host-not-a-carriage.md) **decision 4**, the settlement half only, and nothing else in that record. Where the build settled a number or a mechanism this record left open, or added a rule, it says so under **Implementation** below. One measurement is still owed: a funded submit and confirm over a circuit (see "What would make this record true").
 
+**Amended by [0086](0086-a-node-settles-on-more-than-one-evm-network.md)** (2026-10-28, #1566, not yet built): decision 3's circuit is pinned per network, not per chain, so two EVM tables never share one.
+
 **Scope:** connector architecture, internal to this codebase. One consequence reaches outside it. TOON Network's spec §10 and its ADR 0008 require a Hidden Provider to "run its own settlement RPC". That rule exists because of decision 4, and accepting this record is what would let TOON Network relax it. This record does not change that repository.
 
 **Falsifier:** `crates/connector-settlement-*/src/lib.rs` matching `Provider::<Http>|NonceManagerMiddleware|RpcClient::new_with_commitment|send_and_confirm_transaction` — this record says every settlement client is built from its table's one `RpcTransport` and every write confirms through the hardened loops; a match is a client or a confirm loop built around them.
