@@ -427,6 +427,27 @@ _Avoid_: co-signature, release, exit signature
 A proof, shown only to the **zk edge**, that the payer owns a zk note's current state. It is what
 a clearance is given against. The vault refuses it.
 
+**Subsidised allowance**:
+An **allowance** whose charge is paid from the **zk edge**'s **subsidy budget** instead of by the
+note that opened it. The note's state still advances, charged nothing.
+_Avoid_: holding credit, free allowance, loyalty reward, anonymity mining
+
+**Subsidy budget**:
+What a **zk edge** chooses to spend, each **subsidy period**, on paying for subsidised allowances.
+It may be zero. It is open while what remains covers the smallest tier, and closed otherwise.
+_Avoid_: treasury, rewards pool, incentive fund
+
+**Subsidy period**:
+The span of time in which each zk note may claim at most one **subsidised allowance**: whole weeks
+counted from the vault's creation, so every note and every zk edge agrees which period it is.
+_Avoid_: epoch, round, claim window
+
+**Per-period nullifier**:
+The value a subsidised request proof publishes so that one zk note claims at most one subsidised
+allowance per **subsidy period**. It cannot be linked to the note, nor to the same note's
+per-period nullifiers in other periods.
+_Avoid_: nullifier (that spends a state), claim ID
+
 **Sponsor**:
 A connector's Solana settlement key, in the seats it takes on a client's x402 `batch-settlement`
 channel: fee payer and `rent_payer` of the `payment-channels` `open`, which it co-signs through the
