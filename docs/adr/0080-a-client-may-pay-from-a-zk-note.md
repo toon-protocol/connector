@@ -1,12 +1,14 @@
 # A client may pay from a zk note
 
-**Status:** Accepted (owner decision, 2026-10-16, #1511). **Spike #1512 answered yes** (2026-10-16, [research note](../research/zk-note-verifier-spike.md)), so the condition is met and the record stands. **Amended 2026-10-28** (owner decision, #1513): decision 7 names the asset and its rate, and the vault holds one asset with no merge or top-up of notes. Nothing is built. It **amends** [0040](0040-a-verified-payment-is-stated-to-the-app.md): the payer is stated only when it is known. It **adds a note to** [0033](0033-the-exposure-machinery-is-retired-not-restated.md): the risk that record retired comes back at a zk edge, under a cap, as the **open budget**. It leaves [0002](0002-drop-mina-from-the-rust-connector.md) and [0065-mina](0065-mina-leaves-the-repository.md) standing, and the sections below explain why. It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): the allowance claim, the allowance request and answer, and the signed successor state all become vectors.
+**Status:** Accepted (owner decision, 2026-10-16, #1511). **Spike #1512 answered yes** (2026-10-16, [research note](../research/zk-note-verifier-spike.md)), so the condition is met and the record stands. **Amended 2026-10-28** (owner decision, #1513): decision 7 names the asset and its rate, and the vault holds one asset with no merge or top-up of notes. **Amended 2026-10-28** (owner decision, #1555): decision 12 makes toon-protocol/zk_toon's `zk-note` crate the definition of every zk-note derivation, and decision 3 gains the checks that crate's request proof leaves to the zk edge. Nothing is built. It **amends** [0040](0040-a-verified-payment-is-stated-to-the-app.md): the payer is stated only when it is known. It **adds a note to** [0033](0033-the-exposure-machinery-is-retired-not-restated.md): the risk that record retired comes back at a zk edge, under a cap, as the **open budget**. It leaves [0002](0002-drop-mina-from-the-rust-connector.md) and [0065-mina](0065-mina-leaves-the-repository.md) standing, and the sections below explain why. It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): the allowance claim, the allowance request and answer, and the signed successor state all become vectors.
 
 **Scope:** protocol law. It adds a claim scheme, a greeting entry and two client-edge endpoints that every implementation of a zk edge must speak. Where the proof is verified and how the journal records it are connector architecture. See the [ADR index](README.md).
 
 **Falsifier:** `**/Cargo.toml` matching `o1js` — the connector verifies proofs and never produces them; proving, collection and challenging stay outside this repository, so an o1js dependency here means the line this record draws has been crossed.
 
 **Falsifier:** `**/package.json` matching `"o1js"` — the same line, crossed from the npm side.
+
+**Falsifier:** `crates/**/*.rs` matching `"toon\.zk\.` — a zk-note domain tag written out in the connector means a derivation was defined here instead of taken from zk_toon (decision 12).
 
 **A connector may accept payment from a zk note, and one that does is a zk edge.** A payer
 deposits once into the zk edge's Mina vault. It then opens an **allowance** with one proof that
@@ -47,6 +49,24 @@ closes, which zkAPI cannot say.
 3. **One proof per allowance, never one per packet.** Admission is cheapest refusal first:
    structure, tier, expiry, the binding tag, a known root, an unseen nullifier (locally and on
    chain), and the proof. Nothing is written until every check has passed.
+   _Amended 2026-10-28 (owner decision, #1555):_ the proof's public inputs are those of zk_toon's
+   request proof: the state key, root, request time, tier, nullifier, authorization tag,
+   re-randomised commitment, subsidised flag, period and per-period nullifier. The tier is the
+   budget `b`. The proof binds the zk edge, the session key and the expiry only through the tag,
+   and it checks the note's expiry only against the request time the payer supplies. So, before
+   the tag, admission also refuses by name:
+   - a state key other than the zk edge's own;
+   - a request time more than 10 minutes behind or 1 minute ahead of the zk edge's clock. The
+     window is a constant, not config, because every wallet has to know it. Without it a payer
+     could backdate a request and spend a note that has already expired;
+   - a subsidised flag, period or per-period nullifier that is set. This refusal stands until
+     subsidised allowances are built.
+
+   The zk edge enters the tag as the x-coordinate of its state public key, which the greeting
+   already publishes. An allowance claim is signed by the session key with the chunked nonce
+   under the devnet domain (`NetworkId::TESTNET`), as the state is. The tiers the table declares
+   must be a subset of the crate's tiers, and a table naming any other tier refuses to boot.
+
 4. **Close is final, and it waits for packets in flight.** An allowance closes on a signed
    request, on expiry, or when it reaches its budget. Closing stops new claims at once. Δ is
    journaled only after every forward already in flight has resolved, which packet expiry bounds.
@@ -98,6 +118,22 @@ closes, which zkAPI cannot say.
     fsynced before the grant. The journal records the evidence's hash, the spent nullifier, the
     allowance terms and watermarks, the Δ written once, and the signed successor. Open allowances
     are restored on restart.
+12. **The derivations are zk_toon's, and the connector pins them.** _Added 2026-10-28 (owner
+    decision, #1555)._ Every value that a payer, the vault's proof program, the challenger and a
+    zk edge must agree on is defined by the `zk-note` crate in
+    [toon-protocol/zk_toon](https://github.com/toon-protocol/zk_toon), next to the proof program
+    that checks it. That covers the domain tags, the note commitment and leaf, the anchors, the
+    nullifier, the authorization tag, the per-period nullifier, the balance commitment's
+    generators and the state message. The evidence file's format is zk_toon's too, because its
+    challenger is the reader. The connector depends on that crate pinned by git commit and
+    defines none of these values itself. The crate's `test-vectors/zk-note.json`, at the pinned
+    commit, is the parity contract. A derivation changes only in zk_toon. A pin bump is a
+    reviewed change in this repository that replays those vectors, and a bump that changes a
+    derivation breaks every note in a vault. The connector's own wire stays here, in
+    `vectors/wire-vectors.json` ([0021](0021-vectors-are-normative-prose-is-not.md)), with its
+    values computed through the pinned crate: the allowance claim and its signed bytes, the
+    allowance request and answer, and the signed successor. The crate and the verifier share one
+    `proof-systems` source, the one the live Mina daemon pins. For Mesa that is tag `0.7.0`.
 
 ## Why this does not undo 0002 or 0065-mina
 
@@ -132,6 +168,13 @@ challenger all live outside this repository. The rule "do not reintroduce an o1j
   the damage.
 - **Proof evidence in the journal.** Rejected: proofs are tens of KB and are evidence, not money
   state. The journal keeps a hash of each one.
+- **The connector's own primitives crate** (#1521). Rejected (2026-10-28, #1555): it was built
+  at the same time as zk_toon's and disagrees with it on every derivation. The vault's proof
+  program is written against zk_toon's, so a zk edge built on the connector's would refuse every
+  real allowance at the tag, and the vault would refuse its successors.
+- **Merging the two crates into one, in one place.** Rejected (2026-10-28, #1555): the proof
+  program, the challenger and the wallet already build on zk_toon's crate, and a zk edge only
+  checks against them.
 - **Merging notes.** Rejected (2026-10-28): one proof spending two states needs somewhere to record
   the result. On chain, the vault cannot see the nullifiers a zk edge journaled off chain, so a
   merged leaf would have to wait out a challenge window like an escape. At the zk edge, the merge
@@ -175,5 +218,9 @@ challenger all live outside this repository. The rule "do not reintroduce an o1j
   the allowance exchange and the successor; the asset is stated in the greeting.
 - A connector without the zk-note table refuses `scheme: "zk-note"` like any unknown scheme, and
   behaves exactly as before.
-- Built in two issues, unblocked by #1512 (answered yes): the primitives, gate, journal, config, greeting and
-  vectors over an in-memory vault, then the Mina adapter run against committed fixtures.
+- Built in two issues, unblocked by #1512 (answered yes): the gate, journal, config, greeting and
+  vectors over an in-memory vault, on zk_toon's primitives, then the Mina adapter run against
+  committed fixtures. The first also reduces `connector-zk-note` (#1521) to a boundary that
+  re-exports zk_toon's crate and keeps only the session-key signature check and tier validation.
+  Subsidised allowances (zk_toon's ADR 0001) are a third piece of work: they wait for zk_toon's
+  subsidised request proof, and until it lands admission refuses them.
