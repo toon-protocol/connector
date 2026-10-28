@@ -19,7 +19,10 @@ fn edge(dir: &std::path::Path, vault: Arc<InMemoryZkNoteVault>, clock: Arc<dyn C
     ZkEdge {
         vault,
         evidence: EvidenceFile::open(&dir.join("evidence.bin")).unwrap(),
-        state_keypair: keypair(500),
+        state_signer: connector_signer::ZkStateSigner::from_base58(
+            &SecKey::new(Scalar::from(500u64)).to_base58(),
+        )
+        .unwrap(),
         tiers: Tiers::new([TIERS[1]]).unwrap(),
         allowance_lifetime: Duration::from_secs(3600),
         open_budget_cap: TIERS[1],

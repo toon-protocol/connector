@@ -20,7 +20,8 @@ use connector_zk_note::session::{
     allowance_claim_fields, allowance_close_fields, sign_allowance_claim, sign_allowance_close,
     signature_to_hex,
 };
-use connector_zk_note::successor::successor;
+use connector_signer::ZkStateSigner;
+use connector_zk_note::successor::successor_state;
 use connector_zk_note::{scalar_to_string, Field, Keypair, Scalar, SecKey, Signature};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -71,9 +72,10 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
     const CHARGE: u64 = 250_000;
 
     let session = keypair(SESSION_SECRET);
-    let state = keypair(STATE_SECRET);
+    let state = ZkStateSigner::from_base58(&SecKey::new(Scalar::from(STATE_SECRET)).to_base58())
+        .expect("a fixture state key");
     let session_key = session.public.into_compressed();
-    let state_key = state.public.into_compressed();
+    let state_key = state.public_key();
     let tier = TIERS[1];
     let nullifier = Field::from(0x6e75_6c6c_6966_6965u64);
     let commitment = commit(Scalar::from(BALANCE), Scalar::from(BLINDING));
@@ -147,14 +149,15 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
         "signature": signature_json(&close_signature),
     });
 
-    let next = successor(&state, commitment, nullifier, CHARGE).expect("a signable successor");
+    let next =
+        successor_state(&state_key, commitment, nullifier, CHARGE).expect("a signable successor");
     let signed = SignedSuccessor {
         allowance_id,
         charge: CHARGE,
         state_key: state_key.clone(),
         commitment: next.commitment,
         anchor: next.anchor,
-        signature: next.signature.clone(),
+        signature: state.sign(&next.message),
     };
     let successor = json!({
         "path": format!("{ZK_NOTE_ALLOWANCES_PATH}/{allowance_id}/successor"),
@@ -165,7 +168,7 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
         },
         "charge": CHARGE.to_string(),
         "signed_fields": fields_json(&next.message.to_fields()),
-        "signature": signature_json(&next.signature),
+        "signature": signature_json(&signed.signature),
         "answer": { "status": 200, "body": successor_json(&signed) },
         "pending": {
             "status": 202,

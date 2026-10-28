@@ -1701,7 +1701,7 @@ fn zk_note_terms(
         asset: ZK_NOTE_ASSET.to_string(),
         pay_to: zk_note.vault().to_string(),
         verification_key_hash: zk_note.verification_key_hash().to_string(),
-        state_key: state_key.public.into_address(),
+        state_key: state_key.public_key().into_address(),
         tiers: zk_note
             .tiers()
             .as_slice()
@@ -1718,23 +1718,29 @@ fn zk_note_terms(
 /// CAIP-19 `mina:<network>/slip44:12586`.
 const ZK_NOTE_ASSET: &str = "slip44:12586";
 
-/// The zk edge's state key, from `[zk_note] state_key_file`.
+/// The zk edge's state key, from `[zk_note] state_key_file`: read and held
+/// by `connector-signer`, which alone may (coding-standards.md, "One crate
+/// owns key material").
 fn read_zk_note_state_key(
     location: &connector_config::SecretLocation,
-) -> Result<connector_zk_note::Keypair, RuntimeError> {
+) -> Result<connector_signer::ZkStateSigner, RuntimeError> {
     let connector_config::SecretLocation::File(path) = location else {
         return Err(RuntimeError::ZkNoteStateKey {
             path: PathBuf::new(),
             reason: "a KMS-held state key is not supported".to_string(),
         });
     };
-    let unusable = |reason: String| RuntimeError::ZkNoteStateKey {
-        path: path.clone(),
-        reason,
-    };
-    let text = std::fs::read_to_string(path).map_err(|error| unusable(error.to_string()))?;
-    connector_zk_note::state_keypair_from_text(&text)
-        .ok_or_else(|| unusable("not a base58 Mina secret key".to_string()))
+    connector_signer::ZkStateSigner::from_key_file(path).map_err(|error| {
+        RuntimeError::ZkNoteStateKey {
+            path: path.clone(),
+            reason: match error {
+                connector_signer::ZkStateKeyError::Unreadable { source, .. } => source.to_string(),
+                connector_signer::ZkStateKeyError::NotAMinaKey { .. } => {
+                    "not a base58 Mina secret key".to_string()
+                }
+            },
+        }
+    })
 }
 
 /// Merge the client edge and (if `[operator]` is configured) the operator

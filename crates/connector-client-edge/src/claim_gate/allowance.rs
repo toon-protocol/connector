@@ -35,8 +35,9 @@
 //! charge Δ is read only once nothing can move the watermark again. Then,
 //! each durable before the next: Δ is journaled
 //! ([`JournalEntry::AllowanceClosed`], once), the close record goes to the
-//! evidence file, and the successor -- zk_toon's `charge`, `next_anchor`
-//! and `sign_state` -- is signed and journaled
+//! evidence file, and the successor -- zk_toon's `charge` and
+//! `next_anchor` -- is signed by the state key, which only
+//! `connector-signer`'s [`ZkStateSigner`] holds, and journaled
 //! ([`JournalEntry::AllowanceSuccessorSigned`]). A successor fetch only
 //! reads what that left.
 //!
@@ -56,15 +57,16 @@ use connector_zk_note::request::{expected_tag, RequestProof};
 use connector_zk_note::session::{
     signature_from_be_bytes, verify_allowance_claim, verify_allowance_close,
 };
-use connector_zk_note::successor::successor;
+use connector_zk_note::successor::successor_state;
 use connector_zk_note::tiers::Tiers;
 use connector_zk_note::{
     commitment_from_le_bytes, decompress, field_from_le_bytes, field_to_le_bytes,
-    scalar_from_le_bytes, scalar_to_le_bytes, Commitment, CompressedPubKey, Field, Keypair,
-    Signature,
+    scalar_from_le_bytes, scalar_to_le_bytes, Commitment, CompressedPubKey, Field, Signature,
 };
 
 use super::*;
+use connector_signer::ZkStateSigner;
+
 use crate::evidence_file::EvidenceFile;
 use crate::zk_note::ZkNoteVault;
 
@@ -73,10 +75,10 @@ use crate::zk_note::ZkNoteVault;
 pub struct ZkEdge {
     pub vault: Arc<dyn ZkNoteVault>,
     pub evidence: EvidenceFile,
-    /// The key this edge signs successor states with. A request proof must
-    /// be about its public half, whose x is the `edge` the binding tag is
-    /// computed with.
-    pub state_keypair: Keypair,
+    /// The key this edge signs successor states with, held by
+    /// `connector-signer`. A request proof must be about its public half,
+    /// whose x is the `edge` the binding tag is computed with.
+    pub state_signer: ZkStateSigner,
     pub tiers: Tiers,
     pub allowance_lifetime: Duration,
     /// The most the budgets of all open allowances may sum to.
@@ -188,10 +190,10 @@ pub struct ZkEdgeRestoreError {
 }
 
 impl ZkEdge {
-    /// The public half of [`Self::state_keypair`]: what the greeting
+    /// The public half of [`Self::state_signer`]: what the greeting
     /// publishes and every request proof must be about.
     pub fn state_key(&self) -> CompressedPubKey {
-        self.state_keypair.public.into_compressed()
+        self.state_signer.public_key()
     }
 }
 
@@ -1031,8 +1033,8 @@ impl ZkParts {
             }
         }
 
-        let Some(next) = successor(
-            &self.edge.state_keypair,
+        let Some(next) = successor_state(
+            &self.edge.state_key(),
             allowance.commitment,
             allowance.nullifier,
             charge,
@@ -1040,6 +1042,7 @@ impl ZkParts {
             tracing::error!(allowance = %id, "a zk-note successor charges to no point; not signed");
             return;
         };
+        let signature = self.edge.state_signer.sign(&next.message);
         if let Err(error) = self
             .journal
             .append(&JournalEntry::AllowanceSuccessorSigned {
@@ -1047,8 +1050,8 @@ impl ZkParts {
                 commitment_x: field_to_le_bytes(next.commitment.x),
                 commitment_y: field_to_le_bytes(next.commitment.y),
                 anchor: field_to_le_bytes(next.anchor),
-                signature_rx: field_to_le_bytes(next.signature.rx),
-                signature_s: scalar_to_le_bytes(next.signature.s),
+                signature_rx: field_to_le_bytes(signature.rx),
+                signature_s: scalar_to_le_bytes(signature.s),
             })
         {
             tracing::error!(
@@ -1063,7 +1066,7 @@ impl ZkParts {
                 charge,
                 commitment: next.commitment,
                 anchor: next.anchor,
-                signature: next.signature,
+                signature,
             }),
         );
         tracing::info!(allowance = %id, "signed a zk-note successor");

@@ -549,7 +549,7 @@ fn the_committed_zk_note_vectors_replay_against_the_real_implementation() {
         allowance_claim_fields, signature_from_be_bytes, verify_allowance_claim,
         verify_allowance_close,
     };
-    use connector_zk_note::successor::successor;
+    use connector_zk_note::successor::successor_state;
     use connector_zk_note::{
         commitment_from_le_bytes, field_to_le_bytes, scalar_to_string, CompressedPubKey, Field,
         Keypair, Scalar, SecKey,
@@ -587,7 +587,7 @@ fn the_committed_zk_note_vectors_replay_against_the_real_implementation() {
     let state_secret = SecKey::new(Scalar::from(
         text(&zk["keys"]["state_secret"]).parse::<u64>().unwrap(),
     ));
-    let state = Keypair::try_from(state_secret).expect("a keypair");
+    let state = Keypair::try_from(state_secret.clone()).expect("a keypair");
     assert_eq!(
         state.public.into_compressed().into_address(),
         text(&zk["keys"]["state_key"])
@@ -673,14 +673,18 @@ fn the_committed_zk_note_vectors_replay_against_the_real_implementation() {
         charge, claim.cumulative_amount,
         "the charge is the final watermark"
     );
-    let derived = successor(&state, commitment, public.nullifier, charge).expect("signable");
+    let derived = successor_state(&state.public.into_compressed(), commitment, public.nullifier, charge)
+        .expect("signable");
+    let state_signer = connector_signer::ZkStateSigner::from_base58(&state_secret.to_base58())
+        .expect("the fixture state key");
+    let derived_signature = state_signer.sign(&derived.message);
     assert_eq!(
         text(&next["signature"]["r"]),
-        field_to_string(derived.signature.rx)
+        field_to_string(derived_signature.rx)
     );
     assert_eq!(
         text(&next["signature"]["s"]),
-        scalar_to_string(derived.signature.s)
+        scalar_to_string(derived_signature.s)
     );
     let fields: Vec<String> = derived
         .message
@@ -690,7 +694,7 @@ fn the_committed_zk_note_vectors_replay_against_the_real_implementation() {
         .collect();
     assert_eq!(serde_json::to_value(fields).unwrap(), next["signed_fields"]);
     assert!(verify_state(
-        &derived.signature,
+        &derived_signature,
         &state.public,
         &derived.message
     ));

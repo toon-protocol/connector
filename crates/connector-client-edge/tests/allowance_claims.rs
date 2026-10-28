@@ -18,6 +18,7 @@ use connector_client_edge::{
 use connector_domain::client_claim::{AllowanceId, ClientEdgeClaim};
 use connector_domain::JournalEntry;
 use connector_runtime::{Clock, FileJournal, Journal, TestClock};
+use connector_signer::ZkStateSigner;
 use connector_zk_note::evidence::{evidence_hash, scan, Record};
 use connector_zk_note::note::balance::{commit, Commitment};
 use connector_zk_note::note::policy::TIERS;
@@ -36,6 +37,12 @@ const NOTE_BALANCE: u64 = 5_000_000_000;
 
 fn keypair(seed: u64) -> Keypair {
     Keypair::try_from(SecKey::new(Scalar::from(seed))).expect("a keypair")
+}
+
+/// The zk edge's state key as the node holds it: `connector-signer`'s,
+/// read from the text of a key file.
+fn state_signer(seed: u64) -> ZkStateSigner {
+    ZkStateSigner::from_base58(&SecKey::new(Scalar::from(seed)).to_base58()).expect("a state key")
 }
 
 /// The zk edge under test: its state key, its clock, its vault, and the
@@ -88,7 +95,7 @@ impl Edge {
                 vault: Arc::clone(&self.vault) as Arc<dyn ZkNoteVault>,
                 evidence: EvidenceFile::open(&self.dir.path().join(EVIDENCE_FILE))
                     .expect("evidence"),
-                state_keypair: self.state.clone(),
+                state_signer: state_signer(1_000),
                 tiers: Tiers::new([TIERS[0], TIERS[1]]).expect("tiers"),
                 allowance_lifetime: std::time::Duration::from_millis(HOUR_MS),
                 open_budget_cap: self.cap,
