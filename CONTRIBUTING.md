@@ -54,7 +54,7 @@ After reading the documentation above:
 - **Node.js** >= 22.11.0
 - **npm** 10.x or higher
 - **Git** 2.x
-- **Docker** - Docker Desktop or Docker Engine. Needed for `local/` (the shipped image against real containerised chains) and for the `docker-compose.yml` chain profiles. The Rust test gate does **not** need it: every chain-backed test spawns its own `anvil` or `solana-test-validator` and throws it away.
+- **Docker** - Docker Desktop or Docker Engine. Needed for `local/` (the shipped image against real containerised chains) and for the `docker-compose.yml` chain profiles. The Rust test gate does **not** need it yet: every chain-backed test spawns its own `anvil` or `solana-test-validator` and throws it away. Once a chain that ships only as a Docker image is admitted to the shared tier ([ADR 0084](docs/adr/0084-a-chain-too-heavy-to-spawn-per-test-is-spawned-once-per-test-binary.md)), the gate needs Docker for that chain.
 - **Familiarity** with TypeScript and Interledger Protocol basics
 
 ### Initial Setup
@@ -408,6 +408,13 @@ program left the repository outright in #1386. Nothing under `crates/`
 dials `localhost:8545` or `localhost:8899`, so running `make anvil-up` or `make solana-up` before
 `cargo test` changes nothing. The Docker chain profiles exist for running a node by hand, and for
 `local/` — not for the test gate.
+
+**A chain too heavy for that is spawned once per test binary** ([ADR
+0084](docs/adr/0084-a-chain-too-heavy-to-spawn-per-test-is-spawned-once-per-test-binary.md)). A
+chain that takes more than 10 s to its first usable block, or more than 1 GB, on the gate's runner
+may be spawned lazily by the harness, once for the whole binary, with every test on fresh accounts
+and its own channels. It is still spawned by `cargo test`, never by hand, and a missing binary or
+image still fails CI. No chain uses this tier yet.
 
 ### What the workspace gate does not cover
 
