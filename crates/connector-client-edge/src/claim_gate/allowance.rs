@@ -32,7 +32,10 @@
 //!
 //! **Closing an allowance** (decision 4, #1523) happens on its session
 //! key's signed request, at its expiry (the sweep), or when a claim reaches
-//! its budget, and stops new claims at once. Every packet admitted on an
+//! its budget, and stops new claims at once. Its start is journaled then
+//! ([`JournalEntry::AllowanceClosing`]), before a signed close is answered,
+//! so a close is final: a restart brings the allowance back closing, and
+//! the boot sweep finishes it. Every packet admitted on an
 //! allowance is counted in flight from before its watermark moves until the
 //! carriage drops its [`InFlightForward`] -- after any rollback -- so the
 //! charge Δ is read only once nothing can move the watermark again. Then,
@@ -236,6 +239,11 @@ struct Allowance {
     /// The proof's re-randomised commitment, which the successor charges.
     commitment: Commitment,
     state: AllowanceState,
+    /// Whether the close's start is journaled
+    /// ([`JournalEntry::AllowanceClosing`]): once it is, a restart brings
+    /// the allowance back closing. A close whose entry could not be written
+    /// is retried by the sweep.
+    closing_journaled: bool,
     /// Packets admitted on this allowance and not yet resolved: each is an
     /// [`InFlightForward`] somebody holds.
     in_flight: usize,
@@ -295,9 +303,22 @@ impl ZkLedger {
                             commitment: commitment_from_le_bytes(commitment_x, commitment_y)
                                 .ok_or_else(corrupt)?,
                             state: AllowanceState::Open,
+                            closing_journaled: false,
                             in_flight: 0,
                         },
                     );
+                }
+                JournalEntry::AllowanceClosing { allowance_id } => {
+                    let corrupt =
+                        || JournalError::Corrupt(format!("allowance_closing {allowance_id}"));
+                    let allowance = ledger.replayed(allowance_id).ok_or_else(corrupt)?;
+                    if allowance.state != AllowanceState::Open {
+                        // A close starts once; a second is a journal this
+                        // build did not write.
+                        return Err(corrupt());
+                    }
+                    allowance.state = AllowanceState::Closing;
+                    allowance.closing_journaled = true;
                 }
                 JournalEntry::AllowanceClosed {
                     allowance_id,
@@ -306,9 +327,9 @@ impl ZkLedger {
                     let corrupt =
                         || JournalError::Corrupt(format!("allowance_closed {allowance_id}"));
                     let allowance = ledger.replayed(allowance_id).ok_or_else(corrupt)?;
-                    if allowance.state != AllowanceState::Open {
-                        // Δ is written once; a second is a journal this
-                        // build did not write.
+                    if allowance.state != AllowanceState::Closing {
+                        // Δ is written once, after the close's start; any
+                        // other order is a journal this build did not write.
                         return Err(corrupt());
                     }
                     allowance.state = AllowanceState::Charged { charge: *charge };
@@ -586,6 +607,7 @@ impl ClientClaimGate {
                     nullifier: public.nullifier,
                     commitment: public.commitment,
                     state: AllowanceState::Open,
+                    closing_journaled: false,
                     in_flight: 0,
                 },
             );
@@ -692,8 +714,10 @@ impl ClientClaimGate {
         drop(watermarks);
         tracing::debug!(allowance = %key, cumulative = amount, "accepted an allowance claim");
         if amount == u128::from(tier) {
-            // Decision 4: an allowance closes when it reaches its budget.
-            self.begin_close(claim.allowance_id);
+            // Decision 4: an allowance closes when it reaches its budget. A
+            // close start that cannot be journaled is retried by the sweep;
+            // the claim that reached the budget is good either way.
+            let _ = self.begin_close(claim.allowance_id);
         }
         Ok((ticket, in_flight))
     }
@@ -716,21 +740,19 @@ impl ClientClaimGate {
         })
     }
 
-    /// Stop `id` taking claims; charge it now if nothing is in flight.
-    fn begin_close(&self, id: AllowanceId) {
+    /// Stop `id` taking claims, durably, and charge it now if nothing is in
+    /// flight.
+    ///
+    /// # Errors
+    /// [`JournalError`] when the close's start could not be journaled. The
+    /// allowance takes no claims regardless; the sweep retries the entry.
+    fn begin_close(&self, id: AllowanceId) -> Result<(), JournalError> {
         let Some(parts) = self.zk_parts() else {
-            return;
+            return Ok(());
         };
-        {
-            let mut ledger = parts.ledger.lock().expect("zk ledger lock poisoned");
-            if let Some(allowance) = ledger.allowances.get_mut(&id) {
-                if allowance.state == AllowanceState::Open {
-                    allowance.state = AllowanceState::Closing;
-                    tracing::info!(allowance = %id, "closing a zk-note allowance");
-                }
-            }
-        }
+        parts.start_close(id)?;
         parts.finish(id);
+        Ok(())
     }
 
     /// Close an allowance on its session key's signed request (ADR 0080
@@ -762,7 +784,8 @@ impl ClientClaimGate {
         if !signed {
             return Err(AllowanceCloseRefusal::SignatureInvalid);
         }
-        self.begin_close(close.allowance_id);
+        self.begin_close(close.allowance_id)
+            .map_err(|_| AllowanceCloseRefusal::NotDurable)?;
         self.successor(close.allowance_id)
     }
 
@@ -809,23 +832,27 @@ impl ClientClaimGate {
         };
         let now = now_ms(parts.edge.clock.as_ref());
         let due: Vec<AllowanceId> = {
-            let mut ledger = parts.ledger.lock().expect("zk ledger lock poisoned");
+            let ledger = parts.ledger.lock().expect("zk ledger lock poisoned");
             ledger
                 .allowances
-                .iter_mut()
-                .filter_map(|(id, allowance)| {
-                    if allowance.state == AllowanceState::Open && now >= allowance.expires_at_ms {
-                        allowance.state = AllowanceState::Closing;
-                        tracing::info!(allowance = %id, "closing an expired zk-note allowance");
+                .iter()
+                .filter(|(_, allowance)| match allowance.state {
+                    AllowanceState::Open => now >= allowance.expires_at_ms,
+                    AllowanceState::Closing => {
+                        !allowance.closing_journaled || allowance.in_flight == 0
                     }
-                    let unfinished = matches!(allowance.state, AllowanceState::Charged { .. })
-                        || (allowance.state == AllowanceState::Closing && allowance.in_flight == 0);
-                    unfinished.then_some(*id)
+                    AllowanceState::Charged { .. } => true,
+                    AllowanceState::Signed(_) => false,
                 })
+                .map(|(id, _)| *id)
                 .collect()
         };
         for id in due {
-            parts.finish(id);
+            // A start that cannot be journaled is logged, and retried on the
+            // next sweep.
+            if parts.start_close(id).is_ok() {
+                parts.finish(id);
+            }
         }
     }
 
@@ -861,6 +888,11 @@ pub enum AllowanceCloseRefusal {
     UnknownAllowance,
     #[error("refused: the close is not signed by the allowance's session key")]
     SignatureInvalid,
+    #[error(
+        "refused: this zk edge could not durably record the close; the allowance takes no \
+         more claims -- retry the close"
+    )]
+    NotDurable,
 }
 
 impl AllowanceCloseRefusal {
@@ -870,6 +902,7 @@ impl AllowanceCloseRefusal {
             AllowanceCloseRefusal::NotAZkEdge => "zk_note_not_offered",
             AllowanceCloseRefusal::UnknownAllowance => "unknown_allowance",
             AllowanceCloseRefusal::SignatureInvalid => "signature_invalid",
+            AllowanceCloseRefusal::NotDurable => "not_durable",
         }
     }
 }
@@ -963,6 +996,52 @@ struct ZkParts {
 }
 
 impl ZkParts {
+    /// Stop `id` taking claims at once (decision 4), and journal that it
+    /// has, so a restart brings it back closing. A no-op for an allowance
+    /// already closing with its start journaled, or past closing.
+    ///
+    /// # Errors
+    /// [`JournalError`] when the entry could not be written; the allowance
+    /// still takes no claims, and the sweep retries the entry.
+    fn start_close(&self, id: AllowanceId) -> Result<(), JournalError> {
+        // Under the close lock, so the start is journaled once.
+        let _closing = self.closing.lock().expect("zk close lock poisoned");
+        let unjournaled = {
+            let mut ledger = self.ledger.lock().expect("zk ledger lock poisoned");
+            let Some(allowance) = ledger.allowances.get_mut(&id) else {
+                return Ok(());
+            };
+            if allowance.state == AllowanceState::Open {
+                allowance.state = AllowanceState::Closing;
+                tracing::info!(allowance = %id, "closing a zk-note allowance");
+            }
+            allowance.state == AllowanceState::Closing && !allowance.closing_journaled
+        };
+        if !unjournaled {
+            return Ok(());
+        }
+        self.journal
+            .append(&JournalEntry::AllowanceClosing {
+                allowance_id: id.to_string(),
+            })
+            .inspect_err(|error| {
+                tracing::error!(
+                    allowance = %id, %error,
+                    "a zk-note allowance's close could not be journaled; the sweep retries"
+                );
+            })?;
+        if let Some(allowance) = self
+            .ledger
+            .lock()
+            .expect("zk ledger lock poisoned")
+            .allowances
+            .get_mut(&id)
+        {
+            allowance.closing_journaled = true;
+        }
+        Ok(())
+    }
+
     /// Finish `id`'s close as far as it will go: charge a closing one with
     /// nothing in flight, then sign the successor of a charged one. Each
     /// step is durable before the next (decision 11): Δ is journaled, then
@@ -982,7 +1061,9 @@ impl ZkParts {
             return;
         };
         let charge = match allowance.state {
-            AllowanceState::Closing if allowance.in_flight == 0 => {
+            // Charged only once its start is journaled: a restart must find
+            // it closing before it can find it charged.
+            AllowanceState::Closing if allowance.in_flight == 0 && allowance.closing_journaled => {
                 // Nothing in flight and nothing admitted: the watermark is
                 // final.
                 let watermark = self

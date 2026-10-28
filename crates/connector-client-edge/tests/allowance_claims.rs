@@ -1146,6 +1146,97 @@ async fn the_boot_sweep_closes_what_expired_while_the_node_was_down() {
     assert_eq!(edge.charges(), vec![(expiring.to_string(), 700)]);
 }
 
+/// ADR 0080 decision 4: a close is final. A node that stops after closing
+/// an allowance -- on its session key's request, on reaching its budget, or
+/// at its expiry -- but before its forwards in flight resolved, boots with
+/// it closing, refuses its claims, and finishes the close in the boot
+/// sweep: Δ written, the successor signed.
+#[tokio::test]
+async fn a_close_survives_a_restart_and_the_boot_sweep_finishes_it() {
+    let edge = Edge::new();
+    let by_request = Payer::new(&edge, 43).provable(&edge);
+    let by_budget = Payer::new(&edge, 44).provable(&edge);
+    let by_expiry = Payer {
+        expires_at_ms: edge.now_ms() + 1_000,
+        ..Payer::new(&edge, 45)
+    }
+    .provable(&edge);
+    let (requested, budgeted, expired) = {
+        let gate = edge.gate();
+        let requested = grant(&gate, &by_request).await.allowance_id;
+        let budgeted = grant(&gate, &by_budget).await.allowance_id;
+        let expired = grant(&gate, &by_expiry).await.allowance_id;
+        let (_, a) = gate
+            .ingest_forward(&by_request.claim(requested, 300), 100)
+            .await
+            .unwrap();
+        let (_, b) = gate
+            .ingest_forward(&by_budget.claim(budgeted, TIERS[1]), 100)
+            .await
+            .unwrap();
+        let (_, c) = gate
+            .ingest_forward(&by_expiry.claim(expired, 200), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            gate.close_allowance(by_request.close(requested)),
+            Ok(SuccessorStatus::Pending)
+        );
+        edge.advance_ms(1_000);
+        gate.sweep_allowances();
+        // The node stops with all three forwards still in flight.
+        std::mem::forget((a, b, c));
+        assert!(edge.charges().is_empty());
+        (requested, budgeted, expired)
+    };
+    let gate = edge.gate();
+    by_request.check(&edge, &signed(gate.successor(requested).unwrap()), 300);
+    by_budget.check(&edge, &signed(gate.successor(budgeted).unwrap()), TIERS[1]);
+    by_expiry.check(&edge, &signed(gate.successor(expired).unwrap()), 200);
+    assert_eq!(
+        gate.ingest(&by_request.claim(requested, 400), 100)
+            .await
+            .unwrap_err(),
+        ClaimIngestRejection::AllowanceClosed
+    );
+    let mut charges = edge.charges();
+    charges.sort();
+    let mut expected = vec![
+        (requested.to_string(), 300),
+        (budgeted.to_string(), TIERS[1]),
+        (expired.to_string(), 200),
+    ];
+    expected.sort();
+    assert_eq!(charges, expected);
+}
+
+/// A signed close the journal refuses is refused as not durable -- the
+/// payer retries -- but the allowance takes no more claims meanwhile.
+#[tokio::test]
+async fn a_close_the_journal_refuses_is_not_durable_and_still_stops_claims() {
+    use std::sync::atomic::Ordering;
+    let edge = Edge::new();
+    let disk = Arc::new(FullDisk {
+        inner: edge.journal(),
+        failures: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let gate = edge.gate_over(Arc::clone(&disk) as Arc<dyn Journal>);
+    let payer = Payer::new(&edge, 47).provable(&edge);
+    let id = grant(&gate, &payer).await.allowance_id;
+    gate.ingest(&payer.claim(id, 100), 100).await.unwrap();
+
+    disk.failures.store(1, Ordering::SeqCst);
+    assert_eq!(
+        gate.close_allowance(payer.close(id)),
+        Err(AllowanceCloseRefusal::NotDurable)
+    );
+    assert_eq!(
+        gate.ingest(&payer.claim(id, 200), 100).await.unwrap_err(),
+        ClaimIngestRejection::AllowanceClosed
+    );
+    payer.check(&edge, &signed(gate.close_allowance(payer.close(id)).unwrap()), 100);
+}
+
 #[tokio::test]
 async fn a_closed_allowance_no_longer_counts_against_the_open_budget() {
     let edge = Edge::with_cap(TIERS[1]);

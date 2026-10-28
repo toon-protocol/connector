@@ -222,6 +222,7 @@ fn close_refused(refusal: AllowanceCloseRefusal) -> Response {
             StatusCode::NOT_FOUND
         }
         AllowanceCloseRefusal::SignatureInvalid => StatusCode::UNPROCESSABLE_ENTITY,
+        AllowanceCloseRefusal::NotDurable => StatusCode::SERVICE_UNAVAILABLE,
     };
     refusal_body(status, refusal.name(), refusal.to_string())
 }
