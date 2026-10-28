@@ -107,8 +107,8 @@ pub use batch_settlement::{
 pub use channels::{ChannelLookupFailed, ChannelResolutionError, ChannelTerminal};
 pub use claim_gate::{
     AllowanceClose, AllowanceCloseRefusal, AllowanceGrant, AllowanceRefusal, AllowanceRequest,
-    ClaimIngestRejection, ClientClaimGate, InFlightForward, SignedSuccessor, SuccessorStatus,
-    ZkEdge, ZkEdgeRestoreError,
+    ClaimIngestRejection, ClientClaimGate, InFlightForward, NotAZkEdge, SignedSuccessor,
+    SuccessorStatus, ZkEdge, ZkEdgeRestoreError,
 };
 pub use evidence_file::{EvidenceFile, EvidenceFileError, EVIDENCE_FILE};
 pub use lookup_budget::{
@@ -1036,7 +1036,7 @@ async fn extract_and_validate_claim(
         state.wrap_receiver_secret.as_ref(),
     )?;
     let (claim, in_flight) = state.claim_gate.ingest_forward(&claim_json, charge).await?;
-    let channel_key = claim.channel_key();
+    let channel_key = claim.claim_key();
     // An allowance claim has no signer to declare: who pays is what the
     // proof hides (ADR 0080).
     let plaintext_signer = claim

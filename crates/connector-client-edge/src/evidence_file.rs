@@ -332,7 +332,11 @@ mod tests {
     /// The evidence file at `path`, as `EvidenceFile::open` leaves it, over
     /// a disk that faults once.
     fn faulting(path: &Path, fault: Fault) -> EvidenceFile {
-        let mut file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
         let end = file.seek(SeekFrom::End(0)).unwrap();
         EvidenceFile::over(
             Box::new(FailingDisk {

@@ -439,17 +439,46 @@ pub(crate) fn check_settlement_rpc_routes(
 ) -> Result<(), ConfigError> {
     for settlement in settlements.iter().filter(|s| s.rpc_via_socks_proxy()) {
         let table = settlement.chain().name();
-        if socks_proxy.is_none() {
-            return Err(ConfigError::SettlementRpcViaSocksProxyWithoutProxy { table });
-        }
         let url = Url::parse(settlement.rpc_url())
             .expect("resolve_rpc_url already parsed every settlement rpc_url");
-        if url.scheme() == "http" && !crate::is_onion_endpoint(&url) {
-            return Err(ConfigError::SettlementRpcViaSocksProxyPlaintext {
+        check_circuit_route(&url, socks_proxy).map_err(|refusal| match refusal {
+            CircuitRouteRefusal::WithoutProxy => {
+                ConfigError::SettlementRpcViaSocksProxyWithoutProxy { table }
+            }
+            CircuitRouteRefusal::Plaintext => ConfigError::SettlementRpcViaSocksProxyPlaintext {
                 table,
                 value: settlement.rpc_url().to_string(),
-            });
-        }
+            },
+        })?;
+    }
+    Ok(())
+}
+
+/// Which of ADR 0073's two rules a read opted onto the circuit breaks.
+/// Each table that may opt in -- `[settlement.<chain>]` and `[zk_note]` --
+/// names it in its own error, because what an exit relay could rewrite is
+/// that table's to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CircuitRouteRefusal {
+    /// The node configures no `socks_proxy` to ride.
+    WithoutProxy,
+    /// Plain `http://` to a host that is not an onion address.
+    Plaintext,
+}
+
+/// ADR 0073's rules for one endpoint whose table set
+/// `rpc_via_socks_proxy = true`: the node has a `socks_proxy`, and the URL
+/// is https unless its host is an onion address, which authenticates the
+/// service itself (ADR 0070 decision 2).
+pub(crate) fn check_circuit_route(
+    url: &Url,
+    socks_proxy: Option<&Url>,
+) -> Result<(), CircuitRouteRefusal> {
+    if socks_proxy.is_none() {
+        return Err(CircuitRouteRefusal::WithoutProxy);
+    }
+    if url.scheme() == "http" && !crate::is_onion_endpoint(url) {
+        return Err(CircuitRouteRefusal::Plaintext);
     }
     Ok(())
 }

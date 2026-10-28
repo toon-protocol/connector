@@ -72,9 +72,10 @@ const ATTRIBUTION_HEADERS: [&str; 3] = [PAYER_HEADER, AMOUNT_HEADER, CHAIN_HEADE
 /// A payment this connector verified for itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PaymentAttribution<'a> {
-    /// The chain-namespaced client channel key the covering claim was
-    /// admitted under (`evm:0x<64 hex>` or `solana:<base58>`).
-    pub channel_key: &'a str,
+    /// The claim key the covering claim was admitted under: a voucher's
+    /// chain-namespaced channel key (`evm:0x<64 hex>` or `solana:<base58>`),
+    /// or an allowance's claim key (`zk-note:<allowance id>`).
+    pub claim_key: &'a str,
     /// What this connector charged for this packet -- the route's schedule
     /// at this packet's own payload length -- which is exactly what that
     /// claim had to cover (ADR 0020, ADR 0028, ADR 0065). At a payment
@@ -92,7 +93,7 @@ impl PaymentAttribution<'_> {
     /// channel key for a voucher, and nothing for an allowance claim, whose
     /// payer the proof hides.
     fn payer(&self) -> Option<&str> {
-        (!self.is_allowance()).then_some(self.channel_key)
+        (!self.is_allowance()).then_some(self.claim_key)
     }
 
     /// The chain the payment was verified on: the channel key's namespace
@@ -101,12 +102,13 @@ impl PaymentAttribution<'_> {
         if self.is_allowance() {
             self.zk_note_network
         } else {
-            chain_of(self.channel_key)
+            chain_of(self.claim_key)
         }
     }
 
+    /// Whether the claim key is an allowance's, which names no chain.
     fn is_allowance(&self) -> bool {
-        chain_of(self.channel_key) == Some(connector_domain::client_claim::ZK_NOTE_NAMESPACE)
+        connector_domain::client_claim::AllowanceId::from_claim_key(self.claim_key).is_some()
     }
 }
 
@@ -192,7 +194,7 @@ mod tests {
         apply_payment_attribution(
             &mut request,
             Some(PaymentAttribution {
-                channel_key: "evm:0xabc",
+                claim_key: "evm:0xabc",
                 charge: 1000,
                 zk_note_network: None,
             }),
@@ -209,7 +211,7 @@ mod tests {
         apply_payment_attribution(
             &mut request,
             Some(PaymentAttribution {
-                channel_key: "solana:9xQeWv",
+                claim_key: "solana:9xQeWv",
                 charge: 7,
                 zk_note_network: None,
             }),
@@ -234,7 +236,7 @@ mod tests {
         apply_payment_attribution(
             &mut request,
             Some(PaymentAttribution {
-                channel_key: "evm:0xabc",
+                claim_key: "evm:0xabc",
                 charge: 0,
                 zk_note_network: None,
             }),
@@ -258,7 +260,7 @@ mod tests {
         apply_payment_attribution(
             &mut overwritten,
             Some(PaymentAttribution {
-                channel_key: "evm:0xreal",
+                claim_key: "evm:0xreal",
                 charge: 1000,
                 zk_note_network: None,
             }),
@@ -298,7 +300,7 @@ mod tests {
         apply_payment_attribution(
             &mut request,
             Some(PaymentAttribution {
-                channel_key: "zk-note:00112233445566778899aabbccddeeff",
+                claim_key: "zk-note:00112233445566778899aabbccddeeff",
                 charge: 250,
                 zk_note_network: Some("mina:devnet"),
             }),

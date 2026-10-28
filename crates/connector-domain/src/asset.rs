@@ -174,14 +174,18 @@ impl AssetId {
 
     /// The same constructors, chosen at runtime -- what a config row that
     /// names its chain in a field rather than in a table key needs.
-    pub fn new(chain: AssetChain, token: impl AsRef<str>) -> AssetId {
+    ///
+    /// # Errors
+    /// [`AssetIdError::UnknownChain`] for a Mina token other than `native`:
+    /// Mina has one asset (ADR 0080 decision 7, as amended), and any other
+    /// `mina:` token names a chain this connector has no backend for,
+    /// refused exactly as before Mina had an asset at all.
+    pub fn new(chain: AssetChain, token: impl AsRef<str>) -> Result<AssetId, AssetIdError> {
         match chain {
-            AssetChain::Evm => AssetId::evm(token),
-            AssetChain::Solana => AssetId::solana(token),
-            AssetChain::Mina => AssetId {
-                chain: AssetChain::Mina,
-                token: token.as_ref().to_string(),
-            },
+            AssetChain::Evm => Ok(AssetId::evm(token)),
+            AssetChain::Solana => Ok(AssetId::solana(token)),
+            AssetChain::Mina if token.as_ref() == MINA_NATIVE_TOKEN => Ok(AssetId::mina_native()),
+            AssetChain::Mina => Err(AssetIdError::UnknownChain(MINA_NAMESPACE.to_string())),
         }
     }
 
@@ -218,13 +222,7 @@ impl FromStr for AssetId {
         if token.is_empty() {
             return Err(AssetIdError::EmptyToken(s.to_string()));
         }
-        let chain = chain.parse::<AssetChain>()?;
-        // Mina has one asset, native MINA. Any other `mina:` token is a chain
-        // this connector has no backend for, refused exactly as before.
-        if chain == AssetChain::Mina && token != MINA_NATIVE_TOKEN {
-            return Err(AssetIdError::UnknownChain(MINA_NAMESPACE.to_string()));
-        }
-        Ok(AssetId::new(chain, token))
+        AssetId::new(chain.parse::<AssetChain>()?, token)
     }
 }
 
@@ -363,6 +361,20 @@ mod tests {
         assert_eq!(mina.to_string(), "mina:native");
     }
 
+    /// The constructor upholds it as the parser does: no Mina asset but
+    /// `native` can be built, by name or at runtime.
+    #[test]
+    fn no_other_mina_asset_can_be_constructed() {
+        assert_eq!(
+            AssetId::new(AssetChain::Mina, "native"),
+            Ok(AssetId::mina_native())
+        );
+        assert_eq!(
+            AssetId::new(AssetChain::Mina, "B62qFoo"),
+            Err(AssetIdError::UnknownChain("mina".to_string()))
+        );
+    }
+
     #[test]
     fn a_bare_address_names_no_chain_and_is_refused() {
         let error = USDC_LOWERCASE
@@ -415,7 +427,7 @@ mod tests {
             chain in prop::sample::select(vec![AssetChain::Evm, AssetChain::Solana]),
             token in "[A-Za-z0-9]{1,64}",
         ) {
-            let asset = AssetId::new(chain, &token);
+            let asset = AssetId::new(chain, &token).expect("an EVM or Solana asset");
             prop_assert_eq!(asset.to_string().parse::<AssetId>().expect("reads back"), asset);
         }
 
@@ -424,7 +436,7 @@ mod tests {
             chain in prop::sample::select(vec![AssetChain::Evm, AssetChain::Solana]),
             token in "[A-Za-z0-9]{1,64}",
         ) {
-            let asset = AssetId::new(chain, &token);
+            let asset = AssetId::new(chain, &token).expect("an EVM or Solana asset");
             let json = serde_json::to_string(&asset).expect("serializes");
             let read: AssetId = serde_json::from_str(&json).expect("reads back");
             prop_assert_eq!(read, asset);

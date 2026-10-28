@@ -137,7 +137,10 @@ mod tests {
         let key = secret(11);
         let signer = ZkStateSigner::from_base58(&key.to_base58()).unwrap();
         let shown = format!("{signer:?}");
-        assert!(shown.contains(&signer.public_key().into_address()), "{shown}");
+        assert!(
+            shown.contains(&signer.public_key().into_address()),
+            "{shown}"
+        );
         assert!(!shown.contains(&key.to_base58()), "{shown}");
     }
 }

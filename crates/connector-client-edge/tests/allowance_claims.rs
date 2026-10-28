@@ -245,7 +245,7 @@ async fn an_allowance_is_granted_and_paid_with_allowance_claims() {
         .await
         .expect("a first claim");
     assert!(matches!(first, ClientEdgeClaim::Allowance(_)));
-    assert_eq!(first.channel_key(), granted.allowance_id.channel_key());
+    assert_eq!(first.claim_key(), granted.allowance_id.claim_key());
     gate.ingest(&payer.claim(granted.allowance_id, 250), 150)
         .await
         .expect("a second claim, covering its packet");
@@ -1234,7 +1234,11 @@ async fn a_close_the_journal_refuses_is_not_durable_and_still_stops_claims() {
         gate.ingest(&payer.claim(id, 200), 100).await.unwrap_err(),
         ClaimIngestRejection::AllowanceClosed
     );
-    payer.check(&edge, &signed(gate.close_allowance(payer.close(id)).unwrap()), 100);
+    payer.check(
+        &edge,
+        &signed(gate.close_allowance(payer.close(id)).unwrap()),
+        100,
+    );
 }
 
 #[tokio::test]
@@ -1570,7 +1574,7 @@ mod btp {
             .collect();
         assert_eq!(
             accepted,
-            vec![(id.channel_key(), u128::from(PRICE))],
+            vec![(id.claim_key(), u128::from(PRICE))],
             "the allowance's watermark is journaled under its key"
         );
 

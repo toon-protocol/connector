@@ -3649,13 +3649,13 @@ impl Connector {
         // has already made the voucher's own advance; at any other route a
         // peer arrival states nothing.
         let attribution = match (client_channel_id, peer_channel) {
-            (Some(channel_key), _) => Some(PaymentAttribution {
-                channel_key,
+            (Some(claim_key), _) => Some(PaymentAttribution {
+                claim_key,
                 charge,
                 zk_note_network: self.zk_note_network.as_deref(),
             }),
             (None, Some(channel_key)) if route.payment() => Some(PaymentAttribution {
-                channel_key,
+                claim_key: channel_key,
                 charge: prepare.amount,
                 zk_note_network: None,
             }),
@@ -6463,9 +6463,8 @@ mod tests {
     #[tokio::test]
     async fn an_allowance_paid_arrival_converts_from_mina_at_the_declared_rate() {
         let peer = Arc::new(CarriesAndRemembers::quoting(0));
-        let assets: ClientChannelAssets = [(SettlementChain::Evm, asset(USDC))]
-            .into_iter()
-            .collect();
+        let assets: ClientChannelAssets =
+            [(SettlementChain::Evm, asset(USDC))].into_iter().collect();
         // Half a USDC to the MINA: 10^9 nanomina to 5 * 10^5 micro-USDC.
         let hop = dealing_hop_over(
             peer.clone(),

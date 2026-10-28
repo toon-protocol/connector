@@ -104,6 +104,18 @@ pub struct AllowanceRequest {
     pub expires_at_ms: u64,
 }
 
+/// This connector is no zk edge: what opening, closing and fetching a
+/// successor all refuse with, under the one name both endpoints answer
+/// ([`NotAZkEdge::NAME`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("this connector is not a zk edge")]
+pub struct NotAZkEdge;
+
+impl NotAZkEdge {
+    /// The rule's name, as both zk-note endpoints answer it.
+    pub const NAME: &'static str = "zk_note_not_offered";
+}
+
 /// An allowance granted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowanceGrant {
@@ -117,7 +129,7 @@ pub struct AllowanceGrant {
 /// a session key or anything from the proof beyond its tier and times.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AllowanceRefusal {
-    #[error("allowance refused: this connector is not a zk edge")]
+    #[error("allowance refused: {}", NotAZkEdge)]
     NotAZkEdge,
     #[error("allowance refused: the request is malformed: {0}")]
     Malformed(String),
@@ -166,7 +178,7 @@ impl AllowanceRefusal {
     /// The rule's name, as `POST /ilp/zk-note/allowances` answers it.
     pub fn name(&self) -> &'static str {
         match self {
-            AllowanceRefusal::NotAZkEdge => "zk_note_not_offered",
+            AllowanceRefusal::NotAZkEdge => NotAZkEdge::NAME,
             AllowanceRefusal::Malformed(_) => "request_malformed",
             AllowanceRefusal::TierNotOffered { .. } => "tier_not_offered",
             AllowanceRefusal::ExpiryOutsideLifetime { .. } => "expiry_outside_lifetime",
@@ -384,20 +396,21 @@ impl ZkLedger {
 }
 
 /// A nullifier and its tier held against the cap while a request is being
-/// verified; released unless the grant is committed.
+/// verified, released when dropped. A granted request has already moved its
+/// nullifier from pending to spent, in the lock hold that records the
+/// allowance, so the release then finds nothing to remove.
 struct Reservation<'a> {
     ledger: &'a Mutex<ZkLedger>,
     nullifier: [u8; 32],
-    committed: bool,
 }
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        let mut ledger = self.ledger.lock().expect("zk ledger lock poisoned");
-        ledger.pending.remove(&self.nullifier);
-        if self.committed {
-            ledger.spent.insert(self.nullifier);
-        }
+        self.ledger
+            .lock()
+            .expect("zk ledger lock poisoned")
+            .pending
+            .remove(&self.nullifier);
     }
 }
 
@@ -509,7 +522,7 @@ impl ClientClaimGate {
         // This edge's own records: a spent nullifier, and the cap. The
         // nullifier and the tier are reserved from here on.
         let nullifier = field_to_le_bytes(public.nullifier);
-        let mut reservation = {
+        let reservation = {
             let mut ledger = self.zk_ledger.lock().expect("zk ledger lock poisoned");
             if ledger.spent.contains(&nullifier) || ledger.pending.contains_key(&nullifier) {
                 return Err(AllowanceRefusal::NullifierSpent);
@@ -526,7 +539,6 @@ impl ClientClaimGate {
             Reservation {
                 ledger: &self.zk_ledger,
                 nullifier,
-                committed: false,
             }
         };
 
@@ -617,7 +629,6 @@ impl ClientClaimGate {
             ledger.pending.remove(&nullifier);
             ledger.spent.insert(nullifier);
         }
-        reservation.committed = true;
         drop(reservation);
         tracing::info!(allowance = %allowance_id, tier, "granted a zk-note allowance");
         Ok(AllowanceGrant {
@@ -664,7 +675,7 @@ impl ClientClaimGate {
         // drop may charge the allowance, which reads the watermarks.
         let in_flight = InFlightForward(Some((parts, claim.allowance_id)));
 
-        let key = claim.allowance_id.channel_key();
+        let key = claim.allowance_id.claim_key();
         let amount = u128::from(claim.cumulative_amount);
         let check = |current: Option<&LiveClaim>| {
             let watermark = current.map(|record| VoucherWatermark {
@@ -882,7 +893,7 @@ pub struct AllowanceClose {
 /// Why a close or a successor fetch was refused, by its rule.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AllowanceCloseRefusal {
-    #[error("refused: this connector is not a zk edge")]
+    #[error("refused: {}", NotAZkEdge)]
     NotAZkEdge,
     #[error("refused: no allowance by that id was granted here")]
     UnknownAllowance,
@@ -899,7 +910,7 @@ impl AllowanceCloseRefusal {
     /// The rule's name, as the endpoints answer it.
     pub fn name(&self) -> &'static str {
         match self {
-            AllowanceCloseRefusal::NotAZkEdge => "zk_note_not_offered",
+            AllowanceCloseRefusal::NotAZkEdge => NotAZkEdge::NAME,
             AllowanceCloseRefusal::UnknownAllowance => "unknown_allowance",
             AllowanceCloseRefusal::SignatureInvalid => "signature_invalid",
             AllowanceCloseRefusal::NotDurable => "not_durable",
@@ -1070,7 +1081,7 @@ impl ZkParts {
                     .watermarks
                     .read()
                     .expect("client claim watermarks lock poisoned")
-                    .get(&id.channel_key())
+                    .get(&id.claim_key())
                     .map(|record| record.watermark.cumulative_amount);
                 let charge = match allowance_close_charge(watermark, allowance.tier) {
                     Ok(charge) => charge,

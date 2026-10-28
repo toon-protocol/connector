@@ -684,13 +684,15 @@ impl AllowanceId {
         &self.0
     }
 
-    /// The allowance's key in the claim gate: `zk-note:<id>`.
-    pub fn channel_key(&self) -> String {
+    /// The allowance's claim key: what the claim gate holds its watermark
+    /// under, `zk-note:<id>`. Beside every voucher's channel key, in its
+    /// own namespace; an allowance is not a channel.
+    pub fn claim_key(&self) -> String {
         format!("{ZK_NOTE_NAMESPACE}:{self}")
     }
 
-    /// The id a gate key names, if it is an allowance's.
-    pub fn from_channel_key(key: &str) -> Option<AllowanceId> {
+    /// The id a claim key names, if it is an allowance's.
+    pub fn from_claim_key(key: &str) -> Option<AllowanceId> {
         key.strip_prefix(ZK_NOTE_NAMESPACE)?
             .strip_prefix(':')?
             .parse()
@@ -738,11 +740,12 @@ pub enum ClientEdgeClaim {
 }
 
 impl ClientEdgeClaim {
-    /// The key the claim gate holds its watermark under.
-    pub fn channel_key(&self) -> String {
+    /// The claim key the claim gate holds its watermark under: a voucher's
+    /// channel key, or an allowance's claim key.
+    pub fn claim_key(&self) -> String {
         match self {
             ClientEdgeClaim::Voucher(claim) => claim.channel_key(),
-            ClientEdgeClaim::Allowance(claim) => claim.allowance_id.channel_key(),
+            ClientEdgeClaim::Allowance(claim) => claim.allowance_id.claim_key(),
         }
     }
 
@@ -805,7 +808,7 @@ fn parse_allowance_claim(
     }
     let allowance_id = required_str(obj, "allowanceId")?.parse()?;
     let raw = required_str(obj, "cumulativeAmount")?;
-    if !raw.bytes().all(|b| b.is_ascii_digit()) || (raw.len() > 1 && raw.starts_with('0')) {
+    if !is_canonical_decimal(raw) {
         return Err(malformed(
             "'cumulativeAmount' must be a decimal string with no sign or leading zero",
         ));
@@ -822,7 +825,19 @@ fn parse_allowance_claim(
     })
 }
 
-fn decode_lower_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
+/// Whether `text` is a canonical decimal: one or more ASCII digits, no
+/// sign, and no leading zero unless it is `0`. The one spelling of an
+/// amount or a time on the zk-note wire, so two spellings never name one
+/// value.
+pub fn is_canonical_decimal(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text.len() == 1 || !text.starts_with('0'))
+}
+
+/// Exactly `2 * N` lowercase hex characters, as `N` bytes: the one spelling
+/// of an allowance id and a session-key signature on the zk-note wire.
+pub fn decode_lower_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
     let digit = |b: u8| match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),
@@ -862,11 +877,11 @@ mod tests {
         assert_eq!(claim.cumulative_amount, 250);
         assert_eq!(claim.signature, [0xab; 64]);
         assert_eq!(
-            claim.allowance_id.channel_key(),
+            claim.allowance_id.claim_key(),
             format!("zk-note:{ALLOWANCE_ID}")
         );
         assert_eq!(
-            AllowanceId::from_channel_key(&claim.allowance_id.channel_key()),
+            AllowanceId::from_claim_key(&claim.allowance_id.claim_key()),
             Some(claim.allowance_id)
         );
     }

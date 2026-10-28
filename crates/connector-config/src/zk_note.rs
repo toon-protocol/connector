@@ -26,6 +26,7 @@ use url::Url;
 
 use crate::error::ConfigError;
 use crate::secret::SecretLocation;
+use crate::settlement::{check_circuit_route, CircuitRouteRefusal};
 
 /// The vault asset's decimals: native MINA's nanomina.
 pub const ZK_NOTE_DECIMALS: u8 = 9;
@@ -163,17 +164,15 @@ pub(crate) fn resolve_zk_note(
         .ok_or_else(|| ConfigError::ZkNoteGraphqlUrlInvalid {
             value: raw.graphql_url.clone(),
         })?;
-    // ADR 0073's two rules for a read that rides the circuit, exactly as
-    // `check_settlement_rpc_routes` applies them to a settlement table.
+    // ADR 0073's two rules for a read that rides the circuit: the ones a
+    // settlement table is held to, named for this table.
     if raw.rpc_via_socks_proxy {
-        if socks_proxy.is_none() {
-            return Err(ConfigError::ZkNoteViaSocksProxyWithoutProxy);
-        }
-        if graphql_url.scheme() == "http" && !crate::is_onion_endpoint(&graphql_url) {
-            return Err(ConfigError::ZkNoteViaSocksProxyPlaintext {
-                value: raw.graphql_url,
-            });
-        }
+        check_circuit_route(&graphql_url, socks_proxy).map_err(|refusal| match refusal {
+            CircuitRouteRefusal::WithoutProxy => ConfigError::ZkNoteViaSocksProxyWithoutProxy,
+            CircuitRouteRefusal::Plaintext => ConfigError::ZkNoteViaSocksProxyPlaintext {
+                value: raw.graphql_url.clone(),
+            },
+        })?;
     }
     if !raw.state_key_file.is_file() {
         return Err(ConfigError::ZkNoteStateKeyFileNotFound(raw.state_key_file));
@@ -518,9 +517,10 @@ max_move = {{ numerator = 1, denominator = 10 }}
         })
         .unwrap_err();
         assert!(
-            matches!(error, ConfigError::TokenAssetInvalid { .. }),
+            matches!(error, ConfigError::TokenMinaNative { .. }),
             "{error}"
         );
+        assert!(error.to_string().contains("mina:native"), "{error}");
         // As a rate's `from`, on a node with no zk-note table.
         let error = load(|text| {
             let text = with_evm(

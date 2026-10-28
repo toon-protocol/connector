@@ -108,7 +108,7 @@ mod allowance;
 use allowance::ZkLedger;
 pub use allowance::{
     AllowanceClose, AllowanceCloseRefusal, AllowanceGrant, AllowanceRefusal, AllowanceRequest,
-    InFlightForward, SignedSuccessor, SuccessorStatus, ZkEdge, ZkEdgeRestoreError,
+    InFlightForward, NotAZkEdge, SignedSuccessor, SuccessorStatus, ZkEdge, ZkEdgeRestoreError,
 };
 
 /// Why the gate refused a claim. [`ClaimIngestRejection::Mina`] and

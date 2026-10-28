@@ -441,11 +441,11 @@ fn resolve_tokens(
                 })?;
         // ADR 0080 decision 7, as amended: native MINA is the zk-note
         // table's asset and no other table's. It parses now, so it is
-        // refused here by the same name an unknown chain always was.
+        // refused here by its own name; any other `mina:` token is refused
+        // by the parser above as an unknown chain, as it always was.
         if asset.chain() == AssetChain::Mina {
-            return Err(ConfigError::TokenAssetInvalid {
+            return Err(ConfigError::TokenMinaNative {
                 value: token.asset.clone(),
-                source: connector_domain::AssetIdError::UnknownChain(asset.chain().to_string()),
             });
         }
         if !seen.insert(asset.clone()) {

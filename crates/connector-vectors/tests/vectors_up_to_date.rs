@@ -673,8 +673,13 @@ fn the_committed_zk_note_vectors_replay_against_the_real_implementation() {
         charge, claim.cumulative_amount,
         "the charge is the final watermark"
     );
-    let derived = successor_state(&state.public.into_compressed(), commitment, public.nullifier, charge)
-        .expect("signable");
+    let derived = successor_state(
+        &state.public.into_compressed(),
+        commitment,
+        public.nullifier,
+        charge,
+    )
+    .expect("signable");
     let state_signer = connector_signer::ZkStateSigner::from_base58(&state_secret.to_base58())
         .expect("the fixture state key");
     let derived_signature = state_signer.sign(&derived.message);

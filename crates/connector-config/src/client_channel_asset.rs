@@ -184,7 +184,11 @@ pub(crate) fn resolve_client_channel_assets(
         chains,
         zk_note: None,
     };
-    Ok(if zk_edge { assets.with_zk_edge() } else { assets })
+    Ok(if zk_edge {
+        assets.with_zk_edge()
+    } else {
+        assets
+    })
 }
 
 #[cfg(test)]
