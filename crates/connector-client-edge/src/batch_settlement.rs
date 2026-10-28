@@ -47,7 +47,7 @@
 
 use async_trait::async_trait;
 use connector_domain::client_claim::{canonical_channel_key, EVM_NAMESPACE, SOLANA_NAMESPACE};
-use connector_domain::JournalEntry;
+use connector_domain::{JournalEntry, Network};
 use connector_runtime::JournalError;
 use connector_signer::{BatchChannelConfig, BatchSettlementDomain};
 
@@ -89,8 +89,30 @@ pub trait BatchSettlementChannels: Send + Sync + std::fmt::Debug {
     /// this node has not opted in to EVM vouchers.
     fn evm_domain(&self) -> Option<BatchSettlementDomain>;
 
+    /// The CAIP-2 network this node settles Solana vouchers on
+    /// (`solana:<genesis prefix>`, as its greeting publishes it), or `None`
+    /// if it has not opted in to Solana vouchers. A Solana voucher's
+    /// `network` must equal it (ADR 0086 decision 1).
+    fn solana_network(&self) -> Option<Network>;
+
     /// Whether this node has opted in to Solana vouchers.
-    fn accepts_solana(&self) -> bool;
+    fn accepts_solana(&self) -> bool {
+        self.solana_network().is_some()
+    }
+
+    /// Whether `network` names a settlement table this node has: on EVM,
+    /// the chain of the domain vouchers are verified under; on Solana, the
+    /// one Solana network. A voucher, claim-state entry or peer-role
+    /// challenge naming any other network is refused by name (ADR 0086
+    /// decision 1).
+    fn settles_on(&self, network: &Network) -> bool {
+        match network {
+            Network::Eip155(chain_id) => self
+                .evm_domain()
+                .is_some_and(|domain| domain.chain_id == *chain_id),
+            Network::Solana(_) => self.solana_network().as_ref() == Some(network),
+        }
+    }
 
     /// The EVM channel `channel_id`, if this connector admits it.
     /// `presented_config` is the client's `ChannelConfig` when the voucher

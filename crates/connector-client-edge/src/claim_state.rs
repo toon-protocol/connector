@@ -56,6 +56,7 @@ use serde::{Deserialize, Serialize};
 use connector_domain::client_claim::{
     declared_scheme, parse_evm_channel_config, DeclaredScheme, SCHEME_BATCH_SETTLEMENT,
 };
+use connector_domain::{AssetChain, Network};
 use connector_signer::{
     evm_voucher_signer, verify_evm_voucher_claim_state_challenge,
     verify_solana_voucher_claim_state_challenge, BatchChannelConfig,
@@ -119,6 +120,10 @@ enum ChannelProofRequest {
         signature: String,
         #[serde(default)]
         scheme: Option<String>,
+        /// The CAIP-2 network the channel is on (ADR 0086 decision 1):
+        /// required, and read only after `scheme`.
+        #[serde(default)]
+        network: Option<String>,
         /// A batch-settlement channel's `ChannelConfig`, for a channel this
         /// node has no record of yet; see [`resolve_evm_voucher`].
         /// Parsed by `connector_domain`'s own `channelConfig` parser, the
@@ -133,6 +138,8 @@ enum ChannelProofRequest {
         signature: String,
         #[serde(default)]
         scheme: Option<String>,
+        #[serde(default)]
+        network: Option<String>,
     },
 }
 
@@ -164,6 +171,8 @@ enum ChannelStateResult {
 #[serde(rename_all = "camelCase")]
 struct VerifiedVoucherChannelState {
     blockchain: &'static str,
+    /// The CAIP-2 network the entry named, echoed (ADR 0086 decision 1).
+    network: String,
     channel_id: String,
     ok: bool,
     /// Always `"batch-settlement"`: what tells a reader this entry has no
@@ -193,10 +202,16 @@ struct VerifiedVoucherChannelState {
 #[serde(rename_all = "camelCase")]
 struct UnverifiedChannelState {
     blockchain: &'static str,
+    /// The CAIP-2 network the entry named, echoed once it has been read --
+    /// absent on an entry refused before it (a retired scheme, a missing
+    /// or unreadable `network`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network: Option<String>,
     channel_id: String,
     ok: bool,
-    /// `"expired"`, `"toon-channel-refused"` or `"unverified"` -- see this
-    /// module's own doc for why nothing more specific is ever reported.
+    /// `"expired"`, `"toon-channel-refused"`, `"network-missing"`,
+    /// `"network-not-settled"` or `"unverified"` -- see this module's own
+    /// doc for why nothing more specific is ever reported.
     error: &'static str,
 }
 
@@ -207,10 +222,69 @@ fn unverified(
 ) -> ChannelStateResult {
     ChannelStateResult::Unverified(UnverifiedChannelState {
         blockchain,
+        network: None,
         channel_id,
         ok: false,
         error,
     })
+}
+
+/// An entry with no `network` (ADR 0086 decision 1): refused by name.
+const NETWORK_MISSING: &str = "network-missing";
+
+/// An entry whose `network` names no settlement table on this node: refused
+/// by name, echoing it.
+const NETWORK_NOT_SETTLED: &str = "network-not-settled";
+
+impl ChannelStateResult {
+    /// This answer, echoing the `network` its entry named.
+    fn on(mut self, network: &Network) -> ChannelStateResult {
+        match &mut self {
+            ChannelStateResult::VerifiedVoucher(state) => state.network = network.to_string(),
+            ChannelStateResult::Unverified(state) => state.network = Some(network.to_string()),
+        }
+        self
+    }
+}
+
+/// The network an entry names, if it names one of `chain`'s that this node
+/// settles on; else the answer that refuses it, by name. Read after the
+/// entry's `scheme`, so a retired entry -- which never carried one -- is
+/// still refused as what it is.
+fn entry_network(
+    state: &ClientEdgeState,
+    blockchain: &'static str,
+    chain: AssetChain,
+    channel_id_text: &str,
+    network: Option<String>,
+) -> Result<Network, ChannelStateResult> {
+    let Some(raw) = network else {
+        log_outcome(blockchain, channel_id_text, "network_missing");
+        return Err(unverified(
+            blockchain,
+            channel_id_text.to_string(),
+            NETWORK_MISSING,
+        ));
+    };
+    let parsed = raw
+        .parse::<Network>()
+        .ok()
+        .filter(|network| network.chain() == chain);
+    let Some(network) = parsed else {
+        log_outcome(blockchain, channel_id_text, "network_invalid");
+        return Err(unverified(
+            blockchain,
+            channel_id_text.to_string(),
+            "unverified",
+        ));
+    };
+    if !state.claim_gate.settles_on(&network) {
+        log_outcome(blockchain, channel_id_text, "network_not_settled");
+        return Err(
+            unverified(blockchain, channel_id_text.to_string(), NETWORK_NOT_SETTLED).on(&network),
+        );
+    }
+    Ok(network)
 }
 
 pub(crate) async fn claim_state(
@@ -236,6 +310,7 @@ async fn resolve_channel_proof(
             expires,
             signature,
             scheme,
+            network,
             channel_config,
         } => {
             resolve_evm(
@@ -243,7 +318,7 @@ async fn resolve_channel_proof(
                 channel_id,
                 expires,
                 signature,
-                scheme,
+                (scheme, network),
                 channel_config,
                 now,
             )
@@ -254,7 +329,18 @@ async fn resolve_channel_proof(
             expires,
             signature,
             scheme,
-        } => resolve_solana(state, channel_account, expires, signature, scheme, now).await,
+            network,
+        } => {
+            resolve_solana(
+                state,
+                channel_account,
+                expires,
+                signature,
+                (scheme, network),
+                now,
+            )
+            .await
+        }
     }
 }
 
@@ -263,7 +349,7 @@ async fn resolve_evm(
     channel_id_text: String,
     expires: u64,
     signature_text: String,
-    scheme: Option<String>,
+    (scheme, network): (Option<String>, Option<String>),
     channel_config: Option<serde_json::Value>,
     now: u64,
 ) -> ChannelStateResult {
@@ -278,6 +364,31 @@ async fn resolve_evm(
             return unverified("evm", channel_id_text, "unverified");
         }
     }
+    let network = match entry_network(state, "evm", AssetChain::Evm, &channel_id_text, network) {
+        Ok(network) => network,
+        Err(refused) => return refused,
+    };
+    resolve_evm_on(
+        state,
+        channel_id_text,
+        expires,
+        signature_text,
+        channel_config,
+        now,
+    )
+    .await
+    .on(&network)
+}
+
+/// [`resolve_evm`], once its entry's scheme and network are known good.
+async fn resolve_evm_on(
+    state: &ClientEdgeState,
+    channel_id_text: String,
+    expires: u64,
+    signature_text: String,
+    channel_config: Option<serde_json::Value>,
+    now: u64,
+) -> ChannelStateResult {
     if expires <= now {
         log_outcome("evm", &channel_id_text, "expired");
         return unverified("evm", channel_id_text, "expired");
@@ -325,7 +436,7 @@ async fn resolve_solana(
     channel_account_text: String,
     expires: u64,
     signature_text: String,
-    scheme: Option<String>,
+    (scheme, network): (Option<String>, Option<String>),
     now: u64,
 ) -> ChannelStateResult {
     match declared_scheme(scheme.as_deref()) {
@@ -339,6 +450,29 @@ async fn resolve_solana(
             return unverified("solana", channel_account_text, "unverified");
         }
     }
+    let network = match entry_network(
+        state,
+        "solana",
+        AssetChain::Solana,
+        &channel_account_text,
+        network,
+    ) {
+        Ok(network) => network,
+        Err(refused) => return refused,
+    };
+    resolve_solana_on(state, channel_account_text, expires, signature_text, now)
+        .await
+        .on(&network)
+}
+
+/// [`resolve_solana`], once its entry's scheme and network are known good.
+async fn resolve_solana_on(
+    state: &ClientEdgeState,
+    channel_account_text: String,
+    expires: u64,
+    signature_text: String,
+    now: u64,
+) -> ChannelStateResult {
     if expires <= now {
         log_outcome("solana", &channel_account_text, "expired");
         return unverified("solana", channel_account_text, "expired");
@@ -493,6 +627,8 @@ fn verified_voucher_state(
         .map_or(0, |watermark| watermark.cumulative_amount);
     ChannelStateResult::VerifiedVoucher(VerifiedVoucherChannelState {
         blockchain,
+        // Filled in by `ChannelStateResult::on`, from the entry.
+        network: String::new(),
         channel_id,
         ok: true,
         scheme: SCHEME_BATCH_SETTLEMENT,

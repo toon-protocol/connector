@@ -31,6 +31,9 @@
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::asset::AssetChain;
+use crate::network::Network;
+
 /// Fields common to every claim regardless of chain (client-edge-spec.md
 /// §1.3's "required fields on every claim").
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +77,10 @@ pub struct EvmVoucherChannelConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvmVoucher {
     pub common: ClientClaimCommon,
+    /// The CAIP-2 network the voucher is on (ADR 0086 decision 1): required,
+    /// an `eip155` network, and the chain whose EIP-712 domain the voucher's
+    /// channel id and signature are checked under.
+    pub network: Network,
     /// The channel the voucher signs, `0x` + 64 hex. Named by the voucher
     /// and verified on chain, never derived (ADR 0074 decision 2).
     pub channel_id: String,
@@ -95,6 +102,9 @@ pub struct EvmVoucher {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolanaVoucher {
     pub common: ClientClaimCommon,
+    /// The CAIP-2 network the voucher is on (ADR 0086 decision 1):
+    /// `solana:<genesis prefix>`, as the greeting spells it.
+    pub network: Network,
     /// The channel account, base58. Canonical as it arrives.
     pub channel_id: String,
     /// The signed message and SPL amounts are `u64` on Solana (ADR 0074
@@ -138,6 +148,16 @@ impl ClientClaim {
         match self {
             ClientClaim::EvmVoucher(voucher) => voucher.max_claimable_amount,
             ClientClaim::SolanaVoucher(voucher) => u128::from(voucher.max_claimable_amount),
+        }
+    }
+
+    /// The CAIP-2 network the voucher names (ADR 0086 decision 1). Its
+    /// family always matches the voucher's `blockchain`: the parser refuses
+    /// one that does not.
+    pub fn network(&self) -> &Network {
+        match self {
+            ClientClaim::EvmVoucher(voucher) => &voucher.network,
+            ClientClaim::SolanaVoucher(voucher) => &voucher.network,
         }
     }
 
@@ -324,6 +344,30 @@ pub enum ClientClaimError {
          -- a voucher that can expire is value that can lapse before it is landed"
     )]
     VoucherExpires { expires_at: i64 },
+    /// A voucher with no `network` (ADR 0086 decision 1, `schema_version`
+    /// 10). Refused by name, even by a node that settles on one network,
+    /// rather than guessed: the rule must not change when its operator adds
+    /// a second one.
+    #[error(
+        "claim carries no 'network': since wire schema_version 10 every voucher names the \
+         CAIP-2 network it is on (eip155:<chainId> or solana:<genesis prefix>), and one \
+         without it is refused rather than guessed (ADR 0086)"
+    )]
+    NetworkMissing,
+    /// A `network` that is not a CAIP-2 network this connector reads.
+    #[error("claim's 'network' {network:?} is not a CAIP-2 network: {reason}")]
+    NetworkInvalid { network: String, reason: String },
+    /// A `network` of the other family from `blockchain`, which still picks
+    /// the parser: an `evm` voucher on a `solana:` network is on no network
+    /// it could be verified on.
+    #[error(
+        "claim's 'network' {network} is not a '{blockchain}' network: 'blockchain' and \
+         'network' must name the same chain family"
+    )]
+    NetworkNotOnChain {
+        network: Network,
+        blockchain: &'static str,
+    },
 }
 
 fn malformed(msg: impl Into<String>) -> ClientClaimError {
@@ -394,6 +438,43 @@ fn parse_common(
             sender_id,
         },
     ))
+}
+
+/// A wire object's required `network` (ADR 0086 decision 1), of the family
+/// `chain` names: the one reading of the field, shared by a voucher, a
+/// claim-state entry and a peer-role challenge. A caller reads it after
+/// `scheme`, so a retired claim -- which never carried one -- is still
+/// refused as what it is.
+pub fn required_network(
+    obj: &serde_json::Map<String, Value>,
+    chain: AssetChain,
+) -> Result<Network, ClientClaimError> {
+    let raw = match obj.get("network") {
+        None | Some(Value::Null) => return Err(ClientClaimError::NetworkMissing),
+        Some(Value::String(raw)) => raw,
+        Some(other) => {
+            return Err(ClientClaimError::NetworkInvalid {
+                network: other.to_string(),
+                reason: "it must be a string".to_string(),
+            })
+        }
+    };
+    let network: Network = raw.parse().map_err(|error: crate::network::NetworkError| {
+        ClientClaimError::NetworkInvalid {
+            network: raw.clone(),
+            reason: error.to_string(),
+        }
+    })?;
+    if network.chain() != chain {
+        return Err(ClientClaimError::NetworkNotOnChain {
+            network,
+            blockchain: match chain {
+                AssetChain::Evm => EVM_NAMESPACE,
+                AssetChain::Solana => SOLANA_NAMESPACE,
+            },
+        });
+    }
+    Ok(network)
 }
 
 /// A deliberately narrow ISO-8601 check matching the deleted TS reference's
@@ -569,6 +650,7 @@ fn parse_evm_voucher(
     obj: &serde_json::Map<String, Value>,
     common: ClientClaimCommon,
 ) -> Result<EvmVoucher, ClientClaimError> {
+    let network = required_network(obj, AssetChain::Evm)?;
     let channel_id = required_str(obj, "channelId")?.to_string();
     if !is_hex_of_len(&channel_id, 64) {
         return Err(malformed(
@@ -585,6 +667,7 @@ fn parse_evm_voucher(
     let channel_config = parse_evm_voucher_channel_config(obj)?;
     Ok(EvmVoucher {
         common,
+        network,
         channel_id,
         max_claimable_amount,
         signature,
@@ -596,6 +679,7 @@ fn parse_solana_voucher(
     obj: &serde_json::Map<String, Value>,
     common: ClientClaimCommon,
 ) -> Result<SolanaVoucher, ClientClaimError> {
+    let network = required_network(obj, AssetChain::Solana)?;
     let channel_id = required_str(obj, "channelId")?.to_string();
     if !is_base58(&channel_id, 32, 44) {
         return Err(malformed(
@@ -620,6 +704,7 @@ fn parse_solana_voucher(
     }
     Ok(SolanaVoucher {
         common,
+        network,
         channel_id,
         max_claimable_amount,
         signature,
@@ -719,6 +804,7 @@ mod tests {
             r#"{{
             "version": "1.0",
             "blockchain": "evm",
+            "network": "eip155:84532",
             "scheme": "batch-settlement",
             "messageId": "voucher-1",
             "timestamp": "2026-09-25T12:00:00.000Z",
@@ -736,6 +822,7 @@ mod tests {
         r#"{
             "version": "1.0",
             "blockchain": "solana",
+            "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
             "scheme": "batch-settlement",
             "messageId": "voucher-2",
             "timestamp": "2026-09-25T12:00:00Z",
@@ -786,6 +873,78 @@ mod tests {
             "signature": "deadbeef",
             "signerPublicKey": "So11111111111111111111111111111111111111112"
         }"#
+    }
+
+    // -- A voucher names its network (ADR 0086 decision 1, #1599) --
+
+    #[test]
+    fn a_voucher_carries_the_caip2_network_it_names() {
+        let evm = parse_client_claim(&evm_voucher_json()).expect("parses");
+        assert_eq!(evm.network(), &Network::Eip155(84_532));
+        let solana = parse_client_claim(&solana_voucher_json()).expect("parses");
+        assert_eq!(
+            solana.network().to_string(),
+            "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+        );
+    }
+
+    /// Refused by name, on both chains, rather than guessed from the one
+    /// network a node happens to settle on.
+    #[test]
+    fn a_voucher_with_no_network_is_refused_by_name() {
+        let evm = evm_voucher_json().replace(r#""network": "eip155:84532","#, "");
+        let solana = solana_voucher_json().replace(
+            r#""network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1","#,
+            "",
+        );
+        for json in [evm, solana] {
+            assert!(!json.contains("network"));
+            let refused = parse_client_claim(&json);
+            assert_eq!(refused, Err(ClientClaimError::NetworkMissing));
+            assert!(refused.unwrap_err().to_string().contains("'network'"));
+        }
+    }
+
+    /// `evm:84532`, a bare chain id and a family name are not networks.
+    #[test]
+    fn a_network_that_is_not_caip2_is_refused_naming_it() {
+        for spelling in ["evm:84532", "84532", "evm", "eip155:084532"] {
+            let json = evm_voucher_json().replace("eip155:84532", spelling);
+            match parse_client_claim(&json) {
+                Err(ClientClaimError::NetworkInvalid { network, .. }) => {
+                    assert_eq!(network, spelling)
+                }
+                other => panic!("{spelling}: {other:?}"),
+            }
+        }
+    }
+
+    /// `blockchain` still picks the parser, so a `network` of the other
+    /// family cannot be a network this voucher is on.
+    #[test]
+    fn a_network_of_the_other_family_is_refused() {
+        let evm =
+            evm_voucher_json().replace("eip155:84532", "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1");
+        let solana = solana_voucher_json()
+            .replace("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1", "eip155:84532");
+        assert!(matches!(
+            parse_client_claim(&evm),
+            Err(ClientClaimError::NetworkNotOnChain { .. })
+        ));
+        assert!(matches!(
+            parse_client_claim(&solana),
+            Err(ClientClaimError::NetworkNotOnChain { .. })
+        ));
+    }
+
+    /// The retired claims carry no `network` either, and are still refused
+    /// as what they are.
+    #[test]
+    fn a_retired_claim_is_refused_as_retired_not_as_missing_its_network() {
+        assert_eq!(
+            parse_client_claim(&toon_channel_claim_json()),
+            Err(ClientClaimError::ToonChannel)
+        );
     }
 
     // -- The retired toon-channel claim (ADR 0075 decision 8, #1384) --

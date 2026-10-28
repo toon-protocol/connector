@@ -84,8 +84,8 @@ use connector_domain::client_claim::{
     EvmVoucherChannelConfig, EVM_NAMESPACE,
 };
 use connector_domain::{
-    advance_voucher_watermark, validate_voucher, ClaimError, JournalEntry, VoucherAdmission,
-    VoucherWatermark, Watermark, VOUCHER_WATERMARK_NONCE,
+    advance_voucher_watermark, validate_voucher, ClaimError, JournalEntry, Network,
+    VoucherAdmission, VoucherWatermark, Watermark, VOUCHER_WATERMARK_NONCE,
 };
 use connector_runtime::{Journal, JournalError};
 use connector_signer::{
@@ -223,7 +223,21 @@ pub enum ClaimIngestRejection {
     /// signs (ADR 0074 decision 2: the connector recomputes `getChannelId`
     /// and refuses a mismatch). The config is where the voucher's signer is
     /// read from, so one that is not the channel's names nobody.
-    VoucherChannelConfigMismatch,
+    VoucherChannelConfigMismatch {
+        /// The network the voucher named, whose domain the id was
+        /// recomputed under (ADR 0086 decision 1).
+        network: Network,
+    },
+    /// A voucher with no `network` (ADR 0086 decision 1): refused by name,
+    /// even on a node that settles on one network per chain, rather than
+    /// guessed.
+    NetworkMissing,
+    /// A voucher whose `network` names no settlement table on this node
+    /// (ADR 0086 decision 1). Refused by name, before anything about it is
+    /// judged: the greeting's `accepts` lists the networks this node takes.
+    NetworkNotSettled {
+        network: Network,
+    },
 }
 
 impl ClaimIngestRejection {
@@ -298,9 +312,18 @@ impl ClaimIngestRejection {
                  'batch-settlement' voucher on a chain this connector does not settle on -- pay \
                  on a chain its greeting's 'accepts' lists"
                 .to_string(),
-            ClaimIngestRejection::VoucherChannelConfigMismatch => "claim rejected: the \
-                 voucher's 'channelConfig' does not hash to the 'channelId' it signs"
-                .to_string(),
+            ClaimIngestRejection::VoucherChannelConfigMismatch { network } => format!(
+                "claim rejected: the voucher's 'channelConfig' does not hash to the 'channelId' \
+                 it signs under {network}'s EIP-712 domain -- a voucher's 'network' must be the \
+                 network its channel was opened on"
+            ),
+            ClaimIngestRejection::NetworkMissing => {
+                format!("claim rejected: {}", ClientClaimError::NetworkMissing)
+            }
+            ClaimIngestRejection::NetworkNotSettled { network } => format!(
+                "claim rejected: it names network '{network}', on which this connector settles \
+                 nothing -- pay on a network its greeting's 'accepts' lists"
+            ),
         }
     }
 }
@@ -762,6 +785,14 @@ impl ClientClaimGate {
             .await
     }
 
+    /// Whether `network` names a settlement table this node has (ADR 0086
+    /// decision 1) -- `false` on a node that settles on nothing.
+    pub(crate) fn settles_on(&self, network: &Network) -> bool {
+        self.batch_settlement
+            .as_deref()
+            .is_some_and(|backend| backend.settles_on(network))
+    }
+
     fn known_batch_channel(&self, key: &str) -> Option<JournaledBatchChannel> {
         self.batch_channels
             .read()
@@ -916,6 +947,7 @@ impl ClientClaimGate {
         let claim = parse_client_claim(claim_json).map_err(|error| match error {
             ClientClaimError::Mina => ClaimIngestRejection::Mina,
             ClientClaimError::ToonChannel => ClaimIngestRejection::ToonChannel,
+            ClientClaimError::NetworkMissing => ClaimIngestRejection::NetworkMissing,
             other => ClaimIngestRejection::Malformed(other.to_string()),
         })?;
         self.admit_voucher(claim, price).await
@@ -1016,6 +1048,13 @@ impl ClientClaimGate {
         };
         if !accepted_here {
             return Err(ClaimIngestRejection::BatchSettlementNotAccepted);
+        }
+        // ADR 0086 decision 1: the voucher's network must name a table this
+        // node has, before anything about the voucher is judged.
+        if !backend.settles_on(claim.network()) {
+            return Err(ClaimIngestRejection::NetworkNotSettled {
+                network: claim.network().clone(),
+            });
         }
 
         // Decoded before freshness, not after: a resend is recognised by its
@@ -1692,7 +1731,9 @@ async fn verify_voucher(
             // mismatch -- before asking the backend anything about it.
             if presented.is_some_and(|config| evm_batch_channel_id(&domain, &config) != channel_id)
             {
-                return Err(ClaimIngestRejection::VoucherChannelConfigMismatch);
+                return Err(ClaimIngestRejection::VoucherChannelConfigMismatch {
+                    network: voucher.network.clone(),
+                });
             }
             let reservation = reserve_voucher_lookup(budget, known.is_none(), requester).await?;
             let found = backend
@@ -1704,7 +1745,9 @@ async fn verify_voucher(
             // The backend's config is re-hashed too: the signer is read from
             // it, so it has to be this channel's, whoever supplied it.
             if evm_batch_channel_id(&domain, &channel.config) != channel_id {
-                return Err(ClaimIngestRejection::VoucherChannelConfigMismatch);
+                return Err(ClaimIngestRejection::VoucherChannelConfigMismatch {
+                    network: voucher.network.clone(),
+                });
             }
             let signer = evm_voucher_signer(&channel.config);
             if verify_evm_voucher(

@@ -430,6 +430,10 @@ impl HttpPeerTransport {
             body: prepare.encode(),
         };
         let voucher = matches!(rendered, Some((_, _, true)));
+        let sent_on = match &rendered {
+            Some((_, json, true)) => connector_peer_btp::claim_json::network_of(json),
+            _ => None,
+        };
         if let Some((header, json, _)) = rendered.as_ref() {
             request
                 .headers
@@ -472,11 +476,11 @@ impl HttpPeerTransport {
         // the body said about the packet. Absence and malformation both mean
         // not acknowledged, and an ack on a response to a request that
         // carried no voucher is ignored.
-        let ack = if voucher {
-            headers::claim_ack(&response.headers).unwrap_or(ClaimAckOutcome::NotSent)
-        } else {
-            ClaimAckOutcome::NotSent
-        };
+        // An ack is read as a verdict only for the network its voucher named
+        // (ADR 0086).
+        let ack = sent_on
+            .and_then(|network| headers::claim_ack(&response.headers, &network))
+            .unwrap_or(ClaimAckOutcome::NotSent);
 
         // A `402` with readable terms is the far node's client edge greeting
         // a claimless packet (#1481). It carries no ILP body, so the reject

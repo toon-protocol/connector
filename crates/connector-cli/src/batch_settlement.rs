@@ -25,6 +25,7 @@ use connector_client_edge::{
     ChannelLookupFailed, ChannelResolutionError, ChannelTerminal, ClientClaimGate,
     JournaledBatchChannel,
 };
+use connector_domain::Network;
 use connector_settlement::batch::{
     BatchChannelState, BatchSettlementBackend, BatchSettlementError, ChannelPresentation,
     EvmChannelConfig, HeldVoucher, HeldVouchers, Voucher, VoucherSigner,
@@ -38,7 +39,8 @@ use connector_signer::{BatchChannelConfig, BatchSettlementDomain};
 /// vouchers by name.
 pub(crate) struct BatchSettlementChannelsAdapter {
     evm: Option<EvmLeg>,
-    solana: Option<Arc<dyn BatchSettlementBackend>>,
+    /// The Solana backend, and the CAIP-2 network it reached at connect.
+    solana: Option<(Arc<dyn BatchSettlementBackend>, Network)>,
     /// Every channel this adapter has seen `admit` accept in this process.
     /// A backend also answers for channels it only **restored** -- ones the
     /// journal holds vouchers on, brought back at boot without judging them
@@ -61,7 +63,7 @@ impl BatchSettlementChannelsAdapter {
     /// every voucher by name, which is what "off unless configured" means.
     pub(crate) fn new(
         evm: Option<(Arc<dyn BatchSettlementBackend>, BatchSettlementDomain)>,
-        solana: Option<Arc<dyn BatchSettlementBackend>>,
+        solana: Option<(Arc<dyn BatchSettlementBackend>, Network)>,
     ) -> Option<BatchSettlementChannelsAdapter> {
         if evm.is_none() && solana.is_none() {
             return None;
@@ -89,8 +91,8 @@ impl BatchSettlementChannels for BatchSettlementChannelsAdapter {
         self.evm.as_ref().map(|leg| leg.domain)
     }
 
-    fn accepts_solana(&self) -> bool {
-        self.solana.is_some()
+    fn solana_network(&self) -> Option<Network> {
+        self.solana.as_ref().map(|(_, network)| network.clone())
     }
 
     /// An EVM channel is found only from its config: the contract stores a
@@ -119,7 +121,7 @@ impl BatchSettlementChannels for BatchSettlementChannelsAdapter {
         &self,
         channel_account: &[u8; 32],
     ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
-        let Some(backend) = &self.solana else {
+        let Some((backend, _)) = &self.solana else {
             return Ok(None);
         };
         let presentation = ChannelPresentation::Solana {

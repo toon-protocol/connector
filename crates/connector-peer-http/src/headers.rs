@@ -36,6 +36,7 @@ use connector_btp::{
     ProtocolData, ACCUMULATED_COST_HEADER, ACCUMULATED_COST_PROTOCOL, CLAIM_ACK_HEADER,
     CLAIM_HEADER, CONTENT_TYPE_TEXT, FLUSH_REQUESTED_HEADER, PEER_CHALLENGE_HEADER,
 };
+use connector_domain::Network;
 use connector_peer_btp::{ack, fields};
 use connector_runtime::ClaimAckOutcome;
 
@@ -269,8 +270,11 @@ pub fn peer_challenge_json(headers: &Headers) -> Option<Result<Vec<u8>, ClaimHea
 /// `ClaimRejectReason` → ack function both carriages call (I3), so a fifth
 /// reason cannot appear on one carriage and not the other.
 #[must_use]
-pub fn claim_ack_header_value(outcome: ClaimAckOutcome) -> Option<String> {
-    ack::encode(outcome).map(|json| STANDARD.encode(json))
+pub fn claim_ack_header_value(
+    outcome: ClaimAckOutcome,
+    network: Option<&Network>,
+) -> Option<String> {
+    ack::encode(outcome, network).map(|json| STANDARD.encode(json))
 }
 
 /// The verdict a response carries. **Absence and malformation both mean NOT
@@ -278,10 +282,10 @@ pub fn claim_ack_header_value(outcome: ClaimAckOutcome) -> Option<String> {
 /// every shape that is not exactly one of the two the spec names returns
 /// `None`, which a caller must never read as either verdict.
 #[must_use]
-pub fn claim_ack(headers: &Headers) -> Option<ClaimAckOutcome> {
+pub fn claim_ack(headers: &Headers, sent_on: &Network) -> Option<ClaimAckOutcome> {
     let value = headers.get(CLAIM_ACK_HEADER)?;
     let json = STANDARD.decode(value).ok()?;
-    ack::decode(&json)
+    ack::decode(&json, sent_on)
 }
 
 /// A REJECT's running cost (§5.2). **Absent means zero on receipt**, and a
@@ -333,6 +337,10 @@ fn entry(name: &str, data: &[u8]) -> ProtocolData {
 mod tests {
     use super::*;
     use connector_runtime::ClaimRejectReason;
+
+    fn net() -> Network {
+        Network::Eip155(84_532)
+    }
 
     fn with(name: &str, value: &str) -> Headers {
         let mut headers = Headers::new();
@@ -401,11 +409,18 @@ mod tests {
             ClaimAckOutcome::Rejected(ClaimRejectReason::AmountNotAdvancing),
             ClaimAckOutcome::Rejected(ClaimRejectReason::UnknownChannel),
         ] {
-            let value = claim_ack_header_value(outcome).expect("a judged claim is acknowledged");
+            let value = claim_ack_header_value(outcome, Some(&net()))
+                .expect("a judged claim is acknowledged");
             let decoded = STANDARD.decode(&value).expect("standard base64");
 
-            assert_eq!(decoded, ack::encode(outcome).expect("the same JSON"));
-            assert_eq!(claim_ack(&with(CLAIM_ACK_HEADER, &value)), Some(outcome));
+            assert_eq!(
+                decoded,
+                ack::encode(outcome, Some(&net())).expect("the same JSON")
+            );
+            assert_eq!(
+                claim_ack(&with(CLAIM_ACK_HEADER, &value), &net()),
+                Some(outcome)
+            );
         }
     }
 
@@ -413,31 +428,40 @@ mod tests {
     /// claim, so `NotSent` has no header value at all.
     #[test]
     fn a_request_that_carried_no_claim_is_answered_with_no_ack_header() {
-        assert_eq!(claim_ack_header_value(ClaimAckOutcome::NotSent), None);
+        assert_eq!(
+            claim_ack_header_value(ClaimAckOutcome::NotSent, Some(&net())),
+            None
+        );
     }
 
     /// §6.3: absence and malformation are the same "not acknowledged", and
     /// the base64 layer is one more way to be malformed.
     #[test]
     fn an_absent_or_malformed_ack_header_is_not_acknowledged() {
-        assert_eq!(claim_ack(&Headers::new()), None);
-        assert_eq!(claim_ack(&with(CLAIM_ACK_HEADER, "!!!")), None);
+        assert_eq!(claim_ack(&Headers::new(), &net()), None);
+        assert_eq!(claim_ack(&with(CLAIM_ACK_HEADER, "!!!"), &net()), None);
         assert_eq!(
-            claim_ack(&with(CLAIM_ACK_HEADER, &STANDARD.encode("not json"))),
+            claim_ack(
+                &with(CLAIM_ACK_HEADER, &STANDARD.encode("not json")),
+                &net()
+            ),
             None
         );
         assert_eq!(
-            claim_ack(&with(
-                CLAIM_ACK_HEADER,
-                &STANDARD.encode(r#"{"result":"maybe"}"#)
-            )),
+            claim_ack(
+                &with(CLAIM_ACK_HEADER, &STANDARD.encode(r#"{"result":"maybe"}"#)),
+                &net()
+            ),
             None
         );
         assert_eq!(
-            claim_ack(&with(
-                CLAIM_ACK_HEADER,
-                &STANDARD.encode(r#"{"result":"rejected"}"#)
-            )),
+            claim_ack(
+                &with(
+                    CLAIM_ACK_HEADER,
+                    &STANDARD.encode(r#"{"result":"rejected"}"#)
+                ),
+                &net()
+            ),
             None
         );
     }

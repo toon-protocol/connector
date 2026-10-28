@@ -28,7 +28,10 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
 
-use support::{paid_prepare, post_ilp, solana_voucher, spawn_recording_app, CLIENT_EDGE_JOURNAL};
+use support::{
+    paid_prepare, post_ilp, solana_network, solana_voucher, spawn_recording_app,
+    CLIENT_EDGE_JOURNAL,
+};
 
 const ROUTE: &str = "g.toon.batch";
 const PRICE: u64 = 100;
@@ -41,6 +44,7 @@ fn unaccepted_evm_voucher() -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": "eip155:31337",
         "scheme": "batch-settlement",
         "messageId": "voucher-evm",
         "timestamp": "2026-09-25T12:00:00.000Z",
@@ -130,7 +134,12 @@ price = {PRICE}
 
     let response = post_ilp(
         &app,
-        &solana_voucher(&channel.to_string(), PRICE, &payer.sign(&channel, PRICE)),
+        &solana_voucher(
+            &solana_network(&runtime),
+            &channel.to_string(),
+            PRICE,
+            &payer.sign(&channel, PRICE),
+        ),
         paid_prepare(ROUTE, &receiver),
     )
     .await;

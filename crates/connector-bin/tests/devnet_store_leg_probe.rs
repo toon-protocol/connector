@@ -460,6 +460,7 @@ impl Payer {
         let mut voucher = serde_json::json!({
             "version": "1.0",
             "blockchain": "evm",
+            "network": format!("eip155:{}", self.chain_id),
             "scheme": "batch-settlement",
             "messageId": format!("store-probe-{}", self.cumulative),
             // `Z`, not `+00:00`: the claim gate refuses a `+00:00` offset by

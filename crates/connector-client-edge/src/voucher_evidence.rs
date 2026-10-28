@@ -78,7 +78,9 @@ fn voucher_ack(rejection: &ClaimIngestRejection) -> ClaimAckOutcome {
         | ClaimIngestRejection::WrapUnsupported
         | ClaimIngestRejection::WrapFailed(_)
         | ClaimIngestRejection::BatchSettlementNotAccepted
-        | ClaimIngestRejection::VoucherChannelConfigMismatch => {
+        | ClaimIngestRejection::VoucherChannelConfigMismatch { .. }
+        | ClaimIngestRejection::NetworkMissing
+        | ClaimIngestRejection::NetworkNotSettled { .. } => {
             ClaimAckOutcome::Rejected(ClaimRejectReason::UnknownChannel)
         }
     }
@@ -191,6 +193,11 @@ impl ClientClaimGate {
 #[async_trait]
 impl VoucherEvidence for ClientClaimGate {
     async fn check_voucher(&self, voucher: &ClientClaim) -> VoucherCheck {
+        // ADR 0086 decision 1: a voucher on a network this node has no
+        // table for names no channel it could resolve.
+        if !self.settles_on(voucher.network()) {
+            return VoucherCheck::Unresolved;
+        }
         match voucher {
             ClientClaim::EvmVoucher(voucher) => {
                 let (Some(channel_id), Some(signature)) = (
@@ -264,8 +271,12 @@ impl VoucherEvidence for ClientClaimGate {
     }
 
     async fn check_challenge(&self, challenge: &PeerRoleChallenge) -> VoucherCheck {
+        if !self.settles_on(challenge.network()) {
+            return VoucherCheck::Unresolved;
+        }
         match challenge {
             PeerRoleChallenge::Evm {
+                network: _,
                 channel_id,
                 expires,
                 signature,
@@ -289,6 +300,7 @@ impl VoucherEvidence for ClientClaimGate {
                 .await
             }
             PeerRoleChallenge::Solana {
+                network: _,
                 channel_account,
                 expires,
                 signature,

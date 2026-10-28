@@ -55,6 +55,7 @@ impl VoucherStateSource for NothingAcceptedYet {
     async fn watermark(
         &self,
         _presentation: &ChannelPresentation,
+        _network: &connector_domain::Network,
         _expires: u64,
         _signature: &[u8],
     ) -> Result<u128, String> {

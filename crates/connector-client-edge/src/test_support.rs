@@ -35,6 +35,9 @@ pub(crate) const CHAIN_ID: u64 = 84_532;
 /// The Solana channel account the fake holds.
 pub(crate) const SOLANA_CHANNEL: [u8; 32] = [0xc3; 32];
 
+/// The Solana network the fake settles on: devnet's genesis prefix.
+pub(crate) const SOLANA_NETWORK: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+
 pub(crate) fn domain() -> BatchSettlementDomain {
     BatchSettlementDomain::x402(CHAIN_ID)
 }
@@ -115,6 +118,7 @@ pub(crate) fn evm_voucher_with(
     serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": format!("eip155:{CHAIN_ID}"),
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2026-09-25T12:00:00.000Z",
@@ -168,6 +172,7 @@ pub(crate) fn solana_voucher(amount: u64, signer: &ed25519_dalek::Keypair) -> St
     serde_json::json!({
         "version": "1.0",
         "blockchain": "solana",
+        "network": SOLANA_NETWORK,
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2026-09-25T12:00:00Z",
@@ -207,6 +212,7 @@ pub(crate) fn evm_challenge(secret: &SecretKey, expires: u64) -> serde_json::Val
     let digest = evm_voucher_claim_state_challenge_digest(&domain(), &channel_id(), expires);
     serde_json::json!({
         "blockchain": "evm",
+        "network": format!("eip155:{CHAIN_ID}"),
         "scheme": "batch-settlement",
         "channelId": format!("0x{}", hex::encode(channel_id())),
         "expires": expires,
@@ -224,6 +230,7 @@ pub(crate) fn solana_challenge(signer: &ed25519_dalek::Keypair, expires: u64) ->
     ));
     serde_json::json!({
         "blockchain": "solana",
+        "network": SOLANA_NETWORK,
         "scheme": "batch-settlement",
         "channelAccount": bs58::encode(SOLANA_CHANNEL).into_string(),
         "expires": expires,
@@ -284,8 +291,8 @@ impl BatchSettlementChannels for FakeBatchSettlement {
         Some(domain())
     }
 
-    fn accepts_solana(&self) -> bool {
-        true
+    fn solana_network(&self) -> Option<connector_domain::Network> {
+        Some(SOLANA_NETWORK.parse().expect("a CAIP-2 network"))
     }
 
     async fn evm(

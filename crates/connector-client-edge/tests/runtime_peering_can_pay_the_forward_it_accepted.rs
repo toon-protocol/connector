@@ -105,8 +105,8 @@ impl BatchSettlementChannels for PaysThisNode {
         Some(self.domain)
     }
 
-    fn accepts_solana(&self) -> bool {
-        false
+    fn solana_network(&self) -> Option<connector_domain::Network> {
+        None
     }
 
     async fn evm(

@@ -3306,6 +3306,22 @@ impl Connector {
                 hop.channel_id
             )));
         };
+        // ADR 0086 decision 1: every voucher and challenge names the network
+        // its channel is on -- this node's own network on the channel's
+        // chain, which its greeting publishes.
+        let Some(network) = presentation
+            .chain()
+            .parse::<SettlementChain>()
+            .ok()
+            .and_then(|chain| self.x402_network(chain))
+            .and_then(|network| network.parse::<connector_domain::Network>().ok())
+        else {
+            return Err(CoverError::Failed(format!(
+                "peer '{peer_id}' is paid over x402 channel {}, on a chain for which this node \
+                 publishes no CAIP-2 network to name on its vouchers",
+                hop.channel_id
+            )));
+        };
         // PF-26: every wait below ends at the packet's outgoing expiry, and
         // the expiry is read again after each one, so a packet that ran out
         // of time while this forward queued, asked, or both is refused
@@ -3333,7 +3349,7 @@ impl Connector {
                     match tokio::time::timeout(
                         budget,
                         hop.claim_state
-                            .watermark(&presentation, expires, &signature),
+                            .watermark(&presentation, &network, expires, &signature),
                     )
                     .await
                     {
@@ -3383,7 +3399,7 @@ impl Connector {
                 .map_err(|error| CoverError::Failed(error.to_string()))?;
             return Ok((
                 Covering::Challenge(
-                    challenge_entry(&presentation, expires, &signature).to_string(),
+                    challenge_entry(&presentation, &network, expires, &signature).to_string(),
                 ),
                 0,
             ));
@@ -3397,6 +3413,7 @@ impl Connector {
         Ok((
             Covering::Voucher(voucher_json(
                 &presentation,
+                &network,
                 &voucher,
                 &voucher_sender(&presentation),
                 &self
@@ -9591,6 +9608,7 @@ mod tests {
             async fn watermark(
                 &self,
                 _presentation: &ChannelPresentation,
+                _network: &connector_domain::Network,
                 _expires: u64,
                 signature: &[u8],
             ) -> Result<u128, String> {
@@ -9697,7 +9715,10 @@ mod tests {
         ) {
             let settles_on = match exit {
                 PayerExit::Withdrawal => (SettlementChain::Evm, "eip155:31337"),
-                PayerExit::Close => (SettlementChain::Solana, "solana:test"),
+                PayerExit::Close => (
+                    SettlementChain::Solana,
+                    "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+                ),
             };
             let chain = InMemoryBatchChain::new(exit);
             let payer = Arc::new(InMemoryBatchSettlement::on(
@@ -10218,7 +10239,12 @@ mod tests {
             let presentation = outbound.presentation(&channel).expect("the channel");
             let refused = hop
                 .claim_state
-                .watermark(&presentation, 0, &[1])
+                .watermark(
+                    &presentation,
+                    &connector_domain::Network::Eip155(84_532),
+                    0,
+                    &[1],
+                )
                 .await
                 .expect_err("no proxy, no dial");
             assert!(refused.contains("socks_proxy"), "{refused}");
@@ -10251,7 +10277,7 @@ mod tests {
                         channels: vec![RuntimePeerChannel::SolanaVoucher {
                             outbound_channel_id: channel.clone(),
                             voucher_signer: bs58::encode([0x02; 32]).into_string(),
-                            network: "solana:test".to_string(),
+                            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
                         }],
                         ..RuntimePeering::default()
                     },
@@ -10341,7 +10367,7 @@ mod tests {
                             RuntimePeerChannel::SolanaVoucher {
                                 outbound_channel_id: bs58::encode([0x03; 32]).into_string(),
                                 voucher_signer: bs58::encode([0x04; 32]).into_string(),
-                                network: "solana:test".to_string(),
+                                network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
                             },
                         ],
                         ..RuntimePeering::default()
@@ -10394,6 +10420,7 @@ mod tests {
             async fn watermark(
                 &self,
                 _presentation: &ChannelPresentation,
+                _network: &connector_domain::Network,
                 _expires: u64,
                 _signature: &[u8],
             ) -> Result<u128, String> {
@@ -10410,6 +10437,7 @@ mod tests {
             async fn watermark(
                 &self,
                 _presentation: &ChannelPresentation,
+                _network: &connector_domain::Network,
                 _expires: u64,
                 _signature: &[u8],
             ) -> Result<u128, String> {

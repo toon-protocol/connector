@@ -409,6 +409,7 @@ impl PeerFixture {
             .sign_voucher(&wallet, presentation.channel(), cumulative);
         connector_runtime::voucher_json(
             presentation,
+            &connector_domain::Network::Eip155(self.chain.x402.chain_id()),
             &Voucher {
                 cumulative_amount: cumulative,
                 signature,

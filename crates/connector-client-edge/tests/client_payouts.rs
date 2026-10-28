@@ -124,6 +124,7 @@ fn evm_voucher_by(secret: &SecretKey, amount: u64) -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": format!("eip155:{CHAIN_ID}"),
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2026-09-27T12:00:00.000Z",
@@ -151,6 +152,7 @@ fn client_solana_voucher(amount: u64) -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "solana",
+        "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2026-09-27T12:00:00Z",
@@ -174,8 +176,12 @@ impl BatchSettlementChannels for ClientChannels {
         Some(domain())
     }
 
-    fn accepts_solana(&self) -> bool {
-        true
+    fn solana_network(&self) -> Option<connector_domain::Network> {
+        Some(
+            "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                .parse()
+                .expect("a CAIP-2 network"),
+        )
     }
 
     async fn evm(
@@ -320,7 +326,15 @@ async fn serve(outbound: Arc<OutboundChannels>) -> SocketAddr {
     let gate = ClientClaimGate::restore(Arc::new(connector_runtime::InMemoryJournal::new()))
         .expect("an empty journal")
         .with_batch_settlement(Arc::new(ClientChannels))
-        .with_payout_ledger(Arc::new(ClientPayoutLedger::new(outbound)));
+        .with_payout_ledger(Arc::new(ClientPayoutLedger::new(
+            outbound,
+            vec![
+                connector_domain::Network::Eip155(CHAIN_ID),
+                "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                    .parse()
+                    .expect("a CAIP-2 network"),
+            ],
+        )));
     let app = connector_client_edge::router_with_gate(connector, signer, None, gate);
     let server = axum::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(app.into_make_service());
     let addr = server.local_addr();
@@ -544,6 +558,8 @@ fn payout_of(transfer: &Frame) -> (serde_json::Value, ChannelPresentation, Vouch
         .unwrap();
     let (presentation, signature) = match json["blockchain"].as_str().unwrap() {
         "evm" => {
+            // ADR 0086 decision 1: a payout voucher names its network.
+            assert_eq!(json["network"], format!("eip155:{CHAIN_ID}"));
             let config = &json["channelConfig"];
             let address = |field: &str| -> [u8; 20] {
                 hex::decode(config[field].as_str().unwrap().trim_start_matches("0x"))
@@ -572,6 +588,7 @@ fn payout_of(transfer: &Frame) -> (serde_json::Value, ChannelPresentation, Vouch
         }
         "solana" => {
             assert_eq!(json["expiresAt"], 0);
+            assert_eq!(json["network"], "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1");
             let signature = bs58::decode(json["signature"].as_str().unwrap())
                 .into_vec()
                 .unwrap();

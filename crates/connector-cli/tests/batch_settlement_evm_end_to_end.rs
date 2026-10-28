@@ -41,6 +41,7 @@ fn unaccepted_solana_voucher() -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "solana",
+        "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
         "scheme": "batch-settlement",
         "messageId": "voucher-solana",
         "timestamp": "2026-09-25T12:00:00Z",

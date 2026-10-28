@@ -1352,6 +1352,25 @@ fn batch_channels_for_operator(
     )))
 }
 
+/// This node's own CAIP-2 network on each chain it settles on, as its
+/// greeting publishes it: what every voucher it signs names (ADR 0086
+/// decision 1).
+fn x402_networks(runtime: &Runtime) -> Vec<Network> {
+    runtime
+        .batch_settlements
+        .iter()
+        .map(|terms| match terms {
+            connector_client_edge::X402BatchSettlementTerms::Evm(evm) => &evm.network,
+            connector_client_edge::X402BatchSettlementTerms::Solana(solana) => &solana.network,
+        })
+        .map(|network| {
+            network
+                .parse()
+                .expect("a connected backend publishes a CAIP-2 network")
+        })
+        .collect()
+}
+
 /// The claim gate's view of this node's batch-settlement backends (ADR
 /// 0074), or `None` when no chain has opted in -- and a gate given `None`
 /// refuses every voucher by name.
@@ -1363,10 +1382,15 @@ fn batch_settlement_channels(runtime: &Runtime) -> Option<BatchSettlementChannel
                 backend.domain(),
             )
         }),
-        runtime
-            .batch_settlement_solana
-            .as_ref()
-            .map(|backend| Arc::clone(backend) as Arc<dyn BatchSettlementBackend>),
+        runtime.batch_settlement_solana.as_ref().map(|backend| {
+            (
+                Arc::clone(backend) as Arc<dyn BatchSettlementBackend>,
+                backend
+                    .caip2_network()
+                    .parse()
+                    .expect("a connected Solana backend names a CAIP-2 network"),
+            )
+        }),
     )
 }
 
@@ -1641,6 +1665,7 @@ fn spawn_batch_settlement_watchers(runtime: &Runtime, gate: &Arc<ClientClaimGate
 fn client_claim_gate(
     config: &Config,
     outbound: Option<Arc<OutboundChannels>>,
+    networks: Vec<Network>,
 ) -> Result<ClientClaimGate, RuntimeError> {
     let (journal, path) = match config.state_dir() {
         Some(state_dir) => (
@@ -1670,7 +1695,9 @@ fn client_claim_gate(
                 .unwrap_or(budget.max_wait),
         });
     Ok(match outbound {
-        Some(outbound) => gate.with_payout_ledger(Arc::new(ClientPayoutLedger::new(outbound))),
+        Some(outbound) => {
+            gate.with_payout_ledger(Arc::new(ClientPayoutLedger::new(outbound, networks)))
+        }
         None => gate,
     })
 }
@@ -1745,7 +1772,11 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     // a receiver public key, a sender can wrap to no other one. No new
     // config section exists or is needed for this.
     let wrap_receiver_secret = Some(read_signer_secret(config.signer_key())?);
-    let mut claim_gate = client_claim_gate(config, runtime.outbound_channels.clone())?;
+    let mut claim_gate = client_claim_gate(
+        config,
+        runtime.outbound_channels.clone(),
+        x402_networks(runtime),
+    )?;
     // Vouchers are accepted on exactly the chains whose `batch_settlement`
     // table is written, and refused by name on the rest.
     if let Some(channels) = batch_settlement_channels(runtime) {
@@ -2175,6 +2206,7 @@ btp_endpoint = "wss://apex.example/ilp/btp"
             r#"{{
                 "version": "1.0",
                 "blockchain": "evm",
+                "network": "eip155:84532",
                 "scheme": "batch-settlement",
                 "messageId": "msg-1",
                 "timestamp": "2026-02-02T12:00:00.000Z",
@@ -2417,8 +2449,8 @@ key_file = "{}"
             fn evm_domain(&self) -> Option<BatchSettlementDomain> {
                 Some(BatchSettlementDomain::x402(84_532))
             }
-            fn accepts_solana(&self) -> bool {
-                false
+            fn solana_network(&self) -> Option<connector_domain::Network> {
+                None
             }
             async fn evm(
                 &self,
@@ -2453,7 +2485,7 @@ key_file = "{}"
         });
 
         let backend = Arc::new(EmptyCountingBackend::default());
-        let gate = client_claim_gate(&config, None)
+        let gate = client_claim_gate(&config, None, Vec::new())
             .expect("a fresh in-memory journal has nothing to replay")
             .with_batch_settlement(backend.clone());
 
@@ -2464,6 +2496,7 @@ key_file = "{}"
             serde_json::json!({
                 "version": "1.0",
                 "blockchain": "evm",
+                "network": "eip155:84532",
                 "scheme": "batch-settlement",
                 "messageId": format!("msg-{n}"),
                 "timestamp": "2026-02-02T12:00:00.000Z",
@@ -2591,7 +2624,7 @@ key_file = "{key_path}"
             )
         });
 
-        client_claim_gate(&config, None).expect("a writable state_dir produces a gate");
+        client_claim_gate(&config, None, Vec::new()).expect("a writable state_dir produces a gate");
         assert!(
             state_dir.path().join(CLIENT_EDGE_JOURNAL).exists(),
             "the journal file is created at startup, not lazily at the first claim"
@@ -2622,7 +2655,7 @@ key_file = "{key_path}"
             )
         });
 
-        let Err(error) = client_claim_gate(&config, None) else {
+        let Err(error) = client_claim_gate(&config, None, Vec::new()) else {
             panic!("an unusable state_dir must not produce a gate");
         };
         assert!(matches!(error, RuntimeError::StateDirUnusable { .. }));
@@ -2658,7 +2691,7 @@ key_file = "{key_path}"
             )
         });
 
-        let Err(error) = client_claim_gate(&config, None) else {
+        let Err(error) = client_claim_gate(&config, None, Vec::new()) else {
             panic!("a corrupt journal must not produce a gate");
         };
         assert!(matches!(error, RuntimeError::JournalUnreplayable { .. }));

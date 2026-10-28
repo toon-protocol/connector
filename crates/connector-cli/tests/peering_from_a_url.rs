@@ -774,6 +774,7 @@ async fn the_ack_carries_each_vouchers_verdict(chain: &Chain, a: &Node, b: &Node
     let as_json = |voucher: &Voucher| {
         connector_runtime::voucher_json(
             &presentation,
+            &connector_domain::Network::Eip155(chain.x402.chain_id()),
             voucher,
             &spelled(b.settlement_address()),
             "2026-09-28T00:00:00.000Z",

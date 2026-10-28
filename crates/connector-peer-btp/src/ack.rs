@@ -7,9 +7,15 @@
 //! raw UTF-8 JSON:
 //!
 //! ```json
-//! { "result": "accepted" }
-//! { "result": "rejected", "reason": "signature_invalid" }
+//! { "result": "accepted", "network": "eip155:8453" }
+//! { "result": "rejected", "reason": "signature_invalid", "network": "eip155:8453" }
 //! ```
+//!
+//! **`network` names the network of the voucher judged** (ADR 0086
+//! decision 1, `schema_version` 10), so a payer on several networks reads a
+//! verdict only for the voucher it sent: [`decode`] takes the network that
+//! voucher named and reads an ack naming any other -- or none -- as not
+//! acknowledged.
 //!
 //! **One refusal taxonomy** (spec I3): [`ClaimRejectReason`] → this JSON is
 //! the single function [`encode`], called by whichever carriage is
@@ -26,6 +32,7 @@
 //! and a caller must never read `None` as either verdict.
 
 use connector_btp::{ProtocolData, CLAIM_ACK_PROTOCOL, CONTENT_TYPE_TEXT};
+use connector_domain::Network;
 use connector_runtime::{ClaimAckOutcome, ClaimRejectReason};
 
 /// The wire spelling of each of `peer-semantics-pre-868.md` §3.4's four reasons
@@ -62,12 +69,18 @@ pub fn reason_from_name(name: &str) -> Option<ClaimRejectReason> {
 /// two examples §6.1 pins or the ones this module's own header quotes.
 /// §10.2 vectors the ack, and a vector that disagreed with the prose it
 /// vectors would be a spec bug found the expensive way.
-pub fn encode(outcome: ClaimAckOutcome) -> Option<Vec<u8>> {
+///
+/// `network` is the judged voucher's own: an ack names it (ADR 0086), and
+/// with none -- no voucher was judged -- there is nothing to acknowledge.
+pub fn encode(outcome: ClaimAckOutcome, network: Option<&Network>) -> Option<Vec<u8>> {
+    let network = network?;
     let json = match outcome {
         ClaimAckOutcome::NotSent => return None,
-        ClaimAckOutcome::Accepted => r#"{"result":"accepted"}"#.to_string(),
+        ClaimAckOutcome::Accepted => {
+            format!(r#"{{"result":"accepted","network":"{network}"}}"#)
+        }
         ClaimAckOutcome::Rejected(reason) => format!(
-            r#"{{"result":"rejected","reason":"{}"}}"#,
+            r#"{{"result":"rejected","reason":"{}","network":"{network}"}}"#,
             reason_name(reason)
         ),
     };
@@ -76,8 +89,8 @@ pub fn encode(outcome: ClaimAckOutcome) -> Option<Vec<u8>> {
 
 /// The `claim-ack` protocolData entry for a judged claim, or `None` when
 /// there is nothing to acknowledge.
-pub fn protocol_data(outcome: ClaimAckOutcome) -> Option<ProtocolData> {
-    encode(outcome).map(|data| ProtocolData {
+pub fn protocol_data(outcome: ClaimAckOutcome, network: Option<&Network>) -> Option<ProtocolData> {
+    encode(outcome, network).map(|data| ProtocolData {
         name: CLAIM_ACK_PROTOCOL.to_string(),
         content_type: CONTENT_TYPE_TEXT,
         data,
@@ -89,8 +102,15 @@ pub fn protocol_data(outcome: ClaimAckOutcome) -> Option<ProtocolData> {
 /// spec names -- it is never a verdict of its own, and a caller that turns
 /// it into `Accepted` or `Rejected` has broken the rule that stands between
 /// a lost ack and a permanently wedged peering.
-pub fn decode(bytes: &[u8]) -> Option<ClaimAckOutcome> {
+///
+/// `sent_on` is the network the answered voucher named: an ack naming
+/// another, or none, is not acknowledged (ADR 0086).
+pub fn decode(bytes: &[u8], sent_on: &Network) -> Option<ClaimAckOutcome> {
     let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let network: Network = json.get("network")?.as_str()?.parse().ok()?;
+    if network != *sent_on {
+        return None;
+    }
     match json.get("result")?.as_str()? {
         "accepted" => Some(ClaimAckOutcome::Accepted),
         "rejected" => {
@@ -106,23 +126,58 @@ pub fn decode(bytes: &[u8]) -> Option<ClaimAckOutcome> {
 /// caller cannot distinguish "the peer chose to say nothing" from "the peer
 /// said something we could not read" -- and §6.3 requires it does not have
 /// to.
-pub fn from_protocol_data(protocol_data: &[ProtocolData]) -> Option<ClaimAckOutcome> {
+pub fn from_protocol_data(
+    protocol_data: &[ProtocolData],
+    sent_on: &Network,
+) -> Option<ClaimAckOutcome> {
     let entry = protocol_data
         .iter()
         .find(|pd| pd.name == CLAIM_ACK_PROTOCOL)?;
-    decode(&entry.data)
+    decode(&entry.data, sent_on)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn network() -> Network {
+        Network::Eip155(84_532)
+    }
+
     #[test]
-    fn an_accepted_ack_is_the_two_field_json_the_spec_pins() {
-        let bytes = encode(ClaimAckOutcome::Accepted).expect("a judged claim is acknowledged");
+    fn an_accepted_ack_is_the_json_the_spec_pins() {
+        let bytes = encode(ClaimAckOutcome::Accepted, Some(&network()))
+            .expect("a judged claim is acknowledged");
+        assert_eq!(
+            String::from_utf8(bytes.clone()).expect("utf-8"),
+            r#"{"result":"accepted","network":"eip155:84532"}"#
+        );
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
-        assert_eq!(json["result"], "accepted");
         assert!(json.get("reason").is_none(), "accepted carries no reason");
+    }
+
+    /// ADR 0086: an ack names the network of the voucher it judged, and is
+    /// read as a verdict only for that network. One naming another, or
+    /// none -- an ack from a node that predates `schema_version` 10 -- is
+    /// not acknowledged.
+    #[test]
+    fn an_ack_is_a_verdict_only_on_the_network_its_voucher_was_sent_on() {
+        let rejected = ClaimAckOutcome::Rejected(ClaimRejectReason::AmountNotAdvancing);
+        let bytes = encode(rejected, Some(&network())).expect("judged");
+        assert_eq!(
+            String::from_utf8(bytes.clone()).expect("utf-8"),
+            r#"{"result":"rejected","reason":"amount_not_advancing","network":"eip155:84532"}"#
+        );
+        assert_eq!(decode(&bytes, &network()), Some(rejected));
+        assert_eq!(decode(&bytes, &Network::Eip155(31_337)), None);
+        assert_eq!(decode(br#"{"result":"accepted"}"#, &network()), None);
+    }
+
+    /// An ack answers a voucher, and a voucher always names its network:
+    /// with no network to name there is nothing to acknowledge.
+    #[test]
+    fn there_is_no_ack_without_a_network() {
+        assert_eq!(encode(ClaimAckOutcome::Accepted, None), None);
     }
 
     #[test]
@@ -133,8 +188,12 @@ mod tests {
             ClaimRejectReason::AmountNotAdvancing,
             ClaimRejectReason::UnknownChannel,
         ] {
-            let bytes = encode(ClaimAckOutcome::Rejected(reason)).expect("judged");
-            assert_eq!(decode(&bytes), Some(ClaimAckOutcome::Rejected(reason)));
+            let bytes =
+                encode(ClaimAckOutcome::Rejected(reason), Some(&network())).expect("judged");
+            assert_eq!(
+                decode(&bytes, &network()),
+                Some(ClaimAckOutcome::Rejected(reason))
+            );
         }
     }
 
@@ -142,8 +201,11 @@ mod tests {
     /// that carried no claim, so there is no encoding for `NotSent`.
     #[test]
     fn a_frame_that_carried_no_claim_is_answered_with_no_ack_entry() {
-        assert_eq!(encode(ClaimAckOutcome::NotSent), None);
-        assert_eq!(protocol_data(ClaimAckOutcome::NotSent), None);
+        assert_eq!(encode(ClaimAckOutcome::NotSent, Some(&network())), None);
+        assert_eq!(
+            protocol_data(ClaimAckOutcome::NotSent, Some(&network())),
+            None
+        );
     }
 
     /// §6.3: every malformed shape is *not acknowledged* -- never a
@@ -159,7 +221,11 @@ mod tests {
             br#"{"result":123}"#,
             br#"[]"#,
         ] {
-            assert_eq!(decode(malformed), None, "got a verdict from {malformed:?}");
+            assert_eq!(
+                decode(malformed, &network()),
+                None,
+                "got a verdict from {malformed:?}"
+            );
         }
     }
 
@@ -173,17 +239,17 @@ mod tests {
             data: b"7".to_vec(),
         }];
 
-        assert_eq!(from_protocol_data(&unrelated), None);
-        assert_eq!(from_protocol_data(&[]), None);
+        assert_eq!(from_protocol_data(&unrelated, &network()), None);
+        assert_eq!(from_protocol_data(&[], &network()), None);
     }
 
     #[test]
     fn an_ack_entry_is_read_back_off_the_response_it_rode() {
-        let entry = protocol_data(ClaimAckOutcome::Accepted).expect("judged");
+        let entry = protocol_data(ClaimAckOutcome::Accepted, Some(&network())).expect("judged");
         assert_eq!(entry.name, CLAIM_ACK_PROTOCOL);
 
         assert_eq!(
-            from_protocol_data(&[entry]),
+            from_protocol_data(&[entry], &network()),
             Some(ClaimAckOutcome::Accepted)
         );
     }

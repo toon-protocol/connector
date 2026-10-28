@@ -52,7 +52,7 @@ use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::VersionedTransaction;
 use tower::ServiceExt;
 
-use support::{paid_prepare, post_ilp, solana_voucher, spawn_recording_app};
+use support::{paid_prepare, post_ilp, solana_network, solana_voucher, spawn_recording_app};
 
 const SPONSOR_PATH: &str = "/ilp/batch-settlement/solana/open";
 const ROUTE: &str = "g.toon.sponsored";
@@ -506,7 +506,12 @@ price = {PRICE}
     // The channel it opened pays for a write.
     let response = post_ilp(
         &app,
-        &solana_voucher(&channel.to_string(), PRICE, &payer.sign(&channel, PRICE)),
+        &solana_voucher(
+            &solana_network(&runtime),
+            &channel.to_string(),
+            PRICE,
+            &payer.sign(&channel, PRICE),
+        ),
         paid_prepare(ROUTE, &receiver),
     )
     .await;

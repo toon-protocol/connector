@@ -517,10 +517,12 @@ impl BtpPeerTransport {
         // challenge rides a slot of its own (§1.4), because it is not a
         // claim.
         let mut entries = Vec::new();
+        // The network the voucher names: its ack is read as a verdict only
+        // for that network (ADR 0086).
         let voucher = match covering {
             Some(Covering::Voucher(json)) => {
                 entries.push(claim_json::protocol_data(&json));
-                true
+                claim_json::network_of(&json)
             }
             Some(Covering::Challenge(json)) => {
                 entries.push(ProtocolData {
@@ -528,9 +530,9 @@ impl BtpPeerTransport {
                     content_type: CONTENT_TYPE_TEXT,
                     data: json.into_bytes(),
                 });
-                false
+                None
             }
-            None => false,
+            None => None,
         };
         // §8.1: `data` rides byte-for-byte unchanged. `Prepare::encode` is
         // the same OER encoding every other carriage puts on a wire, and
@@ -565,11 +567,9 @@ impl BtpPeerTransport {
         // the `ilpPacket` said about the packet. Absence and malformation
         // both mean not acknowledged, and an ack on a response to a frame
         // that carried no voucher is ignored.
-        let ack = if voucher {
-            ack::from_protocol_data(&frame.protocol_data).unwrap_or(ClaimAckOutcome::NotSent)
-        } else {
-            ClaimAckOutcome::NotSent
-        };
+        let ack = voucher
+            .and_then(|network| ack::from_protocol_data(&frame.protocol_data, &network))
+            .unwrap_or(ClaimAckOutcome::NotSent);
         match decode_answer(&frame) {
             // The terms are read and REPORTED here, not acted on: turning a
             // quote into a payment is the forwarding path's decision to make

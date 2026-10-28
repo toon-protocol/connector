@@ -205,6 +205,10 @@ pub enum RefusedEvidence {
     /// `toon-channel` claim. Refused rather than read as absent, so a
     /// straggling peer is told why rather than silently downgraded.
     ToonChannelClaim,
+    /// A voucher with no `network` (ADR 0086 decision 1): refused by name
+    /// for the same reason, so a peer that predates `schema_version` 10
+    /// learns it must upgrade.
+    NetworkMissingClaim,
 }
 
 impl RefusedEvidence {
@@ -239,6 +243,11 @@ impl RefusedEvidence {
             }
             RefusedEvidence::ToonChannelClaim => {
                 connector_domain::client_claim::ClientClaimError::ToonChannel
+                    .to_string()
+                    .into_bytes()
+            }
+            RefusedEvidence::NetworkMissingClaim => {
+                connector_domain::client_claim::ClientClaimError::NetworkMissing
                     .to_string()
                     .into_bytes()
             }
@@ -295,6 +304,10 @@ pub fn decode_claim(raw: &[u8]) -> Result<Option<ClientClaim>, RefusedEvidence> 
         Err(ClaimDecodeError::ToonChannel) => {
             tracing::warn!("refusing a toon-channel claim: ADR 0075 retired the scheme");
             Err(RefusedEvidence::ToonChannelClaim)
+        }
+        Err(ClaimDecodeError::NetworkMissing) => {
+            tracing::warn!("refusing a voucher with no 'network': ADR 0086 requires one");
+            Err(RefusedEvidence::NetworkMissingClaim)
         }
         Err(error) => {
             // No peer id to name: the claim *is* what would have named one,

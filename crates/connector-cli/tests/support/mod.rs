@@ -128,6 +128,10 @@ fn address(bytes: &[u8; 20]) -> String {
 
 /// An EVM voucher on the wire, as x402's payload names its fields. The
 /// channel's first voucher carries its config; later ones need not.
+/// The CAIP-2 network of every disposable anvil these tests spawn with
+/// `Anvil::spawn`: chain id 31337.
+pub const ANVIL_NETWORK: &str = "eip155:31337";
+
 pub fn evm_voucher(
     channel: &ChannelId,
     amount: u64,
@@ -137,6 +141,7 @@ pub fn evm_voucher(
     let mut voucher = serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": ANVIL_NETWORK,
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2026-09-25T12:00:00.000Z",
@@ -161,10 +166,23 @@ pub fn evm_voucher(
 
 /// A Solana voucher on the wire, as x402's payload names its fields.
 /// `channel` is the channel account, base58.
-pub fn solana_voucher(channel: &str, amount: u64, signature: &[u8; 64]) -> String {
+/// The CAIP-2 network `runtime`'s Solana backend reached: a
+/// `solana-test-validator`'s genesis is fresh every spawn, so a voucher on
+/// it names the network read from the chain (ADR 0086 decision 1).
+pub fn solana_network(runtime: &connector_cli::Runtime) -> String {
+    runtime
+        .batch_settlement_solana
+        .as_ref()
+        .expect("the node settles on Solana")
+        .caip2_network()
+}
+
+/// `network` is the CAIP-2 network the channel is on ([`solana_network`]).
+pub fn solana_voucher(network: &str, channel: &str, amount: u64, signature: &[u8; 64]) -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "solana",
+        "network": network,
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2026-09-25T12:00:00Z",

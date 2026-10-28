@@ -21,7 +21,7 @@ use connector_client_edge::{
     BatchSettlementChannels, ChannelResolutionError, ClaimIngestRejection, ClientClaimGate,
     JournaledBatchChannel, UnresolvableLookupBudgetPolicy,
 };
-use connector_domain::{JournalEntry, Watermark, VOUCHER_WATERMARK_NONCE};
+use connector_domain::{JournalEntry, Network, Watermark, VOUCHER_WATERMARK_NONCE};
 use connector_runtime::{FileJournal, InMemoryJournal, Journal};
 use connector_signer::{
     derive_evm_address, evm_batch_channel_id, evm_voucher_digest, solana_voucher_message,
@@ -89,6 +89,7 @@ fn evm_voucher(amount: u128, signature: &str, config: Option<&BatchChannelConfig
     let mut voucher = serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": format!("eip155:{CHAIN_ID}"),
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2026-09-25T12:00:00.000Z",
@@ -113,6 +114,9 @@ fn signed_evm_voucher(amount: u128) -> String {
 
 const SOLANA_CHANNEL: [u8; 32] = [0xc3; 32];
 
+/// The Solana network this node settles on: devnet's genesis prefix.
+const SOLANA_NETWORK: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+
 fn solana_signer() -> ed25519_dalek::Keypair {
     let secret = ed25519_dalek::SecretKey::from_bytes(&[0x21; 32]).expect("seed");
     let public = (&secret).into();
@@ -124,6 +128,7 @@ fn solana_voucher(amount: u64, signer: &ed25519_dalek::Keypair, expires_at: i64)
     serde_json::json!({
         "version": "1.0",
         "blockchain": "solana",
+        "network": SOLANA_NETWORK,
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2026-09-25T12:00:00Z",
@@ -175,8 +180,8 @@ impl BatchSettlementChannels for FakeBatchSettlement {
         Some(domain())
     }
 
-    fn accepts_solana(&self) -> bool {
-        true
+    fn solana_network(&self) -> Option<Network> {
+        Some(SOLANA_NETWORK.parse().expect("a CAIP-2 network"))
     }
 
     async fn evm(
@@ -245,6 +250,155 @@ async fn a_node_that_has_not_opted_in_refuses_a_voucher_by_name() {
     assert!(ClaimIngestRejection::BatchSettlementNotAccepted
         .message()
         .contains("does not settle on"));
+}
+
+// -- The voucher's network (ADR 0086 decision 1, #1599) --
+
+/// Refused by name on a node that settles on one network per chain, and
+/// before the backend is asked anything: the rule does not change when an
+/// operator adds a network.
+#[tokio::test]
+async fn a_voucher_with_no_network_is_refused_by_name_on_a_single_network_node() {
+    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let (gate, _journal) = gate_with(&backend);
+    let evm = signed_evm_voucher(100).replace(r#""network":"eip155:84532","#, "");
+    let solana = solana_voucher(100, &solana_signer(), 0)
+        .replace(&format!(r#""network":"{SOLANA_NETWORK}","#), "");
+    for voucher in [evm, solana] {
+        assert!(!voucher.contains("network"), "{voucher}");
+        let refused = gate.ingest(&voucher, 0).await.unwrap_err();
+        assert_eq!(refused, ClaimIngestRejection::NetworkMissing);
+        assert!(
+            refused.message().contains("'network'"),
+            "{}",
+            refused.message()
+        );
+    }
+    assert_eq!(backend.lookups(), 0);
+}
+
+/// A network the voucher's family is right for, but on which this node has
+/// no settlement table: refused naming it, before any lookup.
+#[tokio::test]
+async fn a_voucher_on_a_network_this_node_has_no_table_for_is_refused_by_name() {
+    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let (gate, _journal) = gate_with(&backend);
+    let base = signed_evm_voucher(100).replace("eip155:84532", "eip155:8453");
+    let mainnet_beta = solana_voucher(100, &solana_signer(), 0)
+        .replace(SOLANA_NETWORK, "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp");
+    for (voucher, network) in [
+        (base, "eip155:8453"),
+        (mainnet_beta, "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"),
+    ] {
+        let refused = gate.ingest(&voucher, 0).await.unwrap_err();
+        assert_eq!(
+            refused,
+            ClaimIngestRejection::NetworkNotSettled {
+                network: network.parse().expect("a CAIP-2 network")
+            }
+        );
+        assert!(refused.message().contains(network), "{}", refused.message());
+    }
+    assert_eq!(backend.lookups(), 0);
+}
+
+/// ADR 0086 decision 1: a voucher's `network` is checked by recomputing its
+/// channel id under that network's EIP-712 domain. A channel opened under
+/// chain 31337's domain, presented as a voucher on this node's own 84532, is
+/// refused naming the network it claimed -- and nothing is credited.
+#[tokio::test]
+async fn an_evm_voucher_whose_network_is_not_its_channels_domain_is_refused() {
+    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let (gate, _journal) = gate_with(&backend);
+    let elsewhere = BatchSettlementDomain::x402(31_337);
+    let channel = evm_batch_channel_id(&elsewhere, &config());
+    let digest = evm_voucher_digest(&elsewhere, &channel, 100);
+    let (signature, recovery) = libsecp256k1::sign(&Message::parse(&digest), &authorizer());
+    let mut signature = signature.serialize().to_vec();
+    signature.push(recovery.serialize() + 27);
+    let voucher = serde_json::json!({
+        "version": "1.0",
+        "blockchain": "evm",
+        "network": "eip155:84532",
+        "scheme": "batch-settlement",
+        "messageId": "voucher-elsewhere",
+        "timestamp": "2026-09-25T12:00:00.000Z",
+        "senderId": "client-1",
+        "channelId": format!("0x{}", hex::encode(channel)),
+        "maxClaimableAmount": "100",
+        "signature": format!("0x{}", hex::encode(signature)),
+        "channelConfig": config_json(&config()),
+    })
+    .to_string();
+
+    let refused = gate.ingest(&voucher, 0).await.unwrap_err();
+    assert_eq!(
+        refused,
+        ClaimIngestRejection::VoucherChannelConfigMismatch {
+            network: Network::Eip155(CHAIN_ID)
+        }
+    );
+    assert!(
+        refused.message().contains("eip155:84532"),
+        "{}",
+        refused.message()
+    );
+    assert_eq!(backend.lookups(), 0);
+    assert_eq!(
+        gate.watermark(&format!("evm:0x{}", hex::encode(channel))),
+        None
+    );
+}
+
+/// Schema 10's `claim_network` refusals (issue #1599), replayed from the
+/// committed artifact against this gate -- a node on [`CHAIN_ID`] and
+/// [`SOLANA_NETWORK`]. The vector's refusals are each made before any
+/// channel is looked up, so the fake's own channels play no part.
+#[tokio::test]
+async fn the_committed_claim_network_refusals_match_the_real_gate() {
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("../../../vectors/wire-vectors.json")).expect("JSON");
+    let mut replayed = 0;
+    for case in vectors["claim_network"]["cases"].as_array().expect("cases") {
+        let name = case["name"].as_str().expect("name");
+        let node: Vec<&str> = case["node_networks"]
+            .as_array()
+            .expect("node_networks")
+            .iter()
+            .map(|network| network.as_str().expect("a string"))
+            .collect();
+        let expected = match case["outcome"].as_str().expect("outcome") {
+            "network_not_settled" => {
+                let claim = connector_domain::client_claim::parse_client_claim(
+                    case["claim_json"].as_str().unwrap(),
+                )
+                .expect("parses");
+                ClaimIngestRejection::NetworkNotSettled {
+                    network: claim.network().clone(),
+                }
+            }
+            "network_domain_mismatch" => ClaimIngestRejection::VoucherChannelConfigMismatch {
+                network: Network::Eip155(CHAIN_ID),
+            },
+            // Acceptance on two EVM networks at once needs a two-network
+            // node (#1601); the vector's own replay pins those verdicts.
+            _ => continue,
+        };
+        assert!(
+            node.contains(&"eip155:84532") && node.contains(&SOLANA_NETWORK),
+            "case {name} is judged by a node this gate stands in for"
+        );
+        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let (gate, _journal) = gate_with(&backend);
+        let refused = gate
+            .ingest(case["claim_json"].as_str().expect("claim_json"), 0)
+            .await
+            .unwrap_err();
+        assert_eq!(refused, expected, "case {name}");
+        assert_eq!(backend.lookups(), 0, "case {name}");
+        replayed += 1;
+    }
+    assert_eq!(replayed, 3);
 }
 
 // -- EVM --
@@ -433,7 +587,9 @@ async fn a_config_that_does_not_hash_to_the_channel_is_refused() {
         )
         .await
         .unwrap_err(),
-        ClaimIngestRejection::VoucherChannelConfigMismatch
+        ClaimIngestRejection::VoucherChannelConfigMismatch {
+            network: Network::Eip155(CHAIN_ID)
+        }
     );
     assert_eq!(backend.lookups(), 0);
 }
@@ -830,6 +986,7 @@ mod claim_state {
     fn evm_entry(signature: String, config: Option<&BatchChannelConfig>) -> serde_json::Value {
         let mut entry = serde_json::json!({
             "blockchain": "evm",
+            "network": format!("eip155:{CHAIN_ID}"),
             "scheme": "batch-settlement",
             "channelId": format!("0x{}", hex::encode(channel_id())),
             "expires": EXPIRES,
@@ -845,6 +1002,7 @@ mod claim_state {
         let message = solana_voucher_claim_state_challenge_message(&SOLANA_CHANNEL, EXPIRES);
         serde_json::json!({
             "blockchain": "solana",
+            "network": SOLANA_NETWORK,
             "scheme": "batch-settlement",
             "channelAccount": bs58::encode(SOLANA_CHANNEL).into_string(),
             "expires": EXPIRES,
@@ -902,6 +1060,7 @@ mod claim_state {
             entry,
             serde_json::json!({
                 "blockchain": "evm",
+                "network": "eip155:84532",
                 "channelId": format!("0x{}", hex::encode(channel_id())),
                 "ok": true,
                 "scheme": "batch-settlement",
@@ -911,6 +1070,55 @@ mod claim_state {
                 "lastClaimTime": null,
             })
         );
+    }
+
+    /// ADR 0086 decision 1: a claim-state entry names its network, as a
+    /// voucher does. One with none is refused by name, on both chains and
+    /// before any lookup.
+    #[tokio::test]
+    async fn an_entry_with_no_network_is_refused_by_name() {
+        for entry in [
+            evm_entry(evm_challenge(&authorizer(), channel_id()), Some(&config())),
+            solana_entry(&solana_signer()),
+        ] {
+            let backend = Arc::new(FakeBatchSettlement::new(1_000));
+            let (gate, _journal) = gate_with(&backend);
+            let mut entry = entry;
+            entry.as_object_mut().unwrap().remove("network");
+
+            let answer = claim_state(gate, entry).await;
+
+            assert_eq!(answer["ok"], false);
+            assert_eq!(answer["error"], "network-missing");
+            assert_eq!(backend.lookups(), 0);
+        }
+    }
+
+    /// An entry on a network this node has no table for is refused naming
+    /// that network, before any lookup.
+    #[tokio::test]
+    async fn an_entry_on_a_network_this_node_does_not_settle_on_is_refused_by_name() {
+        for (mut entry, network) in [
+            (
+                evm_entry(evm_challenge(&authorizer(), channel_id()), Some(&config())),
+                "eip155:8453",
+            ),
+            (
+                solana_entry(&solana_signer()),
+                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+            ),
+        ] {
+            let backend = Arc::new(FakeBatchSettlement::new(1_000));
+            let (gate, _journal) = gate_with(&backend);
+            entry["network"] = network.into();
+
+            let answer = claim_state(gate, entry).await;
+
+            assert_eq!(answer["ok"], false);
+            assert_eq!(answer["error"], "network-not-settled");
+            assert_eq!(answer["network"], network);
+            assert_eq!(backend.lookups(), 0);
+        }
     }
 
     /// The case the endpoint exists for: the connector restarted too, and
@@ -1108,6 +1316,7 @@ mod claim_state {
             entry,
             serde_json::json!({
                 "blockchain": "solana",
+                "network": SOLANA_NETWORK,
                 "channelId": bs58::encode(SOLANA_CHANNEL).into_string(),
                 "ok": true,
                 "scheme": "batch-settlement",
@@ -1133,9 +1342,10 @@ mod claim_state {
     }
 
     /// ADR 0074 decision 1: a node that has not opted in knows no voucher
-    /// channel, and says no more than that.
+    /// channel, and says no more than that: it settles on no network (ADR
+    /// 0086 decision 1), which is a fact about the node, not the channel.
     #[tokio::test]
-    async fn a_node_that_has_not_opted_in_answers_unverified() {
+    async fn a_node_that_has_not_opted_in_answers_that_it_settles_on_no_network() {
         let gate =
             ClientClaimGate::restore(Arc::new(InMemoryJournal::new())).expect("an empty journal");
 
@@ -1145,7 +1355,7 @@ mod claim_state {
         )
         .await;
 
-        assert_eq!(entry["error"], "unverified");
+        assert_eq!(entry["error"], "network-not-settled");
     }
 
     // -- A peer's voucher channel (ADR 0075 decisions 5 and 6, issue #1377) --

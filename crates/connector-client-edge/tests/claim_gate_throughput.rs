@@ -85,8 +85,8 @@ impl BatchSettlementChannels for Channels {
         Some(domain())
     }
 
-    fn accepts_solana(&self) -> bool {
-        false
+    fn solana_network(&self) -> Option<connector_domain::Network> {
+        None
     }
 
     async fn evm(
@@ -143,6 +143,7 @@ fn signed_claim_json(secret: &SecretKey, session: u32, amount: u64) -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": "eip155:84532",
         "scheme": "batch-settlement",
         "messageId": format!("msg-{amount}"),
         "timestamp": "2026-02-02T12:00:00.000Z",
