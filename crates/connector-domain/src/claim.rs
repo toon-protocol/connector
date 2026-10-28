@@ -44,6 +44,11 @@ pub enum ClaimError {
         "claim advances value by {advanced}, less than the terminated route's price of {price}"
     )]
     Underpayment { advanced: u128, price: u64 },
+
+    /// An allowance claim above its allowance's budget `b` (ADR 0080
+    /// decision 2): the cap is on the cumulative amount signed.
+    #[error("allowance claim amount {claimed} exceeds the allowance's budget of {budget}")]
+    OverBudget { claimed: u128, budget: u64 },
 }
 
 /// Whether a claim of `cumulative_amount` advances value past `watermark` by
@@ -176,6 +181,30 @@ pub fn validate_voucher(
     Ok(VoucherAdmission::Advances { advanced })
 }
 
+/// An **allowance claim** under a voucher's rules (ADR 0080 decision 2):
+/// exactly [`validate_voucher`] -- strictly above the watermark, an advance
+/// covering `charge`, a byte-identical resend at no charge buying nothing --
+/// and then a cumulative amount no greater than the allowance's `budget`,
+/// else [`ClaimError::OverBudget`]. Pure, and run before the session key's
+/// signature is checked, so a stale or over-budget claim never pays for
+/// one.
+pub fn validate_allowance_claim(
+    watermark: Option<VoucherWatermark<'_>>,
+    cumulative_amount: u128,
+    signature: &[u8],
+    charge: u64,
+    budget: u64,
+) -> Result<VoucherAdmission, ClaimError> {
+    let admission = validate_voucher(watermark, cumulative_amount, signature, charge)?;
+    if cumulative_amount > u128::from(budget) {
+        return Err(ClaimError::OverBudget {
+            claimed: cumulative_amount,
+            budget,
+        });
+    }
+    Ok(admission)
+}
+
 /// The watermark after accepting a voucher of `cumulative_amount`: the
 /// amount. Callers MUST have already checked [`validate_voucher`]; this does
 /// not re-check.
@@ -187,6 +216,73 @@ pub fn advance_voucher_watermark(cumulative_amount: u128) -> Watermark {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // -- Allowance claims (ADR 0080 decision 2, issue #1522) --
+
+    #[test]
+    fn an_allowance_claim_at_its_budget_is_admitted_and_one_above_it_is_not() {
+        assert_eq!(
+            validate_allowance_claim(None, 100, b"s", 100, 100),
+            Ok(VoucherAdmission::Advances { advanced: 100 })
+        );
+        assert_eq!(
+            validate_allowance_claim(None, 101, b"s", 0, 100),
+            Err(ClaimError::OverBudget {
+                claimed: 101,
+                budget: 100
+            })
+        );
+    }
+
+    #[test]
+    fn an_allowance_claim_is_held_to_the_voucher_rules_first() {
+        let at = voucher_watermark(50, b"a");
+        assert_eq!(
+            validate_allowance_claim(at, 50, b"b", 0, 100),
+            Err(ClaimError::AmountNotAdvancing {
+                claimed: 50,
+                watermark: 50
+            })
+        );
+        assert_eq!(
+            validate_allowance_claim(at, 60, b"b", 20, 100),
+            Err(ClaimError::Underpayment {
+                advanced: 10,
+                price: 20
+            })
+        );
+        assert_eq!(
+            validate_allowance_claim(at, 50, b"a", 0, 100),
+            Ok(VoucherAdmission::Retransmission)
+        );
+    }
+
+    proptest! {
+        /// Tier 1: whatever sequence of claims arrives, the watermark an
+        /// allowance's admitted claims leave only ever rises, and never
+        /// exceeds the budget.
+        #[test]
+        fn an_allowance_watermark_rises_and_never_exceeds_its_budget(
+            budget in 1u64..10_000,
+            claims in proptest::collection::vec((0u128..12_000, 0u64..50), 1..40),
+        ) {
+            let mut watermark: Option<u128> = None;
+            for (amount, charge) in claims {
+                let signature = amount.to_le_bytes();
+                let prior = watermark.map(|w| VoucherWatermark {
+                    cumulative_amount: w,
+                    signature: &[],
+                });
+                if let Ok(VoucherAdmission::Advances { .. }) =
+                    validate_allowance_claim(prior, amount, &signature, charge, budget)
+                {
+                    prop_assert!(watermark.is_none_or(|w| amount > w));
+                    watermark = Some(advance_voucher_watermark(amount).cumulative_amount);
+                }
+                prop_assert!(watermark.is_none_or(|w| w <= u128::from(budget)));
+            }
+        }
+    }
 
     // -- Vouchers (ADR 0074 decision 3, issue #1341) --
 
@@ -328,6 +424,9 @@ mod tests {
                 Err(ClaimError::Underpayment { advanced, price }) => {
                     prop_assert_eq!(price, charge);
                     prop_assert!(advanced < u128::from(charge));
+                }
+                Err(ClaimError::OverBudget { .. }) => {
+                    prop_assert!(false, "a voucher has no budget");
                 }
             }
         }

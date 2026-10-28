@@ -163,4 +163,33 @@ pub enum JournalEntry {
         channel_id: String,
         cumulative_amount: u128,
     },
+    /// A zk edge granted an allowance (ADR 0080 decisions 3 and 11): the
+    /// note state `nullifier` is spent, the request proof that spent it is
+    /// the evidence-file record whose SHA-256 is `evidence_hash`, and these
+    /// are the allowance's terms. Written, and fsynced, after the evidence
+    /// record and before the grant is answered, so no nullifier is ever
+    /// spent twice across a crash.
+    ///
+    /// `allowance_id` is the opaque id the zk edge minted (32 lowercase
+    /// hex); field elements are 32 bytes little-endian, the evidence file's
+    /// encoding. The allowance's watermark is carried by the
+    /// `InboundClaim*` kinds under the key `zk-note:<allowance_id>`, so an
+    /// allowance claim rolls back exactly as a voucher does; this entry is
+    /// what marks that key as an allowance's rather than a retired
+    /// `toon-channel`'s. `commitment` is the proof's re-randomised balance
+    /// commitment, which the successor is charged from.
+    ///
+    /// Written only by `connector_client_edge::ClientClaimGate`, into the
+    /// client edge's own journal.
+    AllowanceGranted {
+        allowance_id: String,
+        nullifier: [u8; 32],
+        evidence_hash: [u8; 32],
+        tier: u64,
+        expires_at_ms: u64,
+        session_key_x: [u8; 32],
+        session_key_is_odd: bool,
+        commitment_x: [u8; 32],
+        commitment_y: [u8; 32],
+    },
 }
