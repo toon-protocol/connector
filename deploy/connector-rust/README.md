@@ -279,7 +279,7 @@ A packet routed to a peer this node cannot dial is still answered
 
 Omit `[settlement]` entirely and the node settles on no chain, so it takes no
 claim at all -- every claim is an x402 voucher (ADR 0075). Configure
-`[settlement.evm]` and/or `[settlement.solana]` -- an `rpc_url`, a
+`[settlement.eip155.<chainId>]` (one per EVM network) and/or `[settlement.solana]` -- an `rpc_url`, a
 `token_address`, its `decimals`, the chain's x402 terms and a key table (see
 `docs/protocol/configuration-spec.md` §2.1) -- and the node reads the chain
 **at startup**: a chain without `x402BatchSettlement` (EVM) or

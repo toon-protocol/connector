@@ -179,15 +179,17 @@ write_keys = ["REPLACE-WITH-A-64-HEX-CHARACTER-ED25519-PUBLIC-KEY-NO-PRODUCTION-
 # EIP-712 domain, which a payer signs its deposit under. They are empty on
 # purpose, which is refused at load.
 #
-# The placeholders are not `0x`-prefixed hex and will not parse as addresses.
-[settlement.evm]
+# The placeholders are not `0x`-prefixed hex and will not parse as addresses,
+# and the table key is no chain id (ADR 0086: [settlement.eip155.<chainId>]),
+# which is refused at load by name.
+[settlement.eip155.REPLACE-ME-no-mainnet-network-chosen]
 rpc_url = "REPLACE-ME-no-mainnet-rpc-chosen"
 token_address = "REPLACE-ME-no-mainnet-token-chosen"
 decimals = 6
 asset_eip712_name = ""
 asset_eip712_version = ""
 
-[settlement.evm.key]
+[settlement.eip155.REPLACE-ME-no-mainnet-network-chosen.key]
 key_file = "/nonexistent/production-evm-settlement-key-does-not-exist"
 
 # ── Settlement: Solana ───────────────────────────────────────────────────────

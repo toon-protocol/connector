@@ -268,17 +268,17 @@ peer_allow_plaintext_endpoints = true
 [signer]
 key_file = "{key_file}"
 
-# An EVM `[[peer_channels]]` row needs `[settlement.evm]` with its x402
+# An EVM `[[peer_channels]]` row needs `[settlement.eip155.<chainId>]` with its x402
 # `batch_settlement` sub-table (ADR 0075, issue #1380): the peer's vouchers
 # are admitted by that table's receiving half.
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 {peers}

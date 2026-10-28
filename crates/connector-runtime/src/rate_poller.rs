@@ -810,14 +810,14 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "{usdc}"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 [[tokens]]
@@ -893,14 +893,14 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "{usdc}"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 [settlement.solana]

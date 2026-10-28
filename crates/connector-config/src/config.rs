@@ -1515,7 +1515,7 @@ handler_url = "http://localhost:5000"
     /// A `TokenNetwork` address: what a retired `toon-channel` row named.
     const PEER_TOKEN_NETWORK: &str = "0x3333333333333333333333333333333333333333";
 
-    /// An `[settlement.evm]` table and its key, in the shape a channel row
+    /// An `[settlement.eip155.<chainId>]` table and its key, in the shape a channel row
     /// on this chain now requires (issue #1138): that table is where this
     /// node's EVM address comes from, and a channel row names it as this
     /// node's on-chain participant. Written once here rather than inline
@@ -1524,14 +1524,14 @@ handler_url = "http://localhost:5000"
     fn evm_settlement(key_path: &Path) -> String {
         format!(
             r#"
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 "#,
@@ -1544,7 +1544,7 @@ key_file = "{key_file}"
     /// spoils exactly one thing about it, so what each error is *about* is
     /// the diff between it and this.
     ///
-    /// It carries `[settlement.evm]` with its `batch_settlement` sub-table
+    /// It carries `[settlement.eip155.<chainId>]` with its `batch_settlement` sub-table
     /// because an x402 channel row on a chain this node takes no voucher on
     /// does not load (ADR 0075, issue #1380).
     ///
@@ -1893,7 +1893,7 @@ state_dir = "/tmp/connector-rpc-route-test"
 [signer]
 key_file = "{key}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "{evm_rpc}"
 token_address = "0x00000000000000000000000000000000000000bb"
 decimals = 6
@@ -1901,7 +1901,7 @@ asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 {evm_line}
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key}"
 
 [settlement.solana]
@@ -1967,7 +1967,10 @@ key_file = "{key}"
     /// settlement call", and that is refused where the operator wrote it.
     #[test]
     fn a_table_that_opts_into_the_proxy_on_a_node_with_none_is_refused_by_name() {
-        for (evm, solana, table) in [(Some(true), None, "evm"), (None, Some(true), "solana")] {
+        for (evm, solana, table) in [
+            (Some(true), None, "eip155.31337"),
+            (None, Some(true), "solana"),
+        ] {
             let error = load_settlement_routes(
                 "",
                 "https://sepolia.base.org",
@@ -1978,7 +1981,7 @@ key_file = "{key}"
             .expect_err("no socks_proxy to ride");
             assert!(
                 matches!(
-                    error,
+                    &error,
                     ConfigError::SettlementRpcViaSocksProxyWithoutProxy { table: named }
                         if named == table
                 ),
@@ -2002,7 +2005,7 @@ key_file = "{key}"
         assert!(
             matches!(
                 error,
-                ConfigError::SettlementRpcViaSocksProxyPlaintext { table: "evm", .. }
+                ConfigError::SettlementRpcViaSocksProxyPlaintext { ref table, .. } if table == "eip155.31337"
             ),
             "{error}"
         );
@@ -2478,7 +2481,7 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
         assert_eq!(
             resolved.asset("store").map(ToString::to_string),
             Some(SETTLEMENT_TOKEN.to_ascii_lowercase()),
-            "the peering holds what [settlement.evm] settles in, however the row spelled it"
+            "the peering holds what [settlement.eip155.<chainId>] settles in, however the row spelled it"
         );
         assert_eq!(
             resolved
@@ -2669,7 +2672,7 @@ key_file = "{key_file}"
                 .asset(UNDECLARED_EVM_CHANNEL_KEY)
                 .map(ToString::to_string),
             Some(SETTLEMENT_TOKEN.to_ascii_lowercase()),
-            "a channel on the EVM chain holds what [settlement.evm] settles in -- including a \
+            "a channel on the EVM chain holds what [settlement.eip155.<chainId>] settles in -- including a \
              channel this file never named, which is the one this rule exists for"
         );
         assert_eq!(
@@ -2777,13 +2780,15 @@ key_file = "{key_file}"
     // refusals when one file trips more than one.
 
     /// The EVM half of #1134's rule, at the level an operator meets it: a
-    /// peering bound to an EVM channel on a node with no `[settlement.evm]`
+    /// peering bound to an EVM channel on a node with no `[settlement.eip155.<chainId>]`
     /// does not load. It used to load and verify the peer's inbound claims
     /// under a domain no address this node holds could ever redeem at.
     #[test]
     fn rejects_an_evm_peer_channel_on_a_node_that_does_not_settle_on_evm() {
         let result = load_peering(|text| {
-            let start = text.find("[settlement.evm]").expect("the fixture has one");
+            let start = text
+                .find("[settlement.eip155.31337]")
+                .expect("the fixture has one");
             let end = text.find("[[peers]]").expect("the fixture has one");
             let mut without = text.clone();
             without.replace_range(start..end, "");
@@ -2797,7 +2802,7 @@ key_file = "{key_file}"
             )
         });
         assert!(
-            message.contains("[settlement.evm]") && message.contains("no"),
+            message.contains("[settlement.eip155.<chainId>]") && message.contains("no"),
             "got: {message}"
         );
     }
@@ -2805,7 +2810,7 @@ key_file = "{key_file}"
     /// The rule is **per chain**: a row needs the table for its own chain
     /// and no other. This is the shape `local/mixed-chain/connector-c.toml`
     /// is committed in -- a Solana peering on a node with no
-    /// `[settlement.evm]` at all -- and it must keep loading.
+    /// `[settlement.eip155.<chainId>]` at all -- and it must keep loading.
     #[test]
     fn a_solana_only_node_needs_no_evm_settlement_table() {
         let config = load_solana_peering("").expect("load");
@@ -3002,7 +3007,10 @@ key_file = "{key_file}"
                 ConfigError::PayChannelWithoutX402 { peer_id, chain: "evm" } if peer_id == "store"
             )
         });
-        assert!(message.contains("[settlement.evm]"), "got: {message}");
+        assert!(
+            message.contains("[settlement.eip155.<chainId>]"),
+            "got: {message}"
+        );
     }
 
     /// The Solana shapes: a Solana pay row names a channel account, and the
@@ -3862,14 +3870,14 @@ state_dir = "/tmp"
 [signer]
 key_file = "{}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{}"
 "#,
                 key_path.display(),
@@ -3888,7 +3896,7 @@ key_file = "{}"
         assert_eq!(evm.decimals(), 6);
     }
 
-    /// The new keyed shape (issue #628): `[settlement.evm]` alone resolves
+    /// The new keyed shape (issue #628): `[settlement.eip155.<chainId>]` alone resolves
     /// the same facts the legacy flat shape does.
     #[test]
     fn a_keyed_evm_settlement_table_loads() {
@@ -3901,14 +3909,14 @@ state_dir = "/tmp"
 [signer]
 key_file = "{}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{}"
 "#,
                 key_path.display(),
@@ -3936,7 +3944,7 @@ state_dir = "/tmp"
 [signer]
 key_file = "{key_path}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
@@ -3944,7 +3952,7 @@ asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 {delay}
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_path}"
 "#,
                     key_path = key_path.display()
@@ -3965,7 +3973,7 @@ key_file = "{key_path}"
         ));
     }
 
-    /// AC: "A config declaring both [settlement.evm] and [settlement.solana]
+    /// AC: "A config declaring both [settlement.eip155.<chainId>] and [settlement.solana]
     /// parses into typed per-chain settlement config".
     #[test]
     fn declaring_both_evm_and_solana_settlement_tables_loads_both() {
@@ -3978,14 +3986,14 @@ state_dir = "/tmp"
 [signer]
 key_file = "{key_path}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117893403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_path}"
 
 [settlement.solana]

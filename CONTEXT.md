@@ -460,7 +460,7 @@ _Avoid_: facilitator (x402's relayer, which on Solana would take these seats its
 
 **Facilitator**:
 x402's relayer: the service that sends a payer's signed EVM deposit into `x402BatchSettlement` and
-pays its gas. In TOON the **operator** names it (`[settlement.evm] facilitator_url`, published as
+pays its gas. In TOON the **operator** names it (`[settlement.eip155.<chainId>] facilitator_url`, published as
 `facilitator`) and pays for it as a cost of the sale; the payer calls it, and the connector never
 does ([ADR 0076](docs/adr/0076-the-operator-names-the-facilitator-and-pays-its-gas.md)). EVM only:
 on Solana the **sponsor** does this job. A node's own outbound deposits use none.

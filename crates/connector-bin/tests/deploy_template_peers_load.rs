@@ -141,14 +141,14 @@ fn the_templates_peering_example_loads() {
     // so this test proves the PEERING example loads, not that the template
     // should also teach settlement configuration it deliberately omits.
     doc.push_str(&format!(
-        "\n[settlement.evm]\n\
+        "\n[settlement.eip155.31337]\n\
          rpc_url = \"http://127.0.0.1:8545\"\n\
          token_address = \"0x49beE1Bca5d15Fb0963117923403F9498119a9Ce\"\n\
          decimals = 6\n\
          asset_eip712_name = \"USD Coin\"\n\
          asset_eip712_version = \"2\"\n\
          \n\
-         [settlement.evm.key]\n\
+         [settlement.eip155.31337.key]\n\
          key_file = \"{}\"\n",
         settlement_key.display()
     ));

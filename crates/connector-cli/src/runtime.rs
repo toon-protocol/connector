@@ -19,7 +19,7 @@ use connector_config::{
     Config, EvmSettlementConfig, PeerCarriage, SecretLocation, SettlementChain, SettlementConfig,
     SolanaSettlementConfig,
 };
-use connector_domain::AssetChain;
+use connector_domain::{AssetChain, Network};
 use connector_rate_source_evm::UniswapV3RateSource;
 use connector_runtime::{
     BatchChannels, BoundedHttpSelfDescription, ConfigPeeringError, Connector, DeclaredRates,
@@ -85,7 +85,7 @@ pub enum RuntimeError {
     /// `payment-channels`) the binary fixes is not deployed (ADR 0075
     /// decision 1): a network x402 has not deployed to is unsupported,
     /// loudly, rather than a node that admits nothing and says nothing.
-    X402NotDeployed { table: &'static str, what: String },
+    X402NotDeployed { table: String, what: String },
     /// A journal under `state_dir` holds `toon-channel` entries: claims on
     /// TOON's own retired channels this build can neither judge, land nor
     /// drain (ADR 0075 decision 8, issue #1385). Refused by name, never
@@ -158,10 +158,7 @@ pub enum RuntimeError {
     /// URL and a `socks_proxy` that is not `socks5h://`, so this is the
     /// second lock on those doors -- and a refusal to start, because a table
     /// with no transport has no client that could settle on it.
-    SettlementEndpointUnusable {
-        table: &'static str,
-        message: String,
-    },
+    SettlementEndpointUnusable { table: String, message: String },
     /// A `[settlement.<chain>]` table's x402 backend could not be bound (ADR
     /// 0074, ADR 0075): the contract or program at the fixed address is not
     /// the x402 one, the token disagrees with the table, or the chain could
@@ -169,9 +166,19 @@ pub enum RuntimeError {
     /// alternative is a node whose greeting offers `batch-settlement` and
     /// whose every voucher fails.
     BatchSettlementUnusable {
-        table: &'static str,
+        table: String,
         source: BatchSettlementError,
     },
+    /// A `[settlement.eip155.<chainId>]` table whose RPC answers
+    /// `eth_chainId` with another id (ADR 0086 decision 4). The key is
+    /// declared and asserted, like `decimals`: a wrong `rpc_url` must never
+    /// settle on a network other than the one the operator named.
+    EvmChainIdMismatch { network: Network, reported: u64 },
+    /// More than one `[settlement.eip155.<chainId>]` table (ADR 0086,
+    /// interim, #1597): they load, but this build runs one EVM network per
+    /// node until multi-network settlement lands, and refuses rather than
+    /// silently settling on one of them.
+    MoreThanOneEvmNetwork { networks: Vec<Network> },
     /// `[settlement.evm] asset_transfer_method` is `"eip3009"`, and the
     /// token has no ERC-3009: it fails the very probe this node's own
     /// deposits are routed by (`EvmBatchSettlementBackend::deposit_route`,
@@ -179,7 +186,7 @@ pub enum RuntimeError {
     /// method is published to payers and never used by this node itself:
     /// every payer's deposit would fail on chain, and nothing here would
     /// ever see it.
-    AssetTransferMethodUnsupported { token: String },
+    AssetTransferMethodUnsupported { table: String, token: String },
     /// `[settlement.evm] asset_eip712_name` and `asset_eip712_version` do
     /// not reproduce the token's own `DOMAIN_SEPARATOR()`, on a table that
     /// publishes `eip3009`: every payer's ERC-3009 authorization is signed
@@ -187,6 +194,7 @@ pub enum RuntimeError {
     /// #1422). Only a definite mismatch is refused; a token with no
     /// `DOMAIN_SEPARATOR()` is not judged.
     AssetEip712DomainMismatch {
+        table: String,
         token: String,
         name: String,
         version: String,
@@ -296,20 +304,52 @@ impl fmt::Display for RuntimeError {
                 "[settlement.{table}] could not be bound: {source}. A node must reach the x402 \
                  contract or program its vouchers are signed for (ADR 0074, ADR 0075)"
             ),
-            RuntimeError::AssetTransferMethodUnsupported { token } => write!(
+            RuntimeError::EvmChainIdMismatch { network, reported } => {
+                let declared = network.eip155_chain_id().unwrap_or_default();
+                write!(
+                    f,
+                    "[settlement.eip155.{declared}] is keyed for chain id {declared} ({network}), but \
+                     its rpc_url answers eth_chainId with {reported}. The table key names the \
+                     network this table settles on and is checked, never trusted (ADR 0086): \
+                     point rpc_url at chain {declared}, or key the table \
+                     [settlement.eip155.{reported}] if that is the network you meant"
+                )
+            }
+            RuntimeError::MoreThanOneEvmNetwork { networks } => {
+                let tables: Vec<String> = networks
+                    .iter()
+                    .map(|network| {
+                        format!(
+                            "[settlement.eip155.{}]",
+                            network.eip155_chain_id().unwrap_or_default()
+                        )
+                    })
+                    .collect();
+                write!(
+                    f,
+                    "this config settles on {} EVM networks ({}), and this build settles on \
+                     one EVM network per node: keep one [settlement.eip155.<chainId>] table and \
+                     remove the others. Several networks per node is ADR 0086's, and lands in \
+                     a later release",
+                    networks.len(),
+                    tables.join(", ")
+                )
+            }
+            RuntimeError::AssetTransferMethodUnsupported { table, token } => write!(
                 f,
-                "[settlement.evm] asset_transfer_method = \"eip3009\", but token {token} does not \
+                "[settlement.{table}] asset_transfer_method = \"eip3009\", but token {token} does not \
                  have ERC-3009 (it reverts on authorizationState). Payers read this method to \
                  sign their deposit, so every deposit would fail on chain -- set \
                  asset_transfer_method = \"permit2\", which works for any ERC-20 (issue #1422)"
             ),
             RuntimeError::AssetEip712DomainMismatch {
+                table,
                 token,
                 name,
                 version,
             } => write!(
                 f,
-                "[settlement.evm] asset_eip712_name = \"{name}\" and asset_eip712_version = \
+                "[settlement.{table}] asset_eip712_name = \"{name}\" and asset_eip712_version = \
                  \"{version}\" are not the EIP-712 domain of token {token}: they do not reproduce \
                  its DOMAIN_SEPARATOR() on this chain. Payers sign their ERC-3009 deposit under \
                  them, so the token would refuse every one -- set them to the token's own name \
@@ -417,9 +457,29 @@ fn read_settlement_private_key(location: &SecretLocation) -> Result<String, Runt
     read_settlement_key_bytes(location).map(hex_encode_32)
 }
 
+/// ADR 0086, interim (#1597): several `[settlement.eip155.<chainId>]` tables
+/// load, but this build holds one EVM backend, so more than one is refused
+/// by name before any chain is dialed rather than reduced to one. The
+/// ticket that keys the runtime by network removes this.
+fn refuse_more_than_one_evm_network(config: &Config) -> Result<(), RuntimeError> {
+    let networks: Vec<Network> = config
+        .settlements()
+        .iter()
+        .filter_map(|settlement| match settlement {
+            SettlementConfig::Evm(evm) => Some(evm.network().clone()),
+            SettlementConfig::Solana(_) => None,
+        })
+        .collect();
+    if networks.len() > 1 {
+        return Err(RuntimeError::MoreThanOneEvmNetwork { networks });
+    }
+    Ok(())
+}
+
 /// Map a backend that would not bind to its refusal: by name when the x402
 /// contract or program is absent from the chain (ADR 0075 decision 1).
-fn unbound(table: &'static str, source: BatchSettlementError) -> RuntimeError {
+fn unbound(table: &str, source: BatchSettlementError) -> RuntimeError {
+    let table = table.to_string();
     match source {
         BatchSettlementError::NotDeployed(what) => RuntimeError::X402NotDeployed { table, what },
         source => RuntimeError::BatchSettlementUnusable { table, source },
@@ -436,6 +496,18 @@ async fn build_evm_batch_settlement(
     settlement: &EvmSettlementConfig,
     transport: &RpcTransport,
 ) -> Result<Arc<EvmBatchSettlementBackend>, RuntimeError> {
+    let table = settlement.table_name();
+    // ADR 0086 decision 4: the table key is asserted against the chain
+    // before anything is bound to it, and is never an input to the backend.
+    let reported = EvmBatchSettlementBackend::chain_id_at(transport)
+        .await
+        .map_err(|source| unbound(&table, source))?;
+    if reported != settlement.chain_id() {
+        return Err(RuntimeError::EvmChainIdMismatch {
+            network: settlement.network().clone(),
+            reported,
+        });
+    }
     let private_key = read_settlement_private_key(settlement.key())?;
     let backend = EvmBatchSettlementBackend::connect(
         transport,
@@ -445,7 +517,7 @@ async fn build_evm_batch_settlement(
         settlement.batch_settlement().min_withdraw_delay_secs(),
     )
     .await
-    .map_err(|source| unbound(SettlementChain::Evm.name(), source))?;
+    .map_err(|source| unbound(&table, source))?;
     check_published_deposit_terms(settlement, &backend).await?;
     Ok(Arc::new(backend))
 }
@@ -479,7 +551,7 @@ async fn check_published_deposit_terms(
     if terms.asset_transfer_method() != connector_domain::x402::X402AssetTransferMethod::Eip3009 {
         return Ok(());
     }
-    let table = SettlementChain::Evm.name();
+    let table = settlement.table_name();
     let token = format!(
         "{:#x}",
         ethers::types::Address::from(settlement.token_address())
@@ -487,16 +559,17 @@ async fn check_published_deposit_terms(
     let route = backend
         .deposit_route()
         .await
-        .map_err(|source| unbound(table, source))?;
+        .map_err(|source| unbound(&table, source))?;
     if route != DepositRoute::Erc3009 {
-        return Err(RuntimeError::AssetTransferMethodUnsupported { token });
+        return Err(RuntimeError::AssetTransferMethodUnsupported { table, token });
     }
     let matches = backend
         .asset_eip712_domain_matches(terms.asset_eip712_name(), terms.asset_eip712_version())
         .await
-        .map_err(|source| unbound(table, source))?;
+        .map_err(|source| unbound(&table, source))?;
     if matches == Some(false) {
         return Err(RuntimeError::AssetEip712DomainMismatch {
+            table,
             token,
             name: terms.asset_eip712_name().to_string(),
             version: terms.asset_eip712_version().to_string(),
@@ -525,7 +598,7 @@ async fn build_solana_batch_settlement(
     let sponsor_seed = read_settlement_key_bytes(settlement.key())?;
     let mint = Pubkey::from_str(settlement.token_address()).map_err(|error| {
         RuntimeError::BatchSettlementUnusable {
-            table,
+            table: table.to_string(),
             source: BatchSettlementError::Backend(format!(
                 "token_address '{}' is not a valid base58 Solana pubkey: {error}",
                 settlement.token_address()
@@ -541,11 +614,11 @@ async fn build_solana_batch_settlement(
         batch.min_sponsored_deposit(),
     )
     .await
-    .map_err(|source| unbound(table, source))?;
+    .map_err(|source| unbound(&table, source))?;
     let backend = match socks_proxy {
         Some(proxy) => backend
             .with_socks_proxy(proxy)
-            .map_err(|source| unbound(table, source))?,
+            .map_err(|source| unbound(&table, source))?,
         None => backend,
     };
     Ok(Arc::new(backend))
@@ -903,6 +976,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     let mut batch_settlement_solana: Option<Arc<SolanaBatchSettlement>> = None;
     // Each table's one transport, built once and handed to every client of
     // its `rpc_url` below (ADR 0073 decision 2).
+    refuse_more_than_one_evm_network(config)?;
     let transports = settlement_transports(config)?;
     for settlement in config.settlements() {
         match settlement {
@@ -1451,8 +1525,8 @@ impl SettlementTransports {
             SettlementChain::Evm => self.evm.as_ref(),
             SettlementChain::Solana => self.solana.as_ref(),
         };
-        transport.ok_or(RuntimeError::SettlementEndpointUnusable {
-            table: chain.name(),
+        transport.ok_or_else(|| RuntimeError::SettlementEndpointUnusable {
+            table: chain.name().to_string(),
             message: "no transport was built for a table the config names".to_string(),
         })
     }
@@ -1467,7 +1541,7 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
     for settlement in config.settlements() {
         let chain = settlement.chain();
         let unusable = |message: String| RuntimeError::SettlementEndpointUnusable {
-            table: chain.name(),
+            table: settlement.table_name(),
             message,
         };
         let transport = if settlement.rpc_via_socks_proxy() {
@@ -2838,7 +2912,7 @@ key_file = "{}"
         ) -> String {
             format!(
                 r#"
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "{rpc_url}"
 token_address = "{token:?}"
 decimals = {decimals}
@@ -2846,7 +2920,7 @@ min_withdraw_delay_secs = 3600
 {deposit_terms}
 facilitator_url = "https://facilitator.example/x402"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key}"
 "#
             )
@@ -2928,10 +3002,85 @@ key_file = "{signer_key}"
                 panic!("built on a chain without x402BatchSettlement");
             };
             assert!(
-                matches!(&error, RuntimeError::X402NotDeployed { table: "evm", what } if what.contains("x402BatchSettlement")),
+                matches!(&error, RuntimeError::X402NotDeployed { table, what } if table == "eip155.31337" && what.contains("x402BatchSettlement")),
                 "{error}"
             );
-            assert!(error.to_string().contains("[settlement.evm]"), "{error}");
+            assert!(
+                error.to_string().contains("[settlement.eip155.31337]"),
+                "{error}"
+            );
+        }
+
+        /// ADR 0086 decision 4: the table key is declared and asserted. A
+        /// table keyed `8453` whose RPC answers `eth_chainId` with another
+        /// id is refused by name, both ids in the message, before anything
+        /// is bound -- a wrong RPC URL cannot settle on the wrong network.
+        #[tokio::test]
+        async fn an_evm_table_whose_rpc_reports_another_chain_id_refuses_to_build_by_name() {
+            if !require_anvil() {
+                return;
+            }
+            let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+            let mut x402 = X402Chain::place(&anvil.rpc_url).await;
+            let token = x402.deploy_fiat_token().await;
+            let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let key = key_path.display().to_string();
+            let table =
+                evm_table(&anvil.rpc_url, token, 6, &key).replace("eip155.31337", "eip155.8453");
+            let config = node_config(&key, &table);
+
+            let Err(error) = build(&config).await else {
+                panic!("built a table keyed 8453 on a chain that reports 31337");
+            };
+            assert!(
+                matches!(
+                    &error,
+                    RuntimeError::EvmChainIdMismatch { network, reported: 31337 }
+                        if *network == Network::Eip155(8453)
+                ),
+                "{error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("[settlement.eip155.8453]")
+                    && message.contains("8453")
+                    && message.contains("31337"),
+                "the refusal names the table and both ids: {message}"
+            );
+        }
+
+        /// ADR 0086, interim (#1597): one EVM network per node until
+        /// multi-network settlement lands. Two tables load, and boot refuses
+        /// them by name, naming both -- never quietly settling on one.
+        #[tokio::test]
+        async fn two_evm_tables_refuse_to_build_by_name() {
+            let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
+            let key = key_path.display().to_string();
+            let token: ethers::types::Address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
+                .parse()
+                .expect("address");
+            let first = evm_table("http://127.0.0.1:1", token, 6, &key);
+            let second = first.replace("eip155.31337", "eip155.31338");
+            let config = node_config(&key, &format!("{first}{second}"));
+            assert_eq!(config.settlements().len(), 2, "two EVM tables load");
+
+            let Err(error) = build(&config).await else {
+                panic!("built a node on two EVM networks");
+            };
+            assert!(
+                matches!(
+                    &error,
+                    RuntimeError::MoreThanOneEvmNetwork { networks }
+                        if *networks == vec![Network::Eip155(31337), Network::Eip155(31338)]
+                ),
+                "{error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("[settlement.eip155.31337]")
+                    && message.contains("[settlement.eip155.31338]"),
+                "the refusal names both tables: {message}"
+            );
         }
 
         /// ADR 0075 decision 1, Solana: a chain without `payment-channels`
@@ -2960,7 +3109,7 @@ key_file = "{signer_key}"
                 panic!("built on a chain without payment-channels");
             };
             assert!(
-                matches!(&error, RuntimeError::X402NotDeployed { table: "solana", what } if what.contains("payment-channels")),
+                matches!(&error, RuntimeError::X402NotDeployed { table, what } if table == "solana" && what.contains("payment-channels")),
                 "{error}"
             );
         }
@@ -3066,12 +3215,12 @@ key_file = "{signer_key}"
                     panic!("built eip3009 over a token without ERC-3009");
                 };
                 assert!(
-                    matches!(&error, RuntimeError::AssetTransferMethodUnsupported { token: named } if *named == format!("{token:#x}")),
+                    matches!(&error, RuntimeError::AssetTransferMethodUnsupported { token: named, .. } if *named == format!("{token:#x}")),
                     "{error}"
                 );
                 let message = error.to_string();
                 for named in [
-                    "[settlement.evm]",
+                    "[settlement.eip155.31337]",
                     "asset_transfer_method = \"eip3009\"",
                     "ERC-3009",
                     "asset_transfer_method = \"permit2\"",
@@ -3459,14 +3608,14 @@ client_edge_addr = "127.0.0.1:0"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "{USDC}"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 [[tokens]]
@@ -3546,14 +3695,14 @@ client_edge_addr = "127.0.0.1:0"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "{USDC}"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 [[tokens]]
@@ -3756,7 +3905,7 @@ socks_proxy = "{proxy}"
 [signer]
 key_file = "{key}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://{EVM_HOST}/"
 token_address = "0x00000000000000000000000000000000000000bb"
 decimals = 6
@@ -3764,7 +3913,7 @@ rpc_via_socks_proxy = {evm_proxied}
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key}"
 
 [settlement.solana]

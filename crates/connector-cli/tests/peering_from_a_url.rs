@@ -349,14 +349,14 @@ handler_url = "http://{app}/pinned"
 price = 0
 transport = "{pinned}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "{rpc_url}"
 token_address = "{token:?}"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{settlement_key}"
 
 "#,

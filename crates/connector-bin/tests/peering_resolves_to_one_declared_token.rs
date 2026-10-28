@@ -106,14 +106,14 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USD Coin"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 [[peers]]
@@ -159,14 +159,14 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USD Coin"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 [settlement.solana]

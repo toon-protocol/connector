@@ -334,14 +334,14 @@ endpoint = "wss://peer.example:443/ilp/btp"
 peer_id = "{PEER_ID}"
 voucher_signer = "0x7777777777777777777777777777777777777777"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 "#,

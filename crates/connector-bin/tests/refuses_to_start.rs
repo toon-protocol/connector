@@ -481,14 +481,14 @@ client_edge_addr = "127.0.0.1:0"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 "#,
         key_file = key_file.path().display(),
@@ -734,7 +734,7 @@ key_file = "{key_file}"
 // -- ADR 0075 decisions 1, 8 and 9 (issue #1385): TOON's channels leave the
 // port, the config and the boot --
 
-/// A `[settlement.evm]` table with `extra` written into it, on a node with a
+/// A `[settlement.eip155.31337]` table with `extra` written into it, on a node with a
 /// state_dir.
 fn evm_settlement_config(
     key_file: &std::path::Path,
@@ -750,7 +750,7 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "{rpc_url}"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
@@ -758,12 +758,109 @@ asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 {extra}
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 "#,
         key_file = key_file.display(),
         state_dir = state_dir.display(),
     ))
+}
+
+/// ADR 0086 decision 4, through the real binary: every way of writing EVM
+/// settlement that names no network is refused at load, by name -- the
+/// retired `[settlement.evm]` with its rewrite, a table key that is not a
+/// chain id, and an `[settlement.eip155]` heading holding no network.
+#[test]
+fn exits_non_zero_naming_an_evm_table_that_names_no_network() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let table = evm_settlement_config(
+        key_file.path(),
+        state_dir.path(),
+        "http://127.0.0.1:8545",
+        "",
+    );
+    let text = std::fs::read_to_string(table.path()).expect("read config");
+    let cases: [(String, &[&str]); 3] = [
+        (
+            text.replace("[settlement.eip155.31337", "[settlement.evm"),
+            &[
+                "[settlement.evm]",
+                "[settlement.eip155.<chainId>]",
+                "ADR 0086",
+            ],
+        ),
+        (
+            text.replace("[settlement.eip155.31337", "[settlement.eip155.base"),
+            &["[settlement.eip155.base]", "chain id"],
+        ),
+        (
+            text[..text.find("[settlement.eip155.31337]").expect("the table")].to_string()
+                + "[settlement.eip155]\n",
+            &["[settlement.eip155]", "no network"],
+        ),
+    ];
+    for (config, named) in cases {
+        let output = run(Some(write_config(&config).path()));
+        assert!(!output.status.success(), "{config}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for named in named {
+            assert!(stderr.contains(named), "expected {named} in: {stderr}");
+        }
+    }
+}
+
+/// ADR 0086 decision 4, through the real binary: a table keyed `8453` on an
+/// RPC that answers `eth_chainId` with 31337 refuses to start, naming both
+/// ids, before x402's code is even looked for.
+#[tokio::test]
+async fn exits_non_zero_naming_both_chain_ids_when_the_rpc_is_another_network() {
+    if !connector_settlement_evm::test_support::require_anvil() {
+        return;
+    }
+    let anvil = connector_settlement_evm::test_support::Anvil::spawn(24_700).await;
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let table = evm_settlement_config(key_file.path(), state_dir.path(), &anvil.rpc_url, "");
+    let text = std::fs::read_to_string(table.path())
+        .expect("read config")
+        .replace("[settlement.eip155.31337", "[settlement.eip155.8453");
+
+    let output = run(Some(write_config(&text).path()));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in ["[settlement.eip155.8453]", "8453", "31337", "eth_chainId"] {
+        assert!(stderr.contains(named), "expected {named} in: {stderr}");
+    }
+}
+
+/// ADR 0086, interim (#1597), through the real binary: two EVM tables load
+/// but refuse to start, by name, rather than settle on one of them.
+#[test]
+fn exits_non_zero_naming_both_tables_when_two_evm_networks_are_configured() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let table = evm_settlement_config(
+        key_file.path(),
+        state_dir.path(),
+        "http://127.0.0.1:8545",
+        "",
+    );
+    let text = std::fs::read_to_string(table.path()).expect("read config");
+    let start = text.find("[settlement.eip155.31337]").expect("the table");
+    let second = text[start..].replace("eip155.31337", "eip155.31338");
+    let output = run(Some(write_config(&format!("{text}\n{second}")).path()));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in [
+        "[settlement.eip155.31337]",
+        "[settlement.eip155.31338]",
+        "one EVM network per node",
+    ] {
+        assert!(stderr.contains(named), "expected {named} in: {stderr}");
+    }
 }
 
 /// ADR 0075 decision 1, through the real binary: a node pointed at a chain
@@ -785,7 +882,7 @@ async fn exits_non_zero_naming_x402_on_a_chain_without_the_x402_contract() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     for named in [
-        "[settlement.evm]",
+        "[settlement.eip155.31337]",
         "x402BatchSettlement",
         "not deployed",
         "ADR 0075",
@@ -857,8 +954,8 @@ fn exits_non_zero_naming_each_removed_settlement_key() {
             "contract_address",
         ),
         (
-            "\n[settlement.evm.batch_settlement]\nmin_withdraw_delay_secs = 3600",
-            "[settlement.evm.batch_settlement]",
+            "\n[settlement.eip155.31337.batch_settlement]\nmin_withdraw_delay_secs = 3600",
+            "[settlement.eip155.31337.batch_settlement]",
         ),
         ("channel_index_from_block = 1", "channel_index_from_block"),
     ] {
@@ -964,12 +1061,12 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 "#,
         key_file = key_file.path().display(),
@@ -981,7 +1078,7 @@ key_file = "{key_file}"
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("[settlement.evm]") && stderr.contains("asset_eip712_name"),
+        stderr.contains("[settlement.eip155.31337]") && stderr.contains("asset_eip712_name"),
         "expected the table and the missing key in: {stderr}"
     );
 }
@@ -1372,14 +1469,14 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 [[peers]]

@@ -24,7 +24,7 @@ query-filters:
   #
   # Where a REAL hard-coded key would live, this query cannot see it and
   # is not the guard: every key a node holds is a file path in the config
-  # -- `[signer] key_file`, `[settlement.evm.key] key_file`,
+  # -- `[signer] key_file`, `[settlement.eip155.<chainId>.key] key_file`,
   # `[settlement.solana.key] key_file` -- never a literal, by ADR 0009 and
   # ADR 0012, and `tools/ci/check-tracked-secrets.sh` fails the build on
   # tracked key material. Nothing else is excluded here; the other open

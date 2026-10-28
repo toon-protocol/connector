@@ -466,9 +466,10 @@ pub enum ConfigError {
 
     #[error(
         "'[[peer_channels]]' for peer '{peer_id}' names a voucher signer on {chain}, but this \
-         node has no '[settlement.{chain}]' table, so no channel the peer opens toward this \
+         node has no '{heading}' table, so no channel the peer opens toward this \
          node could ever be admitted (ADR 0075). Add the table, or peer over a chain this node \
-         settles on"
+         settles on",
+        heading = crate::settlement::settlement_heading(.chain)
     )]
     PeerChannelWithoutX402 {
         peer_id: String,
@@ -541,8 +542,9 @@ pub enum ConfigError {
 
     #[error(
         "'[[pay_channels]]' for peer '{peer_id}' names an outbound channel on {chain}, but this \
-         node has no '[settlement.{chain}]' table, so there is no paying half to sign a voucher \
-         with (ADR 0075). Add the table, or pay over a chain this node settles on"
+         node has no '{heading}' table, so there is no paying half to sign a voucher \
+         with (ADR 0075). Add the table, or pay over a chain this node settles on",
+        heading = crate::settlement::settlement_heading(.chain)
     )]
     PayChannelWithoutX402 {
         peer_id: String,
@@ -723,14 +725,14 @@ pub enum ConfigError {
     #[error(
         "the flat [settlement] shape (chain = \"evm\", contract_address, ...) was removed with \
          TOON's own channels (ADR 0075, issue #1385): every channel is an x402 channel on a \
-         contract the binary fixes. Write a [settlement.evm] table instead -- rpc_url, \
+         contract the binary fixes. Write a [settlement.eip155.<chainId>] table instead (ADR 0086) -- rpc_url, \
          token_address, decimals, asset_eip712_name, asset_eip712_version and \
-         [settlement.evm.key] -- and no contract_address"
+         [settlement.eip155.<chainId>.key] -- and no contract_address"
     )]
     SettlementLegacyShapeRemoved,
 
     /// A settlement key that named TOON's own channel deployment:
-    /// `[settlement.evm] contract_address` (the `TokenNetworkRegistry`) or
+    /// `[settlement.eip155.<chainId>] contract_address` (the `TokenNetworkRegistry`) or
     /// `[settlement.solana] program_id` (TOON's payment-channel program)
     /// (ADR 0075 decisions 1 and 9).
     #[error(
@@ -741,10 +743,7 @@ pub enum ConfigError {
          Delete the line. A node with TOON channels still open drains them on the last release \
          that supports them first (ADR 0075, \"Draining a node with live TOON channels\")"
     )]
-    SettlementToonKeyRemoved {
-        table: &'static str,
-        field: &'static str,
-    },
+    SettlementToonKeyRemoved { table: String, field: &'static str },
 
     /// The `[settlement.<chain>.batch_settlement]` sub-table, whose keys moved
     /// up into `[settlement.<chain>]` (ADR 0075 decision 9).
@@ -753,7 +752,7 @@ pub enum ConfigError {
          channels are the only channels, so their terms are no longer an opt-in sub-table. Move \
          its keys up into [settlement.{table}] unchanged and delete the sub-table's header"
     )]
-    SettlementBatchSubTableRemoved { table: &'static str },
+    SettlementBatchSubTableRemoved { table: String },
 
     /// A key ADR 0075 decision 9 makes required wherever its settlement table
     /// exists: `asset_eip712_name` and `asset_eip712_version` on EVM,
@@ -763,10 +762,7 @@ pub enum ConfigError {
          accepting them is no longer an opt-in and this key has no safe default: add it to \
          [settlement.{table}]"
     )]
-    SettlementMissingRequiredKey {
-        table: &'static str,
-        key: &'static str,
-    },
+    SettlementMissingRequiredKey { table: String, key: &'static str },
 
     #[error("the [settlement] section's rpc_url is empty")]
     SettlementMissingRpcUrl,
@@ -804,18 +800,46 @@ pub enum ConfigError {
 
     #[error(
         "the [settlement] section is present but names no chain at all -- add an \
-         [settlement.evm] and/or [settlement.solana] table, or remove the section"
+         [settlement.eip155.<chainId>] and/or [settlement.solana] table, or remove the section"
     )]
     SettlementSectionEmpty,
+
+    /// `[settlement.evm]`, which named no network (ADR 0086 decision 4).
+    /// Refused by name, never read as some chain's table.
+    #[error(
+        "[settlement.evm] was removed: EVM settlement is one table per network (ADR 0086). Rename \
+         [settlement.evm] to [settlement.eip155.<chainId>] and [settlement.evm.key] to \
+         [settlement.eip155.<chainId>.key], where <chainId> is the decimal chain id its rpc_url \
+         answers eth_chainId with -- e.g. [settlement.eip155.8453] for Base, \
+         [settlement.eip155.84532] for Base Sepolia. Every key in the table is unchanged"
+    )]
+    SettlementEvmTableRemoved,
+
+    /// A `[settlement.eip155.<key>]` table whose key is not a decimal
+    /// EIP-155 chain id (ADR 0086 decision 4).
+    #[error(
+        "[settlement.eip155.{key}] is not keyed by a chain id: an EVM settlement table is \
+         [settlement.eip155.<chainId>], with the network's EIP-155 chain id in decimal, no \
+         leading zero (e.g. [settlement.eip155.8453] for Base), checked against eth_chainId at \
+         boot (ADR 0086)"
+    )]
+    SettlementEip155KeyNotAChainId { key: String },
+
+    /// `[settlement.eip155]` holding no network (ADR 0086 decision 4).
+    #[error(
+        "[settlement.eip155] names no network: add a [settlement.eip155.<chainId>] table under \
+         it (e.g. [settlement.eip155.8453] for Base), or remove the heading (ADR 0086)"
+    )]
+    SettlementEip155Empty,
 
     #[error("the [settlement.solana] section's token_address is empty")]
     SettlementMissingSolanaTokenAddress,
 
-    /// A `[settlement.evm]` key that tuned the local `TokenNetwork` channel
+    /// A `[settlement.eip155.<chainId>]` key that tuned the local `TokenNetwork` channel
     /// index (issue #661), deleted with the `toon-channel` client claims it
     /// resolved (ADR 0075 decisions 9 and 12, issue #1384).
     #[error(
-        "'[settlement.evm] {field}' was removed with the TokenNetwork channel index it tuned \
+        "'[settlement.eip155.<chainId>] {field}' was removed with the TokenNetwork channel index it tuned \
          (ADR 0075, issue #1384): every claim is an x402 voucher, whose channel the settlement \
          backend reads from the chain when it is presented, so nothing indexes TokenNetwork \
          logs any more. Delete the line"
@@ -831,16 +855,16 @@ pub enum ConfigError {
          has to land in"
     )]
     BatchSettlementDelayBelowFloor {
-        table: &'static str,
+        table: String,
         key: &'static str,
         value: u64,
     },
 
-    /// `[settlement.evm] min_withdraw_delay_secs` above the
+    /// `[settlement.eip155.<chainId>] min_withdraw_delay_secs` above the
     /// contract's own thirty-day `MAX_WITHDRAW_DELAY`: no channel could carry
     /// a `withdrawDelay` that meets it.
     #[error(
-        "[settlement.evm] min_withdraw_delay_secs = {value} exceeds \
+        "[settlement.eip155.<chainId>] min_withdraw_delay_secs = {value} exceeds \
          x402BatchSettlement's MAX_WITHDRAW_DELAY of 2592000 seconds (30 days). No channel \
          could ever meet it, so the opt-in would admit nothing"
     )]
@@ -856,34 +880,34 @@ pub enum ConfigError {
     )]
     BatchSettlementZeroMinimumSponsoredDeposit,
 
-    /// `[settlement.evm] asset_eip712_name` or
+    /// `[settlement.eip155.<chainId>] asset_eip712_name` or
     /// `asset_eip712_version` was written empty. Both are required wherever
     /// the table exists (ADR 0074 decision 8, issue #1345): the greeting
     /// publishes them so a payer's deposit can be signed under the asset's
     /// real EIP-712 domain, and an empty value would be published as one.
     #[error(
-        "[settlement.evm] {key} is empty. A client signs its deposit \
+        "[settlement.eip155.<chainId>] {key} is empty. A client signs its deposit \
          authorization under this asset's real EIP-712 domain, so the greeting must publish \
          it -- there is no safe default for an arbitrary settlement token"
     )]
     BatchSettlementEmptyAssetEip712Field { key: &'static str },
 
-    /// `[settlement.evm] asset_transfer_method` names neither of x402's two
+    /// `[settlement.eip155.<chainId>] asset_transfer_method` names neither of x402's two
     /// EVM deposit methods (toon-client#695). The greeting publishes it as
     /// `extra.assetTransferMethod`, and a payer that deposits by a method
     /// the operator did not mean has its deposit refused on chain.
     #[error(
-        "[settlement.evm] asset_transfer_method = \"{value}\" is not an x402 asset transfer \
+        "[settlement.eip155.<chainId>] asset_transfer_method = \"{value}\" is not an x402 asset transfer \
          method. Write \"eip3009\" (ERC-3009 receiveWithAuthorization -- the token must \
          implement ERC-3009, as USDC does) or \"permit2\" (a Permit2 witness transfer, for any \
          ERC-20), or omit the key for \"eip3009\""
     )]
     BatchSettlementUnknownAssetTransferMethod { value: String },
 
-    /// `[settlement.evm] facilitator_url` is not a URL at all
+    /// `[settlement.eip155.<chainId>] facilitator_url` is not a URL at all
     /// (toon-client#695).
     #[error(
-        "[settlement.evm] facilitator_url = \"{value}\" is not a valid URL ({source}). It is \
+        "[settlement.eip155.<chainId>] facilitator_url = \"{value}\" is not a valid URL ({source}). It is \
          published to payers as the x402 facilitator their deposit is relayed through; write \
          an absolute http(s) URL, or omit the key to name none"
     )]
@@ -893,10 +917,10 @@ pub enum ConfigError {
         source: url::ParseError,
     },
 
-    /// `[settlement.evm] facilitator_url` is a URL, but not `http`/`https`
+    /// `[settlement.eip155.<chainId>] facilitator_url` is a URL, but not `http`/`https`
     /// (toon-client#695): a payer POSTs its deposit to it.
     #[error(
-        "[settlement.evm] facilitator_url = \"{value}\" must use http or https. A payer POSTs \
+        "[settlement.eip155.<chainId>] facilitator_url = \"{value}\" must use http or https. A payer POSTs \
          its deposit to the x402 facilitator it names"
     )]
     BatchSettlementUnsupportedFacilitatorScheme { value: String },
@@ -912,7 +936,7 @@ pub enum ConfigError {
          socks_proxy = \"socks5h://<host>:<port>\" at the top level, or remove \
          rpc_via_socks_proxy"
     )]
-    SettlementRpcViaSocksProxyWithoutProxy { table: &'static str },
+    SettlementRpcViaSocksProxyWithoutProxy { table: String },
 
     /// A settlement table asked for its RPC to ride a circuit to a plain
     /// `http://` endpoint that is not an onion address (ADR 0073). The exit
@@ -924,7 +948,7 @@ pub enum ConfigError {
          over a circuit is accepted only for a .onion or .anyone host, whose address \
          authenticates the service itself (ADR 0070, ADR 0073)"
     )]
-    SettlementRpcViaSocksProxyPlaintext { table: &'static str, value: String },
+    SettlementRpcViaSocksProxyPlaintext { table: String, value: String },
 
     #[error("[[client_identities]] entry has an empty 'id'")]
     ClientIdentityIdEmpty,
@@ -1317,10 +1341,11 @@ pub enum ConfigError {
     /// A quote on a token whose chain this node has no `[settlement]` table
     /// for (ADR 0071 decision 3).
     #[error(
-        "'{asset}' has a quote but this node has no [settlement.{chain}] table: a quote is \
+        "'{asset}' has a quote but this node has no {heading} table: a quote is \
          read over that table's own RPC endpoint, so a pool on a chain this node does not \
          settle on is one it can never take a reading from. Add the settlement table, or \
-         drop the quote and price this token's pairs with [[rates]] rows"
+         drop the quote and price this token's pairs with [[rates]] rows",
+        heading = crate::settlement::settlement_heading(.chain)
     )]
     TokenQuoteWithoutSettlement { asset: AssetId, chain: AssetChain },
 
@@ -1493,11 +1518,12 @@ pub enum ConfigError {
          which declared token every channel it accepts a claim on holds, because a forward \
          out of a client arrival is a conversion exactly when that token and the outgoing \
          peering's differ. This applies to every channel on the chain -- a \
-         [settlement.{chain}] table is what lets this node accept a claim on a channel it has \
+         {heading} table is what lets this node accept a claim on a channel it has \
          never been configured for (ADR 0052). The \
          token comes from that table's own 'token_address' -- declare it with a [[tokens]] \
-         row, remove the [settlement.{chain}] table, or remove the [[tokens]] table if this \
-         node deals nothing"
+         row, remove the {heading} table, or remove the [[tokens]] table if this \
+         node deals nothing",
+        heading = crate::settlement::settlement_heading(.chain)
     )]
     ClientChannelTokenNotDeclared {
         chain: SettlementChain,

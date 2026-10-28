@@ -45,6 +45,9 @@ use rand::RngCore;
 /// The public Base Sepolia devnet, as `docs/guide/get-paid.md` publishes it.
 /// Copied, not chosen: a voucher resolves against one token, so every node
 /// that might accept a devnet voucher has to name the same one.
+/// Base Sepolia's EIP-155 chain id: the `[settlement.eip155.<chainId>]`
+/// table key, asserted against `eth_chainId` at boot (ADR 0086).
+pub const DEVNET_EVM_CHAIN_ID: u64 = 84532;
 pub const DEVNET_EVM_RPC_URL: &str = "https://base-sepolia-rpc.publicnode.com";
 pub const DEVNET_EVM_TOKEN: &str = "0x0C996d7c934c79a6255254875607Fe69df25C0E1";
 pub const DEVNET_EVM_DECIMALS: u8 = 6;
@@ -305,7 +308,7 @@ price       = {DEVNET_PRICE}
 # Circle's devnet USDC; the facilitator relays a payer's deposit so they need
 # no ETH to open a channel. This node settles to the key below, whose address
 # is {settlement_address}.
-[settlement.evm]
+[settlement.eip155.{DEVNET_EVM_CHAIN_ID}]
 rpc_url              = "{DEVNET_EVM_RPC_URL}"
 token_address        = "{DEVNET_EVM_TOKEN}"
 decimals             = {DEVNET_EVM_DECIMALS}
@@ -313,7 +316,7 @@ asset_eip712_name    = "{DEVNET_EVM_EIP712_NAME}"
 asset_eip712_version = "{DEVNET_EVM_EIP712_VERSION}"
 facilitator_url      = "{DEVNET_FACILITATOR_URL}"
 
-[settlement.evm.key]
+[settlement.eip155.{DEVNET_EVM_CHAIN_ID}.key]
 key_file = "/app/data/settlement.key"
 
 # The operator surface (docs/guide/operator-surface.md): bearer-token reads

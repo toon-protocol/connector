@@ -176,11 +176,11 @@ key handling belongs to `toon-client`.
 
 A node reads these:
 
-| Config                             | File                    | What it signs                                                                                |
-| ---------------------------------- | ----------------------- | -------------------------------------------------------------------------------------------- |
-| `[signer] key_file`                | `signer.key`            | identity: gift-wrap and the self-description, never value. 32 raw bytes or 64 hex, secp256k1 |
-| `[settlement.evm.key] key_file`    | `settlement.key`        | EVM settlement transactions and EVM claims, client-payout vouchers included (ADR 0075)       |
-| `[settlement.solana.key] key_file` | `settlement-solana.key` | Solana settlement transactions and Solana claims, client-payout vouchers included (ADR 0075) |
+| Config                                       | File                    | What it signs                                                                                |
+| -------------------------------------------- | ----------------------- | -------------------------------------------------------------------------------------------- |
+| `[signer] key_file`                          | `signer.key`            | identity: gift-wrap and the self-description, never value. 32 raw bytes or 64 hex, secp256k1 |
+| `[settlement.eip155.<chainId>.key] key_file` | `settlement.key`        | EVM settlement transactions and EVM claims, client-payout vouchers included (ADR 0075)       |
+| `[settlement.solana.key] key_file`           | `settlement-solana.key` | Solana settlement transactions and Solana claims, client-payout vouchers included (ADR 0075) |
 
 Each chain's settlement key signs every voucher on that chain — client payouts and peer claims
 included — under [ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md).
@@ -356,7 +356,7 @@ so there is no per-peer proxy key and nothing to keep in sync. The host rule has
 `PeerCarriage` stays two-valued — ADR 0070's own falsifier is that no
 `PeerCarriage::Onion` exists. A route's `handler_url` is **not** proxied, on purpose
 (decision 4). Settlement RPC is not proxied either **unless its table opts in**:
-`rpc_via_socks_proxy = true` in `[settlement.evm]` or `[settlement.solana]` puts every
+`rpc_via_socks_proxy = true` in a `[settlement.eip155.<chainId>]` table or `[settlement.solana]` puts every
 client of that `rpc_url` on the one `socks_proxy`, on a circuit pinned per chain by SOCKS
 username, failing closed (ADR 0073, amending decision 4). Every client of a table's
 `rpc_url` is built from one `connector_chain_rpc::RpcTransport` in

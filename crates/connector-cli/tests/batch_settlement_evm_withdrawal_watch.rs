@@ -72,7 +72,7 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{signer_key}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "{rpc_url}"
 token_address = "{token:?}"
 decimals = 6
@@ -82,7 +82,7 @@ asset_eip712_version = "2"
 # default day would watch every fifteen minutes.
 min_withdraw_delay_secs = 900
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{settlement_key}"
 
 [[routes]]
@@ -221,7 +221,7 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{signer_key}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "{rpc_url}"
 token_address = "{token:?}"
 decimals = 6
@@ -229,7 +229,7 @@ asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 {extra}
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{settlement_key}"
 
 [[routes]]

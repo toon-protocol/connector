@@ -49,7 +49,7 @@ prefix      = "g.lab.hs"
 handler_url = "http://stub-app:3100/"
 price       = 1000
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://anvil:8545"
 # The local chain `infra/anvil/seed.sh` builds (ADR 0075 decision 13): Circle's
 # FiatToken v2.2 as USDC, and x402's `x402BatchSettlement` at its canonical
@@ -60,7 +60,7 @@ decimals         = 6
 asset_eip712_name    = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "/app/data/settlement.key"
 
 # x402 batch-settlement, the only channel a payer can open toward this node

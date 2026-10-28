@@ -95,14 +95,14 @@ state_dir = "{}"
 [signer]
 key_file = "{}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{}"
 {declaration}
 "#,
@@ -389,7 +389,8 @@ max_move = {{ numerator = 5, denominator = 100 }}
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("[settlement.evm]") && stderr.contains(&ANYONE.to_ascii_lowercase()),
+        stderr.contains("[settlement.eip155.<chainId>]")
+            && stderr.contains(&ANYONE.to_ascii_lowercase()),
         "expected the refusal to name the missing settlement table, got: {stderr}"
     );
 }

@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use connector_domain::{AssetChain, AssetId};
+use connector_domain::{AssetChain, AssetId, Network};
 use serde::Deserialize;
 use url::Url;
 
@@ -13,7 +14,7 @@ use crate::error::ConfigError;
 use crate::secret::SecretLocation;
 
 /// The `[settlement]` section as written in the config file: one table per
-/// chain, `[settlement.evm]` and/or `[settlement.solana]` (issue #628).
+/// chain, `[settlement.eip155.<chainId>]` and/or `[settlement.solana]` (issue #628).
 ///
 /// The legacy flat shape -- `chain`, `rpc_url`, `contract_address`,
 /// `token_address`, `decimals` and `[settlement.key]` directly under
@@ -48,17 +49,28 @@ pub(crate) struct RawLegacySettlementConfig {
 /// field. `deny_unknown_fields` so a chain this connector has no table for
 /// (or a typo'd one, e.g. `slana`) fails loudly rather than being silently
 /// ignored.
+///
+/// EVM settlement is one table per network, `[settlement.eip155.<chainId>]`
+/// (ADR 0086 decision 4): a map from the decimal chain id, as written, to
+/// that network's table. The key is checked to be a chain id when the
+/// section resolves, so a table keyed `base` is refused by name rather than
+/// failing as an unknown field. `evm` is read only to refuse
+/// `[settlement.evm]` by name.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawKeyedSettlementConfig {
     #[serde(default)]
-    evm: Option<RawEvmSettlementTable>,
+    eip155: Option<BTreeMap<String, RawEvmSettlementTable>>,
     #[serde(default)]
     solana: Option<RawSolanaSettlementTable>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    evm: Option<toml::Value>,
 }
 
-/// `[settlement.evm]`: this node's x402 `batch-settlement` terms on EVM
-/// (ADR 0075 decisions 1 and 9). The contract is a constant of the binary
+/// `[settlement.eip155.<chainId>]`: this node's x402 `batch-settlement`
+/// terms on one EVM network (ADR 0075 decisions 1 and 9, ADR 0086 decision
+/// 4). The contract is a constant of the binary
 /// (`connector_signer::X402_BATCH_SETTLEMENT_ADDRESS`), never config.
 ///
 /// Every key a `TokenNetwork` deployment needed is parsed only to be
@@ -125,7 +137,7 @@ pub(crate) struct RawSolanaSettlementTable {
     batch_settlement: Option<toml::Value>,
 }
 
-/// The `[settlement.evm.key]`/`[settlement.solana.key]` sub-section: where
+/// The `[settlement.eip155.<chainId>.key]`/`[settlement.solana.key]` sub-section: where
 /// the key material this node signs settlement transactions and vouchers
 /// with lives. Same File-or-KMS shape as the top-level `[signer]` section
 /// (`crate::secret`), kept as its own type rather than reused directly
@@ -204,6 +216,19 @@ impl std::str::FromStr for SettlementChain {
     }
 }
 
+/// The settlement table heading a refusal about `chain` tells an operator to
+/// write: `[settlement.eip155.<chainId>]` for EVM, which has one table per
+/// network (ADR 0086), and `[settlement.solana]`. Takes the chain's name in
+/// any of the workspace's spellings of it (`SettlementChain`, `AssetChain`,
+/// or the bare `"evm"`/`"solana"`), since the refusals carry all three.
+pub(crate) fn settlement_heading(chain: impl std::fmt::Display) -> &'static str {
+    match chain.to_string().parse::<SettlementChain>() {
+        Ok(SettlementChain::Evm) => "[settlement.eip155.<chainId>]",
+        Ok(SettlementChain::Solana) => "[settlement.solana]",
+        Err(_) => "[settlement.<chain>]",
+    }
+}
+
 /// A chain name `SettlementChain::from_str` does not recognize. It names
 /// every chain the `[settlement.<chain>]` tables -- and therefore the rest
 /// of the fleet -- recognize.
@@ -220,13 +245,15 @@ impl std::fmt::Display for UnknownSettlementChain {
     }
 }
 
-/// A fully validated `[settlement.evm]` table: which ERC-20 this node
-/// settles in, its RPC endpoint, where its signing key material lives, and
-/// its x402 `batch-settlement` terms. Constructed only by
-/// [`resolve_settlement`], so a value that exists has already had every
-/// field checked -- downstream code never re-validates any of them.
+/// A fully validated `[settlement.eip155.<chainId>]` table: which network it
+/// is for, which ERC-20 this node settles in there, its RPC endpoint, where
+/// its signing key material lives, and its x402 `batch-settlement` terms.
+/// Constructed only by [`resolve_settlement`], so a value that exists has
+/// already had every field checked -- downstream code never re-validates any
+/// of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvmSettlementConfig {
+    network: Network,
     rpc_url: String,
     token_address: [u8; 20],
     decimals: u8,
@@ -236,6 +263,28 @@ pub struct EvmSettlementConfig {
 }
 
 impl EvmSettlementConfig {
+    /// The network this table is for, `eip155:<chainId>`, from its table
+    /// key. **Declared and asserted**, like [`Self::decimals`] (ADR 0086
+    /// decision 4): never an input to the backend, which takes the chain id
+    /// from `eth_chainId`, and always checked against it when the backend
+    /// connects.
+    pub fn network(&self) -> &Network {
+        &self.network
+    }
+
+    /// The EIP-155 chain id the table key declares.
+    pub fn chain_id(&self) -> u64 {
+        self.network
+            .eip155_chain_id()
+            .expect("an EVM table's network is always eip155")
+    }
+
+    /// The table's name as an operator wrote it, `eip155.<chainId>` -- what
+    /// follows `settlement.` in its header, and what a refusal names.
+    pub fn table_name(&self) -> String {
+        eip155_table_name(self.chain_id())
+    }
+
     /// The RPC endpoint this node reaches the chain through.
     pub fn rpc_url(&self) -> &str {
         &self.rpc_url
@@ -272,7 +321,7 @@ impl EvmSettlementConfig {
 
     /// This node's terms for x402 batch-settlement channels on EVM (ADR
     /// 0074, ADR 0075 decision 9): the only channels it settles on, so every
-    /// `[settlement.evm]` table carries them.
+    /// `[settlement.eip155.<chainId>]` table carries them.
     pub fn batch_settlement(&self) -> &EvmBatchSettlementConfig {
         &self.batch_settlement
     }
@@ -396,6 +445,25 @@ impl SettlementConfig {
         }
     }
 
+    /// The network this table is for, when config can say: an EVM table's
+    /// `eip155:<chainId>` from its key. `None` for Solana, whose CAIP-2
+    /// reference is its cluster's genesis hash, which only the chain knows.
+    pub fn network(&self) -> Option<Network> {
+        match self {
+            SettlementConfig::Evm(evm) => Some(evm.network().clone()),
+            SettlementConfig::Solana(_) => None,
+        }
+    }
+
+    /// The table's name as written after `settlement.` in its header:
+    /// `eip155.<chainId>` or `solana`. What a refusal about the table names.
+    pub fn table_name(&self) -> String {
+        match self {
+            SettlementConfig::Evm(evm) => evm.table_name(),
+            SettlementConfig::Solana(_) => SettlementChain::Solana.name().to_string(),
+        }
+    }
+
     /// This table's RPC endpoint.
     pub fn rpc_url(&self) -> &str {
         match self {
@@ -433,7 +501,7 @@ pub(crate) fn check_settlement_rpc_routes(
     socks_proxy: Option<&Url>,
 ) -> Result<(), ConfigError> {
     for settlement in settlements.iter().filter(|s| s.rpc_via_socks_proxy()) {
-        let table = settlement.chain().name();
+        let table = settlement.table_name();
         if socks_proxy.is_none() {
             return Err(ConfigError::SettlementRpcViaSocksProxyWithoutProxy { table });
         }
@@ -456,7 +524,7 @@ pub(crate) fn check_settlement_rpc_routes(
 /// There is **one** such rule and it governs every channel table, because
 /// the reason is one reason. A `[settlement.<chain>]` table is where this
 /// node's on-chain identity on that chain comes from and where its x402
-/// terms are (ADR 0075 decision 9): `[settlement.evm.key]` is this node's
+/// terms are (ADR 0075 decision 9): `[settlement.eip155.<chainId>.key]` is this node's
 /// EVM address and voucher signer, and `[settlement.solana.key]` its
 /// Solana one. The connector holds a signer rather than a wallet (ADR
 /// 0012), so a node with no table for a chain has no address on it at all,
@@ -513,22 +581,36 @@ fn refuse_removed(written: Vec<(bool, ConfigError)>) -> Result<(), ConfigError> 
 }
 
 /// A key ADR 0075 decision 9 makes required, written or refused by name.
-fn required<T>(table: &'static str, key: &'static str, value: Option<T>) -> Result<T, ConfigError> {
-    value.ok_or(ConfigError::SettlementMissingRequiredKey { table, key })
+fn required<T>(table: &str, key: &'static str, value: Option<T>) -> Result<T, ConfigError> {
+    value.ok_or_else(|| ConfigError::SettlementMissingRequiredKey {
+        table: table.to_string(),
+        key,
+    })
 }
 
-fn resolve_evm_fields(table: RawEvmSettlementTable) -> Result<EvmSettlementConfig, ConfigError> {
+/// `eip155.<chainId>`: an EVM table's name after `settlement.`.
+pub(crate) fn eip155_table_name(chain_id: u64) -> String {
+    format!("eip155.{chain_id}")
+}
+
+fn resolve_evm_fields(
+    chain_id: u64,
+    table: RawEvmSettlementTable,
+) -> Result<EvmSettlementConfig, ConfigError> {
+    let name = eip155_table_name(chain_id);
     refuse_removed(vec![
         (
             table.contract_address.is_some(),
             ConfigError::SettlementToonKeyRemoved {
-                table: "evm",
+                table: name.clone(),
                 field: "contract_address",
             },
         ),
         (
             table.batch_settlement.is_some(),
-            ConfigError::SettlementBatchSubTableRemoved { table: "evm" },
+            ConfigError::SettlementBatchSubTableRemoved {
+                table: name.clone(),
+            },
         ),
         (
             table.channel_index_from_block.is_some(),
@@ -554,15 +636,23 @@ fn resolve_evm_fields(table: RawEvmSettlementTable) -> Result<EvmSettlementConfi
         return Err(ConfigError::SettlementZeroDecimals);
     }
     let key = resolve_settlement_key(table.key)?;
-    let batch_settlement = resolve_evm_batch_settlement(RawEvmBatchSettlementTable {
-        min_withdraw_delay_secs: table.min_withdraw_delay_secs,
-        asset_eip712_name: required("evm", "asset_eip712_name", table.asset_eip712_name)?,
-        asset_eip712_version: required("evm", "asset_eip712_version", table.asset_eip712_version)?,
-        asset_transfer_method: table.asset_transfer_method,
-        facilitator_url: table.facilitator_url,
-    })?;
+    let batch_settlement = resolve_evm_batch_settlement(
+        &name,
+        RawEvmBatchSettlementTable {
+            min_withdraw_delay_secs: table.min_withdraw_delay_secs,
+            asset_eip712_name: required(&name, "asset_eip712_name", table.asset_eip712_name)?,
+            asset_eip712_version: required(
+                &name,
+                "asset_eip712_version",
+                table.asset_eip712_version,
+            )?,
+            asset_transfer_method: table.asset_transfer_method,
+            facilitator_url: table.facilitator_url,
+        },
+    )?;
 
     Ok(EvmSettlementConfig {
+        network: Network::Eip155(chain_id),
         rpc_url,
         token_address,
         decimals: table.decimals,
@@ -579,13 +669,15 @@ fn resolve_solana_fields(
         (
             table.program_id.is_some(),
             ConfigError::SettlementToonKeyRemoved {
-                table: "solana",
+                table: "solana".to_string(),
                 field: "program_id",
             },
         ),
         (
             table.batch_settlement.is_some(),
-            ConfigError::SettlementBatchSubTableRemoved { table: "solana" },
+            ConfigError::SettlementBatchSubTableRemoved {
+                table: "solana".to_string(),
+            },
         ),
     ])?;
 
@@ -621,8 +713,10 @@ fn resolve_solana_fields(
 /// chain, and so takes no claim at all (every claim is a voucher, ADR
 /// 0075).
 ///
-/// Returns every chain the section names, each fully validated, at most one
-/// per [`SettlementChain`] by construction.
+/// Returns every table the section names, each fully validated: the EVM
+/// tables first, one per network in chain-id order, then the Solana table
+/// if there is one (ADR 0086 decision 4). Several EVM tables load; whether
+/// a node may *run* more than one is boot's question, not config's.
 pub(crate) fn resolve_settlement(
     raw: Option<RawSettlementSection>,
 ) -> Result<Vec<SettlementConfig>, ConfigError> {
@@ -634,12 +728,27 @@ pub(crate) fn resolve_settlement(
         RawSettlementSection::Legacy(_) => Err(ConfigError::SettlementLegacyShapeRemoved),
         RawSettlementSection::Keyed(raw) => {
             let raw = *raw;
-            if raw.evm.is_none() && raw.solana.is_none() {
+            if raw.evm.is_some() {
+                return Err(ConfigError::SettlementEvmTableRemoved);
+            }
+            if raw.eip155.is_none() && raw.solana.is_none() {
                 return Err(ConfigError::SettlementSectionEmpty);
             }
             let mut out = Vec::new();
-            if let Some(evm) = raw.evm {
-                out.push(SettlementConfig::Evm(resolve_evm_fields(evm)?));
+            if let Some(eip155) = raw.eip155 {
+                if eip155.is_empty() {
+                    return Err(ConfigError::SettlementEip155Empty);
+                }
+                let mut networks = Vec::with_capacity(eip155.len());
+                for (key, table) in eip155 {
+                    let chain_id = Network::parse_eip155_chain_id(&key)
+                        .map_err(|_| ConfigError::SettlementEip155KeyNotAChainId { key })?;
+                    networks.push((chain_id, table));
+                }
+                networks.sort_by_key(|(chain_id, _)| *chain_id);
+                for (chain_id, table) in networks {
+                    out.push(SettlementConfig::Evm(resolve_evm_fields(chain_id, table)?));
+                }
             }
             if let Some(solana) = raw.solana {
                 out.push(SettlementConfig::Solana(resolve_solana_fields(solana)?));
@@ -709,12 +818,17 @@ mod tests {
         resolve_settlement(Some(section(body)))
     }
 
-    /// A complete `[settlement.evm]` table, with `extra` appended to it
-    /// before its key sub-table.
+    /// A complete `[settlement.eip155.31337]` table, with `extra` appended
+    /// to it before its key sub-table.
     fn evm_table(extra: &str, key_file: &Path) -> String {
+        evm_table_on(31337, extra, key_file)
+    }
+
+    /// A complete `[settlement.eip155.<chain_id>]` table.
+    fn evm_table_on(chain_id: u64, extra: &str, key_file: &Path) -> String {
         format!(
             r#"
-[evm]
+[eip155.{chain_id}]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "{TOKEN}"
 decimals = 6
@@ -722,7 +836,7 @@ asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 {extra}
 
-[evm.key]
+[eip155.{chain_id}.key]
 key_file = "{key}"
 "#,
             key = key_file.display()
@@ -767,7 +881,7 @@ key_file = "{key}"
         assert!(resolved.is_empty());
     }
 
-    /// ADR 0075 decision 9: `[settlement.evm]` needs only an RPC URL, a
+    /// ADR 0075 decision 9: `[settlement.eip155.<chainId>]` needs only an RPC URL, a
     /// token, its decimals, its asset's EIP-712 domain and a key, and its
     /// x402 terms sit in the table itself.
     #[test]
@@ -798,7 +912,7 @@ key_file = "{key}"
         assert_eq!(evm.batch_settlement().facilitator_url(), None);
     }
 
-    /// toon-client#695: the deposit keys sit in `[settlement.evm]` itself,
+    /// toon-client#695: the deposit keys sit in `[settlement.eip155.<chainId>]` itself,
     /// like every other x402 term, and reach the resolved terms.
     #[test]
     fn an_evm_table_carries_its_deposit_method_and_facilitator() {
@@ -894,7 +1008,7 @@ key_file = "{key}"
         assert!(matches!(error, ConfigError::SettlementLegacyShapeRemoved));
         let message = error.to_string();
         assert!(
-            message.contains("[settlement.evm]") && message.contains("ADR 0075"),
+            message.contains("[settlement.eip155.<chainId>]") && message.contains("ADR 0075"),
             "the refusal names the shape to write and the record: {message}"
         );
     }
@@ -913,9 +1027,9 @@ key_file = "{key}"
         assert!(matches!(
             error,
             ConfigError::SettlementToonKeyRemoved {
-                table: "evm",
+                ref table,
                 field: "contract_address",
-            }
+            } if table == "eip155.31337"
         ));
         assert!(error.to_string().contains("contract_address"));
     }
@@ -934,9 +1048,9 @@ key_file = "{key}"
         assert!(matches!(
             error,
             ConfigError::SettlementToonKeyRemoved {
-                table: "solana",
+                ref table,
                 field: "program_id",
-            }
+            } if table == "solana"
         ));
         assert!(error.to_string().contains("program_id"));
     }
@@ -948,17 +1062,17 @@ key_file = "{key}"
     fn the_batch_settlement_sub_table_is_refused_by_name_on_both_chains() {
         let key_file = temp_key_file();
         let evm = resolve(&format!(
-            "{}\n[evm.batch_settlement]\nmin_withdraw_delay_secs = 3600\n",
+            "{}\n[eip155.31337.batch_settlement]\nmin_withdraw_delay_secs = 3600\n",
             evm_table("", key_file.path())
         ))
         .expect_err("the EVM sub-table is retired");
         assert!(matches!(
             evm,
-            ConfigError::SettlementBatchSubTableRemoved { table: "evm" }
+            ConfigError::SettlementBatchSubTableRemoved { ref table } if table == "eip155.31337"
         ));
         assert!(evm
             .to_string()
-            .contains("[settlement.evm.batch_settlement]"));
+            .contains("[settlement.eip155.31337.batch_settlement]"));
 
         let solana = resolve(&format!(
             "{}\n[solana.batch_settlement]\nmin_sponsored_deposit = 5\n",
@@ -967,7 +1081,7 @@ key_file = "{key}"
         .expect_err("the Solana sub-table is retired");
         assert!(matches!(
             solana,
-            ConfigError::SettlementBatchSubTableRemoved { table: "solana" }
+            ConfigError::SettlementBatchSubTableRemoved { ref table } if table == "solana"
         ));
     }
 
@@ -995,12 +1109,12 @@ key_file = "{key}"
     fn each_newly_required_key_is_refused_by_name_when_missing() {
         let key_file = temp_key_file();
         for (table, key) in [
-            ("evm", "asset_eip712_name"),
-            ("evm", "asset_eip712_version"),
+            ("eip155.31337", "asset_eip712_name"),
+            ("eip155.31337", "asset_eip712_version"),
             ("solana", "min_sponsored_deposit"),
         ] {
             let full = match table {
-                "evm" => evm_table("", key_file.path()),
+                "eip155.31337" => evm_table("", key_file.path()),
                 _ => solana_table("", key_file.path()),
             };
             let written: String = full
@@ -1011,8 +1125,8 @@ key_file = "{key}"
             let error = resolve(&written).expect_err("a required key is missing");
             assert!(
                 matches!(
-                    error,
-                    ConfigError::SettlementMissingRequiredKey { table: t, key: k } if t == table && k == key
+                    &error,
+                    ConfigError::SettlementMissingRequiredKey { table: t, key: k } if t == table && *k == key
                 ),
                 "{table}.{key}: {error}"
             );
@@ -1032,10 +1146,10 @@ key_file = "{key}"
         assert!(matches!(
             error,
             ConfigError::BatchSettlementDelayBelowFloor {
-                table: "solana",
+                ref table,
                 key: "min_grace_period_secs",
                 value: 60,
-            }
+            } if table == "solana"
         ));
     }
 
@@ -1123,8 +1237,9 @@ key_file = "{key}"
     fn an_empty_keyed_settlement_section_is_rejected() {
         let result = resolve_settlement(Some(RawSettlementSection::Keyed(Box::new(
             RawKeyedSettlementConfig {
-                evm: None,
+                eip155: None,
                 solana: None,
+                evm: None,
             },
         ))));
         assert!(matches!(result, Err(ConfigError::SettlementSectionEmpty)));
@@ -1162,6 +1277,88 @@ key_file = "{key}"
             // `evm:` asset and an `[settlement.evm]` table comparable.
             assert_eq!(chain.asset_chain().as_str(), chain.name());
         }
+    }
+
+    /// ADR 0086 decision 4: `[settlement.evm]` named no network, so it is
+    /// refused by name with its rewrite, never read as some chain's table.
+    #[test]
+    fn the_evm_table_is_refused_by_name_with_its_rewrite() {
+        let key_file = temp_key_file();
+        let body = evm_table("", key_file.path())
+            .replace("[eip155.31337]", "[evm]")
+            .replace("[eip155.31337.key]", "[evm.key]");
+        let error = resolve(&body).expect_err("[settlement.evm] is retired");
+
+        assert!(matches!(error, ConfigError::SettlementEvmTableRemoved));
+        let message = error.to_string();
+        assert!(
+            message.contains("[settlement.evm]")
+                && message.contains("[settlement.eip155.<chainId>]")
+                && message.contains("ADR 0086"),
+            "the refusal names the table and its rewrite: {message}"
+        );
+    }
+
+    /// The table key is a decimal chain id, or the table is refused by
+    /// name: a typo must not become a silently unused table.
+    #[test]
+    fn a_table_key_that_is_not_a_decimal_chain_id_is_refused_by_name() {
+        let key_file = temp_key_file();
+        for key in ["base", "0x2105", "08453", "0"] {
+            let body = evm_table("", key_file.path())
+                .replace("[eip155.31337]", &format!("[eip155.\"{key}\"]"))
+                .replace("[eip155.31337.key]", &format!("[eip155.\"{key}\".key]"));
+            let error = resolve(&body).expect_err("not a chain id");
+            assert!(
+                matches!(&error, ConfigError::SettlementEip155KeyNotAChainId { key: named } if named == key),
+                "{key}: {error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("[settlement.eip155.{key}]")),
+                "the refusal names the table: {message}"
+            );
+        }
+    }
+
+    /// `[settlement.eip155]` with no network under it is not EVM
+    /// settlement, and is refused rather than read as an empty one.
+    #[test]
+    fn an_eip155_section_with_no_network_is_refused_by_name() {
+        let error = resolve("[eip155]\n").expect_err("no network");
+        assert!(matches!(error, ConfigError::SettlementEip155Empty));
+        assert!(error.to_string().contains("[settlement.eip155]"));
+    }
+
+    /// Each table answers for its own network, in chain-id order, and two
+    /// tables may name one key file (ADR 0086 decision 5). Loading two is
+    /// legal here; boot refuses it until multi-network settlement lands.
+    #[test]
+    fn each_eip155_table_answers_for_its_own_network() {
+        let key_file = temp_key_file();
+        let resolved = resolve(&format!(
+            "{}{}{}",
+            evm_table_on(84532, "", key_file.path()),
+            solana_table("", key_file.path()),
+            evm_table_on(8453, "", key_file.path()),
+        ))
+        .expect("two EVM tables load");
+
+        let networks: Vec<Option<Network>> =
+            resolved.iter().map(SettlementConfig::network).collect();
+        assert_eq!(
+            networks,
+            vec![
+                Some(Network::Eip155(8453)),
+                Some(Network::Eip155(84532)),
+                None,
+            ]
+        );
+        let SettlementConfig::Evm(base) = &resolved[0] else {
+            panic!("EVM first");
+        };
+        assert_eq!(base.network(), &Network::Eip155(8453));
+        assert_eq!(base.chain_id(), 8453);
     }
 
     #[test]

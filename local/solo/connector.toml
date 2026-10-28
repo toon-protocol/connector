@@ -83,14 +83,14 @@ write_keys_file = "/app/data/operator-write-keys"
 # `receiveWithAuthorization` signs under and so what the two `asset_eip712_*`
 # keys must say. `connect` reads its `decimals()` and refuses to start if 6 is
 # wrong (issue #564).
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://anvil:8545"
 token_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "/app/data/settlement.key"
 
 # `token_address` is the deterministic mock mint from
