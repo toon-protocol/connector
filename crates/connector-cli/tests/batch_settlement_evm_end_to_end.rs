@@ -215,6 +215,65 @@ price = {PRICE}
         "refused by name: {refused:?}"
     );
 
+    // ADR 0086 decision 1 (#1599): the voucher's network, on the real
+    // channel this node holds. Each refusal is by name, and none of them
+    // advances the watermark -- the restarted node below still takes the
+    // next voucher above it.
+    let next = x402.sign_voucher(&session, &channel, u128::from(3 * PRICE));
+    let genuine = evm_voucher(&channel, 3 * PRICE, &next, Some(&channel_config));
+    let refusal_of = |json: String| {
+        let app = app.clone();
+        async move {
+            Reject::decode(&post_ilp(&app, &json, paid_prepare(ROUTE, &receiver)).await)
+                .expect("the voucher is refused")
+                .message
+        }
+    };
+    // No network at all, on a node that settles on exactly one.
+    let mut unnamed: serde_json::Value = serde_json::from_str(&genuine).expect("JSON");
+    unnamed
+        .as_object_mut()
+        .expect("an object")
+        .remove("network");
+    let message = refusal_of(unnamed.to_string()).await;
+    assert!(message.contains("'network'"), "refused by name: {message}");
+    // A network this node holds no table for.
+    let message = refusal_of(genuine.replace("eip155:31337", "eip155:8453")).await;
+    assert!(
+        message.contains("'eip155:8453'") && message.contains("settles"),
+        "refused naming the network: {message}"
+    );
+    // This node's own network, on a channel id computed under another
+    // network's domain: it does not recompute under eip155:31337's.
+    let elsewhere = connector_signer::evm_batch_channel_id(
+        &connector_signer::BatchSettlementDomain::x402(84_532),
+        &connector_signer::BatchChannelConfig {
+            payer: channel_config.payer,
+            payer_authorizer: channel_config.payer_authorizer,
+            receiver: channel_config.receiver,
+            receiver_authorizer: channel_config.receiver_authorizer,
+            token: channel_config.token,
+            withdraw_delay: channel_config.withdraw_delay,
+            salt: channel_config.salt,
+        },
+    );
+    let relabelled = genuine.replace(
+        &channel.0,
+        &format!(
+            "0x{}",
+            elsewhere
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ),
+    );
+    assert_ne!(relabelled, genuine);
+    let message = refusal_of(relabelled).await;
+    assert!(
+        message.contains("eip155:31337's EIP-712 domain"),
+        "refused naming the network it claimed: {message}"
+    );
+
     // Restart: a new process, from the same config and state_dir. Nothing
     // was ever landed, and the chain never gives the config back -- the
     // journal is how the port can land this channel at all.

@@ -167,9 +167,21 @@ connector cannot open is refused under its own reason, distinguishable both from
 and from a claim naming an unknown channel.
 
 Required fields on every claim, regardless of chain: `version` (`'1.0'`), `scheme`
-(`'batch-settlement'`), `blockchain`, `messageId` (idempotency), `timestamp` (ISO 8601),
+(`'batch-settlement'`), `blockchain`, `network`, `messageId` (idempotency), `timestamp` (ISO 8601),
 `senderId`. `senderId` is self-declared and carries no authority: it labels the sender for §1.2's
 anonymous identity and for the lookup budget below, and nothing is verified against it.
+
+`network` is the CAIP-2 network the voucher is on (`eip155:<chainId>`, or `solana:<genesis prefix>`
+as the greeting's `accepts[]` spells it; [ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md)
+decision 1, `schema_version` 10), of the family `blockchain` names; `blockchain` still picks the
+parser. A claim with no `network` is refused **by name**, even by a node that settles on one
+network. One naming a network this node holds no settlement table for is refused by name before
+anything about it is looked up. On EVM the channel id is recomputed from `channelConfig` under the
+EIP-712 domain of the network named, so a voucher relabelled onto another network does not
+recompute and is refused, naming the network it claimed; on Solana the network must equal this
+node's one Solana network. The same field, under the same rules, rides every claim-state entry
+(§1.10) -- answered `"network-missing"` or `"network-not-settled"` by name, and echoed on every
+answer that read it -- every `channelChallenge` (§1.9) and every payout voucher.
 Chain-specific fields, named as x402's own voucher payloads name them:
 
 - **evm**: `channelId` (bytes32 hex), `maxClaimableAmount` (decimal string, cumulative, a `uint128`

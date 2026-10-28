@@ -210,6 +210,38 @@ price = {PRICE}
         "refused by name: {refused:?}"
     );
 
+    // ADR 0086 decision 1 (#1599): a Solana voucher's network must be this
+    // node's one Solana network. Each refusal is by name, and none advances
+    // the watermark -- the journaled voucher above is still the latest.
+    let next = solana_voucher(
+        &network,
+        &channel.to_string(),
+        2 * PRICE,
+        &payer.sign(&channel, 2 * PRICE),
+    );
+    let refusal_of = |json: String| {
+        let app = app.clone();
+        async move {
+            Reject::decode(&post_ilp(&app, &json, paid_prepare(ROUTE, &receiver)).await)
+                .expect("the voucher is refused")
+                .message
+        }
+    };
+    let mut unnamed: serde_json::Value = serde_json::from_str(&next).expect("JSON");
+    unnamed
+        .as_object_mut()
+        .expect("an object")
+        .remove("network");
+    let message = refusal_of(unnamed.to_string()).await;
+    assert!(message.contains("'network'"), "refused by name: {message}");
+    // Mainnet-beta's genesis prefix: never a test validator's.
+    let mainnet_beta = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+    let message = refusal_of(next.replace(&network, mainnet_beta)).await;
+    assert!(
+        message.contains(mainnet_beta) && message.contains("settles"),
+        "refused naming the network: {message}"
+    );
+
     // Restart, and land the journaled voucher through the port.
     drop(app);
     drop(runtime);
