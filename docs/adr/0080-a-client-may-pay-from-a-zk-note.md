@@ -1,6 +1,6 @@
 # A client may pay from a zk note
 
-**Status:** Accepted (owner decision, 2026-10-16, #1511). **Spike #1512 answered yes** (2026-10-16, [research note](../research/zk-note-verifier-spike.md)), so the condition is met and the record stands. **Amended 2026-10-28** (owner decision, #1513): decision 7 names the asset and its rate, and the vault holds one asset with no merge or top-up of notes. **Amended 2026-10-28** (owner decision, #1555): decision 12 makes toon-protocol/zk_toon's `zk-note` crate the definition of every zk-note derivation, and decision 3 gains the checks that crate's request proof leaves to the zk edge. Nothing is built. It **amends** [0040](0040-a-verified-payment-is-stated-to-the-app.md): the payer is stated only when it is known. It **adds a note to** [0033](0033-the-exposure-machinery-is-retired-not-restated.md): the risk that record retired comes back at a zk edge, under a cap, as the **open budget**. It leaves [0002](0002-drop-mina-from-the-rust-connector.md) and [0065-mina](0065-mina-leaves-the-repository.md) standing, and the sections below explain why. It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): the allowance claim, the allowance request and answer, and the signed successor state all become vectors.
+**Status:** Accepted (owner decision, 2026-10-16, #1511). **Spike #1512 answered yes** (2026-10-16, [research note](../research/zk-note-verifier-spike.md)), so the condition is met and the record stands. **Amended 2026-10-28** (owner decision, #1513): decision 7 names the asset and its rate, and the vault holds one asset with no merge or top-up of notes. **Amended 2026-10-28** (owner decision, #1555): decision 12 makes toon-protocol/zk_toon's `zk-note` crate the definition of every zk-note derivation, and decision 3 gains the checks that crate's request proof leaves to the zk edge. **Amended 2026-10-28** (owner decision, #1581): decision 13 admits subsidised allowances (zk_toon's ADR 0001), paid from the zk edge's subsidy budget. Nothing is built. It **amends** [0040](0040-a-verified-payment-is-stated-to-the-app.md): the payer is stated only when it is known. It **adds a note to** [0033](0033-the-exposure-machinery-is-retired-not-restated.md): the risk that record retired comes back at a zk edge, under a cap, as the **open budget**. It leaves [0002](0002-drop-mina-from-the-rust-connector.md) and [0065-mina](0065-mina-leaves-the-repository.md) standing, and the sections below explain why. It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): the allowance claim, the allowance request and answer, and the signed successor state all become vectors.
 
 **Scope:** protocol law. It adds a claim scheme, a greeting entry and two client-edge endpoints that every implementation of a zk edge must speak. Where the proof is verified and how the journal records it are connector architecture. See the [ADR index](README.md).
 
@@ -59,8 +59,8 @@ closes, which zkAPI cannot say.
    - a request time more than 10 minutes behind or 1 minute ahead of the zk edge's clock. The
      window is a constant, not config, because every wallet has to know it. Without it a payer
      could backdate a request and spend a note that has already expired;
-   - a subsidised flag, period or per-period nullifier that is set. This refusal stands until
-     subsidised allowances are built.
+   - a subsidised flag, period or per-period nullifier that is set. _Amended 2026-10-28 (#1581):_
+     decision 13 replaces this refusal with the subsidised checks.
 
    The zk edge enters the tag as the x-coordinate of its state public key, which the greeting
    already publishes. An allowance claim is signed by the session key with the chunked nonce
@@ -134,6 +134,50 @@ closes, which zkAPI cannot say.
     values computed through the pinned crate: the allowance claim and its signed bytes, the
     allowance request and answer, and the signed successor. The crate and the verifier share one
     `proof-systems` source, the one the live Mina daemon pins. For Mesa that is tag `0.7.0`.
+13. **A subsidised allowance is paid from the subsidy budget.** _Added 2026-10-28 (owner
+    decision, #1581; the shape was set in #1511's design review)._ zk_toon's
+    [ADR 0001](https://github.com/toon-protocol/zk_toon/blob/main/docs/adr/0001-a-notes-reward-is-service-not-money.md)
+    lets a note at least 7 days old open one smallest-tier allowance per **subsidy period**, and
+    its request proof proves the age, the period and the **per-period nullifier**. The connector
+    computes none of them: the age and the nullifier need the note's private deposit time and
+    secret. It owns who pays the charge, the per-period nullifier's uniqueness, and the budget.
+    - **Admission.** A subsidised proof is admitted under the same verification key as any
+      other, after decision 3's checks. Before the binding tag, it is also refused by name, in
+      this order, when:
+      1. its tier is not the smallest of zk_toon's tiers;
+      2. its period is not the current one, as `zk_note::policy::subsidy_period` computes from
+         the vault's creation time and the zk edge's clock. There is no grace window at a period
+         boundary; the wallet proves again for the new period;
+      3. the period's subsidy budget is closed;
+      4. its per-period nullifier has already been seen.
+    - **Per-period nullifiers are the zk edge's alone.** The vault never records them, so they
+      are checked in the journal only, never on chain. Each is journaled durably before the grant
+      (decision 11). One from a finished period may be pruned, because its proof could no longer
+      be admitted.
+    - **The budget is counted in the vault's asset, per period.** The table's `subsidy_budget`
+      is an amount in MINA base units, zero by default. A table with a non-zero budget must offer
+      the smallest tier, or it refuses to boot, and only then does it read the vault's creation
+      time, once, at boot; a failed read fails the boot. A grant **reserves** the full tier
+      against the budget of the period it was granted in. The close **charges** Δ instead, and
+      the remainder returns to that period's budget, or is lost if that period has ended. The
+      budget is **open** while what remains covers the smallest tier, so a subsidy is never
+      partial.
+    - **The note is charged nothing.** The state advance still happens, so the note's state moves
+      on and stays unlinkable, but the successor carries the old balance unchanged. The payer
+      checks it against a charge of zero; Δ is the budget's. The vault must accept a state
+      advance with zero charge (zk_toon #12).
+    - **A subsidised allowance counts toward the open budget** (decision 5): the zk edge pays
+      downstream for it exactly as for any other.
+    - **What is published.** The greeting's zk-note entry gains `subsidy`, `"open"` or
+      `"closed"`, and omits it when the budget is zero. It never says how much remains. A wallet
+      that read `"open"` may still be refused as closed; the refusal is authoritative. The
+      self-description publishes how many subsidised allowances were granted in the last
+      **finished** period, never the current one, and no amount.
+    - **Vectors.** A subsidised allowance request, its successor with zero charge and the
+      greeting's `subsidy` field join `vectors/wire-vectors.json`. The budget, an amount, stays
+      out of them, as the asset does.
+    - **Known leak, accepted.** The zk edge sees that an allowance is subsidised, so it learns
+      that the payer's note is at least 7 days old.
 
 ## Why this does not undo 0002 or 0065-mina
 
@@ -187,6 +231,16 @@ challenger all live outside this repository. The rule "do not reintroduce an o1j
 - **An operator-writable MINA rate first.** Rejected for now (2026-10-28): ADR 0071 names it as
   the natural next step, but it is a change of its own and need not precede the zk edge. A
   static rate with a spread, under the open-budget cap, is enough to start.
+- **Charging the subsidy budget the full tier at grant.** Rejected (2026-10-28, #1581): the budget
+  would pay for service never given, and the owner's design says it is charged the amount used.
+- **Charging the subsidy budget only at close.** Rejected (2026-10-28, #1581): allowances already
+  open could spend past the budget, which "no partial subsidy" forbids.
+- **A grace window at a subsidy period's boundary.** Rejected (2026-10-28, #1581): it would be a
+  second rule that every wallet must compute, to save one re-proof a week.
+- **Checking per-period nullifiers on chain.** Rejected (2026-10-28, #1581): the vault does not
+  record them, so there is nothing on chain to check.
+- **Publishing subsidy counts for every finished period.** Rejected (2026-10-28, #1581): the
+  journal would grow without bound, for history anyone watching can keep for themselves.
 
 ## Consequences
 
@@ -222,5 +276,5 @@ challenger all live outside this repository. The rule "do not reintroduce an o1j
   vectors over an in-memory vault, on zk_toon's primitives, then the Mina adapter run against
   committed fixtures. The first also reduces `connector-zk-note` (#1521) to a boundary that
   re-exports zk_toon's crate and keeps only the session-key signature check and tier validation.
-  Subsidised allowances (zk_toon's ADR 0001) are a third piece of work: they wait for zk_toon's
-  subsidised request proof, and until it lands admission refuses them.
+  Subsidised allowances (decision 13) are a third piece of work, #1581: they wait for zk_toon's
+  subsidised request proof (zk_toon #12), and until it lands admission refuses them.
