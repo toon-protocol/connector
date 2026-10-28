@@ -411,7 +411,10 @@ redemptionSafetySeconds, destinationTag?}}`. **Inference:** TOON would publish t
   ```
 
   There is no contract address or program id to pin: the binding is the protocol. Boot would
-  instead assert that the `PayChan` amendment is enabled (it has been since 2020).
+  instead assert that the `PayChan` amendment is enabled (it has been on mainnet since 2017-03-31).
+  _Corrected 2026-10-28 (#1564): PayChan is a retired amendment, so testnet reports it `enabled:
+false` while channels work there; boot checks the network id instead
+  (`whose-code-a-channel-may-bind-to.md`, Q12)._
 
 - **Wire vectors** (ADR 0021). Add `claim_voucher.xrpl`:
   - channel id derivation;
@@ -859,7 +862,8 @@ Sources pinned: x402 [`261d0c5e`](https://github.com/x402-foundation/x402/tree/2
 - **On-chain code exists, but nobody in x402 owns it.** The channel is Subbit's Aiken validator `subbit.subbit.spend`. Its owner is Kompact.io (`@waalge`), and its funding is Project Catalyst Fund 13 ([milestones 1300174](https://milestones.projectcatalyst.io/projects/1300174); README: M1–M5 done). CONFIRMED-DOCS.
   - The validator is Apache-2.0 and Plutus V3, built with Aiken v1.1.24.
   - Script hash at `c45f4869` and on the `x402` branch: `6d8774631fece31d0c768afb960c9a8a9957f8a85fa31deae1159094`, which is the hash CSPEC names. The older build `62ce4309…` has a liveness defect, fixed in subbit-xyz#10.
-  - Both CSPEC and SUBBIT's README say it is **alpha and unaudited**. CONFIRMED-CODE.
+  - CSPEC says it is **alpha and unaudited**; SUBBIT's README says only **alpha**. No audit is
+    published. CONFIRMED-CODE. _(Corrected 2026-10-28, #1564.)_
 - **Deployment.** The validator is parameter-free, so "deploying" means publishing a reference-script UTxO. Anyone can do that, and nobody needs to own it. REF published one on **preprod** (deploy tx `544752f6…`; CSPEC's example `referenceScript` is `ff61e3f4…#0`). **No mainnet reference script or mainnet channel was found** in CSPEC or REF's `RESULTS.md`. UNCONFIRMED: nothing indexes channels by script hash, and only preprod was searched.
 - **Two Cardano x402 dialects already diverge.** Subbit's own Rust stack has an x402 dialect on its `x402` branch (ADR `docs/adrs/x402.md`, 2026-10-07, status accepted). It says REF "isn't load-bearing", and it "diverges from the reference where it disagrees (notably, `Keytag`'s derivation)". It also has **no facilitator** ("erodes the trustlessness guarantee"). CSPEC requires a channel id derived from a spent input and defines a facilitator. CONFIRMED-CODE.
 - **Likelihood signals.**
