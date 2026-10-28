@@ -49,7 +49,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use connector_domain::x402::X402BatchSettlementTerms;
-use connector_domain::JournalEntry;
+use connector_domain::{AssetChain, JournalEntry, Network};
 use connector_settlement::batch::{
     BatchChannelState, BatchChannelStatus, BatchSettlementBackend, BatchSettlementError,
     BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, HeldVouchers, Landed,
@@ -154,6 +154,13 @@ pub enum BatchChannelError {
     /// This node has no x402 batch-settlement backend on that chain.
     #[error("this node has no x402 batch-settlement backend on {0}")]
     NoBackend(SettlementChain),
+    /// This node pays on several networks of that chain, and the open did
+    /// not say which (ADR 0086): a channel is never opened on a guessed one.
+    #[error(
+        "this node pays on several {0} networks, and an open on that chain names the one it \
+         is on"
+    )]
+    NetworkAmbiguous(SettlementChain),
     /// Not an outbound channel this node opened (for fund, withdraw), or
     /// not a channel it holds a voucher on (for land).
     #[error("'{0}' is not an x402 batch-settlement channel of this node's")]
@@ -217,6 +224,10 @@ pub enum WithdrawStep {
 #[derive(Debug, Clone)]
 struct Tracked {
     chain: SettlementChain,
+    /// The network whose payer the channel is on (ADR 0086): proved from
+    /// the record at restore, or the one it was opened on. `None` for a
+    /// record no configured network reproduces, which no payer serves.
+    network: Option<Network>,
     record: OutboundChannelRecord,
     opened: bool,
     /// The highest voucher journaled on it.
@@ -252,6 +263,54 @@ fn chain_of(name: &str) -> SettlementChain {
     SettlementChain::from_str(name).expect("the settlement port names only evm and solana")
 }
 
+/// The network among `networks` that the channel `presentation` is on (ADR
+/// 0086 decisions 9 and 10): the one candidate of its chain when there is
+/// one, and otherwise, on EVM, the one whose `x402BatchSettlement` domain
+/// reproduces the channel id from its config -- an EVM channel id binds
+/// its chain, so at most one does. `None` when no network of its chain is
+/// given, or (EVM) when none or several reproduce it.
+pub fn network_of_presentation<'a>(
+    presentation: &ChannelPresentation,
+    networks: impl IntoIterator<Item = &'a Network>,
+) -> Option<Network> {
+    let family = match presentation {
+        ChannelPresentation::Evm { .. } => AssetChain::Evm,
+        ChannelPresentation::Solana { .. } => AssetChain::Solana,
+    };
+    let candidates: Vec<&Network> = networks
+        .into_iter()
+        .filter(|network| network.chain() == family)
+        .collect();
+    if let [only] = candidates.as_slice() {
+        return Some((*only).clone());
+    }
+    let ChannelPresentation::Evm { channel, config } = presentation else {
+        return None;
+    };
+    let config = connector_signer::BatchChannelConfig {
+        payer: config.payer,
+        payer_authorizer: config.payer_authorizer,
+        receiver: config.receiver,
+        receiver_authorizer: config.receiver_authorizer,
+        token: config.token,
+        withdraw_delay: config.withdraw_delay,
+        salt: config.salt,
+    };
+    let mut reproducing = candidates.into_iter().filter(|network| {
+        network.eip155_chain_id().is_some_and(|chain_id| {
+            let id = connector_signer::evm_batch_channel_id(
+                &connector_signer::BatchSettlementDomain::x402(chain_id),
+                &config,
+            );
+            canonical_id(&channel.0) == hex(&id)
+        })
+    });
+    match (reproducing.next(), reproducing.next()) {
+        (Some(network), None) => Some(network.clone()),
+        _ => None,
+    }
+}
+
 /// `bytes` as `0x` and lowercase hex.
 pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(2 + 2 * bytes.len());
@@ -283,7 +342,9 @@ fn spell_signer(signer: &VoucherSigner) -> String {
 /// what each crash leaves.
 pub struct OutboundChannels {
     journal: Arc<dyn Journal>,
-    payers: Vec<(SettlementChain, Arc<dyn BatchSettlementPayer>)>,
+    /// The paying half of each network this node settles on (ADR 0086):
+    /// one per EVM table, and the one Solana table.
+    payers: Vec<(Network, Arc<dyn BatchSettlementPayer>)>,
     channels: Mutex<BTreeMap<String, Tracked>>,
     /// One open at a time, so two concurrent opens toward one receiver
     /// cannot both miss the other's pending record.
@@ -300,7 +361,7 @@ impl OutboundChannels {
     /// whatever is in it.
     pub async fn restore(
         journal: Arc<dyn Journal>,
-        payers: Vec<(SettlementChain, Arc<dyn BatchSettlementPayer>)>,
+        payers: Vec<(Network, Arc<dyn BatchSettlementPayer>)>,
     ) -> Result<OutboundChannels, JournalError> {
         let mut channels: BTreeMap<String, Tracked> = BTreeMap::new();
         let mut by_key: BTreeMap<String, String> = BTreeMap::new();
@@ -314,10 +375,15 @@ impl OutboundChannels {
                     })?;
                     let id = record.channel().0.clone();
                     by_key.insert(channel_id, id.clone());
+                    let network = network_of_presentation(
+                        &record.presentation(),
+                        payers.iter().map(|(network, _)| network),
+                    );
                     channels.insert(
                         id,
                         Tracked {
                             chain: chain_of(record.chain()),
+                            network,
                             record,
                             opened: false,
                             signed: 0,
@@ -399,15 +465,39 @@ impl OutboundChannels {
             .ok_or_else(|| BatchChannelError::UnknownChannel(id.to_string()))
     }
 
+    /// The payer of the network `tracked` is on.
     fn payer(
         &self,
-        chain: SettlementChain,
+        tracked: &Tracked,
     ) -> Result<&Arc<dyn BatchSettlementPayer>, BatchChannelError> {
+        tracked
+            .network
+            .as_ref()
+            .and_then(|network| self.payer_on(network))
+            .ok_or(BatchChannelError::NoBackend(tracked.chain))
+    }
+
+    fn payer_on(&self, network: &Network) -> Option<&Arc<dyn BatchSettlementPayer>> {
         self.payers
             .iter()
-            .find(|(configured, _)| *configured == chain)
+            .find(|(configured, _)| configured == network)
             .map(|(_, payer)| payer)
-            .ok_or(BatchChannelError::NoBackend(chain))
+    }
+
+    /// The network an outbound channel this node journaled is on (ADR
+    /// 0086): what every voucher and challenge signed on it names.
+    pub fn network(&self, id: &str) -> Option<Network> {
+        self.channels()
+            .get(&canonical_id(id))
+            .and_then(|tracked| tracked.network.clone())
+    }
+
+    /// Every network this node pays on, in the order its payers were given.
+    pub fn networks(&self) -> Vec<Network> {
+        self.payers
+            .iter()
+            .map(|(network, _)| network.clone())
+            .collect()
     }
 
     fn append(&self, entry: JournalEntry) -> Result<(), BatchChannelError> {
@@ -419,7 +509,7 @@ impl OutboundChannels {
     /// that the chain does not hold stays opening.
     async fn restore_one(&self, id: &str) -> Result<OutboundChannelState, BatchChannelError> {
         let tracked = self.tracked(id)?;
-        let payer = self.payer(tracked.chain)?;
+        let payer = self.payer(&tracked)?;
         let state = match payer
             .restore_outbound(&tracked.record, tracked.signed)
             .await
@@ -457,7 +547,7 @@ impl OutboundChannels {
         }
         Ok((
             tracked.record.channel().clone(),
-            Arc::clone(self.payer(tracked.chain)?),
+            Arc::clone(self.payer(&tracked)?),
         ))
     }
 
@@ -489,7 +579,39 @@ impl OutboundChannels {
         gate: Option<&dyn DepositGate>,
     ) -> Result<(OutboundChannelState, bool), BatchChannelError> {
         let chain = chain_of(terms.chain());
-        let payer = Arc::clone(self.payer(chain)?);
+        let mut on_chain = self
+            .payers
+            .iter()
+            .filter(|(network, _)| network.chain() == chain.asset_chain());
+        let network = match (on_chain.next(), on_chain.next()) {
+            (Some((network, _)), None) => network.clone(),
+            (None, _) => return Err(BatchChannelError::NoBackend(chain)),
+            (Some(_), Some(_)) => return Err(BatchChannelError::NetworkAmbiguous(chain)),
+        };
+        self.open_on(&network, terms, deposit, gate).await
+    }
+
+    /// [`OutboundChannels::open_with`] on `network`, one of the networks this
+    /// node pays on (ADR 0086): the channel is opened through that network's
+    /// payer, and every voucher on it names it.
+    pub async fn open_on(
+        &self,
+        network: &Network,
+        terms: ReceiverTerms,
+        deposit: u128,
+        gate: Option<&dyn DepositGate>,
+    ) -> Result<(OutboundChannelState, bool), BatchChannelError> {
+        let chain = chain_of(terms.chain());
+        if network.chain() != chain.asset_chain() {
+            return Err(BatchChannelError::InvalidTerms(format!(
+                "they are {} terms, and the open names {network}",
+                chain.name()
+            )));
+        }
+        let payer = Arc::clone(
+            self.payer_on(network)
+                .ok_or(BatchChannelError::NoBackend(chain))?,
+        );
         let _opening = self.opening.lock().await;
         let receiver = match &terms {
             ReceiverTerms::Evm(evm) => evm.receiver.to_vec(),
@@ -503,7 +625,7 @@ impl OutboundChannels {
             .channels()
             .values()
             .find(|tracked| {
-                tracked.chain == chain
+                tracked.network.as_ref() == Some(network)
                     && !tracked.opened
                     && tracked.record.receiver() == receiver
                     && tracked.record.deposit() == deposit
@@ -512,7 +634,7 @@ impl OutboundChannels {
         let (mut record, mut resumed) = match pending {
             Some(record) => (record, true),
             None => (
-                self.prepare(&payer, chain, terms.clone(), deposit, gate)
+                self.prepare(&payer, network, chain, terms.clone(), deposit, gate)
                     .await?,
                 false,
             ),
@@ -531,7 +653,7 @@ impl OutboundChannels {
                         return Err(BatchSettlementError::OpenLapsed(channel).into());
                     }
                     record = self
-                        .prepare(&payer, chain, terms.clone(), deposit, gate)
+                        .prepare(&payer, network, chain, terms.clone(), deposit, gate)
                         .await?;
                     resumed = false;
                 }
@@ -547,6 +669,7 @@ impl OutboundChannels {
     async fn prepare(
         &self,
         payer: &Arc<dyn BatchSettlementPayer>,
+        network: &Network,
         chain: SettlementChain,
         terms: ReceiverTerms,
         deposit: u128,
@@ -568,6 +691,7 @@ impl OutboundChannels {
             record.channel().0.clone(),
             Tracked {
                 chain,
+                network: Some(network.clone()),
                 record: record.clone(),
                 opened: false,
                 signed: 0,
@@ -683,14 +807,18 @@ impl OutboundChannels {
     /// answers `Err`.
     ///
     /// Narrows [`Self::opened_toward`], the journal's own "channels toward
-    /// this party", to the ones the chain still shows open.
+    /// this party", to the ones on `network` the chain still shows open: one
+    /// settlement key may receive on several networks (ADR 0086 decision
+    /// 5), and a channel on one never pays a peering on another.
     pub async fn live_toward(
         &self,
         receiver: &VoucherSigner,
+        network: &Network,
     ) -> Result<Option<String>, BatchChannelError> {
         let mut candidates: Vec<(String, u128)> = self
             .opened_toward(receiver)
             .into_iter()
+            .filter(|id| self.network(id).as_ref() == Some(network))
             .map(|id| {
                 let signed = self.signed(&id).unwrap_or(0);
                 (id, signed)
@@ -731,7 +859,7 @@ impl OutboundChannels {
         if amount == tracked.signed {
             return Ok(tracked.signed);
         }
-        let payer = Arc::clone(self.payer(tracked.chain)?);
+        let payer = Arc::clone(self.payer(&tracked)?);
         let channel_id = journal_key(tracked.chain, tracked.record.channel());
         self.append(if amount > tracked.signed {
             JournalEntry::OutboundVoucherSigned {
@@ -872,28 +1000,25 @@ impl OutboundChannels {
 /// operator surface reads and drives them (ADR 0075 decision 11).
 pub struct BatchChannels {
     outbound: Arc<OutboundChannels>,
-    /// The receiving half on each chain.
-    receivers: Vec<(SettlementChain, Arc<dyn BatchSettlementBackend>)>,
+    /// The receiving half of each network this node settles on (ADR 0086),
+    /// keyed by its CAIP-2 network as the greeting publishes it: a
+    /// counterparty's terms must name one of them.
+    receivers: Vec<(Network, Arc<dyn BatchSettlementBackend>)>,
     /// The latest voucher held on each inbound channel: the client edge's
     /// claim gate, which is where vouchers are accepted and journaled.
     held: Arc<dyn HeldVouchers>,
-    /// This node's own CAIP-2 network on each chain, as its greeting
-    /// publishes it: a counterparty's terms must name the same one.
-    networks: Vec<(SettlementChain, String)>,
 }
 
 impl BatchChannels {
     pub fn new(
         outbound: Arc<OutboundChannels>,
-        receivers: Vec<(SettlementChain, Arc<dyn BatchSettlementBackend>)>,
+        receivers: Vec<(Network, Arc<dyn BatchSettlementBackend>)>,
         held: Arc<dyn HeldVouchers>,
-        networks: Vec<(SettlementChain, String)>,
     ) -> BatchChannels {
         BatchChannels {
             outbound,
             receivers,
             held,
-            networks,
         }
     }
 
@@ -901,15 +1026,18 @@ impl BatchChannels {
         &self.outbound
     }
 
+    /// The receiving half of the network the inbound channel
+    /// `presentation` is on.
     fn receiver(
         &self,
-        chain: SettlementChain,
+        presentation: &ChannelPresentation,
     ) -> Result<&Arc<dyn BatchSettlementBackend>, BatchChannelError> {
+        let network = network_of_presentation(presentation, self.receivers.iter().map(|(n, _)| n));
         self.receivers
             .iter()
-            .find(|(configured, _)| *configured == chain)
+            .find(|(configured, _)| Some(configured) == network.as_ref())
             .map(|(_, backend)| backend)
-            .ok_or(BatchChannelError::NoBackend(chain))
+            .ok_or(BatchChannelError::NoBackend(chain_of(presentation.chain())))
     }
 
     /// Open an outbound channel toward the counterparty that published
@@ -937,17 +1065,36 @@ impl BatchChannels {
             X402BatchSettlementTerms::Evm(evm) => (SettlementChain::Evm, &evm.network),
             X402BatchSettlementTerms::Solana(solana) => (SettlementChain::Solana, &solana.network),
         };
-        if let Some((_, own)) = self.networks.iter().find(|(c, _)| *c == chain) {
-            if own != network {
+        // ADR 0086: the counterparty's network must be one this node settles
+        // on, and the channel is opened on exactly that one.
+        let ours: Vec<&Network> = self
+            .outbound
+            .payers
+            .iter()
+            .map(|(network, _)| network)
+            .filter(|own| own.chain() == chain.asset_chain())
+            .collect();
+        let on = ours
+            .iter()
+            .find(|own| own.to_string() == *network)
+            .map(|own| (*own).clone());
+        let on = match (on, ours.is_empty()) {
+            (Some(on), _) => on,
+            (None, true) => return Err(BatchChannelError::NoBackend(chain)),
+            (None, false) => {
                 return Err(BatchChannelError::InvalidTerms(format!(
-                    "the counterparty settles on {network}, and this node's {} backend on {own}",
-                    chain.name()
-                )));
+                    "the counterparty settles on {network}, and this node's {} backends on {}",
+                    chain.name(),
+                    ours.iter()
+                        .map(|own| own.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )))
             }
-        }
+        };
         let terms =
             receiver_terms(terms, counterparty_url).map_err(BatchChannelError::InvalidTerms)?;
-        let (state, resumed) = self.outbound.open_with(terms, deposit, gate).await?;
+        let (state, resumed) = self.outbound.open_on(&on, terms, deposit, gate).await?;
         Ok((self.outbound.view_of(&state), resumed))
     }
 
@@ -970,7 +1117,7 @@ impl BatchChannels {
                 watermark: held.voucher.cumulative_amount,
                 detail: None,
             };
-            let state = match self.receiver(chain) {
+            let state = match self.receiver(&held.presentation) {
                 Ok(backend) => read_inbound(backend.as_ref(), &held.presentation).await,
                 Err(error) => Err(error),
             };
@@ -1010,7 +1157,7 @@ impl BatchChannels {
             .find(|held| held.presentation.channel().0 == id)
             .ok_or_else(|| BatchChannelError::NoVoucherHeld(id.clone()))?;
         let chain = chain_of(held.presentation.chain());
-        let backend = self.receiver(chain)?;
+        let backend = self.receiver(&held.presentation)?;
         read_inbound(backend.as_ref(), &held.presentation).await?;
         let Landed { state, transaction } = backend
             .land(held.presentation.channel(), held.voucher.clone())
@@ -1187,6 +1334,16 @@ mod tests {
         }
     }
 
+    /// The one network of the in-memory chain an exit belongs to.
+    fn exit_network(exit: PayerExit) -> Network {
+        match exit {
+            PayerExit::Withdrawal => "eip155:8453",
+            PayerExit::Close => "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+        }
+        .parse()
+        .expect("a CAIP-2 network")
+    }
+
     /// One chain, the paying node `0x01` funded with 10,000, and the
     /// counterparty `0x02` it pays.
     struct World {
@@ -1224,7 +1381,7 @@ mod tests {
         /// A node booting over `journal`.
         async fn boot(&self, journal: Arc<dyn Journal>) -> OutboundChannels {
             let payer = self.payer() as Arc<dyn BatchSettlementPayer>;
-            OutboundChannels::restore(journal, vec![(chain_name(self.exit), payer)])
+            OutboundChannels::restore(journal, vec![(exit_network(self.exit), payer)])
                 .await
                 .expect("the journal replays")
         }
@@ -1618,15 +1775,13 @@ mod tests {
                 presentation: opened.presentation.clone(),
                 voucher,
             }]));
-            let chain = chain_name(exit);
             let channels = BatchChannels::new(
                 Arc::new(world.boot(Arc::new(InMemoryJournal::new())).await),
                 vec![(
-                    chain,
+                    exit_network(exit),
                     Arc::clone(&world.receiver) as Arc<dyn BatchSettlementBackend>,
                 )],
                 held,
-                Vec::new(),
             );
 
             let view = only_view(channels.inbound_views().await);
@@ -1732,7 +1887,6 @@ mod tests {
             Arc::new(world.boot(Arc::clone(&journal) as Arc<dyn Journal>).await),
             Vec::new(),
             Arc::new(RwLock::new(Vec::new())),
-            vec![(SettlementChain::Evm, "eip155:8453".to_string())],
         );
         let error = channels
             .open(&X402BatchSettlementTerms::Evm(evm_terms()), None, 1_000)

@@ -370,6 +370,7 @@ async fn resolve_evm(
     };
     resolve_evm_on(
         state,
+        &network,
         channel_id_text,
         expires,
         signature_text,
@@ -383,6 +384,7 @@ async fn resolve_evm(
 /// [`resolve_evm`], once its entry's scheme and network are known good.
 async fn resolve_evm_on(
     state: &ClientEdgeState,
+    network: &Network,
     channel_id_text: String,
     expires: u64,
     signature_text: String,
@@ -419,6 +421,7 @@ async fn resolve_evm_on(
     };
     resolve_evm_voucher(
         state,
+        network,
         channel_id_text,
         channel_id,
         VoucherProof {
@@ -522,6 +525,7 @@ struct VoucherProof<'a> {
 /// key for any channel it has paid on.
 async fn resolve_evm_voucher(
     state: &ClientEdgeState,
+    network: &Network,
     channel_id_text: String,
     channel_id: [u8; 32],
     proof: VoucherProof<'_>,
@@ -529,7 +533,7 @@ async fn resolve_evm_voucher(
 ) -> ChannelStateResult {
     let lookup = state
         .claim_gate
-        .evm_voucher_channel(&channel_id, presented, proof.requester)
+        .evm_voucher_channel(network, &channel_id, presented, proof.requester)
         .await;
     let (domain, channel) = match lookup {
         Ok(Some(found)) => found,

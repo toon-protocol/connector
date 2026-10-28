@@ -1,8 +1,7 @@
-use connector_domain::AssetId;
+use connector_domain::{AssetChain, AssetId, Network};
 
 use crate::denomination::DenominationConfig;
 use crate::error::ConfigError;
-use crate::peering_asset::settlement_asset;
 use crate::settlement::{SettlementChain, SettlementConfig};
 
 /// Which declared token each client channel this node accepts claims on is
@@ -52,9 +51,10 @@ use crate::settlement::{SettlementChain, SettlementConfig};
 /// forward, where there is no I/O to do and no chain to ask.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientChannelAssets {
-    /// One entry per `[settlement.<chain>]` table, and there are two chains
-    /// -- so a linear scan is not a compromise here, it is the whole table.
-    chains: Vec<(SettlementChain, AssetId)>,
+    /// One entry per settlement table -- each EVM network's and the Solana
+    /// one (ADR 0086) -- each asset id naming its own network, so a linear
+    /// scan is not a compromise here, it is the whole table.
+    assets: Vec<AssetId>,
 }
 
 impl ClientChannelAssets {
@@ -63,7 +63,7 @@ impl ClientChannelAssets {
     /// repository ships. The question a caller asks before any other, since
     /// `true` means no forward out of a client arrival can be a conversion.
     pub fn is_empty(&self) -> bool {
-        self.chains.is_empty()
+        self.assets.is_empty()
     }
 
     /// The declared token a claim on `channel_key` is denominated in, or
@@ -84,13 +84,38 @@ impl ClientChannelAssets {
     /// all, or a key in a namespace that is not a settlement chain this
     /// node configured, on which no claim of this node's could have been
     /// admitted.
+    ///
+    /// On a chain where this node holds several networks -- several EVM
+    /// tables (ADR 0086) -- the key alone does not say which, and this
+    /// answers `None`: ask [`Self::asset_on`] with the channel's network.
     pub fn asset(&self, channel_key: &str) -> Option<&AssetId> {
+        self.asset_on(channel_key, None)
+    }
+
+    /// [`Self::asset`], for a channel on `network` when it is known: the
+    /// network the channel was verified on picks the table among several
+    /// of the key's chain. A Solana channel is matched by chain alone, since
+    /// a node holds one Solana table and config cannot know its cluster's
+    /// genesis prefix. `None` for a network this node resolved nothing on,
+    /// and for an unknown network on a chain with several tables.
+    pub fn asset_on(&self, channel_key: &str, network: Option<&Network>) -> Option<&AssetId> {
         let (namespace, _) = channel_key.split_once(':')?;
-        let chain = namespace.parse::<SettlementChain>().ok()?;
-        self.chains
+        let chain = namespace.parse::<SettlementChain>().ok()?.asset_chain();
+        let on_chain: Vec<&AssetId> = self
+            .assets
             .iter()
-            .find(|(resolved, _)| *resolved == chain)
-            .map(|(_, asset)| asset)
+            .filter(|asset| asset.chain() == chain)
+            .collect();
+        match (on_chain.as_slice(), chain, network) {
+            // One table on the key's chain: it is the channel's, as it
+            // always was.
+            ([only], _, _) => Some(only),
+            (several, AssetChain::Evm, Some(network)) => several
+                .iter()
+                .find(|asset| asset.network() == network)
+                .copied(),
+            _ => None,
+        }
     }
 }
 
@@ -103,12 +128,10 @@ impl ClientChannelAssets {
 /// a client-edge crossing without a whole config file around it. The twin
 /// of [`PeeringAssets`](crate::PeeringAssets)'s own `FromIterator`, for the
 /// same reason.
-impl FromIterator<(SettlementChain, AssetId)> for ClientChannelAssets {
-    fn from_iter<I: IntoIterator<Item = (SettlementChain, AssetId)>>(
-        chains: I,
-    ) -> ClientChannelAssets {
+impl FromIterator<AssetId> for ClientChannelAssets {
+    fn from_iter<I: IntoIterator<Item = AssetId>>(assets: I) -> ClientChannelAssets {
         ClientChannelAssets {
-            chains: chains.into_iter().collect(),
+            assets: assets.into_iter().collect(),
         }
     }
 }
@@ -138,22 +161,24 @@ pub(crate) fn resolve_client_channel_assets(
         return Ok(ClientChannelAssets::default());
     }
 
-    let mut chains = Vec::with_capacity(settlements.len());
+    let mut assets = Vec::with_capacity(settlements.len());
     for settlement in settlements {
-        let chain = settlement.chain();
-        let asset = match settlement_asset(settlements, chain, denomination) {
-            // Unreachable: `settlement_asset` is looking up the very table
-            // it is being asked about.
-            None => continue,
-            Some(Ok(asset)) => asset,
-            Some(Err(asset)) => {
-                return Err(ConfigError::ClientChannelTokenNotDeclared { chain, asset })
-            }
-        };
-        chains.push((chain, asset));
+        // Each table's own token (ADR 0086): two EVM tables are two
+        // networks, and each resolves to the declared asset on its own.
+        let asset = denomination
+            .tokens()
+            .iter()
+            .map(|token| token.asset())
+            .find(|asset| settlement.holds(asset))
+            .cloned()
+            .ok_or_else(|| ConfigError::ClientChannelTokenNotDeclared {
+                chain: settlement.chain(),
+                asset: settlement.asset_spelling(),
+            })?;
+        assets.push(asset);
     }
 
-    Ok(ClientChannelAssets { chains })
+    Ok(ClientChannelAssets { assets })
 }
 
 #[cfg(test)]
@@ -168,10 +193,7 @@ mod tests {
     }
 
     fn assets(chains: &[(SettlementChain, &str)]) -> ClientChannelAssets {
-        chains
-            .iter()
-            .map(|(chain, token)| (*chain, asset(token)))
-            .collect()
+        chains.iter().map(|(_, token)| asset(token)).collect()
     }
 
     /// The claim of issue #1301 this whole shape rests on, made
@@ -210,6 +232,30 @@ mod tests {
             resolved.asset("solana:AiCAdi9xJ5XhJQ3sRkeCYzbWozd7dbS3gwZ9rneJWk8W"),
             Some(&asset(USDC_SOLANA))
         );
+    }
+
+    /// ADR 0086: on a node with two EVM tables, an `evm:` key alone does not
+    /// say which network's token it holds; the network its channel was
+    /// verified on does.
+    #[test]
+    fn two_evm_networks_answer_by_the_channels_network() {
+        const USDC_ARBITRUM: &str = "eip155:42161/erc20:0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+        let resolved = assets(&[
+            (SettlementChain::Evm, USDC_BASE),
+            (SettlementChain::Evm, USDC_ARBITRUM),
+        ]);
+        let key = format!("evm:0x{}", "ab".repeat(32));
+
+        assert_eq!(resolved.asset(&key), None, "never guessed");
+        assert_eq!(
+            resolved.asset_on(&key, Some(&Network::Eip155(42161))),
+            Some(&asset(USDC_ARBITRUM))
+        );
+        assert_eq!(
+            resolved.asset_on(&key, Some(&Network::Eip155(8453))),
+            Some(&asset(USDC_BASE))
+        );
+        assert_eq!(resolved.asset_on(&key, Some(&Network::Eip155(1))), None);
     }
 
     /// A node that declares no tokens, and a key in a namespace no

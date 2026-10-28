@@ -835,34 +835,6 @@ async fn exits_non_zero_naming_both_chain_ids_when_the_rpc_is_another_network() 
     }
 }
 
-/// ADR 0086, interim (#1597), through the real binary: two EVM tables load
-/// but refuse to start, by name, rather than settle on one of them.
-#[test]
-fn exits_non_zero_naming_both_tables_when_two_evm_networks_are_configured() {
-    let key_file = write_raw_key_file();
-    let state_dir = tempfile::tempdir().expect("temp state dir");
-    let table = evm_settlement_config(
-        key_file.path(),
-        state_dir.path(),
-        "http://127.0.0.1:8545",
-        "",
-    );
-    let text = std::fs::read_to_string(table.path()).expect("read config");
-    let start = text.find("[settlement.eip155.31337]").expect("the table");
-    let second = text[start..].replace("eip155.31337", "eip155.31338");
-    let output = run(Some(write_config(&format!("{text}\n{second}")).path()));
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for named in [
-        "[settlement.eip155.31337]",
-        "[settlement.eip155.31338]",
-        "one EVM network per node",
-    ] {
-        assert!(stderr.contains(named), "expected {named} in: {stderr}");
-    }
-}
-
 /// ADR 0075 decision 1, through the real binary: a node pointed at a chain
 /// on which `x402BatchSettlement` is not deployed -- here a bare anvil --
 /// refuses to start, by name, rather than boot a node that admits nothing

@@ -726,6 +726,7 @@ impl ClientClaimGate {
     /// another channel, or one the backend does not admit.
     pub(crate) async fn evm_voucher_channel(
         &self,
+        network: &Network,
         channel_id: &[u8; 32],
         presented: Option<BatchChannelConfig>,
         requester: &str,
@@ -734,7 +735,12 @@ impl ClientClaimGate {
         let Some(backend) = self.batch_settlement.as_deref() else {
             return Ok(None);
         };
-        let Some(domain) = backend.evm_domain() else {
+        // ADR 0086: verified under the named network's own domain, and
+        // asked of that network's backend only.
+        let Some(domain) = network
+            .eip155_chain_id()
+            .and_then(|chain_id| backend.evm_domain_on(chain_id))
+        else {
             return Ok(None);
         };
         let key = format!("{EVM_NAMESPACE}:0x{}", hex::encode(channel_id));
@@ -752,7 +758,7 @@ impl ClientClaimGate {
             .metered_voucher_lookup(
                 recorded.is_none(),
                 requester,
-                backend.evm(channel_id, Some(&config)),
+                backend.evm(network, channel_id, Some(&config)),
             )
             .await?;
         // As in `verify_voucher`: the signer is read from the backend's
@@ -1043,7 +1049,7 @@ impl ClientClaimGate {
             return Err(ClaimIngestRejection::BatchSettlementNotAccepted);
         };
         let accepted_here = match &claim {
-            ClientClaim::EvmVoucher(_) => backend.evm_domain().is_some(),
+            ClientClaim::EvmVoucher(_) => backend.accepts_evm(),
             ClientClaim::SolanaVoucher(_) => backend.accepts_solana(),
         };
         if !accepted_here {
@@ -1711,9 +1717,15 @@ async fn verify_voucher(
     };
     match (claim, signature) {
         (ClientClaim::EvmVoucher(voucher), VoucherSignature::Evm(signature)) => {
-            let domain = backend
-                .evm_domain()
-                .ok_or(ClaimIngestRejection::BatchSettlementNotAccepted)?;
+            // ADR 0086: the voucher's own network picks the domain it is
+            // verified under, and the backend that resolves its channel.
+            let domain = voucher
+                .network
+                .eip155_chain_id()
+                .and_then(|chain_id| backend.evm_domain_on(chain_id))
+                .ok_or_else(|| ClaimIngestRejection::NetworkNotSettled {
+                    network: voucher.network.clone(),
+                })?;
             let Some(channel_id) = decode_hex_bytes::<32>(&voucher.channel_id) else {
                 return Err(ClaimIngestRejection::UnknownChannel);
             };
@@ -1737,7 +1749,7 @@ async fn verify_voucher(
             }
             let reservation = reserve_voucher_lookup(budget, known.is_none(), requester).await?;
             let found = backend
-                .evm(&channel_id, presented.as_ref())
+                .evm(&voucher.network, &channel_id, presented.as_ref())
                 .await
                 .map_err(refuse_resolution)?;
             refund_if_found(budget, reservation, found.is_some());

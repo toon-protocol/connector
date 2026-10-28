@@ -305,9 +305,10 @@ accepts.
 
 **Settlement circuit**:
 The circuit a settlement table's RPC rides when that table sets `rpc_via_socks_proxy = true`: the
-node's one `socks_proxy`, authenticated with a SOCKS username fixed per chain
-(`toon-settlement-evm`, `toon-settlement-solana`), so each chain stays on its own circuit and off the
-ILP wire's. Every client of the table's `rpc_url` rides it (the backend, and on EVM the rate
+node's one `socks_proxy`, authenticated with a SOCKS username fixed per network
+(`toon-settlement-eip155-<chainId>` for each EVM table, `toon-settlement-solana`), so each network
+stays on its own circuit and off the ILP wire's
+([ADR 0086](docs/adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision 7). Every client of the table's `rpc_url` rides it (the backend, and on EVM the rate
 source), and none ever falls back to a direct dial. It hides the
 node's address from the RPC provider; it does not hide the node's keys, its transactions or its
 payments, which are on chain either way

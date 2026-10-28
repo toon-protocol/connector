@@ -1654,8 +1654,7 @@ client_edge_url = "https://store.example/ilp"
     /// a channel row names which of them it is on.
     #[test]
     fn two_evm_tables_sharing_one_key_file_load_with_each_row_on_its_network() {
-        let config =
-            load_two_network_peering(|text| rows_on(text, "eip155:31338")).expect("load");
+        let config = load_two_network_peering(|text| rows_on(text, "eip155:31338")).expect("load");
 
         assert_eq!(config.settlements().len(), 2);
         let on = "eip155:31338".parse::<connector_domain::Network>().unwrap();
@@ -1703,7 +1702,10 @@ client_edge_url = "https://store.example/ilp"
         assert!(
             matches!(
                 &error,
-                ConfigError::ChannelRowNetworkAmbiguous { table: "pay_channels", .. }
+                ConfigError::ChannelRowNetworkAmbiguous {
+                    table: "pay_channels",
+                    ..
+                }
             ),
             "{error:?}"
         );
@@ -1731,10 +1733,8 @@ client_edge_url = "https://store.example/ilp"
 
         // A Solana network on an EVM signer's row names no table of that
         // signer's chain.
-        let error = load_peering(|text| {
-            rows_on(text, "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1")
-        })
-        .unwrap_err();
+        let error = load_peering(|text| rows_on(text, "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"))
+            .unwrap_err();
         assert!(
             matches!(&error, ConfigError::ChannelRowNetworkInvalid { .. }),
             "{error:?}"

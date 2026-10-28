@@ -84,10 +84,24 @@ pub struct AdmittedSolanaVoucherChannel {
 /// doc for the seam it is and what an implementation owes.
 #[async_trait]
 pub trait BatchSettlementChannels: Send + Sync + std::fmt::Debug {
-    /// The EIP-712 domain EVM vouchers are verified under -- this node's
-    /// settlement chain and `x402BatchSettlement`'s address -- or `None` if
-    /// this node has not opted in to EVM vouchers.
-    fn evm_domain(&self) -> Option<BatchSettlementDomain>;
+    /// The EIP-712 domain of each EVM network this node settles on -- its
+    /// chain id and `x402BatchSettlement`'s address, one per
+    /// `[settlement.eip155.<chainId>]` table (ADR 0086 decision 4) -- in
+    /// table order. Empty if this node has not opted in to EVM vouchers.
+    fn evm_domains(&self) -> Vec<BatchSettlementDomain>;
+
+    /// The domain vouchers on EVM chain `chain_id` are verified under, if
+    /// this node settles on that network.
+    fn evm_domain_on(&self, chain_id: u64) -> Option<BatchSettlementDomain> {
+        self.evm_domains()
+            .into_iter()
+            .find(|domain| domain.chain_id == chain_id)
+    }
+
+    /// Whether this node has opted in to EVM vouchers on any network.
+    fn accepts_evm(&self) -> bool {
+        !self.evm_domains().is_empty()
+    }
 
     /// The CAIP-2 network this node settles Solana vouchers on
     /// (`solana:<genesis prefix>`, as its greeting publishes it), or `None`
@@ -107,20 +121,22 @@ pub trait BatchSettlementChannels: Send + Sync + std::fmt::Debug {
     /// decision 1).
     fn settles_on(&self, network: &Network) -> bool {
         match network {
-            Network::Eip155(chain_id) => self
-                .evm_domain()
-                .is_some_and(|domain| domain.chain_id == *chain_id),
+            Network::Eip155(chain_id) => self.evm_domain_on(*chain_id).is_some(),
             Network::Solana(_) => self.solana_network().as_ref() == Some(network),
         }
     }
 
-    /// The EVM channel `channel_id`, if this connector admits it.
-    /// `presented_config` is the client's `ChannelConfig` when the voucher
+    /// The EVM channel `channel_id` on `network`, if this connector admits
+    /// it: asked of that network's backend and no other (ADR 0086). The gate
+    /// has already checked `channel_id` recomputes under `network`'s domain
+    /// whenever it holds a config. `presented_config` is the client's
+    /// `ChannelConfig` when the voucher
     /// carried one, already checked by the gate to hash to `channel_id`; a
     /// channel's first voucher carries one, and an implementation that has
     /// never seen the channel and is given `None` has nothing to admit.
     async fn evm(
         &self,
+        network: &Network,
         channel_id: &[u8; 32],
         presented_config: Option<&BatchChannelConfig>,
     ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError>;

@@ -118,7 +118,7 @@ price = {PRICE}
         runtime.batch_settlement_solana.is_some(),
         "opted in on Solana"
     );
-    assert!(runtime.batch_settlement_evm.is_none(), "and not on EVM");
+    assert!(runtime.batch_settlement_evm.is_empty(), "and not on EVM");
     let app = connector_cli::router(&runtime, &config).expect("router");
     let receiver = runtime.signer.public_key().expect("the node's wrap key");
 

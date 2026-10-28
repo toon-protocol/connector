@@ -138,10 +138,21 @@ pub fn evm_voucher(
     signature: &[u8],
     config: Option<&EvmChannelConfig>,
 ) -> String {
+    evm_voucher_on(ANVIL_NETWORK, channel, amount, signature, config)
+}
+
+/// [`evm_voucher`], naming `network` (CAIP-2) rather than anvil's default.
+pub fn evm_voucher_on(
+    network: &str,
+    channel: &ChannelId,
+    amount: u64,
+    signature: &[u8],
+    config: Option<&EvmChannelConfig>,
+) -> String {
     let mut voucher = serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
-        "network": ANVIL_NETWORK,
+        "network": network,
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2026-09-25T12:00:00.000Z",

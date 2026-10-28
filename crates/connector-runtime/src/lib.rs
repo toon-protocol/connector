@@ -39,14 +39,15 @@ pub use app_client::{AppClient, AppOutcome, Delivery, FakeAppClient, HttpAppClie
 // place rather than retyping a string literal.
 pub use attribution::{AMOUNT_HEADER, CHAIN_HEADER, NETWORK_HEADER, PAYER_HEADER};
 pub use batch_channels::{
-    receiver_terms, BatchChannelError, BatchChannelView, BatchChannelViewStatus, BatchChannels,
-    ChannelDirection, DepositGate, LandedChannel, OutboundChannels, WithdrawStep,
+    network_of_presentation, receiver_terms, BatchChannelError, BatchChannelView,
+    BatchChannelViewStatus, BatchChannels, ChannelDirection, DepositGate, LandedChannel,
+    OutboundChannels, WithdrawStep,
 };
 pub use claim::{ClaimAckOutcome, ClaimRejectReason, Covering};
 pub use clock::{Clock, SystemClock, TestClock};
 pub use connector::{
-    ClientRouteFacts, ClientRouteKind, ClientRoutePrice, ConfigPeeringError, Connector,
-    LeaseRouteError, PeerRouteTableError, ProbeDenied,
+    ChannelNetworks, ClientRouteFacts, ClientRouteKind, ClientRoutePrice, ConfigPeeringError,
+    Connector, LeaseRouteError, PeerRouteTableError, ProbeDenied,
 };
 // Re-exported for callers that hold a `Connector` but not a config-crate
 // dependency of their own (`connector-operator`): the chain key an x402

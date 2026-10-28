@@ -81,8 +81,8 @@ struct Channels(HashMap<[u8; 32], BatchChannelConfig>);
 
 #[async_trait]
 impl BatchSettlementChannels for Channels {
-    fn evm_domain(&self) -> Option<BatchSettlementDomain> {
-        Some(domain())
+    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
+        vec![domain()]
     }
 
     fn solana_network(&self) -> Option<connector_domain::Network> {
@@ -91,6 +91,7 @@ impl BatchSettlementChannels for Channels {
 
     async fn evm(
         &self,
+        _network: &connector_domain::Network,
         channel_id: &[u8; 32],
         _presented_config: Option<&BatchChannelConfig>,
     ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {

@@ -337,14 +337,20 @@ impl Connector {
         let url_text = url.to_string();
         let chain = shared.chain();
         let network = shared.network();
-        let ours = self.x402_network(chain).unwrap_or_default();
-        if network != ours {
+        // ADR 0086: the peering is on the counterparty's network, which must
+        // be one this node settles on; the channel is opened on exactly it.
+        let ours = self.x402_networks_on(chain);
+        let Some(on) = ours
+            .iter()
+            .find(|own| **own == network)
+            .and_then(|own| own.parse::<connector_domain::Network>().ok())
+        else {
             return Err(EstablishPeeringError::NetworkMismatch {
                 url: url_text,
                 theirs: network.to_string(),
-                ours: ours.to_string(),
+                ours: ours.join(", "),
             });
-        }
+        };
         let published_signer = shared.voucher_signer.as_deref().ok_or_else(|| {
             EstablishPeeringError::NoVoucherSigner {
                 url: url_text.clone(),
@@ -375,7 +381,7 @@ impl Connector {
             .outbound_channels()
             .ok_or(BatchChannelError::NoBackend(chain))?;
 
-        let (channel_id, status) = match outbound.live_toward(&receiver).await? {
+        let (channel_id, status) = match outbound.live_toward(&receiver, &on).await? {
             Some(channel_id) => (channel_id, ChannelBranch::Found),
             None => {
                 let deposit = deposit.ok_or_else(|| EstablishPeeringError::DepositRequired {
@@ -391,7 +397,8 @@ impl Connector {
                 // The id comes back off the chain: `open` restores the
                 // channel from it before answering, so a row written here is
                 // a row backed by a channel the chain confirmed.
-                let (state, _resumed) = outbound.open_with(receiver_terms, deposit, gate).await?;
+                let (state, _resumed) =
+                    outbound.open_on(&on, receiver_terms, deposit, gate).await?;
                 (state.on_chain.id.0, ChannelBranch::Created)
             }
         };
@@ -956,7 +963,7 @@ mod tests {
         let outbound = OutboundChannels::restore(
             Arc::new(InMemoryJournal::new()),
             vec![(
-                SettlementChain::Evm,
+                NETWORK.parse().expect("a CAIP-2 network"),
                 Arc::clone(&payer) as Arc<dyn BatchSettlementPayer>,
             )],
         )
@@ -1216,7 +1223,7 @@ mod tests {
         let outbound = OutboundChannels::restore(
             Arc::new(InMemoryJournal::new()),
             vec![(
-                SettlementChain::Solana,
+                SOLANA_NETWORK.parse().expect("a CAIP-2 network"),
                 Arc::clone(&payer) as Arc<dyn BatchSettlementPayer>,
             )],
         )

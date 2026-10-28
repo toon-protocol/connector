@@ -68,7 +68,7 @@ use std::time::Duration;
 
 use chrono::TimeDelta;
 use connector_config::DenominationConfig;
-use connector_domain::{AssetChain, AssetId, Refresh, Ttl};
+use connector_domain::{AssetChain, AssetId, Network, Refresh, Ttl};
 use connector_rate_source::{PoolId, QuoteLeg, QuotePath, QuotePathError, RateSource};
 use thiserror::Error;
 
@@ -134,11 +134,12 @@ pub enum QuotePathUnusable {
     /// until someone writes a source for the chain against the port, and
     /// the row is what the message asks for.
     #[error(
-        "the quote path for {token} reads pools on the {chain} chain, which no rate source \
-         linked into this node can read (ADR 0071 decision 6 leaves that source unwritten): \
-         drop the quote and price this token's pairs with [[rates]] rows"
+        "the quote path for {token} reads pools on {network}, which no rate source linked \
+         into this node reads (ADR 0071 decision 6 leaves the Solana source unwritten, and an \
+         EVM source reads only its own table's network, ADR 0086 decision 13): drop the quote \
+         and price this token's pairs with [[rates]] rows"
     )]
-    NoSourceForChain { token: AssetId, chain: AssetChain },
+    NoSourceForChain { token: AssetId, network: Network },
 
     /// A path with no leg at all -- nothing to read, and no rate that could
     /// come of reading it.
@@ -221,7 +222,9 @@ pub enum QuotePathUnusable {
 /// change.
 #[derive(Clone)]
 pub struct RateSources {
-    by_chain: BTreeMap<AssetChain, Arc<dyn RateSource>>,
+    /// One source per network it reads (ADR 0086 decision 13): each EVM
+    /// table's reader over that table's own transport.
+    by_network: BTreeMap<Network, Arc<dyn RateSource>>,
 }
 
 impl RateSources {
@@ -230,40 +233,51 @@ impl RateSources {
     /// that declares no quote path never asks.
     pub fn none() -> RateSources {
         RateSources {
-            by_chain: BTreeMap::new(),
+            by_network: BTreeMap::new(),
         }
     }
 
-    /// The one-chain map, which is every map this binary builds today.
-    pub fn reading(chain: AssetChain, source: Arc<dyn RateSource>) -> RateSources {
-        RateSources::none().with(chain, source)
+    /// The one-network map.
+    pub fn reading(network: Network, source: Arc<dyn RateSource>) -> RateSources {
+        RateSources::none().with(network, source)
     }
 
-    /// Add the source that reads `chain`, replacing any already registered
-    /// for it. Taken by value and returned so that wiring reads as one
-    /// expression at the call site.
+    /// Add the source that reads `network`, replacing any already
+    /// registered for it. Taken by value and returned so that wiring reads
+    /// as one expression at the call site.
     #[must_use]
-    pub fn with(mut self, chain: AssetChain, source: Arc<dyn RateSource>) -> RateSources {
-        self.by_chain.insert(chain, source);
+    pub fn with(mut self, network: Network, source: Arc<dyn RateSource>) -> RateSources {
+        self.by_network.insert(network, source);
         self
     }
 
-    /// The source that reads `chain`, or `None` when nothing linked into
-    /// this node does.
-    pub fn get(&self, chain: AssetChain) -> Option<&Arc<dyn RateSource>> {
-        self.by_chain.get(&chain)
+    /// The source that reads `network`, or `None` when nothing linked into
+    /// this node does. A quote path never leaves its token's network (ADR
+    /// 0086 decision 13), so an EVM token is read only by its own network's
+    /// source. A Solana token is read by the node's one Solana source,
+    /// whatever genesis prefix its asset id spells: config cannot know the
+    /// cluster's, and a node holds one Solana table.
+    pub fn get(&self, network: &Network) -> Option<&Arc<dyn RateSource>> {
+        self.by_network.get(network).or_else(|| match network {
+            Network::Solana(_) => self
+                .by_network
+                .iter()
+                .find(|(held, _)| held.chain() == AssetChain::Solana)
+                .map(|(_, source)| source),
+            Network::Eip155(_) => None,
+        })
     }
 
-    /// Every chain this node can read pools on, in a stable order -- for
+    /// Every network this node can read pools on, in a stable order -- for
     /// the log line that says so at boot.
-    pub fn chains(&self) -> impl Iterator<Item = AssetChain> + '_ {
-        self.by_chain.keys().copied()
+    pub fn networks(&self) -> impl Iterator<Item = &Network> + '_ {
+        self.by_network.keys()
     }
 }
 
 impl std::fmt::Debug for RateSources {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_set().entries(self.chains()).finish()
+        f.debug_set().entries(self.networks()).finish()
     }
 }
 
@@ -308,11 +322,10 @@ impl RatePoller {
                 // and not a complaint about its pools, the same way
                 // `resolve_quote` states the node-shaped refusal before
                 // every per-leg one.
-                let chain = declared.chain();
-                let source = sources.get(chain).cloned().ok_or_else(|| {
+                let source = sources.get(token.network()).cloned().ok_or_else(|| {
                     QuotePathUnusable::NoSourceForChain {
                         token: token.clone(),
-                        chain,
+                        network: token.network().clone(),
                     }
                 })?;
                 let path = port_quote_path(token, declared)?;
@@ -527,6 +540,11 @@ mod tests {
 
     /// USDC on Base: the numeraire, 6 decimals.
     const USDC: &str = "eip155:31337/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+    /// The network every EVM token of these fixtures is on.
+    fn evm_network() -> Network {
+        "eip155:31337".parse().expect("a CAIP-2 network")
+    }
     /// ANYONE on Base: the dealt token, 18 decimals, WETH-quoted.
     const ANYONE: &str = "eip155:31337/erc20:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
     /// WETH on Base: an intermediate, never a token this node deals.
@@ -1047,7 +1065,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
         let table = SharedRateTable::from_config(config.denomination()).expect("a dealing node");
         let pollers = RatePoller::for_config(
             &table,
-            &RateSources::reading(AssetChain::Evm, two_leg_source()),
+            &RateSources::reading(evm_network(), two_leg_source()),
             config.denomination(),
         )
         .expect("usable quote paths");
@@ -1086,8 +1104,8 @@ max_move = {{ numerator = 5, denominator = 100 }}
     #[tokio::test]
     async fn each_quoted_token_is_polled_through_its_own_chains_source() {
         let sources = RateSources::none()
-            .with(AssetChain::Evm, two_leg_source())
-            .with(AssetChain::Solana, solana_source());
+            .with(evm_network(), two_leg_source())
+            .with(asset(SOL_NUMERAIRE).network().clone(), solana_source());
 
         let (evm_config, _evm_dir) = dealing_node();
         let evm_table =
@@ -1153,7 +1171,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
 
         let refused = RatePoller::for_config(
             &table,
-            &RateSources::reading(AssetChain::Evm, two_leg_source()),
+            &RateSources::reading(evm_network(), two_leg_source()),
             config.denomination(),
         );
 
@@ -1161,7 +1179,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
             refused.err(),
             Some(QuotePathUnusable::NoSourceForChain {
                 token: asset(SOL_DEALT),
-                chain: AssetChain::Solana,
+                network: asset(SOL_DEALT).network().clone(),
             })
         );
     }
@@ -1284,7 +1302,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
         let table = SharedRateTable::from_config(config.denomination()).expect("a dealing node");
         let pollers = RatePoller::for_config(
             &table,
-            &RateSources::reading(AssetChain::Evm, two_leg_source()),
+            &RateSources::reading(evm_network(), two_leg_source()),
             config.denomination(),
         )
         .expect("usable quote paths");

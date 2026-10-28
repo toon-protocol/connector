@@ -114,7 +114,7 @@ price = {PRICE}
     ));
 
     let runtime = connector_cli::build(&config).await.expect("build");
-    assert!(runtime.batch_settlement_evm.is_some(), "opted in on EVM");
+    assert!(!runtime.batch_settlement_evm.is_empty(), "opted in on EVM");
     assert!(
         runtime.batch_settlement_solana.is_none(),
         "and not on Solana"
@@ -282,7 +282,9 @@ price = {PRICE}
     let runtime = connector_cli::build(&config).await.expect("rebuild");
     let backend = runtime
         .batch_settlement_evm
-        .clone()
+        .values()
+        .next()
+        .cloned()
         .expect("still opted in") as std::sync::Arc<dyn BatchSettlementBackend>;
     let before = backend
         .channel_state(&channel)

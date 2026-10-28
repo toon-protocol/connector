@@ -63,7 +63,7 @@ use connector_btp::{
     CONTENT_TYPE_TEXT,
 };
 use connector_domain::{Prepare, Reject};
-use connector_runtime::{FileJournal, InMemoryJournal, Journal, OutboundChannels, SettlementChain};
+use connector_runtime::{FileJournal, InMemoryJournal, Journal, OutboundChannels};
 use connector_settlement::batch::{
     BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, ReceiverTerms, Voucher,
 };
@@ -259,7 +259,7 @@ key_file = "{key_file}"
         let outbound = OutboundChannels::restore(
             journal,
             vec![(
-                SettlementChain::Evm,
+                connector_domain::Network::Eip155(payer.domain().chain_id),
                 Arc::new(payer) as Arc<dyn BatchSettlementPayer>,
             )],
         )

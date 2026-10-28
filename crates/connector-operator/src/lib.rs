@@ -1061,7 +1061,9 @@ fn batch_channel_error_response(error: BatchChannelError) -> Response {
             StatusCode::NOT_FOUND
         }
         BatchChannelError::StillOpening(_) => StatusCode::CONFLICT,
-        BatchChannelError::InvalidTerms(_) => StatusCode::BAD_REQUEST,
+        BatchChannelError::InvalidTerms(_) | BatchChannelError::NetworkAmbiguous(_) => {
+            StatusCode::BAD_REQUEST
+        }
         BatchChannelError::Journal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         BatchChannelError::DepositRefused(_) => StatusCode::FORBIDDEN,
         BatchChannelError::Settlement(settlement) => match settlement {
@@ -2945,7 +2947,10 @@ mod tests {
             payer.fund(10_000);
             let outbound = OutboundChannels::restore(
                 Arc::new(connector_runtime::InMemoryJournal::new()),
-                vec![(SettlementChain::Evm, payer as Arc<dyn BatchSettlementPayer>)],
+                vec![(
+                    NETWORK.parse().expect("a CAIP-2 network"),
+                    payer as Arc<dyn BatchSettlementPayer>,
+                )],
             )
             .await
             .expect("an empty journal replays");
@@ -3977,7 +3982,7 @@ mod tests {
                 OutboundChannels::restore(
                     Arc::new(InMemoryJournal::new()),
                     vec![(
-                        SettlementChain::Evm,
+                        "eip155:31337".parse().expect("a CAIP-2 network"),
                         Arc::clone(&this) as Arc<dyn BatchSettlementPayer>,
                     )],
                 )
@@ -3987,12 +3992,11 @@ mod tests {
             let batch = Arc::new(BatchChannels::new(
                 Arc::clone(&outbound),
                 vec![(
-                    SettlementChain::Evm,
+                    "eip155:31337".parse().expect("a CAIP-2 network"),
                     Arc::clone(&this) as Arc<dyn BatchSettlementBackend>,
                 )],
                 Arc::new(RwLock::new(Vec::new()))
                     as Arc<dyn connector_settlement::batch::HeldVouchers>,
-                Vec::new(),
             ));
             // A peering opens on the same outbound channels a `POST
             // /channels` does, so the two count into one day.
@@ -4348,7 +4352,7 @@ mod tests {
             let outbound = OutboundChannels::restore(
                 Arc::new(InMemoryJournal::new()),
                 vec![(
-                    SettlementChain::Evm,
+                    "eip155:31337".parse().expect("a CAIP-2 network"),
                     Arc::clone(&this) as Arc<dyn BatchSettlementPayer>,
                 )],
             )
@@ -4357,12 +4361,11 @@ mod tests {
             let batch = Arc::new(BatchChannels::new(
                 Arc::new(outbound),
                 vec![(
-                    SettlementChain::Evm,
+                    "eip155:31337".parse().expect("a CAIP-2 network"),
                     Arc::clone(&this) as Arc<dyn BatchSettlementBackend>,
                 )],
                 Arc::new(RwLock::new(Vec::new()))
                     as Arc<dyn connector_settlement::batch::HeldVouchers>,
-                Vec::new(),
             ));
             let app = router_with_controller_keys(
                 Arc::new(Connector::new(
@@ -4440,7 +4443,7 @@ mod tests {
                 let outbound = OutboundChannels::restore(
                     Arc::new(InMemoryJournal::new()),
                     vec![(
-                        SettlementChain::Evm,
+                        "eip155:31337".parse().expect("a CAIP-2 network"),
                         Arc::clone(&this) as Arc<dyn BatchSettlementPayer>,
                     )],
                 )
@@ -4450,11 +4453,10 @@ mod tests {
                 let batch = Arc::new(BatchChannels::new(
                     Arc::new(outbound),
                     vec![(
-                        SettlementChain::Evm,
+                        "eip155:31337".parse().expect("a CAIP-2 network"),
                         Arc::clone(&this) as Arc<dyn BatchSettlementBackend>,
                     )],
                     Arc::clone(&held) as Arc<dyn connector_settlement::batch::HeldVouchers>,
-                    Vec::new(),
                 ));
                 let operator = Keypair::generate(&mut OsRng);
                 let connector = Arc::new(Connector::new(

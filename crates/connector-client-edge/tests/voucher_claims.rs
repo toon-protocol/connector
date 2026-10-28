@@ -176,8 +176,8 @@ impl FakeBatchSettlement {
 
 #[async_trait]
 impl BatchSettlementChannels for FakeBatchSettlement {
-    fn evm_domain(&self) -> Option<BatchSettlementDomain> {
-        Some(domain())
+    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
+        vec![domain()]
     }
 
     fn solana_network(&self) -> Option<Network> {
@@ -186,6 +186,7 @@ impl BatchSettlementChannels for FakeBatchSettlement {
 
     async fn evm(
         &self,
+        _network: &connector_domain::Network,
         channel_id: &[u8; 32],
         presented_config: Option<&BatchChannelConfig>,
     ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
@@ -380,8 +381,8 @@ async fn the_committed_claim_network_refusals_match_the_real_gate() {
             "network_domain_mismatch" => ClaimIngestRejection::VoucherChannelConfigMismatch {
                 network: Network::Eip155(CHAIN_ID),
             },
-            // Acceptance on two EVM networks at once needs a two-network
-            // node (#1601); the vector's own replay pins those verdicts.
+            // Acceptance is replayed below, on a node that settles on every
+            // network the case names.
             _ => continue,
         };
         assert!(
@@ -399,6 +400,104 @@ async fn the_committed_claim_network_refusals_match_the_real_gate() {
         replayed += 1;
     }
     assert_eq!(replayed, 3);
+}
+
+/// A port settling on every EVM network a vector case's node names (ADR
+/// 0086), admitting any channel whose presented config reproduces its id
+/// under the network the voucher was asked about -- and only under that one.
+#[derive(Debug)]
+struct EveryNetwork {
+    chain_ids: Vec<u64>,
+    asked_on: Mutex<Vec<Network>>,
+}
+
+#[async_trait]
+impl BatchSettlementChannels for EveryNetwork {
+    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
+        self.chain_ids
+            .iter()
+            .map(|chain_id| BatchSettlementDomain::x402(*chain_id))
+            .collect()
+    }
+
+    fn solana_network(&self) -> Option<Network> {
+        None
+    }
+
+    async fn evm(
+        &self,
+        network: &Network,
+        channel_id: &[u8; 32],
+        presented_config: Option<&BatchChannelConfig>,
+    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
+        self.asked_on.lock().unwrap().push(network.clone());
+        let (Some(chain_id), Some(config)) = (network.eip155_chain_id(), presented_config) else {
+            return Ok(None);
+        };
+        Ok(
+            (evm_batch_channel_id(&BatchSettlementDomain::x402(chain_id), config) == *channel_id)
+                .then_some(AdmittedEvmVoucherChannel {
+                    config: *config,
+                    max_cumulative: u128::MAX,
+                }),
+        )
+    }
+
+    async fn solana(
+        &self,
+        _channel_account: &[u8; 32],
+    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
+        Ok(None)
+    }
+}
+
+/// Schema 10's two-network acceptances (#1601), replayed against the real
+/// gate on a node settling on both EVM networks the case names: each voucher
+/// is accepted, and its channel is asked of its own network's backend only.
+#[tokio::test]
+async fn the_committed_two_network_acceptances_match_the_real_gate() {
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("../../../vectors/wire-vectors.json")).expect("JSON");
+    let mut replayed = 0;
+    for case in vectors["claim_network"]["cases"].as_array().expect("cases") {
+        let name = case["name"].as_str().expect("name");
+        let claim_json = case["claim_json"].as_str().expect("claim_json");
+        let claim = connector_domain::client_claim::parse_client_claim(claim_json).expect("parses");
+        if case["outcome"] != "accepted" || claim.network().eip155_chain_id().is_none() {
+            continue;
+        }
+        let chain_ids: Vec<u64> = case["node_networks"]
+            .as_array()
+            .expect("node_networks")
+            .iter()
+            .filter_map(|network| {
+                network
+                    .as_str()
+                    .expect("a string")
+                    .parse::<Network>()
+                    .ok()?
+                    .eip155_chain_id()
+            })
+            .collect();
+        assert!(chain_ids.len() > 1, "case {name} is a two-network node");
+        let backend = Arc::new(EveryNetwork {
+            chain_ids,
+            asked_on: Mutex::new(Vec::new()),
+        });
+        let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
+            .expect("an empty journal")
+            .with_batch_settlement(Arc::clone(&backend) as Arc<dyn BatchSettlementChannels>);
+        gate.ingest(claim_json, 0)
+            .await
+            .unwrap_or_else(|refused| panic!("case {name} is accepted: {refused:?}"));
+        assert_eq!(
+            *backend.asked_on.lock().unwrap(),
+            vec![claim.network().clone()],
+            "case {name} is asked of its own network only"
+        );
+        replayed += 1;
+    }
+    assert_eq!(replayed, 2);
 }
 
 // -- EVM --

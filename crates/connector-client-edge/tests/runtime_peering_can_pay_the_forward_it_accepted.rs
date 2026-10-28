@@ -101,8 +101,8 @@ struct PaysThisNode {
 
 #[async_trait]
 impl BatchSettlementChannels for PaysThisNode {
-    fn evm_domain(&self) -> Option<BatchSettlementDomain> {
-        Some(self.domain)
+    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
+        vec![self.domain]
     }
 
     fn solana_network(&self) -> Option<connector_domain::Network> {
@@ -111,6 +111,7 @@ impl BatchSettlementChannels for PaysThisNode {
 
     async fn evm(
         &self,
+        _network: &connector_domain::Network,
         channel_id: &[u8; 32],
         presented_config: Option<&BatchChannelConfig>,
     ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
@@ -290,7 +291,7 @@ async fn outbound_channels(
         OutboundChannels::restore(
             journal,
             vec![(
-                SettlementChain::Evm,
+                connector_domain::Network::Eip155(payer.domain().chain_id),
                 Arc::new(payer) as Arc<dyn BatchSettlementPayer>,
             )],
         )

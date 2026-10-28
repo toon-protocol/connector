@@ -26,6 +26,7 @@ use connector_client_edge::{
     JournaledBatchChannel,
 };
 use connector_domain::Network;
+use connector_runtime::network_of_presentation;
 use connector_settlement::batch::{
     BatchChannelState, BatchSettlementBackend, BatchSettlementError, ChannelPresentation,
     EvmChannelConfig, HeldVoucher, HeldVouchers, Voucher, VoucherSigner,
@@ -33,12 +34,14 @@ use connector_settlement::batch::{
 use connector_settlement::ChannelId;
 use connector_signer::{BatchChannelConfig, BatchSettlementDomain};
 
-/// This node's batch-settlement backends, one per chain it has opted in on
-/// (`[settlement.<chain>]`), as the claim gate asks them.
-/// A chain whose table is absent is `None` here, and the gate refuses its
+/// This node's batch-settlement backends, one per network it has opted in
+/// on -- each `[settlement.eip155.<chainId>]` table and the one
+/// `[settlement.solana]` (ADR 0086) -- as the claim gate asks them. A
+/// network whose table is absent has no leg here, and the gate refuses its
 /// vouchers by name.
 pub(crate) struct BatchSettlementChannelsAdapter {
-    evm: Option<EvmLeg>,
+    /// One leg per EVM network, in table order.
+    evm: Vec<EvmLeg>,
     /// The Solana backend, and the CAIP-2 network it reached at connect.
     solana: Option<(Arc<dyn BatchSettlementBackend>, Network)>,
     /// Every channel this adapter has seen `admit` accept in this process.
@@ -59,27 +62,39 @@ struct EvmLeg {
 }
 
 impl BatchSettlementChannelsAdapter {
-    /// `None` when neither chain has opted in: a gate given nothing refuses
+    /// `None` when no network has opted in: a gate given nothing refuses
     /// every voucher by name, which is what "off unless configured" means.
     pub(crate) fn new(
-        evm: Option<(Arc<dyn BatchSettlementBackend>, BatchSettlementDomain)>,
+        evm: Vec<(Arc<dyn BatchSettlementBackend>, BatchSettlementDomain)>,
         solana: Option<(Arc<dyn BatchSettlementBackend>, Network)>,
     ) -> Option<BatchSettlementChannelsAdapter> {
-        if evm.is_none() && solana.is_none() {
+        if evm.is_empty() && solana.is_none() {
             return None;
         }
         Some(BatchSettlementChannelsAdapter {
-            evm: evm.map(|(backend, domain)| EvmLeg { backend, domain }),
+            evm: evm
+                .into_iter()
+                .map(|(backend, domain)| EvmLeg { backend, domain })
+                .collect(),
             solana,
             admitted: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// The leg of EVM network `network`, if this node settles on it.
+    fn evm_leg(&self, network: &Network) -> Option<&EvmLeg> {
+        let chain_id = network.eip155_chain_id()?;
+        self.evm.iter().find(|leg| leg.domain.chain_id == chain_id)
     }
 }
 
 impl fmt::Debug for BatchSettlementChannelsAdapter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BatchSettlementChannelsAdapter")
-            .field("evm", &self.evm.as_ref().map(|leg| leg.domain))
+            .field(
+                "evm",
+                &self.evm.iter().map(|leg| leg.domain).collect::<Vec<_>>(),
+            )
             .field("solana", &self.solana.is_some())
             .finish()
     }
@@ -87,8 +102,8 @@ impl fmt::Debug for BatchSettlementChannelsAdapter {
 
 #[async_trait]
 impl BatchSettlementChannels for BatchSettlementChannelsAdapter {
-    fn evm_domain(&self) -> Option<BatchSettlementDomain> {
-        self.evm.as_ref().map(|leg| leg.domain)
+    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
+        self.evm.iter().map(|leg| leg.domain).collect()
     }
 
     fn solana_network(&self) -> Option<Network> {
@@ -100,10 +115,12 @@ impl BatchSettlementChannels for BatchSettlementChannelsAdapter {
     /// has no record of -- there is nothing to look up.
     async fn evm(
         &self,
+        network: &Network,
         channel_id: &[u8; 32],
         presented_config: Option<&BatchChannelConfig>,
     ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
-        let (Some(leg), Some(config)) = (&self.evm, presented_config) else {
+        // ADR 0086: asked of `network`'s backend and no other.
+        let (Some(leg), Some(config)) = (self.evm_leg(network), presented_config) else {
             return Ok(None);
         };
         let presentation = ChannelPresentation::Evm {
@@ -285,6 +302,48 @@ impl HeldVouchers for ClaimGateVouchers {
     }
 }
 
+/// [`ClaimGateVouchers`] narrowed to the channels on one network (ADR
+/// 0086): what one network's watcher lands, so a backend is never handed a
+/// channel on another network. Which network a channel is on is proved from
+/// its presentation against `networks`, every network this node settles on.
+pub(crate) struct NetworkVouchers {
+    pub(crate) held: ClaimGateVouchers,
+    pub(crate) network: Network,
+    pub(crate) networks: Vec<Network>,
+}
+
+impl HeldVouchers for NetworkVouchers {
+    fn held_vouchers(&self) -> Vec<HeldVoucher> {
+        self.held
+            .held_vouchers()
+            .into_iter()
+            .filter(|held| {
+                network_of_presentation(&held.presentation, &self.networks).as_ref()
+                    == Some(&self.network)
+            })
+            .collect()
+    }
+}
+
+/// The claim gate as the connector asks which network a payment's channel
+/// is on (ADR 0086 decision 14): the network whose domain reproduces the
+/// channel the gate journaled, among every network this node settles on.
+pub(crate) struct GateChannelNetworks {
+    pub(crate) gate: Arc<ClientClaimGate>,
+    pub(crate) networks: Vec<Network>,
+}
+
+impl connector_runtime::ChannelNetworks for GateChannelNetworks {
+    fn network_of(&self, channel_key: &str) -> Option<Network> {
+        let channel = self
+            .gate
+            .batch_channels()
+            .into_iter()
+            .find(|channel| channel.channel_key() == channel_key)?;
+        network_of_presentation(&presentation(channel), &self.networks)
+    }
+}
+
 /// A journaled channel and its latest voucher, as the port names them.
 fn held_voucher(channel: JournaledBatchChannel, amount: u128, signature: Vec<u8>) -> HeldVoucher {
     HeldVoucher {
@@ -328,24 +387,28 @@ fn presentation(channel: JournaledBatchChannel) -> ChannelPresentation {
 /// again from the same record. A channel whose chain has since been opted
 /// out of is logged too: its vouchers can no longer be accepted here, and
 /// whatever it still holds unlanded is the operator's to collect.
+///
+/// An EVM channel goes to the network whose domain reproduces its id (ADR
+/// 0086): its journal key names no network, and its id binds one.
 pub(crate) async fn restore_journaled_channels(
     channels: &[JournaledBatchChannel],
-    evm: Option<&dyn BatchSettlementBackend>,
-    solana: Option<&dyn BatchSettlementBackend>,
+    backends: &[(Network, Arc<dyn BatchSettlementBackend>)],
 ) {
     for channel in channels {
-        let backend = match channel {
-            JournaledBatchChannel::Evm { .. } => evm,
-            JournaledBatchChannel::Solana { .. } => solana,
-        };
         let presentation = presentation(*channel);
+        let network =
+            network_of_presentation(&presentation, backends.iter().map(|(network, _)| network));
+        let backend = backends
+            .iter()
+            .find(|(held, _)| Some(held) == network.as_ref())
+            .map(|(_, backend)| backend);
         let channel = presentation.channel().clone();
         let Some(backend) = backend else {
             tracing::warn!(
                 %channel,
                 chain = presentation.chain(),
-                "the client-edge journal holds vouchers on a batch-settlement channel on a chain \
-                 this node no longer opts in to; they will not be landed from here"
+                "the client-edge journal holds vouchers on a batch-settlement channel on a \
+                 network this node no longer opts in to; they will not be landed from here"
             );
             continue;
         };

@@ -195,7 +195,12 @@ async fn a_client_is_paid_an_evm_voucher_it_lands_on_chain_itself() {
     assert_eq!(second.cumulative_amount, 500, "vouchers are cumulative");
 
     // -- 4. The client lands its latest payout itself --
-    let lander = client.batch_settlement_evm.clone().expect("x402 on EVM");
+    let lander = client
+        .batch_settlement_evm
+        .values()
+        .next()
+        .cloned()
+        .expect("x402 on EVM");
     lander
         .admit(presentation.clone())
         .await

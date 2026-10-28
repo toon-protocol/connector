@@ -4,6 +4,7 @@
 //! construction decision lives -- `connector-bin` calls exactly
 //! [`build`] and [`router`] and branches on neither.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -19,7 +20,7 @@ use connector_config::{
     Config, EvmSettlementConfig, PeerCarriage, SecretLocation, SettlementChain, SettlementConfig,
     SolanaSettlementConfig,
 };
-use connector_domain::{AssetChain, Network};
+use connector_domain::Network;
 use connector_rate_source_evm::UniswapV3RateSource;
 use connector_runtime::{
     BatchChannels, BoundedHttpSelfDescription, ConfigPeeringError, Connector, DeclaredRates,
@@ -37,6 +38,7 @@ use connector_signer::{LocalSigner, Signer, SignerError};
 
 use crate::batch_settlement::{
     restore_journaled_channels, BatchSettlementChannelsAdapter, ClaimGateVouchers,
+    GateChannelNetworks, NetworkVouchers,
 };
 use crate::peer_transport;
 use solana_sdk::pubkey::Pubkey;
@@ -174,11 +176,12 @@ pub enum RuntimeError {
     /// declared and asserted, like `decimals`: a wrong `rpc_url` must never
     /// settle on a network other than the one the operator named.
     EvmChainIdMismatch { network: Network, reported: u64 },
-    /// More than one `[settlement.eip155.<chainId>]` table (ADR 0086,
-    /// interim, #1597): they load, but this build runs one EVM network per
-    /// node until multi-network settlement lands, and refuses rather than
-    /// silently settling on one of them.
-    MoreThanOneEvmNetwork { networks: Vec<Network> },
+    /// Two `[settlement.eip155.<chainId>]` tables whose RPCs answer
+    /// `eth_chainId` with the same id (ADR 0086 decision 4) -- two anvils
+    /// both left at 31337, say. Refused by name before either is bound: two
+    /// tables on one chain would be one network settled twice, under one
+    /// EIP-712 domain.
+    EvmNetworkReportedTwice { tables: Vec<String>, reported: u64 },
     /// `[settlement.evm] asset_transfer_method` is `"eip3009"`, and the
     /// token has no ERC-3009: it fails the very probe this node's own
     /// deposits are routed by (`EvmBatchSettlementBackend::deposit_route`,
@@ -315,24 +318,18 @@ impl fmt::Display for RuntimeError {
                      [settlement.eip155.{reported}] if that is the network you meant"
                 )
             }
-            RuntimeError::MoreThanOneEvmNetwork { networks } => {
-                let tables: Vec<String> = networks
+            RuntimeError::EvmNetworkReportedTwice { tables, reported } => {
+                let tables: Vec<String> = tables
                     .iter()
-                    .map(|network| {
-                        format!(
-                            "[settlement.eip155.{}]",
-                            network.eip155_chain_id().unwrap_or_default()
-                        )
-                    })
+                    .map(|table| format!("[settlement.{table}]"))
                     .collect();
                 write!(
                     f,
-                    "this config settles on {} EVM networks ({}), and this build settles on \
-                     one EVM network per node: keep one [settlement.eip155.<chainId>] table and \
-                     remove the others. Several networks per node is ADR 0086's, and lands in \
-                     a later release",
-                    networks.len(),
-                    tables.join(", ")
+                    "{} each answer eth_chainId with {reported}: two settlement tables on one \
+                     chain are one network settled twice (ADR 0086 decision 4). Point each \
+                     table's rpc_url at the chain its key names -- a local anvil takes \
+                     --chain-id",
+                    tables.join(" and ")
                 )
             }
             RuntimeError::AssetTransferMethodUnsupported { table, token } => write!(
@@ -457,23 +454,39 @@ fn read_settlement_private_key(location: &SecretLocation) -> Result<String, Runt
     read_settlement_key_bytes(location).map(hex_encode_32)
 }
 
-/// ADR 0086, interim (#1597): several `[settlement.eip155.<chainId>]` tables
-/// load, but this build holds one EVM backend, so more than one is refused
-/// by name before any chain is dialed rather than reduced to one. The
-/// ticket that keys the runtime by network removes this.
-fn refuse_more_than_one_evm_network(config: &Config) -> Result<(), RuntimeError> {
-    let networks: Vec<Network> = config
-        .settlements()
-        .iter()
-        .filter_map(|settlement| match settlement {
-            SettlementConfig::Evm(evm) => Some(evm.network().clone()),
-            SettlementConfig::Solana(_) => None,
-        })
-        .collect();
-    if networks.len() > 1 {
-        return Err(RuntimeError::MoreThanOneEvmNetwork { networks });
+/// ADR 0086 decision 4: what each `[settlement.eip155.<chainId>]` table's
+/// RPC reports as its chain id, read over the table's own transport before
+/// anything is bound, and two tables reporting one id refused by name.
+/// Each table's report is then asserted against its key as it is built.
+async fn evm_reported_chain_ids(
+    config: &Config,
+    transports: &SettlementTransports,
+) -> Result<BTreeMap<Network, u64>, RuntimeError> {
+    let mut reported: BTreeMap<Network, u64> = BTreeMap::new();
+    for settlement in config.settlements() {
+        let SettlementConfig::Evm(evm) = settlement else {
+            continue;
+        };
+        let transport = transports.for_settlement(settlement)?;
+        let id = EvmBatchSettlementBackend::chain_id_at(transport)
+            .await
+            .map_err(|source| unbound(&evm.table_name(), source))?;
+        let twins: Vec<String> = reported
+            .iter()
+            .filter(|(_, held)| **held == id)
+            .map(|(network, _)| format!("eip155.{}", network.eip155_chain_id().unwrap_or_default()))
+            .collect();
+        if !twins.is_empty() {
+            let mut tables = twins;
+            tables.push(evm.table_name());
+            return Err(RuntimeError::EvmNetworkReportedTwice {
+                tables,
+                reported: id,
+            });
+        }
+        reported.insert(evm.network().clone(), id);
     }
-    Ok(())
+    Ok(reported)
 }
 
 /// Map a backend that would not bind to its refusal: by name when the x402
@@ -495,13 +508,11 @@ fn unbound(table: &str, source: BatchSettlementError) -> RuntimeError {
 async fn build_evm_batch_settlement(
     settlement: &EvmSettlementConfig,
     transport: &RpcTransport,
+    reported: u64,
 ) -> Result<Arc<EvmBatchSettlementBackend>, RuntimeError> {
     let table = settlement.table_name();
     // ADR 0086 decision 4: the table key is asserted against the chain
     // before anything is bound to it, and is never an input to the backend.
-    let reported = EvmBatchSettlementBackend::chain_id_at(transport)
-        .await
-        .map_err(|source| unbound(&table, source))?;
     if reported != settlement.chain_id() {
         return Err(RuntimeError::EvmChainIdMismatch {
             network: settlement.network().clone(),
@@ -804,15 +815,16 @@ pub struct Runtime {
     ///
     /// Writing it is [`spawn_rate_pollers`]'s job, and nothing else's.
     pub rate_table: Option<SharedRateTable>,
-    /// This node's receive-only x402 `batch-settlement` backend on EVM (ADR
-    /// 0074), `Some` exactly when `[settlement.evm]` is
-    /// written. [`router`] hands it to the client edge's claim gate, which
-    /// admits vouchers through it; every channel the client-edge journal
-    /// holds vouchers on is already restored to it by the time [`build`]
-    /// returns, so its `channel_state` and `land` work from the first
-    /// packet. [`router`] also starts its watcher and sweep over it (issue
-    /// #1344, `spawn_batch_settlement_watchers`).
-    pub batch_settlement_evm: Option<Arc<EvmBatchSettlementBackend>>,
+    /// This node's x402 `batch-settlement` backend on each EVM network (ADR
+    /// 0074, ADR 0086), one per `[settlement.eip155.<chainId>]` table, keyed
+    /// by its CAIP-2 network. [`router`] hands them to the client edge's
+    /// claim gate, which admits each voucher through its own network's;
+    /// every channel the client-edge journal holds vouchers on is already
+    /// restored to its network's by the time [`build`] returns, so
+    /// `channel_state` and `land` work from the first packet. [`router`]
+    /// also starts a watcher and sweep over each (issue #1344,
+    /// `spawn_batch_settlement_watchers`).
+    pub batch_settlement_evm: BTreeMap<Network, Arc<EvmBatchSettlementBackend>>,
     /// The Solana twin of [`Self::batch_settlement_evm`], `Some` exactly
     /// when `[settlement.solana]` is written -- and what
     /// the public sponsor endpoint (issue #1346) co-signs an `open` with.
@@ -972,19 +984,23 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // decision 10).
     let mut batch_settlements: Vec<connector_client_edge::X402BatchSettlementTerms> = Vec::new();
     let mut voucher_signers: Vec<connector_domain::VoucherSignerFact> = Vec::new();
-    let mut batch_settlement_evm: Option<Arc<EvmBatchSettlementBackend>> = None;
+    let mut batch_settlement_evm: BTreeMap<Network, Arc<EvmBatchSettlementBackend>> =
+        BTreeMap::new();
     let mut batch_settlement_solana: Option<Arc<SolanaBatchSettlement>> = None;
     // Each table's one transport, built once and handed to every client of
     // its `rpc_url` below (ADR 0073 decision 2).
-    refuse_more_than_one_evm_network(config)?;
     let transports = settlement_transports(config)?;
+    // ADR 0086 decision 4: every EVM table's chain id, read before any is
+    // bound, so two tables on one chain are refused as that.
+    let reported = evm_reported_chain_ids(config, &transports).await?;
     for settlement in config.settlements() {
         match settlement {
             SettlementConfig::Evm(evm) => {
-                let transport = transports.for_chain(SettlementChain::Evm)?;
+                let transport = transports.for_settlement(settlement)?;
                 // ADR 0075 decision 1: bound before anything is served, and
                 // refused by name on a chain without `x402BatchSettlement`.
-                let backend = build_evm_batch_settlement(evm, transport).await?;
+                let backend =
+                    build_evm_batch_settlement(evm, transport, reported[evm.network()]).await?;
                 let batch = evm.batch_settlement();
                 let network = format!("eip155:{}", backend.domain().chain_id);
                 // The connection proved the settlement address and the live
@@ -1018,10 +1034,10 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                         facilitator: batch.facilitator_url().map(str::to_string),
                     },
                 ));
-                batch_settlement_evm = Some(backend);
+                batch_settlement_evm.insert(evm.network().clone(), backend);
             }
             SettlementConfig::Solana(solana) => {
-                let transport = transports.for_chain(SettlementChain::Solana)?;
+                let transport = transports.for_settlement(settlement)?;
                 // ADR 0075 decision 1: bound before anything is served, and
                 // refused by name on a chain without `payment-channels`;
                 // the mint must be the SPL Token program's and agree with
@@ -1159,7 +1175,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // tightened since cannot strand a voucher already accepted (decision 5).
     // The journal is where an EVM channel's config survives a restart; the
     // chain never gives it back.
-    if batch_settlement_evm.is_some() || batch_settlement_solana.is_some() {
+    if !batch_settlement_evm.is_empty() || batch_settlement_solana.is_some() {
         if let Some(state_dir) = config.state_dir() {
             let path = state_dir.join(CLIENT_EDGE_JOURNAL);
             let unreplayable = |source| RuntimeError::JournalUnreplayable {
@@ -1173,12 +1189,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 connector_client_edge::journaled_batch_channels(&entries).map_err(unreplayable)?;
             restore_journaled_channels(
                 &channels,
-                batch_settlement_evm
-                    .as_deref()
-                    .map(|backend| backend as &dyn BatchSettlementBackend),
-                batch_settlement_solana
-                    .as_deref()
-                    .map(|backend| backend as &dyn BatchSettlementBackend),
+                &receivers(&batch_settlement_evm, &batch_settlement_solana),
             )
             .await;
         }
@@ -1274,19 +1285,22 @@ fn wire_config_peerings(
 /// memory, which survives nothing -- the same posture its claim books take.
 async fn restore_outbound_channels(
     config: &Config,
-    evm: &Option<Arc<EvmBatchSettlementBackend>>,
+    evm: &BTreeMap<Network, Arc<EvmBatchSettlementBackend>>,
     solana: &Option<Arc<SolanaBatchSettlement>>,
 ) -> Result<Option<Arc<OutboundChannels>>, RuntimeError> {
-    let mut payers: Vec<(SettlementChain, Arc<dyn BatchSettlementPayer>)> = Vec::new();
-    if let Some(evm) = evm {
-        payers.push((
-            SettlementChain::Evm,
-            Arc::clone(evm) as Arc<dyn BatchSettlementPayer>,
-        ));
-    }
+    // ADR 0086: one payer per network, each EVM table's own.
+    let mut payers: Vec<(Network, Arc<dyn BatchSettlementPayer>)> = evm
+        .iter()
+        .map(|(network, backend)| {
+            (
+                network.clone(),
+                Arc::clone(backend) as Arc<dyn BatchSettlementPayer>,
+            )
+        })
+        .collect();
     if let Some(solana) = solana {
         payers.push((
-            SettlementChain::Solana,
+            solana_network_of(solana),
             Arc::clone(solana) as Arc<dyn BatchSettlementPayer>,
         ));
     }
@@ -1319,56 +1333,50 @@ fn batch_channels_for_operator(
     claim_gate: &Arc<ClientClaimGate>,
 ) -> Option<Arc<BatchChannels>> {
     let outbound = Arc::clone(runtime.outbound_channels.as_ref()?);
-    let mut receivers: Vec<(SettlementChain, Arc<dyn BatchSettlementBackend>)> = Vec::new();
-    if let Some(evm) = &runtime.batch_settlement_evm {
-        receivers.push((
-            SettlementChain::Evm,
-            Arc::clone(evm) as Arc<dyn BatchSettlementBackend>,
-        ));
-    }
-    if let Some(solana) = &runtime.batch_settlement_solana {
-        receivers.push((
-            SettlementChain::Solana,
-            Arc::clone(solana) as Arc<dyn BatchSettlementBackend>,
-        ));
-    }
-    let networks = runtime
-        .batch_settlements
-        .iter()
-        .map(|terms| match terms {
-            connector_client_edge::X402BatchSettlementTerms::Evm(evm) => {
-                (SettlementChain::Evm, evm.network.clone())
-            }
-            connector_client_edge::X402BatchSettlementTerms::Solana(solana) => {
-                (SettlementChain::Solana, solana.network.clone())
-            }
-        })
-        .collect();
     Some(Arc::new(BatchChannels::new(
         outbound,
-        receivers,
+        runtime_receivers(runtime),
         Arc::new(ClaimGateVouchers(Arc::clone(claim_gate))),
-        networks,
     )))
 }
 
-/// This node's own CAIP-2 network on each chain it settles on, as its
-/// greeting publishes it: what every voucher it signs names (ADR 0086
-/// decision 1).
-fn x402_networks(runtime: &Runtime) -> Vec<Network> {
-    runtime
-        .batch_settlements
+/// The receiving half of every backend this node connected, keyed by its
+/// CAIP-2 network (ADR 0086): each EVM table's, then the Solana one.
+fn receivers(
+    evm: &BTreeMap<Network, Arc<EvmBatchSettlementBackend>>,
+    solana: &Option<Arc<SolanaBatchSettlement>>,
+) -> Vec<(Network, Arc<dyn BatchSettlementBackend>)> {
+    let mut receivers: Vec<(Network, Arc<dyn BatchSettlementBackend>)> = evm
         .iter()
-        .map(|terms| match terms {
-            connector_client_edge::X402BatchSettlementTerms::Evm(evm) => &evm.network,
-            connector_client_edge::X402BatchSettlementTerms::Solana(solana) => &solana.network,
+        .map(|(network, backend)| {
+            (
+                network.clone(),
+                Arc::clone(backend) as Arc<dyn BatchSettlementBackend>,
+            )
         })
-        .map(|network| {
-            network
-                .parse()
-                .expect("a connected backend publishes a CAIP-2 network")
-        })
-        .collect()
+        .collect();
+    if let Some(solana) = solana {
+        receivers.push((
+            solana_network_of(solana),
+            Arc::clone(solana) as Arc<dyn BatchSettlementBackend>,
+        ));
+    }
+    receivers
+}
+
+fn runtime_receivers(runtime: &Runtime) -> Vec<(Network, Arc<dyn BatchSettlementBackend>)> {
+    receivers(
+        &runtime.batch_settlement_evm,
+        &runtime.batch_settlement_solana,
+    )
+}
+
+/// The CAIP-2 network a connected Solana backend read off its cluster.
+fn solana_network_of(backend: &SolanaBatchSettlement) -> Network {
+    backend
+        .caip2_network()
+        .parse()
+        .expect("a connected Solana backend names a CAIP-2 network")
 }
 
 /// The claim gate's view of this node's batch-settlement backends (ADR
@@ -1376,19 +1384,20 @@ fn x402_networks(runtime: &Runtime) -> Vec<Network> {
 /// refuses every voucher by name.
 fn batch_settlement_channels(runtime: &Runtime) -> Option<BatchSettlementChannelsAdapter> {
     BatchSettlementChannelsAdapter::new(
-        runtime.batch_settlement_evm.as_ref().map(|backend| {
-            (
-                Arc::clone(backend) as Arc<dyn BatchSettlementBackend>,
-                backend.domain(),
-            )
-        }),
+        runtime
+            .batch_settlement_evm
+            .values()
+            .map(|backend| {
+                (
+                    Arc::clone(backend) as Arc<dyn BatchSettlementBackend>,
+                    backend.domain(),
+                )
+            })
+            .collect(),
         runtime.batch_settlement_solana.as_ref().map(|backend| {
             (
                 Arc::clone(backend) as Arc<dyn BatchSettlementBackend>,
-                backend
-                    .caip2_network()
-                    .parse()
-                    .expect("a connected Solana backend names a CAIP-2 network"),
+                solana_network_of(backend),
             )
         }),
     )
@@ -1478,9 +1487,9 @@ fn spawn_quote_path_pollers(
     let started = spawn_rate_pollers(table, &sources, config)?;
     tracing::info!(
         started,
-        chains = %sources
-            .chains()
-            .map(|chain| chain.as_str())
+        networks = %sources
+            .networks()
+            .map(|network| network.to_string())
             .collect::<Vec<_>>()
             .join(","),
         "reading declared quote paths by TWAP over each token's own settlement endpoint"
@@ -1513,12 +1522,13 @@ fn spawn_quote_path_pollers(
 /// nothing else.
 fn rate_sources(transports: &SettlementTransports) -> RateSources {
     let mut sources = RateSources::none();
-    // The EVM table's own transport, shared with its backend and syncer:
+    // Each EVM table's own transport, shared with its backend and syncer:
     // a rate source dialing on its own would be the one client of that
-    // `rpc_url` left direct (ADR 0073 decision 2).
-    if let Some(transport) = &transports.evm {
+    // `rpc_url` left direct (ADR 0073 decision 2). One per network, reading
+    // only that network's pools (ADR 0086 decision 13).
+    for (network, transport) in &transports.evm {
         sources = sources.with(
-            AssetChain::Evm,
+            network.clone(),
             Arc::new(UniswapV3RateSource::connect(transport)),
         );
     }
@@ -1536,21 +1546,21 @@ fn rate_sources(transports: &SettlementTransports) -> RateSources {
 /// other table dials direct. Which is which is the table's own key, never
 /// inferred from the `rpc_url` (ADR 0073 decision 1).
 pub(crate) struct SettlementTransports {
-    evm: Option<RpcTransport>,
+    /// One per EVM table, keyed by its network (ADR 0086).
+    evm: BTreeMap<Network, RpcTransport>,
     solana: Option<RpcTransport>,
 }
 
 impl SettlementTransports {
-    /// The transport for a table `config.settlements()` named. The loader
-    /// guarantees one per configured chain, so a miss is a wiring error
-    /// reported rather than a panic.
-    fn for_chain(&self, chain: SettlementChain) -> Result<&RpcTransport, RuntimeError> {
-        let transport = match chain {
-            SettlementChain::Evm => self.evm.as_ref(),
-            SettlementChain::Solana => self.solana.as_ref(),
+    /// The transport for a table `config.settlements()` named. One is built
+    /// per table, so a miss is a wiring error reported rather than a panic.
+    fn for_settlement(&self, settlement: &SettlementConfig) -> Result<&RpcTransport, RuntimeError> {
+        let transport = match settlement {
+            SettlementConfig::Evm(evm) => self.evm.get(evm.network()),
+            SettlementConfig::Solana(_) => self.solana.as_ref(),
         };
         transport.ok_or_else(|| RuntimeError::SettlementEndpointUnusable {
-            table: chain.name().to_string(),
+            table: settlement.table_name(),
             message: "no transport was built for a table the config names".to_string(),
         })
     }
@@ -1559,11 +1569,10 @@ impl SettlementTransports {
 /// Build [`SettlementTransports`] from `config`'s settlement tables.
 pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTransports, RuntimeError> {
     let mut transports = SettlementTransports {
-        evm: None,
+        evm: BTreeMap::new(),
         solana: None,
     };
     for settlement in config.settlements() {
-        let chain = settlement.chain();
         let unusable = |message: String| RuntimeError::SettlementEndpointUnusable {
             table: settlement.table_name(),
             message,
@@ -1575,14 +1584,17 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
             let proxy = config.socks_proxy().ok_or_else(|| {
                 unusable("rpc_via_socks_proxy is set and there is no socks_proxy".to_string())
             })?;
-            let circuit = match chain {
-                SettlementChain::Evm => Circuit::EvmSettlement,
-                SettlementChain::Solana => Circuit::SolanaSettlement,
+            // ADR 0086 decision 7: a circuit of its own per network.
+            let circuit = match settlement {
+                SettlementConfig::Evm(evm) => Circuit::EvmSettlement {
+                    chain_id: evm.chain_id(),
+                },
+                SettlementConfig::Solana(_) => Circuit::SolanaSettlement,
             };
             let transport = RpcTransport::through(settlement.rpc_url(), proxy, circuit)
                 .map_err(|error| unusable(error.to_string()))?;
             tracing::info!(
-                table = chain.name(),
+                table = settlement.table_name(),
                 endpoint = %transport.endpoint(),
                 circuit = circuit.socks_username(),
                 "settlement rpc via socks_proxy"
@@ -1592,9 +1604,11 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
             RpcTransport::direct(settlement.rpc_url())
                 .map_err(|error| unusable(error.to_string()))?
         };
-        match chain {
-            SettlementChain::Evm => transports.evm = Some(transport),
-            SettlementChain::Solana => transports.solana = Some(transport),
+        match settlement {
+            SettlementConfig::Evm(evm) => {
+                transports.evm.insert(evm.network().clone(), transport);
+            }
+            SettlementConfig::Solana(_) => transports.solana = Some(transport),
         }
     }
     Ok(transports)
@@ -1631,16 +1645,29 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
 /// [`BATCH_SWEEP_INTERVAL`]: connector_settlement_evm::BATCH_SWEEP_INTERVAL
 /// [`OPEN_SETTLE_INTERVAL`]: connector_settlement_solana::batch::OPEN_SETTLE_INTERVAL
 fn spawn_batch_settlement_watchers(runtime: &Runtime, gate: &Arc<ClientClaimGate>) {
-    let held: Arc<dyn HeldVouchers> = Arc::new(ClaimGateVouchers(Arc::clone(gate)));
-    if let Some(backend) = &runtime.batch_settlement_evm {
-        let watcher = EvmBatchWatcher::new(Arc::clone(backend), Arc::clone(&held));
+    // ADR 0086: one watcher per network, each handed only the vouchers held
+    // on its own network's channels.
+    let networks: Vec<Network> = runtime_receivers(runtime)
+        .into_iter()
+        .map(|(network, _)| network)
+        .collect();
+    let held_on = |network: &Network| -> Arc<dyn HeldVouchers> {
+        Arc::new(NetworkVouchers {
+            held: ClaimGateVouchers(Arc::clone(gate)),
+            network: network.clone(),
+            networks: networks.clone(),
+        })
+    };
+    for (network, backend) in &runtime.batch_settlement_evm {
+        let watcher = EvmBatchWatcher::new(Arc::clone(backend), held_on(network));
         tokio::spawn(watcher.run(
             watch_interval(backend.min_withdraw_delay_secs()),
             connector_settlement_evm::BATCH_SWEEP_INTERVAL,
         ));
     }
     if let Some(backend) = &runtime.batch_settlement_solana {
-        let watcher = SolanaBatchWatcher::new(Arc::clone(backend), held);
+        let watcher =
+            SolanaBatchWatcher::new(Arc::clone(backend), held_on(&solana_network_of(backend)));
         tokio::spawn(watcher.run(
             watch_interval(backend.min_grace_period_secs()),
             connector_settlement_solana::batch::OPEN_SETTLE_INTERVAL,
@@ -1665,7 +1692,6 @@ fn spawn_batch_settlement_watchers(runtime: &Runtime, gate: &Arc<ClientClaimGate
 fn client_claim_gate(
     config: &Config,
     outbound: Option<Arc<OutboundChannels>>,
-    networks: Vec<Network>,
 ) -> Result<ClientClaimGate, RuntimeError> {
     let (journal, path) = match config.state_dir() {
         Some(state_dir) => (
@@ -1695,9 +1721,7 @@ fn client_claim_gate(
                 .unwrap_or(budget.max_wait),
         });
     Ok(match outbound {
-        Some(outbound) => {
-            gate.with_payout_ledger(Arc::new(ClientPayoutLedger::new(outbound, networks)))
-        }
+        Some(outbound) => gate.with_payout_ledger(Arc::new(ClientPayoutLedger::new(outbound))),
         None => gate,
     })
 }
@@ -1772,17 +1796,23 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     // a receiver public key, a sender can wrap to no other one. No new
     // config section exists or is needed for this.
     let wrap_receiver_secret = Some(read_signer_secret(config.signer_key())?);
-    let mut claim_gate = client_claim_gate(
-        config,
-        runtime.outbound_channels.clone(),
-        x402_networks(runtime),
-    )?;
+    let mut claim_gate = client_claim_gate(config, runtime.outbound_channels.clone())?;
     // Vouchers are accepted on exactly the chains whose `batch_settlement`
     // table is written, and refused by name on the rest.
     if let Some(channels) = batch_settlement_channels(runtime) {
         claim_gate = claim_gate.with_batch_settlement(Arc::new(channels));
     }
     let claim_gate = Arc::new(claim_gate);
+    // ADR 0086 decision 14: which network a payment's channel is on, for an
+    // app's `X-TOON-Network`, is the gate's to say -- it verified the
+    // channel under that network's domain.
+    connector.set_channel_networks(Arc::new(GateChannelNetworks {
+        gate: Arc::clone(&claim_gate),
+        networks: runtime_receivers(runtime)
+            .into_iter()
+            .map(|(network, _)| network)
+            .collect(),
+    }));
     spawn_batch_settlement_watchers(runtime, &claim_gate);
     let app = connector_client_edge::router_with_node_facts(
         connector.clone(),
@@ -2446,14 +2476,15 @@ key_file = "{}"
 
         #[async_trait::async_trait]
         impl BatchSettlementChannels for EmptyCountingBackend {
-            fn evm_domain(&self) -> Option<BatchSettlementDomain> {
-                Some(BatchSettlementDomain::x402(84_532))
+            fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
+                vec![BatchSettlementDomain::x402(84_532)]
             }
             fn solana_network(&self) -> Option<connector_domain::Network> {
                 None
             }
             async fn evm(
                 &self,
+                _network: &connector_domain::Network,
                 _channel_id: &[u8; 32],
                 _presented_config: Option<&BatchChannelConfig>,
             ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
@@ -2485,7 +2516,7 @@ key_file = "{}"
         });
 
         let backend = Arc::new(EmptyCountingBackend::default());
-        let gate = client_claim_gate(&config, None, Vec::new())
+        let gate = client_claim_gate(&config, None)
             .expect("a fresh in-memory journal has nothing to replay")
             .with_batch_settlement(backend.clone());
 
@@ -2624,7 +2655,7 @@ key_file = "{key_path}"
             )
         });
 
-        client_claim_gate(&config, None, Vec::new()).expect("a writable state_dir produces a gate");
+        client_claim_gate(&config, None).expect("a writable state_dir produces a gate");
         assert!(
             state_dir.path().join(CLIENT_EDGE_JOURNAL).exists(),
             "the journal file is created at startup, not lazily at the first claim"
@@ -2655,7 +2686,7 @@ key_file = "{key_path}"
             )
         });
 
-        let Err(error) = client_claim_gate(&config, None, Vec::new()) else {
+        let Err(error) = client_claim_gate(&config, None) else {
             panic!("an unusable state_dir must not produce a gate");
         };
         assert!(matches!(error, RuntimeError::StateDirUnusable { .. }));
@@ -2691,7 +2722,7 @@ key_file = "{key_path}"
             )
         });
 
-        let Err(error) = client_claim_gate(&config, None, Vec::new()) else {
+        let Err(error) = client_claim_gate(&config, None) else {
             panic!("a corrupt journal must not produce a gate");
         };
         assert!(matches!(error, RuntimeError::JournalUnreplayable { .. }));
@@ -3008,7 +3039,7 @@ key_file = "{signer_key}"
             let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
             let config = node_config(&key_path.display().to_string(), "");
             let runtime = build(&config).await.expect("builds with no settlement");
-            assert!(runtime.batch_settlement_evm.is_none());
+            assert!(runtime.batch_settlement_evm.is_empty());
             assert!(runtime.batch_settlement_solana.is_none());
             assert!(runtime.batch_settlements.is_empty());
         }
@@ -3079,40 +3110,6 @@ key_file = "{signer_key}"
                     && message.contains("8453")
                     && message.contains("31337"),
                 "the refusal names the table and both ids: {message}"
-            );
-        }
-
-        /// ADR 0086, interim (#1597): one EVM network per node until
-        /// multi-network settlement lands. Two tables load, and boot refuses
-        /// them by name, naming both -- never quietly settling on one.
-        #[tokio::test]
-        async fn two_evm_tables_refuse_to_build_by_name() {
-            let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
-            let key = key_path.display().to_string();
-            let token: ethers::types::Address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
-                .parse()
-                .expect("address");
-            let first = evm_table("http://127.0.0.1:1", token, 6, &key);
-            let second = first.replace("eip155.31337", "eip155.31338");
-            let config = node_config(&key, &format!("{first}{second}"));
-            assert_eq!(config.settlements().len(), 2, "two EVM tables load");
-
-            let Err(error) = build(&config).await else {
-                panic!("built a node on two EVM networks");
-            };
-            assert!(
-                matches!(
-                    &error,
-                    RuntimeError::MoreThanOneEvmNetwork { networks }
-                        if *networks == vec![Network::Eip155(31337), Network::Eip155(31338)]
-                ),
-                "{error}"
-            );
-            let message = error.to_string();
-            assert!(
-                message.contains("[settlement.eip155.31337]")
-                    && message.contains("[settlement.eip155.31338]"),
-                "the refusal names both tables: {message}"
             );
         }
 
@@ -3490,7 +3487,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
             let runtime = build(&config)
                 .await
                 .expect("both chains bind without either refusing startup");
-            assert!(runtime.batch_settlement_evm.is_some());
+            assert!(!runtime.batch_settlement_evm.is_empty());
             assert!(runtime.batch_settlement_solana.is_some());
 
             // No `{:?}` of the facts: they carry keys derived from the
@@ -3693,7 +3690,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
 
             let started = spawn_rate_pollers(
                 &table,
-                &RateSources::reading(AssetChain::Evm, source),
+                &RateSources::reading(Network::Eip155(31337), source),
                 &config,
             )
             .expect("a usable quote path");
@@ -3841,7 +3838,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
                     RuntimeError::QuotePathUnpollable {
                         source: QuotePathUnusable::NoSourceForChain {
                             token,
-                            chain: AssetChain::Solana,
+                            network: Network::Solana(_),
                         },
                     } if token == &asset(&format!("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:{SOL_DEALT}"))
                 ),
@@ -4005,10 +4002,8 @@ key_file = "{key}"
             let config = config(&proxy.proxy_url(), true, key.path());
 
             let transports = settlement_transports(&config).expect("transports");
-            let evm = transports.for_chain(SettlementChain::Evm).expect("evm");
-            let solana = transports
-                .for_chain(SettlementChain::Solana)
-                .expect("solana");
+            let evm = evm_transport(&transports, 31337);
+            let solana = solana_transport(&transports);
             assert!(evm.is_proxied() && solana.is_proxied());
 
             // The two EVM clients `build` makes from the one transport.
@@ -4049,7 +4044,12 @@ key_file = "{key}"
             let connects = proxy.connects();
             assert!(
                 connects.iter().any(|c| c.target == format!("{EVM_HOST}:80")
-                    && c.username.as_deref() == Some(Circuit::EvmSettlement.socks_username())),
+                    && c.username.as_deref()
+                        == Some(
+                            Circuit::EvmSettlement { chain_id: 31337 }
+                                .socks_username()
+                                .as_str()
+                        )),
                 "{connects:?}"
             );
             assert!(
@@ -4057,7 +4057,7 @@ key_file = "{key}"
                     .iter()
                     .any(|c| c.target == format!("{SOLANA_HOST}:80")
                         && c.username.as_deref()
-                            == Some(Circuit::SolanaSettlement.socks_username())),
+                            == Some(Circuit::SolanaSettlement.socks_username().as_str())),
                 "{connects:?}"
             );
             assert!(
@@ -4073,14 +4073,126 @@ key_file = "{key}"
             let config = config(&proxy.proxy_url(), false, key.path());
 
             let transports = settlement_transports(&config).expect("transports");
-            assert!(!transports
-                .for_chain(SettlementChain::Evm)
-                .expect("evm")
-                .is_proxied());
-            assert!(transports
-                .for_chain(SettlementChain::Solana)
-                .expect("solana")
-                .is_proxied());
+            assert!(!evm_transport(&transports, 31337).is_proxied());
+            assert!(solana_transport(&transports).is_proxied());
+        }
+
+        fn evm_transport(transports: &SettlementTransports, chain_id: u64) -> &RpcTransport {
+            transports
+                .evm
+                .get(&Network::Eip155(chain_id))
+                .expect("a transport per EVM table")
+        }
+
+        fn solana_transport(transports: &SettlementTransports) -> &RpcTransport {
+            transports.solana.as_ref().expect("the Solana table's")
+        }
+
+        const SECOND_EVM_HOST: &str =
+            "secondevmrpcsecondevmrpcsecondevmrpcsecondevmrpcsecondevm.onion";
+
+        /// Two EVM tables, each opting in or not as `proxied` says, on two
+        /// onion hosts.
+        fn two_evm_config(
+            proxy: &url::Url,
+            proxied: [bool; 2],
+            key_path: &std::path::Path,
+        ) -> Config {
+            let table = |chain_id: u64, host: &str, proxied: bool| {
+                format!(
+                    r#"
+[settlement.eip155.{chain_id}]
+rpc_url = "http://{host}/"
+token_address = "0x00000000000000000000000000000000000000bb"
+decimals = 6
+rpc_via_socks_proxy = {proxied}
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+
+[settlement.eip155.{chain_id}.key]
+key_file = "{key}"
+"#,
+                    key = key_path.display(),
+                )
+            };
+            load_config(&format!(
+                r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "/tmp/connector-settlement-rpc-route"
+socks_proxy = "{proxy}"
+
+[signer]
+key_file = "{key}"
+{first}{second}"#,
+                key = key_path.display(),
+                first = table(31337, EVM_HOST, proxied[0]),
+                second = table(31338, SECOND_EVM_HOST, proxied[1]),
+            ))
+        }
+
+        /// ADR 0086 decision 7 (amending ADR 0073 decision 3): under
+        /// `rpc_via_socks_proxy`, each EVM table's RPC rides a circuit of its
+        /// own, pinned by a SOCKS username naming its network -- so no one
+        /// exit sees two of this node's networks.
+        #[tokio::test]
+        async fn each_evm_table_rides_a_circuit_of_its_own() {
+            let answer = |call: &connector_chain_rpc::RpcCall| match call.method.as_str() {
+                "eth_blockNumber" => RpcReply::Result(serde_json::json!("0x2a")),
+                _ => RpcReply::Error {
+                    code: -32601,
+                    message: "not served by this fake".to_string(),
+                },
+            };
+            let first_rpc = FakeRpc::spawn(answer).await;
+            let second_rpc = FakeRpc::spawn(answer).await;
+            let proxy = Socks5TestServer::spawn(HashMap::from([
+                (format!("{EVM_HOST}:80"), first_rpc.addr()),
+                (format!("{SECOND_EVM_HOST}:80"), second_rpc.addr()),
+            ]))
+            .await;
+            let key = tempfile::NamedTempFile::new().expect("key file");
+            let config = two_evm_config(&proxy.proxy_url(), [true, true], key.path());
+
+            let transports = settlement_transports(&config).expect("transports");
+            for chain_id in [31337, 31338] {
+                let transport = evm_transport(&transports, chain_id);
+                assert!(transport.is_proxied());
+                EvmRpc::provider(transport.clone())
+                    .get_block_number()
+                    .await
+                    .expect("through the proxy");
+            }
+
+            let connects = proxy.connects();
+            for (host, username) in [
+                (EVM_HOST, "toon-settlement-eip155-31337"),
+                (SECOND_EVM_HOST, "toon-settlement-eip155-31338"),
+            ] {
+                let dials: Vec<_> = connects
+                    .iter()
+                    .filter(|c| c.target == format!("{host}:80"))
+                    .collect();
+                assert!(!dials.is_empty(), "{host} was dialed: {connects:?}");
+                assert!(
+                    dials
+                        .iter()
+                        .all(|c| c.username.as_deref() == Some(username)),
+                    "every dial to {host} is on {username}'s circuit: {connects:?}"
+                );
+            }
+        }
+
+        /// ADR 0086 decision 7: `rpc_via_socks_proxy` is each table's own --
+        /// one EVM network on the circuit, another dialed direct.
+        #[tokio::test]
+        async fn rpc_via_socks_proxy_is_per_evm_table() {
+            let proxy = Socks5TestServer::spawn_recording_only().await;
+            let key = tempfile::NamedTempFile::new().expect("key file");
+            let config = two_evm_config(&proxy.proxy_url(), [true, false], key.path());
+
+            let transports = settlement_transports(&config).expect("transports");
+            assert!(evm_transport(&transports, 31337).is_proxied());
+            assert!(!evm_transport(&transports, 31338).is_proxied());
         }
     }
 }

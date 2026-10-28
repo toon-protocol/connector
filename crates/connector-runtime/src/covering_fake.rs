@@ -98,7 +98,10 @@ pub fn covering(connector: Connector, peer_id: &str) -> Connector {
     let outbound = Arc::new(
         complete(OutboundChannels::restore(
             Arc::new(InMemoryJournal::new()),
-            vec![(SettlementChain::Evm, payer as Arc<dyn BatchSettlementPayer>)],
+            vec![(
+                "eip155:31337".parse().expect("a CAIP-2 network"),
+                payer as Arc<dyn BatchSettlementPayer>,
+            )],
         ))
         .expect("an empty journal"),
     );

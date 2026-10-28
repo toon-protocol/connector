@@ -602,8 +602,9 @@ sets it:
 - every client of that table's `rpc_url` dials through the node's one `socks_proxy` as `socks5h`: the
   settlement backend, and on EVM the rate source too. None is left
   direct, and a proxy that is down is a failed call, never a direct dial;
-- each chain rides its own circuit, pinned by a fixed SOCKS username (`toon-settlement-evm`,
-  `toon-settlement-solana`), which relies on the daemon's `IsolateSOCKSAuth` (on by default);
+- each network rides its own circuit, pinned by a fixed SOCKS username naming it
+  (`toon-settlement-eip155-<chainId>` for each EVM table, `toon-settlement-solana`), which relies on
+  the daemon's `IsolateSOCKSAuth` (on by default) (ADR 0086 decision 7);
 - a node with no `socks_proxy` is refused at load (`SettlementRpcViaSocksProxyWithoutProxy`), since
   the key selects the node's one proxy and never names a second;
 - a plain `http://` `rpc_url` is refused at load (`SettlementRpcViaSocksProxyPlaintext`) unless its

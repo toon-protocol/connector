@@ -417,6 +417,17 @@ pub struct ClientRoutePrice {
     pub payment: bool,
 }
 
+/// Which network an admitted x402 channel is on (ADR 0086 decision 14), as
+/// whatever verified its vouchers knows it: on EVM, the network whose
+/// EIP-712 domain reproduced the channel id. The journal key
+/// (`evm:0x…`) does not say, because an EVM channel id already binds its
+/// chain (decision 9).
+pub trait ChannelNetworks: Send + Sync {
+    /// The CAIP-2 network of the channel `channel_key` (`evm:0x…`,
+    /// `solana:…`), or `None` for a channel this source never admitted.
+    fn network_of(&self, channel_key: &str) -> Option<connector_domain::Network>;
+}
+
 /// The connector's packet plane: a fixed set of terminated routes and peer
 /// routes, an [`AppClient`] port for delivering to the apps behind
 /// terminated routes, a [`PeerTransport`] port for forwarding to the next
@@ -493,10 +504,16 @@ pub struct Connector {
     /// through. `None` on a node with no x402 backend, which then peers
     /// with nobody.
     outbound_channels: Option<Arc<OutboundChannels>>,
-    /// This node's own CAIP-2 network on each chain it pays x402 on, as its
-    /// greeting publishes it: a counterparty's terms must name the same one
-    /// before this node opens a channel on them.
+    /// This node's own CAIP-2 networks, with the chain each is on, as its
+    /// greeting publishes them -- one per EVM table and the one Solana
+    /// table (ADR 0086): a counterparty's terms must name one of them before
+    /// this node opens a channel on them.
     x402_networks: Vec<(SettlementChain, String)>,
+    /// Which network an admitted channel is on, for a chain on which this
+    /// node holds several (ADR 0086 decision 14): the claim gate, which
+    /// verified the channel under its network's domain. Set once the gate
+    /// exists, after this connector is shared.
+    channel_networks: RwLock<Option<Arc<dyn ChannelNetworks>>>,
     /// The node's one root-level `socks_proxy` (ADR 0070), if configured:
     /// what a runtime peering's claim-state ask leaves on when the peer's
     /// client edge is an onion host ([`Connector::register_voucher_hop`]).
@@ -851,6 +868,7 @@ impl Connector {
             outbound_voucher_hops: ArcSwap::from_pointee(HashMap::new()),
             outbound_channels: None,
             x402_networks: Vec::new(),
+            channel_networks: RwLock::new(None),
             socks_proxy: None,
             config_peer_ids: HashSet::new(),
             runtime_peers: ArcSwap::from_pointee(RuntimePeers::new()),
@@ -948,7 +966,7 @@ impl Connector {
         // pay on a chain shares that chain with nobody.
         crate::peering::shared_settlement_of(
             document,
-            |chain| self.outbound_channels.is_some() && self.x402_network(chain).is_some(),
+            |chain| self.outbound_channels.is_some() && self.pays_on(chain),
             wanted,
             url,
         )
@@ -1106,7 +1124,13 @@ impl Connector {
         let incoming = match arrived? {
             Arrival::Operator => return None,
             Arrival::Peer(peer_id) => self.peer_asset(peer_id)?,
-            Arrival::ClientChannel(channel_key) => self.client_channel_assets.asset(channel_key)?,
+            Arrival::ClientChannel(channel_key) => {
+                let network = self
+                    .verified_network(channel_key)
+                    .and_then(|network| network.parse::<connector_domain::Network>().ok());
+                self.client_channel_assets
+                    .asset_on(channel_key, network.as_ref())?
+            }
         };
         let outgoing = self.peer_asset(outgoing_peer_id)?;
         // The compare itself is `PeeringAssets::crosses`: both legs are
@@ -1175,7 +1199,14 @@ impl Connector {
                 chain,
                 &ChannelId(binding.channel().to_string()),
             );
-            let Some(asset) = self.client_channel_assets.asset(&key) else {
+            let network = match binding {
+                RuntimePeerChannel::EvmVoucher { network, .. }
+                | RuntimePeerChannel::SolanaVoucher { network, .. } => {
+                    network.parse::<connector_domain::Network>().ok()
+                }
+                _ => None,
+            };
+            let Some(asset) = self.client_channel_assets.asset_on(&key, network.as_ref()) else {
                 continue;
             };
             match resolved {
@@ -1280,22 +1311,51 @@ impl Connector {
         self.outbound_channels.as_ref()
     }
 
-    /// This node's own CAIP-2 network on `chain`, if it pays x402 there.
-    pub(crate) fn x402_network(&self, chain: SettlementChain) -> Option<&str> {
+    /// Whether this node pays x402 on `chain` at all.
+    pub(crate) fn pays_on(&self, chain: SettlementChain) -> bool {
         self.x402_networks
             .iter()
-            .find(|(configured, _)| *configured == chain)
+            .any(|(configured, _)| *configured == chain)
+    }
+
+    /// This node's own CAIP-2 networks on `chain`, in table order.
+    pub(crate) fn x402_networks_on(&self, chain: SettlementChain) -> Vec<&str> {
+        self.x402_networks
+            .iter()
+            .filter(|(configured, _)| *configured == chain)
             .map(|(_, network)| network.as_str())
+            .collect()
+    }
+
+    /// Tell this connector which network each admitted channel is on (ADR
+    /// 0086 decision 14): consulted for a chain on which it holds several
+    /// networks. Replaces any source set before.
+    pub fn set_channel_networks(&self, source: Arc<dyn ChannelNetworks>) {
+        *self
+            .channel_networks
+            .write()
+            .expect("channel networks lock poisoned") = Some(source);
     }
 
     /// The CAIP-2 network a payment on `channel_key` was verified on (ADR
-    /// 0086 decision 14): this node's own network on the chain the key's
-    /// namespace names. A claim is only ever admitted on a chain this node
-    /// holds a backend for, and holds one network per chain, so the chain
-    /// decides it. `None` for a key with no chain this node settles on.
-    fn verified_network(&self, channel_key: &str) -> Option<&str> {
+    /// 0086 decision 14). On a chain where this node holds one network, the
+    /// chain decides it; on one where it holds several, the claim gate that
+    /// verified the channel under its network's domain does. `None` for a
+    /// key on no chain this node settles on, or a channel no source knows.
+    fn verified_network(&self, channel_key: &str) -> Option<String> {
         let (namespace, _) = channel_key.split_once(':')?;
-        self.x402_network(namespace.parse::<SettlementChain>().ok()?)
+        let chain = namespace.parse::<SettlementChain>().ok()?;
+        match self.x402_networks_on(chain).as_slice() {
+            [] => None,
+            [only] => Some((*only).to_string()),
+            _ => self
+                .channel_networks
+                .read()
+                .expect("channel networks lock poisoned")
+                .as_ref()?
+                .network_of(channel_key)
+                .map(|network| network.to_string()),
+        }
     }
 
     /// Register an x402 peering's outbound channel as the hop `peer_id` is
@@ -3307,15 +3367,9 @@ impl Connector {
             )));
         };
         // ADR 0086 decision 1: every voucher and challenge names the network
-        // its channel is on -- this node's own network on the channel's
-        // chain, which its greeting publishes.
-        let Some(network) = presentation
-            .chain()
-            .parse::<SettlementChain>()
-            .ok()
-            .and_then(|chain| self.x402_network(chain))
-            .and_then(|network| network.parse::<connector_domain::Network>().ok())
-        else {
+        // its channel is on -- the network whose payer it was opened, or
+        // restored, on.
+        let Some(network) = outbound.network(&hop.channel_id) else {
             return Err(CoverError::Failed(format!(
                 "peer '{peer_id}' is paid over x402 channel {}, on a chain for which this node \
                  publishes no CAIP-2 network to name on its vouchers",
@@ -3661,16 +3715,19 @@ impl Connector {
         // route states the packet's whole `amount`, which the carriage's gate
         // has already made the voucher's own advance; at any other route a
         // peer arrival states nothing.
+        let network = client_channel_id
+            .or(peer_channel)
+            .and_then(|channel_key| self.verified_network(channel_key));
         let attribution = match (client_channel_id, peer_channel) {
             (Some(channel_key), _) => Some(PaymentAttribution {
                 channel_key,
                 charge,
-                network: self.verified_network(channel_key),
+                network: network.as_deref(),
             }),
             (None, Some(channel_key)) if route.payment() => Some(PaymentAttribution {
                 channel_key,
                 charge: prepare.amount,
-                network: self.verified_network(channel_key),
+                network: network.as_deref(),
             }),
             _ => None,
         };
@@ -6369,7 +6426,7 @@ mod tests {
             .with_client_channel_assets(
                 client_chains
                     .iter()
-                    .map(|(chain, token)| (*chain, asset(token)))
+                    .map(|(_, token)| asset(token))
                     .collect(),
             );
         (hop, peer, clock)
@@ -6531,7 +6588,7 @@ mod tests {
             Some(table),
             clock.clone(),
         )
-        .with_client_channel_assets([(SettlementChain::Evm, asset(USDC))].into_iter().collect());
+        .with_client_channel_assets([asset(USDC)].into_iter().collect());
 
         // Past the two-minute ttl `rate_guards` declares.
         clock.advance(Duration::seconds(121));
@@ -6646,7 +6703,7 @@ mod tests {
                     .into_iter()
                     .collect(),
             )
-            .with_client_channel_assets([(SettlementChain::Evm, asset(USDC))].into_iter().collect())
+            .with_client_channel_assets([asset(USDC)].into_iter().collect())
             .with_rate_table(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
             "second-hop",
         );
@@ -9731,7 +9788,10 @@ mod tests {
             let outbound = Arc::new(
                 OutboundChannels::restore(
                     Arc::new(InMemoryJournal::new()),
-                    vec![(settles_on.0, payer as Arc<dyn BatchSettlementPayer>)],
+                    vec![(
+                        settles_on.1.parse().expect("a CAIP-2 network"),
+                        payer as Arc<dyn BatchSettlementPayer>,
+                    )],
                 )
                 .await
                 .expect("an empty journal"),
@@ -10301,14 +10361,7 @@ mod tests {
                 )
                 .expect("the incoming peering's runtime row");
             let connector = connector
-                .with_client_channel_assets(
-                    [
-                        (SettlementChain::Evm, asset(USDC)),
-                        (SettlementChain::Solana, asset(USDC_SOLANA)),
-                    ]
-                    .into_iter()
-                    .collect(),
-                )
+                .with_client_channel_assets([asset(USDC), asset(USDC_SOLANA)].into_iter().collect())
                 .with_rate_table(declaring(USDC, USDC_SOLANA, 1_000, 1));
 
             let response = connector
@@ -10375,12 +10428,7 @@ mod tests {
                 )
                 .expect("the ambiguous row");
             let connector = connector.with_client_channel_assets(
-                [
-                    (SettlementChain::Evm, asset(USDC)),
-                    (SettlementChain::Solana, asset(USDC_SOLANA)),
-                ]
-                .into_iter()
-                .collect(),
+                [asset(USDC), asset(USDC_SOLANA)].into_iter().collect(),
             );
 
             assert_eq!(connector.peer_asset("ambiguous"), None);

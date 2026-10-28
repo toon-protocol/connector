@@ -26,7 +26,7 @@ use connector_client_edge::{
 use connector_domain::{Fulfill, Prepare};
 use connector_runtime::{
     Connector, FakeAppClient, FileJournal, InProcessPeerTransport, Journal, OutboundChannels,
-    SettlementChain, TestClock,
+    TestClock,
 };
 use connector_settlement::batch::{
     BatchSettlementBackend, BatchSettlementPayer, ChannelPresentation, EvmChannelConfig,
@@ -172,8 +172,8 @@ struct ClientChannels;
 
 #[async_trait]
 impl BatchSettlementChannels for ClientChannels {
-    fn evm_domain(&self) -> Option<BatchSettlementDomain> {
-        Some(domain())
+    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
+        vec![domain()]
     }
 
     fn solana_network(&self) -> Option<connector_domain::Network> {
@@ -186,6 +186,7 @@ impl BatchSettlementChannels for ClientChannels {
 
     async fn evm(
         &self,
+        _network: &connector_domain::Network,
         channel_id: &[u8; 32],
         _presented_config: Option<&BatchChannelConfig>,
     ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
@@ -275,10 +276,12 @@ impl PayoutChain {
         }
     }
 
-    fn settlement_chain(&self) -> SettlementChain {
+    fn settlement_network(&self) -> connector_domain::Network {
         match self.exit {
-            PayerExit::Withdrawal => SettlementChain::Evm,
-            PayerExit::Close => SettlementChain::Solana,
+            PayerExit::Withdrawal => connector_domain::Network::Eip155(CHAIN_ID),
+            PayerExit::Close => "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                .parse()
+                .expect("a CAIP-2 network"),
         }
     }
 
@@ -290,7 +293,7 @@ impl PayoutChain {
             OutboundChannels::restore(
                 journal,
                 vec![(
-                    self.settlement_chain(),
+                    self.settlement_network(),
                     Arc::new(payer) as Arc<dyn BatchSettlementPayer>,
                 )],
             )
@@ -326,15 +329,7 @@ async fn serve(outbound: Arc<OutboundChannels>) -> SocketAddr {
     let gate = ClientClaimGate::restore(Arc::new(connector_runtime::InMemoryJournal::new()))
         .expect("an empty journal")
         .with_batch_settlement(Arc::new(ClientChannels))
-        .with_payout_ledger(Arc::new(ClientPayoutLedger::new(
-            outbound,
-            vec![
-                connector_domain::Network::Eip155(CHAIN_ID),
-                "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
-                    .parse()
-                    .expect("a CAIP-2 network"),
-            ],
-        )));
+        .with_payout_ledger(Arc::new(ClientPayoutLedger::new(outbound)));
     let app = connector_client_edge::router_with_gate(connector, signer, None, gate);
     let server = axum::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(app.into_make_service());
     let addr = server.local_addr();

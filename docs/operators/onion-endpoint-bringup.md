@@ -401,8 +401,9 @@ rpc_via_socks_proxy = true
 ```
 
 - Every client of that `rpc_url` then rides the daemon: the backend, the EVM channel-index syncer
-  and the EVM rate source. Each chain gets its own circuit, pinned by a fixed SOCKS username
-  (`toon-settlement-evm`, `toon-settlement-solana`). That needs `IsolateSOCKSAuth` on the
+  and the EVM rate source. Each network gets its own circuit, pinned by a fixed SOCKS username
+  (`toon-settlement-eip155-<chainId>` per EVM table, `toon-settlement-solana`). That needs
+  `IsolateSOCKSAuth` on the
   `SocksPort`, which is the daemon's default; do not turn it off.
 - It **fails closed**. If the daemon is down, settlement calls fail and nothing dials direct. The
   node also refuses to start with the key set and no `socks_proxy`.

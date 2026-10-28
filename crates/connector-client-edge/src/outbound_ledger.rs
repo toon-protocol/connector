@@ -46,7 +46,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use connector_domain::{AssetChain, Network};
+use connector_domain::Network;
 use connector_runtime::{BatchChannelError, OutboundChannels};
 use connector_settlement::batch::{
     BatchSettlementError, ChannelPresentation, Voucher, VoucherSigner,
@@ -85,9 +85,6 @@ impl PayoutVoucher {
 /// channels toward them. See the module doc.
 pub struct ClientPayoutLedger {
     outbound: Arc<OutboundChannels>,
-    /// This node's own network on each chain it pays on: what a payout
-    /// voucher on a channel of that chain names.
-    networks: Vec<Network>,
     /// One payout signed at a time: the next voucher's amount is read from
     /// the channel's watermark, and two payouts reading it at once would
     /// sign the same step twice.
@@ -109,12 +106,11 @@ pub struct ClientPayoutLedger {
 }
 
 impl ClientPayoutLedger {
-    /// A ledger that signs on `outbound`'s channels, each on this node's
-    /// network for its chain among `networks`.
-    pub fn new(outbound: Arc<OutboundChannels>, networks: Vec<Network>) -> ClientPayoutLedger {
+    /// A ledger that signs on `outbound`'s channels, each voucher naming
+    /// the network its channel is on (ADR 0086 decision 1).
+    pub fn new(outbound: Arc<OutboundChannels>) -> ClientPayoutLedger {
         ClientPayoutLedger {
             outbound,
-            networks,
             signing: tokio::sync::Mutex::new(()),
             credited_jobs: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
@@ -189,11 +185,11 @@ impl ClientPayoutLedger {
             else {
                 continue;
             };
-            let Some(network) = self.network_of(&presentation) else {
+            let Some(network) = self.outbound.network(&id) else {
                 tracing::warn!(
                     channel = %id,
-                    "a payout channel is on a chain this node publishes no network for; trying \
-                     the next one toward the same client"
+                    "a payout channel is on no network this node pays on; trying the next one \
+                     toward the same client"
                 );
                 continue;
             };
@@ -236,18 +232,6 @@ impl ClientPayoutLedger {
              tops one up with POST /channels/:id/fund"
         );
         None
-    }
-
-    /// This node's network on `presentation`'s chain.
-    fn network_of(&self, presentation: &ChannelPresentation) -> Option<Network> {
-        let chain = match presentation {
-            ChannelPresentation::Evm { .. } => AssetChain::Evm,
-            ChannelPresentation::Solana { .. } => AssetChain::Solana,
-        };
-        self.networks
-            .iter()
-            .find(|network| network.chain() == chain)
-            .cloned()
     }
 
     /// Every voucher signed toward `payee` that it has not acknowledged,
@@ -305,7 +289,7 @@ impl ClientPayoutLedger {
 /// payout channel an operator's `POST /channels` would have opened.
 #[cfg(test)]
 pub(crate) async fn test_ledger_paying(payee: [u8; 20]) -> Arc<ClientPayoutLedger> {
-    use connector_runtime::{InMemoryJournal, SettlementChain};
+    use connector_runtime::InMemoryJournal;
     use connector_settlement::batch::{
         BatchSettlementPayer, EvmReceiverTerms, InMemoryBatchChain, InMemoryBatchSettlement,
         PayerExit, ReceiverTerms,
@@ -317,7 +301,7 @@ pub(crate) async fn test_ledger_paying(payee: [u8; 20]) -> Arc<ClientPayoutLedge
     let outbound = OutboundChannels::restore(
         Arc::new(InMemoryJournal::new()),
         vec![(
-            SettlementChain::Evm,
+            Network::Eip155(84_532),
             Arc::new(payer) as Arc<dyn BatchSettlementPayer>,
         )],
     )
@@ -334,10 +318,7 @@ pub(crate) async fn test_ledger_paying(payee: [u8; 20]) -> Arc<ClientPayoutLedge
         )
         .await
         .expect("the payout channel opens");
-    Arc::new(ClientPayoutLedger::new(
-        Arc::new(outbound),
-        vec![Network::Eip155(84_532)],
-    ))
+    Arc::new(ClientPayoutLedger::new(Arc::new(outbound)))
 }
 
 #[cfg(test)]
@@ -347,15 +328,7 @@ mod tests {
 
     use super::*;
 
-    fn test_networks() -> Vec<Network> {
-        vec![
-            Network::Eip155(84_532),
-            "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
-                .parse()
-                .expect("a CAIP-2 network"),
-        ]
-    }
-    use connector_runtime::{InMemoryJournal, Journal, SettlementChain};
+    use connector_runtime::{InMemoryJournal, Journal};
     use connector_settlement::batch::{
         BatchSettlementBackend, BatchSettlementPayer, EvmReceiverTerms, InMemoryBatchChain,
         InMemoryBatchSettlement, PayerExit, ReceiverTerms,
@@ -395,7 +368,7 @@ mod tests {
         let outbound = OutboundChannels::restore(
             journal,
             vec![(
-                SettlementChain::Evm,
+                Network::Eip155(84_532),
                 Arc::new(payer) as Arc<dyn BatchSettlementPayer>,
             )],
         )
@@ -408,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn with_no_channel_toward_the_client_nothing_is_signed_and_the_job_is_not_spent() {
         let (outbound, _, _) = world(Arc::new(InMemoryJournal::new())).await;
-        let ledger = ClientPayoutLedger::new(Arc::clone(&outbound), test_networks());
+        let ledger = ClientPayoutLedger::new(Arc::clone(&outbound));
         assert!(ledger
             .record_payout_once(payee(), &[7; 32], 500)
             .await
@@ -426,7 +399,7 @@ mod tests {
     async fn payouts_are_cumulative_vouchers_the_client_can_land_itself() {
         let (outbound, _, client) = world(Arc::new(InMemoryJournal::new())).await;
         outbound.open(client_terms(), 1_000).await.expect("open");
-        let ledger = ClientPayoutLedger::new(Arc::clone(&outbound), test_networks());
+        let ledger = ClientPayoutLedger::new(Arc::clone(&outbound));
 
         let first = ledger
             .record_payout_once(payee(), &[1; 32], 300)
@@ -456,7 +429,7 @@ mod tests {
     async fn a_retried_job_is_paid_once() {
         let (outbound, _, _) = world(Arc::new(InMemoryJournal::new())).await;
         outbound.open(client_terms(), 1_000).await.expect("open");
-        let ledger = ClientPayoutLedger::new(outbound, test_networks());
+        let ledger = ClientPayoutLedger::new(outbound);
 
         ledger
             .record_payout_once(payee(), &[7; 32], 500)
@@ -481,7 +454,7 @@ mod tests {
     async fn a_payout_above_the_channels_collateral_is_not_signed() {
         let (outbound, _, _) = world(Arc::new(InMemoryJournal::new())).await;
         outbound.open(client_terms(), 1_000).await.expect("open");
-        let ledger = ClientPayoutLedger::new(outbound, test_networks());
+        let ledger = ClientPayoutLedger::new(outbound);
         assert!(ledger
             .record_payout_once(payee(), &[7; 32], 1_001)
             .await
@@ -493,7 +466,7 @@ mod tests {
     async fn a_payout_to_another_client_is_not_signed_on_this_ones_channel() {
         let (outbound, _, _) = world(Arc::new(InMemoryJournal::new())).await;
         outbound.open(client_terms(), 1_000).await.expect("open");
-        let ledger = ClientPayoutLedger::new(outbound, test_networks());
+        let ledger = ClientPayoutLedger::new(outbound);
         assert!(ledger
             .record_payout_once(VoucherSigner::Evm([0x03; 20]), &[7; 32], 100)
             .await
@@ -508,7 +481,7 @@ mod tests {
     async fn the_latest_voucher_is_pending_until_the_client_acknowledges_it() {
         let (outbound, _, _) = world(Arc::new(InMemoryJournal::new())).await;
         outbound.open(client_terms(), 1_000).await.expect("open");
-        let ledger = ClientPayoutLedger::new(outbound, test_networks());
+        let ledger = ClientPayoutLedger::new(outbound);
         let first = ledger
             .record_payout_once(payee(), &[1; 32], 100)
             .await
@@ -548,24 +521,24 @@ mod tests {
             let outbound = Arc::new(
                 OutboundChannels::restore(
                     Arc::clone(&journal),
-                    vec![(SettlementChain::Evm, payer())],
+                    vec![(Network::Eip155(84_532), payer())],
                 )
                 .await
                 .expect("replays"),
             );
             outbound.open(client_terms(), 1_000).await.expect("open");
-            ClientPayoutLedger::new(outbound, test_networks())
+            ClientPayoutLedger::new(outbound)
                 .record_payout_once(payee(), &[1; 32], 300)
                 .await
                 .expect("paid");
         }
 
         let restarted = Arc::new(
-            OutboundChannels::restore(journal, vec![(SettlementChain::Evm, payer())])
+            OutboundChannels::restore(journal, vec![(Network::Eip155(84_532), payer())])
                 .await
                 .expect("replays"),
         );
-        let paid = ClientPayoutLedger::new(restarted, test_networks())
+        let paid = ClientPayoutLedger::new(restarted)
             .record_payout_once(payee(), &[2; 32], 100)
             .await
             .expect("paid after the restart");
@@ -609,7 +582,7 @@ mod tests {
         let (outbound, _, _) = world(Arc::new(InMemoryJournal::new())).await;
         // No channel toward `payee()` yet: the first attempt has nothing to
         // sign on.
-        let ledger = ClientPayoutLedger::new(Arc::clone(&outbound), test_networks());
+        let ledger = ClientPayoutLedger::new(Arc::clone(&outbound));
 
         let hold = ledger.test_hold_signing().await;
         let mut first = std::pin::pin!(ledger.record_payout_once(payee(), &[7; 32], 500));
@@ -661,7 +634,7 @@ mod tests {
     async fn a_concurrent_attempt_pays_once_when_the_first_succeeds() {
         let (outbound, _, _) = world(Arc::new(InMemoryJournal::new())).await;
         outbound.open(client_terms(), 1_000).await.expect("open");
-        let ledger = ClientPayoutLedger::new(Arc::clone(&outbound), test_networks());
+        let ledger = ClientPayoutLedger::new(Arc::clone(&outbound));
 
         let hold = ledger.test_hold_signing().await;
         let mut first = std::pin::pin!(ledger.record_payout_once(payee(), &[7; 32], 500));
