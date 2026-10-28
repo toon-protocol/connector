@@ -1,4 +1,4 @@
-# Fleet pin drift — do the four node repos still agree on one connector build?
+# Fleet pin drift — does the devnet's one connector pin name a real, immutable build?
 #
 # ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
 # ADR 0068 moved the connector pin out of this repository: `toon-protocol/relay`,
@@ -20,9 +20,21 @@
 # afternoon to trace back to "these two are not on the same binary".
 #
 # This buys that signal back without buying back the write path. It is strictly
-# READ-ONLY and holds no credential: all five repos are public, so the four
+# READ-ONLY and holds no credential: all five repos are public, so the pins
 # pins are read over plain HTTPS, and GHCR is asked with an anonymous pull
 # token. It writes to no host, dispatches no workflow, and moves no tag.
+#
+# ── ONE CONNECTOR, ONE PIN ──────────────────────────────────────────────────
+# On 2026-10-16 the devnet consolidated to ONE connector, the relay's, at
+# `https://toonprotocol.dev/ilp`, routing straight to the store, gas-station
+# and gateway apps (store#156, gas-station#49, gateway#36). Those three repos'
+# shared-edge overlays now run no connector, so their own pins are not a build
+# the devnet runs: they ship only to whoever runs one of those bundles
+# standalone. Holding them to the relay's pin raised an alarm (#1527) about a
+# divergence nothing on the devnet could feel, and a bump of three unused pins
+# per release to silence it. So only the relay's pin is read now. The
+# agreement check stays in place for the day a second connector rejoins the
+# devnet: that is one entry in REPOS below, and assertion 2 comes back with it.
 #
 # ── WHAT IT ASSERTS ─────────────────────────────────────────────────────────
 #   1. Each pin is findable. A pin that cannot be parsed means the file moved
@@ -34,7 +46,8 @@
 #      404 turned into a hard job failure under `set -euo pipefail` instead
 #      of a comparison. The loudness fired exactly as designed; nobody read
 #      it for a month. See "WHERE EACH PIN LIVES" below.)
-#   2. All four name the SAME build. A claim accepted by one node against a
+#   2. Every repo in REPOS names the SAME build — vacuous while only the
+#      relay is read (see ONE CONNECTOR, ONE PIN above). A claim accepted by one node against a
 #      channel another node's binary resolves differently is the shape of an
 #      afternoon lost.
 #   3. Each pin is IMMUTABLE. Ruling, 2026-09-23 (issue #125): a RELEASE
@@ -55,6 +68,8 @@
 #      until it tried.
 #
 # ── WHERE EACH PIN LIVES ─────────────────────────────────────────────────────
+# Only the relay's pin is read since 2026-10-16 (see ONE CONNECTOR, ONE PIN);
+# the history below is kept because it explains the parsing.
 # As of 2026-09-25 all four node repos keep their pin the same way: a
 # mounted, published `ghcr.io/toon-protocol/connector:<tag>` image line in
 # their own `deploy/docker-compose.yml`, alongside the matching literal in that
@@ -106,13 +121,13 @@ concurrency:
 
 jobs:
   pins-agree:
-    name: The four node repos name one connector build
+    name: The devnet's connector pin is immutable and pullable
     runs-on: ubuntu-latest
     steps:
       - name: Read each node repo's pin, and hold them to each other
         env:
           GH_TOKEN: ${{ github.token }}
-          ALERT_TITLE: '[fleet-pins] the node repos disagree on the connector build'
+          ALERT_TITLE: '[fleet-pins] the devnet connector pin is unusable'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -125,7 +140,7 @@ jobs:
               "https://raw.githubusercontent.com/toon-protocol/$1/main/$2"
           }
 
-          # All four mount their config and pin the published image the same
+          # Every node repo mounts its config and pins the published image the same
           # way, in deploy/docker-compose.yml's `connector:` service. `|| true`:
           # a fetch that fails is an unparsed pin, reported below, not a
           # `set -e` exit before anything is compared (issue #125).
@@ -134,9 +149,11 @@ jobs:
               | sed -n 's|^[[:space:]]*image:[[:space:]]*ghcr\.io/toon-protocol/connector:\([A-Za-z0-9._-]*\).*|\1|p' | head -1
           }
 
-          # The node repos, in the order the summary lists them. Adding a node
-          # is one entry here.
-          REPOS=(relay store gas-station gateway)
+          # The node repos whose connector runs on the devnet, in the order the
+          # summary lists them. Only the relay's does since 2026-10-16 (store#156,
+          # gas-station#49, gateway#36); a connector rejoining the devnet is one
+          # entry here.
+          REPOS=(relay)
           declare -A PIN
           for repo in "${REPOS[@]}"; do
             PIN[$repo]=$(pin_from_compose "$repo")
@@ -253,7 +270,7 @@ jobs:
           if [ -z "$FAILURES" ]; then
             if [ -n "$EXISTING" ]; then
               gh issue comment "$EXISTING" --repo "${{ github.repository }}" --body \
-                "✅ Recovered — the ${#REPOS[@]} repos agree again, on \`$AGREED\`, in [this run]($RUN_URL). Closing; a later divergence opens a fresh alert."
+                "✅ Recovered — the devnet's pin is \`$AGREED\` again and usable, in [this run]($RUN_URL). Closing; a later failure opens a fresh alert."
               gh issue close "$EXISTING" --repo "${{ github.repository }}" --reason completed
               echo "Closed alert #$EXISTING."
             fi
@@ -263,7 +280,7 @@ jobs:
 
           BODY=/tmp/alert-body.md
           {
-            echo "The ${#REPOS[@]} node repositories that deploy this connector do not agree on one build."
+            echo "The connector pin the devnet runs (${REPOS[*]}) is not usable as it stands."
             echo ""
             echo "**Run:** $RUN_URL"
             echo ""
@@ -277,20 +294,18 @@ jobs:
             echo "Each repo owns its own pin (ADR 0068 — nothing in this repository moves a tag onto a node),"
             echo "at \`deploy/docker-compose.yml\`'s \`connector:\` service. Bump it by a reviewed commit that"
             echo "changes that image line **and** the matching literal in that repo's own guard test —"
-            echo "\`adopt-connector-release.yml\` does this unattended when the connector cuts a release, in"
-            echo "relay, store and gas-station; the gateway has no such workflow, so bump"
-            echo "\`toon-protocol/gateway\`'s pin and \`deploy/bundle.test.mjs\` by hand. Each node applies a"
-            echo "merged bump itself, on its own timer on the devnet host (\`deploy/auto-apply.sh\`); nothing"
-            echo "here, and nothing in the node repo's CI, ever pushes to the host:"
+            echo "\`adopt-connector-release.yml\` does this unattended when the connector cuts a release."
+            echo "The node applies a merged bump itself, on its own timer on the devnet host"
+            echo "(\`deploy/auto-apply.sh\`); nothing here, and nothing in the node repo's CI, ever pushes"
+            echo "to the host:"
             echo ""
             echo '```sh'
             echo '# On the host, applied automatically by deploy/auto-apply.sh — shown here for a manual check:'
-            echo 'cd /root/<relay|store|gas-station|gateway> && git pull --ff-only'
-            echo '[ -x deploy/render.sh ] && (cd deploy && ./render.sh)   # store, gas-station, gateway'
+            echo 'cd /root/relay && git pull --ff-only'
             echo 'cd deploy && docker compose pull && docker compose up -d'
             echo '```'
             echo ""
-            echo "Full runbook: \`docs/operators/fleet-release-and-health.md\` § \"Keeping the three pins together\"."
+            echo "Full runbook: \`docs/operators/fleet-release-and-health.md\` § \"The devnet's connector pin\"."
             echo ""
             echo "<sub>Opened automatically by \`.github/workflows/fleet-pin-drift.yml\`. It closes itself when a later run is green.</sub>"
           } > "$BODY"
@@ -306,5 +321,5 @@ jobs:
             echo "Opened a new alert."
           fi
 
-          echo "::error::the node repos disagree on the connector build — see the alert issue"
+          echo "::error::the devnet connector pin is unusable — see the alert issue"
           exit 1

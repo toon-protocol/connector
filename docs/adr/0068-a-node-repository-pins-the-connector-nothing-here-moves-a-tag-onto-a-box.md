@@ -208,3 +208,10 @@ do not.
 
 This adds no mechanism that moves a tag, writes a config, or reaches a box, and this record's own
 falsifier is untouched: nothing here calls, dispatches or names the retired promotion workflow.
+
+**2026-10-28: one pin, not four.** On 2026-10-16 the devnet consolidated to one connector, the
+relay's (store#156, gas-station#49, gateway#36). The other three repositories' pins stopped being a
+build the devnet runs, and holding them to the relay's raised a standing alarm about a divergence
+nothing could feel (#1527). `fleet-pin-drift.yml` now reads only the relay's pin and asserts that it
+parses, is immutable and is pullable; the agreement assertion returns if a second connector rejoins
+the devnet. The decision above is unchanged: each node repository still owns its pin.
