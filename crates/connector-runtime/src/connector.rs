@@ -637,6 +637,10 @@ pub struct Connector {
     /// the buyer whose channel this node discovered on chain (ADR 0052,
     /// issue #502) has no row to be resolved from.
     client_channel_assets: ClientChannelAssets,
+    /// The Mina network a zk edge's vault lives on (ADR 0080 decision 6):
+    /// what `X-TOON-Chain` states for a packet paid by an allowance claim.
+    /// `None` on a node that is no zk edge.
+    zk_note_network: Option<String>,
     /// The rates this node deals at (ADR 0071 decisions 1 and 5, issue
     /// #1294), or `None` for a node that declares no token to deal.
     ///
@@ -865,6 +869,7 @@ impl Connector {
             peer_fees: HashMap::new(),
             peering_assets: PeeringAssets::default(),
             client_channel_assets: ClientChannelAssets::default(),
+            zk_note_network: None,
             rate_table: None,
             history: None,
         }
@@ -1059,6 +1064,15 @@ impl Connector {
     /// peering table.
     pub fn with_client_channel_assets(mut self, assets: ClientChannelAssets) -> Self {
         self.client_channel_assets = assets;
+        self
+    }
+
+    /// Make this node's app deliveries state an allowance-paid packet's
+    /// chain as `network`, its vault's CAIP-2 Mina network (ADR 0080
+    /// decision 6) -- set wherever the `[zk_note]` table makes this node a
+    /// zk edge.
+    pub fn with_zk_note_network(mut self, network: impl Into<String>) -> Self {
+        self.zk_note_network = Some(network.into());
         self
     }
 
@@ -3638,10 +3652,12 @@ impl Connector {
             (Some(channel_key), _) => Some(PaymentAttribution {
                 channel_key,
                 charge,
+                zk_note_network: self.zk_note_network.as_deref(),
             }),
             (None, Some(channel_key)) if route.payment() => Some(PaymentAttribution {
                 channel_key,
                 charge: prepare.amount,
+                zk_note_network: None,
             }),
             _ => None,
         };
@@ -4461,6 +4477,37 @@ mod tests {
             assert_eq!(header(&delivery, PAYER_HEADER), Some(PAYING_CHANNEL));
             assert_eq!(header(&delivery, AMOUNT_HEADER), Some("1000"));
             assert_eq!(header(&delivery, CHAIN_HEADER), Some("evm"));
+        }
+
+        /// ADR 0040 as amended by ADR 0080 decision 6: a packet a zk edge
+        /// admitted on an allowance claim reaches the app with its amount
+        /// and the vault's Mina network, and with no `X-TOON-Payer` at all
+        /// -- the allowance key is not a payer, and the proof hides who is.
+        #[tokio::test]
+        async fn an_allowance_paid_delivery_states_no_payer() {
+            let (data, _secret) = sealed_envelope_request_data(b"an event");
+            let route =
+                StaticRoute::new_priced("g.example.app", "http://localhost:4000", PRICE).unwrap();
+            let app_client = Arc::new(FakeAppClient::new());
+            app_client.respond(route.handler_url(), answered(b"stored"));
+            let connector = connector_with(vec![route], app_client.clone(), test_clock())
+                .with_zk_note_network("mina:devnet");
+            let prepare = Prepare {
+                data,
+                ..prepare("g.example.app", b"unused")
+            };
+            let response = connector
+                .handle_prepare_with_client_channel(
+                    prepare,
+                    Some("zk-note:00112233445566778899aabbccddeeff"),
+                )
+                .await;
+            assert!(matches!(response, PacketResponse::Fulfill(_)));
+
+            let delivery = one_delivery(&app_client);
+            assert_eq!(header(&delivery, PAYER_HEADER), None);
+            assert_eq!(header(&delivery, AMOUNT_HEADER), Some("1000"));
+            assert_eq!(header(&delivery, CHAIN_HEADER), Some("mina:devnet"));
         }
 
         /// The chain is read off the admitted claim's own namespace, not

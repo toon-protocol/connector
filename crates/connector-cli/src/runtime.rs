@@ -1090,6 +1090,11 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     if let Some(table) = &rate_table {
         connector = connector.with_rate_table(table.clone());
     }
+    // ADR 0080 decision 6: an allowance-paid delivery states the vault's
+    // Mina network as its chain, and no payer.
+    if let Some(zk_note) = config.zk_note() {
+        connector = connector.with_zk_note_network(zk_note.network().caip2());
+    }
     // ADR 0074: every batch-settlement channel the client edge's journal
     // holds vouchers on, restored before anything is served, so the port
     // can land them after a restart -- restored, not re-admitted, so a rule
