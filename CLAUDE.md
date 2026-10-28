@@ -89,6 +89,19 @@ A missing chain binary **fails CI and skips locally**. `require_anvil()` /
 returns early and reports `passed` in `0.00s` is worse than a missing test.
 Never add a skip-when-unavailable branch that can go green in CI.
 
+A chain too heavy to spawn per test — more than 10 s to its first usable block, or
+more than 1 GB, measured on the gate's runner — may be spawned **once per test
+binary** instead (ADR 0084). The harness spawns it itself, lazily: never a
+hand-started container. Each test gets fresh accounts and its own channels, all
+funding goes through one funder, and a test that moves the clock still gets its
+own chain. A Docker-only chain is pinned by digest and fails CI and skips locally
+without Docker, like a missing binary. Its containers carry a
+`toon.test-chain.owner` label and are cleared at the next spawn, so none outlives
+the next run. A chain is admitted only if the harness can spawn, as one process
+or one container, a chain that runs the deployed program unmodified. A public
+testnet never counts toward the gate. No chain uses the shared tier yet; Mina's
+#1554 builds it.
+
 Install Foundry (`anvil`, `cast`) and the Solana CLI to run the full gate
 locally.
 
