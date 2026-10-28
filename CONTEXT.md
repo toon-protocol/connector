@@ -411,6 +411,22 @@ The zk edge's signature over a zk note's next state once an allowance closes: th
 less exactly the allowance's charge. It is what lets the payer spend the remainder.
 _Avoid_: receipt, refund
 
+**Mutual close**:
+A zk note leaving its vault at once, paid to one destination, because the **zk edge** gave a
+**clearance**. Without one, the payer can still leave by escape, after the challenge window,
+conceding at most one allowance.
+_Avoid_: withdrawal (it covers escape too), cash-out
+
+**Clearance**:
+The **zk edge**'s signature that lets one state of a zk note leave by **mutual close** to one
+destination. A state is spent once: by an allowance or by a clearance, never both. The zk edge
+gives one to any payer whose **ownership proof** holds, and refuses only by a named rule.
+_Avoid_: co-signature, release, exit signature
+
+**Ownership proof**:
+A proof, shown only to the **zk edge**, that the payer owns a zk note's current state. It is what
+a clearance is given against. The vault refuses it.
+
 **Subsidised allowance**:
 An **allowance** whose charge is paid from the **zk edge**'s **subsidy budget** instead of by the
 note that opened it. The note's state still advances, charged nothing.

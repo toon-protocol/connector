@@ -13,6 +13,8 @@ fee already attaches to. Extends [0011](0011-rejects-accumulate-fees-and-probes-
 a reject's running cost now converts at each boundary it crosses, so a probe still answers with
 one number in the prober's own unit.
 
+**Amended by [0086](0086-a-node-settles-on-more-than-one-evm-network.md)** (2026-10-28, #1566, not yet built): an asset id becomes CAIP-19 (`eip155:<chainId>/erc20:0x…`, `solana:<genesis>/token:<mint>`), and decision 2's same-asset sentence is replaced — USDC on two networks is two assets, forwarded unconverted by a node that declares no `[[tokens]]` and at a declared rate by one that does.
+
 **Scope:** protocol law for decisions 1, 2, 7 and 8 — they bind every implementation and change
 what the numbers on the wire mean. The sourcing machinery (decisions 3–6) is connector
 architecture, internal to this codebase.
