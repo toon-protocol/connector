@@ -24,8 +24,9 @@ _Avoid_: terminator, connector-as-terminator, gateway
 **App**:
 The payment-oblivious service a connector delivers to at the end of a route. It settles nothing,
 holds no channel and is never told which destination was addressed. It IS told who paid, how much
-and on what chain — `X-TOON-Payer`/`X-TOON-Amount`/`X-TOON-Chain`, from the client claim the
-delivering connector verified itself (ADR 0040) — and told none of the three when that connector
+and on what chain and network — `X-TOON-Payer`/`X-TOON-Amount`/`X-TOON-Chain`/`X-TOON-Network`,
+from the client claim the delivering connector verified itself (ADR 0040, ADR 0086) — and told none
+of them when that connector
 was not the one paid. Either way, whatever arrives at one of its handlers was paid for, under that
 handler's one price (ADR 0020) — `X-TOON-Amount` states what this packet was actually charged,
 which for a route priced by size is not a figure the app's own route table could have known
