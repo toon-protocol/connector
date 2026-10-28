@@ -257,14 +257,14 @@ fn entry_network(
     chain: AssetChain,
     channel_id_text: &str,
     network: Option<String>,
-) -> Result<Network, ChannelStateResult> {
+) -> Result<Network, Box<ChannelStateResult>> {
     let Some(raw) = network else {
         log_outcome(blockchain, channel_id_text, "network_missing");
-        return Err(unverified(
+        return Err(Box::new(unverified(
             blockchain,
             channel_id_text.to_string(),
             NETWORK_MISSING,
-        ));
+        )));
     };
     let parsed = raw
         .parse::<Network>()
@@ -272,17 +272,17 @@ fn entry_network(
         .filter(|network| network.chain() == chain);
     let Some(network) = parsed else {
         log_outcome(blockchain, channel_id_text, "network_invalid");
-        return Err(unverified(
+        return Err(Box::new(unverified(
             blockchain,
             channel_id_text.to_string(),
             "unverified",
-        ));
+        )));
     };
     if !state.claim_gate.settles_on(&network) {
         log_outcome(blockchain, channel_id_text, "network_not_settled");
-        return Err(
+        return Err(Box::new(
             unverified(blockchain, channel_id_text.to_string(), NETWORK_NOT_SETTLED).on(&network),
-        );
+        ));
     }
     Ok(network)
 }
@@ -366,7 +366,7 @@ async fn resolve_evm(
     }
     let network = match entry_network(state, "evm", AssetChain::Evm, &channel_id_text, network) {
         Ok(network) => network,
-        Err(refused) => return refused,
+        Err(refused) => return *refused,
     };
     resolve_evm_on(
         state,
@@ -458,7 +458,7 @@ async fn resolve_solana(
         network,
     ) {
         Ok(network) => network,
-        Err(refused) => return refused,
+        Err(refused) => return *refused,
     };
     resolve_solana_on(state, channel_account_text, expires, signature_text, now)
         .await

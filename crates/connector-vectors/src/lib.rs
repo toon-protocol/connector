@@ -200,8 +200,9 @@ use serde::Serialize;
 /// `claim_network` section pinning a node's refusal of a voucher on a network
 /// it settles on no table for and of one whose `network` and channel domain
 /// disagree, `peer_carriage.ack_other_network` (an ack naming another network
-/// is not acknowledged), and a top-level `asset_ids` section pinning CAIP-19
-/// asset ids on both chains and the refusal of every legacy spelling. A
+/// is not acknowledged), and -- in a file of its own, `vectors/asset-ids.json`
+/// ([`AssetIdVectorFile`]) -- CAIP-19 asset ids on both chains and the refusal
+/// of every legacy spelling. A
 /// replaying SDK that omits `network` is sending a claim every connector on
 /// this schema refuses -- which is what this number exists to announce.
 pub const SCHEMA_VERSION: u32 = 10;
@@ -246,8 +247,36 @@ pub struct WireVectors {
     pub client_edge: ClientEdgeVectors,
     /// Schema 10: a node's verdict on a claim's `network`.
     pub claim_network: ClaimNetworkVectors,
-    /// Schema 10: CAIP-19 asset ids, and every legacy spelling refused.
+}
+
+/// `vectors/asset-ids.json` (schema 10, ADR 0086 decision 2): CAIP-19 asset
+/// ids on both chains, and every legacy spelling refused by name.
+///
+/// **A file of its own, not a section of `wire-vectors.json`.** No asset id
+/// rides a packet: ADR 0071 decision 7 keeps the packet wire unit-silent, and
+/// its falsifier fires on any asset or token field in `wire-vectors.json`. An
+/// asset id is the spelling every config, rate table and operator surface
+/// shares -- a contract for `toon-client`, `rig` and `swap` all the same, so
+/// it is pinned beside the wire vectors, at the same `schema_version`.
+#[derive(Debug, Serialize)]
+pub struct AssetIdVectorFile {
+    pub schema_version: u32,
     pub asset_ids: AssetIdVectors,
+}
+
+/// Build `vectors/asset-ids.json`.
+pub fn generate_asset_id_file() -> AssetIdVectorFile {
+    AssetIdVectorFile {
+        schema_version: SCHEMA_VERSION,
+        asset_ids: generate_asset_id_vectors(),
+    }
+}
+
+/// [`to_json`], for [`AssetIdVectorFile`].
+pub fn asset_ids_to_json(file: &AssetIdVectorFile) -> String {
+    let mut json = serde_json::to_string_pretty(file).expect("the asset ids always serialize");
+    json.push('\n');
+    json
 }
 
 /// Schema 9 (issue #1532): the client edge's own responses, as opposed to
@@ -3731,7 +3760,6 @@ pub fn generate() -> WireVectors {
     let claim_state_toon_channel_refused = generate_claim_state_toon_channel_refused_vectors();
     let client_edge = generate_client_edge_vectors();
     let claim_network = generate_claim_network_vectors(&claim_voucher);
-    let asset_ids = generate_asset_id_vectors();
 
     WireVectors {
         schema_version: SCHEMA_VERSION,
@@ -3748,7 +3776,6 @@ pub fn generate() -> WireVectors {
         claim_state_toon_channel_refused,
         client_edge,
         claim_network,
-        asset_ids,
     }
 }
 

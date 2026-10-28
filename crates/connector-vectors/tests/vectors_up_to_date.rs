@@ -12,6 +12,23 @@
 use std::path::PathBuf;
 
 #[test]
+fn committed_asset_ids_match_what_the_implementation_generates_today() {
+    let regenerated: serde_json::Value = serde_json::from_str(
+        &connector_vectors::asset_ids_to_json(&connector_vectors::generate_asset_id_file()),
+    )
+    .expect("valid JSON");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/asset-ids.json");
+    let committed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the asset ids"))
+            .expect("valid JSON");
+    assert_eq!(
+        regenerated, committed,
+        "vectors/asset-ids.json is stale -- run `cargo run -p connector-vectors --bin \
+         generate-vectors` from the repo root and commit the result"
+    );
+}
+
+#[test]
 fn committed_vectors_match_what_the_implementation_generates_today() {
     let regenerated: serde_json::Value =
         serde_json::from_str(&connector_vectors::to_json(&connector_vectors::generate()))
@@ -376,7 +393,12 @@ fn the_committed_claim_network_verdicts_replay() {
 fn the_committed_asset_ids_replay() {
     use connector_domain::{AssetId, AssetIdError};
 
-    let assets = committed()["asset_ids"].clone();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/asset-ids.json");
+    let file: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the asset ids"))
+            .expect("the asset ids are valid JSON");
+    assert_eq!(file["schema_version"], committed()["schema_version"]);
+    let assets = file["asset_ids"].clone();
     for case in assets["valid"].as_array().expect("valid") {
         let caip19 = case["caip19"].as_str().expect("caip19");
         let parsed: AssetId = caip19.parse().expect("a CAIP-19 asset id");

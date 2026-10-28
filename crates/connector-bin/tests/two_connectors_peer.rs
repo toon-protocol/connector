@@ -1404,7 +1404,13 @@ async fn a_peer_voucher_is_acknowledged(carriage: Carriage) {
     let first = ack_of(b"first crossing", voucher.clone()).await;
     assert_eq!(
         first.as_deref(),
-        Some(r#"{"result":"accepted"}"#),
+        Some(
+            format!(
+                r#"{{"result":"accepted","network":"eip155:{}"}}"#,
+                fixture.chain.x402.chain_id()
+            )
+            .as_str()
+        ),
         "§6.1: the ack rides the response that already answers the voucher-bearing frame"
     );
     assert_eq!(
@@ -1418,7 +1424,13 @@ async fn a_peer_voucher_is_acknowledged(carriage: Carriage) {
     let resent = ack_of(b"retransmission", voucher).await;
     assert_eq!(
         resent.as_deref(),
-        Some(r#"{"result":"accepted"}"#),
+        Some(
+            format!(
+                r#"{{"result":"accepted","network":"eip155:{}"}}"#,
+                fixture.chain.x402.chain_id()
+            )
+            .as_str()
+        ),
         "§6.3: a voucher byte-identical to the one at the watermark MUST be re-acked \
          `accepted` -- a lost ack and a lost voucher are indistinguishable at the payer"
     );

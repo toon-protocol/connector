@@ -11,9 +11,11 @@ channel id, another digest) and two `invalid` cases (`network_missing`, one per 
 `claim_network` section pins a node's verdict — `accepted`, `network_not_settled`, or
 `network_domain_mismatch` when an EVM channel id does not recompute under the domain of the network
 the claim names — including a two-network EVM node; `peer_carriage.ack_other_network` pins that an
-ack naming another network is not acknowledged; and a new `asset_ids` section pins CAIP-19 asset ids
-on both chains and the by-name refusal of every legacy spelling (`evm:0x…`, `evm:<chainId>:0x…`,
-`solana:<mint>`, `<chain>:native`). Before that, **`schema_version` 9** (issue #1532): a new
+ack naming another network is not acknowledged. A sibling file, `vectors/asset-ids.json`, at the
+same `schema_version`, pins CAIP-19 asset ids on both chains and the by-name refusal of every legacy
+spelling (`evm:0x…`, `evm:<chainId>:0x…`, `solana:<mint>`, `<chain>:native`) -- beside the wire
+vectors rather than in them, because no asset id rides a packet and ADR 0071 decision 7 keeps
+`wire-vectors.json` unit-silent. Before that, **`schema_version` 9** (issue #1532): a new
 top-level `client_edge` section. Its `f03_rejects` holds
 four cases, one per client-edge **reject reason** — `underpayment`, `undercollateralized`,
 `amount_over_charge`, `probe_terminates_here` — each pinning the code (`F03`), the cost, the reason,
