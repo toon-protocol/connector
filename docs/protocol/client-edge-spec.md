@@ -1557,8 +1557,10 @@ is normative where this prose and it disagree (ADR 0021).
 "expiresAt": "<ms>"}` opens an allowance, checked cheapest refusal first (decision 3), and answers
   `200 {"allowanceId", "tier", "expiresAt"}` once the grant is durable. The same path with
   `{"allowanceId", "signature"}`, the session key's signature over the close fields, closes it: claims
-  on it are refused (`claim rejected: its allowance is closed`) at once, and the answer is what the
-  successor fetch would answer at that moment.
+  on it are refused (`claim rejected: its allowance is closed`) at once, the close is journaled before
+  it is answered, and the answer is what the successor fetch would answer at that moment. A close is
+  final: a node that restarts before the close finishes comes back with the allowance closing, and its
+  boot sweep finishes it.
 - `GET /ilp/zk-note/allowances/:id/successor` answers `202 {"allowanceId", "status": "pending"}` until
   the charge Δ — the final watermark, read once every forward in flight on the allowance has resolved
   and any uncarried one rolled back — is journaled, and then `200 {"allowanceId", "status": "signed",
@@ -1566,7 +1568,8 @@ is normative where this prose and it disagree (ADR 0021).
   It only reads. An allowance also closes at its expiry, by a sweep that runs periodically and once at
   boot, and when a claim reaches its budget.
 - A refusal is `{"error": <rule>, "detail"}`: `400` for a malformed request, `404` for no zk edge or
-  an unknown allowance, `503` when the vault cannot be read or the grant not made durable, and `422`
+  an unknown allowance, `503` when the vault cannot be read or the grant or close not made durable
+  (`not_durable`; a close refused so still takes no claims, and is retried), and `422`
   for every other rule. No refusal and no log line carries the proof, a nullifier or a session key.
 
 A packet paid by an allowance claim reaches the app with `X-TOON-Amount` and `X-TOON-Chain` (the
