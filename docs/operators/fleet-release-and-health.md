@@ -81,26 +81,22 @@ first, because the config that pin boots against no longer lives in this reposit
 for it to check. Do not wire anything to move it — a floating tag moving unsupervised shipped once
 (#990) and was reverted, and there is even less reason to repeat it now.
 
-## Keeping the four pins together
+## The devnet's connector pin
 
 Since [ADR 0068](../adr/0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md)
-this repository does not deploy the connector. On the one-connector devnet only the relay's pin is
-the build the devnet runs; the store, gas-station and gateway repositories still carry a connector
-pin in their compose files, which the drift check below keeps reading. Four node repositories each
-pin a build,
-in `deploy/docker-compose.yml`'s `connector:` image line, guarded by that repo's own bundle test
-(relay: `deploy/bundle.test.ts`; store and gas-station: `src/deploy-bundle-guard.test.ts`; gateway:
-`deploy/bundle.test.mjs`):
+this repository does not deploy the connector. Since 2026-10-16 the devnet runs **one** connector,
+the relay's (store#156, gas-station#49, gateway#36), so the relay's pin is the only build the devnet
+runs. It lives in `toon-protocol/relay`'s `deploy/docker-compose.yml` `connector:` image line,
+guarded by `deploy/bundle.test.ts`, and reaches the host through relay's own
+`adopt-connector-release.yml` and then `toon-auto-apply-relay.timer`.
 
-| repo          | the pin of record                                    | how a bump reaches the host                                                                  |
-| ------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `relay`       | `deploy/docker-compose.yml` → `connector:rust-sha-…` | its own `adopt-connector-release.yml`, then `toon-auto-apply-relay.timer`                    |
-| `store`       | `deploy/docker-compose.yml` → `connector:rust-sha-…` | its own `adopt-connector-release.yml`, then `toon-auto-apply-store.timer`                    |
-| `gas-station` | `deploy/docker-compose.yml` → `connector:rust-sha-…` | its own `adopt-connector-release.yml`, then `toon-auto-apply-gas-station.timer`              |
-| `gateway`     | `deploy/docker-compose.yml` → `connector:rust-sha-…` | bumped by hand — no `adopt-connector-release.yml` yet — then `toon-auto-apply-gateway.timer` |
+The store, gas-station and gateway bundles still carry a connector pin in their
+`deploy/docker-compose.yml`, for whoever runs one of them standalone; their devnet shared-edge
+overlays switch that connector off. Those pins are each repo's own to keep current, and nothing
+here reads them.
 
-Bump the pin **and** the literal in that repo's guard test in one reviewed commit — the guards exist
-so the two cannot disagree. The pin must be immutable: a `rust-sha-<sha>` build tag or a
+Bump the pin **and** the literal in the guard test in one reviewed commit — the guard exists so the
+two cannot disagree. The pin must be immutable: a `rust-sha-<sha>` build tag or a
 `rust-<UTC-date>.<ordinal>` release handle (e.g. `rust-2026.09.11.1`) are both legal (issue #125's
 ruling). `:rust-release` is retired and frozen at `rust-sha-8708caf`, a build that predates
 connector#1230 and cannot pay for a peering it establishes.
@@ -112,17 +108,17 @@ run — which is the behaviour you want, and the reason ordering matters.
 ### The drift check
 
 `.github/workflows/fleet-pin-drift.yml` runs daily and on dispatch. It is read-only, holds no
-credential, and reaches no host: it reads the four pins over plain HTTPS and asks GHCR anonymously
-whether each is pullable. It **fails**, and opens a rolling `needs-triage` issue, when a pin cannot
-be parsed, when the four name different builds, when one is a moving tag, or when one cannot be
-pulled. The first green run closes the issue.
+credential, and reaches no host: it reads the relay's pin over plain HTTPS and asks GHCR anonymously
+whether it is pullable. It **fails**, and opens a rolling `needs-triage` issue, when the pin cannot
+be parsed, when it is a moving tag, or when it cannot be pulled. The first green run closes the
+issue. It used to read all four node repos and fail when they disagreed; once only one of them ran a
+connector on the devnet, that raised an alarm about a split nothing could feel (#1527). Should a
+second connector rejoin the devnet, adding its repo to the workflow's `REPOS` brings the agreement
+check back.
 
 Being **behind `main` is only reported, never failed** — a pin lagging is what pinning is. The run
 summary says how far behind, and whether any of those commits touch `crates/*/src`: if none do, the
 shipped binary is unchanged and there is nothing to gain from bumping.
-
-A staged rollout will show as drift while it is in progress. That is correct — it clears when the
-last repo lands.
 
 ## Rolling the faucet back
 
