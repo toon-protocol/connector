@@ -8,7 +8,10 @@
 //!
 //! What stays here is what the connector owns:
 //!
-//! - [`session`]: the allowance claim's signed fields, and the session-key signature over them.
+//! - [`session`]: the allowance claim's and the close request's signed fields, and the
+//!   session-key signature over them.
+//! - [`successor`]: the signed successor state, composed from zk_toon's charge, anchor and
+//!   state message.
 //! - [`tiers`]: the operator's published tiers, validated against zk_toon's.
 //! - [`request`]: the request proof's public inputs, until zk_toon#29 adds a Rust
 //!   `RequestPublic`.
@@ -21,6 +24,7 @@ pub use zk_note as note;
 pub mod evidence;
 pub mod request;
 pub mod session;
+pub mod successor;
 pub mod tiers;
 
 /// The Mina keys and signatures the zk edge reads and signs with.
@@ -48,6 +52,48 @@ pub fn field_from_le_bytes(bytes: &[u8; 32]) -> Option<Field> {
     use ark_ff::PrimeField;
     let field = Field::from_le_bytes_mod_order(bytes);
     (field_to_le_bytes(field) == *bytes).then_some(field)
+}
+
+/// A scalar (a signature's `s`) as 32 bytes, little-endian: the journal's encoding.
+#[must_use]
+pub fn scalar_to_le_bytes(scalar: Scalar) -> [u8; 32] {
+    use ark_ff::{BigInteger, PrimeField};
+    let bytes = scalar.into_bigint().to_bytes_le();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    out
+}
+
+/// A scalar as a decimal string: `zk_note::field_to_string`'s encoding, for a signature's `s`.
+#[must_use]
+pub fn scalar_to_string(scalar: Scalar) -> String {
+    use ark_ff::PrimeField;
+    scalar.into_bigint().to_string()
+}
+
+/// The scalar 32 little-endian bytes encode, or `None` when they are not its canonical encoding.
+#[must_use]
+pub fn scalar_from_le_bytes(bytes: &[u8; 32]) -> Option<Scalar> {
+    use ark_ff::PrimeField;
+    let scalar = Scalar::from_le_bytes_mod_order(bytes);
+    (scalar_to_le_bytes(scalar) == *bytes).then_some(scalar)
+}
+
+/// The commitment two coordinates (32 bytes little-endian each) name, or `None` when they are
+/// not canonical or not a point on Pallas.
+#[must_use]
+pub fn commitment_from_le_bytes(x: &[u8; 32], y: &[u8; 32]) -> Option<Commitment> {
+    let point = Commitment::new_unchecked(field_from_le_bytes(x)?, field_from_le_bytes(y)?);
+    point.is_on_curve().then_some(point)
+}
+
+/// The zk edge's state key, from the text of `[zk_note] state_key_file`: a Mina secret key in
+/// base58 (`EK…`), as Mina's tooling and o1js's `PrivateKey.toBase58` export it, with surrounding
+/// whitespace ignored. `None` for anything else.
+#[must_use]
+pub fn state_keypair_from_text(text: &str) -> Option<Keypair> {
+    let secret = SecKey::from_base58(text.trim()).ok()?;
+    Keypair::try_from(secret).ok()
 }
 
 /// The full public key a compressed one names, or `None` when its x is not on Pallas.

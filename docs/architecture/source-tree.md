@@ -208,8 +208,10 @@ connector-vectors                bin/generate-vectors → vectors/wire-vectors.j
 connector-zk-note                the connector's zk-note boundary (ADR 0080 decision 12):
                                   re-exports toon-protocol/zk_toon's `zk-note`, pinned by
                                   commit, which defines every derivation; keeps the allowance
-                                  claim's session-key signature, tier validation, and stand-ins
-                                  for zk_toon#29's RequestPublic and evidence-file bytes.
+                                  claim's and close's session-key signatures, the successor
+                                  composed from zk_toon's charge, anchor and state message,
+                                  tier validation, and stand-ins for zk_toon#29's
+                                  RequestPublic and evidence-file bytes.
                                   tests/zk_toon_parity.rs replays zk_toon's vectors. Pure: no
                                   I/O, no clock, no connector crate
 ```

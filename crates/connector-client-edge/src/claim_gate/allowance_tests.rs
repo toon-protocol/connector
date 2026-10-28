@@ -5,7 +5,7 @@ use super::*;
 use crate::zk_note::InMemoryZkNoteVault;
 use chrono::TimeZone;
 use connector_runtime::{FileJournal, TestClock};
-use connector_zk_note::note::balance::generator_g;
+use connector_zk_note::note::balance::commit;
 use connector_zk_note::note::policy::TIERS;
 use connector_zk_note::request::{json_proof_for, RequestPublic};
 use connector_zk_note::session::{sign_allowance_claim, signature_to_hex};
@@ -19,7 +19,7 @@ fn edge(dir: &std::path::Path, vault: Arc<InMemoryZkNoteVault>, clock: Arc<dyn C
     ZkEdge {
         vault,
         evidence: EvidenceFile::open(&dir.join("evidence.bin")).unwrap(),
-        state_key: keypair(500).public.into_compressed(),
+        state_keypair: keypair(500),
         tiers: Tiers::new([TIERS[1]]).unwrap(),
         allowance_lifetime: Duration::from_secs(3600),
         open_budget_cap: TIERS[1],
@@ -53,7 +53,7 @@ async fn edge_with_allowance(
         tier: TIERS[1],
         nullifier,
         tag: expected_tag(nullifier, &state, &session_key, TIERS[1], expires),
-        commitment: generator_g(),
+        commitment: commit(Scalar::from(5_000_000_000u64), Scalar::from(17u64)),
         subsidised: false,
         period: Field::from(0u64),
         period_nullifier: Field::from(0u64),
@@ -144,4 +144,63 @@ async fn a_lost_evidence_file_refuses_the_zk_edge_at_boot() {
         .err()
         .expect("refused");
     assert_eq!(error.allowance_id, id.to_string());
+}
+
+fn close(session: &Keypair, id: AllowanceId) -> AllowanceClose {
+    AllowanceClose {
+        allowance_id: id,
+        signature: connector_zk_note::session::signature_to_be_bytes(
+            &connector_zk_note::session::sign_allowance_close(session, id.as_bytes()),
+        ),
+    }
+}
+
+/// ADR 0080 decisions 2 and 4: a close waits for forwards in flight, and a
+/// forward the next hop rejected while the close waited is rolled back
+/// before the charge is read -- so Δ is the final watermark, and the payer
+/// pays nothing for the packet that was never carried.
+#[tokio::test]
+async fn a_forward_rejected_while_the_close_waits_is_not_charged() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = keypair(11);
+    let (gate, id) = edge_with_allowance(dir.path(), &session).await;
+    let (_, carried) = gate
+        .ingest_forward(&claim(&session, id, 100), 100)
+        .await
+        .unwrap();
+    let (_, rejected) = gate
+        .ingest_forward(&claim(&session, id, 250), 150)
+        .await
+        .unwrap();
+    assert_eq!(
+        gate.close_allowance(close(&session, id)),
+        Ok(SuccessorStatus::Pending)
+    );
+
+    // The next hop rejects the second packet: rolled back, then resolved.
+    gate.roll_back(&id.channel_key(), 250).await.unwrap();
+    drop(rejected);
+    assert_eq!(gate.successor(id), Ok(SuccessorStatus::Pending));
+    drop(carried);
+    let SuccessorStatus::Signed(successor) = gate.successor(id).unwrap() else {
+        panic!("signed once nothing is in flight");
+    };
+    assert_eq!(successor.charge, 100);
+
+    // A restart charges it the same, once.
+    drop(gate);
+    let journal = Arc::new(FileJournal::open(dir.path().join("claims.log")).unwrap());
+    let charges: Vec<_> = journal
+        .read_all()
+        .unwrap()
+        .into_iter()
+        .filter(|entry| matches!(entry, JournalEntry::AllowanceClosed { .. }))
+        .collect();
+    assert_eq!(
+        charges,
+        vec![JournalEntry::AllowanceClosed {
+            allowance_id: id.to_string(),
+            charge: 100
+        }]
+    );
 }

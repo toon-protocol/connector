@@ -644,6 +644,7 @@ mod tests {
                 peer_carriages: vec!["http".to_string()],
                 batch_settlements,
                 voucher_signers,
+                zk_note: None,
             },
             Some(EdgeIdentity {
                 key_id: "peer-key".to_string(),

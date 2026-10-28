@@ -2882,6 +2882,7 @@ mod tests {
                         network: NETWORK.to_string(),
                         signer: settlement_address.to_string(),
                     }],
+                    zk_note: None,
                 },
                 Some(EdgeIdentity {
                     key_id: "counterparty-key".to_string(),

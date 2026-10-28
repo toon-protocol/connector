@@ -89,3 +89,75 @@ fn tiers_are_a_validated_subset_of_zk_toons() {
     assert!(t.get(TIERS[0]).is_some());
     assert!(t.get(TIERS[1]).is_none());
 }
+
+/// The state key file holds the key as Mina's own tooling exports it: base58 `EK…`, with
+/// surrounding whitespace ignored, and nothing else read as a key.
+#[test]
+fn a_state_key_file_is_a_base58_mina_secret_key() {
+    let secret = SecKey::new(Scalar::from(42u64));
+    let key = Keypair::try_from(secret.clone()).expect("a keypair");
+    let text = format!("  {}\n", secret.to_base58());
+    let read = connector_zk_note::state_keypair_from_text(&text).expect("a key");
+    assert_eq!(read.public, key.public);
+    assert!(connector_zk_note::state_keypair_from_text("not a key").is_none());
+    assert!(connector_zk_note::state_keypair_from_text("").is_none());
+}
+
+// -- Closing an allowance and its successor (ADR 0080 decision 4, #1523) --
+
+mod close_and_successor {
+    use super::*;
+    use connector_zk_note::note::balance::commit;
+    use connector_zk_note::note::state::verify_state;
+    use connector_zk_note::session::{sign_allowance_close, verify_allowance_close};
+    use connector_zk_note::successor::successor;
+    use connector_zk_note::Field;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(8))]
+
+        /// A close request verifies only for the allowance it names and under its own session
+        /// key, and a claim's signature is never a close's.
+        #[test]
+        fn a_close_request_verifies_only_as_signed(seed in 0u64..1_000_000, id in any::<[u8; 16]>()) {
+            let key = session(seed);
+            let public = key.public.into_compressed();
+            let close = sign_allowance_close(&key, &id);
+            prop_assert!(verify_allowance_close(&close, &public, &id));
+            let mut other = id;
+            other[15] ^= 1;
+            prop_assert!(!verify_allowance_close(&close, &public, &other));
+            let stranger = session(seed + 1).public.into_compressed();
+            prop_assert!(!verify_allowance_close(&close, &stranger, &id));
+            for amount in [0u64, 1] {
+                let claim = sign_allowance_claim(&key, &id, amount);
+                prop_assert!(!verify_allowance_close(&claim, &public, &id));
+            }
+        }
+
+        /// The successor of `commit(B, r)` charged Δ is `commit(B − Δ, r)` at `next_anchor(N)`,
+        /// signed by the state key over zk_toon's state message.
+        #[test]
+        fn a_successor_is_the_old_balance_less_the_charge_signed_by_the_state_key(
+            balance in 1u64..1_000_000_000_000,
+            blinding in 1u64..u64::MAX,
+            charge_seed in any::<u64>(),
+            nullifier in any::<u64>(),
+        ) {
+            let charge = charge_seed % balance;
+            let state = session(9_999);
+            let before = commit(Scalar::from(balance), Scalar::from(blinding));
+            let next = successor(&state, before, Field::from(nullifier), charge).expect("signable");
+            prop_assert_eq!(
+                next.commitment,
+                commit(Scalar::from(balance - charge), Scalar::from(blinding))
+            );
+            prop_assert_eq!(
+                next.anchor,
+                connector_zk_note::note::next_anchor(Field::from(nullifier))
+            );
+            prop_assert!(verify_state(&next.signature, &state.public, &next.message));
+            prop_assert!(!verify_state(&next.signature, &session(1).public, &next.message));
+        }
+    }
+}

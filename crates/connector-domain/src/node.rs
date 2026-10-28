@@ -34,7 +34,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::x402::X402BatchSettlementTerms;
+use crate::x402::{X402BatchSettlementTerms, X402ZkNoteTerms};
 
 /// The client-edge versions this connector serves, and the one an
 /// unversioned `POST /ilp` resolves to (issue #1054,
@@ -99,6 +99,11 @@ pub struct NodeFacts {
     /// this node's inbound channel to the peering by this value (decision
     /// 4). Empty on a node that pays on no x402 channel.
     pub voucher_signers: Vec<VoucherSignerFact>,
+    /// This node's zk-note terms, when the `[zk_note]` table makes it a zk
+    /// edge (ADR 0080): read off the table and the state key it names. The
+    /// greeting's `zk-note` entry and the self-description's `zkNote` are
+    /// both projections of it (ND-11). `None` on every other node.
+    pub zk_note: Option<X402ZkNoteTerms>,
 }
 
 /// One chain's voucher signer, as the self-description publishes it (ADR
@@ -273,6 +278,11 @@ pub struct NodeSelfDescription {
         default
     )]
     pub voucher_signers: Vec<VoucherSignerFact>,
+    /// [`NodeFacts::zk_note`] (ADR 0080): the pins a wallet proves a
+    /// request against, the same the greeting carries. Never a count of
+    /// open allowances. Absent on a node that is no zk edge.
+    #[serde(rename = "zkNote", skip_serializing_if = "Option::is_none", default)]
+    pub zk_note: Option<X402ZkNoteTerms>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub routes: Vec<RoutePrice>,
     /// The one client transport the routes covering this node's own
@@ -311,6 +321,7 @@ impl NodeSelfDescription {
             edge_identity,
             batch_settlements: facts.batch_settlements.clone(),
             voucher_signers: facts.voucher_signers.clone(),
+            zk_note: facts.zk_note.clone(),
             routes,
             required_transport,
             supported_versions: CLIENT_EDGE_SUPPORTED_VERSIONS.to_vec(),
@@ -391,6 +402,7 @@ mod tests {
             peer_carriages: vec!["btp".to_string()],
             batch_settlements: Vec::new(),
             voucher_signers: Vec::new(),
+            zk_note: None,
         }
     }
 
@@ -420,6 +432,59 @@ mod tests {
                 "'{absent}' must be absent rather than null on a node that has none"
             );
         }
+    }
+
+    /// ADR 0080 (#1523): a zk edge's self-description publishes the same
+    /// pins its greeting's `zk-note` entry carries, from the same fact, and
+    /// no count of open allowances -- nor anything else that changes as
+    /// allowances open and close.
+    #[test]
+    fn a_zk_edge_publishes_its_pins_and_never_a_count() {
+        let terms = crate::x402::X402ZkNoteTerms {
+            network: "mina:devnet".to_string(),
+            asset: "slip44:12586".to_string(),
+            pay_to: "B62qvault".to_string(),
+            verification_key_hash: "1234".to_string(),
+            state_key: "B62qstate".to_string(),
+            tiers: vec!["100000000".to_string()],
+            allowance_lifetime_secs: 3600,
+            allowance_endpoint: "/ilp/zk-note/allowances".to_string(),
+        };
+        let zk_edge = NodeFacts {
+            zk_note: Some(terms.clone()),
+            ..facts()
+        };
+        let json = serde_json::to_value(NodeSelfDescription::describe(
+            &zk_edge,
+            None,
+            Vec::new(),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(json["zkNote"], serde_json::to_value(&terms).unwrap());
+        assert_eq!(
+            json["zkNote"],
+            serde_json::json!({
+                "network": "mina:devnet",
+                "asset": "slip44:12586",
+                "payTo": "B62qvault",
+                "verificationKeyHash": "1234",
+                "stateKey": "B62qstate",
+                "tiers": ["100000000"],
+                "allowanceLifetimeSecs": 3600,
+                "allowanceEndpoint": "/ilp/zk-note/allowances"
+            }),
+            "the pins, and nothing that counts allowances"
+        );
+
+        let without = serde_json::to_value(NodeSelfDescription::describe(
+            &facts(),
+            None,
+            Vec::new(),
+            None,
+        ))
+        .unwrap();
+        assert!(without.get("zkNote").is_none());
     }
 
     /// Every field name the emitted document carries, at any depth.

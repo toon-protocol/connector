@@ -187,6 +187,25 @@ fn encode_line(entry: &JournalEntry) -> String {
             encode_hex(commitment_x),
             encode_hex(commitment_y),
         ),
+        JournalEntry::AllowanceClosed {
+            allowance_id,
+            charge,
+        } => format!("allowance_closed\t{allowance_id}\t{charge}"),
+        JournalEntry::AllowanceSuccessorSigned {
+            allowance_id,
+            commitment_x,
+            commitment_y,
+            anchor,
+            signature_rx,
+            signature_s,
+        } => format!(
+            "allowance_successor_signed\t{allowance_id}\t{}\t{}\t{}\t{}\t{}",
+            encode_hex(commitment_x),
+            encode_hex(commitment_y),
+            encode_hex(anchor),
+            encode_hex(signature_rx),
+            encode_hex(signature_s),
+        ),
     }
 }
 
@@ -281,6 +300,26 @@ fn decode_line(line: &str) -> Result<JournalEntry, JournalError> {
                 },
                 commitment_x: bytes32(commitment_x)?,
                 commitment_y: bytes32(commitment_y)?,
+            })
+        }
+        ["allowance_closed", allowance_id, charge] => Ok(JournalEntry::AllowanceClosed {
+            allowance_id: allowance_id.to_string(),
+            charge: parse_u64(charge)?,
+        }),
+        ["allowance_successor_signed", allowance_id, commitment_x, commitment_y, anchor, signature_rx, signature_s] =>
+        {
+            let bytes32 = |hex: &str| -> Result<[u8; 32], JournalError> {
+                decode_hex(hex)
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    .ok_or_else(corrupt)
+            };
+            Ok(JournalEntry::AllowanceSuccessorSigned {
+                allowance_id: allowance_id.to_string(),
+                commitment_x: bytes32(commitment_x)?,
+                commitment_y: bytes32(commitment_y)?,
+                anchor: bytes32(anchor)?,
+                signature_rx: bytes32(signature_rx)?,
+                signature_s: bytes32(signature_s)?,
             })
         }
         _ => Err(corrupt()),
@@ -427,6 +466,18 @@ mod tests {
                 session_key_is_odd: true,
                 commitment_x: [0x04; 32],
                 commitment_y: [0x05; 32],
+            },
+            JournalEntry::AllowanceClosed {
+                allowance_id: "00112233445566778899aabbccddeeff".to_string(),
+                charge: 250,
+            },
+            JournalEntry::AllowanceSuccessorSigned {
+                allowance_id: "00112233445566778899aabbccddeeff".to_string(),
+                commitment_x: [0x06; 32],
+                commitment_y: [0x07; 32],
+                anchor: [0x08; 32],
+                signature_rx: [0x09; 32],
+                signature_s: [0x0a; 32],
             },
         ]
     }

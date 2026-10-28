@@ -192,4 +192,25 @@ pub enum JournalEntry {
         commitment_x: [u8; 32],
         commitment_y: [u8; 32],
     },
+    /// A zk edge closed an allowance and fixed its charge Δ (ADR 0080
+    /// decisions 4 and 11, #1523): the allowance's final watermark, written
+    /// once every forward in flight on it had resolved, and never
+    /// rewritten. Written, and fsynced, before the evidence file's close
+    /// record and before the successor is signed, so a restart can finish
+    /// a close but never charge it differently.
+    AllowanceClosed { allowance_id: String, charge: u64 },
+    /// The successor state a zk edge signed for a closed allowance (ADR
+    /// 0080 decision 11, #1523): zk_toon's state message over the charged
+    /// commitment and the next anchor, and the state key's signature over
+    /// it. Field elements and the signature's two halves are 32 bytes
+    /// little-endian. Written once, after [`JournalEntry::AllowanceClosed`];
+    /// a successor fetch only ever reads it back.
+    AllowanceSuccessorSigned {
+        allowance_id: String,
+        commitment_x: [u8; 32],
+        commitment_y: [u8; 32],
+        anchor: [u8; 32],
+        signature_rx: [u8; 32],
+        signature_s: [u8; 32],
+    },
 }

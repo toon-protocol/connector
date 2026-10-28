@@ -11,21 +11,28 @@ use std::sync::Arc;
 use chrono::{Duration as TimeDelta, TimeZone, Utc};
 use connector_client_edge::zk_note::{InMemoryZkNoteVault, ZkNoteVault};
 use connector_client_edge::{
-    AllowanceGrant, AllowanceRefusal, AllowanceRequest, ClaimIngestRejection, ClientClaimGate,
-    EvidenceFile, ZkEdge, EVIDENCE_FILE,
+    AllowanceClose, AllowanceCloseRefusal, AllowanceGrant, AllowanceRefusal, AllowanceRequest,
+    ClaimIngestRejection, ClientClaimGate, EvidenceFile, SignedSuccessor, SuccessorStatus, ZkEdge,
+    EVIDENCE_FILE,
 };
 use connector_domain::client_claim::{AllowanceId, ClientEdgeClaim};
 use connector_domain::JournalEntry;
 use connector_runtime::{Clock, FileJournal, Journal, TestClock};
 use connector_zk_note::evidence::{evidence_hash, scan, Record};
-use connector_zk_note::note::balance::generator_g;
+use connector_zk_note::note::balance::{commit, Commitment};
 use connector_zk_note::note::policy::TIERS;
+use connector_zk_note::note::state::verify_state;
 use connector_zk_note::request::{expected_tag, json_proof_for, RequestProof, RequestPublic};
-use connector_zk_note::session::{sign_allowance_claim, signature_to_hex};
+use connector_zk_note::session::{
+    sign_allowance_claim, sign_allowance_close, signature_to_be_bytes, signature_to_hex,
+};
 use connector_zk_note::tiers::Tiers;
 use connector_zk_note::{field_to_le_bytes, CompressedPubKey, Field, Keypair, Scalar, SecKey};
 
 const HOUR_MS: u64 = 3_600_000;
+
+/// What every test payer's note holds before its allowance, nanomina.
+const NOTE_BALANCE: u64 = 5_000_000_000;
 
 fn keypair(seed: u64) -> Keypair {
     Keypair::try_from(SecKey::new(Scalar::from(seed))).expect("a keypair")
@@ -81,7 +88,7 @@ impl Edge {
                 vault: Arc::clone(&self.vault) as Arc<dyn ZkNoteVault>,
                 evidence: EvidenceFile::open(&self.dir.path().join(EVIDENCE_FILE))
                     .expect("evidence"),
-                state_key: self.state_key(),
+                state_keypair: self.state.clone(),
                 tiers: Tiers::new([TIERS[0], TIERS[1]]).expect("tiers"),
                 allowance_lifetime: std::time::Duration::from_millis(HOUR_MS),
                 open_budget_cap: self.cap,
@@ -119,6 +126,11 @@ struct Payer {
     /// What the tag is bound to, if not this payer's own terms.
     tag_override: Option<Field>,
     proof_bytes: &'static str,
+    /// The note's balance before this allowance, and the proof's
+    /// re-randomised commitment to it.
+    balance: u64,
+    blinding: u64,
+    commitment: Commitment,
 }
 
 impl Payer {
@@ -136,6 +148,9 @@ impl Payer {
             vault: edge.state_key(),
             tag_override: None,
             proof_bytes: "proof",
+            balance: NOTE_BALANCE,
+            blinding: seed + 101,
+            commitment: commit(Scalar::from(NOTE_BALANCE), Scalar::from(seed + 101)),
         }
     }
 
@@ -156,7 +171,7 @@ impl Payer {
                     self.expires_at_ms,
                 )
             }),
-            commitment: generator_g(),
+            commitment: self.commitment,
             subsidised: self.subsidised,
             period: self.period,
             period_nullifier: self.period_nullifier,
@@ -746,4 +761,482 @@ async fn a_mina_claim_is_still_refused_by_name_at_a_zk_edge() {
         gate.ingest(mina, 0).await.unwrap_err(),
         ClaimIngestRejection::Mina
     );
+}
+
+// -- Closing an allowance, and its successor (ADR 0080 decision 4, #1523) --
+
+impl Payer {
+    /// A close request signed by this payer's session key.
+    fn close(&self, id: AllowanceId) -> AllowanceClose {
+        close_signed_by(&self.session, id)
+    }
+
+    /// Check a successor the way the payer's wallet does (ADR 0080
+    /// decision 2): signed by the zk edge's state key, and the old balance
+    /// less exactly `charge`, under the same blinding.
+    fn check(&self, edge: &Edge, successor: &SignedSuccessor, charge: u64) {
+        assert_eq!(
+            successor.charge, charge,
+            "the charge is the final watermark"
+        );
+        assert_eq!(
+            successor.commitment,
+            commit(
+                Scalar::from(self.balance - charge),
+                Scalar::from(self.blinding)
+            ),
+            "the successor is the old balance less the charge"
+        );
+        assert_eq!(
+            successor.anchor,
+            connector_zk_note::note::next_anchor(self.nullifier)
+        );
+        assert!(verify_state(
+            &successor.signature,
+            &edge.state.public,
+            &successor.message()
+        ));
+    }
+}
+
+fn close_signed_by(key: &Keypair, id: AllowanceId) -> AllowanceClose {
+    AllowanceClose {
+        allowance_id: id,
+        signature: signature_to_be_bytes(&sign_allowance_close(key, id.as_bytes())),
+    }
+}
+
+fn signed(status: SuccessorStatus) -> SignedSuccessor {
+    match status {
+        SuccessorStatus::Signed(successor) => *successor,
+        SuccessorStatus::Pending => panic!("expected a signed successor, got pending"),
+    }
+}
+
+impl Edge {
+    /// Every charge the journal holds, by allowance.
+    fn charges(&self) -> Vec<(String, u64)> {
+        self.entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                JournalEntry::AllowanceClosed {
+                    allowance_id,
+                    charge,
+                } => Some((allowance_id, charge)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn successors(&self) -> usize {
+        self.entries()
+            .iter()
+            .filter(|entry| matches!(entry, JournalEntry::AllowanceSuccessorSigned { .. }))
+            .count()
+    }
+
+    fn advance_ms(&self, ms: u64) {
+        self.clock
+            .advance(TimeDelta::milliseconds(i64::try_from(ms).unwrap()));
+    }
+}
+
+#[tokio::test]
+async fn an_open_allowances_successor_is_pending_and_an_unknown_one_is_refused() {
+    let edge = Edge::new();
+    let gate = edge.gate();
+    let payer = Payer::new(&edge, 30).provable(&edge);
+    let id = grant(&gate, &payer).await.allowance_id;
+    gate.ingest(&payer.claim(id, 100), 100).await.unwrap();
+    assert_eq!(gate.successor(id), Ok(SuccessorStatus::Pending));
+    assert_eq!(
+        gate.successor(AllowanceId::from_bytes([9; 16])),
+        Err(AllowanceCloseRefusal::UnknownAllowance)
+    );
+    // A fetch only reads: nothing was closed or journaled by asking.
+    assert!(edge.charges().is_empty());
+    gate.ingest(&payer.claim(id, 200), 100)
+        .await
+        .expect("still open");
+}
+
+#[tokio::test]
+async fn a_close_waits_for_every_forward_in_flight_before_charging() {
+    let edge = Edge::new();
+    let gate = edge.gate();
+    let payer = Payer::new(&edge, 31).provable(&edge);
+    let id = grant(&gate, &payer).await.allowance_id;
+    gate.ingest(&payer.claim(id, 100), 100).await.unwrap();
+    let (_, in_flight) = gate
+        .ingest_forward(&payer.claim(id, 250), 150)
+        .await
+        .expect("admitted and forwarded");
+
+    // The close stops new claims at once, but charges nothing yet.
+    assert_eq!(
+        gate.close_allowance(payer.close(id)),
+        Ok(SuccessorStatus::Pending)
+    );
+    assert_eq!(
+        gate.ingest(&payer.claim(id, 300), 50).await.unwrap_err(),
+        ClaimIngestRejection::AllowanceClosed
+    );
+    assert_eq!(gate.successor(id), Ok(SuccessorStatus::Pending));
+    assert!(
+        edge.charges().is_empty(),
+        "no charge while a forward is in flight"
+    );
+
+    // The forward resolves: the charge is the final watermark, once.
+    drop(in_flight);
+    let successor = signed(gate.successor(id).expect("known"));
+    payer.check(&edge, &successor, 250);
+    assert_eq!(edge.charges(), vec![(id.to_string(), 250)]);
+    assert_eq!(edge.successors(), 1);
+}
+
+#[tokio::test]
+async fn the_charge_is_written_once_and_the_successor_is_idempotent() {
+    let edge = Edge::new();
+    let payer = Payer::new(&edge, 32).provable(&edge);
+    let (id, first) = {
+        let gate = edge.gate();
+        let id = grant(&gate, &payer).await.allowance_id;
+        gate.ingest(&payer.claim(id, 100), 100).await.unwrap();
+        gate.ingest(&payer.claim(id, 400), 100).await.unwrap();
+        let first = signed(gate.close_allowance(payer.close(id)).expect("closed"));
+        payer.check(&edge, &first, 400);
+        // Asking again -- to close, or for the successor -- changes nothing.
+        assert_eq!(
+            gate.close_allowance(payer.close(id)),
+            Ok(SuccessorStatus::Signed(Box::new(first.clone())))
+        );
+        assert_eq!(
+            gate.successor(id),
+            Ok(SuccessorStatus::Signed(Box::new(first.clone())))
+        );
+        (id, first)
+    };
+    // Nor does a restart: the same successor, from the journal.
+    let restarted = edge.gate();
+    assert_eq!(
+        restarted.successor(id),
+        Ok(SuccessorStatus::Signed(Box::new(first)))
+    );
+    assert_eq!(edge.charges(), vec![(id.to_string(), 400)]);
+    assert_eq!(edge.successors(), 1);
+
+    // The evidence file holds the close record the challenger reads: the
+    // spent nullifier, the allowance and the charge.
+    let closes: Vec<_> = edge
+        .evidence()
+        .iter()
+        .filter_map(|payload| match Record::from_payload(payload).unwrap() {
+            Record::Close(close) => Some((close.nullifier, close.allowance_id, close.charge)),
+            Record::Grant(_) => None,
+        })
+        .collect();
+    assert_eq!(closes, vec![(payer.nullifier, id.as_bytes().to_vec(), 400)]);
+}
+
+#[tokio::test]
+async fn an_allowance_closed_with_no_claim_charges_nothing() {
+    let edge = Edge::new();
+    let gate = edge.gate();
+    let payer = Payer::new(&edge, 33).provable(&edge);
+    let id = grant(&gate, &payer).await.allowance_id;
+    let successor = signed(gate.close_allowance(payer.close(id)).expect("closed"));
+    payer.check(&edge, &successor, 0);
+}
+
+#[tokio::test]
+async fn a_close_not_signed_by_the_session_key_is_refused_and_closes_nothing() {
+    let edge = Edge::new();
+    let gate = edge.gate();
+    let payer = Payer::new(&edge, 34).provable(&edge);
+    let id = grant(&gate, &payer).await.allowance_id;
+    assert_eq!(
+        gate.close_allowance(close_signed_by(&keypair(77_777), id)),
+        Err(AllowanceCloseRefusal::SignatureInvalid)
+    );
+    // A claim's signature is not a close's.
+    assert_eq!(
+        gate.close_allowance(AllowanceClose {
+            allowance_id: id,
+            signature: signature_to_be_bytes(&sign_allowance_claim(
+                &payer.session,
+                id.as_bytes(),
+                0
+            )),
+        }),
+        Err(AllowanceCloseRefusal::SignatureInvalid)
+    );
+    assert_eq!(
+        gate.close_allowance(close_signed_by(
+            &payer.session,
+            AllowanceId::from_bytes([3; 16])
+        )),
+        Err(AllowanceCloseRefusal::UnknownAllowance)
+    );
+    gate.ingest(&payer.claim(id, 100), 100)
+        .await
+        .expect("still open");
+}
+
+#[tokio::test]
+async fn reaching_the_budget_closes_the_allowance() {
+    let edge = Edge::new();
+    let gate = edge.gate();
+    let payer = Payer::new(&edge, 35).provable(&edge);
+    let id = grant(&gate, &payer).await.allowance_id;
+    let (_, in_flight) = gate
+        .ingest_forward(&payer.claim(id, TIERS[1]), 100)
+        .await
+        .expect("a claim at the budget");
+    assert_eq!(gate.successor(id), Ok(SuccessorStatus::Pending));
+    drop(in_flight);
+    payer.check(&edge, &signed(gate.successor(id).unwrap()), TIERS[1]);
+    assert_eq!(
+        gate.ingest(&payer.claim(id, TIERS[1]), 0)
+            .await
+            .unwrap_err(),
+        ClaimIngestRejection::AllowanceClosed
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_closes_an_expired_allowance_and_then_its_claims_are_refused() {
+    let edge = Edge::new();
+    let gate = edge.gate();
+    let payer = Payer::new(&edge, 36).provable(&edge);
+    let id = grant(&gate, &payer).await.allowance_id;
+    gate.ingest(&payer.claim(id, 300), 100).await.unwrap();
+
+    gate.sweep_allowances();
+    assert_eq!(
+        gate.successor(id),
+        Ok(SuccessorStatus::Pending),
+        "not yet expired"
+    );
+
+    edge.advance_ms(payer.expires_at_ms - edge.now_ms());
+    assert_eq!(
+        gate.ingest(&payer.claim(id, 400), 100).await.unwrap_err(),
+        ClaimIngestRejection::AllowanceExpired
+    );
+    gate.sweep_allowances();
+    payer.check(&edge, &signed(gate.successor(id).unwrap()), 300);
+    assert_eq!(
+        gate.ingest(&payer.claim(id, 400), 100).await.unwrap_err(),
+        ClaimIngestRejection::AllowanceClosed
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_waits_for_an_expired_allowances_forward_in_flight() {
+    let edge = Edge::new();
+    let gate = edge.gate();
+    let payer = Payer::new(&edge, 37).provable(&edge);
+    let id = grant(&gate, &payer).await.allowance_id;
+    let (_, in_flight) = gate
+        .ingest_forward(&payer.claim(id, 300), 100)
+        .await
+        .unwrap();
+    edge.advance_ms(payer.expires_at_ms - edge.now_ms());
+    gate.sweep_allowances();
+    assert_eq!(gate.successor(id), Ok(SuccessorStatus::Pending));
+    drop(in_flight);
+    payer.check(&edge, &signed(gate.successor(id).unwrap()), 300);
+}
+
+#[tokio::test]
+async fn the_boot_sweep_closes_what_expired_while_the_node_was_down() {
+    let edge = Edge::new();
+    let payer = Payer::new(&edge, 38).provable(&edge);
+    let still_open = Payer {
+        expires_at_ms: edge.now_ms() + HOUR_MS,
+        ..Payer::new(&edge, 39)
+    }
+    .provable(&edge);
+    let (expiring, open) = {
+        let gate = edge.gate();
+        let expiring = grant(&gate, &payer).await.allowance_id;
+        let open = grant(&gate, &still_open).await.allowance_id;
+        gate.ingest(&payer.claim(expiring, 700), 100).await.unwrap();
+        (expiring, open)
+    };
+    edge.advance_ms(payer.expires_at_ms - edge.now_ms());
+
+    // Replayed, then swept, before the gate serves anything.
+    let gate = edge.gate();
+    payer.check(&edge, &signed(gate.successor(expiring).unwrap()), 700);
+    assert_eq!(gate.successor(open), Ok(SuccessorStatus::Pending));
+    assert_eq!(edge.charges(), vec![(expiring.to_string(), 700)]);
+}
+
+#[tokio::test]
+async fn a_closed_allowance_no_longer_counts_against_the_open_budget() {
+    let edge = Edge::with_cap(TIERS[1]);
+    let gate = edge.gate();
+    let first = Payer::new(&edge, 40).provable(&edge);
+    let second = Payer::new(&edge, 41).provable(&edge);
+    let id = grant(&gate, &first).await.allowance_id;
+    assert!(matches!(
+        gate.admit_allowance(second.request()).await.unwrap_err(),
+        AllowanceRefusal::OpenBudgetExceeded { .. }
+    ));
+    signed(gate.close_allowance(first.close(id)).unwrap());
+    grant(&gate, &second).await;
+    // And after a restart, from the journal: only the second is open.
+    let third = Payer::new(&edge, 42).provable(&edge);
+    assert!(matches!(
+        edge.gate().admit_allowance(third.request()).await.unwrap_err(),
+        AllowanceRefusal::OpenBudgetExceeded { open, .. } if open == TIERS[1]
+    ));
+}
+
+// -- The two HTTP endpoints (ADR 0080 decision 8, #1523) --
+
+mod endpoints {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use connector_client_edge::{zk_note_router, ZK_NOTE_ALLOWANCES_PATH};
+    use tower::ServiceExt;
+
+    async fn call(app: axum::Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let response = app.oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = hyper::body::to_bytes(response.into_body())
+            .await
+            .expect("body");
+        (status, serde_json::from_slice(&bytes).expect("JSON"))
+    }
+
+    fn post(body: String) -> Request<Body> {
+        Request::post(ZK_NOTE_ALLOWANCES_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("request")
+    }
+
+    fn get_successor(id: &str) -> Request<Body> {
+        Request::get(format!("{ZK_NOTE_ALLOWANCES_PATH}/{id}/successor"))
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    fn open_body(payer: &Payer) -> String {
+        let request = payer.request();
+        let proof: serde_json::Value = serde_json::from_slice(&request.proof).unwrap();
+        serde_json::json!({
+            "proof": proof,
+            "sessionKey": request.session_key.into_address(),
+            "expiresAt": request.expires_at_ms.to_string(),
+        })
+        .to_string()
+    }
+
+    fn close_body(payer: &Payer, id: &str) -> String {
+        let id: AllowanceId = id.parse().unwrap();
+        serde_json::json!({
+            "allowanceId": id.to_string(),
+            "signature": signature_to_hex(&sign_allowance_close(&payer.session, id.as_bytes())),
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_allowance_opens_and_closes_over_http_and_its_successor_is_idempotent() {
+        let edge = Edge::new();
+        let gate = Arc::new(edge.gate());
+        let app = zk_note_router(Arc::clone(&gate));
+        let payer = Payer::new(&edge, 50).provable(&edge);
+
+        let (status, opened) = call(app.clone(), post(open_body(&payer))).await;
+        assert_eq!(status, StatusCode::OK, "{opened}");
+        let id = opened["allowanceId"].as_str().expect("an id").to_string();
+        assert_eq!(opened["tier"], TIERS[1].to_string());
+        assert_eq!(opened["expiresAt"], payer.expires_at_ms.to_string());
+
+        let (status, pending) = call(app.clone(), get_successor(&id)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            pending,
+            serde_json::json!({"allowanceId": id, "status": "pending"})
+        );
+
+        let allowance: AllowanceId = id.parse().unwrap();
+        gate.ingest(&payer.claim(allowance, 300), 100)
+            .await
+            .unwrap();
+        let (status, closed) = call(app.clone(), post(close_body(&payer, &id))).await;
+        assert_eq!(status, StatusCode::OK, "{closed}");
+        assert_eq!(closed["status"], "signed");
+        assert_eq!(closed["charge"], "300");
+        let successor = signed(gate.successor(allowance).unwrap());
+        payer.check(&edge, &successor, 300);
+        assert_eq!(
+            closed["anchor"],
+            connector_zk_note::note::field_to_string(successor.anchor)
+        );
+        assert_eq!(
+            closed["commitment"]["x"],
+            connector_zk_note::note::field_to_string(successor.commitment.x)
+        );
+        assert_eq!(
+            closed["signature"]["r"],
+            connector_zk_note::note::field_to_string(successor.signature.rx)
+        );
+
+        let (status, again) = call(app.clone(), get_successor(&id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again, closed, "every fetch returns the same signed state");
+    }
+
+    #[tokio::test]
+    async fn each_refusal_is_named() {
+        let edge = Edge::new();
+        let app = zk_note_router(Arc::new(edge.gate()));
+        let payer = Payer::new(&edge, 51).provable(&edge);
+
+        let (status, body) = call(app.clone(), post("{}".to_string())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "request_malformed");
+
+        let unoffered = Payer {
+            tier: TIERS[2],
+            ..payer.clone()
+        };
+        let (status, body) = call(app.clone(), post(open_body(&unoffered))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "tier_not_offered");
+
+        let unknown = "00000000000000000000000000000000";
+        let (status, body) = call(app.clone(), get_successor(unknown)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "unknown_allowance");
+        let (status, body) = call(app.clone(), get_successor("not-an-id")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "request_malformed");
+
+        let (_, opened) = call(app.clone(), post(open_body(&payer))).await;
+        let id = opened["allowanceId"].as_str().unwrap();
+        let stranger = Payer::new(&edge, 52);
+        let (status, body) = call(app.clone(), post(close_body(&stranger, id))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "signature_invalid");
+    }
+
+    #[tokio::test]
+    async fn a_node_that_is_no_zk_edge_refuses_both_endpoints_by_name() {
+        let journal = Arc::new(connector_runtime::InMemoryJournal::new());
+        let app = zk_note_router(Arc::new(ClientClaimGate::restore(journal).unwrap()));
+        let (status, body) = call(app.clone(), post("{}".to_string())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "zk_note_not_offered");
+        let (status, body) = call(app, get_successor("00000000000000000000000000000000")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "zk_note_not_offered");
+    }
 }

@@ -97,6 +97,9 @@ pub enum RuntimeError {
     /// #1514). Refused by name rather than served: a zk edge that cannot
     /// verify a proof can grant no allowance.
     ZkNoteVaultNotBuilt,
+    /// `[zk_note] state_key_file` could not be read, or does not hold a
+    /// Mina secret key in base58 (ADR 0080, #1523).
+    ZkNoteStateKey { path: PathBuf, reason: String },
     /// `state_dir` names a directory this node cannot create or write a
     /// journal file in (issue #605) -- typically a read-only mount, or a
     /// directory owned by another uid than the one the container runs as.
@@ -248,6 +251,12 @@ impl fmt::Display for RuntimeError {
                 "[zk_note] is set, but this build has no Mina vault adapter to read the vault \
                  and verify request proofs with (ADR 0080; connector#1514), so it cannot be a \
                  zk edge yet -- remove the [zk_note] table to run this build"
+            ),
+            RuntimeError::ZkNoteStateKey { path, reason } => write!(
+                f,
+                "[zk_note] state_key_file {} is unusable: {reason} -- it must hold the zk edge's \
+                 Mina secret key in base58 (EK...), as Mina's tooling exports it",
+                path.display()
             ),
             RuntimeError::ToonChannelJournal { path, channel } => write!(
                 f,
@@ -1090,6 +1099,11 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     if let Some(table) = &rate_table {
         connector = connector.with_rate_table(table.clone());
     }
+    // ADR 0080 decision 6: an allowance-paid delivery states the vault's
+    // Mina network as its chain, and no payer.
+    if let Some(zk_note) = config.zk_note() {
+        connector = connector.with_zk_note_network(zk_note.network().caip2());
+    }
     // ADR 0074: every batch-settlement channel the client edge's journal
     // holds vouchers on, restored before anything is served, so the port
     // can land them after a restart -- restored, not re-admitted, so a rule
@@ -1596,7 +1610,9 @@ fn client_claim_gate(
     let budget = UnresolvableLookupBudgetPolicy::default();
     // The gate's zk edge (`ClientClaimGate::with_zk_edge`) needs a
     // `ZkNoteVault`, and the only one is the in-memory fake. #1514's Mina
-    // adapter is what this refusal becomes the construction of.
+    // adapter is what this refusal becomes the construction of -- with
+    // `ClientClaimGate::run_allowance_sweep` spawned beside it (#1523): the
+    // boot sweep already runs inside `with_zk_edge`.
     if config.zk_note().is_some() {
         return Err(RuntimeError::ZkNoteVaultNotBuilt);
     }
@@ -1641,9 +1657,12 @@ fn client_claim_gate(
 ///   * `batch_settlements` and `voucher_signers` are **proved**: every entry
 ///     was read off a backend that connected to a live chain and refused to
 ///     boot on a disagreement. Nothing re-declares any of it.
-fn node_facts(config: &Config, runtime: &Runtime) -> connector_domain::NodeFacts {
+fn node_facts(
+    config: &Config,
+    runtime: &Runtime,
+) -> Result<connector_domain::NodeFacts, RuntimeError> {
     let node = config.node();
-    connector_domain::NodeFacts {
+    Ok(connector_domain::NodeFacts {
         ilp_addresses: node
             .map(|node| node.addresses().to_vec())
             .unwrap_or_default(),
@@ -1664,7 +1683,58 @@ fn node_facts(config: &Config, runtime: &Runtime) -> connector_domain::NodeFacts
             .collect(),
         batch_settlements: runtime.batch_settlements.clone(),
         voucher_signers: runtime.voucher_signers.clone(),
-    }
+        zk_note: config.zk_note().map(zk_note_terms).transpose()?,
+    })
+}
+
+/// A zk edge's standing terms (ADR 0080 decisions 7 and 8, #1523), read off
+/// the `[zk_note]` table and the state key it names -- the one fact the
+/// greeting's `zk-note` entry and the self-description's `zkNote` project.
+/// `allowanceEndpoint` is the path the endpoints mount, from the one
+/// constant, so the greeting can never name a path nothing serves.
+fn zk_note_terms(
+    zk_note: &connector_config::ZkNoteConfig,
+) -> Result<connector_domain::x402::X402ZkNoteTerms, RuntimeError> {
+    let state_key = read_zk_note_state_key(zk_note.state_key())?;
+    Ok(connector_domain::x402::X402ZkNoteTerms {
+        network: zk_note.network().caip2().to_string(),
+        asset: ZK_NOTE_ASSET.to_string(),
+        pay_to: zk_note.vault().to_string(),
+        verification_key_hash: zk_note.verification_key_hash().to_string(),
+        state_key: state_key.public.into_address(),
+        tiers: zk_note
+            .tiers()
+            .as_slice()
+            .iter()
+            .map(|tier| tier.budget().to_string())
+            .collect(),
+        allowance_lifetime_secs: zk_note.allowance_lifetime().as_secs(),
+        allowance_endpoint: connector_client_edge::ZK_NOTE_ALLOWANCES_PATH.to_string(),
+    })
+}
+
+/// Native MINA as the greeting names it (ADR 0080 decision 7, as amended):
+/// SLIP-44 coin type 12586, which with the CAIP-2 `network` reads as the
+/// CAIP-19 `mina:<network>/slip44:12586`.
+const ZK_NOTE_ASSET: &str = "slip44:12586";
+
+/// The zk edge's state key, from `[zk_note] state_key_file`.
+fn read_zk_note_state_key(
+    location: &connector_config::SecretLocation,
+) -> Result<connector_zk_note::Keypair, RuntimeError> {
+    let connector_config::SecretLocation::File(path) = location else {
+        return Err(RuntimeError::ZkNoteStateKey {
+            path: PathBuf::new(),
+            reason: "a KMS-held state key is not supported".to_string(),
+        });
+    };
+    let unusable = |reason: String| RuntimeError::ZkNoteStateKey {
+        path: path.clone(),
+        reason,
+    };
+    let text = std::fs::read_to_string(path).map_err(|error| unusable(error.to_string()))?;
+    connector_zk_note::state_keypair_from_text(&text)
+        .ok_or_else(|| unusable("not a base58 Mina secret key".to_string()))
 }
 
 /// Merge the client edge and (if `[operator]` is configured) the operator
@@ -1701,7 +1771,7 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
         signer.clone(),
         wrap_receiver_secret,
         claim_gate.clone(),
-        node_facts(config, runtime),
+        node_facts(config, runtime)?,
         config
             .btp_session_window()
             .unwrap_or(connector_client_edge::DEFAULT_BTP_SESSION_WINDOW),
@@ -1740,6 +1810,10 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     let app = app.merge(crate::sponsor::router(
         runtime.batch_settlement_solana.clone(),
     ));
+    // ADR 0080 decision 8, #1523: the zk edge's allowance endpoints, beside
+    // the sponsor's and on the same terms -- mounted on every node, so one
+    // that is no zk edge refuses them by name.
+    let app = app.merge(connector_client_edge::zk_note_router(claim_gate.clone()));
     Ok(match config.operator() {
         Some(operator) => {
             let batch_channels = batch_channels_for_operator(runtime, &claim_gate);
@@ -2619,6 +2693,73 @@ open_budget_cap = 1000000000
         };
         assert!(matches!(error, RuntimeError::ZkNoteVaultNotBuilt));
         assert!(error.to_string().contains("[zk_note]"), "{error}");
+    }
+
+    /// ADR 0080 (#1523): the greeting's and self-description's zk-note
+    /// terms are read off the table and the state key file, the state key
+    /// published as the address of the key in that file, the endpoint as
+    /// the path the endpoints mount -- and a file holding no Mina key is
+    /// refused by name.
+    #[test]
+    fn a_zk_edges_terms_are_read_off_its_table_and_state_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let secret = connector_zk_note::SecKey::new(connector_zk_note::Scalar::from(9u64));
+        let address = connector_zk_note::Keypair::try_from(secret.clone())
+            .expect("a keypair")
+            .public
+            .into_address();
+        let state_key = dir.path().join("zk-state.key");
+        std::fs::write(&state_key, format!("{}\n", secret.to_base58())).expect("write");
+        let table = |state_key: &std::path::Path| {
+            config_with_raw_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_path}"
+
+[zk_note]
+vault = "{address}"
+network = "mina:devnet"
+graphql_url = "https://api.minascan.io/node/devnet/v1/graphql"
+state_key_file = "{state_key}"
+verification_key_hash = "1"
+tiers = [100000000, 10000000]
+allowance_lifetime_secs = 3600
+open_budget_cap = 1000000000
+"#,
+                    key_path = key_path.display(),
+                    state_dir = dir.path().display(),
+                    state_key = state_key.display(),
+                )
+            })
+            .0
+        };
+        let config = table(&state_key);
+        let terms = zk_note_terms(config.zk_note().expect("a zk edge")).expect("terms");
+        assert_eq!(
+            terms,
+            connector_domain::x402::X402ZkNoteTerms {
+                network: "mina:devnet".to_string(),
+                asset: "slip44:12586".to_string(),
+                pay_to: address.clone(),
+                verification_key_hash: "1".to_string(),
+                state_key: address.clone(),
+                tiers: vec!["10000000".to_string(), "100000000".to_string()],
+                allowance_lifetime_secs: 3600,
+                allowance_endpoint: "/ilp/zk-note/allowances".to_string(),
+            }
+        );
+
+        let garbage = dir.path().join("garbage.key");
+        std::fs::write(&garbage, "not a key").expect("write");
+        let config = table(&garbage);
+        assert!(matches!(
+            zk_note_terms(config.zk_note().unwrap()),
+            Err(RuntimeError::ZkNoteStateKey { .. })
+        ));
     }
 
     /// A journal carrying a line this build cannot decode stops the node

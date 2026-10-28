@@ -107,7 +107,8 @@ use connector_settlement::batch::VoucherSigner;
 mod allowance;
 use allowance::ZkLedger;
 pub use allowance::{
-    AllowanceGrant, AllowanceRefusal, AllowanceRequest, ZkEdge, ZkEdgeRestoreError,
+    AllowanceClose, AllowanceCloseRefusal, AllowanceGrant, AllowanceRefusal, AllowanceRequest,
+    InFlightForward, SignedSuccessor, SuccessorStatus, ZkEdge, ZkEdgeRestoreError,
 };
 
 /// Why the gate refused a claim. [`ClaimIngestRejection::Mina`] and
@@ -235,6 +236,9 @@ pub enum ClaimIngestRejection {
     UnknownAllowance,
     /// An allowance claim on an allowance past its expiry.
     AllowanceExpired,
+    /// An allowance claim on an allowance that is closed or closing (ADR
+    /// 0080 decision 4): closing stops new claims at once.
+    AllowanceClosed,
     /// An allowance claim above its allowance's budget `b` (ADR 0080
     /// decision 2).
     OverBudget {
@@ -320,6 +324,9 @@ impl ClaimIngestRejection {
                 .to_string(),
             ClaimIngestRejection::AllowanceExpired => "claim rejected: its allowance has \
                  expired -- open a new one"
+                .to_string(),
+            ClaimIngestRejection::AllowanceClosed => "claim rejected: its allowance is \
+                 closed -- fetch its successor and open a new one"
                 .to_string(),
             ClaimIngestRejection::OverBudget { claimed, budget } => format!(
                 "claim rejected: claims a cumulative {claimed}, more than its allowance's \
@@ -447,10 +454,12 @@ pub struct ClientClaimGate {
     journal: Arc<dyn Journal>,
     /// The zk edge, when this node is one (ADR 0080). `None` -- every
     /// constructor's default -- and `scheme: "zk-note"` is an unknown scheme.
-    zk_edge: Option<ZkEdge>,
+    zk_edge: Option<Arc<ZkEdge>>,
     /// Every allowance this gate has granted and the nullifiers they spent,
     /// replayed from the journal whether or not this node is a zk edge now.
-    zk_ledger: Mutex<ZkLedger>,
+    zk_ledger: Arc<Mutex<ZkLedger>>,
+    /// Held across each allowance close, so two never interleave.
+    zk_closing: Arc<Mutex<()>>,
 }
 
 /// One client session's slot in [`ClientClaimGate`]'s payee map (issue
@@ -485,12 +494,13 @@ impl ClientClaimGate {
             .into_iter()
             .map(|channel| (channel.channel_key(), channel))
             .collect();
-        let zk_ledger = Mutex::new(ZkLedger::replay(&entries)?);
+        let zk_ledger = Arc::new(Mutex::new(ZkLedger::replay(&entries)?));
         let committer = GroupCommitter::spawn(Arc::clone(&journal), Arc::clone(&watermarks));
         Ok(ClientClaimGate {
             journal,
             zk_edge: None,
             zk_ledger,
+            zk_closing: Arc::new(Mutex::new(())),
             lookup_budget: UnresolvableLookupBudget::default(),
             watermarks,
             previous_watermarks: RwLock::new(HashMap::new()),
@@ -929,9 +939,23 @@ impl ClientClaimGate {
         claim_json: &str,
         price: u64,
     ) -> Result<ClientEdgeClaim, ClaimIngestRejection> {
-        let (claim, durability) = self.admit(claim_json, price).await?;
-        durability.durable().await?;
+        let (claim, _resolved) = self.ingest_forward(claim_json, price).await?;
         Ok(claim)
+    }
+
+    /// [`Self::ingest`], for a caller about to route the packet the claim
+    /// pays for: the claim, and the [`InFlightForward`] the caller holds
+    /// until that packet has resolved -- past any rollback of an uncarried
+    /// forward (ADR 0080 decision 4, #1523). An allowance cannot be charged
+    /// while one of its forwards is in flight; a voucher's is inert.
+    pub async fn ingest_forward(
+        &self,
+        claim_json: &str,
+        price: u64,
+    ) -> Result<(ClientEdgeClaim, InFlightForward), ClaimIngestRejection> {
+        let (claim, durability, in_flight) = self.admit(claim_json, price).await?;
+        durability.durable().await?;
+        Ok((claim, in_flight))
     }
 
     /// [`ClientClaimGate::ingest`]'s decision half: everything up to and
@@ -953,7 +977,7 @@ impl ClientClaimGate {
         &self,
         claim_json: &str,
         price: u64,
-    ) -> Result<(ClientEdgeClaim, DurabilityTicket), ClaimIngestRejection> {
+    ) -> Result<(ClientEdgeClaim, DurabilityTicket, InFlightForward), ClaimIngestRejection> {
         let claim = parse_client_edge_claim(claim_json, self.zk_edge.is_some()).map_err(
             |error| match error {
                 ClientClaimError::Mina => ClaimIngestRejection::Mina,
@@ -964,11 +988,15 @@ impl ClientClaimGate {
         match claim {
             ClientEdgeClaim::Voucher(claim) => {
                 let (claim, ticket) = self.admit_voucher(claim, price).await?;
-                Ok((ClientEdgeClaim::Voucher(claim), ticket))
+                Ok((
+                    ClientEdgeClaim::Voucher(claim),
+                    ticket,
+                    InFlightForward::untracked(),
+                ))
             }
             ClientEdgeClaim::Allowance(claim) => {
-                let ticket = self.admit_allowance_claim(&claim, price)?;
-                Ok((ClientEdgeClaim::Allowance(claim), ticket))
+                let (ticket, in_flight) = self.admit_allowance_claim(&claim, price)?;
+                Ok((ClientEdgeClaim::Allowance(claim), ticket, in_flight))
             }
         }
     }
