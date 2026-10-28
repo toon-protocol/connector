@@ -143,10 +143,15 @@ fn a_request_proofs_public_inputs_decode_in_o1js_order_and_bind() {
 fn the_successor_anchor_follows_the_spent_nullifier() {
     let v = vectors();
     let chain = v["nullifiers"]["chain"].as_array().expect("chain");
-    let next = v["nullifiers"]["nextAnchors"].as_array().expect("nextAnchors");
+    let next = v["nullifiers"]["nextAnchors"]
+        .as_array()
+        .expect("nextAnchors");
     assert_eq!(chain.len(), next.len());
     for (link, anchor) in chain.iter().zip(next) {
-        assert_eq!(field_to_string(next_anchor(f(&link["nullifier"]))), s(anchor));
+        assert_eq!(
+            field_to_string(next_anchor(f(&link["nullifier"]))),
+            s(anchor)
+        );
     }
 }
 
@@ -170,9 +175,18 @@ fn the_state_is_signed_exactly_as_o1js_signs_it() {
     assert!(!cases.is_empty());
     for e in cases {
         let kp = keypair(&e["secret"]);
-        let msg = StateMessage::new(&kp.public.into_compressed(), pt(&e["commitment"]), f(&e["anchor"]));
+        let msg = StateMessage::new(
+            &kp.public.into_compressed(),
+            pt(&e["commitment"]),
+            f(&e["anchor"]),
+        );
         let fields: Vec<String> = msg.to_fields().into_iter().map(field_to_string).collect();
-        let pinned: Vec<&str> = e["fields"].as_array().expect("fields").iter().map(s).collect();
+        let pinned: Vec<&str> = e["fields"]
+            .as_array()
+            .expect("fields")
+            .iter()
+            .map(s)
+            .collect();
         assert_eq!(fields, pinned);
         assert_eq!(sign_state(&kp, &msg), signature(e));
         assert!(verify_state(&signature(e), &kp.public, &msg));
@@ -191,7 +205,11 @@ fn a_mainnet_signed_state_is_refused() {
     let e = &v["stateSignatures"]["mainnetState"];
     assert_eq!(s(&e["networkId"]), "mainnet");
     let kp = keypair(&e["secret"]);
-    let msg = StateMessage::new(&kp.public.into_compressed(), pt(&e["commitment"]), f(&e["anchor"]));
+    let msg = StateMessage::new(
+        &kp.public.into_compressed(),
+        pt(&e["commitment"]),
+        f(&e["anchor"]),
+    );
     let sig = signature(e);
     assert!(verify_state_on(NetworkId::MAINNET, &sig, &kp.public, &msg));
     assert!(!verify_state(&sig, &kp.public, &msg));

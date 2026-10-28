@@ -23,12 +23,12 @@ pub mod request;
 pub mod session;
 pub mod tiers;
 
-/// The Pallas base field, the field every value in a zk note lives in.
-pub use zk_note::Field;
-/// The balance commitment: a point on Pallas, in affine form.
-pub use zk_note::balance::{Commitment, Scalar};
 /// The Mina keys and signatures the zk edge reads and signs with.
 pub use mina_signer::{CompressedPubKey, Keypair, NetworkId, PubKey, SecKey, Signature};
+/// The balance commitment: a point on Pallas, in affine form.
+pub use zk_note::balance::{Commitment, Scalar};
+/// The Pallas base field, the field every value in a zk note lives in.
+pub use zk_note::Field;
 
 /// A field element as 32 bytes, little-endian: the encoding zk_toon#29 fixes for the evidence
 /// file, and the one the journal stores.

@@ -8,7 +8,7 @@
 //! The order is o1js's `RequestPublic` struct, flattened as o1js flattens a `Struct`: a
 //! `PublicKey` is `x, isOdd`, a `Group` is `x, y`, a `Bool` is 0 or 1. Twelve field elements.
 
-use crate::{CompressedPubKey, Commitment, Field};
+use crate::{Commitment, CompressedPubKey, Field};
 use ark_ec::AffineRepr;
 use ark_ff::{BigInteger, PrimeField};
 use std::str::FromStr;

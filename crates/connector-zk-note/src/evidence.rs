@@ -126,8 +126,8 @@ impl Record {
         match self {
             Record::Grant(grant) => {
                 out.push(KIND_GRANT);
-                let len =
-                    u32::try_from(grant.proof_json.len()).map_err(|_| EvidenceError::ProofTooLong)?;
+                let len = u32::try_from(grant.proof_json.len())
+                    .map_err(|_| EvidenceError::ProofTooLong)?;
                 out.extend_from_slice(&len.to_le_bytes());
                 out.extend_from_slice(&grant.proof_json);
                 put_id(&mut out, &grant.allowance_id)?;

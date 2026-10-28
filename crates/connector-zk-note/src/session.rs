@@ -28,7 +28,10 @@ pub type AllowanceIdBytes = [u8; 16];
 /// What the session key signs for one allowance claim, in order: the claim tag, the allowance
 /// id (its 16 bytes read little-endian) and the cumulative amount in nanomina.
 #[must_use]
-pub fn allowance_claim_fields(allowance_id: &AllowanceIdBytes, cumulative_amount: u64) -> [Field; 3] {
+pub fn allowance_claim_fields(
+    allowance_id: &AllowanceIdBytes,
+    cumulative_amount: u64,
+) -> [Field; 3] {
     use ark_ff::PrimeField;
     [
         zk_note::tag_to_field(ALLOWANCE_CLAIM_TAG),
@@ -45,7 +48,10 @@ pub fn sign_allowance_claim(
     allowance_id: &AllowanceIdBytes,
     cumulative_amount: u64,
 ) -> Signature {
-    sign_fields(session, &allowance_claim_fields(allowance_id, cumulative_amount))
+    sign_fields(
+        session,
+        &allowance_claim_fields(allowance_id, cumulative_amount),
+    )
 }
 
 /// Whether `signature` is the session key's over this allowance claim.

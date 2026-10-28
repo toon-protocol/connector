@@ -2,8 +2,8 @@
 
 use connector_zk_note::note::policy::TIERS;
 use connector_zk_note::session::{
-    sign_allowance_claim, signature_from_be_bytes, signature_to_hex,
-    verify_allowance_claim, SIGNING_NETWORK,
+    sign_allowance_claim, signature_from_be_bytes, signature_to_hex, verify_allowance_claim,
+    SIGNING_NETWORK,
 };
 use connector_zk_note::tiers::{Tiers, TiersError};
 use connector_zk_note::{Keypair, NetworkId, Scalar, SecKey};
@@ -80,7 +80,9 @@ fn tiers_are_a_validated_subset_of_zk_toons() {
         Tiers::new([TIERS[1], 12_345]).unwrap_err(),
         TiersError::NotPublished(12_345)
     );
-    assert!(TiersError::NotPublished(12_345).to_string().contains("12345"));
+    assert!(TiersError::NotPublished(12_345)
+        .to_string()
+        .contains("12345"));
     let t = Tiers::new([TIERS[2], TIERS[0]]).unwrap();
     let budgets: Vec<u64> = t.as_slice().iter().map(|t| t.budget()).collect();
     assert_eq!(budgets, [TIERS[0], TIERS[2]]);
