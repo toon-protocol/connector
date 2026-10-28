@@ -62,6 +62,4 @@ pub use settlement::{
     EvmSettlementConfig, SettlementChain, SettlementConfig, SolanaSettlementConfig,
     UnknownSettlementChain,
 };
-pub use zk_note::{
-    compressed_key_of, MinaNetwork, ZkNoteConfig, MAX_ALLOWANCE_LIFETIME_MS, ZK_NOTE_DECIMALS,
-};
+pub use zk_note::{MinaNetwork, ZkNoteConfig, MAX_ALLOWANCE_LIFETIME_MS, ZK_NOTE_DECIMALS};

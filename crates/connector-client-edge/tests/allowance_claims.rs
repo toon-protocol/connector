@@ -275,6 +275,13 @@ async fn a_grant_is_evidence_before_it_is_an_answer() {
     );
 }
 
+/// A case name, the request it spoils, and the refusal it must earn.
+type RefusalCase = (
+    &'static str,
+    AllowanceRequest,
+    fn(&AllowanceRefusal) -> bool,
+);
+
 /// Every refusal the gate can make without the vault, it makes without the
 /// vault -- and writes nothing.
 #[tokio::test]
@@ -284,7 +291,7 @@ async fn each_cheap_refusal_is_named_and_asks_the_vault_nothing() {
     let now = edge.now_ms();
     let base = Payer::new(&edge, 3).provable(&edge);
 
-    let cases: Vec<(&str, AllowanceRequest, fn(&AllowanceRefusal) -> bool)> = vec![
+    let cases: Vec<RefusalCase> = vec![
         (
             "not a JsonProof",
             AllowanceRequest {

@@ -20,7 +20,7 @@ use std::time::Duration;
 use connector_domain::AssetId;
 use connector_zk_note::note::policy::CHALLENGE_WINDOW_MS;
 use connector_zk_note::tiers::Tiers;
-use connector_zk_note::{CompressedPubKey, PubKey};
+use connector_zk_note::PubKey;
 use serde::Deserialize;
 use url::Url;
 
@@ -222,14 +222,6 @@ pub(crate) fn resolve_zk_note(
         allowance_lifetime: Duration::from_millis(lifetime_ms),
         open_budget_cap: raw.open_budget_cap,
     })
-}
-
-/// The compressed key a Mina address names. Exposed for the runtime, which
-/// checks the state key file against nothing else.
-pub fn compressed_key_of(address: &str) -> Option<CompressedPubKey> {
-    PubKey::from_address(address)
-        .ok()
-        .map(|key| key.into_compressed())
 }
 
 #[cfg(test)]
