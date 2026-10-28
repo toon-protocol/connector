@@ -87,6 +87,15 @@ pub fn commitment_from_le_bytes(x: &[u8; 32], y: &[u8; 32]) -> Option<Commitment
     point.is_on_curve().then_some(point)
 }
 
+/// The zk edge's state key, from the text of `[zk_note] state_key_file`: a Mina secret key in
+/// base58 (`EK…`), as Mina's tooling and o1js's `PrivateKey.toBase58` export it, with surrounding
+/// whitespace ignored. `None` for anything else.
+#[must_use]
+pub fn state_keypair_from_text(text: &str) -> Option<Keypair> {
+    let secret = SecKey::from_base58(text.trim()).ok()?;
+    Keypair::try_from(secret).ok()
+}
+
 /// The full public key a compressed one names, or `None` when its x is not on Pallas.
 #[must_use]
 pub fn decompress(key: &CompressedPubKey) -> Option<PubKey> {

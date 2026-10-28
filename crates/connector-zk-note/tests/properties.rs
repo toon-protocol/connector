@@ -90,6 +90,19 @@ fn tiers_are_a_validated_subset_of_zk_toons() {
     assert!(t.get(TIERS[1]).is_none());
 }
 
+/// The state key file holds the key as Mina's own tooling exports it: base58 `EK…`, with
+/// surrounding whitespace ignored, and nothing else read as a key.
+#[test]
+fn a_state_key_file_is_a_base58_mina_secret_key() {
+    let secret = SecKey::new(Scalar::from(42u64));
+    let key = Keypair::try_from(secret.clone()).expect("a keypair");
+    let text = format!("  {}\n", secret.to_base58());
+    let read = connector_zk_note::state_keypair_from_text(&text).expect("a key");
+    assert_eq!(read.public, key.public);
+    assert!(connector_zk_note::state_keypair_from_text("not a key").is_none());
+    assert!(connector_zk_note::state_keypair_from_text("").is_none());
+}
+
 // -- Closing an allowance and its successor (ADR 0080 decision 4, #1523) --
 
 mod close_and_successor {
